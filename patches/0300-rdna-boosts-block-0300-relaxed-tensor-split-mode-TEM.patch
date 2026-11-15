@@ -1,4 +1,4 @@
-From 14f3749beaed4204eb0908c1a149fcb9f8ecdb68 Mon Sep 17 00:00:00 2001
+From 951ec437b12d6d2e22f8a44dd39f990838e17fdc Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 25 Oct 2026 10:25:16 -0500
 Subject: [PATCH 16/16] rdna-boosts: block 0300: relaxed-tensor split mode
@@ -128,10 +128,10 @@ index 8a541f31e..7ee502aae 100644
          for (ggml_backend_dev_t dev : devs) {
              if (ggml_backend_dev_is_meta(dev)) {
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index 724e77c3d..52ae840d6 100644
+index d0fecde6c..b031d1b77 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -564,6 +564,18 @@ extern "C" {
+@@ -573,6 +573,18 @@ extern "C" {
          GGML_BACKEND_SPLIT_AXIS_MIRRORED = 10, // all values on all backends
          GGML_BACKEND_SPLIT_AXIS_PARTIAL  = 11, // each backend has a partial sum
  
@@ -151,7 +151,7 @@ index 724e77c3d..52ae840d6 100644
          GGML_BACKEND_SPLIT_AXIS_NONE    = 98,
          GGML_BACKEND_SPLIT_AXIS_UNKNOWN = 99,
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index d6fed69f2..1b76236d0 100644
+index d1f1508ac..b1cfb0e35 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -55,6 +55,8 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
@@ -261,7 +261,7 @@ index d6fed69f2..1b76236d0 100644
      auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
          GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
  
-@@ -1718,12 +1772,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1783,12 +1837,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              case GGML_OP_CONV_3D:
              case GGML_OP_CONV_2D_DW:
              case GGML_OP_CONV_TRANSPOSE_2D:
@@ -277,7 +277,7 @@ index d6fed69f2..1b76236d0 100644
              case GGML_OP_PAD: {
                  split_state = handle_pad(src_ss);
              } break;
-@@ -2346,6 +2402,9 @@ static void ggml_backend_meta_buffer_memset_tensor(
+@@ -2432,6 +2488,9 @@ static void ggml_backend_meta_buffer_memset_tensor(
              GGML_ASSERT(value == 0);
              [[fallthrough]];
          }
@@ -287,7 +287,7 @@ index d6fed69f2..1b76236d0 100644
          case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
              for (size_t j = 0; j < n_bufs; j++) {
                  ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-@@ -2504,6 +2563,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
+@@ -2590,6 +2649,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                  ggml_backend_tensor_set(simple_tensor, data, offset, size);
              }
          } break;
@@ -297,7 +297,7 @@ index d6fed69f2..1b76236d0 100644
          case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
              GGML_ASSERT(tensor->type == GGML_TYPE_F32);
              GGML_ASSERT(offset % sizeof(float) == 0);
-@@ -2703,6 +2765,10 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
+@@ -2789,6 +2851,10 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
                  ggml_backend_tensor_get(simple_tensor, data, offset, size);
              }
          } break;
@@ -308,7 +308,7 @@ index d6fed69f2..1b76236d0 100644
          default: {
              GGML_ABORT("fatal error");
          }
-@@ -3800,7 +3866,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3902,7 +3968,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                      }
                      ggml_tensor * next = cgraph->nodes[id+1];
                      if (next->op == GGML_OP_MUL && next->src[0] == node &&

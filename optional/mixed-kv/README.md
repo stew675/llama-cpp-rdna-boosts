@@ -8,7 +8,7 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `d6c325b03012905ea4632eaf1c8af95b489d42060163661187eb2a20b3268f5d`
+  `33902efebd4051d6eaa94b49a4584133e3df249441f306e934402617dbc609c9` (the r291 cut; the r288/r290 cuts are recorded below)
 * cut against the **r288 default delivery tree** `79d18f41b9ab9b235d35fd3a5034858eddd94844` (official blocks
   `0000`-`0015` plus the temporary `0300`; that is the r287 release tree with block 17 removed)
 * produces tree `89b2555296146290f556f1cf017ed6ee124dfce6` when applied alone on that tree — byte-identical
@@ -22,6 +22,11 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
   `00f2150fad1ad44c2d40c1456c708ea4c7103390`.  The produced tree is no longer the r287 release tree's
   bytes — expected, since the r290 default tree moved (block 07's opt-in WMMA verify family) while this
   artifact's own diff is unchanged.
+* **r291 re-cut**: applies strictly at the r291 default tree
+  `8423b2b5eac33f97ad530229b8c35240aa64fa08` and produces
+  `02f8e9d0b9c0077e795c71a2e32b2ae890b41ab1`; cumulative with `0100` (numeric order) is
+  `310386642121ffd22eb74268a6446b31433aada0`.  The default tree moved by block 12's r291 amendment
+  (sequence parallelism), not by anything this artifact owns.
 * **its own gate is `scripts/gate-mixed-kv.sh`**, run on the **optional-applied build**; it is **not** a
   default release gate any more, and the delivery's own gates do not cover a mixed pair.
 

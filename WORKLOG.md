@@ -1,3 +1,76 @@
+## 261115.004 (r291, RELEASE v16-4f9dfa0e3-r291) -- block 12 gains sequence parallelism for the qwen4exp hyper-connection work (PR #315, @briansp2020): default ON, +7 % copy-engine / +2.2 % default-chain prefill at 31.5k, +15.3 % MTP prefill
+
+PR #315 (`wip/seqpar-r289`, v2 of a series reviewed here on 2026-11-15) keeps the qwen4exp residual streams
+token-split through a 2+-device `-sm tensor` prefill, so the hyper-connection chain -- mixers, combine, gated
+norms, the shared expert and the GEMMs over them, which every device used to run for **every** token of a
+ubatch -- runs on each device's own slice instead.  It is accepted **into block 12** (`campaign remainder`: the
+block that owns the `ALL_GATHER` collective, the Meta collective dispatch and the op-table plumbing this
+extends), with **no new block**, and it ships **default ON** (`LLAMA_SEQPAR=0` is the kill switch).  The v2
+resubmission answered the whole correction list from the 2026-11-15 review: the purity claim is corrected in the
+README and the commit messages (the per-token chain at `T/n`, **not** the reduce-scattered sums), the switch is
+inverted, the `MIN` sweep and the env table are supplied, the three diagnostic lines are implemented (executed
+form census, not-engaged reason, a gather-side scratch message that no longer consumes the all-reduce's flag),
+the decode/verify inertness arm is added, and the cross-backend fallback is stated.  We made the **3-card
+extension** (the contributor's series gated on exactly 2 devices) and re-cut the two `optional/` artifacts.
+
+**Everything of the review reproduced on our box, to the digit.**  Off is inert: `LLAMA_SEQPAR=0` reads prefill
+logits **0.000000 / 99.990 %** against the r290 binary and byte-identical greedy text at 2 devices
+(`3098a0b3693c`), 3 devices and `-sm layer` (`19d357f76b27`).  The family-switch point is unchanged from the
+review: base PPL **2.8450**, control (`-ub 256`) **2.8502**, candidate **0.014184 / 96.373 %** (bf16 wire),
+**0.010644 / 96.833 %** (F32 wire), **0.014184** with `RS=0` (the reduce-scatter is provably not the source).
+Their own table's numbers matched ours exactly -- 0.014184 / 96.373 %, control 0.013587 / 96.225 %, base PPL
+2.8450, control 2.8502 -- on a different box, which is the strongest evidence a contributor's claims can have.
+
+**What it measures here** (Flash-Next GSQ-RCO IQ3_XXS, `-ncmoe 47 -ot per_layer_token_embd.*=CPU`, `-ub 4096`,
+pinned heat prior, two interleaved rounds): pp31500 copy-engine chain 2635.9/2774.7 -> **2828.0/2967.7
+(+7.3/+7.0 %)**; default (RCCL-ring) chain 2634.9/2638.8 -> **2693.3/2693.7 (+2.2/+2.1 %)**; MTP
+(`draft-mtp n3`) prefill 1275.4 -> **1471.1 t/s (+15.3 %)** with decode flat (92.1 vs 92.0) and different text;
+`llama-batched-bench -npl 1,4,8` flat at 1/4 slots and +3.2 % prefill at 8.  **3 cards** (our extension): ce
+3445.3 -> 3539.7 (**+2.7 %**), default 3134.3 -> 3200.1 (**+2.1 %**), 3-device logits 0.014133 / 96.147 % against
+a control of 0.013662 / 96.235 % -- the reduce-scatter declines there (its copy-engine exchange is 2-rank by
+construction) and only the gathers work, which is the documented shape of the extension.
+
+**Two decisions, both from measurement.**  (1) **`LLAMA_SEQPAR_MIN` stays 512**, and the contributor's
+"ahead at every T" sweep does not reproduce here: `-p 8192` reads **-1.0 % at 128**, **-0.8 % at 256**,
+**+6.4 % at 512** (ce) / **+3.0 %** (default), +8.3 % at 1024.  A floor that ships must be a win, so 512 it is.
+(2) **The bf16 gather wire ships** even though the F32 wire is *better* on both logit metrics: the F32 wire is
+**-2.1 %** against seqpar off on the default chain (2578.6 vs 2634.9 t/s), because the gather bytes are the whole
+cost there.  The bf16 wire is exactly its own round-only control (`GGML_SEQPAR_GATHER_ROUND=1`), so the logit
+difference is the wire's rounding and nothing else; `LLAMA_SEQPAR_GATHER_BF16=0` is the documented trade, not a
+free purity dial (`ENVIRONMENT.md` §21).
+
+**One limitation, measured, bounded -- and then closed by a floor guard.**  The contributor reported a crash with
+`LLAMA_SEQPAR_MIN` forced low; we reproduced and characterised **two** failure modes in the band below 128 tokens:
+a token-split ubatch of 48..112 tokens can overflow the thread stack in the Meta split-state recursion (block 09's
+cache -- a nested lookup retires the cache version the non-recursive warm walk is filling, so the recursion
+descends the whole `src` chain), and with `MIN` <= 2 the **2-token warmup graph** trips the token-scatter
+split-state assertion deterministically.  Measured: crashes at T = 48, 64, 80, 112 (and every `MIN` <= 2 run at
+its 2-token graph); clean at 32, 96, 128, 144, 160, 192, 200, 224, 240, 256 (`-p 24576`), 320, 512, 1024, 2048,
+4096, 31500, and seqpar-off is clean at the same T.  I tried the obvious cache fix (restart the walk when a nested
+lookup moves the version) and it does **not** close it -- the switch that matters happens on the root's own lookup
+*after* the walk -- and the cheap alternative (resolving a miss from any version with a byte-identical entry)
+crosses the version-consistency invariant the cache exists to keep, a wrong version of which mis-splits tensors
+**silently**.  So the cache work stays `TODO` #330, and the *band* is closed instead: **`LLAMA_SEQPAR_MIN` is
+clamped to 128 with one WARN**, so a mis-set value degrades to "off" for the ubatches it cannot handle instead of
+aborting.  The shipped default (512) is above the clamp and untouched, `MIN=2 -ub 32` now exits 0 and reports
+`not engaged`, `MIN=128 -ub 128` engages and runs clean, and `scripts/gate-seqpar.sh` arm 6 asserts the clamp.
+
+**Gates.**  `scripts/gate-seqpar.sh` (new: off-inert logits, the F32-wire family-switch calibration, bf16 ==
+its own round-only control, the ON text + executed-form census, ON==OFF text in every layout that cannot split
+with its `not engaged` reason, the T=128 bound, GPU faults) -- PASS.  `scripts/validate-set.sh` -- OK (strict
+apply from a fresh base tarball, applied tree `04bc47fc`, both optional artifacts re-cut and verified alone and
+cumulatively, 512-file Windows portability scan clean).  Prefill logits at 2 and 3 devices (above).  MTP and
+`-npl 1,4,8` arms (above).  CPU-only and Vulkan `llama-cli` builds compile.  No GPU fault in any run of this
+release.  `release.json` was regenerated (`make-release.sh`), and its `.tip` -- which was recorded at r290 as
+`14f3749bed`, a typo for `14f3749bea...` that made `scratch-tree.sh arm` and `fork-refresh.sh` unable to check
+the tip out -- is fixed.  It names the **`apply-all.sh` re-cut tip** (`ec721312c`), not the working chain's
+(`951ec437b`, same tree): the two differ by the re-cut's committer stamp, and recording the working one is the
+trap `AGENTS.md` calls out -- `fork-refresh.sh` caught it (`release.json .tip does NOT match`) and the value was
+corrected to what the branch carries.
+
+**Records.**  `benchmarks/2026-11-15-seqpar.md`; `patches/README.md` block 12; `ENVIRONMENT.md` §21;
+`INVARIANTS.md` r291; `GREEDY-PURITY.md` §92; `TODO` #330 (and #328 closed by this entry); `scripts/README.md`.
+
 ## 261115.002 (r290) -- block 07 gains the verify band's WMMA iu8 matvec family (PR #317): opt-in `--wmma-verify N|auto`, floor 7, Q8_0 included.  +10.6 % at 8 columns on a 2-GPU tensor split, byte-identical to r289 with it off
 
 PR #317 (@burnoutIA; campaign record now in `archive/work/rdna4-wmma-verify/`) offers a 2..16-column WMMA `iu8` matvec family for the

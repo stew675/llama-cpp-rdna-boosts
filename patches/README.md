@@ -3325,6 +3325,33 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 
 ## Block 12 — campaign remainder
 
+> **r291 amendment (contributor PR #315, @briansp2020): sequence parallelism for the qwen4exp hyper-connection
+> work, DEFAULT ON (`LLAMA_SEQPAR=0` off).**  Under `-sm tensor` every device used to run the whole
+> hyper-connection chain (mixers, combine, gated norms, the shared expert and the GEMMs over them) for every token
+> of a ubatch.  A prefill ubatch of at least `LLAMA_SEQPAR_MIN` (512) tokens on a 2+-device `-sm tensor` layout now
+> keeps the residual streams token-split from layer 0 to the last layer: each block gathers its `hc_mixed` input
+> (token-axis all-gather), the shared expert runs on local tokens, and the attention and MoE partial sums are
+> reduce-scattered by token instead of all-reduced.  PLE layers and the last layer run on the gathered streams, so
+> the logits/MTP tails keep their shape.  **This block carries the mechanism** -- a new `GGML_OP_TOKEN_SCATTER`, the
+> Meta token-axis split state and the scatter/gather subgraph handling, the generic gather extended to the token
+> axis, and two comm hooks (copy-engine reduce-scatter + token all-gather) on **block 01's** scratch and event
+> protocol, each following the selected all-reduce arm and declining to all-reduce + local slice / generic copies
+> when it cannot -- because block 12 owns the `ALL_GATHER` collective and the op-table plumbing it extends; the
+> qwen4exp graph changes are here too, so the feature lands as one block.  **Worth** (2 x R9700, Flash-Next GSQ-RCO
+> IQ3_XXS `-ncmoe 47 -ot per_layer_token_embd.*=CPU`, `-ub 4096`, 2 interleaved rounds): pp31500 copy-engine chain
+> **+7.3 / +7.0 %**, default (RCCL-ring) chain **+2.2 / +2.1 %**; MTP prefill **+15.3 %** with decode flat;
+> `-npl 1,4,8` flat/+3.2 %.  **Wire:** the bf16 gather wire ships (`LLAMA_SEQPAR_GATHER_BF16=0` = F32); the F32 wire
+> is better on both logit metrics but **-2.1 %** on the default chain, so it is the kill-switch, not the default.
+> **Purity:** not bit-identical -- the per-token chain runs at `T/n` (a batch-width change, the same class as `-ub`,
+> **not** the reduce-scattered sums: `RS=0` reads the identical KLD), 0.014184 / 96.373 % against a same-kernel
+> `-ub 256` control of 0.013587 / 96.225 %, exactly its own round-only control; OFF is inert (KLD 0.000000 and
+> byte-identical text at 2 devices, 3 devices and `-sm layer`).  **Gate:** `scripts/gate-seqpar.sh> **Floor guard
+> (`TODO` #330):** a token-split ubatch below 128 tokens can overflow the Meta split-state recursion (block 09's
+> cache; T = 48/64/80/112 reproduced, 128+ clean) and with `MIN` \<= 2 a 2-token graph trips the token-scatter
+> assertion, so `LLAMA_SEQPAR_MIN` is **clamped to 128 with one WARN** -- a mis-set value degrades to "off" for
+> the ubatches it cannot handle instead of aborting, and the shipped 512 is above the clamp.
+> `GREEDY-PURITY.md` §92, `INVARIANTS.md` r291, `ENVIRONMENT.md` §21, `benchmarks/2026-11-15-seqpar.md`.
+
 > **r275 amendment:** the transport-coupling WARN in `moe-expert-cache.cu` escapes its literal percent (`-41 %%`); it
 > printed `invalid conversion specifier ')'`.  Diagnostic text only.
 

@@ -4988,3 +4988,54 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   so Q8_0 needs its own unit (`RB = 34`).  With the K-quant unit the kernel walks past the row and the
   launch aborts; the format structs each carry `RB` for this reason.  The same trap applies to any future
   type added to the family.
+
+## r291 — sequence parallelism is a batch-width change, and its thresholds are measured (block 12, PR #315)
+
+* **The per-token chain is what moves, not the collective (`GREEDY-PURITY.md` §92).**  Keeping the qwen4exp
+  residual streams token-split makes the hyper-connection mixers, gated norms, shared expert and their GEMMs
+  run at `T/n` per device, so the logits move at rounding level exactly as a `-ub` change does: on the
+  delivery's family-switch point the ON arm reads **0.014184 / 96.373 %** against a same-kernel `-ub 256`
+  control of **0.013587 / 96.225 %**, and `LLAMA_SEQPAR_RS=0` (all-reduce + local slice instead of the
+  reduce-scatter, the identical values) reads the **same** 0.014184 / 96.373 %.  The reduce-scatter is
+  therefore provably not the source; any claim that it is, or that seqpar alone is `0.000000`, is wrong.
+  `LLAMA_SEQPAR=0` is bit-inert: prefill-logit **0.000000 / 99.990 %** against the previous release's binary,
+  and greedy text identical at 2 devices, 3 devices and `-sm layer`.
+* **The gather wire is a throughput trade with a logit cost, and the cheaper wire is the slower arm (r291).**
+  (`LLAMA_SEQPAR_GATHER_BF16`, default 1.)  The bf16 wire is exactly its own round-only control
+  (`GGML_SEQPAR_GATHER_ROUND=1`, both 0.014372) but is 4 % above the ubatch control on KLD; the F32 wire is
+  **better than the control on both metrics** (0.010644 / 96.833 %) and yet measures **-2.1 %** against seqpar
+  OFF on the default RCCL-ring chain (2634.9 -> 2578.6 t/s at 31.5k, 2 rounds), because there the gather bytes
+  are the whole cost.  So "safer wire" is not "shippable default": the bf16 wire ships and `=0` is the
+  documented kill-switch.  `ROCBLAS_USE_HIPBLASLT=0` is mandatory for every hash/PPL arm here (§44).
+* **`T/2` work is only a win above a measured ubatch (r291).**  `LLAMA_SEQPAR_MIN` is **512** and that is a
+  measurement, not the ubatch that happened to be tested: `llama-bench -p 8192` on 2 x R9700 gives **-1.0 %
+  at 128** and **-0.8 % at 256** (no win), **+6.4 % at 512** (copy-engine chain) / **+3.0 %** (default chain),
+  **+8.3 % at 1024**, and at the delivery's shapes **+7.3/+7.0 %** ce and **+2.2/+2.1 %** default at 31.5k.
+  (The contributor's sweep reported a win at every T on a box whose 31.5k baseline was ~1950 t/s; the
+  crossover is configuration-shaped, so it is measured here.)
+* **A token-split ubatch below 128 tokens can overflow the Meta split-state recursion (r291, open, `TODO` #329).**
+  A nested lookup in `ggml_backend_meta_get_split_state` retires the cache version the non-recursive warm walk
+  is filling (it switches version when a tensor's bytes changed since it was cached), so the recursion then
+  descends the whole `src` chain -- ~10 frames per layer, ~500 for a 48-layer qwen4exp graph -- and a
+  thread stack dies.  Reproduced with the feature on at T = 48, 64, 80 and 112 (`llama-bench -p 4096/8192`,
+  gdb: unbounded `calculate_split_state` <-> `get_split_state`); **clean at 32, 96, 128, 144, 160, 192, 200,
+  224, 240, 256, 320, 512, 1024, 2048, 4096 and 31500**, and seqpar-off at the same T is fine, so the hazard is
+  the cache's, reachable only through this feature's longer chain.  A mis-set `MIN` also reaches a *second*
+  failure at T <= 2 (the token-scatter split-state assertion fires outright, deterministically, on the warmup
+  graph), so the value is **clamped to 128 with one WARN**: a setting below it degrades to "off" for the
+  ubatches it cannot handle instead of aborting, the shipped default (512) is above the clamp, and
+  `scripts/gate-seqpar.sh` arm 6 asserts all of that.  The re-entry condition for lowering the clamp is fixing
+  block 09's cache (`TODO` #330).
+* **Above 2 ranks the reduce-scatter declines and only the gathers help (r291).**  The copy-engine exchange is
+  2-rank by construction (one exchange of the other rank's half, one event pair), so at 3+ devices the Meta
+  backend all-reduces and slices while the token gathers run over N peers: measured 3-card prefill 3445.3 ->
+  3539.7 t/s (ce, **+2.7 %**) and 3134.3 -> 3200.1 (auto, **+2.1 %**), 3-device logits 0.014133 / 96.147 %
+  against a control of 0.013662 / 96.235 %.  The graph layer and the slice-offset maths stay device-count
+  agnostic; the 2-rank restriction lives only in the comm layer and in the RS eligibility test.
+* **The collectives live outside the ggml allocators and the gather never grows an existing scratch (r291).**
+  The reduce-scatter asks for what the all-reduce it replaces would have asked for (2 x ceil(ne/2) bf16); the
+  gather creates a scratch only when none exists (<= 24 MiB) and otherwise chunks through it, because growth
+  retires the old buffers until teardown -- that is the **+60 MiB/device** (3 x 20 MiB at `-ub 4096`) the
+  default chain carries with the feature on, and it is raw device memory, so the allocator breakdown is
+  unchanged (the census line says which caller grew it).  A gather that declines (no scratch, multi-process,
+  `GGML_SEQPAR_CE_GATHER=0`) warns with **its own** message and flag instead of consuming the all-reduce's.

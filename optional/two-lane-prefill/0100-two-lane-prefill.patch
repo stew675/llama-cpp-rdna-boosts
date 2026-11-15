@@ -1,4 +1,4 @@
-From 3190e2296a8382ad590168060e4376d18f13e5ea Mon Sep 17 00:00:00 2001
+From 6c6a4bd634f3bc36a9f3b02d7ced53db1ad4e51b Mon Sep 17 00:00:00 2001
 From: "Slava P." <slavap@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 11:54:47 -0600
 Subject: [PATCH] rdna-boosts: block 0100: two-lane prefill
@@ -83,7 +83,7 @@ Full tables, the reachability matrix, the costs and the open points are in
  8 files changed, 1066 insertions(+), 175 deletions(-)
 
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index 7a7ffd13f..4f1f1e373 100644
+index b031d1b77..da63992af 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
 @@ -267,6 +267,9 @@ extern "C" {
@@ -96,7 +96,7 @@ index 7a7ffd13f..4f1f1e373 100644
  
      //
      // Backend device
-@@ -532,6 +535,23 @@ extern "C" {
+@@ -541,6 +544,23 @@ extern "C" {
      GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
      GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
      GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
@@ -930,10 +930,10 @@ index 79a70b16e..73c3c407a 100644
      GGML_ASSERT(sched);
      for (int i = 0; i < sched->n_backends; i++) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 6b9e69420..1929520a8 100644
+index 46478c6f0..85e2aac2e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -11063,7 +11063,20 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
+@@ -11563,7 +11563,20 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
      ggml_cuda_set_device(dev_ctx->device);
  
      cudaEvent_t event;
@@ -955,7 +955,7 @@ index 6b9e69420..1929520a8 100644
  
      return new ggml_backend_event {
          /* .device  = */ dev,
-@@ -11084,6 +11097,27 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -11584,6 +11597,27 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -983,7 +983,7 @@ index 6b9e69420..1929520a8 100644
  // wip/slab-ring-region (issue #164): the H2D staging-ring cap.  `GGML_CUDA_SLAB_RING_MIB` is a verbatim
  // per-GPU override; otherwise the context auto-sizes it (`slab_set_ring_cap`) from the ubatch and the
  // host-expert device count.  `g_ring_max_table` is stashed by the preflight so the recompute has the model
-@@ -11480,6 +11514,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -11980,6 +12014,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .gtt_store_arena           = */ ggml_backend_cuda_device_gtt_store_arena,
      /* .gtt_store_free_bytes      = */ ggml_backend_cuda_device_gtt_store_free_bytes,
      /* .gtt_store_arena_min       = */ ggml_backend_cuda_device_gtt_store_arena_min,

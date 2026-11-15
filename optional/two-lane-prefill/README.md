@@ -19,7 +19,10 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `d17958a29d4847c6541544baaa53760fcfb2df03e2f3dcdd98262e709d07a5ba`
+  `8814fffe90e776a8ed99950c16c0ab746a81a67e13ec183a5311af88c285273d` (the r291 cut; the earlier cuts are recorded below)
+* **r291 re-cut**: applies strictly at the r291 default tree `8423b2b5…` and produces
+  `4b0b8da0154aac69ab61998865956deaec9ec9a8`; cumulative with `0101` is `310386642121ffd22eb74268a6446b31433aada0`.
+  The default tree moved by block 12's r291 amendment (sequence parallelism), outside this artifact's mechanisms.
 * applies at the r288 default tree `79d18f41…`, produces tree `1bfccf843b7da66ac2d464bd7b89c27d02a426be`
   (the r285 cut, sha256 `9ec906a277…`, produced `772c652409f2f5830edbce0fcee37077ed787889` on the r285 tree
   `3a6304107…`; the r284 tree `39ad82e0e…` produced `a9384ba7dce5b8d341de1ba63ad974af12ea2492`; the r259 cut

@@ -1346,6 +1346,42 @@ this tier** (every miss fills: the pageable mapping is not a GPU-readable cold s
 +63-67 % on a >RAM model with the logits unmoved (mean KLD -0.000000, same-top-p 99.990 %).  Gate:
 `scripts/gate-uma-experts.sh` (16 arms, 40 checks).
 
+## 21. Sequence parallelism (block 12, r291) — the qwen4exp hyper-connection chain, token-split
+
+Under `-sm tensor` the hyper-connection chain (mixers, combine, gated norms, the shared expert and the GEMMs over
+them) is mirrored: every device ran it for **every** token of a ubatch.  With `LLAMA_SEQPAR` on -- the shipped
+default -- a prefill ubatch of at least `LLAMA_SEQPAR_MIN` tokens on a **2+-device `-sm tensor`** layout keeps the
+residual streams token-split from layer 0 to the last layer: each device runs that chain on its own slice, each
+block gathers its `hc_mixed` input for the feature-split parts (attention, router, routed MoE), and the attention
+and MoE partial sums are reduce-scattered by token instead of all-reduced.  PLE layers and the last layer run on
+the gathered streams, so the logits/MTP tails keep their shape.  It is **OFF-path inert** (prefill logits
+0.000000 against r290, byte-identical greedy text) and **not** part of decode or a verify batch: those graphs are
+1..n_draft+1 tokens, below `MIN`, and say so once in the log.
+
+| variable | default | class | meaning |
+|---|---|---|---|
+| `LLAMA_SEQPAR` | `1` | **kill-switch** | `0` = the unsplit graph, exactly as before (verified as an arm in `scripts/gate-seqpar.sh`, and bit-inert in the release record) |
+| `LLAMA_SEQPAR_GATHER_BF16` | `1` | **kill-switch** | `0` = the F32 wire for the per-layer `hc_mixed` gathers. **This is a real trade, not a purity dial**: the F32 wire is *better* on both logit metrics (0.010644 / 96.833 % against the bf16 wire's 0.014184 / 96.373 %, control 0.013587 / 96.225 %) and *slower where it matters* -- on the default (RCCL-ring) chain the F32 wire measures **-2.1 %** against seqpar OFF, because the gather bytes are the cost there.  The bf16 wire rounds exactly as its own round-only control (`GGML_SEQPAR_GATHER_ROUND=1`) and is the arm the throughput numbers are for |
+| `LLAMA_SEQPAR_MIN` | `512` | tuning | smallest ubatch that splits.  Measured on 2 x R9700, `llama-bench -p 8192`: **-1.0 % at 128, -0.8 % at 256** (no win), **+6.4 % at 512** (copy-engine chain) / **+3.0 %** (default chain), +8.3 % at 1024.  **Values below 128 are clamped to 128 with one WARN**, because a token-split ubatch that small can overflow the thread stack in the Meta split-state recursion (block 09's cache; reproduced at T = 48/64/80/112 and, with `MIN` \<= 2, a 2-token graph trips the token-scatter split-state assertion; clean at 128 and above).  So a mis-set value degrades to "off" for the ubatches it cannot handle instead of aborting; `TODO` #330 is the cache fix, and `scripts/gate-seqpar.sh` arm 6 asserts the clamp |
+| `LLAMA_SEQPAR_RS` | `3` | tuning / test | bit 0 = the attention output is reduce-scattered, bit 1 = the MoE output.  A cleared bit all-reduces and slices instead (**the same values**, more link bytes; `RS=0` reads the identical KLD), which is the arm that proves the reduce-scatter is not the source of the rounding change |
+| `LLAMA_SEQPAR_ODD` | `1` | tuning | `0` = split even token counts only.  Default: the first `T % n` devices take one token more (ceil/floor) |
+| `GGML_SEQPAR_CE_GATHER` | `1` | **test only** | `0` = the gathers take the Meta backend's generic copies instead of the copy-engine path (an A/B for the transport, and the arm that proves the gather-side scratch warning is its own message) |
+| `GGML_SEQPAR_GATHER_ROUND` | `0` | **test only** | `1` = F32 wire, then round in place: the **round-only control** for the bf16 wire (same values, no link saving) |
+| `GGML_SEQPAR_GATHER_CHUNK` | `0` | **test only** | cap the gather chunk in elements, to exercise the multi-chunk path |
+
+**Where it can engage.**  Exactly: `-sm tensor` on a **Meta device with at least 2 sub-devices**, a ubatch
+>= `LLAMA_SEQPAR_MIN`, and no drafter layer tap (`embeddings_layer_inp`).  Everything else prints one
+`sequence parallelism not engaged: <reason>` line per reason (`LLAMA_SEQPAR=0`, not `-sm tensor`, `N devices < 2`,
+a drafter tap, or the ubatch below `MIN`).  Above 2 ranks the copy-engine reduce-scatter **declines** (its exchange
+is 2-rank by construction) and the Meta backend all-reduces + slices, while the gathers still run over N peers --
+measured at 3 cards, +2.7 % (ce) / +2.1 % (default) prefill on 31.5k tokens.
+
+**Diagnostics are INFO**, i.e. `-lv 4`: the engaged graph shape, the **executed** form census (copy-engine
+reduce-scatter / all-reduce + slice / fallback all-reduce + slice, and the same split for the gathers), the
+copy-engine decline with its reason, and the copy-engine scratch size in MiB per device when it grows.  The graph
+node counts are *eligibility*; the census is what ran.  `scripts/gate-seqpar.sh` is the gate; the record is
+`benchmarks/2026-11-15-seqpar.md`.
+
 ## 18. Optional artifacts (`optional/`) — **not part of the delivery**
 
 These are **optional blocks `01xx`** and exist only in a checkout made with `scripts/apply-all.sh
