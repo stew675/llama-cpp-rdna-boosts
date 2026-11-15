@@ -1,0 +1,60 @@
+From 59ce091a50cd53b1930a82ca8cd4399ab1ec14fe Mon Sep 17 00:00:00 2001
+From: burnoutIA <72673971+burnoutIA@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 03:55:36 +0100
+Subject: [PATCH] gdn-conv: the conv + q/k norm fusion is no longer refused on
+ a deferred conv-state gather
+
+gdn_conv_norm_match refused the fusion when the normalized q output overlapped the conv-state
+tensor. On the speculative verify path the conv-state gather is deferred: the direct kernel reads
+the cache row, never that dead GET_ROWS output, so the overlap is harmless. The q/k norms then ran
+as a separate kernel (plus a launch) in every Gated DeltaNet layer. Bit-identical results;
+GGML_CUDA_FUSE_GDN_CONV_NORM=0 still disables the fusion.
+---
+ ggml/src/ggml-cuda/gdn-conv.cu | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
+index d24e434..3c5bb48 100644
+--- a/ggml/src/ggml-cuda/gdn-conv.cu
++++ b/ggml/src/ggml-cuda/gdn-conv.cu
+@@ -365,7 +365,8 @@ static bool gdn_conv_norm_one(const ggml_cgraph * cgraph, int j, const ggml_cuda
+ 
+ // The q / k l2 norm pair right after the conv (only no-op nodes between): the direct kernel also writes both normalized
+ // outputs.  Returns the index of the second SCALE, -1 when the pattern is not there.  GGML_CUDA_FUSE_GDN_CONV_NORM=0: off.
+-static int gdn_conv_norm_match(const ggml_cgraph * cgraph, const ggml_cuda_gdn_conv_match & m, gdn_conv_norm_args & na) {
++static int gdn_conv_norm_match(const ggml_cgraph * cgraph, const ggml_cuda_gdn_conv_match & m, gdn_conv_norm_args & na,
++                               const ggml_backend_cuda_context * ctx = nullptr) {
+     static const bool fuse = [] { const char * e = getenv("GGML_CUDA_FUSE_GDN_CONV_NORM"); return e == nullptr || atoi(e) != 0; }();
+     if (!fuse || !m.silu || m.C % 256 != 0) return -1;
+     int j = m.conv_idx + 2;
+@@ -394,8 +395,18 @@ static int gdn_conv_norm_match(const ggml_cgraph * cgraph, const ggml_cuda_gdn_c
+         const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a), b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
+         return a0 < b1 && b0 < a1;
+     };
++    // A deferred conv-state gather (ggml_cuda_gdn_conv_direct reads the cache row, never m.state->data): the dead
++    // GET_ROWS output may then hold the SCALE outputs. This is the speculative verify shape (T <= 16 with snapshots),
++    // where the allocator does place the q output there.
++    bool state_deferred = false;
++    if (ctx != nullptr) {
++        const ggml_tensor * root = m.state;
++        while (root->view_src != nullptr) root = root->view_src;
++        state_deferred = std::find(ctx->gdn_deferred_gathers.begin(), ctx->gdn_deferred_gathers.end(), root) != ctx->gdn_deferred_gathers.end();
++    }
+     for (const ggml_tensor * d : { cgraph->nodes[j + 1], cgraph->nodes[j2 + 1] }) {
+         for (const ggml_tensor * src : { m.x, m.state, m.w, (const ggml_tensor *) m.conv_out }) {
++            if (src == m.state && state_deferred) continue;
+             if (overlap(d, src)) return -1;
+         }
+     }
+@@ -450,7 +461,7 @@ int ggml_cuda_gdn_conv_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgra
+     }
+     if (node->op == GGML_OP_SSM_CONV && ggml_cuda_gdn_conv_match_at_conv(cgraph, i, gm)) {
+         gdn_conv_norm_args na;
+-        const int last = gdn_conv_norm_match(cgraph, gm, na);
++        const int last = gdn_conv_norm_match(cgraph, gm, na, &ctx);
+         if (last > 0) {
+             ggml_cuda_gdn_conv_direct(ctx, gm, &na);
+             return last - i;
+-- 
+2.53.0
+
