@@ -69,7 +69,8 @@ trap `AGENTS.md` calls out -- `fork-refresh.sh` caught it (`release.json .tip do
 corrected to what the branch carries.
 
 **Records.**  `benchmarks/2026-11-15-seqpar.md`; `patches/README.md` block 12; `ENVIRONMENT.md` §21;
-`INVARIANTS.md` r291; `GREEDY-PURITY.md` §92; `TODO` #330 (and #328 closed by this entry); `scripts/README.md`.
+`INVARIANTS.md` r291; `GREEDY-PURITY.md` §92; `TODO` #330 (and #328 closed by this entry); `scripts/README.md`;
+the submission's own notes are archived at `archive/work/seqpar/`.
 
 ## 261115.002 (r290) -- block 07 gains the verify band's WMMA iu8 matvec family (PR #317): opt-in `--wmma-verify N|auto`, floor 7, Q8_0 included.  +10.6 % at 8 columns on a 2-GPU tensor split, byte-identical to r289 with it off
 
