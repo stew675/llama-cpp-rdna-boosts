@@ -1,9 +1,21 @@
 # wip/moe-static-hot-tier — a STATIC VRAM expert tier filled by heat, frozen outside the movable boundary
 
-**Status: OPEN — SCOPING NOTE (2026-11-02), revised 2026-11-15 after r292.  Nothing of the tier itself is
-implemented; block 09's arena settle (r292) has since taken the band where the decode set is short of it.
-This is a plan with an arithmetic argument and a measurement protocol, not a result.  The revision below
-turns the "frozen tier" into a *placement* and names the real blocker.**
+**Status: OPEN — SCOPING NOTE (2026-11-02), revised 2026-11-15 after r292, and the multi-GPU half of it is
+REFUTED by measurement the same day** ([`RESULTS-2026-11-15-2gpu-3gpu.md`](RESULTS-2026-11-15-2gpu-3gpu.md),
+harness [`band-ab.sh`](band-ab.sh)): on a 2-device `-sm tensor` split the region a prefill → decode drop
+returns is 24.4 % of the arena and buys **0.08-0.42 pp** of routed mass, while taking it costs **-41 % of a
+5.2 k prompt's prefill** (-4.6 % of an 84 k one) and 3-6 % of decode; on 3 GPUs the whole 46.9 GiB expert set
+is already resident at every ubatch, so **there is no region to use**.  The premise below ("hot slots above
+the widest prefill boundary make the cold band free") does not survive it: **a prefill routes every expert of
+every layer, so at prefill there is no cold data** — two-segment addressing would change *which* slots survive,
+not the fill bill (~0.25 s per GiB of band, ~4 GB/s, measured at two band sizes and two prompt lengths).  The
+same 100 % residency is available for free by lowering `-ub` (4096 **beats** 16384 on prefill at a 5 k prompt
+and on decode everywhere).  What is left open: the campaign's 1-GPU/24 GiB tier (still unmeasured), the two
+defects the measurement found (the 3-GPU default slab reserve abort, the `-ub 8192` identity cliff), and the
+short-arena shape where the band's prior mass could be large enough to matter.
+
+**Nothing of the tier itself is implemented.**  The revision below turns the "frozen tier" into a
+*placement*; that placement was measured on 2026-11-15 and does not pay.
 
 ## 2026-11-15 revision — placement, not a freeze (after r292)
 
@@ -36,6 +48,9 @@ The convergence:
    transient improves.  The content policy is still the campaign's: heat, per (layer, expert), spread over
    all layers -- layer-tail placement is 5x worse per byte.  Keep the r74 caveat: protect only the
    **robust core** (top ~5-10 % of pairs, ~35-49 % of the mass); the rest stays adaptive.
+   **MEASURED AND REFUTED 2026-11-15 (2 and 3 GPUs):** the "free win" does not exist — the cold segment's
+   bytes are still streamed by the next prefill at ~0.25 s/GiB, because a prefill routes every expert of
+   every layer.  See [`RESULTS-2026-11-15-2gpu-3gpu.md`](RESULTS-2026-11-15-2gpu-3gpu.md) §2, §4, §7.
 5. **Two smaller steps first (contained, no addressing change).**  (a) **Heat-targeted growth**: the
    settle grows only the layers whose tables stay above the seed floor, so the cold tables are not pushed
    into the band; (b) **preserve-on-grow**: grow a table by D2D-copying its existing residents and leave
@@ -45,6 +60,18 @@ The convergence:
    settle's own `the first drop offers ... gain ... pp` line plus `re-armed ... N layer(s) settled UP` and
    the evicted/stood-down counts.  A successful hot/cold split keeps the prefill's stands-down to the cold
    segment only and leaves the `-ub 16384` / `-ub 32768` / partial-pool decode wins intact.
+
+**The measurement was run on 2026-11-15 and it refutes this revision's premise on 2 and 3 GPUs** —
+[`RESULTS-2026-11-15-2gpu-3gpu.md`](RESULTS-2026-11-15-2gpu-3gpu.md).  In one line: the band buys 0.08-0.42 pp
+of routed mass while it costs 0.25 s of prefill per GiB of band (a *fill* bill, ~4 GB/s, paid once per
+prefill and therefore independent of prompt length), because **a prefill routes every expert of every layer
+and there is no cold data at prefill**.  A two-segment table keeps the hot slots resident and still pays the
+cold band's bill; `-ub 4096` reproduces the whole decode win with no band, no bill and a *faster* 5 k-prompt
+prefill.  The continuation that is still unmeasured is the campaign's own 1-GPU / 24 GiB tier (§5's cell) and
+a short-arena multi-GPU shape (residency <= 60 %), where the band's marginal prior mass could be large enough
+to outbid the bill.  Two defects surfaced in the same session and are recorded there, not fixed: the 3-GPU
+default `GGML_CUDA_SLAB_RESERVE_MIB` abort at a wide prefill, and the `-ub 8192` (99.6 % residency)
+`MOE_EXPERT_CACHE_IDENTITY_PREF` cliff (-8.5 % decode against the uniform placement).
 
 **The charter, in the maintainer's words** (2026-11-02, 1-GPU host, after the `host-expert-pinned-window`
 campaign was closed):
