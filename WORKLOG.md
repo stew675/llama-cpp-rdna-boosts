@@ -1,3 +1,60 @@
+## 261116.006 (r299, RELEASE v16-4f9dfa0e3-r299) -- `TODO` #282 retired: the mid-run latch's mixture is a ~1e-5 fp32 path difference, NOT corruption -- and the `pinlate` arm had degenerated to 1 pool of 141, so it is now gated on the LOGITS
+
+**Amends block 12** (no new block: the `MOE_HOST_POOL_PIN_FAULT` diagnostic and its `late` latch live there).  The gate
+(`scripts/gate-host-pool.sh`) gains the delivery's logit instrument for that one arm.  Patches regenerated and re-cut
+from a canonical apply at `4f9dfa0e3`; `release.json` at **`v16-4f9dfa0e3-r299`**, `validate-set.sh` GREEN,
+`gate-per-block-build.sh --changed-from <prev tip> --fast` GREEN on 12.  Record:
+[`benchmarks/2026-11-16-pinlate-mixture-logits.md`](benchmarks/2026-11-16-pinlate-mixture-logits.md),
+`INVARIANTS.md` r299, `GREEDY-PURITY.md` §95, `ENVIRONMENT.md` (`MOE_HOST_POOL_PIN_FAULT`).
+
+**The item as written.**  A mid-run pinned-tier latch (`MOE_HOST_POOL_PIN_FAULT=late`) leaves a MIXTURE of
+cache-served and stood-down ops, and on r231 (this box) that flipped a greedy token -- measured at ~1e-5 KLD, two
+orders inside the 0.005 tolerance, so "a path difference, not corruption".  Owed: name the mechanism, then decide the
+arm's criterion (the gate reported it as a WARN and kept the text assertion for the wholesale arms).
+
+**The arm was not measuring what it claimed, and that is the first half of the answer.**  `late` fired on the first
+bounce-ring grow after `g_sized`; when sizing moved to **registration** (r254/r292) that became true *before* the pool
+tier is built, so on the shipped tree the latch left **1 of 141** pools built (239 MiB of a 31 GiB tier) with **2**
+cache-served ops out of 5 069 -- the "mixture" the gate asserted about was two operations.  `late` now also waits for
+the first ROUTED op (`g_routed_op_seen`, set in `moe_cache_update_host` / `_gather_host` / `_stage_table`), which is
+the field's sequence (pools built at placement -> run live -> a later grow refused).  Restored shape on the gate's
+config: 141 pools / 30 791 MiB, 6 342 fills served from pre-latch pools, 151 rolled-back fills, `get_ok` 660 /
+`decline_all` 1 082 -- and the text is byte-identical to `ref` (`a99ccbd97ecb`) in 5/5 runs.
+
+**With the field-shape latch the divergence reproduces again, deterministically, on the r231..r269 lineage.**  A tag
+bisect (each release re-cut into the scratch tree with the latch fix, `ref` + `pinlate`): r231 `a19aab55e`, r254,
+r262, r264 and r269 all read **158 chars `c634f36735fa`** against `ref`'s 182 `a99ccbd97ecb`; r270 is the first
+release that reads `ref`'s text, and r273/r298 + the fix stay identical.  The measured magnitude on r269 (which
+diverges) under the field-shape latch: `llama-perplexity -c 512 --chunks 2 --kl-divergence` **mean KLD 0.000001, max
+0.000051, 99.9 % 0.000050, same-top-p 100.000 %** (base PPL 3.6948) -- ~1e-5, exactly the item's own figure.  So it is
+an fp32 association difference between the set of cache-served and scheduler-served ops, **not wrong bytes**:
+`MOE_HOST_POOL_VERIFY=1` is clean, and the WHOLESALE arms (`fail`, `late`, `get_ok=0`) stay byte-identical to `ref` on
+every build, i.e. the fallback computes the same logits as the cache.
+
+**What actually moved the flip is the LAYOUT, not the code -- which is why the text cannot be the criterion.**  On
+r269: `MOE_EXPERT_PREFILL_IN_PLACE=0` does not move it (158), `MOE_HOST_POOL_SINK=0` gives a *third* text (175
+`d3d1fe6b3db3`), and `MOE_HOST_POOL_FILL_ORDER=rank` (the pre-r231 prewarm order) reproduces `ref` exactly (182
+`a99ccbd97ecb`).  The prewarm's issue order decides which experts land before a RAM-capped pool runs out, hence the
+residency set, hence which ~1e-5 residue the near tie sees -- and r270's `TODO` #318 ordering change "fixed" the flip
+with no numerics change at all.  A matching text is therefore not evidence about the arithmetic, and a differing text
+is not evidence of a defect: that is `GREEDY-PURITY.md` §11's rule, in its mixture-shaped case (§95).
+
+**So the arm's criterion is now the logits.**  `gate-host-pool.sh` records its own KLD base from the `ref` config in
+the same run (no golden file to go stale), compares the `pinlate` config against it, and requires **mean KLD <= 0.005
+and same-top-p >= 98 %**; the KLD run must itself be a mixture (a rolled-back fill, a pre-latch pool serving, the latch
+line), so a degenerate latch cannot pass it by being inert.  `llama-perplexity` is a hard dependency of that arm
+(startup check; `LLAMA_PPL`/`CORPUS`/`KLD_CTX`/`KLD_CHUNKS`/`KLD_MEAN_MAX`/`KLD_TOPP_MIN` are the knobs) -- the two
+runs cost ~10 s each on this config.  The WHOLESALE arms keep the byte-identical text check and still FAIL on a
+divergence.  `pinlate`'s text is reported, never required.
+
+**Release gates.**  `gate-host-pool.sh` **59/59** (the 56 plus the three KLD checks): every healthy arm byte-identical
+(`a99ccbd97ecb`), the two failure arms byte-identical with 2 790 / 2 625 rolled-back fills and `takeover=0`, `sink`
+5 868 demotes / `sinkfail` 0, `tsplit`/`tsplitnosink` 171 `8c39335bbceb` with 141 of 141 pools non-expressible,
+`pinlate` a real mixture at KLD 0.000000 / same-top-p 100.000 %, every arm's census printed once from the teardown,
+no aborts, kernel journal clean.  Coherence 4B (`1c5d32ac537d`) and `validate-set.sh` GREEN; the change is inert
+without `MOE_HOST_POOL_PIN_FAULT` set (it only narrows a diagnostic's latch condition), so the performance gates are
+not owed and no default moved.
+
 ## 261116.005 (r298, RELEASE v16-4f9dfa0e3-r298) -- `TODO` #335 and #336 retired together: the in-place prefill read was NEVER the carrier -- a stale expert-cache ALIAS resolved a SIBLING ROLE's arena
 
 **Amends blocks 09, 10 and 15** (no new block: the cache engine's alias guard and the take-over promise in **09**, the

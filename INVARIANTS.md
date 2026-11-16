@@ -1,3 +1,31 @@
+## r299 — the mid-run pinned-tier latch's MIXTURE is a ~1e-5 arithmetic path, and it is gated on the LOGITS (block 12, `TODO` #282 retired)
+
+1. **`MOE_HOST_POOL_PIN_FAULT=late` must latch after the run is LIVE, not merely after the arena is sized.**  Sizing
+   moved to registration (r254/r292), so `g_sized` is true before the pool tier is built; a `g_sized`-only latch fired
+   on the second pool and left **1 of 141** pools built (239 MiB of a 31 GiB tier) with **2** cache-served ops out of
+   5 069, i.e. the arm silently stopped reproducing issue #278's shape (the pools are built, the run is live, then a
+   grow is refused).  Keyed on the first ROUTED op as well (`g_routed_op_seen`): 141 pools / 30 791 MiB built, 6 342
+   fills served from pre-latch pools, 151 rolled-back fills, `get_ok` 660 / `decline_all` 1 082.
+2. **The mixture's logit difference is real and ~1e-5; the generated TEXT is not its criterion.**  Measured on r269
+   (which reproduces the divergence deterministically) under the field-shape latch:
+   `llama-perplexity -c 512 --chunks 2 --kl-divergence` reads **mean KLD 0.000001, max 0.000051, 99.9 % 0.000050,
+   same-top-p 100.000 %** (base PPL 3.6948), while the same pair's 32-token greedy text flips one token of the
+   reasoning preamble (158 vs 182 chars).  That is an fp32 association difference between the set of cache-served and
+   scheduler-served ops, not wrong bytes (`MOE_HOST_POOL_VERIFY=1` is clean; the WHOLESALE arms `fail`/`late` stay
+   byte-identical to `ref`, so the fallback computes the same logits as the cache).  A byte-identical text assertion
+   is therefore the right instrument for a WHOLESALE fault arm and the wrong one for a mixed state.
+3. **The near-tie is LAYOUT-dependent, so "the text matches" is not evidence about the arithmetic.**  On r269 the same
+   mixture reads 158 chars `c634f36735fa` with the default (offset-order) prewarm, 175 `d3d1fe6b3db3` with
+   `MOE_HOST_POOL_SINK=0`, and **182 `a99ccbd97ecb` (== `ref`) with `MOE_HOST_POOL_FILL_ORDER=rank`**;
+   `MOE_EXPERT_PREFILL_IN_PLACE=0` does not move it.  The prewarm's fill order decides which experts land before a
+   RAM-capped pool runs out, hence the residency set, hence the residue on the near tie -- which is why r270's
+   `TODO` #318 ordering change "fixed" the flip without any numerics change.  Never read a matching text as
+   "identical arithmetic", and never read a differing text as a defect: use the KLD.
+4. **A mixture gate must assert that the mixture is REAL.**  A near-tie flip needs the mixed state, so a degenerate
+   latch passes for the wrong reason (r298 shipped 1 pool / 2 served ops).  The gate now requires, in the same run:
+   the latch line, pools built before it, pre-latch fills > 0, rolled-back fills > 0, a byte-identical wholesale arm,
+   and the mixture's KLD inside 0.005 / 98 %.  `pinlate`'s text is reported, never required.
+
 ## r298 — the in-place prefill read is a base-pointer swap; the residency-dependent text was a STALE ALIAS resolving a sibling ROLE's arena (blocks 09/10/15, `TODO` #335 + #336 retired)
 
 1. **The in-place prefill read is NOT numerically different from the staged read — measure it before blaming it.**

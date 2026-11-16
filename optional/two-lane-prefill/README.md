@@ -19,7 +19,12 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `a549de5464a31890d8180adfd10530fec5e28d87000bd35d95de84ffaf8517bd` (the r295 cut; the earlier cuts are recorded below)
+  `d025be5f683d1594556803a0db0baaad7d8d17ca3c0496aac428cc55673a299f` (the r299 cut; the earlier cuts are recorded below)
+* **r299 re-cut verification**: applies strictly at the r299 default tree
+  `3da54a4c10d7350eddc5c0d8eae384086a306b0f` and produces `1d389b8db32c28462aae2aca2f413daf31344022`; cumulative with
+  the other optional artifact, numeric order, is `3eeb8f6f1dea6d7d550980afde5072049b5ac665`.  The default tree moved by
+  block 12's r299 amendment (the `MOE_HOST_POOL_PIN_FAULT=late` latch waits for the first routed op), outside this
+  artifact's mechanisms; `validate-set.sh` check 8 verifies all three trees on every run.
 * **r295 re-cut verification**: applies strictly at the r295 default tree
   `bdfd4a182dc9bdf9a7b6a46a0f206622f37b5e34` and produces `87b399a4f61008d8af7443b444f244b0fde97a77`; cumulative with
   the other optional artifact, numeric order, is `af4c85cfedb7eea6a1eb3a71eb0448a40e03aea3`.  The default tree moved by

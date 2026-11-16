@@ -2603,3 +2603,35 @@ against the default 64.05 / 64.92 t/s.
 `WORKLOG.md` 261116.005, `INVARIANTS.md` r298.  Environment: `MOE_EXPERT_ALIAS_ROLE_CHECK` (default 1, A/B),
 `MOE_EXPERT_TAKEOVER_FAULT` (diagnostic, default off), and the census line `take-over promises broken=<n>
 repaired=<n>`.
+
+## 95. A mid-run tier fault leaves a MIXTURE, and a mixture is gated on the LOGITS — the text is a near-tie coin flip (r299, block 12, `TODO` #282)
+
+**Claim.**  When the pinned host tier latches off mid-run (issue #278's Windows shape, emulated by
+`MOE_HOST_POOL_PIN_FAULT=late`), the pools built before the refusal keep serving and the ops that can no longer be
+filled are stood down to the scheduler — a *mixture* of cache-served and fallback-served ops.  The two ends of that
+spectrum are bit-identical (the fallback computes the same logits as the cache: `fail`/`late`, `get_ok=0`, generate
+`ref`'s text byte for byte on every build measured).  The mixture is not: it selects a different set of ops through
+each path and therefore a different fp32 association order.
+
+**Rule.**  **A mixture arm is gated on the logit instrument, never on the generated text.**  Text equality is
+evidence *for* purity and never *against* divergence (§11, and this is its mixture-shaped case): the difference is
+~1e-5, two orders inside tolerance, and whether it lands on a near tie is a property of the *layout*, not of the
+code (below).  A WHOLESALE fault arm keeps the byte-identical text assertion — that is the check that the fallback
+serves the right bytes, and it must keep failing loudly.  A gate for a mixture must additionally prove the mixture
+is REAL (pools built before the latch, pre-latch fills, rolled-back fills, `get_ok`/`decline_all` both non-zero),
+because a degenerate latch passes for the wrong reason: r254/r292 moved sizing to registration and the arm's
+`g_sized`-only latch then fired with 1 of 141 pools built and 2 served ops out of 5 069.
+
+**Numbers.**  Flash-Next GSQ-RCO IQ3_XXS shard 1, 1 x R9700, `-ncmoe 47`, `MOE_HOST_LIMIT_FRAC=40`,
+`--load-mode mmap`, `-c 4096 -ub/-b 1024`, greedy `--seed 42 -n 32`.  Field-shape latch (141 pools, 30 791 MiB,
+6 342 pre-latch fills, 151 rolled-back fills, `get_ok 660 / decline_all 1 082`): on r269 the mixture reads
+**mean KLD 0.000001 / max 0.000051 / same-top-p 100.000 %** (`llama-perplexity -f wiki.test.raw -c 512 --chunks 2`)
+and the text flips one token (158 `c634f36735fa` against `ref` 182 `a99ccbd97ecb`); on r298 + the latch fix both
+read 182 `a99ccbd97ecb` and KLD 0.000000 / 100.000 % (text identical 5/5 runs).  The flip is layout-shaped, not
+code-shaped: at r269 `MOE_HOST_POOL_SINK=0` gives a third text (175 `d3d1fe6b3db3`),
+`MOE_EXPERT_PREFILL_IN_PLACE=0` changes nothing, and `MOE_HOST_POOL_FILL_ORDER=rank` reproduces `ref` exactly —
+which is why r270's prewarm-ordering change (`TODO` #318) "fixed" it with no numerics change at all.
+
+**Record.**  [`benchmarks/2026-11-16-pinlate-mixture-logits.md`](benchmarks/2026-11-16-pinlate-mixture-logits.md),
+`WORKLOG.md` 261116.006, `INVARIANTS.md` r299, `scripts/gate-host-pool.sh` (its `pinlate` arm + the KLD checks),
+`ENVIRONMENT.md` (`MOE_HOST_POOL_PIN_FAULT`).

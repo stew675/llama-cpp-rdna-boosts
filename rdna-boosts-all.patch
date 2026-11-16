@@ -68045,10 +68045,10 @@ index 5605bf7a4..ea7ce5ad9 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..58c9c44de
+index 000000000..de739dc8a
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,13641 @@
+@@ -0,0 +1,13652 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -68871,6 +68871,13 @@ index 000000000..58c9c44de
 +// correct) instead of hammering a driver that is no longer answering.  Nothing clears it: a source that
 +// failed once does not come back (the same policy as `table_t::fill_failed`).
 +static bool                         g_pinned_off       = false;
++// TODO #282: has a ROUTED op reached the cache yet?  `MOE_HOST_POOL_PIN_FAULT=late` keys its latch on this
++// as well as on `g_sized`, because sizing moved to REGISTRATION (r254/r292) and a `g_sized`-only latch now
++// fires while the pool tier is still being built -- one pool out of 141 on the field config, so the arm
++// stopped reproducing the shape it exists for (issue #278: the pools are built, the run is live, and then a
++// grow is refused).  The first routed op is the first moment the run is live; the pools are built at
++// placement, before it.
++static bool                         g_routed_op_seen   = false;
 +// Why the tier is closed, when it was closed by a run-time decision rather than a refused allocation
 +// (`MOE_HOST_POOL_PIN=0`, r233).  Null for a real refusal, whose cause is `g_pinned_alloc_err`.
 +static const char *                 g_pinned_off_why   = nullptr;
@@ -71151,10 +71158,11 @@ index 000000000..58c9c44de
 +    static const char * mode = getenv("MOE_HOST_POOL_PIN_FAULT");
 +    static const int    kind = mode == nullptr ? 0
 +                             : (strcmp(mode, "late") == 0 ? 2 : (atoi(mode) != 0 ? 1 : 0));
-+    // `late` waits until the run holds its pinned tier AND has sized the arena, because that is the field's
-+    // shape: the pools and the arena exist, and a later grow is what is refused.  Refusing the very first
-+    // grow would instead reproduce the `=1` shape with extra steps.
-+    return kind == 1 || (kind == 2 && grow && g_sized);
++    // `late` waits until the run holds its pinned tier, has sized the arena AND has routed an op, because
++    // that is the field's shape: the pools and the arena exist, the run is live, and a later grow is what is
++    // refused.  Refusing the very first grow would instead reproduce the `=1` shape with extra steps, and a
++    // `g_sized`-only latch fires while the pool tier is still being built (see `g_routed_op_seen`, TODO #282).
++    return kind == 1 || (kind == 2 && grow && g_sized && g_routed_op_seen);
 +}
 +
 +// Is the latched-refusal SEMANTICS being emulated on a platform where production code does not latch (POSIX,
@@ -78008,6 +78016,7 @@ index 000000000..58c9c44de
 +bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
 +                           const ggml_tensor * ids, void * stream, int device,
 +                           size_t slice_off, int split_axis) {
++    g_routed_op_seen = true;
 +    if (weight == nullptr || weight_cpy == nullptr || ids == nullptr || ids->data == nullptr) {
 +        return false;
 +    }
@@ -78316,6 +78325,7 @@ index 000000000..58c9c44de
 +bool moe_cache_stage_table(int device, const void * host_src, size_t offset, size_t width, size_t stride_src,
 +                           size_t n_copies, void * dst, void * compute_stream, void * copy_stream,
 +                           void * order_event) {
++    g_routed_op_seen = true;
 +    if (!g_stage_cache || !g_enabled || host_src == nullptr || dst == nullptr || width == 0 || n_copies == 0) {
 +        return false;
 +    }
@@ -79803,6 +79813,7 @@ index 000000000..58c9c44de
 +                           size_t ids_nb0, size_t ids_nb1, void * stream,
 +                           int device, size_t slice_off, int split_axis,
 +                           const struct ggml_backend_moe_slice * slices, int n_slices) {
++    g_routed_op_seen = true;
 +    // TODO #332: the first ROUTED op is the first moment a message is certainly not inside the `--fit`
 +    // probe's quiet log scope (the probe decodes nothing), so it reports what `parse_env()` buffered.
 +    env_log_flush();
