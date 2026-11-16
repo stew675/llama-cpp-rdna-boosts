@@ -44,10 +44,13 @@ left in this file.  The r236 re-base
 | **327** | a table served in place loses the prefill MoE fusions, so residency selects the kernel set — teach the fusions the in-place contract | purity / architecture (blocks 06/08/09/12) | **OPEN** (2026-11-14) — the maintainer's chosen answer to `GREEDY-PURITY.md` §89; deferred, not urgent — §327 |
 | **330** | the Meta split-state cache's warm walk is defeated by a version switch mid-walk, so a token-split ubatch below 128 tokens can overflow the thread stack | correctness (block 09; reachable only with `LLAMA_SEQPAR_MIN` < 128) | **OPEN** (2026-11-15) — reproduced at T = 48/64/80/112, clean at 128+; the shipped `MIN` 512 cannot reach it and `scripts/gate-seqpar.sh` arm 6 is the tripwire |
 | **331** | the `--kv-window` help text and the `--fit` line still quote the old `11-26 %` spill cost, which is a percentage of nothing: the penalty is linear in the depth past the window | docs-in-code (block 14 amendment; no behaviour change) | **OPEN** (2026-11-15) — the docs are corrected at r292, the code strings go in with the next block 14 amendment — §331 |
+| **332** | everything `parse_env()` logs is swallowed, because `ensure_env()` runs before the host installs its ggml log callback | diagnostic visibility (block 12; `moe-expert-cache.cu`) | **OPEN** (r294) |
+| **333** | `--load-mode mlock`/`mmap+mlock` pin the host-expert mapping past the `-lme` budget, because `mlock` is a VM policy wearing a loading mode's clothes | policy / architecture (loader + `common/arg.cpp`) | **OPEN** — deferred by the maintainer, r294 |
+| **334** | `gate-host-pool.sh`'s `tsplit` arm fails on this box (the demote acts on a `-sm tensor` split where r273 says it cannot), and it failed before r294 too | gate / correctness (block 12; `-sm tensor` demote geometry) | **OPEN** — pre-existing, found r294 |
 
 ## Handle numbering
 
-**New handles append after `#331`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
+**New handles append after `#334`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
 that cites `TODO #74` still means the same subject after that item has closed and left this file.
 
 **Two allocation mistakes are on the record, and both are left in place because renumbering would break the dated
@@ -238,6 +241,71 @@ its A/B and it is documented bit-identical to the triple, §69); **MMB's fused G
 **Re-entry:** fold it into the next block 06/08 pass over these fusions, or sooner on a reported residency-dependent
 answer.  Record: [`benchmarks/2026-11-14-residency-reproducibility.md`](benchmarks/2026-11-14-residency-reproducibility.md),
 `GREEDY-PURITY.md` §89, `INVARIANTS.md` (r284), `ENVIRONMENT.md` (`MOE_EXPERT_PREFILL_IN_PLACE`, `MOE_EXPERT_HEATMAP`).
+
+## 332. Everything `parse_env()` logs is swallowed
+
+**Open, not scheduled** (r294, found while removing `MOE_HOST_POOL_TRANSPORT`).  `moe-expert-cache.cu`'s
+`ensure_env()` runs `parse_env()` on the first cache call, which happens **before** the host installs its ggml log
+callback -- so every `GGML_LOG_WARN`/`INFO` in `parse_env` reaches nobody.  Measured: `MOE_HOST_POOL_TRANSPORT=bogus`
+produced no "is not one of auto|map|file|dio; ignoring" line at all, and the invalid value also set
+`g_pool_tr_env_set`, which made `moe_cache_set_host_fill_mode()` return early and left the pool with **no transport
+decision** (`pool_transport_init_locked` then returned on `g_pool_tr_mode < 0`, so the run silently took the
+`g_pool_transport` default).  The knob is gone (r294), so that specific failure is gone with it, but the logging
+hole remains for every future env diagnostic in `parse_env`.
+
+**The fix.**  Buffer the messages `parse_env` emits and flush them at the first pool build (where the deprecation
+warnings live now), or move the `ensure_env()` call site to a point after the callback is installed.  The buffer is
+the safer of the two: `parse_env`'s values must be parsed early (the preflight reads them), only the *reporting*
+needs to be late.
+
+**Re-entry:** the next environment variable that is added, or any report of "I set it and nothing said anything".
+
+## 333. `mlock` pins the host-expert mapping past the `-lme` budget (`mlock` is a VM policy, not a loading mode)
+
+**Open, deferred by the maintainer (r294) to a separate session.**  `load_all_data`'s from-mapping path calls
+`lmlock->grow_to(weight->offs + nbytes)` for every mapped tensor, so an mlock load mode mlocks the host-expert
+mapping ranges -- which means `-lme 30 --load-mode mmap+mlock` pins far more than the 30 GiB the operator asked
+for.  This is **pre-existing** behavior on a mapped load (r294 did not introduce it); what r294 changed is that the
+same applies to `--load-mode dio`/`none`, which now build a mapping for the host experts too.
+
+Two ways out, and the choice is the maintainer's:
+* **skip `grow_to` for a hole tensor** -- an `-lme` budget is an explicit reservation, so mlock must not spend
+  past it; one WARN naming the conflict.  Cheap, and it makes the two flags compose instead of one silently
+  winning.
+* **leave it and document that `mlock` outranks `-lme`** -- defensible (`mlock` literally asks for "keep this in
+  RAM"), but it means a user who typed a budget cannot rely on it.
+
+The larger point on the record: **`--load-mode mlock` is upstream's VM policy filed as a loading mode.**  It says
+nothing about how bytes are read (which is what every other value of that flag means) and everything about what the
+kernel may do with the pages afterwards, so it composes badly with a tier whose whole job is deciding what may stay
+resident.  r294 deliberately did not fight it.  **Re-entry:** a report of an mlock + `-lme` config that pins more
+than the budget, or the next pass over `common/arg.cpp`'s `--load-mode` vocabulary.
+
+## 334. `gate-host-pool.sh`'s `tsplit` arm fails on this box — pre-existing, not r294
+
+**Open, not scheduled** (found while running the ladder for r294, 2026-11-16).  The arm asserts the eviction demote is
+**INERT** on a 2-device `-sm tensor` split (`demoted == 0 && geometry == 0 && retired == 0`), because r273's r273 fix
+made `demote_ok` false when the device's slice is not the whole expert (`expert_bytes != host_bytes`).  Measured here,
+`-ncmoe 47 --load-mode mmap MOE_HOST_LIMIT_FRAC=40 MOE_HOST_POOL_SINK=1 -sm tensor -mg 0` on `HIP_VISIBLE_DEVICES=0,2`:
+
+| build | census |
+|---|---|
+| r292 (`backup-r292-tip`, run by hand with the arm's exact flags) | `8736 demoted, 5567.7 MiB | declined: 0 no-free-slot, 0 geometry (structural), 0 copy-error | 12348 promoter slots retired` |
+| r294 (the gate's own run) | `demoted=5399 geometry=0 retired=4` |
+
+So the shape (`demoted > 0`, `geometry == 0`) is **present on both**, i.e. this is not an r294 regression: the demote is
+*not* declining the split geometry on this config.  r273's measurement (`766 758 geometry declines out of 766 758
+attempts`) was a 122B at `-lme 54`; this arm is a Flash-Next at `MOE_HOST_LIMIT_FRAC=40`, and per r261 the `gate`/`up`
+tables split **contiguously** inside the expert (`host_pitch == 0`) while only `down_exps` is strided — so a partly
+expressible split is a plausible correct answer, and the assertion may simply be too strong for this config.  The gate
+reports **53/54** with this one red; every arm's text is identical (`a99ccbd97ecb`), so nothing is corrupt.
+
+**What is owed.**  A decision, not a code change: either the assertion is wrong for a split where some tables are
+contiguously sliceable (then it should assert "no demote on a STRIDED table" and name the tables), or `demote_ok` is
+wrong for the contiguous case (then it is an r273 regression that predates r294 and needs its own fix + gate).  Confirm
+with a `-lv 4` census of which role demoted (`role=blk.N.ffn_*_exps.weight`) before changing either.
+
+**Re-entry:** the next `gate-host-pool.sh` run on a 2-device split, or any report of an emptied pool on `-sm tensor`.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

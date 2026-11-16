@@ -1,3 +1,104 @@
+## 261116.001 (r294) -- the load mode is not the tier: `--load-mode dio` gets the host-expert pool, the pool's demand transport becomes `--load-mode` alone, and `-lme mirror` states a covering pool
+
+**Amends blocks 12, 14 and 15** (no new block; the change was split by code ownership: the demand transport and
+`-lme mirror`'s CLI + pool semantics in **12**, the storage/transport split itself in **14** — the block that makes a
+hole mapping-backed — and the placement switch in **15**).  Patches regenerated, `release.json` at
+`v16-4f9dfa0e3-r294` (`tip a060ce2a5`, `tree 59f2cc49`; optional `0100` -> `c9e7915cd`, `0101` -> `560b1d1c0`, cumulative
+`58610c50`), cut on top of **r293**'s block-02 MTP readback (issue #318) -- the first cut of this change silently
+dropped that fix because it was built from a stale checkout, which is why the release number moved from r293 to
+r294 and the fork branch was restored to the r293 tip before the corrected chain was cut.  `validate-set.sh` GREEN.  Found while answering "why does `--load-mode dio` bypass the
+`-lme` host-pool limit?" on a Flash-Next GSQ-RCO-IQ3_S `-ncmoe 48` config.
+
+**The defect.**  `--load-mode dio` (and `none`) set `use_mmap = false`, and five separate `use_mmap` tests then
+decided, between them, that the host experts could have no file-backed master: the plan skipped
+`moe_cache_set_host_pool_budget()`/`set_host_pool()`, `host_expert_buft()` handed back the pinned `ROCm_Host` buffer
+type, `init_mappings()` never ran and `host_master_mapped` stayed false.  So the whole host expert set was
+materialised -- **pinned** -- and the pool the operator had just sized never existed.  `-lme` means "cap the
+NON-SWAPPABLE memory spent on MoE experts that are not in VRAM", and under `dio` it silently did the opposite:
+
+| arm (`-ngl all -ncmoe 48 -c 4096 -lme 30`) | host-expert master | pool | pinned tier |
+|---|---|---|---|
+| `--load-mode dio`, **before** | `ROCm_Host` **48 284.6 MiB** (one pinned copy) | none | 48 284.6 MiB |
+| `--load-mode dio`, **after** | `ROCm_HostMap` 47 962.5 MiB (the mapping) | `dio`, 76 970 storage reads, **0 mapping memcpys** | **31 363.7 MiB** |
+| `--load-mode none`, after | the mapping | `file`, 76 899 storage reads, **0 memcpys** | **31 414.4 MiB** |
+| `--load-mode mmap` + `MOE_HOST_POOL_TRANSPORT=dio` | the mapping | `dio`, 0 memcpys | 31 364.4 MiB |
+
+Greedy text `152 chars sha=560704192d30` in every arm (dio / none / mmap, `-lme 30` and `-lme mirror`).
+
+**The fix, and why it is a storage decision.**  A ggml tensor must have a home, and only the read-only model mapping
+is free (pinned costs all of it and is non-swappable; a pageable copy costs all of it and is not GPU-readable).  So
+"does the host expert master cost RAM?" is the TIER's question, not the load mode's.  One predicate replaces the five
+tests:
+```cpp
+bool host_expert_master_mapped() const {   // llama-model-loader.h
+    return host_experts_plan_done && !host_experts_holes.empty() && llama_mmap::SUPPORTED;
+}
+```
+`--load-mode` keeps exactly what it should own: how bytes are READ.  `init_mappings()` builds the mapping with
+`prefetch_size == 0` on a non-mmap load (no `MAP_POPULATE`, no `MADV_WILLNEED`), so it costs address space and no
+pages.
+
+**The demand transport is `--load-mode`, alone: `MOE_HOST_POOL_DIO` and `MOE_HOST_POOL_TRANSPORT` are REMOVED.**  Both
+were a second spelling of a decision the load mode already made and reported.  The mirror is now `dio` -> O_DIRECT,
+`buffered`/`none` -> a buffered `pread` (`none` is upstream's "no special loading mode", which IS a buffered read, and
+it is the arm r232 measured best at a sub-complement budget), `mmap` -> the page cache, `auto` -> the adaptive ladder.
+Setting either removed variable WARNs once and is ignored.  **The one case the removed knob could express and
+`--load-mode` cannot -- "page cache for the model, O_DIRECT for the experts" -- was not worth a variable: the benefit
+it assumed does not exist.**  `LLAMA_LOAD_RELEASE_MMAP=1` (default since r273) `munmap`s each device tensor and
+`posix_fadvise(DONTNEED)`s its page-cache copy right after upload, so a warm restart gains nothing.  Measured, same
+config, two consecutive runs: `mmap` **9.2 / 9.2 s** against `dio` **9.8 / 9.6 s** -- and the second run is identical
+to the first, i.e. there is no warmth to harvest.  A rung stays pinnable for an A/B through `MOE_HOST_POOL_TR_START`.
+
+**The placement transport is the ONE decision that must NOT follow `--load-mode`**, because a placement read is a copy
+into the pool's own storage, never a cache miss.  `MOE_HOST_POOL_BULK_DIO` is therefore renamed
+**`MOE_HOST_POOL_PLACEMENT_MODE=dio|buffered`** (`dio` default) and is reported once per load -- it previously only
+appeared inside `pool_decide_dio_locked`, i.e. never on a pinned demand transport, which is a blind spot now that the
+two decisions are separate.  Re-measured cold with `drop_caches` between arms on a 47.9 GiB `-lme mirror` placement:
+**+1 675 MiB** of page cache on `dio` against **+31 796 MiB** on `buffered` for the same bytes -- r273's
+amplification, 19x, on one env var.
+
+**`-lme mirror`** (new value, `-2` sentinel): the whole host expert set, stated rather than inferred.  `auto` resolves
+to the whole set when it fits `MOE_HOST_LIMIT_FRAC` of MemAvailable, which on a RAM-rich box *is* a mirror -- measured
+identical for `--load-mode mmap` and `dio` (47 962.5 MiB, `h=1.0000`, 73 728 slots), so this was always inference, never
+a load-mode effect.  Nothing scales the explicit request: with `MOE_HOST_POOL_RAM_PCT=20 MOE_HOST_LIMIT_FRAC=5` it is
+still 47 962.5 MiB / `h=1.0000` / 512 of 512 slots, and it is not refused for exceeding MemAvailable.  On an APU it
+sizes the GTT store to `padded_total`; the physical lock/RAM clamps stay there, because a registered region that
+cannot be pinned is not a reservation.
+
+**Census honesty.**  `report_host_expert_placement` prints the PLAN's hole set as "pageable", which was a lie in a
+materialised load (48 GiB of pinned `ROCm_Host`) and is true again now; it names the realised backing whenever the
+platform cannot map.  Six user-visible log lines that told operators to set the removed variables were rewritten.
+
+**Two defects found on the way.**  An invalid `MOE_HOST_POOL_TRANSPORT` value left the pool with **no transport
+decision at all** (`g_pool_tr_env_set` made the loader's seed return early, and `g_pool_tr_mode < 0` then returned
+from `pool_transport_init_locked`) -- measured: no transport line, 1 798 mapping memcpys, silently the MAP default;
+the WARN that would have explained it was invisible because **everything `parse_env()` logs is swallowed**
+(`ensure_env()` runs before the host installs its callback).  Both are recorded: the first is gone with the variable,
+the second is `TODO` **#332**.  `TODO` **#333** records the `mlock`/`-lme` interaction the maintainer deferred.
+
+**Gates**, all re-run on the r294 tree `59f2cc49` (i.e. with r293's block-02 fix in it).  `validate-set.sh` GREEN.  `gate-host-read-transport.sh` **23/23**.  `gate-host-pool.sh`
+**53/54** -- and the one red is a **pre-existing** finding, not this change: `tracked` #334, the `tsplit` arm's
+demote-geometry assertion fails identically on the r292 build when the arm is run by hand
+(`8736 demoted ... 0 geometry ... 12348 promoter slots retired` against r294's `demoted=5399 geometry=0 retired=4`;
+every arm's text is `a99ccbd97ecb` in both).  `gate-prefill-logits.sh` **PASS** (mean KLD **0.000000**, same-top-p
+**100.000 %**).  `gate-per-block-build.sh --changed-from b950836f9` (the r293 fork tip) **4/4** (blocks 12, 14, 15, 0300).
+`check-gpu-faults.sh` clean, and the kernel journal is clean for every gate's window.
+
+Both pool gates were re-cut for the removed variables (`dio` is now `--load-mode dio`, `bulkbuf` is
+`MOE_HOST_POOL_PLACEMENT_MODE=buffered`) and extended: every arm of the read-transport gate must now report a bounded
+pool that honours `-lme`, and the `dio` arm must show the mapping as its master -- the regression this entry fixes.
+Two things the re-cut caught, both fixed here rather than papered over: the gate's `fill_mode()` read a
+`host pool fill mode:` line that only the ADAPTIVE path emits (so a pinned transport had no line at all -- it now
+reads `host read transport -> <arm>`), and a **PINNED** `dio` transport never asked the platform question, i.e. on a
+box with no pool file I/O (`MOE_HOST_POOL_DIO_FAULT=1`, or a build without the helpers) `--load-mode dio` silently
+filled through the mapping with no WARN.  `pool_transport_apply_locked()` now answers it for the pinned path too
+(`pool_dio_effective(true)`, which WARNs once) and lands on the mapping, which every pool has.  Windows: `check-windows-paths.sh` OK,
+`check-windows-portability.sh` OK on the default set (512 files, the CI scope), on this change's own diff, and on the
+two optional artifacts; plus a manual audit of the parts that linter cannot see (the header-inline predicate reads
+`llama_mmap::SUPPORTED`, which is `true` under `_WIN32`; a `dio`-paced load now builds a mapping on Windows, and it
+maps from the *buffered* handle that `llama_file` keeps as its logical cursor in direct-io mode).  One residual note
+is on the record in `INVARIANTS.md` r294: if a Windows reporter ever sees an unresolved external on
+`llama_mmap::SUPPORTED`, the fix is to move the predicate out of line.
 ## 261115.010 (r293, RELEASE v16-4f9dfa0e3-r293) -- GitHub issue #318: the MTP target h-rows path is a -1.5 % Windows/HIP loss and a Linux no-op, so block 02 ships the host readback and keeps the device path behind `LLAMA_MTP_DEV_ROWS=1`
 
 **`release.json` changed: tip `2b7a65309` -> `b950836f9`, tree `4a67e7c9` -> `92e77acf`, release

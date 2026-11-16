@@ -19,8 +19,10 @@
 # ARMS
 #   ref        --load-mode mmap            the mapping transport (the delivered default)
 #   file       --load-mode buffered        the buffered `pread` transport (NEW load mode)
-#   dio        mmap + TRANSPORT=dio        the O_DIRECT fill arm (the delivery's `MOE_HOST_POOL_DIO=1` shape;
-#                                          `--load-mode dio` builds NO pool at all: "a pool needs a mapped load")
+#   dio        --load-mode dio             the O_DIRECT fill arm.  r294: the load mode IS the only thing that
+#                                          picks this transport (MOE_HOST_POOL_TRANSPORT / _DIO are REMOVED), and
+#                                          --load-mode dio DOES build a pool over the file-backed master, where it
+#                                          used to pin the whole host expert set with no pool at all.
 #   auto-warm  --load-mode auto            must NOT latch (no false positive on a RAM-rich box)
 #   auto-32G   --load-mode auto (32G scope) MUST latch on the probe A/B (the ladder is not dead code)
 #   span-off   --load-mode buffered + STAGE_SPAN=0   the buffered arm must be REFUSED (coupling)
@@ -28,7 +30,9 @@
 #
 # PASS CRITERIA (hard): all seven texts identical; the named transport appears in each arm's census; the file
 # arm reports storage reads and the ref arm reports mapping reads; auto-warm reports ZERO transitions, auto-32G
-# reports AT LEAST ONE; the span-off arms report the refusal and stay on the mapping (or dio), never `file`.
+# reports AT LEAST ONE; EVERY arm reports a bounded pool (r294: the load mode no longer decides whether the
+# tier exists, only how it fills); the span-off arms report the refusal and stay on the mapping (or dio),
+# never `file`.
 set -uo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${BIN:-$HOME/llama.cpp/build-rocm/bin/llama-cli}
@@ -91,7 +95,7 @@ check_nhas() { local n=$1 pat=$2 f=$3; grep -qE "$pat" "$f" && bad "$n  (/$(echo
 
 # run_arm <tag> <load-mode> <transport-env> <span-env> <scope|-> <lv: text|census>
 run_arm() {
-    local tag=$1 lm=$2 tr=$3 span=$4 scope=$5 mode=$6
+    local tag=$1 lm=$2 span=$3 scope=$4 mode=$5
     local extra=()
     [ "$mode" = census ] && extra=(-lv 4)
     # the starving arms use a long PREFILL prompt (routing volume); the rest a short story PROMPT with a long
@@ -106,13 +110,9 @@ run_arm() {
     fi
     sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null
     local envs=(LD_LIBRARY_PATH="$LD_LIBRARY_PATH" HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES")
-    # `-` is this script's "leave it to the binary".  It is NOT a value: exporting
-    # `MOE_HOST_POOL_TRANSPORT=-` makes parse_env reject the value, mark the env as an explicit pin and then
-    # IGNORE the loader -- which silently ran every arm without a transport at all (measured: `--load-mode mmap`
-    # reported `pool_decide_dio_locked` and no transport line).
-    [ -n "$tr" ]   && [ "$tr" != "-" ]   && envs+=("MOE_HOST_POOL_TRANSPORT=$tr")
+    # r294: there is no transport override to plumb any more -- `--load-mode` IS the demand transport.
     [ -n "$span" ] && [ "$span" != "-" ] && envs+=("MOE_HOST_POOL_STAGE_SPAN=$span")
-    echo "--- $tag  (load-mode=${lm} transport=${tr:-<load-mode>} span=${span:-on} scope=${scope} ${mode})"
+    echo "--- $tag  (load-mode=${lm} span=${span:-on} scope=${scope} ${mode})"
     export GGML_CUDA_SLAB_HEADROOM_MIB=${GGML_CUDA_SLAB_HEADROOM_MIB:-1536}
     export MOE_HOST_POOL_RAM_PCT=${MOE_HOST_POOL_RAM_PCT:-0}
     local attempt=0
@@ -150,25 +150,25 @@ echo "=== host-read-transport gate  $(date -Is)"
 echo "    bin=$BIN  lme=$NLIB  scope=$SCOPE  prompt=$(wc -c < "$PROMPT") bytes"
 
 # ---------------------------------------------------------------- the TEXT arms (no -lv on any of them)
-for arm in "ref mmap  -    -  -" "file buffered - - -" "dio mmap dio - -" "auto-warm auto - - -"; do
+for arm in "ref mmap  -  -" "file buffered - -" "dio dio - -" "auto-warm auto - -"; do
     set -- $arm
-    run_arm "$1" "$2" "$3" "$4" "$5" text
+    run_arm "$1" "$2" "$3" "$4" text
 done
 if [ "$WANT_SCOPE" = 1 ]; then
-    run_arm auto-32G  auto  -     -     "$SCOPE" text
-    run_arm span-off  buffered -  0     -        text
-    run_arm spanoff32 auto -      0     "$SCOPE" text
+    run_arm auto-32G  auto   -     "$SCOPE" text
+    run_arm span-off  buffered 0    -        text
+    run_arm spanoff32 auto     0    "$SCOPE" text
 fi
 
 # ---------------------------------------------------------------- the CENSUS arms (-lv 4, separate runs)
-for arm in "refc mmap  -    -  -" "filec buffered - - -" "dioc mmap dio - -" "autowc auto - - -"; do
+for arm in "refc mmap  -  -" "filec buffered - -" "dioc dio - -" "autowc auto - -"; do
     set -- $arm
-    run_arm "$1" "$2" "$3" "$4" "$5" census
+    run_arm "$1" "$2" "$3" "$4" census
 done
 if [ "$WANT_SCOPE" = 1 ]; then
-    run_arm auto32c auto -   -    "$SCOPE" census
-    run_arm spanofc buffered - 0  -        census
-    run_arm span32c auto -   0    "$SCOPE" census
+    run_arm auto32c auto  -    "$SCOPE" census
+    run_arm spanofc buffered 0 -        census
+    run_arm span32c auto  0    "$SCOPE" census
 fi
 
 # ---------------------------------------------------------------- HARD: one text for every arm
@@ -185,6 +185,14 @@ done
 [ "$(transport_of refc)" = "map" ]  && ok "ref: transport is the mapping"  || bad "ref: transport is $(transport_of refc), expected map"
 [ "$(transport_of filec)" = "file" ] && ok "file: transport is a buffered pread" || bad "file: transport is $(transport_of filec), expected file"
 [ "$(transport_of dioc)" = "dio" ]  && ok "dio: transport is O_DIRECT"     || bad "dio: transport is $(transport_of dioc), expected dio"
+# r294: the LOAD MODE no longer decides whether the tier exists.  Before this change `--load-mode dio` built no
+# pool at all ("a pool needs a mapped load") and pinned the whole host expert set; every arm must now report a
+# bounded pool that respects `-lme`.
+for a in refc filec dioc autowc; do
+    check_has "$a: a bounded pool exists (--load-mode no longer forbids it)" "host pool \(L2\): .*pinned" "$DIR/$a.log"
+    check_has "$a: the -lme budget is honoured" "pinned tier: [0-9.]+ MiB allocated in total" "$DIR/$a.log"
+done
+check_has "dioc: the master is the model MAPPING, not a pinned copy" "ROCm_HostMap model buffer" "$DIR/dioc.log"
 # HARD: the adaptive arm must be as FAST as the best pinned arm, end to end.  Grading it on one path's read
 # rate was wrong: the two read paths legitimately disagree (a fill is a first touch and favours `file`; the demand
 # read repeats and favours the mapping), so the outcome -- decode throughput on the same prompt -- is the only

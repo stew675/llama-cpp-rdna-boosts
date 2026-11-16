@@ -6,7 +6,7 @@
 #   `--host-experts pool` / `-lme auto` in the NOT-FITTING band places the host expert master in the read-only
 #   model mapping and serves every GPU read through the bounded pinned pool.  A pool fill can be served from two
 #   places: the mapping itself (a plain memcpy out of the page cache, always available) and the pool's DISK
-#   TIER (`MOE_HOST_POOL_DIO=1`), which reads the GGUF with positional aligned reads -- `pread`/`O_DIRECT` on
+#   TIER (`--load-mode dio`), which reads the GGUF with positional aligned reads -- `pread`/`O_DIRECT` on
 #   POSIX, `ReadFile`/`FILE_FLAG_NO_BUFFERING` on Windows (r227; before that Windows had a stub that returned -1,
 #   which is the shape this gate was written against).  Three things were wrong and together they silently
 #   produced garbage on Windows:
@@ -17,16 +17,18 @@
 #     3. `access_locked()` recorded the slot as RESIDENT anyway and only printed
 #        `async fill failed ...: no error` (`cudaGetLastError()` is empty for a host-side failure), so the arena
 #        served stale bytes: the reporter's run prefilled at 20 t/s, generated ONE token and stopped.
-#   r212 already made `MOE_HOST_POOL_DIO=auto` mirror `--load-mode` (a mapped load fills buffered), which is why
-#   a fresh `--load-mode mmap` run can no longer reach (1) by default -- but the mode is still one env var away,
+#   r212 made the fill mode mirror `--load-mode` (a mapped load fills buffered), and r294 removed the separate
+#   override entirely: an arm reaches (1) by saying `--load-mode dio`, and nothing else.
 #   and (2) and (3) are correctness, not defaults.
 #
 # WHAT IT CHECKS
 #   One pool-backed host-expert config (the issue's: Flash-Next, `-ncmoe` most of the trunk, `--load-mode mmap`,
 #   a `MOE_HOST_LIMIT_FRAC` low enough that the set does not fit), nine arms, same-seed greedy text:
 #     ref     the shipped default (buffered fills out of the model mapping)
-#     dio     MOE_HOST_POOL_DIO=1                (the disk tier, available on Linux)
-#     nodisk  MOE_HOST_POOL_DIO=1 + MOE_HOST_POOL_DIO_FAULT=1
+#     dio     --load-mode dio                    (the disk tier, available on Linux; r294: the load mode IS the
+#                                                 demand transport, and it builds a pool over the file-backed
+#                                                 master -- it used to pin the whole set and build none)
+#     nodisk  --load-mode dio + MOE_HOST_POOL_DIO_FAULT=1
 #                                                (a platform with NO pool disk tier -- the Windows shape)
 #     fail    MOE_HOST_POOL_FILL_FAULT=1         (no source can be resolved for a pageable master)
 #     late    MOE_HOST_POOL_FILL_FAULT=late      (each table gets ONE source, then loses it -- the
@@ -49,7 +51,8 @@
 #     qd1     MOE_EXPERT_FILL_QD=1               (r277: the placement read queue at depth 1 -- the A/B for
 #                                                the batch fill.  Its text must equal ref's AND the census
 #                                                must show the queue ran with 8 readers in ref)
-#     bulkbuf MOE_HOST_POOL_BULK_DIO=0           (r277: the placement reads buffered through the page cache;
+#     bulkbuf MOE_HOST_POOL_PLACEMENT_MODE=buffered (r277; renamed from MOE_HOST_POOL_BULK_DIO in r294: the
+#                                                 placement reads buffered through the page cache;
 #                                                the A/B for "a placement fill never uses the page cache")
 #     tsplitnosink the same, MOE_HOST_POOL_SINK=0 -- the A/B the split arm is judged against
 #                                                (r273: a tensor split gives each device a SLICE of every
@@ -190,10 +193,13 @@ run_arm() {
     local dir="$KEEPOUT/$arm"
     mkdir -p "$dir"
     echo "==> arm $arm${*:+ ($*)}"
+    # r294: `--load-mode` IS the pool's demand transport, so an arm that wants O_DIRECT names the LOAD MODE
+    # (`LM=dio`), not an env var.  Default: the delivered mmap.
+    local lm=${LM:-mmap}
     env "$@" HIP_VISIBLE_DEVICES="$GPU" ROCBLAS_USE_HIPBLASLT=0 MOE_HOST_LIMIT_FRAC="$LIMIT_FRAC" \
         MOE_EXPERT_HEATMAP="${HEATMAP:-load}" \
         timeout 3600 "$LLAMA_CLI" -v -m "$MODEL" --fit off -ngl all --n-cpu-moe "$NCMOE" \
-        --load-mode mmap --lazy-mode on -c "$CTX" -np 1 -fa on -ctk q8_0 -ctv q8_0 \
+        --load-mode "$lm" --lazy-mode on -c "$CTX" -np 1 -fa on -ctk q8_0 -ctv q8_0 \
         -b "$UB" -ub "$UB" -t 8 --jinja --spec-type none \
         -p "$PROMPT" -n "$NGEN" --temp 0 --seed 42 --single-turn --no-display-prompt \
         $EXTRA_ARGS > "$dir/out.txt" 2> "$dir/err.txt"
@@ -236,7 +242,19 @@ text_only() { python3 "$REPO_DIR/scripts/extract-generated.py" "$KEEPOUT/$1/out.
 # the pool's exit census: `host pool (L2): <tensors> tensors, <slots> slots, <MiB> pinned`
 pool_slots() { grep -o 'host pool (L2): [0-9]* tensors, [0-9]* slots' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*, \([0-9]*\) slots/\1/'; }
 pool_mib()   { grep -o 'host pool (L2): .* MiB pinned' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*, \([0-9.]*\) MiB pinned/\1/'; }
-fill_mode()  { grep -o 'host pool fill mode: [a-zA-Z_]*' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*: //'; }
+# r294: the transport is reported as `host read transport -> <arm>` and always is (the old `fill mode: ...` line
+# only existed on the ADAPTIVE path, so a pinned transport -- which is every `--load-mode` value but `auto` -- had
+# no line at all).  Keep the gate's vocabulary: O_DIRECT / buffered / map.
+fill_mode() {
+    local t
+    t=$(grep -o 'host read transport -> [a-z]*' "$KEEPOUT/$1/err.txt" | tail -1 | awk '{print $NF}')
+    case "$t" in
+        dio)  echo O_DIRECT ;;
+        file) echo buffered ;;
+        map)  echo map ;;
+        *)    echo "" ;;
+    esac
+}
 failed_fills(){ grep -o 'FAILED fills: [0-9]*' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*: //'; }
 # issue #278: fills served from a pool that existed BEFORE the pinned tier latched off.
 pool_after_latch() { grep -o '[0-9][0-9]* expert fills were served from a host pool' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/ .*//'; }
@@ -264,14 +282,14 @@ sink_retired(){  sink_line "$1" | sed -n 's/.*\([0-9][0-9]*\) promoter slots ret
 gt0() { [ -n "${1:-}" ] && awk "BEGIN{exit !(${1} + 0 > 0)}"; }
 
 # ---- the arms ---------------------------------------------------------------------------------------
-run_arm ref    MOE_HOST_POOL_DIO=0 || exit 2
+run_arm ref || exit 2
 # r277: the PLACEMENT read queue.  `qd1` is the same arm at depth 1 (the pre-r277 one-read-at-a-time
 # transport) and `bulkbuf` is the same arm with the placement reads buffered through the page cache; both must
 # generate ref's text byte for byte, and the census below must show the queue was really the path taken.
-run_arm qd1     MOE_HOST_POOL_DIO=0 MOE_EXPERT_FILL_QD=1  || exit 2
-run_arm bulkbuf MOE_HOST_POOL_DIO=0 MOE_HOST_POOL_BULK_DIO=0 || exit 2
-run_arm dio    MOE_HOST_POOL_DIO=1 || exit 2
-run_arm nodisk MOE_HOST_POOL_DIO=1 MOE_HOST_POOL_DIO_FAULT=1 || exit 2
+run_arm qd1     MOE_EXPERT_FILL_QD=1  || exit 2
+run_arm bulkbuf MOE_HOST_POOL_PLACEMENT_MODE=buffered || exit 2
+LM=dio run_arm dio || exit 2
+LM=dio run_arm nodisk MOE_HOST_POOL_DIO_FAULT=1 || exit 2
 run_arm fail   MOE_HOST_POOL_FILL_FAULT=1 || exit 2
 run_arm late   MOE_HOST_POOL_FILL_FAULT=late || exit 2
 run_arm sink     MOE_HOST_POOL_SINK=1 || exit 2
@@ -348,9 +366,9 @@ else
 fi
 hard
 if grep -q "host pool PLACEMENT reads: buffered" "$KEEPOUT/bulkbuf/err.txt"; then
-    ok "bulkbuf: MOE_HOST_POOL_BULK_DIO=0 flips the placement read to buffered (the A/B is real)"
+    ok "bulkbuf: MOE_HOST_POOL_PLACEMENT_MODE=buffered flips the placement read (the A/B is real)"
 else
-    fail "bulkbuf: MOE_HOST_POOL_BULK_DIO=0 did not report a buffered placement read"
+    fail "bulkbuf: MOE_HOST_POOL_PLACEMENT_MODE=buffered did not report a buffered placement read"
 fi
 
 # ---- HARD: a real pool, no fill failures ------------------------------------------------------
