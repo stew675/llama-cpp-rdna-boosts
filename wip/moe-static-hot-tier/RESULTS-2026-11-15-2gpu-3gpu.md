@@ -242,3 +242,46 @@ overlapping table down **whole**.  Consequences:
 `scripts/check-gpu-faults.sh --since "3 hours ago"` over the five key logs (2-device left/taken, the 84 k
 taken arm, the 3-GPU arms including the aborted one): **clean**.  No delivery change was made; nothing here is
 in `patches/`.  Block/knob decisions belong to the maintainer.
+
+## 10. The prototype: a drop-band **VRAM expert store** (built, measured, neutral on this shape)
+
+Built on the maintainer's design ("hot table + cold-band table; a hot-table miss checks the cold table before
+going to host"): `~/llama.cpp` branch `wip/drop-band-store` (`da1838da1`, **not pushed, not in `patches/`**),
+knobs `MOE_EXPERT_L2` (`0` = A/B) and `MOE_EXPERT_L2_MIB`.
+
+**What it is.**  ONE slab arena allocation per device taken from the band the drop returns, partitioned into
+expert-sized entries per table.  It is **never addressed as table slots** (`arena + slot × eb` in every
+routed-op kernel is untouched, so no kernel changes):
+
+* an arena eviction **retains** the victim's bytes there — a D2D copy of bytes that are about to be
+  overwritten, no host I/O;
+* a miss whose expert is in the store is **served from it** (D2D into the slot) instead of from the pinned host
+  pool — the LRU dropped the expert, VRAM never did;
+* a prefill's boundary move **frees the region whole**, so no table is stood down, no remap is rebuilt, no slot
+  count changes, and the prefill sees exactly the residency it would have seen with no store at all.
+
+**It does exactly what it says** (2 × R9700, `-ub 16384`, 5 246-token prompt, heat prior pinned):
+
+| | store off | store on |
+|---|---:|---:|
+| store size (planned at the drop) | — | 3 858 + 3 876 MiB (12 955 + 13 106 entries, ~28 MiB/table) |
+| **prefill** | 1 454.4 t/s | 1 451.8 t/s (**unchanged** — dropped before the boundary moves into it) |
+| decode, 2 000 tokens | 52.3 t/s | 52.0 t/s |
+| decode, 20 000 tokens | **52.4 t/s** | **52.4 t/s** |
+| greedy text | `sha=90675acf4b72` (2 k), `93fc5debf0a7` (20 k) | **identical** |
+| misses served from VRAM | — | **7 260 of 42 101 (17.2 %)** at 2 k; **10 034 of 64 976 (15.4 %)** at 20 k |
+| host fill traffic | 14 254 MiB | **11 964 MiB (-16 %)** at 2 k |
+
+**Verdict: neutral, and the reason is the shape, not the store.**  The fill path on this configuration is
+already fully overlapped: 0.29-0.62 % of reaches miss at 2 k-20 k tokens, and the whole run's host traffic is
+0.36 GB/s against a 28 GB/s link, so converting 17 % of the misses into a D2D copy buys nothing measurable —
+the prior's 0.42 pp ceiling was right, and this is its mechanism.  The **long-generation hypothesis was tested
+directly**: at 20 000 generated tokens the miss rate is *lower* (0.29 % fills, 0.20 % in-place cold reads) and
+the store is still worth 0.0 % of wall time.  It is also not a prefill cost (0.0 %), which was the design goal,
+so the mechanism is proven free — it simply has nothing to buy here.
+
+**Where it could still pay** (not measured, and the reason this is not a "no"): a **short-arena shape**
+(residency ≤ 60 %, misses 5-10 % of reaches, traffic ~10x) and a **genuinely agentic 40 k-token workload**,
+whose routing drifts across topics instead of continuing one prose passage.  The store's own sizing is the
+cheap lever there: it took 7.7 GiB of the band on this shape and had 24 600 entries against a 42 k-miss
+population (only 57-109 entries ever recycled), i.e. it is *not* capacity-limited — it is demand-limited.

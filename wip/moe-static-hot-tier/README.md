@@ -18,7 +18,16 @@ The measurement **does not** kill the idea — it names what is missing and caps
   flat arm (1 455 -> 115 t/s): a move that was already scheduled is worth retaining, a move that is *postponed
   to first touch* is paid on the critical path.  So the free part of the policy is **retention**, not lazy
   placement.
-* **What is actually missing is reclaim granularity**, exactly as the 2026-11-15 revision said: cold slots in
+* **The reclaim-granularity answer is built and measured** (§10 of the record): a per-device **drop-band VRAM
+  expert store** (`MOE_EXPERT_L2`, `~/llama.cpp` `wip/drop-band-store`, not in `patches/`) that retains evicted
+  arena residents with a D2D copy and serves a miss from VRAM instead of the pinned host pool, and is **freed
+  whole** at a prefill boundary move — so it costs the prefill **0.0 %** (measured) and no table is stood down.
+  17.2 % (2 k) / 15.4 % (20 k) of misses were served from VRAM and host fill traffic fell 16 %, but the decode
+  rate did not move (52.3 → 52.0 / 52.4 → 52.4): on this shape the miss path is already fully overlapped
+  (0.29-0.62 % of reaches, 0.36 GB/s against a 28 GB/s link), which is the 0.42 pp ceiling seen from the other
+  end.  The mechanism is proven free; the prize needs a **short-arena** shape or a genuinely agentic long
+  generation, neither of which is measured yet.
+* **What upstream would otherwise be missing: reclaim granularity**, exactly as the 2026-11-15 revision said: cold slots in
   the band must be droppable at a prefill **without standing their table down**.  Two ways: two-segment /
   per-slot indirection (the revision's plan), or a **band-resident retention store** that is one slab
   allocation holding copies of experts the demand path already moved, dropped wholesale at a boundary move and
