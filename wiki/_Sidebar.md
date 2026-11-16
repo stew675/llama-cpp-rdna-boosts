@@ -4,6 +4,7 @@
 - [MTP & Adaptive MTP](MTP-and-Adaptive-MTP)
 - [MTP Quick Reference](MTP-Quick-Reference)
 - [QFN Memory Usage](QFN-Memory-Usage)
+- [QFN Memory Usage (32 GiB R9700)](QFN-Memory-Usage-R9700)
 
 ---
 
