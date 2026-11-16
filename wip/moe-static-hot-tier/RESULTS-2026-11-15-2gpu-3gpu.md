@@ -1,13 +1,21 @@
-# 2026-11-15 — the prefill → decode drop region on 2 and 3 GPUs: measured, and it is not worth taking
+# 2026-11-15 — the prefill → decode drop region on 2 and 3 GPUs: what it is worth, and why taking it costs
 
-**Verdict: REFUTED for the two configurations this campaign targets.**  On a 2-device `-sm tensor` split
-the region the drop returns is **24.4 % of the arena and buys 0.08-0.42 pp of routed mass**; taking it costs
-**-41 % of a 5.2 k prompt's prefill** (-4.6 % of an 84 k one) and **-3 to -6 % of decode**, and *not* taking
-it — the r292 demand gate — is the right answer.  On 3 GPUs there is **no region at all**: the whole 46.9 GiB
-expert set is resident at every ubatch, and the wide ubatch is free.  The campaign's premise ("keep the hot
-slots above the widest prefill boundary and the cold band below it is free") does not survive the
-measurement, because **a prefill routes every expert of every layer — at prefill there is no cold data**.
-Two-segment slot addressing would change *which* slots survive a prefill, not the fill bill it pays.
+> **Corrected the same evening (see §7).**  The first write-up of this record claimed the region "cannot be
+> made useful because a prefill routes every expert, so there is no cold data at prefill".  **That is wrong**
+> and it is not the campaign's policy.  The bytes a band holds *can* be dropped at a prefill for free; what
+> the measurement actually bills is (a) the **hot** residency a whole-table stand-down destroys and (b) the
+> **transport** that re-acquires it (a demand fill runs at ~4 GB/s on the critical path, the batched seed at
+> 17-33 GB/s off it — §2b).  Both belong to the *take/reclaim mechanism in the tree* (the r292 settle grows
+> every table at the drop, and `moe_cache_evict_slab_range` stands a whole table down), not to the idea.  The
+> measurements below stand; the verdict they support is narrower than "refuted".
+
+**Verdict, as measured.**  On a 2-device `-sm tensor` split the region the drop returns is **24.4 % of the
+arena and buys 0.08-0.42 pp of routed mass** — that ceiling is set by the shape (85.6 % residency already
+covers 99.58 % of routings, and only **0.75 % of decode reaches miss**), not by the mechanism.  Taking it
+with what ships **costs -41 % of a 5.2 k prompt's prefill (-4.6 % of an 84 k one) and 3-6 % of decode**, so
+leaving it alone — the r292 demand gate — is right *today*.  On 3 GPUs there is **no region at all**: the
+whole 46.9 GiB expert set is resident at every ubatch and the wide ubatch is free.  The campaign's plan needs
+one mechanism the tree does not have: **reclaiming the band without standing a table down** (§7).
 
 Everything below is one session's measurements on this box with the r293 delivery tip (`b950836f9`).
 Harness: [`band-ab.sh`](band-ab.sh).
@@ -49,11 +57,12 @@ The region's size is a function of `-ub`, so the trade can be read off as a curv
 at fixed output.
 
 **Reading it.**  The prior is the campaign's own instrument (the persisted decode-band heat map): it says
-85.6 % residency already covers **99.58 %** of the routed mass, so the whole 24.4 % band buys **0.42 pp** —
-and a decode that misses 0.42 % less often is inside this box's noise.  The *measured* decode is **worse**
-when the band is taken, by 3-6 %, because taking it grows every table and the growth is a `free` + host
-re-seed of the whole table (see §3).  The prefill side of the same bytes is not noise: it is a third to a half
-of the prefill.
+85.6 % residency already covers **99.58 %** of the routed mass, so the whole 24.4 % band buys **0.42 pp** of
+*hit-rate* value — and the decode census agrees (`hits=5 598 121 fills=42 101` over 2 000 tokens, i.e. only
+**0.75 % of reaches miss**).  That ceiling is the *shape's*, not the mechanism's: on a shape whose arena holds
+half the expert set the same band is worth several pp.  What the *tree* adds on top of it is a minus 3-6 %
+decode (§3) and a minus 41 % prefill (§2) — both of which are the take/reclaim mechanism (eager whole-table
+growth; whole-table stand-down), not a property of a lazily-retained band (§2b, §7).
 
 ## 2. 2 GPUs — the prefill cost is a **fill bill**, not a compute penalty (84 k tokens)
 
@@ -65,7 +74,35 @@ of the prefill.
 The same comparison on the short prompt (5 298 tokens) is **3 631.8 → 6 175.6 ms**, i.e. **+2 543.8 ms**; on
 83 988 tokens it is **+2 304.9 ms**; at `-ub 12288` (a 14.6 % band) it is **+1 946 ms**.  So the cost is
 **roughly constant per prefill and proportional to the band, ~0.25 s per GiB (3.5-4.5 GB/s)** — a *fill-rate*
-bill paid once per prefill, not a per-token compute penalty.
+cost paid once per prefill, not a per-token compute penalty.
+
+**What the fill is** (corrected, §7): not "the band has to be re-read because a prefill touches everything".
+It is the **hot residency of the stood-down tables** being re-acquired — the band is a contiguous VA range at
+the arena's bottom, a table is ~0.7 % of the arena, and `moe_cache_evict_slab_range` stands a table down
+**whole** when any part of its range is taken, so ~58 tables lose their *hot* slots too.  Those bytes then
+come back through the **demand** path at ~4 GB/s instead of the batched seed's 17-33 GB/s (§2b).
+
+## 2b. The lazy-fill half is already built (`MOE_EXPERT_SEED`, TODO #318) — and deferring a fill is NOT free
+
+The campaign's policy needs two things: take the band **lazily** (fill it only with bytes that are already in
+flight) and drop it at the next prefill for free.  The first half exists: `MOE_EXPERT_SEED=lazy|auto` starts a
+subset tier's slots **empty** and fills them on first miss, keeping the persisted prior for ranking
+(`seed_defer_table()`).  It is **not the default** (the default is `eager`, i.e. the batched seed is treated as
+a prefetch the demand path would otherwise pay inline), and this is why:
+
+| arm (`-ub 16384`, 2 GPUs, 2 000 tokens) | prefill | decode |
+|---|---:|---:|
+| seed **eager**, band left alone (**default**) | **1454.9 t/s** | **52.2 t/s** |
+| seed **eager**, band taken (the r292 settle, gate forced open) | 857.3 | 49.5 |
+| seed **lazy**, band taken | 545.7 | 46.1 |
+| seed **lazy**, band left alone | **115.2** | 42.9 |
+
+All four produce the same text (`sha=90675acf4b72`).  **The bytes are identical; the transport is not.**  A
+demand fill is ~4 GB/s on the critical path; the batched seed moves the same bytes at 17-33 GB/s off it, so
+*deferring* the fill to first touch costs **12x the prefill** on the flat arm (1 455 → 115 t/s).  "The weight
+had to come to the GPU anyway" is therefore true only for a move that was **already scheduled**: *retaining*
+it afterwards is the free part, and that is the half of the policy worth building.  It also means the ±4 GB/s
+"bill" in §2 is a transport bill, not an I/O bill — a batched refill of the same bytes would be 4-8x cheaper.
 
 That is why the same change reads as **-41 %** on a 5 k prompt (the bill is 70 % of a 3.6 s prefill) and
 **-4.6 %** on an 84 k one (5 % of 45 s).  Neither is a win, and a server that sees many short prefills pays
@@ -101,8 +138,11 @@ So on a saturated 2-device split:
   prefill bill;
 * the **wide ubatch** is a genuine, small trade at long prompts (+5.9 % prefill for -4 to -6 % decode) and a
   loss at short ones (the 5.2 k prompt prefill is *faster* at `-ub 4096`);
-* a two-segment (hot/cold) table would land at "`-ub 4096`'s decode, the current prefill bill" — strictly
-  worse than just using `-ub 4096`, and it is a kernel-addressing change across every routed-op consumer.
+* **as a way to get residency, lowering `-ub` is the cheaper lever today** — same (or better) decode, no band,
+  no bill — but note what it does *not* buy: it cannot give 100 % residency to a server that must keep the wide
+  ubatch for its prefill, and it says nothing about a short-arena shape (§7.4, §8).  A cold band that the
+  prefill could reclaim **without standing a table down** would give the same residency inside `-ub 16384`;
+  that is the mechanism the campaign is actually missing (§7.3), and none of these arms has it.
 
 ## 5. 3 GPUs — there is no region (and the default slab reserve aborts at this shape)
 
@@ -144,19 +184,42 @@ host copy for the whole decode, which costs more than the identity fast path buy
 measured at a *large* shortfall (~40 % of decode); its break-even point is much closer to full residency than
 "96 % of the layers can be full".
 
-## 7. Why the two-segment placement the campaign proposes cannot change the verdict
+## 7. What the measurement says about the campaign's policy (this section replaces the original refutation)
 
-The campaign's 2026-11-15 revision replaces "freeze a tier" with "hot slots above the widest prefill
-boundary, cold band below, and the real blocker is two-segment slot addressing".  The measurement says the
-placement is not the blocker; **the fill bill is**:
+**The original §7 was wrong.**  It argued that two-segment placement cannot pay because "a prefill routes
+every expert, so there is no cold data at prefill, so the band's bytes must be streamed".  The first clause
+is true and the conclusion does not follow: the comparison that matters is not "band full vs band empty", it
+is "band filled by data that was already moving (retained) vs no band".  In the second case the same bytes are
+streamed at the *next* prefill anyway, so a lazily-retained band costs the prefill **nothing** — the prefill's
+residency is then identical to the arm that never had the band.  What the −41 % bills is the *other* two
+things: the hot residency destroyed by a whole-table stand-down (§2) and the demand transport that
+re-acquires it (§2b).
 
-* a prefill reads **every** expert of **every** layer it routes, so at prefill no slot is "cold".  The bill is
-  per byte of non-resident expert data (§2: ~0.25 s/GiB, measured at two bands and two prompt lengths).
-* two-segment tables keep the *hot* segments resident through a prefill, so the bill becomes "the cold band's
-  bytes" instead of "the evicted tables' bytes" — the same band bytes, the same bill (§1 vs §4: `-ub 4096`
-  reproduces the whole decode win with no band and no bill).
-* their one unambiguous benefit — no whole-table re-seed at the drop — is worth `+2-3 %` decode (§3) and can
-  be had from step (b) of the campaign's *contained* list without touching a kernel.
+So the policy is sound and the blocker is exactly what the campaign's 2026-11-15 revision named, only sharper:
+**reclaim granularity**.  A table's slots are one contiguous range (`arena + slot × expert_bytes`), the
+arena's free space is one contiguous band at the bottom, and `moe_cache_evict_slab_range()` stands any
+overlapping table down **whole**.  Consequences:
+
+1. **In-place growth cannot put a table's cold slots in the band.**  Growth must be adjacent to the table's
+   existing range (the kernels index `base + slot × eb`), and an allocation is bounded above by the next table
+   up; only the table that currently sits at the arena's bottom has free VA below it.  One table, not 141.
+2. **So the band's contents are whole tables, not per-table cold tails.**  A 24.4 % band on a 141-table arena
+   covers ~34 tables whole; taking it therefore destroys those tables' hot residency, which is the entire
+   measured bill.
+3. **Two mechanisms would fix it, and only one avoids the kernel addressing change:**
+   * **(i) two-segment / per-slot indirection** (the campaign's plan): cold slots live in the band, the
+     prefill takes them and the hot segment survives.  Cost: every routed-op consumer's address arithmetic.
+   * **(ii) a band-resident *retention store* that is not table slots**: one slab allocation in the band,
+     holding copies of experts the demand path already moved, hashed on `(layer, expert)`, dropped
+     **wholesale** at a boundary move (so no table is ever stood down, no hot residency is touched), and hit
+     by a **D2D copy** into the slot instead of a host read.  No kernel change: the hit path is the existing
+     fill, and a D2D copy of one expert beats a pinned-host read by ~10-40x in latency.
+4. **The prize on *this* shape is small and that is a property of the shape, not the idea.**  85.6 % residency
+   already covers 99.58 % of routings, and the decode census is `hits=5 598 121 fills=42 101` over 2 000
+   tokens — **0.75 % of reaches miss** — so a perfect retention store can only address that 0.75 %, i.e.
+   ~1-2 % of decode (the same 0.42 pp the prior quotes, plus the D2D-vs-host latency saving).  The campaign's
+   real prize is a **short-arena shape** (residency ≤ 60 %), where 5-10 % of reaches miss; that cell is still
+   unmeasured (§8).
 
 ## 8. What was not tested
 
@@ -167,6 +230,12 @@ placement is not the blocker; **the fill bill is**:
   would be strictly worse than these one-shot numbers, not better.
 * **`-sm layer` on 2 GPUs** (r292 measured its band at 0.14 pp; the same conclusion follows a fortiori).
 * Anything requiring the `0300` relaxed-tensor split or the optional `0100`/`0101` artifacts.
+* **A retention store in the band** (§7.3 (ii)) and **two-segment slot addressing** (§7.3 (i)): neither exists,
+  so neither is measured.  Both need a maintainer decision before any code lands in a block, and (ii) is the
+  cheaper of the two — one slab allocation, one hit path, one drop hook, no kernel arithmetic change.
+* **A batched refill of a reclaimed band** (§2b's last paragraph): the 4 GB/s bill is a *transport* number, and
+  the batched seed moves the same bytes at 17-33 GB/s, so a "shrink the band back in bulk after the drop"
+  arm could cut the -41 % to single digits without touching the residency question at all.
 
 ## 9. Record hygiene
 
