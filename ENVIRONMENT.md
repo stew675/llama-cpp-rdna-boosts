@@ -1315,6 +1315,28 @@ scope -- where the buffered arm holds **12.8-12.9** and `auto` reaches it on the
 `MOE_HOST_POOL_STAGE_SPAN=0` **refuses** the buffered arm (it falls back to the mapping) and the ladder steps over
 `file` to `dio`.  Nothing an operator can type lands in that pair.
 
+### `--load-mode mlock` / `mmap+mlock` is a RESIDENCY request, not a transport (r296, `TODO` #333)
+
+Upstream files `mlock` under `--load-mode`, which is the wrong shelf, and the delivery now makes the two flags
+compose instead of one silently winning:
+
+* **What it buys is residency for the tensors the CPU reads** -- a CPU-only or partly CPU-offloaded model, where the
+  weights are read out of host memory on every token and a `mmap` page that the kernel reclaimed means a disk fault
+  mid-decode.  Measured here on the 4B Q8_0 (r296): `-ngl 0 --load-mode mmap+mlock` pins **4 274 MiB** (the whole
+  model), `-ngl 99` pins **654 MiB** (what stays in the mapping -- the output layer and any `-ot` tensor).  A model
+  whose weights are all in device buffers has nothing left for the pin to keep; that is not a defect, it is the
+  measurement of what the flag is for.
+* **Host-resident MoE experts are pinned by the TIER, not the load mode.**  An RDNA GPU has no XNACK, so a device
+  read of a host-resident expert must come from a resident page: a pinned master (`ROCm_Host`, default) or the
+  bounded pinned pool in front of a pageable mapping (`--host-experts pool` / an `-lme` hole).  The loader now says
+  so once, INFO, at the tier census ("the host-expert tier is PINNED BY NECESSITY whatever --load-mode says"), so
+  nobody concludes that leaving `mlock` off lets the host experts be reclaimed under the device.
+* **An `-lme` hole set is left PAGEABLE even under an mlock mode** (one WARN, and the mlock census names the bytes).
+  The budget is the operator's explicit reservation; pinning the holes here is what made
+  `-lme 30 --load-mode mmap+mlock` pin **43.5 GiB** before r296 (VmLck, RLIMIT_MEMLOCK raised) against **260 MiB**
+  after it, on a 40 925 MiB hole set.  The tier's own pin covers exactly what it serves.  Gate:
+  `scripts/gate-host-read-transport.sh` (`mlock-hole` / `mlock-nohole` arms).
+
 ## 20. The UMA GTT expert store (block 15) — an APU's MoE expert set in one registered region
 
 On an **integrated GPU** "VRAM" and host RAM are one pool, so r236 refuses the host-expert tier there
@@ -1372,7 +1394,7 @@ the gathered streams, so the logits/MTP tails keep their shape.  It is **OFF-pat
 |---|---|---|---|
 | `LLAMA_SEQPAR` | `1` | **kill-switch** | `0` = the unsplit graph, exactly as before (verified as an arm in `scripts/gate-seqpar.sh`, and bit-inert in the release record) |
 | `LLAMA_SEQPAR_GATHER_BF16` | `1` | **kill-switch** | `0` = the F32 wire for the per-layer `hc_mixed` gathers. **This is a real trade, not a purity dial**: the F32 wire is *better* on both logit metrics (0.010644 / 96.833 % against the bf16 wire's 0.014184 / 96.373 %, control 0.013587 / 96.225 %) and *slower where it matters* -- on the default (RCCL-ring) chain the F32 wire measures **-2.1 %** against seqpar OFF, because the gather bytes are the cost there.  The bf16 wire rounds exactly as its own round-only control (`GGML_SEQPAR_GATHER_ROUND=1`) and is the arm the throughput numbers are for |
-| `LLAMA_SEQPAR_MIN` | `512` | tuning | smallest ubatch that splits.  Measured on 2 x R9700, `llama-bench -p 8192`: **-1.0 % at 128, -0.8 % at 256** (no win), **+6.4 % at 512** (copy-engine chain) / **+3.0 %** (default chain), +8.3 % at 1024.  **Values below 128 are clamped to 128 with one WARN**, because a token-split ubatch that small can overflow the thread stack in the Meta split-state recursion (block 09's cache; reproduced at T = 48/64/80/112 and, with `MIN` \<= 2, a 2-token graph trips the token-scatter split-state assertion; clean at 128 and above).  So a mis-set value degrades to "off" for the ubatches it cannot handle instead of aborting; `TODO` #330 is the cache fix, and `scripts/gate-seqpar.sh` arm 6 asserts the clamp |
+| `LLAMA_SEQPAR_MIN` | `512` | tuning | smallest ubatch that splits.  Measured on 2 x R9700, `llama-bench -p 8192`: **-1.0 % at 128, -0.8 % at 256** (no win), **+6.4 % at 512** (copy-engine chain) / **+3.0 %** (default chain), +8.3 % at 1024 -- which is why the shipped default stays above the band where it does not pay.  **Values below 17 are clamped to 17 with one WARN**: 16 and below is the fused hyper-connection decode band (`GGML_OP_HC_MIX`/`HC_COMBINE` assert mirrored inputs and have no token-split form), so such a ubatch cannot be split at all.  r296 removed the old 128 floor: the Meta split-state cache can no longer be stranded by a version switch mid-walk (block 09, `TODO` #330), so the recursion below 128 is bounded and the floor is the graph's own limitation.  `scripts/gate-seqpar.sh` arm 6 asserts the clamp, the 16-token refusal and a clean 17-token (and sub-floor tail) run |
 | `LLAMA_SEQPAR_RS` | `3` | tuning / test | bit 0 = the attention output is reduce-scattered, bit 1 = the MoE output.  A cleared bit all-reduces and slices instead (**the same values**, more link bytes; `RS=0` reads the identical KLD), which is the arm that proves the reduce-scatter is not the source of the rounding change |
 | `LLAMA_SEQPAR_ODD` | `1` | tuning | `0` = split even token counts only.  Default: the first `T % n` devices take one token more (ceil/floor) |
 | `GGML_SEQPAR_CE_GATHER` | `1` | **test only** | `0` = the gathers take the Meta backend's generic copies instead of the copy-engine path (an A/B for the transport, and the arm that proves the gather-side scratch warning is its own message) |

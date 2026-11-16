@@ -1,4 +1,4 @@
-From 27db4ef02f2743f7d9bdc5cc97c1bd130923e52d Mon Sep 17 00:00:00 2001
+From ad3ea4748c270a572be3a41836c0e92e41d2ee5d Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/16] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -305,7 +305,7 @@ index 6a6e30d01..86f7f2829 100644
          // wip/moe-expert-cache (session 7) identity fast path.  Return true iff this expert input is
          // cache-managed and the consumer can read the arena WITHOUT the host routing (an identity table:
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index c34726abe..71508a402 100644
+index 822070752..700d6a029 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -324,6 +324,10 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
@@ -488,7 +488,7 @@ index c34726abe..71508a402 100644
          GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
          return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
      };
-@@ -2524,6 +2658,17 @@ struct ggml_backend_meta_context {
+@@ -2559,6 +2693,17 @@ struct ggml_backend_meta_context {
      // elision down exactly as the single-backend path does
      bool                        opt_has_eval_callback = false;
  
@@ -506,7 +506,7 @@ index c34726abe..71508a402 100644
      // op-offload H2D staging for the tensor split (issue #50 WIP).  The scheduler's own staging path
      // assumes one destination and an event on the split backend's device; under -sm tensor one logical
      // upload is spliced across N devices and the split's consumers read the per-device "simple"
-@@ -2640,8 +2785,31 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
+@@ -2675,8 +2820,31 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
      delete backend;
  }
  
@@ -538,7 +538,7 @@ index c34726abe..71508a402 100644
      GGML_ASSERT(ggml_is_contiguous(tensor));
      if (size == 0) {
          // A zero-element tensor has no meaningful meta split state (UNKNOWN); nothing to upload.
-@@ -2657,8 +2825,145 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -2692,8 +2860,145 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
          // splitter would treat the remainder as a <=512-byte MMQ tail, so any other mid-row caller would
          // corrupt the tensor.  The reverted `size % row_stride <= 512` attempt tried to divert such a
          // range into a whole-tensor accumulator; a partial per-op upload never reached `total`, stranding
@@ -686,7 +686,7 @@ index c34726abe..71508a402 100644
          ggml_backend_tensor_set(tensor, data, offset, size);
          return;
      }
-@@ -2873,7 +3178,10 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
+@@ -2908,7 +3213,10 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
          if (chunk_size_j == 0) {
              continue;
          }
@@ -698,7 +698,7 @@ index c34726abe..71508a402 100644
          void * slot_ptr = simple_backend->iface.stage_buffer(simple_backend, slot, copy_bytes);
          if (slot_ptr == nullptr) {
              return false;
-@@ -3627,11 +3935,57 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3662,11 +3970,57 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
  // filled).
  static int64_t ggml_backend_meta_moe_cache_band(ggml_backend_t backend);
  
@@ -757,7 +757,7 @@ index c34726abe..71508a402 100644
      // Only a routed expert table (a `MUL_MAT_ID` weight with an expert axis) is cacheable, and only the
      // decode/verify band (the narrowest band of the simple backends, see ggml_backend_meta_moe_cache_band).
      if (weight == nullptr || weight_cpy == nullptr || weight->ne[2] < 2 || n_tok > ggml_backend_meta_moe_cache_band(backend)) {
-@@ -3641,13 +3995,33 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
+@@ -3676,13 +4030,33 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
          return false;
      }
      const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(weight_cpy, /*assume_sync =*/ false);
@@ -795,7 +795,7 @@ index c34726abe..71508a402 100644
      size_t off = 0;
      bool all = true;
      for (size_t j = 0; j < n_backends; j++) {
-@@ -3657,7 +4031,8 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
+@@ -3692,7 +4066,8 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
              return false;
          }
          const bool took = simple_backend->iface.moe_cache_update(

@@ -1404,6 +1404,21 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 
 ## Block 09 — host-resident MoE: iface, scheduler, expert cache, staging rings
 
+> **r296 amendment (`TODO` #330): the split-state cache's pre-warm walk can no longer be stranded by a version
+> switch.**  The walk fills the cache version that is current when it starts, and a nested lookup of a tensor
+> whose cached bytes had changed SWITCHED the version -- every entry the walk had already filled became
+> invisible, and when the switch landed on the root's own lookup (after the walk) the whole walk was stranded
+> and `calculate_split_state` descended the `src` chain (~10 frames per layer; the r291 stack overflow at a
+> token-split ubatch below 128 tokens).  A version is only a performance mechanism (an entry is valid iff its
+> key is present and the tensor's raw bytes are identical), so the fix makes one walk fill one version: the
+> tensor's own resolution runs **before** the walk, and while the walk runs a nested lookup **erases its own
+> stale entry and computes into the current version** (`ss_pin`) instead of switching.  Measured: recursion
+> depth **1** on every arm (temporary probe, including the multi-shape `-p 24,48,64,80,112,160,256,512` sweep in
+> one process), `GGML_META_SS_VERIFY=1` clean, and every shape r291 recorded as a crash runs clean.  `-sm tensor`
+> text is unchanged (qwen4exp 2 devices `97a8c2a4929b`, 27B 3 devices `db556809f0e6`, 4B `6541eadb9041`).
+> `scripts/gate-host-pool.sh` 56/56, `gate-prefill-logits.sh` 0.000697 / 98.784 % (the r295 values).  Record:
+> `benchmarks/2026-11-16-split-state-walk-and-mlock.md`, `INVARIANTS.md` r296 items 1-2.
+
 > **r292 amendment (`wip/arena-steady-sizing`, promoted): the expert arena is settled against the capacity a
 > prefill -> decode drop returns.**  The cache sized itself once from `ggml_cuda_slab_arena_total()` while the
 > wide (prefill) compute view was live, so its fill was `mapped - (narrow + ring + wide)` and shrank as `-ub`
@@ -3366,6 +3381,18 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 
 ## Block 12 — campaign remainder
 
+> **r296 amendment (`TODO` #330, `TODO` #333): the seqpar floor is the fused-HC band's 17, and `--load-mode`'s
+> help says what `mlock` is.**  A token-split ubatch at or below the fused hyper-connection band cannot be served:
+> `GGML_OP_HC_MIX`/`HC_COMBINE` assert mirrored inputs and have no token-split form, and they are selected for
+> `nt <= 16` (BF16 mixer) / `nt <= 8` (Q8_0) -- measured: 8 and 16 abort, 17 and up run clean, so r291's "2-token
+> token-scatter assertion" was this same assert (mislabelled).  `LLAMA_SEQPAR_MIN` is therefore clamped to
+> **17** (`HC_BF16_MAX_TOKENS + 1`, one floor for both mixer families) with one WARN instead of 128; the shipped
+> default stays **512** (the band below it does not pay: -1.0 % at 128, -0.8 % at 256).  `scripts/gate-seqpar.sh`
+> arm 6 asserts the clamp, the 16-token refusal, a clean 17-token split and a sub-floor tail chunk.  The
+> `--load-mode` help now says `mlock`/`mmap+mlock` is a RESIDENCY request for the tensors the CPU reads (and the
+> load itself), that a fully offloaded model has nothing left for it to keep, and that host-resident experts are
+> pinned by the tier whatever the flag says.  Record: `ENVIRONMENT.md` §21/§19, `INVARIANTS.md` r296 item 2.
+
 > **r291 amendment (contributor PR #315, @briansp2020): sequence parallelism for the qwen4exp hyper-connection
 > work, DEFAULT ON (`LLAMA_SEQPAR=0` off).**  Under `-sm tensor` every device used to run the whole
 > hyper-connection chain (mixers, combine, gated norms, the shared expert and the GEMMs over them) for every token
@@ -3386,12 +3413,12 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 > **Purity:** not bit-identical -- the per-token chain runs at `T/n` (a batch-width change, the same class as `-ub`,
 > **not** the reduce-scattered sums: `RS=0` reads the identical KLD), 0.014184 / 96.373 % against a same-kernel
 > `-ub 256` control of 0.013587 / 96.225 %, exactly its own round-only control; OFF is inert (KLD 0.000000 and
-> byte-identical text at 2 devices, 3 devices and `-sm layer`).  **Gate:** `scripts/gate-seqpar.sh> **Floor guard
-> (`TODO` #330):** a token-split ubatch below 128 tokens can overflow the Meta split-state recursion (block 09's
-> cache; T = 48/64/80/112 reproduced, 128+ clean) and with `MIN` \<= 2 a 2-token graph trips the token-scatter
-> assertion, so `LLAMA_SEQPAR_MIN` is **clamped to 128 with one WARN** -- a mis-set value degrades to "off" for
-> the ubatches it cannot handle instead of aborting, and the shipped 512 is above the clamp.
-> `GREEDY-PURITY.md` §92, `INVARIANTS.md` r291, `ENVIRONMENT.md` §21, `benchmarks/2026-11-15-seqpar.md`.
+> byte-identical text at 2 devices, 3 devices and `-sm layer`).  **Gate:** `scripts/gate-seqpar.sh`.
+> **Floor guard (`TODO` #330, superseded by r296):** r291 clamped `LLAMA_SEQPAR_MIN` to 128 because a token-split
+> ubatch below it was believed to overflow the Meta split-state recursion.  r296 fixed that cache (block 09) and
+> found the band's real limit: the **fused hyper-connection** decode band, which has no token-split form, so the
+> clamp is now **17** (`HC_BF16_MAX_TOKENS + 1`) and the shipped 512 is untouched -- see the r296 amendment above.
+> `GREEDY-PURITY.md` §92, `INVARIANTS.md` r291/r296, `ENVIRONMENT.md` §21, `benchmarks/2026-11-15-seqpar.md`.
 
 > **r275 amendment:** the transport-coupling WARN in `moe-expert-cache.cu` escapes its literal percent (`-41 %%`); it
 > printed `invalid conversion specifier ')'`.  Diagnostic text only.
@@ -4518,6 +4545,19 @@ purity band (above).  Detail and numbers: `../archive/work/spec-draft-mtp-vocab/
 
 ## Block 14 — the streamed KV: the resident WINDOW (`--kv-window`), the attendance POOL (`--kv-attendance-pool`) and the MTP draft WINDOW (`--spec-draft-kv-window`, **default `0`**)
 
+> **r296 amendment (`TODO` #333): `mlock` composes with the `-lme` budget instead of outranking it.**  `grow_to()`
+> is a contiguous sweep from the mapping base, and with an `-lme` budget the mapping-backed tensors ARE the holes,
+> so an mlock load mode pinned across the whole hole set (measured `-ncmoe 48 -lme 30 --load-mode mmap+mlock`:
+> **43.5 GiB** VmLck, against **260 MiB** after this change, on a 40 925 MiB hole set; the pool's own
+> `30 693.8 MiB` pinned in both arms).  Two changes: a hole is **exempt** from the load-mode pin (one WARN, and a
+> new `mlock: N MiB of the model mapping pinned (the -lme host-expert holes, M MiB left pageable)` census makes the
+> composition visible), and when a hole set exists the loader pins each non-hole tensor's **own range** through a
+> new `llama_mlock::lock_range(offset, len)` (the contiguous `grow_to` sweep would cross the holes).  The tier
+> itself is unchanged and now says once, at INFO, that it is **pinned by necessity whatever `--load-mode` says**
+> (no XNACK: a device read of a host-resident expert must come from a resident page -- the pinned master, or the
+> bounded pool in front of a pageable hole).  `scripts/gate-host-read-transport.sh` gains `mlock-hole` /
+> `mlock-nohole` arms (30/30).  Record: `benchmarks/2026-11-16-split-state-walk-and-mlock.md`, `ENVIRONMENT.md`
+> §19, `INVARIANTS.md` r296 items 3-4.
 
 > **r275 amendment:** `GGML_OP_KV_POOL` joins the GPU-only abort group in `ggml-cpu.c`'s compute dispatch (its
 > `supports_op` already refuses it), and `llama_kv_cache_context::is_streaming`'s parameter is `n_kv_asked` (it shadowed

@@ -27,12 +27,15 @@
 #   auto-32G   --load-mode auto (32G scope) MUST latch on the probe A/B (the ladder is not dead code)
 #   span-off   --load-mode buffered + STAGE_SPAN=0   the buffered arm must be REFUSED (coupling)
 #   spanoff32  --load-mode auto (32G) + STAGE_SPAN=0 must never latch to `file`
-#
+#   mlock-hole / mlock-nohole  `--load-mode mmap+mlock` with and without a `-lme` hole set (TODO #333): the
+#                              load mode's pin is a RESIDENCY request and may not take the pageable holes
+##
 # PASS CRITERIA (hard): all seven texts identical; the named transport appears in each arm's census; the file
 # arm reports storage reads and the ref arm reports mapping reads; auto-warm reports ZERO transitions, auto-32G
 # reports AT LEAST ONE; EVERY arm reports a bounded pool (r294: the load mode no longer decides whether the
 # tier exists, only how it fills); the span-off arms report the refusal and stay on the mapping (or dio),
-# never `file`.
+# never `file`; and `mmap+mlock` composes with `-lme` (TODO #333): the hole set stays pageable and the pin does
+# not take it.
 set -uo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${BIN:-$HOME/llama.cpp/build-rocm/bin/llama-cli}
@@ -252,6 +255,54 @@ if [ "$WANT_SCOPE" = 1 ]; then
     [ "$t" != "file" ] && ok "span-off auto: never selected the buffered arm (ended on $t)" \
                        || bad "span-off auto: selected the measured -41 % pair"
     check_nhas "span-off auto: no file transition" "host read transport -> file" "$DIR/span32c.log"
+fi
+
+# ---------------------------------------------------------------- arm: the mlock/hole composition (TODO #333)
+# `--load-mode mlock`/`mmap+mlock` is a RESIDENCY request, not a read transport, and a `-lme` hole set must stay
+# PAGEABLE: the tier's budget is the reservation and its device reads come from the pinned host pool, so pinning
+# the holes here is what made `-lme 30 --load-mode mmap+mlock` pin the whole expert set (measured 2026-11-16,
+# RLIMIT_MEMLOCK raised to unlimited: **43.5 GiB** pinned before the fix, **260 MiB** after it, against 40 925
+# MiB of holes).  The arms assert the composition, not a number that needs a raised limit to exist:
+#   mlock-hole    --load-mode mmap+mlock with a `-lme` hole set: the hole set is named PAGEABLE and the census
+#                 counts it as unpinned; the load-mode pin cannot take it.
+#   mlock-nohole  --host-experts pinned (no hole set): no hole line, and the census says there is none.
+# With `sudo -n` the quantity is asserted too (unlimited memlock); without it a failed pin makes the quantity
+# meaningless, so it is reported and not asserted.
+MLOCK_SUDO=0
+( unset -v LD_PRELOAD; sudo -n bash -c 'ulimit -l unlimited' ) 2>/dev/null && MLOCK_SUDO=1
+mlock_arm() {   # <tag> <load-mode> <config-args...>
+    local tag=$1 lm=$2; shift 2
+    echo "--- $tag  (load-mode=$lm $*)  memlock=$([ $MLOCK_SUDO = 1 ] && echo unlimited || echo as-shell)"
+    local cmd=(env LD_LIBRARY_PATH="$LD_LIBRARY_PATH" HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES"
+               "$BIN" -m "$M" -ngl all "$@" --load-mode "$lm" -c 4096 -b 512 -ub 512 --spec-type none
+               --seed 42 --temp 0 --reasoning off -n 8 -p "$(cat "$PROMPT")"
+               --no-display-prompt --single-turn -lv 4)
+    if [ "$MLOCK_SUDO" = 1 ]; then
+        timeout 1200 sudo -n bash -c 'ulimit -l unlimited; exec "$@"' -- "${cmd[@]}" > "$DIR/$tag.log" 2>&1
+    else
+        timeout 1200 "${cmd[@]}" > "$DIR/$tag.log" 2>&1
+    fi
+}
+mlock_arm mlock-hole   mmap+mlock --n-cpu-moe 48 --limit-host-experts "$NLIB"
+mlock_arm mlock-nohole mmap+mlock --n-cpu-moe 48 --host-experts pinned
+
+# the hole set is left pageable, and the census counts it
+check_has "mlock-hole: the -lme holes are left PAGEABLE" "host-expert .-lme. holes are left PAGEABLE" "$DIR/mlock-hole.log"
+check_has "mlock-hole: the mlock census names the pageable hole set" \
+    "mlock: [0-9]+ MiB of the model mapping pinned \\(the -lme host-expert holes, [0-9]+ MiB left pageable\\)" "$DIR/mlock-hole.log"
+check_has "mlock-hole: the tier's residency is named as necessity, not as the load mode" \
+    "PINNED BY NECESSITY whatever --load-mode says" "$DIR/mlock-hole.log"
+check_nhas "mlock-nohole: no hole set, so no hole line" "holes are left PAGEABLE" "$DIR/mlock-nohole.log"
+check_has "mlock-nohole: the census reports that there is no hole set" "no -lme holes" "$DIR/mlock-nohole.log"
+mh_holes=$(sed -n 's/.*host-expert holes, \([0-9][0-9]*\) MiB left pageable.*/\1/p' "$DIR/mlock-hole.log" | tail -1)
+mh_pinned=$(sed -n 's/.*mlock: \([0-9][0-9]*\) MiB of the model mapping pinned.*/\1/p' "$DIR/mlock-hole.log" | tail -1)
+if [ "$MLOCK_SUDO" = 1 ] && [ -n "$mh_holes" ] && [ -n "$mh_pinned" ]; then
+    [ "$mh_holes" -gt 20000 ] && ok "mlock-hole: the pageable hole set is real (${mh_holes} MiB)" \
+                             || bad "mlock-hole: only ${mh_holes} MiB of holes -- the arm is vacuous"
+    [ "$mh_pinned" -lt $((mh_holes / 4)) ] && ok "mlock-hole: the pin did not take the holes (${mh_pinned} MiB pinned of ${mh_holes} MiB holes)" \
+                                           || bad "mlock-hole: ${mh_pinned} MiB pinned against ${mh_holes} MiB of holes -- the sweep is back"
+else
+    echo "    SKIP  mlock-hole quantity: no sudo -n (or the pin failed: ${mh_pinned:-?} MiB pinned, ${mh_holes:-?} MiB holes)"
 fi
 
 echo

@@ -48,11 +48,15 @@
 #                               a self-contained comparison, no recorded anchor -- and the `-lv 4` run of each must
 #                               carry its own "not engaged: <reason>" line.  The **hash and the census are separate
 #                               runs**: `-lv 4` interleaves log lines into llama-cli's generated stream
-#   6  the floor guard:         `LLAMA_SEQPAR_MIN=2` must be clamped to 128 -- one WARN, `-ub 32` does NOT
-#                               engage and does NOT crash (the band below 128 has two failure modes: the Meta
-#                               split-state recursion in `calculate_split_state`, and the token-scatter assertion
-#                               on a 2-token graph), and `MIN=128 -ub 128` DOES engage and runs clean.  The band
-#                               is therefore unreachable from the binary; `TODO` #330 is the cache fix
+#   6  the floor guard:         the band's floor is the GRAPH's, the fused hyper-connection decode band, not an
+#                               arbitrary number: `LLAMA_SEQPAR_MIN=2` is clamped to **17** with one WARN, a
+#                               16-token ubatch (inside the fused HC band, whose `GGML_OP_HC_MIX`/`HC_COMBINE`
+#                               assert mirrored inputs) does NOT engage and does NOT crash, a 17-token ubatch
+#                               DOES engage and runs clean, and so does a chunk sequence whose tail lands below
+#                               the floor (`-p 23 -ub 17`).  Since r296 (TODO #330) the Meta split-state cache
+#                               cannot be stranded by a version switch mid-walk, so the recursion that used to
+#                               overflow the stack below 128 tokens is bounded; the floor is the graph's own
+#                               limitation, not a workaround.
 #   every arm: exit 0, non-empty text, and a GPU-fault scan of this gate's own window
 #
 # NOT covered (do not "simplify" the gate to these): the throughput claim (that is
@@ -269,27 +273,50 @@ inert_arm belowmin tensor "LLAMA_SEQPAR_MIN=100000" "below LLAMA_SEQPAR_MIN"
 
 # ---------------------------------------------------------------- arm 6: the floor guard
 echo
-echo "==> 6/6 the floor guard: a mis-set LLAMA_SEQPAR_MIN is clamped to 128 and cannot crash"
+echo "==> 6/6 the floor guard: LLAMA_SEQPAR_MIN is clamped to the fused-HC band's floor (17)"
+# 6a: the clamp itself, at a ubatch that is now INSIDE the supported band (32 >= 17): it must engage and run
 env GGML_CUDA_ALLREDUCE="$CHAIN" HIP_VISIBLE_DEVICES="$GPU" LLAMA_SEQPAR_MIN=2 \
     timeout 1800 "$BUILD_BIN/llama-cli" -m "$MODEL" -sm tensor $EXTRA_ARGS \
     -c "$CTX" -b 2048 -ub 32 -n 8 -p "$(cat "$PROMPT")" \
     --seed 42 --temp 0 --no-display-prompt --single-turn -lv 4 > "$TMP/min2.log" 2>&1
 rc=$?
-note "MIN=2 -ub 32: exit=$rc"
+note "MIN=2 -ub 32 (clamped to 17): exit=$rc"
 [ $rc -eq 0 ] || bad "arm 6: MIN=2 crashed (exit $rc) -- the clamp is not in place"
-grep -q "below the supported floor of 128 tokens" "$TMP/min2.log" \
+grep -q "below the supported floor of 17 tokens" "$TMP/min2.log" \
     || bad "arm 6: no clamp warning for a mis-set LLAMA_SEQPAR_MIN"
-grep -q "not engaged: ubatch of 32 tokens (below LLAMA_SEQPAR_MIN = 128" "$TMP/min2.log" \
-    || bad "arm 6: a 32-token ubatch was not refused at the clamped floor"
-grep -q "sequence parallelism engaged: T = 32" "$TMP/min2.log" && bad "arm 6: T=32 engaged below the floor"
+grep -q "sequence parallelism (LLAMA_SEQPAR) on: T = 32" "$TMP/min2.log" \
+    || bad "arm 6: a 32-token ubatch did not engage above the clamped floor"
+# 6b: 16 tokens is the fused hyper-connection band itself: not engaged, and no HC_MIX assertion
+env GGML_CUDA_ALLREDUCE="$CHAIN" HIP_VISIBLE_DEVICES="$GPU" LLAMA_SEQPAR_MIN=2 \
+    timeout 1800 "$BUILD_BIN/llama-cli" -m "$MODEL" -sm tensor $EXTRA_ARGS \
+    -c "$CTX" -b 2048 -ub 16 -n 8 -p "$(cat "$PROMPT")" \
+    --seed 42 --temp 0 --no-display-prompt --single-turn -lv 4 > "$TMP/min16.log" 2>&1
+rc=$?
+note "MIN=2 -ub 16 (inside the fused HC band): exit=$rc"
+[ $rc -eq 0 ] || bad "arm 6: -ub 16 crashed (exit $rc) -- the floor must keep the fused HC band unsplit"
+grep -q "not engaged: ubatch of 16 tokens (below LLAMA_SEQPAR_MIN = 17" "$TMP/min16.log" \
+    || bad "arm 6: a 16-token ubatch was not refused at the clamped floor"
+grep -q "sequence parallelism (LLAMA_SEQPAR) on: T = 16" "$TMP/min16.log" && bad "arm 6: T=16 engaged inside the fused HC band"
+# 6c: a chunk sequence whose TAIL is below the floor must run clean at both sizes (the 6-token tail is the
+# shape that used to assert); -p 23 -ub 17 gives 17 + 6 tokens
+env GGML_CUDA_ALLREDUCE="$CHAIN" HIP_VISIBLE_DEVICES="$GPU" LLAMA_SEQPAR_MIN=2 \
+    timeout 1800 "$BUILD_BIN/llama-cli" -m "$MODEL" -sm tensor $EXTRA_ARGS \
+    -c "$CTX" -b 2048 -ub 17 -n 8 -p "$(cat "$PROMPT" | head -c 200)" \
+    --seed 42 --temp 0 --no-display-prompt --single-turn -lv 4 > "$TMP/min17.log" 2>&1
+rc=$?
+note "MIN=2 -ub 17 (a 17-token split + a sub-floor tail): exit=$rc"
+[ $rc -eq 0 ] || bad "arm 6: -ub 17 crashed (exit $rc) -- the floor must cover a sub-floor tail chunk"
+grep -q "sequence parallelism (LLAMA_SEQPAR) on: T = 17" "$TMP/min17.log" \
+    || bad "arm 6: a 17-token ubatch did not engage (17 is the first supported size)"
+# 6d: 128 is still a normal, above-floor arm
 env GGML_CUDA_ALLREDUCE="$CHAIN" HIP_VISIBLE_DEVICES="$GPU" LLAMA_SEQPAR_MIN=128 \
     timeout 1800 "$BUILD_BIN/llama-cli" -m "$MODEL" -sm tensor $EXTRA_ARGS \
     -c "$CTX" -b 2048 -ub 128 -n 8 -p "$(cat "$PROMPT")" \
     --seed 42 --temp 0 --no-display-prompt --single-turn -lv 4 > "$TMP/min128.log" 2>&1
 rc=$?
 note "MIN=128 -ub 128: exit=$rc"
-[ $rc -eq 0 ] || bad "arm 6: MIN=128 at -ub 128 crashed (exit $rc) -- 128 is the supported floor"
-grep -q "sequence parallelism engaged: T = 128" "$TMP/min128.log" \
+[ $rc -eq 0 ] || bad "arm 6: MIN=128 at -ub 128 crashed (exit $rc)"
+grep -q "sequence parallelism (LLAMA_SEQPAR) on: T = 128" "$TMP/min128.log" \
     || bad "arm 6: MIN=128 at -ub 128 did not engage"
 
 # ---------------------------------------------------------------- faults
@@ -310,8 +337,8 @@ fi
 echo
 if [ $fails -eq 0 ]; then
     echo "==> PASS: sequence parallelism (off inert, the mechanism within the same-kernel calibration, the shipped"
-    echo "          wire its own round-only control, never splits a non-prefill graph, and the MIN band below 128"
-    echo "          is clamped off)"
+    echo "          wire its own round-only control, never splits a non-prefill graph, and MIN is clamped to the"
+    echo "          fused-HC band's floor of 17)"
     exit 0
 fi
 echo "==> FAIL: $fails check(s) failed"

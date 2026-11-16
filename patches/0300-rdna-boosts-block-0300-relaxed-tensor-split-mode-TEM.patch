@@ -1,4 +1,4 @@
-From c98b6f0c1764ac1bdcc131f221115ab6941d7bea Mon Sep 17 00:00:00 2001
+From 1282102c62edd40506149d2c3a467bee76195352 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 25 Oct 2026 10:25:16 -0500
 Subject: [PATCH 16/16] rdna-boosts: block 0300: relaxed-tensor split mode
@@ -83,10 +83,10 @@ needed.  Exit verified on this tree (gfx1201, ROCm 10.1.0, VMM build):
  11 files changed, 130 insertions(+), 16 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index cd163d80b..12a32b41e 100644
+index 495df394e..fcc945273 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -3027,12 +3027,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -3031,12 +3031,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          }
      ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
      add_opt(common_arg(
@@ -105,7 +105,7 @@ index cd163d80b..12a32b41e 100644
          [](common_params & params, const std::string & value) {
              if (value == "none") {
                  params.split_mode = LLAMA_SPLIT_MODE_NONE;
-@@ -3042,6 +3046,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -3046,6 +3050,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                  params.split_mode = LLAMA_SPLIT_MODE_ROW;
              } else if (value == "tensor") {
                  params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
@@ -151,7 +151,7 @@ index d0fecde6c..b031d1b77 100644
          GGML_BACKEND_SPLIT_AXIS_NONE    = 98,
          GGML_BACKEND_SPLIT_AXIS_UNKNOWN = 99,
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index d1f1508ac..b1cfb0e35 100644
+index 6892b1277..341f613c2 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -55,6 +55,8 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
@@ -277,7 +277,7 @@ index d1f1508ac..b1cfb0e35 100644
              case GGML_OP_PAD: {
                  split_state = handle_pad(src_ss);
              } break;
-@@ -2432,6 +2488,9 @@ static void ggml_backend_meta_buffer_memset_tensor(
+@@ -2467,6 +2523,9 @@ static void ggml_backend_meta_buffer_memset_tensor(
              GGML_ASSERT(value == 0);
              [[fallthrough]];
          }
@@ -287,7 +287,7 @@ index d1f1508ac..b1cfb0e35 100644
          case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
              for (size_t j = 0; j < n_bufs; j++) {
                  ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-@@ -2590,6 +2649,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
+@@ -2625,6 +2684,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                  ggml_backend_tensor_set(simple_tensor, data, offset, size);
              }
          } break;
@@ -297,7 +297,7 @@ index d1f1508ac..b1cfb0e35 100644
          case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
              GGML_ASSERT(tensor->type == GGML_TYPE_F32);
              GGML_ASSERT(offset % sizeof(float) == 0);
-@@ -2789,6 +2851,10 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
+@@ -2824,6 +2886,10 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
                  ggml_backend_tensor_get(simple_tensor, data, offset, size);
              }
          } break;
@@ -308,7 +308,7 @@ index d1f1508ac..b1cfb0e35 100644
          default: {
              GGML_ABORT("fatal error");
          }
-@@ -3902,7 +3968,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -3937,7 +4003,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                      }
                      ggml_tensor * next = cgraph->nodes[id+1];
                      if (next->op == GGML_OP_MUL && next->src[0] == node &&
@@ -401,7 +401,7 @@ index 884dca647..f72c29d30 100644
  static inline dst_t llama_cast(src_t v) {
      if constexpr (std::is_same_v<src_t, dst_t>) {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 36ed4b0aa..77db3e01b 100644
+index aade37fc1..50c89460d 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -398,7 +398,13 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param

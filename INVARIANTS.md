@@ -110,3 +110,57 @@
    `common/fit.cpp`'s placement hint now say the cost is linear in the depth past the window (and nothing at or above the run
    depth), matching `ENVIRONMENT.md` §17.0 since r292.  Text only: `--fit`'s per-token estimate is unchanged (it divides by
    the calibrated in-place read rate), and the r295 gates that print the line move no number and no token.
+
+## r296 — the split-state walk cannot be stranded, the seqpar floor is the fused-HC band, and `mlock` composes with `-lme`
+
+1. **A split-state cache entry is valid iff its key is present AND the tensor's raw bytes are identical; the cache
+   VERSIONS are a performance mechanism, so pinning one version for the duration of the pre-warm walk costs nothing
+   and is what makes the walk reliable.**  `ggml_backend_meta_get_split_state`'s non-recursive walk exists because
+   `calculate_split_state` recurses every `src` (~500-1200 frames on qwen4exp, more than the 8 MiB stack).  Before
+   r296 a nested lookup of a tensor whose bytes had changed **switched** the current version, which made every entry
+   the walk had already filled invisible -- and when that switch happened on the root's own lookup, after the walk,
+   the whole walk was stranded and the recursion descended the chain (the r291 stack overflow at a token-split ubatch
+   below 128 tokens).  The fix is two-part and must not be "simplified" back: the tensor's own resolution runs
+   **before** the walk, and while the walk runs a nested lookup **erases its own stale entry and computes into the
+   current version** (`ss_pin`) instead of moving it.  Measured: recursion depth **1** on every arm (temporary probe;
+   qwen4exp 2 devices `MIN=2 -ub 48 pp4096`, plus the multi-shape sweep `-p 24,48,64,80,112,160,256,512` in ONE
+   process), and `GGML_META_SS_VERIFY=1` clean over the same sweeps.  Resolving a miss from *another* version's
+   byte-identical entry is still NOT done (it is the one change the r291 note warned about); the pin makes it
+   unnecessary.
+2. **A token-split ubatch at or below the fused hyper-connection band is not a graph seqpar can serve, and that -- not
+   a cache defect -- is the band's real floor.**  `GGML_OP_HC_MIX`/`HC_COMBINE` assert mirrored inputs
+   (`ggml-backend-meta.cpp:1953` and following) and have no token-split form; they are selected for
+   `nt <= HC_BF16_MAX_TOKENS` (16, BF16 mixer) or `nt <= HC_FUSED_MAX_TOKENS` (8, Q8_0).  Measured: 8 and 16 abort,
+   17 and up run clean.  So the floor is **17** (one floor for both families), `LLAMA_SEQPAR_MIN` is clamped to it
+   with one WARN, and the shipped default stays **512** (-1.0 % at 128, -0.8 % at 256, +6.4 % at 512, r291's sweep).
+   r291 recorded this abort as "the token-scatter split-state assertion"; the line it named is the first HC_MIX
+   assert, and the token-scatter handler was never reached (corrected here, with the measurement).
+3. **`grow_to()` is a contiguous sweep from the mapping base, so any range that must stay unlocked needs per-range
+   locking.**  `llama_mlock::grow_to(target)` locks `[base, target)`; with an `-lme` hole set the mapping-backed
+   tensors are exactly the holes, so an mlock load mode pinned across the whole hole set (measured
+   `-ncmoe 48 -lme 30 --load-mode mmap+mlock`: **43.5 GiB** VmLck) and silently overrode the budget.  r296 adds
+   `llama_mlock::lock_range(offset, len)` and exempts the holes: **260 MiB** pinned after, against a 40 925 MiB hole
+   set, with the pool's own `30 693.8 MiB` unchanged.  A hole's device reads are served by the pinned pool, which
+   wires exactly what it serves.
+4. **`--load-mode mlock`/`mmap+mlock` is a RESIDENCY request for the tensors the CPU reads, not a read transport and
+   not a device-side decision.**  Measured on 4B Q8_0 (`--load-mode mmap+mlock`): **4 274 MiB** pinned at `-ngl 0`
+   (CPU inference -- residency is the whole point) and **654 MiB** at `-ngl 99` (what still lives in the mapping).
+   A fully offloaded model has little left for the pin to keep, which is why the flag can compose with a tier budget
+   instead of outranking it.  And **a host-expert tier is pinned by necessity whatever `--load-mode` says** (no
+   XNACK: a device read of a host-resident expert must come from a resident page -- the pinned master, or the bounded
+   pool in front of a pageable hole).  Both statements are logged (INFO at the tier census; the hole exemption WARN
+   plus the `mlock:` census), so an operator cannot read either flag's absence as "the host experts are reclaimable".
+5. **A pooled KV's text is invariant across DEVICE COUNTS (and across its two spellings), but it is not the
+   resident arm's text -- and the resident reference is the side that drifts.**  `gate-kv-residency.sh`'s
+   multi-device section demanded `pmres == pmref`, and it had been red since at least r295 (measured identically
+   on the r295 and the r296 build): pooled `f260d1824ab3` / 842 chars against resident `1e944569dbd6` /
+   831 chars, diverging 539 characters into a coherent continuation, with `LLAMA_KV_POOL_VERIFY=1` reporting
+   `bad 0` (every resolved page IS the authoritative mirror's bytes).  Every record that measured the identity
+   agrees with itself and disagrees with today: r213 lists `f260d1824ab3` for all three of its 2-device arms,
+   r284 (`GREEDY-PURITY.md` §89, after the heat-map pin) lists `b08d3dbcb1e9` for all three, and today the pooled
+   arms read `f260d1824ab3` against the resident one's `1e944569dbd6` -- i.e. a re-baseline moved one side and
+   the assertion was never re-cut.  It also conflated the placement with the device count (text is a
+   per-device-count reference under `-sm layer`), and the reference arm alone carries
+   `LLAMA_QSA_DENSE_DECODE_UNTIL=0` (a forced-sparse decode the pool arms do not set).  The section now asserts `pmlegacy == pmres` and `pmres == pres` (2-device pool text == 1-device pool
+   text: the multi-device placement's real signature) and REPORTS the resident number; do not restore the
+   `pmres == pmref` form, and do not quote pool-on text as byte-identical to pool-off.

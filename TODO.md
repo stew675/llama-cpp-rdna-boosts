@@ -42,8 +42,6 @@ left in this file.  The r236 re-base
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
 | **327** | a table served in place loses the prefill MoE fusions, so residency selects the kernel set — teach the fusions the in-place contract | purity / architecture (blocks 06/08/09/12) | **OPEN** (2026-11-14) — the maintainer's chosen answer to `GREEDY-PURITY.md` §89; deferred, not urgent — §327 |
-| **330** | the Meta split-state cache's warm walk is defeated by a version switch mid-walk, so a token-split ubatch below 128 tokens can overflow the thread stack | correctness (block 09; reachable only with `LLAMA_SEQPAR_MIN` < 128) | **OPEN** (2026-11-15) — reproduced at T = 48/64/80/112, clean at 128+; the shipped `MIN` 512 cannot reach it and `scripts/gate-seqpar.sh` arm 6 is the tripwire |
-| **333** | `--load-mode mlock`/`mmap+mlock` pin the host-expert mapping past the `-lme` budget, because `mlock` is a VM policy wearing a loading mode's clothes | policy / architecture (loader + `common/arg.cpp`) | **OPEN** — deferred by the maintainer, r294 |
 
 ## Handle numbering
 
@@ -239,27 +237,6 @@ its A/B and it is documented bit-identical to the triple, §69); **MMB's fused G
 answer.  Record: [`benchmarks/2026-11-14-residency-reproducibility.md`](benchmarks/2026-11-14-residency-reproducibility.md),
 `GREEDY-PURITY.md` §89, `INVARIANTS.md` (r284), `ENVIRONMENT.md` (`MOE_EXPERT_PREFILL_IN_PLACE`, `MOE_EXPERT_HEATMAP`).
 
-## 333. `mlock` pins the host-expert mapping past the `-lme` budget (`mlock` is a VM policy, not a loading mode)
-
-**Open, deferred by the maintainer (r294) to a separate session.**  `load_all_data`'s from-mapping path calls
-`lmlock->grow_to(weight->offs + nbytes)` for every mapped tensor, so an mlock load mode mlocks the host-expert
-mapping ranges -- which means `-lme 30 --load-mode mmap+mlock` pins far more than the 30 GiB the operator asked
-for.  This is **pre-existing** behavior on a mapped load (r294 did not introduce it); what r294 changed is that the
-same applies to `--load-mode dio`/`none`, which now build a mapping for the host experts too.
-
-Two ways out, and the choice is the maintainer's:
-* **skip `grow_to` for a hole tensor** -- an `-lme` budget is an explicit reservation, so mlock must not spend
-  past it; one WARN naming the conflict.  Cheap, and it makes the two flags compose instead of one silently
-  winning.
-* **leave it and document that `mlock` outranks `-lme`** -- defensible (`mlock` literally asks for "keep this in
-  RAM"), but it means a user who typed a budget cannot rely on it.
-
-The larger point on the record: **`--load-mode mlock` is upstream's VM policy filed as a loading mode.**  It says
-nothing about how bytes are read (which is what every other value of that flag means) and everything about what the
-kernel may do with the pages afterwards, so it composes badly with a tier whose whole job is deciding what may stay
-resident.  r294 deliberately did not fight it.  **Re-entry:** a report of an mlock + `-lme` config that pins more
-than the budget, or the next pass over `common/arg.cpp`'s `--load-mode` vocabulary.
-
 ## Accepted limitations (deliberately not fixed — do not re-report)
 
 These are closed: no work is owed and no row above tracks them.  A handle is kept where one was ever allocated, so
@@ -391,38 +368,3 @@ candidate: the delivery's own adaptive-MTP drafts produce 2..8-column verify bat
 across that whole band is a pure win instead of a config-shaped opt-in.  Until then it stays opt-in with a
 floor of 7 and the purity note in `GREEDY-PURITY.md` §91 -- do not lower the floor without measuring the
 low band on both a single card and a 2-GPU `tensor` split (the crossover moves).
-
-### #330 -- the Meta split-state warm walk is defeated by a cache-version switch mid-walk, so a token-split ubatch below 128 tokens can overflow the stack
-
-**Open, not scheduled** (r291, PR #315).  `ggml_backend_meta_get_split_state` has a non-recursive pre-warm that
-exists precisely to stop `calculate_split_state` from recursing the whole `src` chain (a 1200-node qwen35moe
-chain crashed the allocator this way).  The walk fills the cache version that is current **when it starts**, and
-a nested lookup inside it switches version whenever a tensor's bytes changed since it was cached -- which a graph
-re-allocation does for some tensor on every pass.  The entries the walk already filled then belong to the retired
-version, `wseen` keeps the walk from re-visiting those nodes, and the recursion cannot see the walk's stack, so it
-descends the chain anyway: ~10 frames per layer, ~500 for a 48-layer qwen4exp graph, then a SIGSEGV in
-`ggml_backend_meta_get_split_state` (gdb: unbounded `calculate_split_state` <-> `get_split_state`).
-
-**Reachable only through the r291 sequence-parallel path with its floor lowered**, because that is the only way
-to get a token-split graph at a small ubatch: with `LLAMA_SEQPAR_MIN` forced to 2, `llama-bench -p 4096/8192`
-reproduced it at **T = 48, 64, 80 and 112** and stayed clean at 32, 96, 128, 144, 160, 192, 200, 224, 240, 256,
-256/24576, 320, 512, 1024, 2048, 4096 and 31500; seqpar-off is fine at the same T.  The shipped
-`LLAMA_SEQPAR_MIN=512` cannot reach it, `scripts/gate-seqpar.sh` arm 6 (T=128 forced on) is the tripwire, and
-`INVARIANTS.md` r291 + `GREEDY-PURITY.md` §92 record the numbers.
-
-**Why it is not fixed here.**  A restart of the walk does not close it (measured: the switch that matters happens
-on the root's own lookup *after* the walk, retiring the version the walk just filled), and the plausible cheap
-fix -- resolving a miss from any version that holds a byte-identical entry -- crosses the version-consistency
-invariant the cache exists to keep.  A wrong fix there mis-splits tensors **silently**, which is worse than a
-crash that needs a non-default threshold, so it is block 09 work with its own gates (every `-sm tensor` arm of
-`gate-host-pool`, `gate-kv-residency`, `gate-prefill-logits` and the qwen4exp per-block build), not a rider on
-this feature.
-
-**The band is closed by a floor guard, not left open (r291).**  `LLAMA_SEQPAR_MIN` is clamped to **128** with one
-WARN, so a mis-set value degrades to "off" for the ubatches it cannot handle instead of aborting -- the shipped 512
-is above the clamp, `MIN=2 -ub 32` exits 0 and reports `not engaged`, `MIN=128 -ub 128` engages and runs clean, and
-`scripts/gate-seqpar.sh` arm 6 asserts all three.  A token-split ubatch below 128 therefore cannot be requested at
-all until this is fixed.
-
-**Re-entry:** any proposal to lower that clamp (or to expose `MIN` below 128 again), or a report of this crash at
-or above 128.

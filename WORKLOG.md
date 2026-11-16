@@ -1,3 +1,100 @@
+## 261116.003 (r296, RELEASE v16-4f9dfa0e3-r296) -- `TODO` #330 and #333 retired: the Meta split-state walk can no longer be stranded (so the seqpar floor is the fused-HC band's 17, not 128), and `--load-mode mlock` no longer pins the pageable `-lme` holes
+
+**Amends blocks 09, 12 and 14** (no new block; split by code ownership: the split-state cache in **09**, the seqpar
+floor + `--load-mode`'s help text in **12**, the mlock/hole composition and the tier's residency census in **14**).
+Patches regenerated and re-cut from a canonical apply at `4f9dfa0e3`; `release.json` at **`v16-4f9dfa0e3-r296`**
+(`tip 1282102c6`, `tree 019249493`; optional `0100` -> `8b1b6fd8c`, `0101` -> `093eaa17f`, cumulative
+`ff897703c`), `validate-set.sh` GREEN.  Two `TODO` handles retired, both of them *policies meeting a dynamic
+decision*: a cache-version mechanism against a re-allocated graph shape, and a VM residency request against a tier
+budget.  Record: [`benchmarks/2026-11-16-split-state-walk-and-mlock.md`](benchmarks/2026-11-16-split-state-walk-and-mlock.md).
+
+**#330: the walk could be stranded, and the "second failure mode" was the first one.**  `ggml_backend_meta_get_split_state`
+pre-warms the split-state cache with a non-recursive walk (a qwen4exp `src` chain is ~500-1200 nodes, so the recursion
+alone overflows the 8 MiB stack), and the walk fills **the cache version that is current when it starts**.  A nested
+lookup of a tensor whose cached bytes changed switched the version, and every entry the walk had already filled became
+invisible; when the switch landed on the root's own lookup -- *after* the walk -- the whole walk was stranded and the
+recursion descended the chain.  A version is only a performance mechanism: an entry is valid iff its key is present
+**and the tensor's raw bytes are identical**, so the fix is to make one walk fill one version.  Two parts: the tensor's
+own resolution now runs **before** the walk (so the walk starts on the version the lookup ends on), and while the walk
+runs a nested lookup that finds a stale entry for its own key **erases it and computes into the current version**
+(`ss_pin`) instead of switching -- the entry was invalid for those bytes anyway, so nothing is lost.
+Measured: a temporary depth probe in `calculate_split_state` reads **depth 1** on every arm (qwen4exp 2 devices
+`LLAMA_SEQPAR_MIN=2 -ub 48 pp4096`, and the multi-shape sweep `-p 24,48,64,80,112,160,256,512` in one process --
+the shape alternation that retires versions), and `GGML_META_SS_VERIFY=1` (abort on a stale entry) is clean over
+the same sweeps.  Every shape r291 recorded as a crash at T = 48/64/80/112 is clean here, and so are the chunk
+sequences whose **tail** lands below the floor (`-p 64 -ub 48`, `-p 23 -ub 17`).
+**r291's "second failure mode" was mislabelled**: the 2-token abort is `ggml-backend-meta.cpp:1953`, the first
+`GGML_OP_HC_MIX` assert, and it fires for **any** token-split ubatch at or below the fused hyper-connection band
+(measured: 8 and 16 abort, 17 and up run clean) -- not the token-scatter assertion.  `GGML_OP_HC_MIX`/`HC_COMBINE`
+assert mirrored inputs and have no token-split form, so that band is a **graph** property: the seqpar floor is
+**17** (`HC_BF16_MAX_TOKENS + 1`), one floor for both mixer families (the Q8_0 band ends at 8; the 9..16 band is
+simply not split rather than plumbing a per-layer weight-type decision into the engage predicate).  `LLAMA_SEQPAR_MIN`
+is clamped to 17 with one WARN, the shipped default stays **512** (a floor that ships must be a win: -1.0 % at 128,
+-0.8 % at 256, +6.4 % at 512 on the copy-engine chain), and decode/verify graphs (1..n_draft+1) are below the floor
+by construction.
+**Text is unchanged** wherever the change is not supposed to be visible (r295 build against this one, same seed,
+`ROCBLAS_USE_HIPBLASLT=0`): qwen4exp Flash-Next 2 devices `-sm tensor` **166 chars `97a8c2a4929b`** with seqpar ON
+**and** OFF; 27B Q4_K_XL 3 devices `-sm tensor` **96 chars `db556809f0e6`**; 4B Q8_0 3 devices `-sm tensor` and
+`-sm layer` **96 chars `6541eadb9041`**.
+
+**#333: `mlock` is a residency request, and it now composes with `-lme`.**  `grow_to()` locks everything from the
+mapping base up to its target, and `load_all_data` calls it for every tensor that points into the mapping -- with an
+`-lme` budget those are exactly the **holes**, so an mlock mode pinned the swept range across the whole hole set and
+silently overrode the budget.  Measured (`-ncmoe 48 -lme 30 --load-mode mmap+mlock`, RLIMIT_MEMLOCK raised, VmLck
+sampled from `/proc`): **43.5 GiB pinned before, 260 MiB after**, against a **40 925 MiB** hole set, with the pool's
+own `30 693.8 MiB` pinned in both arms.  Two changes: a hole is **exempt** from the load-mode pin (one WARN, and the
+new `mlock: N MiB of the model mapping pinned (the -lme host-expert holes, M MiB left pageable)` census makes the
+composition visible), and where a hole set exists the loader pins each non-hole tensor's **own range**
+(`llama_mlock::lock_range`) instead of sweeping across the holes.
+**The "why does upstream mlock the model at all" question is answered by measurement**: on the 4B Q8_0,
+`--load-mode mmap+mlock` pins **4 274 MiB at `-ngl 0`** (the whole model -- CPU inference re-reads it from host RAM
+every token, so residency is the whole point) and **654 MiB at `-ngl 99`** (what still lives in the mapping: the
+output layer and any `-ot` tensor).  A model whose weights are all in device buffers has little left for the pin to
+keep, so the flag is a **residency request for the CPU-read path**, not a transport -- which is why it can compose.
+And the host-expert tier is pinned **by necessity whatever the load mode says** (an RDNA GPU has no XNACK, so a
+device read of a host-resident expert must come from a resident page: the pinned master or the bounded pool), now
+stated once at INFO in `report_host_expert_placement`; `--load-mode`'s help says both things where an operator
+chooses the flag.  Nothing about the host-expert tier's residency moved.
+
+**A third finding, found by the gate ladder and pre-existing: `scripts/gate-kv-residency.sh`'s multi-device pool
+text assertion was RED, and it has been red since at least r295.**  The section demanded `pmres == pmref` ("a
+per-device pool is byte-identical to the 2-device sparse arm").  Measured identically on the **r295** and the
+**r296** build: the pooled arms read `f260d1824ab3` (842 chars, == the single-device pool arm `pres`) against the
+resident arm's `1e944569dbd6` (831 chars), diverging 539 characters into a coherent continuation, with
+`LLAMA_KV_POOL_VERIFY=1` reporting `bad 0` -- every resolved page matched the authoritative mirror byte for byte,
+so the KV data is right.  Both records that ever measured it agree with themselves and disagree with today:
+r213 lists `f260d1824ab3` for all three 2-device arms and r284 (`GREEDY-PURITY.md` §89, after the heat-map pin)
+lists `b08d3dbcb1e9` for all three -- while today the two pooled arms read `f260d1824ab3` and the resident one
+`1e944569dbd6`.  So a re-baseline moved one side and the assertion was never re-cut; it also conflated the
+placement with the device count (text is a per-device-count reference under `-sm layer`) and gave only the
+reference arm the forced-sparse `LLAMA_QSA_DENSE_DECODE_UNTIL=0`.  A three-arm text identity is not a property
+this section can assert.  The gate now
+asserts `pmlegacy == pmres` and `pmres == pres` (the pool's text is **device-count invariant** -- the
+multi-device placement's real signature, and a split that mis-claims a resolve corrupts it) and REPORTS the
+resident arm's number and char delta in the log.  `INVARIANTS.md` r296 item 5, `scripts/README.md`.
+
+**Gates**, all on this tree with the r296 build.  `validate-set.sh` GREEN (fresh-tarball strict 17/17, both optional
+artifacts re-cut against `1282102c6` and verified alone and cumulatively, 512-file Windows portability scan).
+`gate-seqpar.sh` **PASS** -- off-inert logits **-0.000000 / 99.990 %**, the F32-wire family-switch calibration
+unchanged (0.010644 / 96.833 %, control 0.013587 / 96.225 %), the bf16 wire still its own round-only control, the
+inertness arms identical, and **arm 6 re-cut** for the new floor: `MIN=2 -ub 32` engages (clamped to 17),
+`-ub 16` is refused *and does not crash*, `-ub 17` engages and a sub-floor tail runs clean, `MIN=128 -ub 128`
+engages.  `gate-host-read-transport.sh` **30/30** -- including two new arms (`mlock-hole`, `mlock-nohole`): the hole
+set is named PAGEABLE, the census reports it, the tier's residency is named as necessity, and, with `sudo` available
+for a raised RLIMIT_MEMLOCK, **322 MiB pinned against 47 962 MiB of holes** (the sweep-back would fail the arm).
+`gate-host-pool.sh` **56/56** (every arm byte-identical: 182 chars `a99ccbd97ecb`, `tsplit`/`tsplitnosink` 171 chars
+`8c39335bbceb`).  `gate-prefill-logits.sh` **PASS** (mean KLD **0.000697**, same-top-p **98.784 %**, the r295 values
+to the digit -- the change moves no prefill number).  `gate-kv-residency.sh` **PASS** in full (window, single-device
+pool and multi-device pool sections) on the release build, after the text-comparison correction described above;
+`gate-per-block-build.sh --tip ec7007e5d --changed-from 713a75c1a` **4/4** (blocks 09, 12, 14, 0300 -- 9 / 12 / 20 /
+5 s; every other block's delta is unchanged) and `check-gpu-faults.sh` clean over every gate's window (kernel
+journal since 10:30).
+
+**Not run, and why.**  The MTP four-axis protocol: the change moves no kernel, no placement and no sampling path (a
+cache lookup's version bookkeeping, one floor constant, one pin exemption and one census line), and every arm above
+is byte-identical (`gate-prefill-logits.sh` also reproduces the r295 numbers exactly).  `gate-uma-experts.sh` needs
+an APU (this box is discrete).
+
 ## 261116.002 (r295) -- the `--kv-window` help text stops quoting the retired `11-26 %`, `parse_env()`'s diagnostics are buffered past the `--fit` probe's quiet logger, and the pool exchange's inertness is named (`TODO` #331, #332, #334 retired)
 
 **Amends blocks 12, 14 and 15** (no new block; split by code ownership: the env-log buffer and four of the five
