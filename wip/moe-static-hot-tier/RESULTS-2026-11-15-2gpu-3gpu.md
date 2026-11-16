@@ -331,3 +331,94 @@ noted:
   the store can see.  Extending the store to the bounce/cold path (a cold *id* that resolves to the store
   instead of the host master) is the change that would matter on a storage-backed box, and it is a kernel-id
   change, not a copy.
+
+## 12. State for the next session (handover)
+
+**BLOCKED on the `--load-mode dio` / `--load-mode mmap` rework** that is being done on the second development
+machine — see the last bullet.  Everything below is the state as it stands, so a fresh session can resume
+without re-deriving anything.
+
+### 12.1 Where the code is
+
+* Prototype: `~/llama.cpp` branch **`wip/drop-band-store`** (2 commits, tip `e550d842e`), cut from the r293
+  delivery tip `b950836f9`.  Build with `~/bin/build-llama-rocm` after `git checkout wip/drop-band-store`.
+* Portable form of the same change: [`drop-band-store.patch`](drop-band-store.patch) — sha256
+  `5131f29ad3f128e0e239bf2da5654b02aae038166e5232ac470c7c9b904bef32`, 345 insertions, **one file**
+  (`ggml/src/ggml-cuda/moe-expert-cache.cu`): no kernel, no header, no CMake change.  Apply to a clean r293
+  tree with `git apply`.
+* **Nothing is in `patches/`, `beta/` or `optional/`**, nothing was pushed to the fork, and `release.json` is
+  untouched.  The block decision (if this ever ships) is the maintainer's.
+* Harness: [`band-ab.sh`](band-ab.sh) — one llama-cli arm per invocation.  `MODEL=`, `LME=` (`-lme`), `EXTRA=`,
+  `DEVS=`, `UB=`, `CTX=`, `NGEN=`, `LV=4` for a census arm, `PROMPT=`, plus any `MOE_*`/`GGML_*`/`LLAMA_*`
+  variable the caller exports (`MOE_EXPERT_L2`, `MOE_HOST_POOL_DIO`, `MOE_HOST_POOL_FILL_SRC=file`,
+  `MOE_EXPERT_SEED`, …).  It prints the footer rates, `prompt eval time`, the decision/census lines and (on a
+  clean arm) the generated-text hash.
+* Knobs added by the prototype: `MOE_EXPERT_L2` (default `1`; **`0` is the A/B arm and is bit-for-bit the
+  pre-change path**) and `MOE_EXPERT_L2_MIB` (per-device cap; `0`/unset = the whole free band).
+  Census: `L2 (VRAM) expert store:` at `-lv 4` — planned size/entries per device, and at exit
+  `misses served / retained / recycled / regions dropped`.
+
+### 12.2 The measurement matrix (2 × R9700 unless stated; `-ub 16384`; 5 246-token prose prompt)
+
+| arm | arena / residency | demand tier | store decision | decode | text |
+|---|---|---|---|---|---|
+| IQ3_S, `MOE_EXPERT_L2=0` (baseline) | 40 121.5 MiB / 85.6 % | pinned mirror | — | 52.3 (2 k) / 52.4 (20 k) | `90675acf…` / `93fc5deb…` |
+| IQ3_S, store on | same | pinned mirror | armed, 7.7 GiB | 52.0 / 52.4 | identical |
+| IQ3_S, settle forced open (`MIN_GAIN_PP=0`) | 46 900 / 100 % | pinned mirror | — | 49.5 (**-5 %**) | identical |
+| IQ3_S, `MOE_EXPERT_SEED=lazy` | 40 121 / 85.6 % | pinned mirror | — | 42.9 (**prefill 115 t/s**) | identical |
+| IQ3_S, `-lme 4` + `FILL_SRC=file DIO=1` | 85.6 % | **storage** (~300 µs) | armed | 34.0 → **35.4 (+4.4 %)** | identical |
+| IQ3_S, `-lme 26` + `DIO=1` | 85.6 % | pinned (pool covers the complement) | armed | 40.7 → 40.7 | identical |
+| Flash-Next Q4_K_XL (111 GiB), `-lme 26` + file | low | storage | armed | 21.7 → 21.8 | identical |
+| 122B Q4_K_XL (78 GiB), `-lme auto` | 46 331.7 MiB / **70.6 %** | pinned mirror | **no band** (planned+dropped 8×, 0 entries) | 34.9 → 34.9 | identical |
+| 3 × R9700, IQ3_S, any `-ub` | 46 900 / **100 %** | pinned mirror | inert (no band) | 56.5-57.7 | — |
+
+### 12.3 Facts established here (do not re-derive)
+
+1. **The band's value on a saturated 2-device split is 0.08-0.42 pp** of routed mass (85.6 % residency already
+   covers 99.58 % of routings; 0.75 % of decode reaches miss at 2 k, 0.49 % at 20 k).  Taking it the way the
+   tree does costs **-41 % prefill** and -5 % decode.
+2. **That prefill cost is a transport bill, not the band's bytes**: the demand fill runs ~4 GB/s on the critical
+   path where the batched seed runs 17-33 GB/s, and it is paid because a whole-table stand-down destroys *hot*
+   residency.  A lazily-retained band would owe nothing.
+3. **Deferring a fill is expensive**: `MOE_EXPERT_SEED=lazy` costs **12x the prefill** (1 455 -> 115 t/s);
+   *retaining* a fill that was already scheduled is the free half.  (It is not the default for that reason.)
+4. **A pinned-mirror fill is ~12 µs and fully hidden** (21 fills/token would be 1.3 % of a token if serialized;
+   measured 0.0 % over 20 000 tokens).  The store pays only the fill it avoids.
+5. **A storage fill is ~300 µs** (0.45 MiB at 2 083 MiB/s) and the store's saving matches it exactly
+   (3 584 hits × ~307 µs = 1.08 s of 29.4 s = +4.4 %).  **Ceiling on that shape: +30 %**, hit-rate-limited.
+6. **The store's hit rate is demand-limited, not capacity-limited** (6 entries recycled in 1 000 tokens; 31 %
+   of retained victims re-touched).  Bigger stores do not help; a longer reuse window might.
+7. **A heavier model does not create the opportunity — it removes the band.**  122B at 70.6 % residency fills
+   the mapped arena, so `share < expert_bytes` and the store is inert.  "Plenty of band" and "the hot set does
+   not fit" do not co-occur on two cards; the shapes that break it are a wide `-ub` on a model that fits,
+   3 GPUs, or a smaller arena (24 GiB card / `-lme` pressure).
+8. **The store costs the prefill 0.0 % in every arm** (prefill t/s identical to 4 digits): it is dropped whole
+   before the boundary moves into it, and no table is ever stood down for it.
+9. **The text hash is the correctness instrument.**  The `+30 %` that turned out to be corruption (1 032 chars
+   against 3 499) was visible only as a text-length/hash change; both `a wrong-text arm is a bug report` and
+   the share/allocation-mismatch bug (a descent can shrink the block, so the per-table share must be derived
+   **after** the allocation) are recorded in §11.
+10. **`-ub` is the cheaper way to residency on a saturated split** (`-ub 4096` = 100 % residency, best 5 k-prefill
+    and best decode, §4) — the store is what you use when the wide `-ub` must stay.
+
+### 12.4 Open items, in the order that pays
+
+* **P1 — extend the store to the bounce/cold path.**  The only version with a large number: on the disk arm the
+  census reads **134 749 per-expert storage reads (61 141.6 MiB, 29 359 ms, 2 083 MiB/s)** on the bounce path
+  against 29 624 arena fills — 4.5x the traffic the store can currently see.  Serving it needs a **cold id that
+  resolves to the store** instead of the host master (`moe_cache_get_cold` + the remap's cold half), i.e. a
+  kernel-id change rather than a copy.  Design note: the cold id space is shared with the pinned master and the
+  pool, so the store needs either its own id range or its own base pointer per table.
+* **P2 — raise the hit rate** (facts 6): measure the reuse-distance curve at 1 k / 5 k / 20 k / 40 k on the
+  storage arm, and consider retaining experts that arrive *through the bounce path* (they never enter the arena,
+  so today they are never stored).
+* **P3 — re-derive the crossover against the new load-mode vocabulary** once the rework lands, and check whether
+  a sub-complement `-lme` pool reaches storage **on its own** (the `-lme 26` arm showed it covering the
+  complement, so today storage needs `-lme` below the complement or `FILL_SRC=file`, which is the knob being
+  reworked).
+* **P4 — the 3-GPU cell** has no band at all (100 % residency), so the only 3-GPU question left is the reserve
+  accounting below; there is nothing for the store to do there.
+* **Carried findings, not this campaign's, still awaiting a decision** (recorded, nothing opened): the 3-GPU
+  default `GGML_CUDA_SLAB_RESERVE_MIB` **abort** at a wide prefill (`HipVMM Failure: out of memory`, rc 134;
+  2 048+ MiB runs — §6a), and the `-ub 8192` (99.6 % residency) `MOE_EXPERT_CACHE_IDENTITY_PREF` **cliff**
+  (**-8.5 %** decode against the uniform placement — §6b).  No `TODO` handles exist for either.

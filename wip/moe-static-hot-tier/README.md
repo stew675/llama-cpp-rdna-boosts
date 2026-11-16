@@ -1,7 +1,9 @@
 # wip/moe-static-hot-tier — a STATIC VRAM expert tier filled by heat, frozen outside the movable boundary
 
-**Status: OPEN — SCOPING NOTE (2026-11-02), revised 2026-11-15 after r292 and measured the same evening**
-([`RESULTS-2026-11-15-2gpu-3gpu.md`](RESULTS-2026-11-15-2gpu-3gpu.md), harness [`band-ab.sh`](band-ab.sh)).
+**Status: OPEN — BLOCKED (2026-11-15) on the `--load-mode dio`/`mmap` rework on the second machine; resume from
+the record's §12 (handover).**  Revised 2026-11-15 after r292 and measured the same evening
+([`RESULTS-2026-11-15-2gpu-3gpu.md`](RESULTS-2026-11-15-2gpu-3gpu.md), harness [`band-ab.sh`](band-ab.sh),
+prototype [`drop-band-store.patch`](drop-band-store.patch) / `~/llama.cpp` `wip/drop-band-store` `e550d842e`).
 The measurement **does not** kill the idea — it names what is missing and caps the prize:
 
 * **The prize is the shape's, not the idea's.**  On a 2-device `-sm tensor` split the band is 24.4 % of the

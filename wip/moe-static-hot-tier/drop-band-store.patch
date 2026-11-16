@@ -1,0 +1,427 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 17c310d88..47e74ea54 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -183,6 +183,19 @@ struct table_t {
+     // per-token host routing readback).
+     bool        identity    = false;
+ 
++    // PROTOTYPE (wip/moe-static-hot-tier): this table's slice of the per-device second-level VRAM expert
++    // store (see the `g_l2_*` block before `access_locked`).  `l2_base` points at `l2_cap` expert-sized
++    // entries inside ONE slab arena allocation per device; the entries are COPIES of experts the arena
++    // evicted, are never addressed as slots, and are freed wholesale when a prefill takes the band back.
++    char *      l2_base    = nullptr;
++    int         l2_cap     = 0;
++    std::vector<int32_t> l2_slot;                  // entry -> expert (-1 empty)
++    std::unordered_map<int32_t, int32_t> l2_index; // expert -> entry
++    std::vector<int64_t> l2_stamp;                 // entry -> the table clock it was last written at
++    int64_t     l2_hits    = 0;                    // misses served from the store instead of from host
++    int64_t     l2_retains = 0;                    // evicted residents copied into the store
++    int64_t     l2_evicts  = 0;                    // entries the store itself recycled
++
+     // wip/apu-expert-gtt P5 (prefill streaming): this table's own census.  `pf_pass` counts the prefill stream
+     // calls it has served (one per ubatch), so a pass-indexed read histogram shows whether a repeated prompt
+     // re-reads bytes the previous chunk already held.  The byte counters are what the plan's accept criterion
+@@ -4788,6 +4801,268 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
+     return err;
+ }
+ 
++
++// =====================================================================================================
++// PROTOTYPE (wip/moe-static-hot-tier): a SECOND-LEVEL VRAM expert store in the band a prefill -> decode
++// drop returns.
++//
++// The band is free arena VA between the decode boundary and the tables (the slab allocates arena top-down,
++// so the free run sits just above the boundary) and a prefill reclaims it by moving the boundary up.  Today
++// its only consumer is table GROWTH (`MOE_EXPERT_CACHE_STEADY_REARM`), which re-sizes whole tables at the
++// drop and gets stood down whole at the next prefill: on a saturated split that costs -41 % of a 5 k
++// prompt's prefill for 0.42 pp of routed mass (campaign record RESULTS-2026-11-15, §1-§3).
++//
++// This store is the alternative that costs the prefill nothing:
++//   * ONE slab arena allocation per device, partitioned per table by expert-sized entries -- the store is
++//     never addressed as table slots, so `arena + slot * expert_bytes` (every routed-op kernel) is
++//     untouched and no kernel changes;
++//   * an arena eviction RETAINS the victim's bytes here (a D2D copy of bytes that are about to be
++//     overwritten -- no host I/O, no extra read: the weight was already on the device);
++//   * a miss whose expert is in the store is served from it (D2D into the slot) instead of from the pinned
++//     host pool, which is the whole point: the LRU dropped the expert, the bytes never left VRAM;
++//   * a boundary move (prefill) frees the WHOLE region in one call -- no table stood down, no remap rebuilt,
++//     no slot count changed -- so the prefill sees exactly the residency it would have had with no store.
++// Every copy is of the same expert bytes the fill would have written, so the text is bit-identical.
++// =====================================================================================================
++static bool    g_l2_on      = true;   // MOE_EXPERT_L2=0 is the A/B arm (bit-for-bit the pre-change path)
++static int64_t g_l2_mib     = 0;      // MOE_EXPERT_L2_MIB: per-device cap, 0/unset = the whole free band
++static int64_t g_l2_hits    = 0;
++static int64_t g_l2_retains = 0;
++static int64_t g_l2_evicts  = 0;
++static int64_t g_l2_drops   = 0;
++static int64_t g_l2_bytes   = 0;      // resident across all devices, now
++static void *  g_l2_region[GGML_CUDA_MAX_DEVICES]       = {};
++static size_t  g_l2_region_bytes[GGML_CUDA_MAX_DEVICES] = {};
++
++// Drop a table's view of the store.  The bytes stay owned by the device region (freed as a unit).
++static void l2_clear_table_locked(table_t & t) {
++    t.l2_base = nullptr;
++    t.l2_cap  = 0;
++    t.l2_slot.clear();
++    t.l2_stamp.clear();
++    t.l2_index.clear();
++}
++
++// Free the whole region on one device.  Called from the prefill's boundary move: the band is the work
++// pool's now, so the store is dropped WHOLE -- that is the property that makes it free (no table is stood
++// down, nothing is re-read, and the residency the prefill sees is the one it would have seen without it).
++static size_t l2_free_locked(int device) {
++    size_t freed = 0;
++    for (table_t & t : g_tables) {
++        if (t.device != device) {
++            continue;
++        }
++        l2_clear_table_locked(t);
++    }
++    if (g_l2_region[device] != nullptr) {
++        // A D2D copy issued from the take-over hook can be a node of a captured graph, and the region's
++        // address is about to stop existing: invalidate captures exactly as a table stand-down does.
++        ggml_cuda_graph_mem_freed(device);
++        ggml_cuda_slab_arena_free(device, g_l2_region[device], g_l2_region_bytes[device]);
++        freed = g_l2_region_bytes[device];
++        g_l2_bytes -= (int64_t) g_l2_region_bytes[device];
++        if (g_l2_bytes < 0) {
++            g_l2_bytes = 0;
++        }
++        g_l2_region[device]       = nullptr;
++        g_l2_region_bytes[device] = 0;
++        g_l2_drops++;
++    }
++    return freed;
++}
++
++// Size / partition the store from the arena's CURRENT free VA (the band the drop just returned) and hand
++// every eligible table an equal BYTE share of it.  Re-planned at every drop: the region is a cache, so
++// throwing its content away to re-partition costs nothing but the retained copies.
++static void l2_plan_locked(int device) {
++    if (!g_l2_on || g_gtt_arena || !ggml_cuda_slab_enabled()) {
++        return;
++    }
++    // Eligibility FIRST, with no device call: a device with no tables is never touched (a hidden ordinal
++    // would make the guard itself fail), and a device whose tables are all wholly resident has nothing to
++    // store.
++    std::vector<int> elig;
++    size_t used = 0;
++    for (int i = 0; i < (int) g_tables.size(); i++) {
++        const table_t & t = g_tables[i];
++        if (t.device != device || !t.allocated || t.slots <= 0 || t.expert_bytes == 0 || t.identity) {
++            continue;   // stood down, or already wholly resident (no miss can ever reach the store)
++        }
++        used += t.arena_reserved;
++        elig.push_back(i);
++    }
++    if (elig.empty()) {
++        return;
++    }
++    device_guard dg(device);
++    l2_free_locked(device);
++    const size_t cap_total = ggml_cuda_slab_arena_total(device);
++    if (cap_total <= used) {
++        return;   // no band on this device (the sizing already took it)
++    }
++    size_t want = cap_total - used;
++    if (g_l2_mib > 0 && want > (size_t) g_l2_mib << 20) {
++        want = (size_t) g_l2_mib << 20;
++    }
++    // A quarter of the band is deliberately left free: the boundary moves in 64 MiB chunks and a store that
++    // fills the band exactly would be dropped by the first chunk of any prefill growth.
++    want = (want / 4) * 3;
++    if (want / elig.size() == 0) {
++        return;
++    }
++    // Allocate ONE block (the slab rounds to its arena unit) and carve it up by each table's own expert size.
++    // A free band that is FRAGMENTED into runs smaller than `want` still has a store to take: descend until a
++    // run fits (a shape whose arena is 70 % resident leaves only ~2 GiB of band, in pieces).
++    void * base = nullptr;
++    size_t alloc_bytes = want;
++    for (int attempt = 0; attempt < 10 && base == nullptr; attempt++) {
++        base = ggml_cuda_slab_arena_alloc(device, alloc_bytes);
++        if (base == nullptr) {
++            alloc_bytes = alloc_bytes * 3 / 4;
++            if (alloc_bytes < (1u << 20) || alloc_bytes < elig.size() * 4096) {
++                break;
++            }
++        }
++    }
++    if (base == nullptr) {
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            GGML_LOG_INFO("%s: drop-band expert store NOT armed on device %d: the arena's free band is %.1f MiB "
++                          "but no single free run holds the store (fragmented); nothing is lost, the miss path "
++                          "is unchanged\n", __func__, device, (double) want / (1024 * 1024));
++        }
++        return;
++    }
++    want = alloc_bytes;
++    // The share MUST be re-derived here: the descent above can shrink the block, and a share computed from
++    // the original `want` would carve the last tables' entries PAST the end of the region -- into another
++    // table's arena or the work region -- which is silent VRAM corruption (measured on the 122B, whose band
++    // is small and fragmented: the corrupted arm generated 1 032 characters instead of 3 499).
++    const size_t share = want / elig.size();
++    if (share == 0) {
++        ggml_cuda_slab_arena_free(device, base, want);
++        return;
++    }
++    const size_t unit = ggml_cuda_slab_arena_unit(device);
++    const size_t reserved = unit > 0 ? unit * ((want + unit - 1) / unit) : want;
++    g_l2_region[device]       = base;
++    g_l2_region_bytes[device] = reserved;
++    g_l2_bytes += (int64_t) reserved;
++    // The region's address is a kernel argument for any captured graph that contains a store copy.
++    ggml_cuda_graph_mem_freed(device);
++
++    size_t off = 0;
++    int    n_tables = 0;
++    int    n_entries = 0;
++    for (int i : elig) {
++        table_t & t = g_tables[i];
++        const size_t k = share / t.expert_bytes;
++        if (k == 0) {
++            continue;
++        }
++        if (off + k * t.expert_bytes > want) {
++            break;   // never carve past the block (see the share note above)
++        }
++        t.l2_base = (char *) base + off;
++        t.l2_cap  = (int) k;
++        t.l2_slot.assign(k, -1);
++        t.l2_stamp.assign(k, 0);
++        t.l2_index.clear();
++        off += k * t.expert_bytes;
++        n_tables++;
++        n_entries += (int) k;
++    }
++    if (n_tables == 0) {
++        l2_free_locked(device);
++        return;
++    }
++    GGML_LOG_INFO("%s: L2 (VRAM) expert store: device %d, %.1f MiB in the band the drop returned (%d entries "
++                  "over %d table(s), %.0f KiB each; MOE_EXPERT_L2=0 disables it)\n", __func__, device,
++                  (double) reserved / (1024 * 1024), n_entries, n_tables,
++                  (double) (n_entries > 0 ? share / 1024 : 0));
++}
++
++static void l2_plan_all_locked() {
++    // PROTOTYPE knobs, read once.  `MOE_EXPERT_L2=0` is the A/B arm and is bit-for-bit the pre-change path
++    // (nothing is allocated, `l2_cap` stays 0, so the miss path never touches the store).
++    static bool parsed = false;
++    if (!parsed) {
++        parsed   = true;
++        g_l2_on  = env_int("MOE_EXPERT_L2", 1) != 0;
++        g_l2_mib = env_int("MOE_EXPERT_L2_MIB", 0);
++        if (g_l2_mib < 0) {
++            g_l2_mib = 0;
++        }
++    }
++    if (!g_l2_on || g_gtt_arena || !ggml_cuda_slab_enabled()) {
++        return;
++    }
++    bool have[GGML_CUDA_MAX_DEVICES] = {};
++    for (const table_t & t : g_tables) {
++        if (t.device >= 0 && t.device < GGML_CUDA_MAX_DEVICES) {
++            have[t.device] = true;
++        }
++    }
++    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
++        if (have[d] && g_l2_region[d] == nullptr) {
++            l2_plan_locked(d);
++        }
++    }
++}
++
++// Retain an evicted resident in the store: copy `t.expert_bytes` from `src` (the arena slot, about to be
++// overwritten) into the expert's entry, taking a free entry, else the least recently written one that is
++// not `avoid` (the entry a caller is about to read).  Pure D2D: the bytes are already on the device.
++static void l2_retain_locked(table_t & t, int32_t expert, const char * src, void * stream, int avoid) {
++    if (t.l2_cap <= 0 || t.l2_base == nullptr || (int) t.l2_slot.size() != t.l2_cap) {
++        return;
++    }
++    int entry = -1;
++    const auto it = t.l2_index.find(expert);
++    if (it != t.l2_index.end()) {
++        entry = it->second;
++    }
++    if (entry < 0) {
++        for (int i = 0; i < t.l2_cap; i++) {
++            if (t.l2_slot[(size_t) i] < 0) {
++                entry = i;
++                break;
++            }
++        }
++    }
++    if (entry < 0) {
++        int64_t best = INT64_MAX;
++        for (int i = 0; i < t.l2_cap; i++) {
++            if (i == avoid || t.l2_slot[(size_t) i] < 0) {
++                continue;
++            }
++            if (t.l2_stamp[(size_t) i] < best) {
++                best  = t.l2_stamp[(size_t) i];
++                entry = i;
++            }
++        }
++        if (entry < 0) {
++            return;
++        }
++        t.l2_index.erase(t.l2_slot[(size_t) entry]);
++        t.l2_evicts++;
++        g_l2_evicts++;
++    }
++    char * dst = t.l2_base + (size_t) entry * t.expert_bytes;
++    if (cudaMemcpyAsync(dst, src, t.expert_bytes, cudaMemcpyDeviceToDevice, (cudaStream_t) stream) != cudaSuccess) {
++        (void) cudaGetLastError();   // fail soft: the store is an optimisation, never a correctness source
++        t.l2_slot[(size_t) entry] = -1;
++        t.l2_index.erase(expert);
++        return;
++    }
++    t.l2_slot[(size_t) entry] = expert;
++    t.l2_index[expert]        = entry;
++    t.l2_stamp[(size_t) entry] = t.clock;
++    t.l2_retains++;
++    g_l2_retains++;
++}
++
+ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+                               const int32_t * protect = nullptr, int n_protect = 0,
+                               bool * out_cold = nullptr) {
+@@ -4843,6 +5118,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+     }
+     int     slot   = -1;
+     int32_t victim = -1;   // arena resident evicted by this miss (also fetched into the pool: additive)
++    bool    l2_served = false;   // PROTOTYPE: this miss was served from the L2 VRAM store (no host read)
+     if ((int) t.expert_slot.size() < t.slots) {
+         for (int s = 0; s < t.slots; s++) {
+             if (t.slot_expert[s] < 0) { slot = s; break; }
+@@ -4893,6 +5169,33 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+             }
+             t.evictions++;
+         }
++        // PROTOTYPE (wip/moe-static-hot-tier): the L2 VRAM store.  Both operations are D2D copies of bytes
++        // that are already on the device, so neither costs host I/O:
++        //   (1) RETAIN the victim this miss is about to overwrite (its bytes are still in the slot here);
++        //   (2) SERVE the miss from the store when it is already there -- the LRU dropped it, VRAM did not.
++        // (1) runs even on a hit: the victim has to go somewhere, and the store is the cheapest place.
++        if (slot >= 0 && t.l2_cap > 0) {
++            const auto l2it = t.l2_index.find(expert);
++            const int l2_hit = (l2it != t.l2_index.end() &&
++                                l2it->second >= 0 && l2it->second < t.l2_cap) ? l2it->second : -1;
++            if (victim >= 0) {
++                l2_retain_locked(t, victim, (const char *) t.arena + (size_t) slot * t.expert_bytes, stream, l2_hit);
++            }
++            if (l2_hit >= 0) {
++                char *       dst = (char *) t.arena + (size_t) slot * t.expert_bytes;
++                const char * src = t.l2_base + (size_t) l2_hit * t.expert_bytes;
++                if (cudaMemcpyAsync(dst, src, t.expert_bytes, cudaMemcpyDeviceToDevice,
++                                    (cudaStream_t) stream) == cudaSuccess) {
++                    t.l2_index.erase(expert);
++                    t.l2_slot[(size_t) l2_hit] = -1;
++                    t.l2_hits++;
++                    g_l2_hits++;
++                    l2_served = true;
++                } else {
++                    (void) cudaGetLastError();   // fall through to the host fill: the store is optional
++                }
++            }
++        }
+     }
+     if (slot < 0) {
+         if (cold_ok && out_cold != nullptr) {
+@@ -4922,7 +5225,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+     t.last[expert] = t.clock;
+     t.fills++;
+ 
+-    if (g_fill && t.host != nullptr) {
++    if (!l2_served && g_fill && t.host != nullptr) {
+         g_acc_fills++;
+         g_fill_bytes += (int64_t) t.expert_bytes;
+         char * dst = (char *) t.arena + (size_t) slot * t.expert_bytes;
+@@ -6183,6 +6486,7 @@ static void free_table_buffers_locked(table_t & t) {
+     t.expert_slot.clear();
+     t.remap_host.clear();
+     t.hook_experts.clear();
++    l2_clear_table_locked(t);   // PROTOTYPE: the store's entries for this table are gone with its map
+ }
+ 
+ void alloc_table_locked(table_t & t, int slots) {
+@@ -7927,6 +8231,22 @@ void moe_cache_forget_all(int device) {
+     // parameters, so nothing may be freed while one is still in flight.
+     moe_cache_sync_devices_locked();
+ 
++    // PROTOTYPE (wip/moe-static-hot-tier): the L2 store goes back to the slab before the tables do.
++    {
++        std::set<int> live;
++        for (const table_t & t : g_tables) {
++            if (t.device >= 0 && (device < 0 || t.device == device)) {
++                live.insert(t.device);
++            }
++        }
++        for (int d : live) {
++            if (d >= 0 && d < GGML_CUDA_MAX_DEVICES && g_l2_region[d] != nullptr) {
++                device_guard dg(d);
++                l2_free_locked(d);
++            }
++        }
++    }
++
+     int64_t freed_b = 0;
+     std::set<const void *> dead_hosts;
+     for (int i : drop) {
+@@ -8379,6 +8699,7 @@ bool moe_cache_rearm() {
+     }
+     if (by_layer.empty()) {
+         g_steady_skipped++;
++        l2_plan_all_locked();   // PROTOTYPE: the drop returned band even when nothing had to be re-armed
+         return false;
+     }
+ 
+@@ -8485,6 +8806,8 @@ bool moe_cache_rearm() {
+                                    : "no host source can be resolved",
+                       (double) g_arena_bytes / (1024 * 1024));
+     }
++    l2_plan_all_locked();   // PROTOTYPE (wip/moe-static-hot-tier): size the L2 store from the band this drop
++                            // returned, AFTER the tables have taken what they are entitled to.
+     return n_rearmed > 0;
+ }
+ 
+@@ -8514,6 +8837,20 @@ size_t moe_cache_evict_slab_range(int device, void * lo, void * hi) {
+     // No kernel that holds an arena address in its launch parameters may still be in flight.
+     moe_cache_sync_devices_locked();
+ 
++    // PROTOTYPE (wip/moe-static-hot-tier): the L2 VRAM store is a CACHE, so the work pool takes it whole and
++    // nothing else has to happen: no table is stood down, no remap is rebuilt, no slot count changes.  This
++    // is the reason the store costs a prefill nothing -- after this line the residency the prefill sees is
++    // the one it would have seen if the store had never existed.
++    {
++        const uintptr_t l2_lo = (uintptr_t) g_l2_region[device];
++        const uintptr_t l2_hi = l2_lo + g_l2_region_bytes[device];
++        if (g_l2_region[device] != nullptr && l2_lo < a_hi && l2_hi > a_lo) {
++            const size_t dropped = l2_free_locked(device);
++            GGML_LOG_INFO("%s: dropped the drop-band expert store (%.1f MiB) for the taken slab range; no "
++                          "table stood down for it\n", __func__, (double) dropped / (1024 * 1024));
++        }
++    }
++
+     size_t freed = 0;
+     int    n_down = 0;
+     for (table_t & t : g_tables) {
+@@ -13215,6 +13552,13 @@ static void report_locked() {
+                       __func__, (long long) g_acc_hits, (long long) g_acc_fills, (long long) g_acc_colds,
+                       100.0 * (double) g_acc_hits / (double) acc, 100.0 * (double) g_acc_fills / (double) acc,
+                       100.0 * (double) g_acc_colds / (double) acc);
++        if (g_l2_on) {
++            GGML_LOG_INFO("%s: L2 (VRAM) expert store: misses served from the store=%lld, evicted residents "
++                          "retained=%lld, entries the store recycled=%lld, regions dropped for a prefill=%lld, "
++                          "%.1f MiB resident now%s\n", __func__, (long long) g_l2_hits, (long long) g_l2_retains,
++                          (long long) g_l2_evicts, (long long) g_l2_drops, (double) g_l2_bytes / (1024 * 1024),
++                          g_l2_on ? "" : " (MOE_EXPERT_L2=0)");
++        }
+         GGML_LOG_INFO("%s: expert H2D traffic: fills=%.1f MiB cold-reads=%.1f MiB total=%.1f MiB over ~%lld tokens = %.2f MiB/token\n",
+                       __func__, (double) g_fill_bytes / (1024 * 1024), (double) g_cold_bytes / (1024 * 1024),
+                       (double) bytes / (1024 * 1024), (long long) tokens,
