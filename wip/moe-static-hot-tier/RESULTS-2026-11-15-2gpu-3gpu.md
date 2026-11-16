@@ -335,8 +335,10 @@ noted:
 ## 12. State for the next session (handover)
 
 **BLOCKED on the `--load-mode dio` / `--load-mode mmap` rework** that is being done on the second development
-machine — see the last bullet.  Everything below is the state as it stands, so a fresh session can resume
-without re-deriving anything.
+machine (§12.4 **P3**: this campaign's whole crossover is the fill *source*, and the arms used
+`MOE_HOST_POOL_DIO` / `MOE_HOST_POOL_FILL_SRC=file` as the proxy for a storage-backed demand tier — exactly the
+mechanism being reworked).  Everything below is the state as it stands, so a fresh session can resume without
+re-deriving anything.
 
 ### 12.1 Where the code is
 
@@ -345,7 +347,7 @@ without re-deriving anything.
 * Portable form of the same change: [`drop-band-store.patch`](drop-band-store.patch) — sha256
   `5131f29ad3f128e0e239bf2da5654b02aae038166e5232ac470c7c9b904bef32`, 345 insertions, **one file**
   (`ggml/src/ggml-cuda/moe-expert-cache.cu`): no kernel, no header, no CMake change.  Apply to a clean r293
-  tree with `git apply`.
+  tree with `git apply` — **verified**: `git apply --check` passes against `b950836f9` in a fresh worktree.
 * **Nothing is in `patches/`, `beta/` or `optional/`**, nothing was pushed to the fork, and `release.json` is
   untouched.  The block decision (if this ever ships) is the maintainer's.
 * Harness: [`band-ab.sh`](band-ab.sh) — one llama-cli arm per invocation.  `MODEL=`, `LME=` (`-lme`), `EXTRA=`,
