@@ -7,6 +7,21 @@ then `0300`).  The optional artifacts (`optional/*/01xx-*.patch`: `0100` two-lan
 K/V) are **not** in this set and never in the default apply.  The base is a `release.json` field — this
 line only states which re-base it is.
 
+> **r298: the expert cache's alias guard owes the ROLE, and a take-over's promise owes a repair (`TODO` #335/#336
+> retired).**  Blocks **09** (`table_t.sem`, the role-aware `alias_find_checked` + its in-place `sem_role_matches`
+> comparer, the `taken_cpy` promise and its writes in `moe_cache_take_over`/`moe_cache_update_host`/
+> `moe_cache_remap_dev`), **10** (`moe_cache_repair_copy`, the `take-over promises broken=/repaired=` census line,
+> `MOE_EXPERT_TAKEOVER_FAULT`, and the redirect's served/declined split with its repair call) and **15** (the promise
+> in the GTT prefill in-place path).  The consumer resolved a table from the scheduler's `input_cpy` address guarded by
+> device + layer only, so a buffer recycled for a **sibling role of the same layer** served the neighbour's arena in
+> place: `blk.43.ffn_up_exps` computed out of `blk.43.ffn_down_exps` (`nan`, then `-2.1e7`; Flash-Next + MTP, 2 devices
+> `-sm layer`, `-c 32768`), which was r297's `f40ae789f219`-vs-`7a3474cbe5f1` pair and, with a capture baking the
+> wrong pointer, its degenerate pressure arm.  The in-place prefill read itself is a base-pointer swap: **KLD
+> 0.000000 / same-top-p 100.000 %** against the staged arm.  A promise broken by an eviction between the hook and the
+> consumer's launch is now re-filled from the host master instead of read.  Knobs: `MOE_EXPERT_ALIAS_ROLE_CHECK`
+> (default 1, A/B), `MOE_EXPERT_TAKEOVER_FAULT` (diagnostic).  Record:
+> `benchmarks/2026-11-16-in-place-read-alias-role.md`, `INVARIANTS.md` r298, `GREEDY-PURITY.md` §89 (corrected) + §94.
+
 > **r294: the MTP target h-rows path is opt-in (GitHub issue #318).**  Upstream `#31927`'s device-side `h_nextn`
 > rows came in with the r278 base and r281 turned them on for every single-head MTP model, because the call site is
 > upstream's.  A Windows/HIP user measured that arm as a **-1.3 to -1.6 % decode loss** (identical text, identical

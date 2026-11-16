@@ -1,4 +1,4 @@
-From 84466bf9f9064c8b94e62eca24164959f2c77dab Mon Sep 17 00:00:00 2001
+From 0774a878f3f81c4b03052b14081d03be393b72fc Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/16] rdna-boosts: block 09: host-resident MoE (iface,
@@ -83,7 +83,7 @@ text/acceptance byte-identical everywhere.
  ggml/src/ggml-cuda/graph.cuh                  |    4 +
  ggml/src/ggml-cuda/mmvq.cu                    |  276 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 7019 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 7084 +++++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h         |  382 +
  ggml/src/ggml-cuda/norm.cu                    |   35 +
  ggml/src/ggml-cuda/norm.cuh                   |    1 +
@@ -122,7 +122,7 @@ text/acceptance byte-identical everywhere.
  tests/test-backend-tensor.cpp                 |    3 +
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 70 files changed, 18094 insertions(+), 540 deletions(-)
+ 70 files changed, 18159 insertions(+), 540 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -10952,10 +10952,10 @@ index 4140f681a..35f625eaa 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..0f20161ea
+index 000000000..95f3e7bc5
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,7019 @@
+@@ -0,0 +1,7084 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -11072,6 +11072,10 @@ index 000000000..0f20161ea
 +    size_t      arena_reserved = 0;
 +    std::vector<int32_t> slot_expert;   // slots -> expert id, -1 empty
 +    std::unordered_map<int32_t, int32_t> expert_slot;
++    // The table's SEMANTIC role (`sem_role` of the host master: "ffn_up_exps.weight", ...).  The alias
++    // guard compares it on every consumer lookup, so a scheduler buffer reused for a sibling role of the
++    // same layer can never resolve the wrong table (TODO #336).
++    std::string sem;
 +    bool        slot_dirty  = false;    // a slot changed since the last device-map upload
 +    std::vector<int64_t> count;         // per expert, decaying LFU counter (uses while RESIDENT)
 +    std::vector<int64_t> ghost;         // per expert, decaying demand counter (uses while NON-resident)
@@ -11088,6 +11092,11 @@ index 000000000..0f20161ea
 +    // in at sizing time, and the consumer reads the arena with the raw routing ids (no remap, no
 +    // per-token host routing readback).
 +    bool        identity    = false;
++    // TODO #335/#336: the scheduler-backed buffer this table's last take-over PROMISED to serve (the
++    // scheduler skips filling it when a hook returns true), or nullptr.  Cleared when the redirect serves the
++    // table; a table still holding a promise when the redirect declines has had its copy skipped, which is the
++    // state the consumer must repair rather than read.
++    const void * taken_cpy  = nullptr;
 +
 +    // slot-remapped ids for the most recent routing (device), and its shape.
 +    int32_t *   remap_dev   = nullptr;
@@ -11263,27 +11272,75 @@ index 000000000..0f20161ea
 +
 +// An alias is keyed by a scheduler tensor address, and the graph allocator reuses those addresses across graphs - with
 +// several devices, for a split input on ANOTHER device.  A lookup that is not preceded by a registration in the same
-+// graph can therefore hit a stale alias: another layer's table, or another device's (its arena/counters are then read
-+// or written from the wrong GPU - a page fault or garbage, with -sm layer on 2 GPUs).
-+// Only trust an alias whose table is on the calling device and, when the op is known, belongs to the op's layer.
++// graph can therefore hit a stale alias: another layer's table, another device's (its arena/counters are then read
++// or written from the wrong GPU - a page fault or garbage, with -sm layer on 2 GPUs), or -- the one the layer and
++// device checks cannot see -- ANOTHER ROLE OF THE SAME LAYER (`TODO` #336).
++// Only trust an alias whose table is on the calling device, belongs to the op's layer and holds the op's ROLE.
++//
++// The ROLE check is load-bearing, not belt-and-braces.  A layer's gate/up/down tables share a device and a layer
++// number, and a whole layer's routed ops are issued back to back, so the scheduler's copy buffer for
++// `blk.43.ffn_down_exps` is routinely reused for `blk.43.ffn_up_exps` (the allocator recycles the split input).
++// Without the role the alias resolves the neighbouring role's table, and every consumer acts on it: the take-over
++// hook (keyed on the HOST master, so it resolves the RIGHT table) declines `up` because that table is not identity,
++// the scheduler fills the copy -- and then the consumer's redirect serves `down`'s ARENA in place, so `up` is read
++// out of `down`'s bytes.  Measured (Flash-Next GSQ-IQ3_XXS + MTP, 2 devices `-sm layer`, `-c 32768`): a NaN at
++// `blk.43.ffn_up_exps` (-2.1e7 at `down`), one near-tie token flip, and on a VRAM-pressure arm a wholly degenerate
++// continuation (`TODO` #335).  `sem_role_matches` compares in place (no allocation, no string build on the
++// decode path).
 +static int64_t g_alias_stale = 0;
-+static int alias_find_checked(const void * key, int device, int layer) {
-+    const auto it = g_alias_to_id.find(key);
++// A/B and bisection knob for the role half of the alias guard (`TODO` #336).  Default ON; `0` restores the
++// pre-r298 behaviour (device + layer only), which is the arm that reads a sibling role's arena.
++static const bool g_alias_role_check = [] {
++    const char * e = getenv("MOE_EXPERT_ALIAS_ROLE_CHECK");
++    return e == nullptr || atoi(e) != 0;
++}();
++static bool sem_role_matches(const char * name, const std::string & sem) {
++    if (name == nullptr || sem.empty() || sem == "?") {
++        return true;   // nothing to compare against: behave as before
++    }
++    const char * b = name;
++    const char * e = name + strlen(name);
++    const char * first = strchr(name, '#');
++    const char * last  = strrchr(name, '#');
++    if (first != nullptr && last != nullptr && last > first + 1 && last + 1 < e) {
++        b = first + 1;
++        e = last;
++    }
++    if ((size_t) (e - b) > 4 && memcmp(b, "blk.", 4) == 0) {
++        const char * d = (const char *) memchr(b + 4, '.', (size_t) (e - b - 4));
++        if (d != nullptr) {
++            b = d + 1;
++        }
++    }
++    for (const char * p = e; p > b + 1; p--) {
++        if (p[-1] == '-' && p < e && *p >= '0' && *p <= '9') {
++            e = p - 1;
++            break;
++        }
++    }
++    return (size_t) (e - b) == sem.size() && memcmp(b, sem.data(), sem.size()) == 0;
++}
++
++static int alias_find_checked(const ggml_tensor * key, int device, int layer) {
++    const auto it = g_alias_to_id.find((const void *) key);
 +    if (it == g_alias_to_id.end()) {
 +        return -1;
 +    }
 +    const int id = it->second;
 +    if (id < 0 || id >= (int) g_tables.size() ||
 +        (device >= 0 && g_tables[id].device != device) ||
-+        (layer >= 0 && g_tables[id].layer >= 0 && g_tables[id].layer != layer)) {
++        (layer >= 0 && g_tables[id].layer >= 0 && g_tables[id].layer != layer) ||
++        (g_alias_role_check && !sem_role_matches(key != nullptr ? key->name : nullptr, g_tables[id].sem))) {
 +        if (g_alias_stale++ == 0 || (g_alias_stale % 10000) == 0) {
 +            // Warn on the first, then every 10000th: the guard is doing its job either way, but the
 +            // magnitude is what tells a one-off (a scheduler address reused across graphs, which is
 +            // routine) from a runaway (the graphs being re-planned constantly).
-+            GGML_LOG_WARN("%s: ignoring a stale MoE-cache alias (table device %d layer %d, op device %d layer %d); %lld refused so far\n",
++            GGML_LOG_WARN("%s: ignoring a stale MoE-cache alias (table device %d layer %d role %s, op device %d "
++                          "layer %d); %lld refused so far\n",
 +                          __func__, id >= 0 && id < (int) g_tables.size() ? g_tables[id].device : -1,
-+                          id >= 0 && id < (int) g_tables.size() ? g_tables[id].layer : -1, device, layer,
-+                          (long long) g_alias_stale);
++                          id >= 0 && id < (int) g_tables.size() ? g_tables[id].layer : -1,
++                          id >= 0 && id < (int) g_tables.size() ? g_tables[id].role.c_str() : "?",
++                          device, layer, (long long) g_alias_stale);
 +        }
 +        return -1;
 +    }
@@ -16074,6 +16131,7 @@ index 000000000..0f20161ea
 +    table_t t;
 +    t.layer        = layer;
 +    t.role         = (role != nullptr) ? role : "?";
++    t.sem          = sem_role((const ggml_tensor *) src0);
 +    t.n_experts    = n_experts;
 +    t.expert_bytes = expert_bytes;
 +    t.host_bytes   = host_bytes > 0 ? host_bytes : expert_bytes;
@@ -17056,6 +17114,7 @@ index 000000000..0f20161ea
 +    t.remap_n_used = n_used;
 +    t.remap_n_tok  = n_tok;
 +    g_takeover++;
++    t.taken_cpy = weight_cpy;   // TODO #335/#336: the scheduler skips `input_cpy` for this pass
 +    return true;
 +}
 +
@@ -17311,6 +17370,7 @@ index 000000000..0f20161ea
 +        t.dr_last_ids    = ids->data;
 +        t.dr_last_stream = stream;
 +        g_takeover++;
++        t.taken_cpy = weight_cpy;   // TODO #335/#336: the scheduler skips `input_cpy` for this pass
 +        g_devremap_calls++;
 +        return true;
 +    };
@@ -17467,6 +17527,7 @@ index 000000000..0f20161ea
 +    if (t.identity && t.arena != nullptr && t.slots >= t.n_experts &&
 +        op != nullptr && op->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
 +        g_get_ok++;
++        t.taken_cpy = nullptr;   // served: the promise it was made with is honoured
 +        if (arena)        *arena        = t.arena;
 +        if (n_slots)      *n_slots      = t.slots;
 +        if (expert_bytes) *expert_bytes = t.expert_bytes;
@@ -17479,6 +17540,7 @@ index 000000000..0f20161ea
 +        return false;
 +    }
 +    g_get_ok++;
++    t.taken_cpy = nullptr;   // served: the promise it was made with is honoured
 +    if (arena)        *arena        = t.arena;
 +    if (n_slots)      *n_slots      = t.slots;
 +    if (expert_bytes) *expert_bytes = t.expert_bytes;
@@ -17565,7 +17627,6 @@ index 000000000..0f20161ea
 +    if (name_layer(weight) < 0) {
 +        return false;
 +    }
-+    std::lock_guard<std::mutex> lock(g_mutex);
 +    // A partially-failed cache MUST fall back wholesale, exactly as the fusion guard assumes.  The guard
 +    // stands the cache-aware fusions down as soon as any table is unserveable (`!moe_cache_has_arena()`),
 +    // and the scheduler hook must agree: if it still took the input over, the scheduler would skip
@@ -17576,22 +17637,26 @@ index 000000000..0f20161ea
 +    // OPEN 2 slab: gate per TABLE.  The `identity` check below already requires THIS table's arena
 +    // and slots, so this hook, the update hook and `moe_cache_get_table` agree per table; only the fusion
 +    // guard is global (`moe_cache_has_arena()`), so a partial cache loses the fusions but keeps serving.
-+    const auto it = g_key_to_id.find({ (const void *) weight, device });
-+    if (it == g_key_to_id.end()) {
-+        return false;   // not registered yet (the first, priming token): the normal path sizes it
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        const auto it = g_key_to_id.find({ (const void *) weight, device });
++        if (it == g_key_to_id.end()) {
++            return false;   // not registered yet (the first, priming token): the normal path sizes it
++        }
++        const int id = it->second;
++        if (id < 0 || id >= (int) g_tables.size()) {
++            return false;
++        }
++        table_t & t = g_tables[id];
++        const bool identity = t.identity && t.arena != nullptr && t.slots >= t.n_experts;
++        if (!identity) {
++            return false;
++        }
++        // Overwrite: the graph allocator reuses these device pointers across graphs (see
++        // `moe_cache_update_host`), so the alias must track the current tensor.
++        g_alias_to_id[weight_cpy] = id;
++        t.taken_cpy = weight_cpy;   // TODO #335/#336: the promise this hook makes to the scheduler
 +    }
-+    const int id = it->second;
-+    if (id < 0 || id >= (int) g_tables.size()) {
-+        return false;
-+    }
-+    table_t & t = g_tables[id];
-+    const bool identity = t.identity && t.arena != nullptr && t.slots >= t.n_experts;
-+    if (!identity) {
-+        return false;
-+    }
-+    // Overwrite: the graph allocator reuses these device pointers across graphs (see
-+    // `moe_cache_update_host`), so the alias must track the current tensor.
-+    g_alias_to_id[weight_cpy] = id;
 +    return true;
 +}
 +

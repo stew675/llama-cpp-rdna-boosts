@@ -2,6 +2,12 @@
 
 > **Promoted:** `apu-expert-gtt` is now **block 16** of the delivery (r263, `v17-a691b2345-r263`); its record moved to [`archive/work/apu-expert-gtt/`](../archive/work/apu-expert-gtt/README.md) and its gate is `scripts/gate-uma-experts.sh`.  It is no longer an open campaign.
 >
+> **Closed (r298, 2026-11-16):** the in-place-prefill-read campaign (`TODO` #335 + #336) is **finished**: the read was
+> never the carrier — a stale expert-cache ALIAS resolved a sibling ROLE's arena — and the fix is folded into blocks
+> 09/10/15.  Its record moved to [`archive/work/prefill-in-place-read/`](../archive/work/prefill-in-place-read/README.md)
+> (`benchmarks/2026-11-16-in-place-read-alias-role.md`, `WORKLOG.md` 261116.005, `INVARIANTS.md` r298); it is not an
+> open campaign and it is not kept here as a stub.
+>
 > **Archived (2026-11-13):** the `4f9dfa0e3` re-base campaign (`upstream-rebase-261113`) is **complete** — the delivery is re-cut at `v17-4f9dfa0e3-r278` and has moved on since (r279/#307+#308, r280/#310, r281/#311); the campaign record's own tree values are historical and its record moved to [`archive/work/upstream-rebase-261113/`](../archive/work/upstream-rebase-261113/README.md).  It is not an open campaign and it is not kept here as a stub; what it left open is `TODO` #322-#326.
 
 This is the index `AGENTS.md` refers to.  `wip/` holds **active exploration only** — nothing here is part

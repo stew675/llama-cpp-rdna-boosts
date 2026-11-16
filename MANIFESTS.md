@@ -655,6 +655,33 @@ in CI.  The model-level gates are manual:
     pass.  Required for any change to `graph_max_nodes()`, the scheduler's sizing, a memory module that adds graph
     nodes/leafs, or anything that changes a graph's node count per layer.
 
+28. **The expert cache's alias ROLE and its take-over promise** (r298, `TODO` #335/#336 retired) — the consumer
+   resolves a routed expert table from the scheduler's `input_cpy` **address**, and the graph allocator recycles those
+   addresses: a layer's `ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps` share a device and a layer number, so an alias
+   guarded by device + layer only resolves a *sibling role* and the redirect serves the neighbour's arena in place.
+   `moe_cache_repair_copy` covers the other half (a take-over's "I skip the copy" promise broken by an eviction between
+   the hook and the consumer's launch).  Verify, on a config whose cache really serves in place (`get_ok > 0` and
+   `identity` tables at `-lv 4`):
+   * the **role arms** — `MOE_EXPERT_ALIAS_ROLE_CHECK=0` against the default on Flash-Next GSQ-IQ3_XXS + its MTP
+     sidecar (2 devices `-sm layer`, `-ncmoe 48`, `-c 32768`, prior absent, 64 tokens): `0` reads one text and the
+     default reads the *other*, and the default must equal the staged (`MOE_EXPERT_PREFILL_IN_PLACE=0`) arm.  Pass
+     is `837 chars sha=f40ae789f219` (`=0`) against `835 chars sha=7a3474cbe5f1` (default **and** staged) — i.e. the
+     gate asserts the two arms AGREE on the default, not merely that each is stable;
+   * the guard must be doing the work: `-lv 2` `alias_find_checked: ignoring a stale MoE-cache alias (… role …)` once
+     per run (a run that never refuses is a vacuous arm — the refusal is the finding);
+   * the **promise repair** — `MOE_EXPERT_TAKEOVER_FAULT=1` on the same model at `-c 8192` on
+     `prompts/kld-corpus-35b-in-domain.txt`: the exit census must read `take-over promises broken=<n> repaired=<n>`
+     with `n > 0` **and** `repaired == broken`, and its greedy text must be byte-identical to both no-fault arms
+     (r298: `595 chars sha=c0e7e91d84c4`) — a repair that is skipped, or that changes the text, is the failure;
+   * **`gate-prefill-logits.sh --ab "MOE_EXPERT_PREFILL_IN_PLACE=0"`** on a host-expert arm of the same model
+     (`--ctx 2048 --chunks 7` on `prompts/kld-corpus-35b-in-domain.txt`, 2 devices `-sm layer`, `-ncmoe 48`):
+     mean KLD **0.000000** / same-top-p **100.000 %**.  This is the measurement that says the in-place read is a
+     base-pointer swap, and it is the arm that `TODO` #336 was owed;
+   * plus `scripts/gate-host-pool.sh` (the host-expert scheduler path) and `scripts/gate-kv-residency.sh` when the
+     change also touches residency.
+   A byte validator cannot substitute for any of this: `MOE_EXPERT_CACHE_VALIDATE=3` reads 0 `MISMATCH` on the NaN arm
+   (`INVARIANTS.md` r298 fact 3).
+
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 
 ## Verification per block

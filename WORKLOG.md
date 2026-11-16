@@ -1,3 +1,71 @@
+## 261116.005 (r298, RELEASE v16-4f9dfa0e3-r298) -- `TODO` #335 and #336 retired together: the in-place prefill read was NEVER the carrier -- a stale expert-cache ALIAS resolved a SIBLING ROLE's arena
+
+**Amends blocks 09, 10 and 15** (no new block: the cache engine's alias guard and the take-over promise in **09**, the
+repair + its census and the consumer's served/declined split in **10**, the promise in the GTT prefill in-place path in
+**15**).  Patches regenerated and re-cut from a canonical apply at `4f9dfa0e3`; `release.json` at
+**`v16-4f9dfa0e3-r298`** (`tip 99c4717c6`, `tree 5f55d95a5`; optional `0100` -> `19cb07ae4`, `0101` -> `ad7862e3e`,
+cumulative `d344b4188`), `validate-set.sh` GREEN, `gate-per-block-build.sh --changed-from 1347f895a --fast` GREEN
+5/5 (09/10/12/15/0300).  Record:
+[`benchmarks/2026-11-16-in-place-read-alias-role.md`](benchmarks/2026-11-16-in-place-read-alias-role.md),
+`INVARIANTS.md` r298, `GREEDY-PURITY.md` §89 (corrected again) + §94.
+
+**What r297 had left open, and what it actually was.**  Both items were written as defects of the in-place prefill
+**read**: `#336` said the in-place and staged arms "read the same bytes, so a logit difference between them is a bug"
+(Flash-Next + MTP, `-c 32768`: `f40ae789f219` in place against `7a3474cbe5f1` staged) and `#335` said a captured graph
+replays an arena pointer whose table the slab evicted mid-run (degenerate `a753000294c9` under VRAM pressure).  Both
+are the same bug, and it is not the read: the expert cache resolves a table from the scheduler's **copy tensor
+address**, guarded by device + layer only -- and a layer's `gate`/`up`/`down` tables share both.  The hooks resolve the
+**host master** (so they decline correctly for a non-identity role) while the consumer's redirect resolves the **copy
+pointer** (so a stale alias serves the *neighbour role's* arena).  Measured at the first divergent dispatch:
+`blk.43.ffn_up_exps` (T=42, `identity=0`, remap 10 wide) produced `nan`, then `-2.1e7`, because it was read out of
+`blk.43.ffn_down_exps`'s arena (`identity=1`, device 1, layer 43); the two arms' 8022 earlier dispatches are the same
+kernel family with the same hashes.  The fix compares the semantic role in `alias_find_checked` (in place, no
+allocation); its first refusal in that run names exactly that pair, and there is **one refusal in a 24 K-token
+prompt**.  Both of r297's pairs collapse to `835 chars 7a3474cbe5f1`, and `GGML_MOE_DEVREMAP=0`,
+`GGML_CUDA_DISABLE_GRAPHS=1` and `GGML_SCHED_DEVGATHER=0` all leave the pre-fix pair unmoved.
+
+**`#336`'s owed magnitude: 0.000000.**  `gate-prefill-logits.sh --ab "MOE_EXPERT_PREFILL_IN_PLACE=0"` on the
+Flash-Next host-expert arm (2 devices `-sm layer`, `-ncmoe 48`, `--ctx 2048 --chunks 7` on
+`prompts/kld-corpus-35b-in-domain.txt`, 143 identity tables, `get_ok` 1280) reads **mean KLD 0.000000 / same-top-p
+100.000 %** -- on the pre-fix build too.  So the read is a base-pointer swap and `ENVIRONMENT.md`'s "the two arms read
+the same bytes" claim was right all along; the difference was a *wrong pointer*, not a different read.
+
+**`#335`'s workaround matrix, explained.**  `GGML_CUDA_DISABLE_GRAPHS=1` (a capture bakes the pointer it served into
+the launch parameters and a replay repeats the wrong table), `GGML_CUDA_SLAB=0` / `MOE_EXPERT_CACHE_MIB=20000` / a
+smaller `-c` (no eviction -> no stand-down/re-arm -> no alias churn), `MOE_EXPERT_PREFILL_IN_PLACE=0` (the staged
+arms never run the redirect) and dropping the drafter (no `T=42` MTP ingest batch, the width where the first wrong
+read appears) are each a *less-stale-alias* arm.  And r297's `MOE_EXPERT_CACHE_VALIDATE=3` was right to report 0
+`MISMATCH` over 157 sampled dispatches: the **arena** held the model's bytes -- the consumer was reading the wrong
+table's slots, which a byte validator cannot see.  Not reproduced on this box: `#335`'s exact degenerate text (the
+pressure arm here is coherent pre-fix, with its wrong-role refusal at layer 30); the hazard is present in it, and its
+severity is one near-tie unless the wrong pointer is baked into a capture.
+
+**Also closed, as hardening rather than as the fix.**  A take-over hook's promise ("do not fill `input_cpy`") can be
+broken by an arena eviction that lands between the hook and the consumer's launch (an op's workspace allocation can
+move the work boundary from inside a graph), which the per-table guards could not see.  `moe_cache_repair_copy()`
+re-fills the skipped buffer from the host master when the table still holds a promise for that buffer, and
+`MOE_EXPERT_TAKEOVER_FAULT=1` makes the identity take-over break its own promise so the path is exercised: the arm's
+text is byte-identical to both no-fault arms (`595 chars c0e7e91d84c4`) while re-filling 343.8-450.0 MiB per broken
+promise.  The exit census prints `take-over promises broken=N repaired=N`; ordinary runs -- including the pressure arm,
+which evicts mid-prompt -- read **0 / 0**.
+
+**Two diagnostic environment variables, no behaviour change on any measured arm:** `MOE_EXPERT_ALIAS_ROLE_CHECK`
+(default 1; `0` is the pre-r298 arm) and `MOE_EXPERT_TAKEOVER_FAULT` (default off).  Throughput of the role check
+(35B-A3B Q8_0 `-ncmoe 48` 2 devices, `tg128`, interleaved): `=0` 62.61 / 64.26 t/s against the default 64.05 / 64.92
+t/s, i.e. inside the run spread.
+
+**Release gates.**  Coherence 4B 3-device `1c5d32ac537d` (the documented reference); `gate-host-pool.sh` **56/56**
+(nine arms byte-identical, `ref`/`dio`/`nodisk`/`fail`/`late`/`pinlate`/`pin0` = `a99ccbd97ecb`, `tsplit`/`tsplitnosink`
+= `8c39335bbceb`); `gate-prefill-logits.sh` canonical 27B 0.000000 / 100.000 % (base re-recorded from this build --
+against the r297-era base the same candidate reads 0.000697 / 98.784 %, reproducible, and this change is inert on a
+dense model: no expert table means `moe_cache_enabled()` is false and the redirect never runs); the Flash-Next
+host-expert `--ab` arm 0.000000 / 100.000 %; per-block build 5/5; `validate-set.sh` GREEN; every run's kernel journal
+clean.
+
+**Release mechanics.**  The revision number first went out as `r321` (there is no `r298`-`r320`; the sequence is one
+per `WORKLOG` entry, so `r297` -> **`r298`**).  Corrected at the source: the block-09 commit's comment, the re-cut
+patches, `rdna-boosts-all.patch` and `release.json` all say `r298`, and `fork-refresh.sh` re-derived the same tip/tree.
+
 ## 261116.004 (r297, RELEASE v16-4f9dfa0e3-r297) -- `TODO` #327 retired, and it was a refutation: the prefill MoE fusions cannot fire for a cache-managed table, so the coupling they were blamed for never existed -- and the residency-dependent text is the in-place READ (two new items, #335/#336)
 
 **Amends blocks 09 and 10** (no new block: the cache engine and its fusion contract in **09**, the fusion dispatcher

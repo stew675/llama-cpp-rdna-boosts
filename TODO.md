@@ -41,12 +41,11 @@ left in this file.  The r236 re-base
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
-| **335** | a captured graph can replay an expert-arena pointer whose table the slab evicted mid-run (Flash-Next + MTP at VRAM pressure) | purity / correctness (blocks 09/10; `INVARIANTS.md` r297) | **OPEN** (2026-11-16) — reproducible degenerate output; three workarounds, no fix yet — §335 |
-| **336** | the in-place prefill read is not bit-identical to the staged read (a coherent near-tie, `MOE_EXPERT_PREFILL_IN_PLACE=1` vs `=0`) | purity / measurement (blocks 09/10) | **OPEN** (2026-11-16) — the magnitudes are unmeasured: `llama-perplexity` cannot load a drafter — §336 |
 
 ## Handle numbering
 
-**New handles append after `#336`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
+**New handles append after `#336`, and a number is never reused.**  (`#335` and `#336` were retired at r298 -- an
+alias ROLE gap in the expert cache, `WORKLOG.md` 261116.005 -- so the next free handle is `#337`.)  `#NN` is a permanent handle: a `WORKLOG.md` entry
 that cites `TODO #74` still means the same subject after that item has closed and left this file.
 
 **Two allocation mistakes are on the record, and both are left in place because renumbering would break the dated
@@ -164,77 +163,6 @@ table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2
 
 **OPEN — found 2026-11-07 on `soar` while gating issue #281.**  `scripts/gate-host-pool.sh` is **36/37 on a clean r231 checkout** (`a19aab55e`) with this one check red: `pinlate` 171 chars `sha=b981e742aa13` against `ref` 182 / `a99ccbd97ecb`, deterministic across two builds and two runs, a one-token divergence at ~31 of 32 greedy tokens.  **Narrowed, four arms, all byte-identical controls:** the cold in-place read is NOT the cause (`MOE_EXPERT_CACHE_COLD_UVA=0` in both arms still diverges); the compute path is NOT the cause (`fail`/`late` stand every table down — `get_ok=0 decline_all=4929` — and still match `ref`, so the fallback computes the same logits); the decode device remap is NOT the cause (`GGML_MOE_DEVREMAP=0` still diverges).  What is left is the mixture itself (`pinlate`: `get_ok=552 decline_all=1711`, 119 rolled-back fills), i.e. a table serving some ops from the arena and others from the fallback inside one run.  `gate-host-pool.sh` now proves the fallback's byte-identity in the same run and reports this as a WARN instead of passing it blindly (a wholesale arm that diverges still FAILS).  **Next:** one instrumented run (the per-table `hits/misses/fills` line) to name the table whose op differs, and check the prefill-staging snapshot (`gprs_dev`/`prs_dev`) that is built before a rolled-back admission — the r219 class one layer deeper.  **MAGNITUDE MEASURED (2026-11-07, same session):** the delivery's own criterion on the gate's config (`llama-perplexity -c 512 --chunks 2 --kl-divergence --kl-divergence-base`) reads **median KLD -0.000000, 99.9 % -0.000040 worst, Same top p 100.000 %** -- ~1e-5, two orders of magnitude inside the 0.005 tolerance. So the mixture is a *path* difference (a ~1e-5 arithmetic difference, most likely a different kernel instantiation for the ops that fall back), **not wrong bytes**: `MOE_HOST_POOL_VERIFY=1` reports 0 pool-read mismatches in the latched arm, and a demoted-slot drain-before-serve diagnostic changed nothing.  The byte-identical *text* assertion was therefore the wrong instrument for this arm (it is the right one for the wholesale arms, which remain bit-exact); the gate now uses it there and reports the mixture as a WARN.  Re-entry: a latched box whose *logits* move outside the tolerance, or one that produces a wrong answer rather than a different near-tie.  Record: `WORKLOG.md` 261107.* (`pinlate`), `benchmarks/` issue-#281 campaign; the gate's own `pinlate` arm.
 
-## 335. A captured graph can replay an expert-arena pointer whose table the slab evicted mid-run
-
-**Found 2026-11-16 (r297) while implementing `TODO` #327.  Pre-existing on r296, not caused by it: the r296 build
-reproduces it identically.**
-
-**Kind:** purity / correctness (the output is *degenerate*, not a near-tie).
-
-**The arm.** Flash-Next `GSQ-RCO-IQ3_XXS` + `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` as `-md`,
-`HIP_VISIBLE_DEVICES=0,1`, `-sm layer`, `-ngl 99 -ncmoe 48 -ot 'per_layer_token_embd.*=CPU' -lm none -lzm off`,
-`-c 16384 -ctk q8_0 -ctv q8_0`, `-f prompts/prose-rdna-boosts.txt -n 64 --seed 42 --temp 0`,
-`ROCBLAS_USE_HIPBLASLT=0`, `MOE_EXPERT_HEATMAP=load`.  At `-c 16384` the arena clamps VRAM to `free-clamped=2` MiB.
-
-| arm | text | prompt t/s |
-|---|---|---|
-| `MOE_EXPERT_PREFILL_IN_PLACE=1` (default) | 82 chars `sha=a753000294c9` — `…\n3333333…` | 853 |
-| `MOE_EXPERT_PREFILL_IN_PLACE=0` | 328 chars `sha=7c5a512a8447` | 587 |
-| in place + `GGML_CUDA_DISABLE_GRAPHS=1` | 297 chars `sha=04ca2590aebf` (coherent) | — |
-| in place + `GGML_CUDA_SLAB=0` | 328 chars `sha=7c5a512a8447` | 948 |
-| in place + `MOE_EXPERT_CACHE_MIB=20000` | 297 chars `sha=04ca2590aebf` | 604 |
-| in place + `MOE_EXPERT_CACHE_MIB=0` (cache off) | 296 chars `sha=91ef8940d66e` | — |
-| no drafter (`-md` dropped), either in-place arm | both `7c5a512a8447` | 1001 / 840 |
-| `-c 8192` (no eviction), either arm | both `7c5a512a8447` | 672 / 603 |
-
-**What is ruled out.** The arena's bytes are correct: `MOE_EXPERT_CACHE_VALIDATE=3` sampled 157 in-place dispatches
-(36 of them with `tables=144 resident=132 down=12`) with **0** `MISMATCH`, 0 `NONFINITE-HEAD`, 0 `NONUNIFORM-LAYER`.
-Filling the `input_cpy` copy the take-over skipped does not change the result, so it is not a missing copy.  The
-four prefill MoE fusions never fire in this arm (r297's census), so it is not a fusion.
-
-**What it is.** `moe_cache_evict_slab_range` fires **inside the prompt** (the log shows
-`evicted 3946.0 MiB … 12 table(s) stood down until the compute-buffer drop re-arms them`, then `re-armed 12`, both
-before the `[ Prompt: … ]` footer) and hands those arena ranges back to the slab's free list.  A graph captured
-before that event still carries the old arena address in its launch parameters (the arena is a raw device pointer,
-not a tensor source, so `ggml_cuda_graph_update_required` cannot see it); `ggml_cuda_graph_mem_freed()` bumps the
-generation, which invalidates the *next* capture/replay, but a replay already issued keeps reading the freed range.
-`GGML_CUDA_DISABLE_GRAPHS=1` removing the symptom is the direct evidence.  **Open question:** whether the fix is to
-defer the eviction to a graph boundary, to make the arena a tracked graph participant, or to make a replay
-re-resolve — that is the work.
-
-**Workarounds until then:** `MOE_EXPERT_PREFILL_IN_PLACE=0` (stages the prefill; -31 % prompt t/s on this arm),
-`GGML_CUDA_SLAB=0` (no eviction; +11 % over staged here), or keep the arena off the VRAM ceiling
-(`MOE_EXPERT_CACHE_MIB`, a smaller `-c`).  A text comparison on a pressure configuration must pin one of them, in
-addition to `MOE_EXPERT_HEATMAP=load`.
-
-Record: [`benchmarks/2026-11-16-prefill-in-place-fusion-contract.md`](benchmarks/2026-11-16-prefill-in-place-fusion-contract.md),
-`INVARIANTS.md` r297.
-
-## 336. The in-place prefill read is not bit-identical to the staged read (coherent, magnitude unmeasured)
-
-**Found 2026-11-16 (r297); this is r284's differential with its cause corrected — it is NOT the MoE fusions.**
-
-Same arm as #335 but `-c 32768` (no eviction, coherent output):
-
-| prior | `MOE_EXPERT_PREFILL_IN_PLACE` | text |
-|---|---|---|
-| absent | 1 | `f40ae789f219` |
-| absent | 0 | `7a3474cbe5f1` |
-| present | 1 | `7a3474cbe5f1` |
-| present | 0 | `7a3474cbe5f1` |
-
-So `MOE_EXPERT_PREFILL_IN_PLACE=0` still collapses the two residency states (r284's rule stands: a fresh-process text
-comparison must pin the cache state), but the carrier is the in-place **read** itself, not a fusion stand-down — the
-fusions never fire in either arm.  **Owed:** the magnitude.  `llama-perplexity --kl-divergence` is the instrument and
-it cannot load a drafter, so the state that produces the difference cannot be measured today; without one, both
-priors read KLD 0.000000 / top-p 100 % at 99.65 % residency.  Two escapes, either of which closes it: give
-`llama-perplexity` an `-md`, or force partial residency without a drafter (`MOE_EXPERT_CACHE_MIB=N` on a discrete
-box, `-lme 16` on the APU arm `gate-uma-experts.sh` already runs) and run `gate-prefill-logits.sh --ab
-"MOE_EXPERT_PREFILL_IN_PLACE=0"` there.  A nonzero KLD is the bug; 0.000000 retires the item.
-
-Record: [`benchmarks/2026-11-16-prefill-in-place-fusion-contract.md`](benchmarks/2026-11-16-prefill-in-place-fusion-contract.md),
-`INVARIANTS.md` r297, `GREEDY-PURITY.md` §89/§93.
-
 ## Accepted limitations (deliberately not fixed — do not re-report)
 
 These are closed: no work is owed and no row above tracks them.  A handle is kept where one was ever allocated, so
@@ -295,10 +223,12 @@ unmeasured (`llama-perplexity` cannot load a drafter, which is the state that pr
 re-entry is a prefill-logit arm that can, and a measurement above the 0.005 tolerance.  The chosen way to remove the
 coupling -- teach the prefill fusions the in-place contract -- was implemented in r297 and **refuted**: those
 fusions cannot fire for a cache-managed table at all, so the coupling was never theirs (`INVARIANTS.md` r297).
-What remains is the in-place prefill **read**, tracked as `TODO` #335 (degenerate under eviction pressure) and
-`TODO` #336 (the coherent near-tie, magnitude still unmeasured).  Record:
+**CLOSED r298:** what r297 then blamed -- the in-place prefill *read* (`TODO` #335, #336) -- was a **stale alias**
+resolving a sibling ROLE's arena, and the read itself measures KLD 0.000000 / top-p 100.000 % against the staged arm.
+The comparison rule stands (pin the prior); the residency-to-text coupling it was written for does not.
+Record: [`benchmarks/2026-11-16-in-place-read-alias-role.md`](benchmarks/2026-11-16-in-place-read-alias-role.md),
 [`benchmarks/2026-11-14-residency-reproducibility.md`](benchmarks/2026-11-14-residency-reproducibility.md),
-`INVARIANTS.md` r284, `GREEDY-PURITY.md` §89.
+`INVARIANTS.md` r284 + r298, `GREEDY-PURITY.md` §89 (corrected) + §94.
 
 ### #300 — the attendance pool is NOT supported on a shared host/device pool (an APU) (retired r264)
 
