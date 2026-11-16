@@ -1,3 +1,21 @@
+## 261115.008 (r292) -- post-release 24 GiB confirmation with the final gate: the fix arm is unchanged (43.54/43.61 t/s, arena 15 995.3 MiB, traffic -38.2 %, text identical); same-binary A/B +18.4 % (the release's +19.5 % was against the separately built r291 base at 36.50)
+
+Re-ran the RX 7900 XTX (`gfx1100`, 24 GiB, PCIe 4.0 x16, mirror) field shape on the **final release tree**
+(`tip 2b7a65309`, tree `4a67e7c9`) -- 2 interleaved cycles, 2 000 greedy tokens, heat prior pinned,
+`-ncmoe 48 -ub 16384 -c 32768`, plain decode.  Same-binary A/B (`MOE_EXPERT_CACHE_STEADY_REARM=1/0`):
+
+| arm | arena | hit | decode t/s | traffic |
+|---|---:|---:|---:|---:|
+| base (=0) | 11 428.6 MiB | 0.7416 | 36.69 / 36.89 | 479 996 / 479 429 MiB |
+| **fix (=1)** | **15 995.3 MiB** | **0.8412** | **43.61 / 43.54** | **296 483 MiB (-38.2 %)** |
+
+Text byte-identical (`sha 4ff95271242c`).  The decision line: the first drop offers **42.34 %** of the
+arena (17 568 -> 24 912 slots), prior coverage 65.05 % -> 76.90 %, **gain 11.85 pp** vs the 1.00 pp gate ->
+**settle ENABLED**.  The fix arm is unchanged from the pre-gate run (43.66/43.56); the separately built
+r291 base binary measured 36.16/36.84 (avg 36.50), which is where the release entry's +19.5 % came from.
+So the final gate changes nothing on this config (it is enabled, as expected); the honest same-binary
+delta is **+18.4 %**.  No non-uniform layer, no stand-down, no GPU faults.
+
 ## 261115.007 (r292, RELEASE v16-4f9dfa0e3-r292) -- block 09 gains the demand-gated arena settle (amend block 09, no new block): the band a prefill -> decode drop returns is taken where the decode set is short of it (+8.2 % at `-ub 16384`, +31.9 % at 32768, +36.8 % partial pool, +19.5 % on the 24 GiB card) and left alone on a saturated split
 
 The v2 candidate (now `archive/work/arena-steady-sizing/`, r292 entries below) is **promoted into block 09**, on the

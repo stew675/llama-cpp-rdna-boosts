@@ -8,6 +8,11 @@
 > One commit, one file (`ggml/src/ggml-cuda/moe-expert-cache.cu`), cut against the r291 tree
 > (`8423b2b5eac3`, `tip ec721312c`).
 >
+> **Post-release confirmation (final gate, 2026-11-15):** on the 24 GiB `gfx1100` field shape the final
+> release tree re-runs the same fix arm (43.61/43.54 t/s, arena 15 995.3 MiB, traffic -38.2 %, text
+> identical); the same-binary A/B is **+18.4 %** (base 36.69/36.89).  The pre-gate +19.5 % was against the
+> separately built r291 base binary (avg 36.50).  `WORKLOG.md` 261115.008.
+>
 > **What v2 changed.** The v1 candidate settled unconditionally at every drop. That is a loss on a
 > saturated split: a 2-device `-sm tensor` split already holds 437/512 experts per table and covers
 > 99.6 % of the routed mass, so taking the band bought **0.44 pp** of decode and cost a whole-table
