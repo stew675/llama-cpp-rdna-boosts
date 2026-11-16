@@ -1,0 +1,415 @@
+# `session-scheduling` — fair, preemptive prefill admission in `llama-server`
+
+**WIP campaign — NOT part of the delivery.**  Nothing here is in `patches/`, `release.json`, the fork's
+`rdna-boosts` branch or a release gate, and nothing is applied by `scripts/apply-all.sh`.  No `TODO` handle
+yet (the maintainer assigns one when this is accepted as work).
+
+Status: **OPEN — measurement + design only (2026-11-17).**  P0 is unimplemented.  The numbers below were
+taken on the delivery at `rdna-boosts` tip `c215c77f3` (r299 tree), gfx1201 ×1, ROCm 10.1.0, one
+`Qwen3.5-4B-Q8_0` (`/llm/models/Qwen3.5/4B/Q8_0/`), greedy, `--cache-prompt off`.
+
+## 0. What this campaign is, and what it is deliberately not
+
+**P0 (the whole point).**  `--parallel N` should behave concurrently:
+
+1. **No prefill starvation.**  A request's prompt must not wait behind another request's entire prompt.
+2. **Bounded decode interference.**  A slot that is decoding must not inherit another slot's prefill chunk
+   as its inter-token latency.
+3. **One slot prefilling while another decodes** must be the normal steady state, not an accident of the
+   fill order.
+
+All three are reachable **without touching the KV cache, the kernels or the backend scheduler**: they are
+decisions in `update_slots()`' batch assembly.  That is the campaign.
+
+**Not P0, kept separate on purpose (§5).**  Paged KV / fragmentation, cross-slot determinism, and true
+parallel *execution* (multi-context or multi-stream).  Each is a real question and each is recorded below
+with its mechanism and its falsification test — but folding any of them into P0 would replace a
+server-side scheduling change (days) with a memory-format or runtime change (weeks) that does **not** fix
+the observed symptom.
+
+## 1. Today's scheduler: one context, one batch, one thread
+
+| what | where |
+|---|---|
+| one `llama_context` for the model; every slot points at it | `slot.ctx_tgt = ctx_tgt`, `tools/server/server-context.cpp:1717` |
+| one sequence id per slot (`slot.id = i`), `n_seq_max = n_parallel` | `server-context.cpp:1716`; `common/common.cpp:2148` |
+| `n_ctx_seq = n_ctx / n_seq_max` unless `--kv-unified` | `src/llama-context.cpp:689-694` |
+| one scheduler thread runs the whole loop | `server_queue::start_loop`, `tools/server/server-queue.cpp:283` |
+| per iteration: build **one** batch = union of all slots | `update_slots()`, `server-context.cpp:3883` |
+| decode tokens are added **first** (one per generating slot) | `:4318` `handle_last_sampled_token(batch)` |
+| then prompts are admitted, slots **in index order**, each filling to `n_batch` | `:4328-4335`, inner loop `:4831` |
+| the batch is executed as one `llama_process()` per (ub)batch | `decode()`, `:5025`; `llama_process` `:5060` |
+| no preemption anywhere | `grep -rni preempt src/ tools/server/` → nothing |
+
+Two consequences that matter:
+
+* **Decode is genuinely batched.**  All generating slots' tokens are in the same graph, so the step is
+  shared.  This is real continuous batching (measured in §2.1).
+* **Prompt admission is a non-preemptive, slot-ordered batch filler.**  The inner loop is
+  `while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch)`: slot 0 takes the
+  whole window if it can, then slot 1 gets what is left.  Nothing rotates the cursor, nothing caps a
+  slot's share, and nothing withdraws an admitted token.  This is the defect (measured in §2.2-§2.4).
+
+Once tokens *are* in the batch, the ubatch splitter is already fair: `llama_batch_allocr::split_equal()`
+takes one token per sequence set per round, so a batch holding two prompts is split evenly between them
+(`src/llama-batch.cpp:668-913`).  **The sharing primitive exists; the admission policy is what is missing.**
+That is why P0 is small.
+
+## 2. Measurements
+
+Server used throughout (the `-b`/`-np` are the only variables):
+
+```bash
+HIP_VISIBLE_DEVICES=0 ./build-rocm/bin/llama-server \
+  -m /llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf \
+  -ngl 99 -np 2 -c 65536 -b 2048 -ub 512 -t 8 --no-warmup --port 8099
+```
+
+Prompts are synthetic (a repeated sentence, ~11 tokens per repetition) so the token counts are exact; a
+real gate should use `prompts/`.  Greedy (`temperature 0`, `seed 42`), `cache_prompt: false`, both requests
+fired from threads so they are admitted concurrently.  The harness is [`probe.py`](probe.py); the exact
+arm for each number below:
+
+| § | command | prompt size |
+|---|---|---|
+| 2.1 | `probe.py decode` | short prompt, 40 generated tokens |
+| 2.2 | `probe.py prefill --reps 180` | 2004 / 2205 tokens |
+| 2.3 | `probe.py prefill --reps 1200` | 13203 tokens each |
+| 2.4 | `probe.py starve --reps 1200` | 13204 + 7 tokens |
+| 2.5 | `probe.py itl --reps 1200 --n 200` | 13203 tokens, fired mid-decode |
+| 2.6 | `probe.py tps --n 200` | ~3.3 k tokens |
+| 2.7 | `probe.py agg` (server at `-b 16384`) | 8803 tokens solo vs 2 × 4403 together |
+
+### 2.1 Decode is batched (the user-visible "concurrency" already exists here)
+
+Two 40-token streams, `-np 2 -b 2048`: both finish in **0.56 s wall**, 40 tokens each, and the token
+arrival timestamps interleave at the *same* instants:
+
+```
+A@0.095 B@0.095 A@0.110 B@0.110 A@0.124 B@0.124 A@0.137 B@0.137 B@0.148 A@0.149 ...
+```
+
+That is one forward pass per step serving both sequences.  A statement like "llama.cpp only ever runs one
+session at a time" is therefore **not true for decode**.
+
+### 2.2 Prefill is co-batched only while both prompts fit the fill window
+
+| arm | tokens | TTFT | prompt eval |
+|---|---|---|---|
+| A | 2004 | 0.68 s | 677 ms (2959 t/s) |
+| B | 2205 | 0.65 s | 644 ms (3423 t/s) |
+
+Both prompts were processed in the **same ~0.65 s window** (`-lv 5` shows one `decode:` per step, and both
+`print_timing` lines land 12 ms apart).  They co-batch because A's prompt ran out before the 2048-token
+window filled, leaving room for B.
+
+### 2.3 Above the fill window, prompt 2 waits out prompt 1
+
+| arm | TTFT | total |
+|---|---|---|
+| one 13203-token prompt alone | 1.90 s | 1.93 s |
+| two 13203-token prompts | 2.60 s / **3.86 s** | 3.55 s / 3.90 s |
+
+The second request's prefill starts after the first has consumed the 2048-token window ~6 times.  Total
+work is unchanged; the *second* request simply has no share until the first is finished.
+
+### 2.4 Admission is slot-index priority, and `-b` does not bound it
+
+13204-token prompt + a 7-token prompt, second request fired 50 ms later:
+
+| admission order | long TTFT | short TTFT | short `prompt_ms` |
+|---|---|---|---|
+| **long admitted first** (slot 0) | 1.99 s | **1.91 s** | 270 ms (reported 24 "t/s") |
+| **short admitted first** (slot 0) | 1.96 s | **0.026 s** | 24 ms |
+| long admitted first, `-b 512` | 2.00 s | **1.92 s** | 293 ms |
+
+Two things to read off this:
+
+* Who goes first is **admission order, i.e. slot index** — not length, not arrival-time service.  A 7-token
+  prompt can wait 1.9 s.
+* **`-b` does not change the block.**  At `-b 512` the long prompt grabs 512 tokens per step instead of
+  2048, and the short prompt still waits ~1.9 s.  Lowering `-b` makes the monopoly finer-grained, not
+  fairer.  There is **no knob** today that shares the batch between prompts.
+
+The `prompt_per_second: 24` on the short request is the log-reading trap: `prompt_ms` is per-request wall
+time, so a 7-token prompt interleaved into someone else's batch reports a nonsense rate.
+
+### 2.5 A decoding slot's ITL is hostage to another slot's prefill chunk
+
+One slot decodes 200 tokens; 350 ms in, the other slot is given a 13203-token prompt:
+
+| | median token gap | during the other slot's prefill |
+|---|---|---|
+| decoder, no prefill | 10 ms | — |
+| decoder while the other slot prefills | — | **266 / 281 / 294 / 305 / 317 / 331 ms** for 6 consecutive tokens, then 86 / 104 ms |
+
+**26-33× the normal inter-token latency**, for as many tokens as the other prompt has 2048-token chunks.
+The decode token *is* included in every step (that part already works); what it inherits is the other
+slot's chunk duration.  This is the "not truly concurrent" a user actually feels, and it is the number P0
+must move.
+
+This is also why `scripts/gate-prefill-server-slots.sh` exists: it measures exactly this interference for
+the expert-cache placement policy (`TODO` #317, block 16).  A fairness change is the same arm with a
+different assertion.
+
+### 2.6 Throughput scaling is *not* the bug
+
+| concurrency | aggregate |
+|---|---|
+| 1 × 200 tokens | 82.6 t/s |
+| 2 × 200 tokens | 120.5 t/s (**1.46×**) |
+
+1.46× at concurrency 2 on one GPU is the memory-bandwidth wall, and vLLM shows the same shape on the same
+card.  Do not read a sub-2× aggregate as evidence of missing concurrency — read §2.5 instead.
+
+### 2.7 Co-batched prefill is throughput-neutral — the serialisation buys nothing
+
+This is the arm that decides what a fair policy may cost.  `-b 16384` so the batch is not the constraint,
+both requests admitted within **1 ms** of each other (`-lv 5`: the two `new prompt` lines, and both slots
+report the same `prompt_ms` — a symmetric split, not a client race):
+
+| arm | rows | wall | aggregate |
+|---|---|---|---|
+| 1 × 8803-token prompt | 8803 | 1.29 s | 6822 t/s |
+| **2 × 4403-token prompts, together** | 8806 | 1.24 s | **7124 t/s** |
+| 1 × 4403-token prompt | 4403 | 0.66 s | 6677 t/s |
+| **2 × 2203-token prompts, together** | 4406 | 0.65 s | **6805 t/s** |
+
+Two readings, and both matter:
+
+* **Each request takes ~1.87× its solo time** (1.235 s vs 0.66 s) because the card is saturated — that is
+  not a defect, it is the work.  The aggregate is conserved, and a bigger batch cannot beat it.
+* **Co-batching two prompt sequences is throughput-neutral.**  The deltas above (+4.4 % / +1.9 %) are inside
+  this box's run-to-run spread: re-running the same arm gave 2 × 2203 at **6893** t/s against a solo 4403 at
+  **7067** (−2.5 %), and 2 × 4403 at 7098 against 6963.  So the honest statement is **within ±3 %**, and the
+  only safe conclusion is the one that matters: **a second sequence in the batch costs nothing.**
+
+So the serialisation the current fill policy imposes buys **nothing at all** — not throughput, not kernel
+efficiency, not memory.  Two slots' rows ride the same layer GEMM at no extra cost, which is exactly the
+shape the hardware prefers.  Today's slot-order fill is therefore a pure latency-distribution decision,
+and §4.6 shows it is made in the direction that hurts the tail.
+
+## 3. Reading the server log (why it *looks* like one session)
+
+With `-lv 4`/`-lv 5` a run prints one `decode: n_batch (effective) = 2048, off = 0` line per **step**, and
+that step is the union of all slots.  There is no per-slot "step" line, `prompt_per_second` is per-request
+wall time (§2.4), and `slot print_timing: prompt eval time` is printed when the slot's prompt *finishes* —
+so two prompts that ran in parallel print 12 ms apart (§2.2) while two that ran serially print ~2 s apart
+(§2.3).  The instrumentation can distinguish them; the log layout just does not make it obvious.
+
+For a bench harness like `llama-benchy`, the sequence at concurrency 2 with prompts above the fill window
+is: request 2 admitted, no prompt progress, then request 1's prefill done, then request 2's prefill.  That
+is §2.3/§2.4, and it is real — it is just *admission*, not execution.
+
+## 4. P0 — the change
+
+### 4.1 Insertion point
+
+Only `update_slots()` (`server-context.cpp:4328-5000`).  Keep everything else: one context, one batch, the
+existing ubatch splitter, the existing `can_batch_with()` homogeneity rule.
+
+### 4.2 Per-slot prefill budget with a rotating cursor
+
+Replace "fill to `n_batch` slot by slot" with "share what is left":
+
+```
+budget_left  = max(0, n_batch - batch.size())        // after decode tokens are in
+n_prompt     = number of slots that still have prompt tokens
+per_slot     = budget_left / n_prompt                 // 0 -> admit no prompt tokens this step
+start        = rotating slot cursor (++ each step)
+// walk the prompt slots from `start`, adding at most `min(remaining, per_slot)` each
+```
+
+Note the `per_slot == 0` case: when decode tokens have already consumed the window (only possible when
+`n_parallel` is close to or above `n_batch`), admit no prompt tokens rather than one per slot — the outer
+`llama_process` loop would otherwise split the batch and charge a second pass (`update_slots()`, `:3974`).
+
+This is the same *mechanism* `split_equal()` already applies inside a batch (one token per sequence per
+round, evenly), lifted one level to the decision of what enters the batch.  With an equal share, equal-length
+prompts finish **together** (§2.2 behaviour extended to any length) and a short prompt finishes in ~one step
+instead of ~1.9 s.
+
+**But equal share is the simple variant, not the best one.**  The mechanism is a **per-step chunk cap**;
+what you do with the remaining budget is a policy choice, and the choices differ on whose latency you
+optimise:
+
+| policy | mean TTFT | max TTFT | decode ITL |
+|---|---|---|---|
+| today: greedy fill, no cap | best for equal-length prompts | unbounded by the peer's prompt (2.4) | unbounded (2.5) |
+| **equal share** | worse for equal-length prompts (4.6) | bounded | bounded by the chunk |
+| **greedy fill with a hard per-slot chunk cap** | near-today (the head of the queue keeps a wide batch) | bounded | bounded by the chunk |
+| **shortest-remaining-first, with aging** | best | bounded | bounded; needs aging or a long prompt starves |
+
+Start with **greedy fill plus a hard per-slot chunk cap**, not equal share: it keeps today's good
+mean-TTFT behaviour for the request at the head of the queue, bounds everything else, and needs no aging
+rule to be safe.  Then measure short-remaining-first as a follow-up if mean TTFT matters on the real
+workload.  §2.7 says a second sequence in the batch is free, so neither policy owes a throughput penalty —
+this is purely a choice of whose latency to optimise.
+
+### 4.3 Preemption is free here — and it is not KV preemption
+
+"Preemptive prefill batching" does **not** require evicting anything:
+
+* The KV cache is only written when tokens are **decoded**, so limiting this step's admitted prompt tokens
+  costs nothing to undo.  The inner loop already breaks early for checkpoints and alora boundaries; a
+  budget is one more `break` condition.
+* A decode needs no space reclaimed to get its token: it is already added first (§1), and the batch is
+  sized `max(n_batch, n_parallel)` (`:1778`), so every generating slot always fits.
+* Real KV preemption is only needed for **admission control** under `--kv-unified`, where
+  `llama_memory_context::init_batch()` can fail and the server today reacts by halving `n_batch` and
+  clearing idle slots (`decode()`, `:5107-5109`).  That is a separate, later item (§7).  **P0 needs no KV
+  work at all.**
+
+### 4.4 Bound the per-step prefill to protect decode ITL (§2.5)
+
+The budget above shares fairly but still admits up to `n_batch` prompt tokens per step.  To bound a
+decoder's ITL, cap the **per-step total** prompt tokens (a new `--prefill-chunk`-style knob, default
+something `n_ubatch`-shaped): `cap = min(n_batch, chunk)`; the same budget then divides `cap`.  This is the
+only tuning decision in P0, and it is the direct trade: smaller chunk → lower ITL jitter, lower prefill
+throughput.  Measure both; do not guess the default.
+
+### 4.5 Guards a fair budget must not break
+
+These are the reason P0 is a few hundred lines rather than twenty.  Each is an existing `break`/special
+case in the same loop and each has a correctness meaning:
+
+| guard | where | why a budget must respect it |
+|---|---|---|
+| checkpoint tail (`4 + n_ubatch`, `4`) | `:4885-4895` | a checkpoint must land on a state boundary; taking fewer tokens is safe, but the tail rule must still get its whole tail in one step |
+| alora invocation boundary | `:4851-4855` | the adapter is switched at a token boundary; budget must not split a pre-invocation run |
+| shared prompt prefix (`n_tokens_shared`) | `:4726-4747`, `:4839-4843` | children start from an exact parent state |
+| decision tasks (`n_decision_first`, `decision.order`) | `:4844-4846` | logits are read from one batch; a decision prompt/option block must not be split |
+| `can_batch_with()` | `:547-566` | batches are homogeneous in task type/LoRA/embd size; a rotation must re-check it rather than assume slot order |
+| TTS / realtime slots | `:3938-3952`, `:4029` | they bypass the shared batch entirely |
+| `n_keep_tail` in `split_equal` | `src/llama-batch.cpp:763-800` | the rollback tail (`n_rs_seq + 1`) must stay in one ubatch; the budget must not starve it |
+| MoE arena band | `INVARIANTS.md` | admission changes the per-step token count, which is the arena's own band input — a wide prefill pays for a narrow decode (see `wip/bimodal-slab/`) |
+
+### 4.6 What P0 is expected to do, and how to falsify it
+
+| metric | today (§) | expected after P0 |
+|---|---|---|
+| short prompt behind a 13 k prompt, TTFT | 1.91 s (2.4) | ~1 step (10-50 ms) — **the win** |
+| decoder ITL during another slot's 13 k prefill | 266-331 ms (2.5) | ≤ `chunk` / prefill rate — **the win** |
+| two equal 13 k prompts, TTFT | 1.90 / **3.86** s (2.3) | both ≈ 3.6-3.8 s.  This **raises mean TTFT** (2.88 → 3.7 s) and lowers max (3.86 → 3.7 s): a deliberate redistribution, not a win.  Aggregate prefill improves ~2-4 % (§2.7).  A *capped greedy* fill (§4.2) keeps the first request near 1.9 s and moves only the tail |
+| prefill throughput of a lone long prompt | 6788 t/s (2.4) | unchanged within a few percent (it still gets the whole remaining budget) |
+| aggregate decode at concurrency 2 | 120.5 t/s (2.6) | unchanged (±2 %) |
+| aggregate prefill, 2 concurrent prompts | within ±3 % of the co-batched case (§2.7) | unchanged — the serialisation is not buying throughput |
+
+**Falsification:** if a long prompt's own total time degrades by more than a few percent, the budget is
+stealing from the only consumer that can use a wide batch; if the short-prompt TTFT does not collapse, the
+rotation is not running.  Both are cheap to measure (§2 harness).
+
+## 5. Not P0 — three questions kept separate
+
+### 5.1 "Paged KV controls fragmentation"
+
+Partly right, but the word means two different things here.
+
+* **Wasted bytes:** llama.cpp is already *finer* than paged — one cell per token from a shared free list
+  with a per-stream `head` cursor (`find_slot`, `src/llama-kv-cache.cpp:1350-1380`), plus `--kv-unified`
+  for one shared pool.  Paged attention (16-token blocks) would *waste* up to 15 cells per sequence where
+  llama.cpp wastes none.  The only block rounding today is per-slot: `GGML_PAD(n_ctx_seq, 256)`.
+* **Scatter/alignment:** this is the real one.  Freed cells are reused, so a sequence's cells become
+  non-contiguous, `slot_info::is_contiguous()` fails, and the vectorised contiguous path is replaced by a
+  per-cell path (`llama-kv-cache.cpp:4806-4860`).  That costs throughput; it does **not** change any value,
+  and the fork already carries compaction/parking machinery to move cells (`seq_park`, `LLAMA_KV_PARK_DEBUG`)
+  precisely because scatter exists.
+
+So a paged cache would buy *alignment for speed* and *block-granular preemption*.  Neither is the concurrency
+symptom, and neither is needed by P0 (§4.3).  Recorded, not scheduled.
+
+### 5.2 Would a paged KV fix cross-slot determinism? (hypothesis H3 — **untested, and probably no**)
+
+The finding you are remembering is **`GREEDY-PURITY.md` §63** (r153, issue **#234**), with
+`benchmarks/2026-10-31-multislot-verify-width.md`, `archive/work/spec-align-234/` and the gate
+`scripts/gate-spec-align.sh`.  Its claim is narrower than "KV misalignment":
+
+> "aligning the sequences of one step into one ubatch changes a slot's verify width … a two-slot *aligned*
+> pair is not stable run to run either, so per-config determinism is a single-slot statement."
+
+And the gate states the consequence explicitly: a two-slot pair is **not** gated on text, because *every*
+fix for that defect has to change some slot's verify width, and `GREEDY-PURITY.md` promises greedy text
+**per config**, never equality between configs.
+
+Mechanism taxonomy — this is the part worth keeping straight, because it decides what paging can and cannot
+buy:
+
+| what changes | changes numerics? | why |
+|---|---|---|
+| **ubatch shape** (tokens per sequence, `n_seqs`, `equal_seqs`) | **yes** | selects the kernel family (`MMVQ_MAX_BATCH_SIZE == 8`, `ggml/src/ggml-cuda/mmvq.cuh:3`; the FA tile's `ncols2`; the WMMA `iu8` verify floor of 7), so the accumulation order changes — §63/#234, §91, §49 |
+| **attention regime** (dense vs pooled/sparse/windowed) | **yes** | §77: the pooled arm is a different regime; a KV residency policy is a new numerics reference |
+| **MoE arena band** (rows served from VRAM) | **yes** | the band selects the expert kernel set (`INVARIANTS.md`, §63 addendum) |
+| **K/V cell index, offset, contiguity, block size, defrag, parking** | **no** | same values, same tile shape; only the copy/store path and the number of launches differ |
+
+So the cross-slot nondeterminism is a **batch-composition** effect, not a KV-cell-layout effect.  A paged
+cache does not constrain a slot's tokens-per-step, so it would not pin the kernel family, so it should not
+fix the determinism claim.  Two things would: make the kernel family width-invariant (invariant 1 in
+`GREEDY-PURITY.md`), or pin the step shape — which is what `LLAMA_SPEC_ALIGN_WIDTH_BAND` does, and it
+*changes the width by design* on a 3+ slot config rather than making it stable.
+
+**Falsification test if it is ever worth the time (cheap, do it before any paging work):** take one
+two-slot config, force a fixed KV placement for slot 1 (even a deliberately scattered one via a diff/extra
+alloc), keep the ubatch shape byte-identical (same token counts, same `n_seqs`), and diff raw logits.
+Prediction: **0 difference**.  Then change only the token counts and predict a *nonzero* difference.  If the
+first arm is nonzero, H3 is alive and this section is wrong — that is the whole reason to state it.
+
+### 5.3 True parallel *execution* (multi-context / multi-stream) — costed, not scheduled
+
+P0 gives concurrency *in scheduling*.  Two forward passes in flight is a different project:
+
+| option | what it costs | what it buys |
+|---|---|---|
+| N `llama_context`s over one `llama_model`, own worker thread each | `server_context` assumes a single `ctx_tgt` everywhere (slots, batch, `spec`, MTP `ctx_dft`, MoE arenas, KV pools); one KV + one compute reserve **per context**; audit `llama_model` for mutable state | real overlap of prefill and decode kernels; on one GPU mostly latency isolation, not throughput (a 1-token batch × 2 is slower in aggregate than one 2-token batch) |
+| N processes (already possible: the router spawns subprocesses) | one weight copy in VRAM per process | same, operationally, today |
+| multi-stream inside one context (extend the optional `0100` two-lane prefill from across-devices to across-graphs) | per-stream compute buffers + graph copies + a hazard analysis; `ggml-backend` is where this gets hard | only meaningful with ≥2 devices |
+
+The honest read for this box: one GPU is bandwidth-bound, so session parallelism is a **latency-isolation**
+feature there; on 3 GPUs `-sm tensor` already spreads every step across all three, and per-session
+parallelism would mean replicating weights.  P0 delivers most of the felt benefit for a fraction of the
+cost, which is why it is first.
+
+## 6. Gate this campaign would add (on acceptance)
+
+A sibling of `scripts/gate-prefill-server-slots.sh` (same two-slot server, same shape), on a small dense
+model so it runs anywhere:
+
+* **HARD** short-prompt TTFT behind a ≥8 k prompt ≤ `--max-short-ttft` (default 0.2 s).
+* **HARD** decoder p95 ITL during the other slot's prefill ≤ `--max-itl` (default 100 ms).
+* **HARD** both arms produce the same greedy text **per request** (a single-slot comparison, never a
+  two-slot diff — §63).
+* **SOFT** lone-long-prompt prefill t/s within 3 % of the pre-change build; aggregate decode at
+  concurrency 2 within 2 %.
+* **HARD** no GPU fault (`scripts/check-gpu-faults.sh`), no abort.
+
+`llama-batched-bench -npl 1,4,8` is a throughput control, not a fairness oracle; it cannot see any of this
+(it has no per-request latency).
+
+## 7. Risks / open questions
+
+* **Prefill throughput vs ITL.**  §4.4's cap is a real trade; the default must come from measurement on
+  gfx1201 *and* gfx1151 (the slow box is where a wide prefill matters most).
+* **MoE arena interaction.**  A per-step token count feeds the arena band; a fair scheduler changes the
+  cadence of wide/narrow steps.  `wip/bimodal-slab/` and `INVARIANTS.md` r292 say a two-slot
+  prefill/decode transition has already been made stable — re-measure, do not assume.
+* **Speculative decoding.**  `LLAMA_SPEC_ALIGN` already caps verify width per step (§63); the two policies
+  must not fight over the same budget.  Drafting happens before the batch is assembled (`:4190-4230`).
+* **Admission queue.**  `n_parallel` slots are still a hard ceiling and a queued task is `defer()`red until
+  a slot frees.  Real elastic admission is a shared-pool (`--kv-unified`) + preemption question (§4.3).
+* **Interaction with block 14's window/pool.**  A streaming KV config changes the attention regime (§77);
+  the fairness gate must run on a resident config, and a separate arm on a windowed one.
+
+## 8. Pointers
+
+* Code: `tools/server/server-context.cpp` `update_slots()` `:3883`, admission `:4328-4335`, inner fill
+  `:4831`, `decode()` `:5025`; `src/llama-batch.cpp` `split_equal()` `:668`;
+  `src/llama-kv-cache.cpp` `find_slot` `:1350`, contiguity `:4806`; `tools/server/server-queue.cpp:283`.
+* Determinism: `GREEDY-PURITY.md` §63 (r153, issue #234), §77, §91; `INVARIANTS.md`;
+  `benchmarks/2026-10-31-multislot-verify-width.md`; `scripts/gate-spec-align.sh`.
+* Existing two-slot harness: `scripts/gate-prefill-server-slots.sh` (`TODO` #317, block 16);
+  `scripts/gate-prefill-logits.sh` for any prefill change.
+* Adjacent campaigns: `wip/bimodal-slab/` (wide/narrow ubatch modes), `wip/kv-residency-cleanup/`
+  (window/pool), `optional/two-lane-prefill/` (device-level prefill overlap).
+* Reproduce §2: `./probe.py --port 8099 {decode,prefill,starve,itl,tps}` (arms, defaults and the server
+  invocation are in this README and the script's header).  The numbers here are one session on one card —
+  a gate must re-take them on the release build and on gfx1151.  This is a scoping note, not a validated
+  result.
