@@ -20,6 +20,11 @@ are in the PRs; this file records what *this repo* verified, what it measures he
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
   `8814fffe90e776a8ed99950c16c0ab746a81a67e13ec183a5311af88c285273d` (the r291 cut; the earlier cuts are recorded below)
+* **r293 re-cut verification**: applies strictly at the r293 default tree
+  `92e77acfae0700b68439d69923fcb79d6fbe3a54` and produces `abe412bb86f98aa60224a8fdea41521b314d03f3`; cumulative with the other optional
+  artifact, numeric order, is `795b1b0be4d56c75b6bb9707c46d207c0b5bb452`.  The patch file is unchanged (sha256 above) and the default tree
+  moved by block 02's MTP h-rows default (r293, issue #318), outside this artifact's mechanisms.
+
 * **r291 re-cut**: applies strictly at the r291 default tree `8423b2b5…` and produces
   `4b0b8da0154aac69ab61998865956deaec9ec9a8`; cumulative with `0101` is `310386642121ffd22eb74268a6446b31433aada0`.
   The default tree moved by block 12's r291 amendment (sequence parallelism), outside this artifact's mechanisms.

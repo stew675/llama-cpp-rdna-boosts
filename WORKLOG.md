@@ -1,3 +1,66 @@
+## 261115.010 (r293, RELEASE v16-4f9dfa0e3-r293) -- GitHub issue #318: the MTP target h-rows path is a -1.5 % Windows/HIP loss and a Linux no-op, so block 02 ships the host readback and keeps the device path behind `LLAMA_MTP_DEV_ROWS=1`
+
+**`release.json` changed: tip `2b7a65309` -> `b950836f9`, tree `4a67e7c9` -> `92e77acf`, release
+`v16-4f9dfa0e3-r292` -> `v16-4f9dfa0e3-r293`; 17 blocks, base unchanged.**  One file moved
+(`common/speculative.cpp`, **block 02**); blocks 03-`0300` were re-cut (their `From` id only).  The two optional
+artifacts re-apply strictly at the new default tree and their produced trees were re-recorded (`0100` ->
+`abe412bb8`, `0101` -> `fafeec707`, cumulative `795b1b0be`).  Record:
+[`archive/work/mtp-dev-rows/`](archive/work/mtp-dev-rows/).
+
+* **The report.**  `@DanoPTT` bisected an MTP decode loss to the one arm r281 turned on: upstream `#31927` keeps
+  the target's MTP hidden rows (`h_nextn`) in a device buffer and lets the drafter read them in place
+  (`llama_set_embeddings_nextn_dev` + `llama_set_ctx_state_src`).  On Windows 11 / one R9700 / dense Qwen3.8-27B
+  UD-Q5_K_XL / `draft-mtp` n3 / `-np 2` / q8_0 KV: **-1.48 / -1.30 / -1.59 %** at 62 857 / 68 767 / 100 607,
+  +0.25-0.30 ms per generated token, with **byte-identical text and identical draft acceptance** in all three
+  arms and an op census showing the same graph shapes and the same GPU time (+0.04 ms).  The cost is host-side:
+  the device path replaces one async device->host readback (which the host path had already paid for) with a
+  host-blocking event wait plus two blocking row copies per decode round.
+* **It was never a decision of ours.**  The call site is upstream's own `if (!is_mem_shared && !chain_heads)`, so
+  r278's re-base brought `#31927` in and r281 enabled it for every single-head MTP model without anyone choosing
+  it.  A default that arrives with a base needs its own measurement; this one had none.
+* **Here it is neutral, at two depths.**  Dense 27B UD-Q5_K_XL, 1 x R9700, `-sm layer`, q8_0 KV, `draft-mtp` n3,
+  `--seed 42 --temp 0`, three interleaved reps: **47.9 / 48.0 / 47.9** t/s (device rows) against **47.9 / 47.9 /
+  48.0** (host rows) at a 61 525-token prompt with `-n 128`, and **49.2 against 49.2** t/s on a 5 246-token
+  prompt with `-n 512`; prefill 873.5 vs 872.4 t/s (noise).  So there is no arm on this box where the device path
+  wins, and one field platform where it loses: the delivery now ships upstream's **pre-`#31927` host readback**
+  and keeps the device path behind `LLAMA_MTP_DEV_ROWS=1` (an opt-in, not a kill switch, since the default is
+  the host arm).
+* **The reporter's alternative - a cheaper ordering - was implemented and measured WORSE, so it was dropped.**
+  Keeping the drafter's carry row on the device (`ggml_backend_tensor_copy_async` into the reserved row
+  `n_batch + seq`, the drafter's first step reading that row too, `ggml_backend_event_wait` instead of
+  `ggml_backend_event_synchronize` in `decode()`) removes every host row round trip in a round and gives
+  identical text and acceptance - but measures **47.7 / 47.7 / 47.7** t/s against the host arm's 47.9 / 48.0 /
+  48.0, i.e. **-0.5 %**; the stream-wait half alone is neutral (47.7 with either wait).  Two tiny copies, two
+  async-input drains and two event records cost more here than two blocking copies of one 10 KB row.  The diff
+  and the bisect are preserved in `archive/work/mtp-dev-rows/` with a do-not-re-derive note (`INVARIANTS.md`
+  r293 fact 3).  What the two arms may NOT differ in - greedy text and draft acceptance - is now gated.
+* **Gates.**  New `scripts/gate-mtp-dev-rows.sh` **PASS** (default arm: census `target h rows on the device: no`
+  and no `h_nextn buffer size` line at all, i.e. the buffer is never allocated; `=1` arm: `yes` with the buffer;
+  text `sha=bbb051e2aeab` and acceptance **87/119** in both; no GPU faults).  Coherence 4B Q8_0
+  `100 chars sha=1c5d32ac537d` on 1 GPU **and** the 3-GPU `-sm tensor` split (the recorded reference).
+  `gate-prefill-logits.sh` **0.000697 / 98.784 %** (unchanged).  MTP four-axis + phase-switch on the 4B, both
+  arms: text hashes `c08c660d3e54` / `0d64a57d271a` / `e4434e9a1e11` / `a36b056175c4` / `11bd75974e63` identical,
+  205.5/205.2, 179.9/179.3, 202.8/203.0, 284.4/284.5, 156.3/156.3 t/s.  `validate-set.sh` green (checksums,
+  fresh-tarball strict 17/17, both optional artifacts, the cumulative optional tree, the Windows lints).  A
+  non-MTP run cannot move: the helper is read only in the `draft-mtp` impl's constructor.  The recorded `.tip`
+  is the value `scripts/fork-refresh.sh` printed after its re-cut (`b950836f9`, tree `92e77acf`), not the
+  working chain's tip (`b39bd8342`, same tree): the amendment was made with an `--amend` + rebase, and
+  `apply-all.sh` stamps the committer date from each patch's own author date, so only its re-cut is
+  reproducible (AGENTS.md's tip trap (a)).
+* **Adjacent finding, recorded not acted on: ROCm 10.0 builds measure ~+0.6-0.8 % prefill here, and the reporter
+  measured ~2 % at depth on Windows.**  Same tree, same flags, two toolchains, one model (27B UD-Q5_K_XL, 1 x
+  R9700, q8_0 KV, `-ub 512`, `llama-bench -r 2`, interleaved): `pp4096 @ d32768` **872.0 / 872.6 (10.1) vs
+  878.5 / 878.6 (10.0)** = +0.7 / +0.7 %; `pp4096 @ d0` **1202.9 / 1199.9 vs 1207.7 / 1206.6** = +0.4 / +0.6 %;
+  `tg64` 25.38/25.38 vs 25.45/25.44 at depth, 26.90/26.90 vs 26.84/26.84 at d0.  The reporter's Windows arm also
+  attributes about half of theirs to `-real-true16` (`-Xclang -target-feature -Xclang -real-true16`, device
+  only), which was **not** measured here.  Nothing was changed for it: the container images build with 10.1 and
+  7.14.1 by policy, and the prefill-logit base is per ROCm line, so a toolchain swap is a re-baseline decision,
+  not a flag flip (`CONTAINERS.md`).  Recorded in `INVARIANTS.md` r293 fact 5.
+* **Issue handling.**  Replied to `@DanoPTT` with the numbers, what the new release does by default, and how to
+  A/B the device path (`LLAMA_MTP_DEV_ROWS=1`); asked him for a Windows A/B of the two arms on r293 so the
+  platform split can be recorded rather than assumed; closed as fixed (the shipped default is the arm that
+  matches r277 on his box).
+
 ## 261115.009 (r292, docs only -- NO delivery change) -- issue #314's field grid corrects two doc claims: a spill costs the depth past the window (not "11-26 %"), and "layer first on a mixed set" is a starting point, not a criterion (that pair measures tensor +63-70 % of decode)
 
 The reporter of issue #314 re-ran the r289 fix on his own settings and then posted a full grid: `--kv-window

@@ -1,0 +1,302 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 013d9a14a..dfd11b2de 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1704,6 +1704,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+     }
+ };
+ 
++// LLAMA_MTP_DEV_ROWS=1: keep the target's MTP hidden rows in a device buffer and let the drafter read them in place,
++// i.e. the #31927 path.  NOT on by default: it measures NEUTRAL on this box (dense Qwen3.8-27B Q5_K_XL, q8_0 KV, one
++// R9700, 61.5k-token prompt, 48.0 vs 48.0 t/s against the host readback), and a Windows/HIP user measured it as a -1.5 %
++// decode LOSS (GitHub issue #318) with identical text and acceptance.  So the delivery ships the host readback (the
++// pre-#31927 behaviour) and keeps the device path as an opt-in, for an A/B on the platform where it is cheaper.  See
++// ENVIRONMENT.md.
++static bool mtp_dev_rows_enabled() {
++    static const bool enabled = [] {
++        const char * e = getenv("LLAMA_MTP_DEV_ROWS");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return enabled;
++}
++
+ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
+ 
+@@ -1743,9 +1757,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
+-    // target h rows on the device (llama_set_embeddings_nextn_dev): the catch-up in process() reads row k - 1 of the last
+-    // target decode in place, and row n_batch_tgt + seq_id for the first token of seq_id, uploaded from pending_h
+-    // pending_h stays on the host: process() and accept() fetch it before the next target decode overwrites the rows
++    // target h rows on the device (llama_set_embeddings_nextn_dev, LLAMA_MTP_DEV_ROWS=1): the catch-up in process()
++    // reads row k - 1 of the last target decode in place, and row n_batch_tgt + seq_id for the first token of seq_id.
++    // That second row is a CARRY row: the graphs never write it, so it survives the next target decode (which is what
++    // the first token of a batch needs, its h(p - 1) comes from the PREVIOUS decode) and it is kept up to date with a
++    // device-side row copy (llama_copy_embeddings_nextn_row) instead of a host round trip.  pending_h is then only
++    // used by the host path.
+     bool    dev_rows    = false;
+     int32_t n_batch_tgt = 0;
+     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
+@@ -1904,7 +1921,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         verify_row0.assign(n_seq, -1);
+ 
+         // shared memory and chained heads keep the host rows
+-        if (!is_mem_shared && !chain_heads) {
++        if (!is_mem_shared && !chain_heads && mtp_dev_rows_enabled()) {
+             dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_ctx_state_src(ctx_dft, ctx_tgt);
+             if (!dev_rows) {
+                 llama_set_ctx_state_src(ctx_dft, nullptr);
+@@ -2062,11 +2079,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             // TODO:this is generally true, but would be nice to assert it
+             if (dev_rows) {
+                 GGML_ASSERT(n_tokens <= n_batch_tgt && "the target batch exceeds the h_nextn device buffer");
+-                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-                    if (i_batch_beg[seq_id] >= 0) {
+-                        llama_set_embeddings_nextn_rows(ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
+-                    }
+-                }
++                // the carry row is already on the device: see the copy in the verify-row block below and in accept()
+             }
+ 
+             const float * h_tgt = dev_rows ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
+@@ -2226,9 +2239,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             verify_h_rows[seq_id] = h_rows;
+ 
+             if (dev_rows) {
+-                // the rows stay on the device until the next target decode, only the pending row comes to the host
++                // the rows stay on the device until the next target decode, and the one the NEXT batch's first token
++                // needs (h of this batch's last row, i.e. everything accepted) is copied to the carry row here, still
++                // on the device; accept() moves the carry to the accepted row when fewer were accepted
+                 verify_row0[seq_id] = h_offset;
+-                llama_get_embeddings_nextn_rows(ctx_tgt, h_offset + h_rows - 1, 1, pending_h[seq_id].data());
++                llama_copy_embeddings_nextn_row(ctx_tgt, h_offset + h_rows - 1, n_batch_tgt + seq_id);
+                 continue;
+             }
+ 
+@@ -2299,7 +2314,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             }
+ 
+             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
+-            batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
++            if (dev_rows) {
++                // the row of the last accepted token is the target's carry row, so the first draft step reads it there
++                // instead of from a host copy that had to be fetched after the previous verify decode
++                batch.set_embd_state_row(idx, n_batch_tgt + seq_id);
++            } else {
++                batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
++            }
+ 
+             i_last[seq_id] = idx;
+ 
+@@ -2538,9 +2559,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+         if (dev_rows) {
+-            // process() already fetched the last row
++            // process() already moved the carry row to the last row; only a smaller accepted count moves it again.
++            // Both moves stay on the device: no host round trip in a decode round.
+             if (i_h != n_rows - 1) {
+-                llama_get_embeddings_nextn_rows(params.ctx_tgt, verify_row0[seq_id] + i_h, 1, pending_h[seq_id].data());
++                llama_copy_embeddings_nextn_row(params.ctx_tgt, verify_row0[seq_id] + i_h, n_batch_tgt + seq_id);
+             }
+             return;
+         }
+@@ -2555,6 +2577,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+         data.resize(row_bytes);
++        if (dev_rows) {
++            // the row a checkpoint carries lives on the device (the target's carry row); a checkpoint is a cold path,
++            // so it is fetched here rather than kept on the host every round
++            std::vector<float> row(n_embd, 0.0f);
++            if (!llama_get_embeddings_nextn_rows(params.ctx_tgt, n_batch_tgt + seq_id, 1, row.data())) {
++                return false;
++            }
++            std::memcpy(data.data(), row.data(), row_bytes);
++            return true;
++        }
+         std::memcpy(data.data(), pending_h[seq_id].data(), row_bytes);
+         return true;
+     }
+@@ -2569,6 +2601,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             return;
+         }
+         std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
++
++        if (dev_rows) {
++            // the restored row must reach the device carry row the drafter reads (cold path: a blocking upload)
++            llama_set_embeddings_nextn_rows(params.ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
++        }
+     }
+ 
+     // partial acceptance on a context that cannot roll back: the rejected draft
+diff --git a/include/llama.h b/include/llama.h
+index 185e808cb..e815419fd 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1317,7 +1317,7 @@ extern "C" {
+ 
+     // Write the unmasked h_nextn rows (see llama_set_embeddings_nextn) of each decode to a device buffer
+     // [n_embd_out, n_batch + n_seq_max] instead of host memory: row r < n_batch is the token at batch index r of the last decode,
+-    // row n_batch + s is free for the caller, e.g. for seq s (see llama_set_embeddings_nextn_rows()).
++    // row n_batch + s is the carry row of seq s (a row the graphs never write, see llama_copy_embeddings_nextn_row()).
+     // Returns false if the buffer cannot be used, the rows are then extracted to host memory.
+     LLAMA_API bool llama_set_embeddings_nextn_dev(struct llama_context * ctx, bool value);
+ 
+@@ -1325,6 +1325,13 @@ extern "C" {
+     LLAMA_API bool llama_get_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, float * out);
+     LLAMA_API bool llama_set_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, const float * data);
+ 
++    // Copy row `src_row` of the h_nextn device buffer to row `dst_row` of the same buffer ON THE DEVICE (no host round
++    // trip).  The copy is queued behind the last decode of that context and behind that decode's readers (see
++    // llama_set_ctx_state_src()), and the buffer's write event is re-recorded behind the copy, so a reader that waits
++    // for the rows of this context also waits for the copy.  Returns false if the buffer is not active or a row is out
++    // of range.
++    LLAMA_API bool llama_copy_embeddings_nextn_row(struct llama_context * ctx, int64_t src_row, int64_t dst_row);
++
+     // Read the state rows of batches (see llama_batch_ext_set_embd_state_row()) from the h_nextn device buffer of ctx_src.
+     // Returns whether decode accepts batches with state rows.
+     LLAMA_API bool llama_set_ctx_state_src(struct llama_context * ctx, struct llama_context * ctx_src);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0e2c63874..d12818d04 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2299,6 +2299,8 @@ bool llama_context::h_nextn_dev_alloc() {
+ 
+     auto reset = [&]() {
+         h_nextn_dev     = nullptr;
++        h_nextn_row_src = nullptr;
++        h_nextn_row_dst = nullptr;
+         h_nextn_dev_dev = nullptr;
+         h_nextn_backend = nullptr;
+         buf_h_nextn_dev.reset();
+@@ -2329,7 +2331,7 @@ bool llama_context::h_nextn_dev_alloc() {
+     }
+ 
+     ggml_init_params params = {
+-        /*.mem_size   =*/ ggml_tensor_overhead(),
++        /*.mem_size   =*/ 4*ggml_tensor_overhead(), // the buffer tensor and the two row views below
+         /*.mem_buffer =*/ nullptr,
+         /*.no_alloc   =*/ true,
+     };
+@@ -2351,6 +2353,15 @@ bool llama_context::h_nextn_dev_alloc() {
+         return fail("the device has no events");
+     }
+ 
++    // one-row views, the two sides of copy_h_nextn_row() (their data pointers are moved per copy).  Created after the
++    // allocation so they inherit the buffer, and views are never allocated themselves.
++    h_nextn_row_src = ggml_view_1d(ctx_h_nextn_dev.get(), h_nextn_dev, h_nextn_dev->ne[0], 0);
++    h_nextn_row_dst = ggml_view_1d(ctx_h_nextn_dev.get(), h_nextn_dev, h_nextn_dev->ne[0], 0);
++
++    // the carry rows (n_batch ..) are never written by a graph, so a run that reads one before the first copy must not
++    // read whatever the allocator handed out: the host path starts from zeros (pending_h), and so does this one
++    ggml_backend_buffer_clear(buf_h_nextn_dev.get(), 0);
++
+     LLAMA_LOG_INFO("%s: %10s h_nextn buffer size = %8.2f MiB\n", __func__,
+             ggml_backend_buffer_name(buf_h_nextn_dev.get()), ggml_backend_buffer_get_size(buf_h_nextn_dev.get())/1024.0/1024.0);
+ 
+@@ -2399,6 +2410,34 @@ bool llama_context::set_h_nextn_rows(int64_t row0, int64_t n_rows, const float *
+     return true;
+ }
+ 
++// The device-side half of the two calls above: one row of the buffer becomes another row of the buffer, queued on the
++// backend's own stream.  This is the steady-state MTP path (the target's carry row, see common/speculative.cpp): a host
++// round trip here costs a blocking event wait plus a blocking copy on both sides, per decode round, which measured
++// 1.5 % of the decode on Windows/HIP (GitHub issue #318).
++bool llama_context::copy_h_nextn_row(int64_t src_row, int64_t dst_row) {
++    const int64_t n_rows = h_nextn_dev ? h_nextn_dev->ne[1] : 0;
++    if (src_row < 0 || dst_row < 0 || src_row >= n_rows || dst_row >= n_rows || src_row == dst_row) {
++        return false;
++    }
++
++    // the same rule as a decode that overwrites the rows: do not clobber a row the reader has not consumed yet
++    if (ev_h_nextn_read_recorded) {
++        ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
++    }
++
++    const size_t nb1 = h_nextn_dev->nb[1];
++    h_nextn_row_src->data = (char *) h_nextn_dev->data + src_row*nb1;
++    h_nextn_row_dst->data = (char *) h_nextn_dev->data + dst_row*nb1;
++
++    ggml_backend_tensor_copy_async(h_nextn_backend, h_nextn_backend, h_nextn_row_src, h_nextn_row_dst);
++
++    // the copy is behind this record, so a reader that waits on the buffer (a decode with state rows) waits for the copy
++    ggml_backend_event_record(ev_h_nextn_written.get(), h_nextn_backend);
++    ev_h_nextn_written_recorded = true;
++
++    return true;
++}
++
+ bool llama_context::set_ctx_state_src(llama_context * ctx_src) {
+     if (cparams.ctx_state_src != ctx_src) {
+         sched_need_reserve = true;
+@@ -3457,13 +3496,26 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         ggml_backend_event_wait(layer_inp_backend, ev_layer_inp_read.get());
+     }
+ 
+-    // ordering for the h_nextn device buffer, as for the layer input buffer
++    // ordering for the h_nextn device buffer, as for the layer input buffer, with one difference: the rows this
++    // context reads are the ones the target's LAST decode wrote, and the reader is a stream that has nothing else
++    // queued, so a stream wait is enough and it keeps the host free to enqueue this graph while the target finishes
++    // (a host wait here is one round trip per decode round, which measured 1.5 % of the decode on Windows/HIP,
++    // GitHub issue #318).  The host arm is kept for the cases where a stream wait cannot order the read: no backend
++    // of ours on the source's device (the read is then a copy the scheduler issues, and a cross-device copy is
++    // queued on the SOURCE stream, which the wait below still covers), and Metal, where a command buffer that sits
++    // waiting for a whole target batch trips the Metal timeout (the reason the layer-input wait above is on the host).
+     llama_context * state_src     = has_state_row ? cparams.ctx_state_src : nullptr;
+     ggml_backend_t  state_backend = nullptr;
+     if (state_src) {
+         state_backend = backend_from_dev(state_src->h_nextn_dev_dev);
+         if (state_src->ev_h_nextn_written_recorded) {
+-            ggml_backend_event_synchronize(state_src->ev_h_nextn_written.get());
++            const char * state_dev_name = state_src->h_nextn_dev_dev ? ggml_backend_dev_name(state_src->h_nextn_dev_dev) : "";
++            static const bool stream_wait = getenv("LLAMA_H_NEXTN_STREAM_WAIT") == nullptr || atoi(getenv("LLAMA_H_NEXTN_STREAM_WAIT")) != 0;
++            if (stream_wait && state_backend && strncmp(state_dev_name, "MTL", 3) != 0) {
++                ggml_backend_event_wait(state_backend, state_src->ev_h_nextn_written.get());
++            } else {
++                ggml_backend_event_synchronize(state_src->ev_h_nextn_written.get());
++            }
+         } else {
+             state_src->synchronize();
+         }
+@@ -6677,6 +6729,10 @@ bool llama_set_embeddings_nextn_rows(llama_context * ctx, int64_t row0, int64_t
+     return ctx->set_h_nextn_rows(row0, n_rows, data);
+ }
+ 
++bool llama_copy_embeddings_nextn_row(llama_context * ctx, int64_t src_row, int64_t dst_row) {
++    return ctx->copy_h_nextn_row(src_row, dst_row);
++}
++
+ bool llama_set_ctx_state_src(llama_context * ctx, llama_context * ctx_src) {
+     return ctx->set_ctx_state_src(ctx_src);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index aba46ec56..2d3b881d6 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -139,6 +139,7 @@ struct llama_context {
+     bool set_embeddings_nextn_dev(bool value);
+     bool get_h_nextn_rows(int64_t row0, int64_t n_rows, float * out);
+     bool set_h_nextn_rows(int64_t row0, int64_t n_rows, const float * data);
++    bool copy_h_nextn_row(int64_t src_row, int64_t dst_row);
+ 
+     // state rows read from the h_nextn device buffer of ctx_src, see llama_set_ctx_state_src()
+     bool set_ctx_state_src(llama_context * ctx_src);
+@@ -574,11 +575,13 @@ private:
+     bool ev_layer_inp_read_recorded = false;
+ 
+     // device buffer with the h_nextn rows, F32 [n_embd_out, n_batch + n_seq_max]:
+-    // row r < n_batch is the token at batch index r of the last decode, row n_batch + s is set by the host for seq s
+-    // ordered with the reader context like the layer input buffer
++    // row r < n_batch is the token at batch index r of the last decode, row n_batch + s is the carry row of seq s
++    // (written by copy_h_nextn_row(), never by a graph), ordered with the reader context like the layer input buffer
+     ggml_context_ptr        ctx_h_nextn_dev;
+     ggml_backend_buffer_ptr buf_h_nextn_dev;
+     ggml_tensor *           h_nextn_dev = nullptr;
++    ggml_tensor *           h_nextn_row_src = nullptr; // 1-row view of h_nextn_dev, the source of copy_h_nextn_row()
++    ggml_tensor *           h_nextn_row_dst = nullptr; // 1-row view of h_nextn_dev, its destination
+     ggml_backend_dev_t      h_nextn_dev_dev = nullptr;
+     ggml_backend_t          h_nextn_backend = nullptr;
+     ggml_backend_event_ptr  ev_h_nextn_written;

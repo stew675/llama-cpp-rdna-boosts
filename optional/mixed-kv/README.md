@@ -22,6 +22,11 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
   `00f2150fad1ad44c2d40c1456c708ea4c7103390`.  The produced tree is no longer the r287 release tree's
   bytes — expected, since the r290 default tree moved (block 07's opt-in WMMA verify family) while this
   artifact's own diff is unchanged.
+* **r293 re-cut verification**: applies strictly at the r293 default tree
+  `92e77acfae0700b68439d69923fcb79d6fbe3a54` and produces `fafeec707a0e6c128ee6026001088b85b595272c`; cumulative with the other optional
+  artifact, numeric order, is `795b1b0be4d56c75b6bb9707c46d207c0b5bb452`.  The patch file is unchanged (sha256 above) and the default tree
+  moved by block 02's MTP h-rows default (r293, issue #318), outside this artifact's mechanisms.
+
 * **r291 re-cut**: applies strictly at the r291 default tree
   `8423b2b5eac33f97ad530229b8c35240aa64fa08` and produces
   `02f8e9d0b9c0077e795c71a2e32b2ae890b41ab1`; cumulative with `0100` (numeric order) is

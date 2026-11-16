@@ -5127,3 +5127,50 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
    **once** (47 layers, arena 22 388.2 MiB at the two-slot narrow floor) and later drops re-arm without
    growing or shrinking.  Concurrent text need not be byte-deterministic (KV placement); the invariants are
    the layer uniformity and the coherence.
+
+## r293 — the MTP target h-rows path is a per-platform trade, not a win (block 02, GitHub issue #318)
+
+1. **The device `h_nextn` path (upstream `#31927`) is NEUTRAL on gfx1201/Linux and NEGATIVE on
+   Windows/HIP, so it is now opt-in (`LLAMA_MTP_DEV_ROWS=1`) and the default is the host readback.**
+   Measured here on dense Qwen3.8-27B UD-Q5_K_XL, one R9700, `-sm layer`, `q8_0` KV,
+   `--spec-type draft-mtp --spec-draft-n-max 3`, `--seed 42 --temp 0`, three interleaved reps per arm:
+   at a **61 525-token** prompt **47.9 / 48.0 / 47.9 t/s** (device rows) against
+   **47.9 / 47.9 / 48.0** (host rows) at `-n 128`, and at a 5 246-token prompt **49.2 vs 49.2** t/s at
+   `-n 512`.  The reporter measured **-1.3 / -1.6 / -1.5 %** at depths 62 857 / 68 767 / 100 607 on
+   Windows 11 + one R9700 (+0.25-0.30 ms per generated token, about 1 ms per verify+draft round), with
+   byte-identical text and identical draft acceptance in both arms, and a kernel census showing the same
+   graph shapes and the same GPU time.  So the cost is the **ordering handshake**, not the kernels: the
+   device path replaces one async device->host readback the host path had already paid for with a
+   host-blocking event wait plus two blocking row copies per round.
+2. **The arm was never a delivery decision — it came in with the base.**  `r278`'s re-base brought
+   `#31927` in, and the enable is upstream's own `if (!is_mem_shared && !chain_heads)` in
+   `common_speculative_impl_draft_mtp`, so **r281 turned it on for every single-head MTP model** without
+   anyone choosing it.  When a base brings a new default in, that default needs its own measurement: this
+   one had none, and the first field report was a regression.
+3. **Keeping the drafter's carry row on the device and ordering it with a stream wait is SLOWER here
+   than the host round trip it removes.**  The rewrite (one 10 KB `ggml_backend_tensor_copy_async` into
+   the reserved carry row per round, the drafter's first step reading that row too, and
+   `ggml_backend_event_wait` instead of `ggml_backend_event_synchronize` in `decode()`) measured
+   **47.7 / 47.7 / 47.7 t/s** against the host arm's **47.9 / 48.0 / 48.0**, i.e. **-0.5 %**; the
+   stream-wait half alone was neutral (47.7 with either wait arm).  Two tiny copies + two drains +
+   two event records cost more than two blocking copies of one row.  Preserved with its diff and numbers
+   in `archive/work/mtp-dev-rows/` — do not re-derive it, and do not assume "remove the host sync" is a
+   win on this platform.
+4. **What the two arms may not differ in: the greedy text and the draft acceptance.**  They only move
+   where the target's hidden rows are read from, so the text is byte-identical by construction (the target
+   verifies every draft) — measured `542 chars sha=d56a982e90c2` with `79/141` accepted on the 27B and
+   `sha=bbb051e2aeab` with `87/119` on the 4B — and an arm that changes the acceptance is being fed the
+   wrong rows.  Both are gated by `scripts/gate-mtp-dev-rows.sh`, which also fails if a default run
+   allocates the `h_nextn` buffer at all.
+5. **A ROCm line is a codegen variable: a 10.0 build measures ~+0.6-0.8 % prefill here than 10.1, and
+   the reporter measured ~2 % at depth on Windows.**  Same tree, same flags, one model (dense 27B
+   UD-Q5_K_XL, 1 x R9700, `-sm layer`, q8_0 KV, `-ub 512`, `llama-bench -r 2`, arms interleaved 10.1 /
+   10.0 / 10.0 / 10.1): `pp4096 @ d32768` **872.0 / 872.6 vs 878.5 / 878.6 t/s** (+0.7 / +0.7 %),
+   `pp4096 @ d0` **1202.9 / 1199.9 vs 1207.7 / 1206.6** (+0.4 / +0.6 %), `tg64` flat at both depths
+   (25.38/25.38 vs 25.45/25.44 at depth, 26.90/26.90 vs 26.84/26.84 at d0).  On Windows the same
+   comparison is -2.0 to -2.7 % at `d32768` for a whole release's worth of builds, answers `-O2` (so it is
+   not the clang-cl `-O0` issue), does not reproduce at `d0`, and about half of it is recovered by
+   `-Xclang -target-feature -Xclang -real-true16` (device only) — i.e. it is device codegen, and the
+   delivery's own native-q8_0 MMA path is more sensitive to it than clean upstream.  **Consequences:**
+   never compare a prefill number across ROCm lines (the prefill-logit gate already refuses a base from
+   another line, and this is why), and a toolchain bump is a re-baseline, not a flag flip.

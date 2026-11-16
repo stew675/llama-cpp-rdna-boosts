@@ -1,4 +1,4 @@
-From df0a60a2cfd22290e589ec4dbc150d5750c1a2e6 Mon Sep 17 00:00:00 2001
+From c701831a65a4c3576ea415436a55befdcf7336fe Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 14/16] rdna-boosts: block 14: the streamed KV -- a fixed-VRAM
@@ -1286,10 +1286,10 @@ index a9cc220ad..8a541f31e 100644
      } catch (const std::runtime_error & e) {
          LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 0f84f1a0a..013d9a14a 100644
+index 8ef7132aa..75432f396 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -1749,6 +1749,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1763,6 +1763,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      bool    dev_rows    = false;
      int32_t n_batch_tgt = 0;
      std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
@@ -1300,7 +1300,7 @@ index 0f84f1a0a..013d9a14a 100644
  
      // Adaptive draft depth (draft-mtp-adaptive), see common_speculative_adaptive
      bool adaptive = false;
-@@ -1908,6 +1912,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1922,6 +1926,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              }
          }
          SPC_TRC("- target h rows on the device: %s\n", dev_rows ? "yes" : "no");
@@ -1308,7 +1308,7 @@ index 0f84f1a0a..013d9a14a 100644
      }
  
      ~common_speculative_impl_draft_mtp() override {
-@@ -1932,6 +1937,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1946,6 +1951,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          // reset here rather than per round, or two identical requests differ
          common_sampler_reset(smpls[seq_id].get());
  
@@ -1320,7 +1320,7 @@ index 0f84f1a0a..013d9a14a 100644
          // new generation: the depth learned for the previous content is stale,
          // so the controller starts over from --spec-draft-n-start (or the default
          // cold start), even for an empty prompt
-@@ -2107,33 +2117,68 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -2121,33 +2131,68 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  }
              }
  
@@ -1405,7 +1405,7 @@ index 0f84f1a0a..013d9a14a 100644
              }
          }
  
-@@ -2217,6 +2262,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -2231,6 +2276,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
@@ -1419,7 +1419,7 @@ index 0f84f1a0a..013d9a14a 100644
              n_drafting++;
              drafting[seq_id] = true;
  
-@@ -3231,6 +3283,15 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
+@@ -3245,6 +3297,15 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
      return spec->synth_probs;
  }
  
@@ -1435,7 +1435,7 @@ index 0f84f1a0a..013d9a14a 100644
  common_params common_base_params_to_speculative(const common_params & params) {
      const bool has_draft = params.speculative.has_dft();
  
-@@ -3287,6 +3348,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
+@@ -3301,6 +3362,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
      // the MoE cache is only used by the target context
      result.moe_cache_size = 0;
  
@@ -1447,7 +1447,7 @@ index 0f84f1a0a..013d9a14a 100644
      // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
      // TODO: refactor such properties to be announced by the speculative types
      //       something like `struct common_speculative_type_props common_speculative_type_get_props(...);`
-@@ -3372,12 +3438,12 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -3386,12 +3452,12 @@ common_speculative_init_result::common_speculative_init_result(
      // and the injection is fast in small chunks, so cap it at 512 by default; the freed VRAM goes to
      // the MoE expert arena (the `-ub 8192` decode DoD).  `MTP_DRAFT_N_UBATCH=0` restores the target's
      // `-ub`; a positive value overrides the 512 default.

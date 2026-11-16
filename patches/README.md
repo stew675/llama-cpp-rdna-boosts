@@ -7,6 +7,14 @@ then `0300`).  The optional artifacts (`optional/*/01xx-*.patch`: `0100` two-lan
 K/V) are **not** in this set and never in the default apply.  The base is a `release.json` field — this
 line only states which re-base it is.
 
+> **r293: the MTP target h-rows path is opt-in (GitHub issue #318).**  Upstream `#31927`'s device-side `h_nextn`
+> rows came in with the r278 base and r281 turned them on for every single-head MTP model, because the call site is
+> upstream's.  A Windows/HIP user measured that arm as a **-1.3 to -1.6 % decode loss** (identical text, identical
+> draft acceptance, bisected to the arm); here it is neutral.  Block 02 now ships the **pre-`#31927` host readback**
+> and keeps the device path behind `LLAMA_MTP_DEV_ROWS=1`.  One file (`common/speculative.cpp`); blocks 03-`0300`
+> were re-cut (their `From` id only).  Gate: `scripts/gate-mtp-dev-rows.sh`; record: `WORKLOG.md` r293,
+> `archive/work/mtp-dev-rows/` (which also holds the on-device-carry rewrite that measured -0.5 % and was dropped).
+
 > **r288: the block-number re-org.**  The old block 14 (`-sm relaxed-tensor`, temporary) became **`0300`**
 > and moved to the end of the apply; the old 15 (streamed KV) and 16 (UMA GTT) became **14** and **15**; the
 > old 17 (mixed K/V) became **optional `0101`** and left the default set; the unnumbered two-lane-prefill
@@ -591,7 +599,20 @@ reserves its compute buffers (r94 moved it here, the block that calls it).
 for the readback skip, on by default; `0` restores the pre-r118 behaviour with the tail still set),
 `LLAMA_MTP_DRAFT_OP_OFFLOAD`, `LLAMA_SPEC_ALIGN` (r153: verify-batch alignment, on),
 `LLAMA_SPEC_ALIGN_WIDTH_BAND` (r185: the verify width the aligned depth is bounded by on a band-0 config,
-default 16, `0` = off).
+default 16, `0` = off), `LLAMA_MTP_DEV_ROWS` (r293: opt-in, default **off**).
+
+**The target's MTP hidden rows are read back to the host (r293, GitHub issue #318).**  The r278 re-base brought
+upstream `#31927` in, which keeps the target's `h_nextn` rows in a device buffer (`llama_set_embeddings_nextn_dev` +
+`llama_set_ctx_state_src`) and lets the drafter read them in place, and because the call site is upstream's, r281
+turned it on for every single-head MTP model without anybody deciding to.  A Windows/HIP user then measured it as a
+**-1.3 to -1.6 % decode loss** at 63k / 69k / 101k with byte-identical text and identical draft acceptance, bisected
+to exactly that arm (issue #318).  Here it is **neutral** (two prompt depths, one and three interleaved reps: 47.9 /
+48.0 / 47.9 t/s device rows vs 47.9 / 47.9 / 48.0 host rows at 61.5k tokens, 49.2 vs 49.2 on a 5.2k prompt with
+`-n 512`), so the delivery now ships upstream's **pre-`#31927` host readback** and keeps the device path behind
+`LLAMA_MTP_DEV_ROWS=1`.  A rewrite that keeps the drafter's carry row on the device and orders the drafter with a
+stream wait (the reporter's own suggestion) was implemented and measured at **-0.5 %** here, so it was not taken; it
+is preserved with its numbers in `archive/work/mtp-dev-rows/`.  Gate: `scripts/gate-mtp-dev-rows.sh` (the default arm
+must not even allocate the `h_nextn` buffer; both arms must produce the same text and the same acceptance counts).
 
 **The drafter's cache is realigned with the batch it ingests (r218, issue #272).**  The `LLAMA_MTP_INGEST_TAIL`
 skip is only exact while the draft's cache stays contiguous with the rows it ingests: the batch check wants the
