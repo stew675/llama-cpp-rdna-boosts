@@ -57,7 +57,8 @@
 #     tsplitnosink the same, MOE_HOST_POOL_SINK=0 -- the A/B the split arm is judged against
 #                                                (r273: a tensor split gives each device a SLICE of every
 #                                                expert, so the arena->pool demote cannot be expressed at
-#                                                all.  The exchange was nevertheless "engaged", which
+#                                                all -- r295 confirms it from the `-lv 4` geometry census,
+#                                                see the HARD list.  The exchange was nevertheless "engaged", which
 #                                                reserved slots no demote could use AND retired the pool's
 #                                                copy of every expert it promoted with nothing to refill the
 #                                                vacancy: measured 766 758 geometry declines out of 766 758
@@ -65,7 +66,9 @@
 #                                                701 706 refills, h=0.3473 and 0 evictions.  The arm proves
 #                                                the r273 guard: on that geometry the exchange is INERT --
 #                                                0 demoted, 0 geometry, 0 retirements -- and SINK=1 is
-#                                                indistinguishable from SINK=0)
+#                                                indistinguishable from SINK=0; r295 asserts that shape only
+#                                                when the census shows NO expressible pool, and always
+#                                                requires a retirement to be paid for by a landed demote)
 #     pin0    MOE_HOST_POOL_PIN=0                (r233: the kill switch closes the pinned tier from the start
 #                                                on ANY platform -- the state a Windows box stuck on the
 #                                                driver-shipped HIP runtime can run in, issue #278.  No pool
@@ -86,11 +89,22 @@
 #           filled.  The TEXT half of that is box-dependent (a stale-but-valid `input_cpy` can hide it -- it
 #           did here; it corrupted the reporter's server), but the take-over counter is not: measured
 #           takeover=128/129 on the pre-fix code and 0 with the fix, in both arms.
-#   HARD  * `tsplit` builds a real pool, and on that geometry the exchange is INERT: 0 demoted, 0 geometry
-#           declines and 0 promoter slots retired.  `tsplit` must also match `tsplitnosink` byte for byte: with
-#           no expressible demote there is nothing for the exchange to do, so switching it on may not change
-#           one byte of the answer.  (Before r273 the same arm retired ~15x its slot count and refilled every
-#           expert from the page cache; the TEXT matched then too, which is why the census is the check.)
+#   HARD  * `tsplit` builds a real pool and `tsplit` matches `tsplitnosink` byte for byte: with no expressible
+#           demote there is nothing for the exchange to do, so switching it on may not change one byte of the
+#           answer.  (Before r273 the same arm retired ~15x its slot count and refilled every expert from the
+#           page cache; the TEXT matched then too, which is why the census is the check.)
+#   HARD  * `tsplit`'s exchange state is asserted as the GUARD's rule, not as one geometry's answer (r295,
+#           `TODO` #334).  `demote_ok` is a pure table-geometry predicate (`n_slices == 0 && host_bytes ==
+#           expert_bytes`), so a `-sm tensor` split normally registers nothing that can demote and the guard
+#           disengages the exchange BEFORE any attempt.  The rules: (1) a retirement must be PAID FOR by a
+#           landed demote -- `retired > 0` with `0 demoted` is the r273 defect (a vacancy nothing fills);
+#           (2) the arm must EXPLAIN `0 demoted`: a geometry decline or the census's `sink no-demote tables`
+#           count must be there, so a pool that never engaged cannot pass as "inert"; (3) when the census says
+#           every pool is non-expressible, full inertness (0/0/0) IS required.  The reason #3 is conditional:
+#           the old unconditional 0/0/0 encoded this model's block geometry, and the r294 ladder's `demoted=5399`
+#           reading could not be reproduced on the same build with the arm's exact flags (measured r295: 0
+#           demoted, 0 geometry declines, 0 retirements on 2 AND 3 devices, on both Flash-Next IQ3_XXS and IQ3_S;
+#           the `-lv 4` `CACHE_GEOM` census shows all 282/423 tables with `expert_bytes != host_bytes`).
 #   HARD  * `sink` demotes at least once (the arm is not vacuous) and its text is byte-identical to `ref`
 #   HARD  * `sinkfail`: text byte-identical to `ref`, the census reports copy-error declines > 0 (the arm
 #           really failed the copies) and **0 demoted** -- a copy that failed must not be published as a
@@ -278,6 +292,13 @@ sink_copyerr(){ sink_line "$1" | sed -n 's/.*, \([0-9][0-9]*\) copy-error.*/\1/p
 # defect).  Both are taken from the same census line, with the `[0-9][0-9]*` digit class the note above explains.
 sink_geomdecl(){ sink_line "$1" | sed -n 's/.*, \([0-9][0-9]*\) geometry.*/\1/p'; }
 sink_retired(){  sink_line "$1" | sed -n 's/.*\([0-9][0-9]*\) promoter slots retired.*/\1/p'; }
+# r295 (TODO #334): the third reason the exchange is inert, NAMED.  `sink no-demote tables (demote cannot be
+# expressed -- r273 guard, exchange DISENGAGED before any attempt): N`.  `demote_ok` is a pure table-geometry
+# predicate (`n_slices == 0 && host_bytes == expert_bytes`), so on a `-sm tensor` split every table is
+# non-expressible and `pool_sink_active()` returns false BEFORE any attempt: the census then reads
+# 0 demoted / 0 declines / 0 retired, which is the right answer with no reason attached.  This counter attaches it.
+sink_nodemote(){ grep -o 'sink no-demote tables .*: [0-9][0-9]*' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*: //'; }
+sink_pools(){   grep -o 'host pool (L2): [0-9][0-9]* tensors' "$KEEPOUT/$1/err.txt" | tail -1 | sed 's/.*: \([0-9][0-9]*\) tensors/\1/'; }
 # `gt0 <value>`: true when value is a number above zero (empty/garbage is false)
 gt0() { [ -n "${1:-}" ] && awk "BEGIN{exit !(${1} + 0 > 0)}"; }
 
@@ -460,15 +481,43 @@ else
     fail "tsplit: no sink census line -- MOE_HOST_POOL_SINK was not on, so the arm proves nothing"
 fi
 hard
+# r295 (TODO #334): assert the GUARD's rule, not one geometry's answer.  The old check demanded
+# `0 demoted / 0 geometry declines / 0 retired` and called that "demote_ok is false".  That holds only while
+# EVERY pool on the split is non-expressible, which is what this box's Flash-Next shapes measure (`expert_bytes
+# != host_bytes` on all 282/423 registered tables, `host_pitch=180` on the axis-0 `down_exps`, `split_axis=1`
+# on `gate`/`up`), but it is a property of the model's block geometry, not of the exchange.  Three rules now:
+#   1. a retirement must be PAID FOR by a landed demote -- `retired > 0` with `0 demoted` is the r273 defect
+#      (a vacancy nothing can fill: measured 792 321 retirements against 52 704 slots with every attempt
+#      structurally declined, so the pool emptied while the text stayed identical);
+#   2. the arm must EXPLAIN its inertness: `0 demoted` is only acceptable next to a geometry decline or a
+#      non-expressible-table count from the census, so a pool that never engaged cannot pass as "inert";
+#   3. when the census says NO pool can express a demote, full inertness is required -- that is the r273
+#      guarantee, asserted where the geometry actually makes it meaningful.
 td="$(sink_demoted tsplit)"; tg="$(sink_geomdecl tsplit)"; tr="$(sink_retired tsplit)"
-if [ "${td:-x}" = "0" ] && [ "${tg:-x}" = "0" ] && [ "${tr:-x}" = "0" ]; then
-    ok "tsplit: the exchange is INERT (0 demoted, 0 geometry declines, 0 retirements) -- demote_ok is false"
+tnd="$(sink_nodemote tsplit)"; tpl="$(sink_pools tsplit)"
+hard
+if gt0 "$tr" && [ "${td:-0}" = "0" ]; then
+    fail "tsplit: ${tr} retirements against 0 demotions -- a vacancy nothing can fill (the r273 defect)"
+    echo "      every promoted expert then has to be refilled from the page cache/disk: measured 792 321"
+    echo "      retirements / 701 706 refills / h=0.3473 on the pre-r273 code"
 else
-    fail "tsplit: the exchange acted on a geometry that cannot demote (demoted='${td}' geometry='${tg}' retired='${tr}')"
-    echo "      a retirement with no demote that can land empties the pool: every promoted expert has to be"
-    echo "      refilled from the page cache/disk (measured 792 321 retirements / 701 706 refills / h=0.3473)"
+    ok "tsplit: retirements are paid for (demoted='${td:-0}' retired='${tr:-0}')"
 fi
 hard
+if [ "${td:-x}" != "0" ] || gt0 "$tg" || gt0 "$tnd"; then
+    ok "tsplit: the exchange's state is reported (demoted='${td:-0}' geometry='${tg:-0}' retired='${tr:-0}', no-demote tables='${tnd:-0}' of '${tpl:-?}')"
+else
+    fail "tsplit: 0 demoted with no geometry decline and no no-demote table in the census -- the arm is vacuous"
+    echo "      (would pass with a pool that never built, a sink silently off, or a tsplit arm that reached nothing)"
+fi
+if gt0 "$tnd" && [ "${td:-x}" = "0" ] && [ "${tg:-x}" = "0" ]; then
+    hard
+    if [ "${tr:-x}" = "0" ]; then
+        ok "tsplit: the exchange is INERT (0 demoted, 0 geometry declines, 0 retirements) -- every one of the ${tnd} sub-mirror pools cannot express a demote"
+    else
+        fail "tsplit: retired=${tr} on a geometry where no demote can be expressed"
+    fi
+fi
 if [ "$(text_hash tsplit)" = "$(text_hash tsplitnosink)" ] && [ -s "$KEEPOUT/tsplit/text.txt" ]; then
     ok "tsplit SINK=1 == SINK=0 on the same split ($(text_hash tsplit))"
 else

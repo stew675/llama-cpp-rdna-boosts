@@ -78,4 +78,35 @@
 6. **`parse_env()`'s logging never reaches the user.**  `ensure_env()` runs before the host installs its ggml log callback, so
    every `GGML_LOG_*` in `parse_env` is dropped -- that is why an invalid `MOE_HOST_POOL_TRANSPORT` value silently left the pool
    with NO transport decision (the WARN that would have said "ignoring" was invisible, and with the env var gone the failure
-   mode is gone with it).  Any new env diagnostic belongs at the first pool build, not in `parse_env` (`TODO` #332).
+   mode is gone with it).  **Fixed at r295** (`TODO` #332 retired): the mechanism is even broader than this note assumed — the
+   parse runs inside the `--fit` PROBE, whose log scope demotes sub-threshold levels to DEBUG — and the lines are now buffered
+   and flushed late.  A new env diagnostic belongs in `parse_env` again; see r295 fact 1.
+## r295 — `parse_env()`'s diagnostics are buffered, and the pool exchange's inertness is named
+
+1. **`parse_env()` runs inside the `--fit` probe, and the probe's logger is deliberately quiet.**  `ensure_env()` is called at
+   the first cache call, which on a default `--fit` run is the PROBE load — and the probe wraps the llama logger in
+   `common_fit_log_scope`, which demotes every level below its own to `GGML_LOG_LEVEL_DEBUG`, which `common_log_add` drops at
+   every default verbosity.  So *every* `GGML_LOG_WARN`/`INFO` `parse_env` issued was lost, not just on a pre-callback path:
+   measured `MOE_EXPERT_SEED=bogus` printing `is not eager|auto|lazy; using eager` with `--fit off` and nothing at all with
+   the default `--fit`.  The VALUES must still be parsed that early (the preflight reads them, and it can run before backend
+   init — issue #136), so only the REPORTING is late: `env_logf()` buffers the lines and they are flushed at the first routed
+   op, the first pool build, or the exit census, whichever comes first.  **A new env diagnostic belongs in `parse_env` again**
+   — it is no longer a hole — and a diagnostic that must appear before any of those three points belongs in the pool build
+   itself (the deprecation warnings live there).
+2. **`demote_ok` is a pure table-geometry predicate, so on `-sm tensor` the exchange is disengaged before any attempt.**
+   `demote_ok = (n_slices == 0 && host_bytes == expert_bytes)` (`pool_sink_active()` requires it), and a tensor split gives
+   each device a SLICE of every expert.  Measured on this box, `-lm 99 --n-cpu-moe 47/48 --sm tensor`, `MOE_HOST_POOL_SINK=1`,
+   the `-lv 4` `CACHE_GEOM` census (`GGML_CUDA_CACHE_GEOM_DEBUG=1`) as the geometry of record:
+   `ffn_gate_exps`/`ffn_up_exps` `split_axis=1 host_pitch=0` (`expert_bytes` 253 440 / 168 960 against `host_bytes` 422 400),
+   `ffn_down_exps` `split_axis=0 host_pitch=180` (184 320 / 276 480 against 460 800), `n_slices=0` everywhere — so **no table
+   is expressible** and the census reads **0 demoted / 0 geometry declines / 0 retirements** with 141 of 141 pools
+   non-expressible, on 2 AND 3 devices, on Flash-Next IQ3_XXS and IQ3_S.  Two consequences: the r294 ladder's
+   `demoted=5399` reading is not reproducible on that same build with the arm's flags (recorded as such rather than
+   explained away), and **a gate must not encode this model's block geometry as the assertion** -- it asserts a retirement
+   is paid for by a landed demote, that `0 demoted` is EXPLAINED (a geometry decline, or the new
+   `sink no-demote tables (...)` census line that names the guard), and full inertness only where the census says no pool
+   can express a demote.
+3. **The `11-26 %` spill figure is gone from the code as well as the docs.**  `common/arg.cpp`'s `--kv-window` help and
+   `common/fit.cpp`'s placement hint now say the cost is linear in the depth past the window (and nothing at or above the run
+   depth), matching `ENVIRONMENT.md` §17.0 since r292.  Text only: `--fit`'s per-token estimate is unchanged (it divides by
+   the calibrated in-place read rate), and the r295 gates that print the line move no number and no token.

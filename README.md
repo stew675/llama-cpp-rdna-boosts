@@ -20,7 +20,8 @@ and treat it as a stop-gap, not a feature.  Two further blocks are **optional** 
 default set: `0100` (two-lane prefill) and `0101` (mixed K/V cache types), applied only with
 `--include-optional` (see [`optional/README.md`](optional/README.md)).  The release `v<N>-...` prefix is
 the **official** block count (`N` = 16); `0300` and the optional blocks are not counted.  The current
-release is **`v16-4f9dfa0e3-r288`**: the release
+release is **`v16-4f9dfa0e3-r295`** (read `.release` in `release.json` -- it is the source of truth, not this
+line): the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
 [`WORKLOG.md`](WORKLOG.md) (newest first; it is the only dated record).  This README describes the set,
@@ -51,7 +52,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 17 default bl
 ## Releases
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
-(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v16-4f9dfa0e3-r288`**; the block
+(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v16-4f9dfa0e3-r295`**; the block
 count in the tag is the **official** `00xx` count, so `v15-*` tags are the 15-block releases up to r177 and
 `v16-*` the 16-official-block releases from r178 on.  The temporary `0300` and the optional `01xx` blocks are
 never counted (`AGENTS.md`).  `r1` is the

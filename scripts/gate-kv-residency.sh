@@ -434,8 +434,9 @@ if [ "$DO_WINDOW" = 1 ]; then
         || fail "hintwin: the hint offered --kv-attendance-pool to a model that cannot take the pool (TODO #300)"
 
     # INFO only, no assertion: a window that spills below the depth the run reaches is a DOCUMENTED trade-off
-    # (11-26 %, `ENVIRONMENT.md` 17.0), so its prompt rate is reported for the record and never gated.  The
-    # assertion in the pool section is the one that has no such excuse (r217).
+    # whose cost is linear in the depth past the window (`ENVIRONMENT.md` 17.0, r292 field correction), so its
+    # prompt rate is reported for the record and never gated.  The assertion in the pool section is the one that
+    # has no such excuse (r217).
     info "window prompt rate (info, not asserted): wref $(prompt_ts wref) / wres $(prompt_ts wres) / wspill $(prompt_ts wspill) t/s"
 fi
 

@@ -8,7 +8,11 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `33902efebd4051d6eaa94b49a4584133e3df249441f306e934402617dbc609c9` (the r291 cut; the r288/r290 cuts are recorded below)
+  `94a393d5a7d50816aa92c7c3fc650455f286f0d398024f52a30197ca6fb1f080` (the r295 cut; the earlier cuts are recorded below)
+* **r295 re-cut verification**: applies strictly at the r295 default tree
+  `bdfd4a182dc9bdf9a7b6a46a0f206622f37b5e34` and produces `5143475fc21ee964717497dd5f0eb4c4e8a48ac8`; cumulative with the
+  other optional artifact, numeric order, is `af4c85cfedb7eea6a1eb3a71eb0448a40e03aea3`.  The default tree moved by blocks
+  12/14/15's r295 amendments, outside this artifact's mechanisms.
 * cut against the **r288 default delivery tree** `79d18f41b9ab9b235d35fd3a5034858eddd94844` (official blocks
   `0000`-`0015` plus the temporary `0300`; that is the r287 release tree with block 17 removed)
 * produces tree `89b2555296146290f556f1cf017ed6ee124dfce6` when applied alone on that tree — byte-identical

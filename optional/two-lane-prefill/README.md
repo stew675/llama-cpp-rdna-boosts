@@ -19,7 +19,12 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `8814fffe90e776a8ed99950c16c0ab746a81a67e13ec183a5311af88c285273d` (the r291 cut; the earlier cuts are recorded below)
+  `a549de5464a31890d8180adfd10530fec5e28d87000bd35d95de84ffaf8517bd` (the r295 cut; the earlier cuts are recorded below)
+* **r295 re-cut verification**: applies strictly at the r295 default tree
+  `bdfd4a182dc9bdf9a7b6a46a0f206622f37b5e34` and produces `87b399a4f61008d8af7443b444f244b0fde97a77`; cumulative with
+  the other optional artifact, numeric order, is `af4c85cfedb7eea6a1eb3a71eb0448a40e03aea3`.  The default tree moved by
+  blocks 12/14/15's r295 amendments (`parse_env` logging, the `--kv-window` help text, the pool exchange's census line),
+  outside this artifact's mechanisms; `validate-set.sh` check 8 verifies all three trees on every run.
 * **r293 re-cut verification**: applies strictly at the r293 default tree
   `92e77acfae0700b68439d69923fcb79d6fbe3a54` and produces `abe412bb86f98aa60224a8fdea41521b314d03f3`; cumulative with the other optional
   artifact, numeric order, is `795b1b0be4d56c75b6bb9707c46d207c0b5bb452`.  The patch file is unchanged (sha256 above) and the default tree

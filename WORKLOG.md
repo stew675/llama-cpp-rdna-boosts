@@ -1,3 +1,84 @@
+## 261116.002 (r295) -- the `--kv-window` help text stops quoting the retired `11-26 %`, `parse_env()`'s diagnostics are buffered past the `--fit` probe's quiet logger, and the pool exchange's inertness is named (`TODO` #331, #332, #334 retired)
+
+**Amends blocks 12, 14 and 15** (no new block; split by code ownership: the env-log buffer and four of the five
+`parse_env` lines it could already emit in **12**, the two shipped help/fit strings in **14**, the fifth `parse_env` line
+(`MOE_EXPERT_SEED`) plus the exchange's census counter in **15**).  Patches
+regenerated, `release.json` at `v16-4f9dfa0e3-r295` (`tip 713a75c1a` -- the re-cut value `fork-refresh.sh` prints, not the
+working chain's `c98b6f0c1`, same tree; `tree bdfd4a18`; optional `0100` -> `87b399a4f`,
+`0101` -> `5143475fc`, cumulative `af4c85cfe`), `validate-set.sh` GREEN.  Three `TODO` handles retired; two of them were
+"do not re-derive" traps rather than code defects, and one turned out to be a measurement that no longer reproduces.
+
+**#331: the shipped text said "11-26 % of decode".**  r292 corrected every doc (`ENVIRONMENT.md` §17.0, `README.md`,
+`patches/README.md`, `MANIFESTS.md`, `scripts/README.md`, `COMMUNITY-CONFIG.md`) to "the penalty is linear in the depth past
+the window", but deliberately left the two strings the USER reads: `common/arg.cpp`'s `--kv-window` help line and
+`common/fit.cpp`'s placement hint.  Both now say that, with the one nuance worth carrying in `--help`: **a window at or above
+the run depth costs nothing**.  Text only -- `--fit`'s per-token estimate already divides by the calibrated in-place read rate,
+so no computed number moves, and both gates that print the line (`gate-kv-window-split.sh`, `gate-kv-residency.sh`) reproduce
+every arm's token and rate.
+
+**#332: everything `parse_env()` logs was swallowed, and the mechanism was not the one the note guessed.**  The r294 finding
+blamed the pre-callback window (`ensure_env()` runs before the host installs its ggml log callback).  Measured here, the
+actual mechanism is broader and permanent: on a default `--fit` run the first cache call is the FIT PROBE's load, and the
+probe wraps the logger in `common_fit_log_scope`, which demotes every level below its own to `GGML_LOG_LEVEL_DEBUG` -- and
+`common_log_add` drops DEBUG at every default verbosity.  So no `parse_env` line ever reached a log file, on any verbosity:
+
+| arm (`4B Q8_0`, `-lv 4`) | `MOE_EXPERT_SEED=bogus` line |
+|---|---|
+| `--fit off` | `W parse_env: MOE_EXPERT_SEED=bogus is not eager|auto|lazy; using eager` |
+| default `--fit` (before) | **nothing at all** |
+| default `--fit` (after) | the same WARN, at 1.7 s (the probe's own model teardown flushes it) |
+
+The values must be parsed that early (the preflight reads them, and it can run before backend init -- issue #136), so only the
+REPORTING moved: `env_logf()` buffers the lines verbatim and the first caller that cannot be inside a quiet probe flushes them
+-- a routed op, the first pool build, or the exit census.  The two `pool_transport_init_locked` deprecation WARNs r294 added
+stay where they are (they are already late).
+
+**#334: `gate-host-pool.sh`'s `tsplit` arm.  The assertion was too strong, and the failure it recorded does not reproduce.**
+The arm demanded `0 demoted / 0 geometry declines / 0 retirements` as its proof that the r273 guard works.  `demote_ok` is a
+pure table predicate (`n_slices == 0 && host_bytes == expert_bytes`) and a tensor split gives every device a SLICE of every
+expert, so the guard fires before any attempt -- the zeros are the right answer for a reason the census did not state, and
+they hold only while every pool on the split is non-expressible.  The r294 ladder read `demoted=5399 geometry=0 retired=4`
+(the r292 build by hand: `8736 demoted ... 12348 retired`); re-run on the SAME r294 build with the arm's exact flags it reads
+`0 demoted / 0 geometry / 0 retired`, on 2 **and** 3 devices, on Flash-Next IQ3_XXS *and* IQ3_S (the shape r294's own work
+was on) -- so the recorded census is not reachable from the shipped code and is recorded as such rather than explained
+away.  The `-lv 4` geometry census (`GGML_CUDA_CACHE_GEOM_DEBUG=1`) is the evidence: all 282 (2 devices) / 423 (3 devices)
+registered tables are slice-sized -- `gate`/`up` `split_axis=1 host_pitch=0`, `down_exps` `split_axis=0 host_pitch=180`, and
+**no table has `expert_bytes == host_bytes`** -- so nothing can demote, on either shape.
+
+What changed, then, is the assertion and the evidence it is allowed to use:
+* block 15's census gains `sink no-demote tables (demote cannot be expressed -- r273 guard, exchange DISENGAGED before any
+  attempt): N`, so an inert census NAMES its geometry instead of being an unexplained zero;
+* the gate requires a **retirement to be paid for by a landed demote** (`retired > 0` with `0 demoted` is the r273 defect:
+  a vacancy nothing fills, measured pre-fix at 792 321 retirements against 52 704 slots);
+* `0 demoted` must be EXPLAINED -- a geometry decline, or the new no-demote count -- so a pool that never engaged cannot pass
+  as "inert";
+* and full inertness (0/0/0) is still required, but only where the census says every pool is non-expressible.  The single-GPU
+  `sink` arm keeps proving the demote is exercised where it CAN be (5852 demotions this run), so the pair cannot pass by the
+  sink silently going global-off.
+
+**Gates**, all on the release tree `bdfd4a18` (the last step was a comment-only amendment -- `pool_transport_init_locked`'s
+note still claimed `parse_env`'s logging is lost, which this change makes false; the tree it produced was rebuilt and both
+re-cut gates re-run).  `validate-set.sh` GREEN (fresh-tarball strict 17/17, both optional artifacts
+re-cut and verified alone and cumulatively, Windows portability 512 files).  `gate-per-block-build.sh --changed-from
+a060ce2a5` **4/4** (blocks 12, 14, 15, 0300; 48 / 46 / 47 / 8 s).  `gate-host-pool.sh` **56/56** -- the two new checks are
+this change's, and every arm is byte-identical (182 chars `a99ccbd97ecb`; `tsplit`/`tsplitnosink` 171 chars `8c39335bbceb`,
+the same text r292/r294 recorded) with `sink` demoting 5852 times, `sinkfail` publishing nothing, and `tsplit` reporting
+`0 demoted / 0 geometry / 0 retired` from **141 of 141 non-expressible pools**.  `gate-host-read-transport.sh` **23/23**
+(transport, pool bound and text identity unchanged).  `gate-kv-residency.sh --window-only` PASS (window arms byte-identical,
+`hintwin` offers the window and not the pool, the selftest sensitive both ways) and `gate-kv-window-split.sh` PASS (every
+split, `-nkvo`, and all five `--fit` arms).  `gate-prefill-logits.sh` **PASS** (mean KLD **0.000697**, same-top-p
+**98.784 %** against the recorded base -- unchanged code paths, the delta is the recorded-base point).  `check-gpu-faults.sh`
+clean over every gate's window.
+
+**Not run, and why.**  The MTP four-axis protocol and `llama-batched-bench -npl 1,4,8`: this release moves no kernel, no
+placement and no sampling path (two help strings, a log buffer, one census line and one gate assertion), and every arm above
+is byte-identical.  `gate-uma-experts.sh` needs an APU (this box is discrete); block 15's change is the census line the
+discrete pool gate reads.
+
+**Not shipped:** the r294 `demoted=5399` observation itself.  It is not reproducible on the build that recorded it, and the
+honest answer is that the census carries a name for the guard now, so the next report of an inert-on-a-split arm (or of an
+emptied pool there) resolves in one log line.
+
 ## 261116.001 (r294) -- the load mode is not the tier: `--load-mode dio` gets the host-expert pool, the pool's demand transport becomes `--load-mode` alone, and `-lme mirror` states a covering pool
 
 **Amends blocks 12, 14 and 15** (no new block; the change was split by code ownership: the demand transport and
