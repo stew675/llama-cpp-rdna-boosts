@@ -285,3 +285,49 @@ so the mechanism is proven free — it simply has nothing to buy here.
 whose routing drifts across topics instead of continuing one prose passage.  The store's own sizing is the
 cheap lever there: it took 7.7 GiB of the band on this shape and had 24 600 entries against a 42 k-miss
 population (only 57-109 entries ever recycled), i.e. it is *not* capacity-limited — it is demand-limited.
+
+## 11. What a fill actually costs, and where the store starts to pay (the crossover)
+
+The §10 shape is a full **pinned mirror**, so its fills are ~12 µs and fully overlapped.  The store pays
+exactly the fill cost it avoids, so the crossover is a *fill-source* question.  Measured on 2 × R9700,
+`-ub 16384`, 5 246-token prompt, 1 000-2 000 generated tokens, `sha` identical in every arm except where
+noted:
+
+| shape | arena residency | host tier / fill source | fill cost | decode (store off -> on) |
+|---|---:|---|---:|---:|
+| Flash-Next GSQ-IQ3_S, `-lme auto` | 85.6 % | pinned **mirror** (h=1.000) | ~12 µs (332 KiB at the 28.7 GB/s H2D calibration) | 52.3 -> 52.0 (2 k) / **52.4 -> 52.4** (20 k) |
+| same, `-lme 26` + `DIO=1` | 85.6 % | 26 GiB pool — covers the arena's complement, so still pinned | ~12 µs | 40.7 -> 40.7 |
+| same, **`-lme 4`** + `FILL_SRC=file DIO=1` | 85.6 % | **storage** (2 083 MiB/s, 0.45 MiB/read) | **~300 µs** | 34.0 -> **35.4 (+4.4 %)** |
+| Flash-Next **Q4_K_XL** (111 GiB), `-lme 26` + file | low | storage | ~300 µs | 21.7 -> 21.8 (+0.5 %) |
+| **122B-A10B Q4_K_XL** (78 GiB), `-lme auto` | **70.6 %** | pinned mirror (h=1.000) | ~12 µs | 34.9 -> 34.9 |
+
+* **The 13 µs was the pinned case, and it is real but hidden.**  21 fills/token × 12 µs would be 1.3 % of a
+  19 ms token *if serialized*; measured 0.0 %, so the async input batch absorbs them.  The user's doubt was
+  right for every other tier: a **storage** fill is ~300 µs (r270's own figure is 0.7-1.6 ms per 0.65 MiB
+  fill on this NVMe), and there the store's arithmetic shows up exactly — 3 584 store hits × ~307 µs = 1.08 s
+  of a 29.4 s decode = the measured **+4.4 %**.
+* **The conversion rate is the other factor, and it is the limiter.**  On the disk shape the store served
+  **10.8 %** of arena misses (3 584 of 33 208): of 11 480 retained victims only 31 % were re-touched inside
+  1 000 tokens, and the store never recycled (6 entries), so it is *demand*-limited, not capacity-limited.
+  **Its ceiling on that shape is +30 %** (29 624 fills × 300 µs = 8.9 s of the 29.4 s), i.e. the store is
+  worth having where fills are storage-backed, and its hit rate is what to improve.
+* **A heavier model does not create the opportunity — it removes the band.**  The 122B at 70.6 % residency
+  has **no drop band at all**: its tables fill the mapped arena, so `share < expert_bytes` for every table and
+  the store is planned-and-dropped 8 times with zero entries (the arm is inert and says so).  The band exists
+  only where the mapped arena exceeds what the tables took — which is the *same* configuration where the
+  hot set is already well covered (85.6 %, prior gain 0.42 pp).  **That anti-correlation is the real
+  crossover answer**: "plenty of band" and "the hot set does not fit" do not co-occur on a 2-card box.  The
+  shapes that break it are (a) a **wide `-ub`** on a model that does fit (the band is `boundary_birth -
+  narrow_floor`), (b) **3 GPUs** (more mapped VA per expert), and (c) a **smaller arena** (a 24 GiB card, or
+  `-lme`-driven pressure) — not a bigger model.
+* **Two prototype bugs found by the arms above** (both fixed, `e550d842e`): the per-table share was derived
+  from the *pre-descent* allocation, so on a fragmented band the last tables' entries were carved **past the
+  end of the region** — silent VRAM corruption, caught because the 122B arm generated **1 032 characters
+  instead of 3 499** (a wrong-text arm is a bug report, not a slow number; the text hash is what caught it);
+  and a fragmented band was refused outright instead of descending to a run that fits.
+* **Not covered by the prototype, and where the disk shapes' cost actually is**: the store serves only the
+  arena *fill* path.  On the disk shape the census shows **134 749 per-expert storage reads (61.1 GiB,
+  29 359 ms)** on the bounce path and 24 on the cold path, against 29 624 arena fills — i.e. 4.5x the traffic
+  the store can see.  Extending the store to the bounce/cold path (a cold *id* that resolves to the store
+  instead of the host master) is the change that would matter on a storage-backed box, and it is a kernel-id
+  change, not a copy.

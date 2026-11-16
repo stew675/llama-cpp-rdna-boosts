@@ -24,6 +24,9 @@
 #            stream and only `extract-generated.py` on a clean arm gives a hash.
 #            The footer rates are unaffected either way.
 #   PROMPT   prompt file (default the delivery's 5 246-token prose prompt)
+#   MODEL    gguf to load (default the Flash-Next GSQ-RCO-IQ3_S field shape)
+#   LME      -lme (host-expert budget); unset = the model's own auto resolution
+#   EXTRA    extra llama-cli arguments (appended verbatim)
 #   NCMOE / SM / THREADS / LOADMODE / LAZYMODE  model-placement overrides
 #   CLEANENV 1 = do not export the campaign's host-pool defaults
 #
@@ -50,15 +53,18 @@ CTX=${CTX:-$((2*UB+512))}
 LVARG=""
 [ -n "${LV:-}" ] && LVARG="-lv $LV"
 D=/llm/models/Qwen3.8/Flash-Next/GSQ-RCO-IQ3_S
+MODEL=${MODEL:-$D/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf}
 LOG=/tmp/band-ab-$TAG.log
 
-timeout 2400 ~/llama.cpp/build-rocm/bin/llama-cli -m "$D/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf" \
+LMEARG=""
+[ -n "${LME:-}" ] && LMEARG="-lme $LME"
+timeout 2400 ~/llama.cpp/build-rocm/bin/llama-cli -m "$MODEL" $LMEARG \
   --n-gpu-layers all --n-cpu-moe "${NCMOE:-47}" --ctx-size "$CTX" \
   --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 \
   --load-mode "${LOADMODE:-mmap}" --lazy-mode "${LAZYMODE:-mlockr}" --threads "${THREADS:-7}" \
   --split-mode "${SM:-tensor}" --batch-size "$UB" --ubatch-size "$UB" --temp 0 --seed 42 \
   --no-display-prompt --single-turn -n "$NGEN" \
-  -f "${PROMPT:-/home/stew675/llama-cpp-rdna-boosts/prompts/prose-rdna-boosts.txt}" $LVARG > "$LOG" 2>&1
+  -f "${PROMPT:-/home/stew675/llama-cpp-rdna-boosts/prompts/prose-rdna-boosts.txt}" $LVARG ${EXTRA:-} > "$LOG" 2>&1
 rc=$?
 
 echo "== $TAG (rc=$rc, log $LOG)"

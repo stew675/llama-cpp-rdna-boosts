@@ -26,7 +26,13 @@ The measurement **does not** kill the idea — it names what is missing and caps
   rate did not move (52.3 → 52.0 / 52.4 → 52.4): on this shape the miss path is already fully overlapped
   (0.29-0.62 % of reaches, 0.36 GB/s against a 28 GB/s link), which is the 0.42 pp ceiling seen from the other
   end.  The mechanism is proven free; the prize needs a **short-arena** shape or a genuinely agentic long
-  generation, neither of which is measured yet.
+  generation, neither of which is measured yet.  **The crossover is measured now (§11 of the record)**: the
+  store pays exactly the fill it avoids, so it is +4.4 % when demand fills are **storage**-backed (~300 µs
+  each, `-lme 4` + `FILL_SRC=file`) and 0.0 % when they come from a **pinned mirror** (~12 µs, hidden by the
+  async input batch) — 20 000 generated tokens included.  And a heavier model does **not** help: the 122B at
+  70.6 % residency has *no band at all* (its tables fill the mapped arena), because "plenty of band" and "the
+  hot set does not fit" do not co-occur on two cards.  The unbought cost on a storage-backed box is the
+  **bounce** path (134 749 reads, 61.1 GiB, 29.4 s on the disk arm) which the store does not see.
 * **What upstream would otherwise be missing: reclaim granularity**, exactly as the 2026-11-15 revision said: cold slots in
   the band must be droppable at a prefill **without standing their table down**.  Two ways: two-segment /
   per-slot indirection (the revision's plan), or a **band-resident retention store** that is one slab
