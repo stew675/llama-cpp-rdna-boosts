@@ -1,3 +1,56 @@
+## 261115.009 (r292, docs only -- NO delivery change) -- issue #314's field grid corrects two doc claims: a spill costs the depth past the window (not "11-26 %"), and "layer first on a mixed set" is a starting point, not a criterion (that pair measures tensor +63-70 % of decode)
+
+The reporter of issue #314 re-ran the r289 fix on his own settings and then posted a full grid: `--kv-window
+{auto, 8192, 1}` x `-sm {tensor, layer}` x `-ts {24/16, 1/1}` x depth `{0, 4095, 8127, 8192, 16384, 65536}`,
+`llama-bench` on a mixed pair (`gfx1100` RX 7900 XTX 24 GB + `gfx1201` RX 9070 XT 16 GB, `ROCm1/ROCm0`), r289
+build `3124657c0`, 27B Q5_K_M, `-b 8192 -ub 2048`.  No fault anywhere in it, and his standard-settings arm shows
+the fix landing: the window arm reads **-8 % prefill / -31 % decode** against no window where his pre-fix report
+was ~-29 % prefill.  Two of our own claims did not survive the grid, and both were prose, so this entry is the
+correction (no patch, no `release.json` change, no gate to re-run).
+
+**1. The spill cost was quoted as a percentage of nothing.**  `ENVIRONMENT.md`'s `--kv-window` summary row (and
+the block-14 bullet in `patches/README.md`) said a spilled cell costs "11-26 % once the request is deeper than the
+window", which is one depth from r181's campaign and reads as a bound.  It is not a bound: the cost is **linear in
+the depth past the window**, which our own r286 record already showed (-10 / -19 / -42 % decode at one / two / six
+spilled 4 MiB map units, `benchmarks/2026-11-14-kv-window-313.md`) and his grid extends to the far end (`W=8192`
+at 65 536: 55.4 vs 851.6 t/s prefill, 1.73 vs 40.05 decode on `tensor 24/16`).  Corrected in `ENVIRONMENT.md`
+§17.0 + summary row, `patches/README.md`, `MANIFESTS.md` and `scripts/README.md` (the two gate-side references
+that quoted the number), and `patches/README.md`'s historical P2 rejection keeps its dated 11-26 % because it is
+a decision record, not a current claim.
+
+**2. The PREFILL side of a spill is not settled, and we had implied it was.**  Our r286 record has prefill at
+-1.8 % with a 31 000-token request at `W=8192`; his pair reads `pp4096` **1 401 -> 590 t/s at `d8127`,
+1 346 -> 445 at `d8192`, 1 245 -> 218 at `d16384`**, with spreads of +/- 120-190 t/s, i.e. a slide during a
+prefill is not free on that box.  `ENVIRONMENT.md` §17.0 now carries a fourth bullet that states the decode
+figures are decode, quotes his, and marks the prefill penalty **open** (his pair is not a validated
+configuration and there is no `gfx1100` on the validation box).  Not a TODO item because there is nothing to
+change until someone measures a `gfx1100`; the bullet is the record.
+
+**3. "Mixed or imbalanced set: try `-sm layer` first" was written as a criterion and is a risk list.**  The r289
+reply's split advice (and `README.md` -> *Picking a split mode*, `INVARIANTS.md`'s r289 entry,
+`COMMUNITY-CONFIG.md`'s split row) reasoned that a mixed pair pays the per-layer all-reduce and should therefore
+prefer `layer`.  His grid measures the opposite on exactly that shape: at `d0`, `tensor 24/16` **1 470 / 47.30**
+against `layer 24/16` **1 291 / 27.80**, and `tensor 1/1` **1 662 / 44.38** against `layer 1/1` **1 328 / 27.28**,
+i.e. +14-25 % prefill and +63-70 % decode, holding at every depth to 65 536.  So the criterion is now: a
+homogeneous set is measured and has nothing to decide (the r16 arm stands), and a mixed or stacked set is an
+**A/B on your own box**, with `layer` the simpler contract to start from when `tensor` misbehaves or underperforms
+rather than because it measures faster.  `README.md`'s heading and section, `INVARIANTS.md`'s r289 entry (corrected
+in place, `r292` appended) and the `COMMUNITY-CONFIG.md` row all say that now.  His `layer` decode loss (-40 %) is
+recorded with the numbers and no explanation: `layer` needs no all-reduce, so on paper it should not pay a handoff
+that large, and that is his box's property until a homogeneous-arm-free measurement says otherwise.
+
+**What did NOT change.**  Nothing under `patches/`, `optional/` or `rdna-boosts-all.patch`; `release.json` still
+reads `v16-4f9dfa0e3-r292`, tip `2b7a653097c3`, tree `4a67e7c9d7b1`, and every recorded artifact sha256 still
+matches its file (checked: 17 default patches, `rdna-boosts-all.patch`, both optional artifacts), so
+`validate-set.sh` sees no change and the block commits are identical.  **One thing was deliberately left in the
+code**: `common/arg.cpp`'s `--kv-window` help line and `common/fit.cpp`'s `--fit` output still say "11-26 %% of
+decode", which is block 14's text and needs a patch amendment with its gates.  That is `TODO` **#331** (text only,
+no computed number moves) and it is the honest caveat to the correction: the docs are right before `--help` is.
+`WORKLOG.md`'s dated entries keep their 11-26 % quotations (they are records of what was believed then).
+
+**Reply:** posted on issue #314 (no em dashes), thanking him for the grid and pointing at both corrections,
+including the `--help` caveat.
+
 ## 261115.008 (r292) -- post-release 24 GiB confirmation with the final gate: the fix arm is unchanged (43.54/43.61 t/s, arena 15 995.3 MiB, traffic -38.2 %, text identical); same-binary A/B +18.4 % (the release's +19.5 % was against the separately built r291 base at 36.50)
 
 Re-ran the RX 7900 XTX (`gfx1100`, 24 GiB, PCIe 4.0 x16, mirror) field shape on the **final release tree**

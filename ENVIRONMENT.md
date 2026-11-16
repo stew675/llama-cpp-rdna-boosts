@@ -1124,7 +1124,7 @@ neither.
 
 | option | env form | default | what |
 |---|---|---|---|
-| `--kv-window [auto\|N]` | `LLAMA_ARG_KV_WINDOW` (`LLAMA_KV_RESIDENT_CELLS` = deprecated alias) | **`0`** (off) | §17.0.  **One copy**, tiered by address: the newest `N` cells stay in VRAM, everything older is pinned host RAM inside the same reservation.  Lossless and model-agnostic; a spilled cell is just read over PCIe (11-26 % once the request is deeper than the window).  `auto` = `--fit` sizes it |
+| `--kv-window [auto\|N]` | `LLAMA_ARG_KV_WINDOW` (`LLAMA_KV_RESIDENT_CELLS` = deprecated alias) | **`0`** (off) | §17.0.  **One copy**, tiered by address: the newest `N` cells stay in VRAM, everything older is pinned host RAM inside the same reservation.  Lossless and model-agnostic; a spilled cell is just read over PCIe, and the cost is **linear in the depth past the window** rather than a fixed percentage (one spilled map unit per tensor is about -10 % of decode, six is -42 %, and a window at or above the run depth costs nothing -- §17.0).  `auto` = `--fit` sizes it |
 | `--kv-attendance-pool [on\|off]` | `LLAMA_ARG_KV_REGION_POOL` (`--kv-region-pool` = alias) | **`off`** | §17.1.  **Two copies**: the attention KV's authoritative copy in a pinned host **mirror**, plus a compact device **pool** of indexer pages + a page table that the sparse QSA decode resolves through.  qwen4exp only, never with a window.  The pool's SIZE is derived from the model and is not a knob |
 | `--spec-draft-kv-window [auto\|N]` | `LLAMA_ARG_SPEC_DRAFT_KV_WINDOW` | **`0`** (off) | §17.2.  The **MTP draft** cache is truncated to a sliding window of `N` cells per sequence.  Lossy (the drafter forgets), so it can only cost decode; measured -9.7 % on a `-sm tensor` split past the window.  `auto` = the cap or nothing |
 
@@ -1186,6 +1186,13 @@ card and 0.40 t/s on a split while another's (same repo, faster link) stayed usa
   once per device) and both the `WINDOWED KV ENABLED` line and `--fit`'s per-token estimate divide by **it**
   rather than by the copy engine.  The log states the worst-case read time at full spill, so the decision is
   made on a measured number; `benchmarks/2026-11-14-kv-window-313.md` has the table.
+* **Those figures are DECODE, and the prefill side is NOT settled (r292, issue #314 field report).**  Here a
+  31 000-token request at `W=8192` held prefill at -1.8 %, but a mixed `gfx1100` + `gfx1201` pair over an x8
+  link (r289, 27B Q5_K_M, `-b 8192 -ub 2048`, 2 devices) read `pp4096` **1 401 -> 590 t/s at `d8127`,
+  1 346 -> 445 at `d8192` and 1 245 -> 218 at `d16384`**, with spreads of +/- 120-190 t/s: once the request
+  outgrows the window a prefill slides the mapping once per ubatch, so prefill is not free either.  That pair is
+  not a validated configuration and there is no `gfx1100` on the validation box, so treat the prefill penalty
+  as **open** and measure both phases on your own hardware rather than trusting either number.
 
 | variable | default | what it does |
 |---|---|---|

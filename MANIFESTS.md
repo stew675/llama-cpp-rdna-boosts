@@ -447,7 +447,7 @@ in CI.  The model-level gates are manual:
    DECODE step and a prompt chunk reuses nothing.  The floor sits BELOW that known cost on purpose (a
    regression floor, not a target) and `pfloor` is not a timing arm (it carries the verify oracle).  The
    window arms' prompt rates are printed and **not** asserted: a window below the run depth is a documented
-   11-26 % trade-off (`ENVIRONMENT.md` 17.0).  The canonical pool arms need ~72 GiB of host RAM
+   trade-off whose cost is linear in the depth past the window (`ENVIRONMENT.md` 17.0).  The canonical pool arms need ~72 GiB of host RAM
    (`-lm none -lzm off` = a resident PLE + a pinned host expert set), so on a smaller box pass `MODEL_POOL`/
    `DRAFT_POOL`/`PROMPT_POOL` or grade `--window-only`.
    **The counters that cannot be asserted are in the script header**: `hits %` can never read 100 % (a block

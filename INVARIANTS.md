@@ -4942,8 +4942,9 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   calibrated in-place rate is a *cold burst* number — at 65536 cells the sustained aggregate is ~10 GB/s per
   device, so treat the quoted ms as a floor (the line already says a card that reads its aperture below its
   DMA link scales up from there).
-* **A HOMOGENEOUS deployment keeps `-sm tensor`; a mixed, imbalanced or feature-stacked set starts on `-sm layer`
-  (r289, guided by the r16 measurement).**  Tensor split interleaves every layer across all the cards, so they
+* **A HOMOGENEOUS deployment keeps `-sm tensor`; on a mixed, imbalanced or feature-stacked set the split is
+  MEASURED, with `-sm layer` the simpler contract to start from (r289, r292 field correction).**  Tensor split
+  interleaves every layer across all the cards, so they
   work in parallel, and on a homogeneous set it is measured well ahead: 2x R9700 on PCIe 5.0 x8 root ports,
   Flash-Next IQ4_NL, `-ncmoe 48`, a 2000-token decode, **35.5 t/s (`tensor`) vs 25.7 (`layer`) at the same
   expert hit rate** (`COMMUNITY-CONFIG.md`, r16) -- a layer split runs one card's layers at a time, so every
@@ -4955,7 +4956,15 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   shards above.  A layer split keeps whole layers per device: no all-reduce, no sharded tensors, one device's
   KV per layer, and every feature stacked on top inherits one device's geometry instead of a shard of every
   device's.  It is a fully supported split (the streamed KV, the pool and every fused path work on both), not a
-  fallback; report a tensor-split problem against the layer arm too.
+  fallback; report a tensor-split problem against the layer arm too.  **The mixed-set half of that is a risk
+  list, not a measurement, and the one field grid that tests it measures the other way (r292, issue #314,
+  r289):** a mixed pair (`gfx1100` RX 7900 XTX + `gfx1201` RX 9070 XT, `-ts 24/16`, 27B Q5_K_M, `-b 8192
+  -ub 2048`, `GGML_CUDA_ALLREDUCE=hybrid`) reads `tensor` **1 470 / 47.3 t/s vs `layer` 1 291 / 27.8** at a
+  proportional ratio and **1 662 / 44.4 vs 1 328 / 27.3** at an equal one (pp4096 / tg64 at `d0`), i.e. tensor
+  +14-25 % prefill and +63-70 % decode on exactly the shape the mixed-set argument calls for layer, and the gap
+  holds at every depth to 65 536.  So neither split is a rule for a mixed set: A/B the two with the real `-ts`
+  and depth and keep the winner, and prefer `layer` when `tensor` misbehaves or underperforms (or several
+  multi-device features are stacked) because it is the simpler contract, not because it measures faster.
 
 * **Block 07's WMMA `iu8` verify family covers widths 2..8, never 9..16, on a dense model (r290, PR #317).**
   Two independent gates close the wider band: `ggml_cuda_mul_mat` sends `ne11 > MMVQ_MAX_BATCH_SIZE` (= 8)

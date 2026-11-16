@@ -261,7 +261,7 @@ things follow:
 * This is a **fittability** feature, not a speed feature: at those depths the alternative to a spilled KV is an
   OOM.  If the table says seconds, use a smaller `-c`, `-sm layer`, or a model that fits.
 
-### Picking a split mode: `-sm tensor` on a HOMOGENEOUS deployment, `-sm layer` on a mixed or stacked set
+### Picking a split mode: `-sm tensor` on a HOMOGENEOUS deployment, `-sm layer` the simpler contract on a mixed or stacked one, and a mixed set is MEASURED
 
 **Homogeneous deployment (same card model, same VRAM, comparable links): keep `-sm tensor`.**  It interleaves
 every layer across all the cards, so they work in parallel, and it is measured the faster of the two on exactly
@@ -271,8 +271,8 @@ hit rate** (`COMMUNITY-CONFIG.md`, r16).  A layer split runs one card's layers a
 boundary is a handoff with the other card idle.  `-sm tensor` is also what the all-reduce work and the
 multi-device KV target.
 
-**Mixed or imbalanced set: try `-sm layer` first.**  A tensor split shards **every tensor** by the `-ts` ratio,
-which costs two things a layer split does not:
+**Mixed or imbalanced set: the two risks below are tensor-split risks.**  A tensor split shards **every
+tensor** by the `-ts` ratio, which costs two things a layer split does not:
 
 * **Every layer pays a cross-device reduction.**  The all-reduce (block 01) is on the critical path of every
   layer, so the *slowest* card and the *slowest* link set the pace of every token.  A layer split needs no
@@ -286,7 +286,8 @@ which costs two things a layer split does not:
 So when the set is *not* homogeneous (two architectures, an x8 card next to an x16 one, cards behind a
 different switch or a PCIe 3.0 chipset link, or one card with materially less VRAM), or when you are **stacking
 several features at once** (tensor split + `--kv-window` + `--kv-attendance-pool` + `--spec-draft-kv-window` +
-host-expert pooling), reach for the simpler contract:
+host-expert pooling), start from the simpler contract below and confirm it with the one-off A/B described after
+it:
 
 ```bash
 # layer split: whole layers per device, no all-reduce, no sharded tensors
@@ -295,8 +296,21 @@ host-expert pooling), reach for the simpler contract:
 
 That is a support statement, not a workaround: `-sm layer` is a fully supported split, the streamed KV, the
 attendance pool and every fused path work on it, and every feature added on top inherits one device's geometry
-instead of a shard of every device's.  If `-sm tensor` misbehaves or underperforms on your mix, `-sm layer` is
-the first thing to try, and it is the arm to report against.
+instead of a shard of every device's.  It is also the arm to report a tensor-split problem against.
+
+**But the list above is a set of risks, not a verdict, and a field report on exactly such a set measures the
+opposite (r292, issue #314).**  A mixed pair (`gfx1100` RX 7900 XTX + `gfx1201` RX 9070 XT, `-ts 24/16`, r289,
+27B Q5_K_M, `-b 8192 -ub 2048`) has `-sm tensor` ahead of `-sm layer` at every depth it measured: **1 470 vs
+1 291 t/s prefill and 47.3 vs 27.8 t/s decode** at a proportional ratio, and **1 662 vs 1 328 / 44.4 vs 27.3**
+at an equal one, i.e. +14-25 % prefill and +63-70 % decode.  A layer split needs no all-reduce, so on paper a
+slow card or link should hurt the tensor split more; on that box it does not, and the layer split's per-layer
+handoff costs more than the reduction it saves.  So:
+
+* a **homogeneous set has nothing to decide**: `-sm tensor` is measured ahead, keep it;
+* a **mixed, imbalanced or feature-stacked set is a measurement, not a rule**: run a one-off A/B of the two
+  splits on your own box (`llama-bench` with `-sm layer,tensor` and your real `-ts` and depth) and keep the
+  winner.  `-sm layer` is the contract to start from when `tensor` misbehaves or underperforms, and it is the
+  arm to report a tensor-split problem against.
 
 ## Consumer workflow
 

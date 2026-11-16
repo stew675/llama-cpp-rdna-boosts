@@ -43,10 +43,11 @@ left in this file.  The r236 re-base
 | **282** | a mid-run pinned-tier latch perturbs the logits by ~1e-5 and flips one near-tie token | purity (delivery; NOT corruption) | **OPEN** (2026-11-07) — measured KLD two orders inside the tolerance — §282 |
 | **327** | a table served in place loses the prefill MoE fusions, so residency selects the kernel set — teach the fusions the in-place contract | purity / architecture (blocks 06/08/09/12) | **OPEN** (2026-11-14) — the maintainer's chosen answer to `GREEDY-PURITY.md` §89; deferred, not urgent — §327 |
 | **330** | the Meta split-state cache's warm walk is defeated by a version switch mid-walk, so a token-split ubatch below 128 tokens can overflow the thread stack | correctness (block 09; reachable only with `LLAMA_SEQPAR_MIN` < 128) | **OPEN** (2026-11-15) — reproduced at T = 48/64/80/112, clean at 128+; the shipped `MIN` 512 cannot reach it and `scripts/gate-seqpar.sh` arm 6 is the tripwire |
+| **331** | the `--kv-window` help text and the `--fit` line still quote the old `11-26 %` spill cost, which is a percentage of nothing: the penalty is linear in the depth past the window | docs-in-code (block 14 amendment; no behaviour change) | **OPEN** (2026-11-15) — the docs are corrected at r292, the code strings go in with the next block 14 amendment — §331 |
 
 ## Handle numbering
 
-**New handles append after `#328`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
+**New handles append after `#331`, and a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry
 that cites `TODO #74` still means the same subject after that item has closed and left this file.
 
 **Two allocation mistakes are on the record, and both are left in place because renumbering would break the dated
@@ -404,3 +405,27 @@ all until this is fixed.
 
 **Re-entry:** any proposal to lower that clamp (or to expose `MIN` below 128 again), or a report of this crash at
 or above 128.
+
+### #331 -- the shipped `--kv-window` help text and `--fit` line quote the superseded `11-26 %` spill cost
+
+**Open, deferred to the next block 14 amendment** (r292, docs-only correction of the prose; the code strings are
+block 14's, so they need a patch amendment and its gates, not a doc commit).  The one number the delivery ever
+quoted for a spill was "11-26 % of decode once your request is deeper than the window".  That was a single depth
+in r181's campaign, and both our own r286 measurement and the issue #314 field grid show the penalty is **linear
+in the depth past the window** (`benchmarks/2026-11-14-kv-window-313.md`: -10 / -19 / -42 % at one / two / six
+spilled map units, and about -95 % decode at 65 536 cells on a mixed pair), so "11-26 %" reads as a bound on a
+quantity that has no bound at a fixed `W`.
+
+**Corrected in prose at r292** (`ENVIRONMENT.md` §17.0 + its summary row, `README.md`, `INVARIANTS.md` r289's
+entry, `patches/README.md`, `MANIFESTS.md`, `scripts/README.md`, `COMMUNITY-CONFIG.md`).  **Left in the code**,
+which is what this handle is: `common/arg.cpp`'s `--kv-window` help line ("which costs 11-26 %% of decode once your
+request is deeper than the window") and the `--fit` output at `common/fit.cpp` ("Costs 11-26 %% of decode once the
+request is deeper than N").  A user who reads `--help` or a fit report therefore still gets the old figure.
+
+**What the fix is.**  Text only, in block 14: state that the cost is linear in the depth past the window (and that
+a `W` at or above the run depth costs nothing), or point at the docs.  **No behaviour change, and it must not
+change a computed number** -- the fit's per-token estimate already divides by the calibrated in-place read rate, so
+the sentence around it is the only thing wrong.  Verify with `scripts/gate-kv-window-split.sh` and
+`scripts/gate-kv-residency.sh` (the `--fit` arms print the line; nothing should move) plus the ordinary
+`validate-set.sh` re-cut, and correct `ENVIRONMENT.md` §17.0's remaining quotation of the sentence if the wording
+changes.

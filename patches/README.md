@@ -4684,7 +4684,9 @@ byte-identical to a build without this block, including its OOM.
 * **Cost:** the spill is read over the link on every step — `(used − W) × cell_bytes / 55.7 GB/s` on the
   validation box — so `W` belongs at or above the depth you actually run.  Measured at `-c 262144`, a `W` at
   the run's depth is free (+2.2…+2.9 GiB of arena, 122B-A10B +3.8 % decode / +4.7 % prefill); a `W` 35 k
-  cells below it costs 11-26 %.
+  cells below it costs 11-26 % *on this model*.  The penalty is **linear in the depth past the window**, not a
+  fixed percentage: -42 % at 31 000 cells at `W=8192` on one R9700, and about -95 % at 65 536 on a mixed two-card
+  field report (r286/r292, `TODO` #331).
 * **Purity:** a spilled KV is numerically transparent — prefill-logit KLD −0.000000 / 100.000 % on a spilling
   27B, −0.000000 / 99.994 % on a spilling Flash-Next (two KV caches), and every text arm byte-identical to
   its plain reference.  The state, context-checkpoint and MTP verify-width gates all pass on arms that
