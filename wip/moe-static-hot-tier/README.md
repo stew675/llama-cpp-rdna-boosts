@@ -1,7 +1,50 @@
 # wip/moe-static-hot-tier — a STATIC VRAM expert tier filled by heat, frozen outside the movable boundary
 
-**Status: OPEN — SCOPING NOTE (2026-11-02).  Nothing implemented, nothing in `patches/`, nothing applied to the
-fork.**  This is a plan with an arithmetic argument and a measurement protocol, not a result.
+**Status: OPEN — SCOPING NOTE (2026-11-02), revised 2026-11-15 after r292.  Nothing of the tier itself is
+implemented; block 09's arena settle (r292) has since taken the band where the decode set is short of it.
+This is a plan with an arithmetic argument and a measurement protocol, not a result.  The revision below
+turns the "frozen tier" into a *placement* and names the real blocker.**
+
+## 2026-11-15 revision — placement, not a freeze (after r292)
+
+Block 09 now carries the arena settle (r292): at a prefill -> decode drop the per-layer slot count is
+scaled into the band the drop returns, demand-gated on the marginal decode-band prior mass the growth buys.
+On a short arena (1 x R9700, 24 GiB, a partial pool) it takes the band (+8.2 / +19.5 / +36.8 % decode); on
+a saturated 2-device split it **leaves it** (2-device tensor 0.44 pp, `-sm layer` 0.14 pp) because taking
+the band fills the lowest VA chunks with **whole** tables and the next prefill stands them down whole,
+forcing a full-table host re-read (prefill 1625 -> 903 t/s, decode -5 %).
+
+That leaves exactly this campaign's target: use the band on a saturated split without paying the prefill.
+The convergence:
+
+1. **Placement, not a freeze.**  The hot set goes **above the widest prefill boundary** (`narrow + ring +
+   wide` at its maximum).  The slab boundary never reaches it, so it is safe **by construction**: no
+   frozen flag, no victim-selection change, no "never promoted/demoted" policy.  The campaign's §7
+   make-or-break risk -- *"a frozen slot inside a lendable chunk is not frozen"* -- **dissolves**; the
+   hot region is simply not in a lendable chunk.
+2. **The band is the cold, transient tier.**  Below the boundary, the rest of the arena (and any
+   cold extension) is lazy-filled and sacrificial.  Tossing it at a prefill is cheap, and the misses it
+   served are the ones the heat prior says are rare.
+3. **The real blocker is slot addressing, not the slab.**  A table's slots are one contiguous block and
+   the kernels compute `arena + slot * expert_bytes`.  Per-(layer, expert) hot/cold placement means
+   **two segments per table** (stable hot base + transient cold base) or a per-slot indirection.  That is
+   the work; the campaign's §4 "allocate frozen slots outside the movable boundary" becomes "allocate the
+   hot segment above the maximum boundary and the cold segment below it".
+4. **What it buys.**  On a saturated 2-device split the 0.44 pp / 0.14 pp become **free wins** once the
+   prefill keeps every table's hot K slots above the boundary and takes only the cold segment.  On 1
+   GPU / 24 GiB the same split removes the whole-table push and the per-drop re-seed, so the short-decode
+   transient improves.  The content policy is still the campaign's: heat, per (layer, expert), spread over
+   all layers -- layer-tail placement is 5x worse per byte.  Keep the r74 caveat: protect only the
+   **robust core** (top ~5-10 % of pairs, ~35-49 % of the mass); the rest stays adaptive.
+5. **Two smaller steps first (contained, no addressing change).**  (a) **Heat-targeted growth**: the
+   settle grows only the layers whose tables stay above the seed floor, so the cold tables are not pushed
+   into the band; (b) **preserve-on-grow**: grow a table by D2D-copying its existing residents and leave
+   the new slots empty (lazy), instead of `free` + host re-seed.  Both improve the enabled arms now; the
+   two-segment placement is what unlocks the saturated split.
+6. **Measurement plan** is unchanged in shape (§5), with one addition: the fingerprint is now the
+   settle's own `the first drop offers ... gain ... pp` line plus `re-armed ... N layer(s) settled UP` and
+   the evicted/stood-down counts.  A successful hot/cold split keeps the prefill's stands-down to the cold
+   segment only and leaves the `-ub 16384` / `-ub 32768` / partial-pool decode wins intact.
 
 **The charter, in the maintainer's words** (2026-11-02, 1-GPU host, after the `host-expert-pinned-window`
 campaign was closed):
@@ -117,7 +160,9 @@ evidence for this feature.
   is much better than the LRU pick, which is exactly the measured 5x.
 * **The movable boundary is the whole difficulty.**  A frozen slot inside a lendable chunk is not frozen.  If
   step 3 cannot be done without gutting the slab's lending, the campaign's honest outcome is "not viable" —
-  record that rather than shipping a frozen flag that a wide ubatch ignores.
+  record that rather than shipping a frozen flag that a wide ubatch ignores.  **2026-11-15 update:** the
+  placement form (hot region above the *widest* boundary) removes this objection; the difficulty moved to
+  the two-segment slot addressing (see the revision above).
 * **Do not reinterpret `-ncmoe`.**  Keep it a *host-capacity* knob (which layers stay off the host).  The VRAM
   content knob is a byte budget (`MOE_EXPERT_CACHE_MIB` for the arena, a new freeze budget for the tier).
 * **Do not repack the model file** to get the hot set contiguous without first checking the router
