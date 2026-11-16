@@ -1,9 +1,12 @@
 # A strictly bimodal slab: prefill band **or** expert arena, never both — viability assessment
 
-> **Status: SCOPING NOTE — 2026-11-15. Nothing implemented, nothing in `patches/`, no code changed.**
+> **Status: SCOPING NOTE — 2026-11-15, revised the same day: S is **promoted into block 09** at r292 (`archive/work/arena-steady-sizing/`).**
 > This is a measurement-backed feasibility assessment of one proposal, plus the numbers that decide it.
-> It is not a plan of record and it is not a `TODO` item yet — it needs the maintainer's decision on
-> whether to open one (see §9).
+> Bimodality itself is not implemented and nothing of it is in `patches/`; the **sizing fix (S)** that the
+> assessment found is a beta candidate (one file, one commit, demand-gated — see §3.5's revision and the
+> candidate's README). The early `+1.8 % / +4 %` figures below were measured at **128 generated tokens**;
+> the 2 000-token re-measurement is **+8.2 % at `-ub 16384` and +31.9 % at `-ub 32768`**, and the
+> 2-device/multi-session gate is in the candidate's README.
 >
 > **The proposal.** On a `--parallel 1` server the expert arena and the prefill compute band never need
 > to hold VRAM *at the same time*. So treat the slab strictly **bimodally**: when prefill is active,
@@ -273,6 +276,14 @@ record is MTP-on, where a verify step does ~4x the MoE work per token, which is 
 robust, cheap, and nowhere near "huge".** Correcting my own earlier estimate: I extrapolated a 10-21 %
 win from the campaign record's slope before measuring it, and the measurement does not support it.
 
+> **REVISION (2026-11-15, 2 000-token measurement).** The 128-token arm above understates the effect by
+> roughly 4x, because the arena only reaches its steady state after a few hundred tokens and the settle's
+> whole-table re-seed is a fixed cost. At **2 000** greedy tokens on the same shape the same fix measures
+> **+8.2 % at `-ub 16384`** (arena 18 411.9 -> 22 819.7 MiB, miss traffic -39 %) and **+31.9 % at
+> `-ub 32768`** (12 183.0 -> 23 018.0 MiB, traffic -70 %); the 24 GiB `gfx1100` card is **+19.5 %**. The
+> 2-device `-sm tensor` band is **not** worth taking (0.44 pp of prior mass, -44 % prefill when taken)
+> and the settle now leaves it alone; see `INVARIANTS.md` r292 items 8-10 and the beta candidate's README.
+
 The reason it is so flat is worth recording: this config's host tier is a **100 % MIRROR**, and a mirror
 answers a miss *in place* through the pool's device alias (`MOE_HOST_POOL_COLD` / `GGML_MOE_DEVREMAP`'s
 cold encoding `slots + pool slot`, r203) — so a "miss" is a local device read, not a copy. The arena is
@@ -514,11 +525,15 @@ would argue for:
 * **A — decline the mode, record it.** The modality mechanism exists, the reload is already eager for
   90 % of the tables, and the incremental win from a *mode* (as opposed to the sizing fix) is ~0.
 
-> **OUTCOME (2026-11-15): S was implemented and measured.** It is staged as the `beta/` candidate
-> [`beta/arena-steady-sizing/`](../../beta/arena-steady-sizing/README.md) (one file, one commit,
-> kill-switch `MOE_EXPERT_CACHE_STEADY_REARM=0`), with arena 18 411.9 -> 22 705.1 MiB, miss traffic
-> -29..-32 %, decode **+4.0 %** on a mirror host tier and **+29 %** on a partial pool, same-seed greedy text
-> byte-identical. This document stays as the assessment that found it.
+> **OUTCOME (2026-11-15, v2): S was implemented, re-measured, demand-gated and promoted.** It was folded
+> into **block 09** at r292 (candidate record
+> [`archive/work/arena-steady-sizing/`](../../archive/work/arena-steady-sizing/README.md); one file, one
+> commit, kill-switch `MOE_EXPERT_CACHE_STEADY_REARM=0`): arena 18 411.9 -> 22 819.7 MiB, miss traffic
+> **-39 %**, decode **+8.2 %** at `-ub 16384`, **+31.9 %** at 32768, **+36.8 %** on a partial pool, and
+> **+19.5 %** on the 24 GiB card, same-seed greedy text byte-identical. The settle is gated on the
+> marginal prior mass the drop offers, so a saturated 2-device split and a small `-ub` are byte-identical
+> to base, and the settled count is sticky per layer with its capacity so a two-slot decode/prefill
+> transition is stable. This document stays as the assessment that found it.
 
 My recommendation: **S + D.** The phase/mode question is downstream of a sizing bug; fixing the sizing
 closes out the symptom that motivated the proposal. Bimodality is then worth re-asking only on a 16 GiB

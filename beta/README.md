@@ -35,18 +35,9 @@ move happens with a "refuted" status.  A finished candidate leaves `beta/`; no s
 
 ## Current candidates
 
-* **`arena-steady-sizing`** (2026-11-15, r292) — **the expert arena was sized once, from the slab's
-  *prefill* boundary**, so a larger `-ub` permanently shrank it: measured `max(0, boundary_at_birth -
-  narrow_floor)` = 21 % of the arena lost at `-ub 16384` and **49 %** at `-ub 32768`, with an explicit
-  `MOE_EXPERT_CACHE_MIB` silently free-clamped on top.  One file, one commit: settle the per-layer slot count
-  at each prefill -> decode drop against the arena the drop returns (growth only, kill-switch
-  `MOE_EXPERT_CACHE_STEADY_REARM=0`).  Same-seed greedy text **byte-identical**; arena 18 411.9 -> 22 705.1
-  MiB, expert miss traffic **-29..-32 %**, decode **+4.0 %** on a 100 % mirror host tier and **+29 %** on a
-  partial pool.  See [`arena-steady-sizing/`](arena-steady-sizing/README.md) (its `README.md` §6 lists the
-  three fold targets — the patch edits a file blocks 09/10/15 own, so where it lands is the maintainer's
-  call).
-
-**None else.**  `0016-host-experts-window` was **withdrawn 2026-11-02**: the mode is unimplementable on a
+**None.**  The `arena-steady-sizing` v2 candidate was **promoted into block 09 at r292** (2026-11-15);
+see *Recently promoted* below and `archive/work/arena-steady-sizing/`.
+`0016-host-experts-window` was **withdrawn 2026-11-02**: the mode is unimplementable on a
 no-XNACK GPU (a kernel read of a reclaimable registered page is a fatal fault, and holding it is pinning —
 the RAM saving disappears).  It is archived with a resolution at
 [`../archive/work/host-experts-window-beta/`](../archive/work/host-experts-window-beta/README.md) and
@@ -58,6 +49,14 @@ since retired there).
 (Empty before this: both earlier candidates were promoted in `v12-097cf33d9-r86`, 2026-10-19.)_
 
 ## Recently promoted
+
+* **`arena-steady-sizing` v2** — promoted into **block 09** at **r292** (2026-11-15), no new block.  The
+  expert arena is now settled against the capacity a prefill -> decode drop returns, demand-gated at the
+  first drop on the marginal decode-band prior mass (`MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP`, default 1.0 pp)
+  and sticky per layer with the capacity it was achieved at (two-slot transitions stable).  Measured: 1 x
+  R9700 +8.2 % at `-ub 16384`, +31.9 % at 32768, partial pool +36.8 %; 24 GiB `gfx1100` +19.5 %; the
+  saturated 2-device splits and a small `-ub 2048` are byte-identical to base.  Record:
+  `archive/work/arena-steady-sizing/`; `WORKLOG.md` 261115.005/.006 and the r292 release entry.
 
 * **`0012-slab-transient-absorption`** — promoted into **r86**, folded per owning block: **block 09**
   (derived draft reserve, draft model loaded before the target context, slab-served common/all-reduce

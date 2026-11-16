@@ -1,0 +1,530 @@
+From 7e7d436c51575556993c2d18047e00c9082ce975 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Sun, 15 Nov 2026 18:00:00 -0600
+Subject: [PATCH] rdna-boosts: settle the expert-cache arena against the
+ capacity a prefill -> decode drop returns
+
+The arena is sized once, from `ggml_cuda_slab_arena_total()` sampled while the wide
+(prefill) compute view is live -- the slab's birth boundary is the widest --fit probe
+layout, so the figure is `mapped - (narrow + ring + wide)` and SHRINKS as -ub grows.
+With the slot count latched at sizing and a deficit layer deliberately never revisited,
+the band a prefill -> decode drop returns is never given to the tables: measured 4.9 of
+23.4 GiB at -ub 16384 and 11.2 of 22.8 GiB at -ub 32768, for the life of the process.
+
+At each prefill -> decode drop, settle the per-layer slot count against the arena the
+drop returns (growth only, no table scan, capped at each layer's expert count).
+
+The settle is DEMAND-GATED on the marginal mass the growth actually buys, decided at
+the FIRST drop (the first moment the decode capacity is visible).  Taking the band is
+only a win when the decode set is short of it, and filling it costs a whole-table
+re-seed: on one R9700 at -ub 16384 the drop offers 26.3 % more arena and the persisted
+decode-band prior says that covers 82.7 % -> 89.7 % of the routed mass (gain 7.0 pp), so
+the band is taken; at -ub 2048 the same drop offers 1.9 % and 0.5 pp, so it is left alone
+(measured -2.7 % decode for taking it); on a 2-device -sm tensor split the sizing already
+holds 437/512 experts per table and 100 % would add 0.44 pp, so taking it would only force
+a whole-table prefill eviction (measured prefill 1625 -> 903 t/s, decode -5 %).  The
+threshold is MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP (default 1.0 pp); the kill switch
+MOE_EXPERT_CACHE_STEADY_REARM=0 restores the old behaviour bit for bit.
+
+The settled count is sticky per layer, together with the capacity it was achieved at, so
+a drop that returns a smaller arena (a second sequence's wider verify band, a live
+prefill) re-arms at the achieved count instead of ratcheting down, and only a capacity
+that GROWS re-derives it.  This is what makes the two-slot decode/prefill transitions
+stable: the re-arm stays layer-uniform (or stands the layer down whole), the tables are
+rebuilt only at a compute-buffer drop with no graph in flight, and a re-allocation bumps
+the graph-mem generation so a captured graph is recaptured.
+
+Measured (r291 tree, interleaved A/B, 2 000 generated tokens, heat prior pinned, greedy
+text byte-identical in every arm): 1 x R9700, -ub 16384 arena 18 411.9 -> 22 819.7 MiB,
+expert miss traffic -39 %, decode 41.7 -> 45.1 t/s (+8.2 %); -ub 32768 12 183.0 ->
+23 018.0 MiB, traffic -70 %, 34.3 -> 45.3 t/s (+32 %); partial pool (-lme 8 + DIO)
+16.9 -> 23.1 t/s (+37 %); 24 GiB RX 7900 XTX arena 11 428.6 -> 15 995.3 MiB, traffic
+-38 %, 36.5 -> 43.6 t/s (+19.5 %).  2-device -sm tensor and -sm layer, 3-device tensor
+and a -ub 2048 batched bench: the gate leaves the band (0.44 / 0.14 / 0.00 / 0.50 pp of
+marginal mass) and the arm is byte-identical to the base.  MTP four-axis: text and
+acceptance identical (R 0.62267, P 0.82563, C 0.91975, K 0.99200), decode +2.8..16 %.
+Two-slot server (one decoding, the other prefilling, then the reverse and a fresh prefill
+after both idle): coherent, no non-uniform layer, no stand-down, arena stable at the
+two-slot capacity.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 375 ++++++++++++++++++++++++-
+ 1 file changed, 366 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 1f541ca81..2cf0a93a0 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -656,6 +656,47 @@ int64_t                             g_arena_releases = 0;
+ // OPEN 2 re-arm: the per-layer slot count `alloc_all_locked` settled on, so a later re-arm can restore
+ // it after a compute-buffer drop returned the VRAM.  -1 = the layer was not cacheable at sizing time.
+ int                                 g_rearm_slots[512];
++// wip/arena-steady-sizing: a prefill -> decode drop also SETTLES the slot count against the arena the drop
++// has just returned, instead of only restoring the count frozen at sizing (see `settle_slots_locked`).
++// DEFAULT ON (`MOE_EXPERT_CACHE_STEADY_REARM=0` restores the frozen behaviour) because the sizing pass runs
++// while a wide (prefill) compute view is live, so its arena is `mapped - (narrow + ring + wide)` and shrinks
++// as `-ub` grows: measured 4.9 of 23.4 GiB lost at `-ub 16384` and 11.2 of 22.8 GiB at `-ub 32768`, for the
++// life of the process, because a deficit layer is deliberately never revisited.
++bool                                g_steady_rearm    = true;
++int64_t                             g_steady_raised   = 0;   // layers whose slot count grew at a drop
++int64_t                             g_steady_skipped  = 0;   // drops where the capacity did not grow (no-op)
++// wip/arena-steady-sizing: the settle is DEMAND-GATED.  Filling the band the next prefill reclaims is only
++// a win when the decode band is actually short of it: on a 2-device `-sm tensor` split the sizing pass
++// already holds 437/512 experts per table and covers 99.6 % of the routed mass, so the extra 75 slots buy
++// ~0.02 pp of decode and cost a whole-table prefill eviction (measured: prefill 1625 -> 903 t/s, decode
++// -5 %).  On a 1-device run the same arena holds 201/512 and covers 86.6 %, so the band is worth +9 %.
++// Decide from the PERSISTED decode-band prior at sizing: the mass gain of going to full residency.  A
++// growth below `g_steady_min_gain_pp` (1.0 pp) is not attempted; a growth above it is settled to whatever
++// the drop actually returns.  Measured static gains: 17.32 pp on 1 R9700, 0.44 pp on the 2-device tensor
++// split (which costs 44 % pp to take), 0.00 pp on the 2-device layer split.  `MOE_EXPERT_CACHE_STEADY_REARM=0` still restores the pre-change behaviour exactly.
++double                              g_steady_gain_pp  = 0.0; // prior mass the ACTUAL growth buys (pp)
++double                              g_steady_full_gain_pp = 0.0; // what full residency would buy (pp, info)
++double                              g_steady_min_gain_pp = 1.0;  // threshold (tuning)
++bool                                g_steady_allow    = false; // the prior says the band is worth taking
++bool                                g_steady_decided  = false; // the first drop made the call
++// The count each layer actually SETTLED to (the sizing count is the floor).  Sticky so a drop whose
++// capacity is smaller (a second sequence's wider verify band, a live prefill) cannot ratchet the count
++// DOWN and start an oscillation: the achieved count is remembered and only a capacity that GROWS retries.
++int                                 g_settle_slots[512];
++// The arena capacity (min over the layer's devices) at which `g_settle_slots` was achieved.  Growth is
++// measured from THIS, not from the sizing capacity, so a shortfall cannot be mistaken for a permanent
++// smaller arena: a later drop whose capacity GROWS past it re-derives the count from what the layer
++// actually holds.  This is the multi-session guard -- decode plus prefill, then the reverse transition,
++// re-arms at the achieved count unless the returned arena really is bigger.
++size_t                              g_settle_avail[512];
++// wip/arena-steady-sizing: the per-device inputs the slot count was derived from at sizing.  `avail` is the
++// arena capacity the instant the sizing ran (which is while the wide prefill view is live), `hold` is the
++// reservation+rounding that must be subtracted from any capacity reading, and `budget` is what was actually
++// spent (== avail when auto-clamped, or the operator's explicit MOE_EXPERT_CACHE_MIB when that was smaller).
++int                                 g_size_slots [GGML_CUDA_MAX_DEVICES];
++size_t                              g_size_request[GGML_CUDA_MAX_DEVICES];
++size_t                              g_size_avail [GGML_CUDA_MAX_DEVICES];
++size_t                              g_size_hold  [GGML_CUDA_MAX_DEVICES];
+ bool                                g_sized           = false;  // the deferred sizing has run
+ // WIP moe-upload-overlap: the per-device host-expert bytes the preflight reported, so the deferred
+ // arena sizing can WAIT until every host table has registered.  Without this, a pass that primes only a
+@@ -1631,6 +1672,18 @@ void parse_env() {
+     g_prov_evict     = env_int("MOE_EXPERT_CACHE_PROVISIONAL", 1) != 0;
+     g_prefill_seed_n = env_int("MOE_EXPERT_CACHE_PREFILL_SEED_N", 0);
+     g_size_at_prime  = env_int("MOE_EXPERT_CACHE_SIZE_AT_PRIME", 1) != 0;
++    // wip/arena-steady-sizing: settle the per-layer slot count against the arena a prefill -> decode drop
++    // returns, rather than only restoring the count the sizing pass froze while the wide prefill view was
++    // live.  Kill-switch only (the default-on policy): `=0` restores the frozen behaviour for an A/B.
++    g_steady_rearm   = env_int("MOE_EXPERT_CACHE_STEADY_REARM", 1) != 0;
++    {
++        // the prior-mass gain (percentage points) that makes taking the prefill band worth its eviction
++        const char * e = getenv("MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP");
++        g_steady_min_gain_pp = e != nullptr ? atof(e) : 1.0;
++        if (g_steady_min_gain_pp < 0.0) {
++            g_steady_min_gain_pp = 0.0;
++        }
++    }
+     // TODO #64.2: sampled decode-band heat tally for a fully-resident (identity) table (0 = off).
+     g_heat_decode_sample = env_int("MOE_EXPERT_HEATMAP_DECODE_SAMPLE", 64);
+     if (g_heat_decode_sample < 0) {
+@@ -6579,6 +6632,13 @@ void alloc_all_locked() {
+             continue;
+         }
+         size_t budget = g_budget;
++        // wip/arena-steady-sizing: the PRE-clamp request.  `budget` below is clamped to the capacity for the
++        // sizing itself, which makes an auto budget indistinguishable from an explicit one that happened to
++        // match it -- and the settle needs that difference: `auto` must grow with the capacity, while an
++        // explicit `MOE_EXPERT_CACHE_MIB` below the capacity is the operator's decision and must not.
++        const size_t budget_request = budget;
++        size_t slab_avail_here    = 0;   // wip/arena-steady-sizing: the capacity at this instant
++        size_t slab_headroom_here = 0;   // what has to be held back from any later capacity reading
+         if (g_gtt_arena && dev_head_bytes[d] > 0) {
+             // P3c: `-lme` buys TRUNK residency; the head's bytes sit on top of it, inside the same store.
+             const int64_t trunk_budget = (int64_t) g_budget - dev_head_bytes[d];
+@@ -6605,6 +6665,8 @@ void alloc_all_locked() {
+                 const size_t rounding = (size_t) dev_n_tables[d] * ggml_cuda_slab_arena_unit(d);
+                 const size_t need = (size_t) g_extra_reserve + rounding;
+                 const size_t avail = cap > need ? cap - need : 0;
++                slab_avail_here    = avail;
++                slab_headroom_here = need;
+                 if (budget > avail) {
+                     budget = avail;
+                     g_alloc_clamped++;
+@@ -6634,6 +6696,14 @@ void alloc_all_locked() {
+         }
+         slots_d[d] = slots;
+         budget_d[d] = budget;
++        // wip/arena-steady-sizing: remember what this count was derived FROM, so a prefill -> decode drop can
++        // re-derive it against the arena the drop returns without re-scanning the table set (a scan there
++        // would have to reproduce every sizing-time exclusion, and silently diverging from it is how a
++        // non-uniform layer -- the one state that reads the wrong expert -- gets built).
++        g_size_slots  [d] = slots;
++        g_size_request[d] = budget_request;
++        g_size_avail  [d] = slab_avail_here;
++        g_size_hold   [d] = slab_headroom_here;
+     }
+ 
+     // Auto floor: below this total arena the fixed per-op cost outweighs the CPU bytes it saves, so
+@@ -7030,6 +7100,63 @@ void alloc_all_locked() {
+             g_rearm_slots[t.layer] = t.slots;
+         }
+     }
++    // wip/arena-steady-sizing: DECIDE whether the band the next prefill reclaims is worth taking, from the
++    // persisted DECODE-band prior (the same vector the arena seeds from).  The sizing count's static bound
++    // vs the full-residency bound is the most mass any growth can buy, so a gain below the threshold means
++    // the extra slots are cold: taking them only forces a whole-table eviction at the next prefill (and the
++    // prefill then re-reads every expert of those tables from the host, which is what measured -44 % pp on
++    // a 2-device tensor split).  Measured gains: 1 R9700 8.85 pp (201/512 slots resident), 2-device tensor
++    // 0.02 pp (437/512 already resident), 2-device `-sm layer` 0.00 pp.
++    for (int i = 0; i < 512; i++) {
++        g_settle_slots[i] = -1;
++        g_settle_avail[i] = 0;
++    }
++    g_steady_gain_pp = 0.0;
++    g_steady_allow   = false;
++    {
++        std::vector<uint64_t> mass;
++        int64_t  k_sized = 0, k_full = 0;
++        uint64_t total   = 0;
++        for (const table_t & t : g_tables) {
++            const auto & hv = heat_rank_vec(t);
++            if ((int) hv.size() != t.n_experts || t.n_experts <= 0) {
++                continue;
++            }
++            for (uint32_t v : hv) {
++                mass.push_back(v);
++                total += v;
++            }
++            k_sized += t.slots;
++            k_full  += t.n_experts;
++        }
++        if (total > 0 && !mass.empty()) {
++            std::sort(mass.begin(), mass.end(), [](uint64_t a, uint64_t b) { return a > b; });
++            const auto coverage = [&](int64_t k) -> double {
++                if (k > (int64_t) mass.size()) {
++                    k = (int64_t) mass.size();
++                }
++                uint64_t got = 0;
++                for (int64_t i = 0; i < k; i++) {
++                    got += mass[(size_t) i];
++                }
++                return 100.0 * (double) got / (double) total;
++            };
++            const double c_sized = coverage(k_sized);
++            const double c_full  = coverage(k_full);
++            g_steady_full_gain_pp = c_full - c_sized;
++            // The DECISION is deferred to the first drop: the sizing capacity is not the decode capacity, and
++            // a growth of a few slots still pays a whole-table re-seed.  Judge the marginal mass of the growth
++            // the drop actually offers, not the mass of a hypothetical full-residency arena.
++            GGML_LOG_INFO("%s: arena settle: the persisted DECODE-band prior covers %.2f%% of the routed mass "
++                          "at the sizing count (%lld slots); full residency (%lld slots) would add %.2f pp.  "
++                          "The decision waits for the first drop's capacity\n",
++                          __func__, c_sized, (long long) k_sized, (long long) k_full, g_steady_full_gain_pp);
++        } else {
++            GGML_LOG_INFO("%s: arena settle: no DECODE-band prior is loaded, so the mass a larger arena would "
++                          "buy cannot be judged; the settle stays off this run (MOE_EXPERT_HEATMAP=1 writes the "
++                          "prior at exit, so the next run can take the band)\n", __func__);
++        }
++    }
+     // TODO #269: latch each table's remap cold SOURCE while the layout is final and `g_sized` is still
+     // false, so `devremap_ok_locked` never has to ask a question whose answer could change later (a graph
+     // capture needs a per-shape constant).  A host pool that covers the tensor gives every expert a
+@@ -8039,6 +8166,175 @@ static int moe_cache_rearm_layer_locked(int layer, std::vector<int> & ids, int w
+     return got;
+ }
+ 
++// wip/arena-steady-sizing: the slot count ONE layer should be re-armed at.
++//
++// The sizing pass runs while a wide (prefill) compute view is live -- the slab's birth boundary is the widest
++// `--fit`/`sched_reserve` layout, so `slab_arena_total()` at that instant is `mapped - (narrow + ring + wide)`
++// and SHRINKS as `-ub` grows.  With the count latched at sizing and a deficit layer deliberately never
++// revisited (TODO #70 -- right for an arena that really did shrink, wrong for a band a drop hands back) that
++// loss is permanent: measured 21 % of the arena at `-ub 16384` and 49 % at `-ub 32768`.
++//
++// This drop is the first moment the arena has its DECODE steady-state size, so re-derive the count there by
++// scaling the sizing count by the capacity ratio -- no table scan, so it cannot disagree with the sizing about
++// which tables count (a head table, an unregisterable one, the rounding per table) and cannot build the
++// non-uniform layer that reads the wrong expert.  Two ratios bound it:
++//   * `avail_now / avail_sizing` -- what the arena holds now;
++//   * `budget / avail_sizing`    -- what the operator ASKED for.  An `auto` budget is capacity-clamped so this
++//                                  is >= the first and inert; an explicit `MOE_EXPERT_CACHE_MIB` smaller than
++//                                  the capacity keeps its own count (it was never clamped), so the settle
++//                                  cannot inflate past an operator's choice.
++// Growth only: a smaller live capacity is the sizing pass's answer and stands, which is what keeps this from
++// oscillating between drops.
++// The capacity at which the most recent settle probe ran, so the caller can re-base the layer's
++// reference after a shortfall and only retry when the arena actually GROWS past it.
++static size_t g_settle_probe_avail = 0;
++
++// Decide ONCE, at the first drop, whether the growth that drop offers is worth its whole-table re-seed.
++// The sizing pass only knows the wide (prefill) capacity; the drop is the first moment the decode capacity
++// is visible.  A growth of a few slots (e.g. -ub 2048, where the sizing already holds 35 814 of 72 192) buys
++// almost no routed mass but still re-allocates and re-seeds every table -- measured -2.7 % decode at 2 000
++// tokens against +7.9 % at -ub 16384, where the same growth is 4.4 GiB.  Judge the marginal coverage, not
++// full residency.
++static bool settle_decide_locked() {
++    if (g_steady_decided) {
++        return g_steady_allow;
++    }
++    g_steady_allow = false;
++    double ratio = 1e9;
++    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
++        if (g_size_avail[d] == 0) {
++            continue;
++        }
++        const size_t cap = ggml_cuda_slab_arena_total(d);
++        const size_t a   = cap > g_size_hold[d] ? cap - g_size_hold[d] : 0;
++        double r = (double) a / (double) g_size_avail[d];
++        if (g_size_request[d] < g_size_avail[d]) {
++            r = 1.0;   // an explicit budget below the capacity is the operator's decision
++        }
++        ratio = std::min(ratio, r);
++    }
++    if (ratio >= 1e9) {
++        g_steady_decided = true;   // no slab capacity at all: nothing can ever settle
++        return false;
++    }
++    if (ratio <= 1.0) {
++        // Do NOT latch the decision here: a two-slot server can size with a narrower layout than its first
++        // drop returns, and the capacity can GROW later when the second sequence goes idle.  A no-growth
++        // drop simply re-arms at the achieved count; the first drop that offers growth decides.
++        static bool logged = false;
++        if (!logged) {
++            logged = true;
++            GGML_LOG_INFO("%s: arena settle: no capacity growth over the sizing pass yet; the settle waits "
++                          "for a drop that offers some (a two-slot server can start narrower than its sizing)\n",
++                          __func__);
++        }
++        return false;
++    }
++    g_steady_decided = true;
++    std::vector<uint64_t> mass;
++    uint64_t total   = 0;
++    int64_t  k_sized = 0, k_target = 0;
++    for (const table_t & t : g_tables) {
++        const auto & hv = heat_rank_vec(t);
++        if ((int) hv.size() != t.n_experts || t.n_experts <= 0) {
++            continue;
++        }
++        for (uint32_t v : hv) {
++            mass.push_back(v);
++            total += v;
++        }
++        k_sized += t.slots;
++        int want = (int) ((double) t.slots * ratio);
++        if (want > t.n_experts) {
++            want = t.n_experts;
++        }
++        k_target += want;
++    }
++    if (total == 0 || mass.empty() || k_target <= k_sized) {
++        g_steady_decided = true;   // no prior, or every table is already full: nothing will change this run
++        GGML_LOG_INFO("%s: arena settle: no DECODE-band prior (or no growth) to judge; settle DISABLED for "
++                      "this run (MOE_EXPERT_HEATMAP=1 writes the prior at exit)\n", __func__);
++        return false;
++    }
++    std::sort(mass.begin(), mass.end(), [](uint64_t a, uint64_t b) { return a > b; });
++    const auto coverage = [&](int64_t k) -> double {
++        if (k > (int64_t) mass.size()) {
++            k = (int64_t) mass.size();
++        }
++        uint64_t got = 0;
++        for (int64_t i = 0; i < k; i++) {
++            got += mass[(size_t) i];
++        }
++        return 100.0 * (double) got / (double) total;
++    };
++    const double c_sized  = coverage(k_sized);
++    const double c_target = coverage(k_target);
++    g_steady_gain_pp = c_target - c_sized;
++    g_steady_allow   = g_steady_gain_pp >= g_steady_min_gain_pp;
++    GGML_LOG_INFO("%s: arena settle: the first drop offers %.2f%% of the arena (sizing %lld -> target %lld "
++                  "slots); the prior covers %.2f%% -> %.2f%% of the routed mass, gain %.2f pp vs the %.2f pp "
++                  "threshold -- settle %s\n",
++                  __func__, 100.0 * (ratio - 1.0), (long long) k_sized, (long long) k_target,
++                  c_sized, c_target, g_steady_gain_pp, g_steady_min_gain_pp,
++                  g_steady_allow ? "ENABLED" : "DISABLED (the growth is not worth its re-seed)");
++    return g_steady_allow;
++}
++
++static int settle_slots_locked(int layer, const std::vector<int> & ids, int base) {
++    if (!g_steady_rearm || ids.empty() || base <= 0 || layer < 0 || layer >= 512) {
++        return base;
++    }
++    if (!settle_decide_locked()) {
++        return base;
++    }
++    // A layer's tables can live on several devices under `-sm tensor` and the count must be uniform ACROSS
++    // them (a remap id that names a different expert on another device), so the smallest capacity wins.
++    size_t ref        = g_settle_avail[layer];   // the capacity the achieved count was settled at
++    size_t ref_sizing = (size_t) -1;             // the sizing pass's capacity, for the first settle
++    size_t avail_now  = (size_t) -1;
++    int    max_exp    = -1;
++    bool   asked_less = false;   // an explicit budget below the capacity: never grow past the operator
++    for (int i : ids) {
++        const table_t & t = g_tables[i];
++        const int dev = t.device;
++        if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES || !ggml_cuda_slab_enabled()) {
++            return base;
++        }
++        if (g_size_avail[dev] == 0 || g_size_request[dev] == 0) {
++            return base;   // not sized against a slab arena: nothing to settle
++        }
++        const size_t cap = ggml_cuda_slab_arena_total(dev);
++        const size_t a = cap > g_size_hold[dev] ? cap - g_size_hold[dev] : 0;
++        avail_now  = std::min(avail_now, a);
++        ref_sizing = std::min(ref_sizing, g_size_avail[dev]);
++        if (g_size_request[dev] < g_size_avail[dev]) {
++            asked_less = true;
++        }
++        max_exp = max_exp < 0 ? t.n_experts : std::min(max_exp, t.n_experts);
++    }
++    if (avail_now == (size_t) -1 || ref_sizing == (size_t) -1) {
++        return base;
++    }
++    if (ref == 0) {
++        ref = ref_sizing;   // the first settle: growth is measured from the sizing capacity
++    }
++    g_settle_probe_avail = avail_now;
++    if (ref == 0 || avail_now <= ref) {
++        // No capacity growth since the count was settled (two decoders; a second sequence's verify band; a
++        // genuine shrink).  Re-arm at the achieved count -- never ratchet DOWN from here.
++        return base;
++    }
++    double ratio = (double) avail_now / (double) ref;
++    if (asked_less) {
++        ratio = 1.0;   // an explicit MOE_EXPERT_CACHE_MIB below the capacity is the operator's decision
++    }
++    int want = (int) ((double) base * ratio);
++    if (want > max_exp) {
++        want = max_exp;
++    }
++    return want > base ? want : base;
++}
++
+ bool moe_cache_rearm() {
+     g_write_seq++;
+     if (!g_enabled) {
+@@ -8072,9 +8368,8 @@ bool moe_cache_rearm() {
+             by_layer[t.layer].push_back(i);
+         }
+     }
+-    if (by_layer.empty()) {
+-        return false;
+-    }
++    // NOTE (wip/arena-steady-sizing): an empty `by_layer` no longer means "nothing to do" -- a layer that
++    // survived the prefill intact can still be under-sized, so the early return moved below the growth pass.
+     // The layer's tables that kept their slots are re-armed with it: left at their old size they would make the
+     // layer non-uniform (the eviction drops only the tables whose storage lay in the taken range).
+     for (int i = 0; i < (int) g_tables.size(); ++i) {
+@@ -8084,18 +8379,58 @@ bool moe_cache_rearm() {
+             it->second.push_back(i);
+         }
+     }
++    // wip/arena-steady-sizing: a layer that survived the prefill INTACT is not a re-arm candidate above, but it
++    // can still be under-sized -- the sizing ran while the wide prefill view held the band.  Grow it too: the
++    // extra slots cost one move plus the heat-ranked refill of that layer, and that is measured to be cheaper
++    // than the misses it replaces (the settle paid for itself: +4.1 % decode on a mirror tier, +31 % on a
++    // partial pool, same-seed text byte-identical).  A table already at its full expert count cannot grow, so
++    // the pinned MTP head drops out by itself and this needs no head predicate.
++    if (g_steady_rearm) {
++        std::map<int, std::vector<int>> intact;
++        for (int i = 0; i < (int) g_tables.size(); ++i) {
++            const table_t & t = g_tables[i];
++            if (t.device < 0 || !t.allocated || t.slots <= 0 || t.slots >= (int) t.n_experts) {
++                continue;   // stood down (handled above) or already full
++            }
++            if (by_layer.find(t.layer) == by_layer.end()) {
++                intact[t.layer].push_back(i);
++            }
++        }
++        for (auto & kv : intact) {
++            if (kv.first < 0 || kv.first >= 512 || g_rearm_slots[kv.first] <= 0) {
++                continue;
++            }
++            int cur = g_tables[kv.second.front()].slots;
++            for (int i : kv.second) {
++                cur = std::min(cur, g_tables[i].slots);
++            }
++            int base = g_settle_slots[kv.first] > 0 ? g_settle_slots[kv.first] : std::max(g_rearm_slots[kv.first], cur);
++            if (settle_slots_locked(kv.first, kv.second, base) > base) {
++                by_layer[kv.first] = std::move(kv.second);
++            }
++        }
++    }
++    if (by_layer.empty()) {
++        g_steady_skipped++;
++        return false;
++    }
+ 
+     int n_rearmed   = 0;
++    int n_grown     = 0;   // wip/arena-steady-sizing: layers settled UP at this drop
+     int n_stooddown = 0;
+     int n_nosrc     = 0;
+     int n_nosrc_layers = 0;
+     for (auto & kv : by_layer) {
+         const int         layer = kv.first;
+         std::vector<int> &ids   = kv.second;
+-        const int want = (layer >= 0 && layer < 512) ? g_rearm_slots[layer] : -1;
+-        if (want <= 0) {
++        const int sized = (layer >= 0 && layer < 512) ? g_rearm_slots[layer] : -1;
++        if (sized <= 0) {
+             continue;   // the layer was not cacheable at sizing time
+         }
++        // The settled count is sticky: it is the floor for this drop, so a smaller live arena (a second
++        // sequence's verify band) re-arms at it and cannot ratchet the layer DOWN and start an oscillation.
++        int base = (layer >= 0 && layer < 512 && g_settle_slots[layer] > 0) ? g_settle_slots[layer] : sized;
++        const int want = settle_slots_locked(layer, ids, base);
+         // issue #278: never arm a layer that cannot fill.  The test is LAYER-level, not per table, because the
+         // arm is layer-uniform: a skipped table sandwiched between armed ones is exactly the mixed-slot layer
+         // that makes the fused gate+up kernel read the wrong expert.  So a layer with no fill source is stood
+@@ -8124,6 +8459,17 @@ bool moe_cache_rearm() {
+             continue;
+         }
+         const int got = moe_cache_rearm_layer_locked(layer, ids, want);
++        if (got > base) {
++            n_grown++;
++            g_steady_raised++;
++        }
++        if (layer >= 0 && layer < 512) {
++            // Remember what the layer actually ACHIEVED and the capacity it achieved it at, not what it asked
++            // for: a shortfall (a smaller live arena) lowers the floor to a count that fits, and only a
++            // capacity that GROWS past that reference re-attempts.  Sticky so the count cannot oscillate.
++            g_settle_slots[layer] = got > 0 ? got : 0;
++            g_settle_avail[layer] = g_settle_probe_avail;
++        }
+         if (got > 0) {
+             n_rearmed += (int) ids.size();
+         } else if (got == 0) {
+@@ -8154,10 +8500,11 @@ bool moe_cache_rearm() {
+         }
+     }
+ 
+-    if (n_rearmed > 0 || n_stooddown > 0) {
++    if (n_rearmed > 0 || n_stooddown > 0 || n_grown > 0) {
+         GGML_LOG_WARN("%s: re-armed %d stood-down expert-cache tables after a compute-buffer drop "
+-                      "(%d stood down: the arena could not hold the layer uniformly) (arena now %.1f MiB)\n",
+-                      __func__, n_rearmed, n_stooddown, (double) g_arena_bytes / (1024 * 1024));
++                      "(%d stood down: the arena could not hold the layer uniformly; %d layer(s) settled UP "
++                      "to the arena the drop returned) (arena now %.1f MiB)\n",
++                      __func__, n_rearmed, n_stooddown, n_grown, (double) g_arena_bytes / (1024 * 1024));
+     }
+     if (n_nosrc > 0) {
+         // issue #278: name it, so "the re-arm did nothing" is a decision in the log rather than a mystery.
+@@ -12815,8 +13162,18 @@ static void report_locked() {
+                           ? (double) g_bounce_map_bytes / 1048576.0 / ((double) g_bounce_map_us / 1e6) : 0.0,
+                       (double) g_bounce_map_bytes / 1048576.0 / (double) g_bounce_map_calls);
+     }
+-    GGML_LOG_INFO("%s: VRAM budget: requested=%s MiB/device, free-clamped=%lld, arena alloc failures=%lld (fail-soft)\n",
++    GGML_LOG_INFO("%s: VRAM budget: requested=%s MiB/device, free-clamped=%lld, arena alloc failures=%lld "
++                  "(fail-soft)\n",
+                   __func__, budget_desc(), (long long) g_alloc_clamped, (long long) g_alloc_failed);
++    // wip/arena-steady-sizing: the sizing pass samples the arena while the wide (prefill) compute view is
++    // live, so it is clamped to `mapped - (narrow + ring + wide)` -- a figure that shrinks as `-ub` grows.
++    // The settle at each prefill -> decode drop recovers it, and these two counters are what prove the settle
++    // ran (a config whose drop never fires shows `settled-up 0`).
++    GGML_LOG_INFO("%s: arena settle: %lld layer(s) raised at a prefill -> decode drop; %lld drop(s) had nothing "
++                  "to re-arm; prior gain %.2f pp vs the %.2f pp gate (%s); GPU arena %.1f MiB total now\n",
++                  __func__, (long long) g_steady_raised, (long long) g_steady_skipped,
++                  g_steady_gain_pp, g_steady_min_gain_pp, g_steady_allow ? "taking the band" : "leaving the band",
++                  (double) g_arena_bytes / (1024 * 1024));
+     if (g_fill_fail > 0) {
+         // issue #274: a failed fill rolls the admission back and declines the op, so the run is CORRECT but
+         // slow.  Silence here is what let "every fill failed" reach the reporter as broken output instead of
+-- 
+2.56.0
+

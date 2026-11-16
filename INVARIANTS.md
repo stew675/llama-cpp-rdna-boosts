@@ -5040,7 +5040,7 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
   unchanged (the census line says which caller grew it).  A gather that declines (no scratch, multi-process,
   `GGML_SEQPAR_CE_GATHER=0`) warns with **its own** message and flag instead of consuming the all-reduce's.
 
-## r292 — the expert arena is sized ONCE, from the slab's *birth* boundary, so `-ub` silently shrinks it (beta candidate)
+## r292 — the expert arena is sized ONCE, from the slab's *birth* boundary, so `-ub` silently shrinks it (promoted into block 09, r292)
 
 1. **The arena's slot count is a one-shot function of the slab boundary at the instant the cache sizes, and
    that boundary is the prefill layout.**  `alloc_all_locked` sizes from `ggml_cuda_slab_arena_total()` =
@@ -5088,3 +5088,33 @@ prewarm and then the re-layout).  r266's in-place prefill band suggested the fil
    The cap must use the **pre-clamp** request: recording the post-clamp budget makes `auto` indistinguishable
    from an explicit budget that matched the capacity, and the ratio pins to 1.0 (the whole settle silently
    does nothing — this was the first implementation's bug).
+8. **The band is not free: taking it evicts WHOLE tables, and that is a prefill cost.**  The slab's arena is
+   per-table atomic.  A full arena fills the lowest VA chunks with whole tables; a prefill boundary move
+   stands those tables down whole, so the prefill re-reads **every** expert of them from the host instead of
+   the 85 % that were resident.  Measured on a 2-device `-sm tensor` split (sizing 437/512 slots/table, prior
+   already covering 99.56 %): taking the band bought **0.44 pp** of decode mass and cost prefill **1625 ->
+   903 t/s (-44 %)** and decode **-5 %** (51.9 -> 49.3 t/s).  The same change on 1 device (sizing 201/512,
+   prior 82.68 %) is **+8.2 %** decode at `-ub 16384` and **+32 %** at `-ub 32768`.  Arena capacity is worth
+   `~1/arena_size`, but only where the decode set is actually short of it.
+9. **Decide on the MARGINAL mass of the growth the drop offers, not on full residency.**  A few-slot growth
+   still frees and re-seeds every table.  At `-ub 2048` the first drop offered only **1.9 %** more arena
+   (28 956 -> 29 412 slots) and **0.50 pp** of prior mass; taking it measured **-2.7 %** decode at 2 000
+   tokens.  At `-ub 16384` the drop offers **26.3 %** and **6.98 pp**, and the whole-table re-seed is paid
+   back (+8.2 %).  The decision must therefore be made at the **first drop** (the first time the decode
+   capacity is visible), from the persisted decode-band prior, with a threshold
+   (`MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP`, default 1.0 pp).  Measured decisions: 1-device 6.98 pp **on**;
+   `-ub 2048` 0.50 pp **off**; 2-device tensor 0.44 pp **off**; 2-device layer 0.14 pp **off**; 3-device
+   0.00 pp **off**.
+10. **A settled slot count must be sticky per layer, together with the capacity it was achieved at.**  At a
+   prefill -> decode drop the live narrow re-reserve varies (a second sequence's verify band, a live
+   prefill), so the arena a drop returns can be smaller than the one the count was settled at.  Re-deriving
+   from the sizing count on every drop ratchets the count **down** and, when the capacity returns, **up**
+   again — an oscillation that re-seeds the tables on every transition.  Keep the achieved count and the
+   capacity reference per layer; re-arm at the achieved count when the capacity has not grown, and only
+   re-derive when it has.  Measured on a two-slot server (`--parallel 2`, 1 x R9700): one slot decoding
+   while the other prefills, then the prefill completes, then the short slot starts a **new** prefill while
+   the long one still decodes, then a fresh prefill after both idle — coherent on every run, no
+   `could not be re-armed slot-uniformly`, no `is not slot-uniform`, no stood-down layer, the settle fires
+   **once** (47 layers, arena 22 388.2 MiB at the two-slot narrow floor) and later drops re-arm without
+   growing or shrinking.  Concurrent text need not be byte-deterministic (KV placement); the invariants are
+   the layer uniformity and the coherence.

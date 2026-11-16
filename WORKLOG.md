@@ -1,3 +1,104 @@
+## 261115.007 (r292, RELEASE v16-4f9dfa0e3-r292) -- block 09 gains the demand-gated arena settle (amend block 09, no new block): the band a prefill -> decode drop returns is taken where the decode set is short of it (+8.2 % at `-ub 16384`, +31.9 % at 32768, +36.8 % partial pool, +19.5 % on the 24 GiB card) and left alone on a saturated split
+
+The v2 candidate (now `archive/work/arena-steady-sizing/`, r292 entries below) is **promoted into block 09**, on the
+maintainer's decision -- **no `0301`**.  Block 09 now carries the settle: at each prefill -> decode drop the
+per-layer slot count is scaled by the capacity ratio (growth only, no table scan), **demand-gated at the
+first drop** on the marginal persisted decode-band prior mass the offered growth buys
+(`MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP`, default 1.0 pp), and the achieved count is **sticky per layer with
+the capacity it was achieved at** so a two-slot decode/prefill transition re-arms at the achieved count and
+only a capacity that GROWS re-derives it.  A saturated 2-device split or a small `-ub 2048` leaves the band
+and is byte-identical to base; the kill switch `MOE_EXPERT_CACHE_STEADY_REARM=0` is bit-for-bit the old
+behaviour.  Blocks 10-15 and 0300 were re-cut onto the amended 09; the block 09 tree compiles on its own.
+
+**The delivery is still 16 official blocks + the temporary `0300` = 17 default patches** (`n_blocks 16`,
+`n_temporary 1`, `n_default 17`); the release prefix is `v16`.  `release.json`:
+`base 4f9dfa0e3`, `tip 2b7a65309`, `tree 4a67e7c9d7b1925081db04a814f03ae40627325f`,
+`optional_tree a22261928d0b1aaccfa76c755790e0248ea9e40d`.  The release tree differs from the tested
+candidate tree (`9cd799ca`) only in comment/line wrapping and a redundant scope; the behaviour is
+identical.
+
+**Measured** (r291 tree + the change, interleaved A/B, 2 000 greedy tokens, heat prior pinned, text
+byte-identical everywhere): 1 x R9700 `-ub 16384` arena 18 411.9 -> **22 819.7 MiB**, miss traffic -39 %,
+decode **41.7 -> 45.1 t/s (+8.2 %)**; `-ub 32768` 12 183.0 -> **23 018.0 MiB**, traffic **-70 %**,
+**34.3 -> 45.3 (+31.9 %)**; partial pool (`-lme 8` + `DIO=1`) **16.9 -> 23.1 (+36.8 %)**; 24 GiB RX 7900
+XTX arena 11 428.6 -> **15 995.3 MiB**, traffic -38.2 %, **36.5 -> 43.6 (+19.5 %)**.  The saturated arms are
+byte-identical: 2-device tensor 51.90 vs 51.90 (0.44 pp), 2-device layer 39.34 vs 39.37 (0.14 pp),
+3-device 57.45 vs 57.51 (0.00 pp), `-ub 2048` batched B=1 49.61 vs 49.56 (0.50 pp).  MTP four-axis: text and
+acceptance identical (R 0.62267, P 0.82563, C 0.91975, K 0.99200), decode +2.8..16 % where the band is
+taken.  Two-slot server (`--parallel 2`, one decoding while the other prefills, then the reverse and a
+fresh prefill after both idle): coherent, no non-uniform layer, no stand-down, arena stable.
+
+**Gates.** `scripts/validate-set.sh` green (17 default + 2 optional, strict apply, optional trees
+re-derived, Windows portability 512 files); `scripts/gate-host-pool.sh` **54/54**;
+`scripts/gate-prefill-logits.sh --ab "MOE_EXPERT_CACHE_STEADY_REARM=0"` **KLD 0.000000 / top-p 99.990 %** on
+the MoE model; `llama-batched-bench -npl 1,4,8` neutral; same-seed greedy text byte-identical in every arm;
+no GPU faults; the per-block build gate built the 4 changed block commits (09, 12, 15, 0300) 4/4 on a
+fresh `all` build each.  `scripts/fork-refresh.sh --build --gates --push` re-cut the branch at
+`4f9dfa0e3`, reproduced tree `4a67e7c9` and tip `2b7a65309`, passed the coherence gate and the recorded-base
+prefill-logit gate (mean KLD 0.000697, limit 0.005), and force-pushed `rdna-boosts` to the personal fork
+(`ec721312c -> 2b7a65309`).  The optional artifacts (`0100` two-lane prefill, `0101` mixed K/V) still apply
+strictly to the new default tree; their trees were re-derived and recorded.  The ROCm images are built and
+pushed off-host by `scripts/container-watch.sh` on `radiance` after the tag.
+
+**Bookkeeping.** The candidate moved to `archive/work/arena-steady-sizing/` (no stub); `beta/README.md`
+carries the promotion.  `ENVIRONMENT.md` records both knobs, `INVARIANTS.md` r292 items 8-10 the findings,
+`patches/README.md` the block 09 amendment note.  The next step after this release is the
+`wip/moe-static-hot-tier/` update: placement above the widest prefill boundary instead of a freeze
+primitive, with the two-segment slot addressing as the real blocker (the 2-device 0.44 pp becomes a free
+win once prefill keeps its hot K slots above the boundary).
+
+## 261115.006 (r292) -- the multi-GPU gap in the arena settle: the band is not free.  The settle is now demand-gated on the MARGINAL mass the drop offers (2-device tensor +0.44 pp -> leave it, prefill 1625 -> 903 t/s avoided) and sticky per layer with its capacity (two-slot decode/prefill transitions stable).  +8.2 % on 1 x R9700 at `-ub 16384`, +31.9 % at 32768, +36.8 % on a partial pool, +19.5 % on the 24 GiB card
+
+The v1 candidate (`beta/arena-steady-sizing/`, r292 entry below) settled the slot count at every
+prefill -> decode drop on the *full* capacity ratio.  It was only ever measured on one device.  The
+multi-GPU gap the maintainer asked for found that **the band is not free**: on a 2-device `-sm tensor`
+split the sizing pass already holds 437/512 experts per table and its persisted decode prior covers
+**99.56 %** of the routed mass, so the extra 75 slots buy **0.44 pp**; taking them fills the arena's
+lowest VA chunks with whole tables, and the next prefill stands those tables down **whole**, so the
+prefill re-reads every expert of them from the host.  Measured: prefill **1625 -> 903 t/s (-44 %)**, decode
+**51.9 -> 49.3 (-5 %)**, text byte-identical.  `-sm layer` is 0.14 pp, 3-device 0.00 pp.  v1 was a loss on
+every saturated split.
+
+The same measurement exposed a second gate hole: even a **few-slot** growth pays a whole-table re-seed.  At
+`-ub 2048` the first drop offered 1.9 % more arena and 0.50 pp of prior mass; taking it read **-2.7 %**
+decode at 2 000 tokens.  So the decision cannot be "full residency is worth X pp"; it must be "the growth
+**this drop** offers is worth X pp", and it has to be made at the **first drop** (the first moment the decode
+capacity is visible).  v2 computes the marginal prior coverage of the offered target against the sizing
+count, once, and takes the band only at >= `MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP` (default 1.0 pp).
+
+The second maintainer requirement -- two sessions, one decoding while the other prefills, then the prefill
+completing to decode, then the reverse when a session finishes and starts prefilling again -- exposed the
+count ratchet.  The narrow re-reserve varies with the live sequence set, so the arena a drop returns can be
+smaller than the one the count was settled at; re-deriving from the sizing count every drop ratchets the
+count DOWN, then UP when the capacity returns, re-seeding the tables on every transition.  v2 keeps the
+achieved count and the capacity it was achieved at **per layer**; a drop re-arms at the achieved count unless
+the capacity has GROWN.  The two-slot harness (`--parallel 2`, 1 x R9700, one slot decoding while the other
+prefills, then the short slot starts a new prefill while the long one still decodes, then a fresh prefill
+after both idle) ran three times: all responses coherent, no `could not be re-armed slot-uniformly`, no
+`is not slot-uniform`, no stood-down layer, no fault, the settle fires **once** (47 layers, arena
+22 388.2 MiB at the two-slot narrow floor) and later drops re-arm without growing or shrinking.  Concurrent
+text happened to be deterministic here; that is not required.
+
+**Measured (r291 tree, interleaved A/B, 2 000 greedy tokens, heat prior pinned, text byte-identical every
+arm).**  1 x R9700: `-ub 16384` arena 18 411.9 -> **22 819.7 MiB**, miss traffic 211 498.5 -> **129 117.3
+MiB (-39 %)**, decode **41.7 -> 45.1 t/s (+8.2 %)**; `-ub 32768` 12 183.0 -> **23 018.0 MiB**, traffic
+425 828.6 -> **126 134.3 (-70 %)**, **34.3 -> 45.3 t/s (+31.9 %)**; partial pool (`-lme 8` + `DIO=1`)
+**16.9 -> 23.1 (+36.8 %)**.  24 GiB RX 7900 XTX (`gfx1100`, PCIe 4.0 x16, r291 re-run at its field shape):
+arena 11 428.6 -> **15 995.3 MiB**, hit 0.7418 -> 0.8412, traffic 479 658.3 -> **296 483.2 (-38.2 %)**,
+decode **36.50 -> 43.61 t/s (+19.5 %)**.  The saturated/tiny-growth arms are byte-identical to base:
+2-device tensor 51.90 vs 51.90, 2-device layer 39.34 vs 39.37, 3-device 57.45 vs 57.51, `-ub 2048` batched
+bench B=1 49.61 vs 49.56 (ntg 2000) and B=1/4/8 47.89/127.36/176.52 -> 48.04/127.67/176.61 (ntg 512).
+
+**Gates.**  Same-seed greedy text byte-identical in every arm; MTP four-axis text and acceptance identical
+(R 0.62267, P 0.82563, C 0.91975, K 0.99200), decode +2.8..16 % where the band is taken;
+`gate-host-pool.sh` **54/54**; `gate-prefill-logits.sh --ab "MOE_EXPERT_CACHE_STEADY_REARM=0"` **KLD 0.000000 /
+top-p 99.990 %** on the MoE model; `llama-batched-bench -npl 1,4,8` neutral; no GPU faults.
+
+Still a **beta candidate**, not in `patches/`: where it folds is the maintainer's decision (block 09 needs a
+09-15 chain rewrite, block 15 is one commit but an APU/GTT semantic mismatch, `0301` is a new temporary
+block).  The recommendation is block 09 at the next re-base.  `beta/arena-steady-sizing/` carries the
+patch (sha256 `dcbfce70...`, applied tree `9cd799ca...`), its README and the tester checklist.
+
 ## 261115.005 (r292) -- the expert arena was sized once, from the slab's *prefill* boundary: `-ub` silently shrank it by 21 % / 49 %.  A one-file beta candidate settles the count at each drop: +4.0 % on the 32 GiB R9700, +19.0 % on the 24 GiB 7900 XTX, same-seed text byte-identical
 
 Started as a feasibility question about a *strictly bimodal* slab (prefill band XOR expert arena on
