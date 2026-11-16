@@ -1,4 +1,4 @@
-From ad3ea4748c270a572be3a41836c0e92e41d2ee5d Mon Sep 17 00:00:00 2001
+From 6472df7cfc2b946902e80fd10bb6adf5eb9bb4b6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/16] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -114,15 +114,15 @@ defect rate is ~1/24 loads, so a green series is evidence the ordering gap is cl
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |  283 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |   27 +
  ggml/src/ggml-cuda/ggml-cuda-slab.cu          | 1847 +++++
- ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 3207 +++++++++
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 3261 +++++++++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cuh     |   43 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   60 +
  ggml/src/ggml-cuda/ggml-cuda.cu               | 6291 ++++++-----------
  ggml/src/ggml-cuda/graph.cuh                  |   28 +-
  ggml/src/ggml-cuda/mmb.cu                     |  333 +-
  ggml/src/ggml-cuda/mmb.cuh                    |   24 +
- ggml/src/ggml-cuda/mmq.cu                     |  206 +-
- ggml/src/ggml-cuda/mmq.cuh                    |   28 +-
+ ggml/src/ggml-cuda/mmq.cu                     |  261 +-
+ ggml/src/ggml-cuda/mmq.cuh                    |   34 +-
  ggml/src/ggml-cuda/mmvf.cu                    |  432 +-
  ggml/src/ggml-cuda/mmvf.cuh                   |   11 +-
  ggml/src/ggml-cuda/mmvq-ksplit-body.inc       |  355 +
@@ -165,7 +165,7 @@ defect rate is ~1/24 loads, so a green series is evidence the ordering gap is cl
  tests/test-fusion-gate-beta-multiseq.cpp      |  305 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 87 files changed, 16569 insertions(+), 5573 deletions(-)
+ 87 files changed, 16678 insertions(+), 5579 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -7520,10 +7520,10 @@ index 000000000..bab71d893
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 new file mode 100644
-index 000000000..5e44e7f28
+index 000000000..a9abf2568
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -0,0 +1,3207 @@
+@@ -0,0 +1,3261 @@
 +// CUDA graph fusion dispatcher: the delivery's matchers and the one-line-per-concern try-fuse
 +// arms.  Split out of ggml-cuda.cu so an upstream change to the shared graph/evaluate path
 +// collides with the single ggml_cuda_try_fuse() call, not with every arm body.
@@ -9198,8 +9198,20 @@ index 000000000..5e44e7f28
 +    // matmul; `ne[2]` is its token count, so gate on the cache band (prefill stays fused).
 +    if (node->op == GGML_OP_MUL_MAT_ID) {
 +        if (node->ne[2] > MOE_EXPERT_CACHE_MAX_TOK) {
++            // TODO #133 / TODO #327: ABOVE the band an identity (fully resident) table is served IN PLACE -- the
++            // scheduler takes the input over and skips the `input_cpy` copy entirely, so the table's bytes live
++            // only in the arena.  The prefill MoE fusions read the expert table DIRECTLY (`gate->src[0]`/
++            // `up->src[0]`, mmb / fused-MMQ / MMQ pair / MMQ-swiglu), bypassing the dispatch's
++            // `moe_cache_get_table` redirect, and they used to stand down for such a table, which made residency
++            // select the kernel set (TODO #321, r284: a run's greedy text was a function of the persisted heat
++            // prior).  They now carry the in-place contract instead: each of them asks
++            // `moe_cache_fusion_serve()` and launches on the arena copies for a served table, so the fused set is
++            // the same whichever table happens to be resident, and the staged arm is byte-for-byte what it was.
++            // Every other matcher above the band is band-limited by its own predicate (`MUL_MAT_ID` width caps in
++            // `ggml_cuda_should_fuse_mul_mat_vec_q/_f`, `node->ne[2] == 1` for the MWR fold, the qwen4exp
++            // weighted-down's `!moe_cache_enabled()` gate), so nothing else can reach a table here.
 +            moe_fuse_trace((int) node->ne[2], false, "prefill");
-+            return false;   // prefill: the cache does not take these inputs over
++            return false;
 +        }
 +        // No routed expert table at all (the model is fully device-resident: `-ncmoe 0`, or a `-ncmoe`
 +        // that did not offload, e.g. on unified memory).  The cache can never take an input over, so its
@@ -9255,11 +9267,13 @@ index 000000000..5e44e7f28
 +    }
 +
 +    // swiglu -> routed-down fold (leading GLU, consuming the next MUL_MAT_ID).  Prefill-only in
-+    // practice, but guard it too so a cache-band variant can never read the redirected table.
++    // practice (the MMQ `mul_mat_q_swiglu` arm).  In the cache band it reads the DOWN table directly, so it
++    // stands down; above the band it carries the in-place contract (TODO #327) and redirects for itself.
 +    if (node->op == GGML_OP_GLU && i + 1 < cgraph->n_nodes &&
-+            cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
-+            cgraph->nodes[i + 1]->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
-+        return true;
++            cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID) {
++        if (cgraph->nodes[i + 1]->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
++            return true;
++        }
 +    }
 +
 +    return false;
@@ -9536,18 +9550,6 @@ index 000000000..5e44e7f28
 +
 +    if (ggml_cuda_fusion_disabled()) {
 +        return 0;
-+    }
-+    // A deferred Q norm+rope whose K node was passed (taken by another fusion) is launched on its own before anything else.
-+    if (cuda_ctx->qk_pend_graph != nullptr && (cuda_ctx->qk_pend_graph != cgraph || i > cuda_ctx->qk_pend_j || i < cuda_ctx->qk_pend_i)) {
-+        if (cuda_ctx->qk_pend_graph != cgraph || i < cuda_ctx->qk_pend_i) {
-+            GGML_ABORT("deferred Q norm+rope was left in an earlier graph");
-+        }
-+        const int qi = cuda_ctx->qk_pend_i;
-+        cuda_ctx->qk_pend_graph = nullptr;
-+        // the FWHT form (quantized KV) writes its rotation output instead of the ROPE output
-+        ggml_tensor * q_fwht = qi + 4 < cgraph->n_nodes && cgraph->nodes[qi + 3]->op == GGML_OP_RESHAPE &&
-+                               ggml_cuda_op_mul_mat_use_fwht(cgraph->nodes[qi + 4]) ? cgraph->nodes[qi + 4] : nullptr;
-+        ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, cgraph->nodes[qi], cgraph->nodes[qi + 1], cgraph->nodes[qi + 2], nullptr, q_fwht);
 +    }
 +    if (ggml_cuda_cache_blocks_fusion(cuda_ctx, cgraph, i)) {
 +        cuda_ctx->mwr_fold_experts = nullptr;
@@ -10137,7 +10139,25 @@ index 000000000..5e44e7f28
 +            // MMB fused MoE gate+up+swiglu (pwilkin port). Prefill-only by the shared predicate.
 +            if (op == GGML_OP_MUL_MAT_ID && ids != nullptr &&
 +                    ggml_cuda_mmb_supported_glu(gate->src[0], up->src[0], src1, ids, glu)) {
-+                ggml_cuda_mul_mat_id_mmb_glu(*cuda_ctx, gate->src[0], up->src[0], src1, ids, glu);
++                // TODO #327: the in-place contract.  A cache-served (in-place identity) table lives ONLY in the
++                // arena -- the scheduler skipped its copy -- so the fused kernel must read the same arena base
++                // the per-op chain would have.  Redirect BOTH lanes together; MIXED (one lane arena, one staged)
++                // means a lane's copy was never filled, so stand the fusion down and let the per-op chain, which
++                // resolves each table itself, run.
++                ggml_tensor src0_c, ids_c, gate_c;
++                const moe_cache_serve_status serve = moe_cache_fusion_serve(
++                    glu, up->src[0], gate->src[0], ids, cuda_ctx->device, cuda_ctx->stream(),
++                    &src0_c, &ids_c, &gate_c);
++                if (serve == MOE_CACHE_SERVE_MIXED) {
++                    moe_cache_fusion_launched(serve, 0);
++                    break;
++                }
++                if (serve == MOE_CACHE_SERVE_IN_PLACE) {
++                    ggml_cuda_mul_mat_id_mmb_glu(*cuda_ctx, &gate_c, &src0_c, src1, &ids_c, glu);
++                } else {
++                    ggml_cuda_mul_mat_id_mmb_glu(*cuda_ctx, gate->src[0], up->src[0], src1, ids, glu);
++                }
++                moe_cache_fusion_launched(serve, 0);
 +                fused_mul_mat_vec = true;
 +                fused_node_count  = 3;
 +                break;
@@ -10185,7 +10205,24 @@ index 000000000..5e44e7f28
 +                fusion_data.glu_op    = ggml_get_glu_op(glu);
 +                fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 +
-+                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
++                // TODO #327: this arm is NVIDIA-only (`ggml_cuda_should_fuse_mul_mat_q`'s turing-MMA gate), and
++                // the expert cache is not an AMD-only facility, so it carries the same in-place contract.
++                ggml_tensor src0_c, ids_c, gate_c;
++                const moe_cache_serve_status serve = ids == nullptr ? MOE_CACHE_SERVE_NONE : moe_cache_fusion_serve(
++                    glu, src0, gate->src[0], ids, cuda_ctx->device, cuda_ctx->stream(),
++                    &src0_c, &ids_c, &gate_c);
++                if (serve == MOE_CACHE_SERVE_MIXED) {
++                    moe_cache_fusion_launched(serve, 1);
++                    break;
++                }
++                if (serve == MOE_CACHE_SERVE_IN_PLACE) {
++                    ggml_cuda_mm_fusion_args_host fusion_local = fusion_data;
++                    fusion_local.gate = &gate_c;
++                    ggml_cuda_mul_mat_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
++                } else {
++                    ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
++                }
++                moe_cache_fusion_launched(serve, 1);
 +                fused_mul_mat_vec = true;
 +                fused_node_count  = 3;
 +                break;
@@ -10216,7 +10253,24 @@ index 000000000..5e44e7f28
 +                fusion_data.glu_op    = ggml_get_glu_op(glu);
 +                fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 +
-+                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
++                // TODO #327: same in-place contract as the MMB arm above -- the fused MMQ kernel reads both
++                // expert streams directly, so it takes the arena copies when the cache serves them in place.
++                ggml_tensor src0_c, ids_c, gate_c;
++                const moe_cache_serve_status serve = moe_cache_fusion_serve(
++                    glu, src0, gate->src[0], ids, cuda_ctx->device, cuda_ctx->stream(),
++                    &src0_c, &ids_c, &gate_c);
++                if (serve == MOE_CACHE_SERVE_MIXED) {
++                    moe_cache_fusion_launched(serve, 1);
++                    break;
++                }
++                if (serve == MOE_CACHE_SERVE_IN_PLACE) {
++                    ggml_cuda_mm_fusion_args_host fusion_local = fusion_data;
++                    fusion_local.gate = &gate_c;
++                    ggml_cuda_mul_mat_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
++                } else {
++                    ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
++                }
++                moe_cache_fusion_launched(serve, 1);
 +                fused_mul_mat_vec = true;
 +                fused_node_count  = 3;
 +                break;
@@ -18751,7 +18805,7 @@ index fd8085897..491c52bc9 100644
  bool ggml_cuda_mmb_active();
  // A fusion that stands down for MMB must ask ggml_cuda_mmb_supported_mm()/_supported_mmid() (the top
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index c7e39db84..0ebb176e8 100644
+index c7e39db84..90e6f1d55 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -1,5 +1,7 @@
@@ -18762,7 +18816,31 @@ index c7e39db84..0ebb176e8 100644
  #include "quantize.cuh"
  #include "mmid.cuh"
  
-@@ -347,13 +349,16 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -274,14 +276,20 @@ static void ggml_cuda_mmq_select_J(const ggml_type type, const bool fallback, co
+     }
+ }
+ 
+-void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1) {
++void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1,
++                              const ggml_tensor * src0_0, const ggml_tensor * src0_1,
++                              const ggml_tensor * ids_o) {
+     GGML_ASSERT(dst0->src[1] == dst1->src[1]);
+     GGML_ASSERT(dst0->src[2] == dst1->src[2]);
+ 
+-    const ggml_tensor * src0s[] = { dst0->src[0], dst1->src[0] };
++    // TODO #327: a cache-served (in-place) table is handed in as `src0_i` -- a shallow copy whose `data` is the
++    // arena -- and the routing as `ids_o` (the slot remap when the tier publishes one, the raw ids otherwise).
++    // The pair kernel takes both tables and the routing as plain pointers, so the redirect reaches BOTH lanes
++    // and the ONE shared quantize/compaction, which is why it is done here and not per lane.
++    const ggml_tensor * src0s[] = { src0_0 ? src0_0 : dst0->src[0], src0_1 ? src0_1 : dst1->src[0] };
+     ggml_tensor * dsts[] = { dst0, dst1 };
+     const ggml_tensor * src1 = dst0->src[1];
+-    const ggml_tensor * ids = dst0->src[2];
++    const ggml_tensor * ids = ids_o ? ids_o : dst0->src[2];
+     const ggml_tensor * src0 = src0s[0];
+ 
+     GGML_ASSERT(src1->type == GGML_TYPE_F32);
+@@ -347,13 +355,16 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
              const int64_t s1 = dst_i->nb[1] / sizeof(float);
              const int64_t s2 = dst_i->nb[2] / sizeof(float);
              const int64_t s3 = dst_i->nb[3] / sizeof(float);
@@ -18780,7 +18858,18 @@ index c7e39db84..0ebb176e8 100644
              const ggml_prec prec_i = ggml_cuda_mmq_get_prec_src1(src0_i->type, ggml_prec_get_src(dst_i, 1), cc);
              ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_i);
          }
-@@ -382,13 +387,6 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -369,8 +380,8 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+     // ISOLATION HOOK: run the two muls through the ORIGINAL single-node path (no merge)
+     static const bool pair_2x = getenv("GGML_PAIR_2X") != nullptr;
+     if (pair_2x) {
+-        ggml_cuda_mul_mat_q(ctx, dst0->src[0], dst0->src[1], dst0->src[2], dst0, nullptr, nullptr);
+-        ggml_cuda_mul_mat_q(ctx, dst1->src[0], dst1->src[1], dst1->src[2], dst1, nullptr, nullptr);
++        ggml_cuda_mul_mat_q(ctx, src0s[0], src1, ids, dst0, nullptr, nullptr);
++        ggml_cuda_mul_mat_q(ctx, src0s[1], src1, ids, dst1, nullptr, nullptr);
+         return;
+     }
+ 
+@@ -382,13 +393,6 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
      ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
      ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
      ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), src0s[0]->ne[2] + 1);
@@ -18794,7 +18883,7 @@ index c7e39db84..0ebb176e8 100644
  
      size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq) / QK8_1_MMQ;
      int J_best_i[2]        = {0, 0};
-@@ -410,6 +408,28 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -410,6 +414,28 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
          nbytes_src1_q8_1 = std::max(nbytes_src1_q8_1,
              ne12*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq) / QK8_1_MMQ + pad);
      }
@@ -18823,7 +18912,7 @@ index c7e39db84..0ebb176e8 100644
      ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
      {
          const int64_t s11 = src1->nb[1] / ts_src1;
-@@ -432,13 +452,21 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -432,13 +458,21 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
          const int64_t s1 = dst_i->nb[1] / sizeof(float);
          const int64_t s2 = dst_i->nb[2] / sizeof(float);
          const int64_t s3 = dst_i->nb[3] / sizeof(float);
@@ -18848,7 +18937,7 @@ index c7e39db84..0ebb176e8 100644
          const ggml_prec prec_i = ggml_cuda_mmq_get_prec_src1(src0_i->type, ggml_prec_get_src(dst_i, 1), cc);
          ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_i);
      }
-@@ -906,3 +934,159 @@ bool ggml_cuda_mmq_fusion_is_efficient(
+@@ -906,3 +940,198 @@ bool ggml_cuda_mmq_fusion_is_efficient(
      const int64_t tiles_efficiency_percent = 100 * ntiles / (nsm*tiles_nwaves);
      return tiles_efficiency_percent >= 90;
  }
@@ -18923,7 +19012,27 @@ index c7e39db84..0ebb176e8 100644
 +        (!has_ids || ncols_dst <= get_mmvq_mmid_max_batch(src0->type, cc) ||
 +                     ncols_dst <= get_mmvq_mmid_max_batch(src0_next->type, cc));
 +    if (use_mmq && !use_mmvq) {
-+        ggml_cuda_mul_mat_q_pair(ctx, node, next);
++        if (!has_ids) {
++            ggml_cuda_mul_mat_q_pair(ctx, node, next);   // dense pair (e.g. the shared-expert up+gate): no routing
++            return 1;
++        }
++        // TODO #327: the pair reads BOTH expert tables directly, so hand it the arena copies (and the remapped
++        // routing) when the cache serves these tables in place.  A mixed/declined answer keeps the graph's
++        // staged copies, i.e. exactly the pre-#327 path.
++        ggml_tensor src0_c0, ids_c, src0_c1;
++        const moe_cache_serve_status serve = moe_cache_fusion_serve(node, src0, src0_next, node->src[2],
++                                                                    ctx.device, ctx.stream(),
++                                                                    &src0_c0, &ids_c, &src0_c1);
++        if (serve == MOE_CACHE_SERVE_MIXED) {
++            moe_cache_fusion_launched(serve, 2);
++            return 0;   // one lane would read a table the scheduler never copied: let the per-op chain resolve it
++        }
++        if (serve == MOE_CACHE_SERVE_IN_PLACE) {
++            ggml_cuda_mul_mat_q_pair(ctx, node, next, &src0_c0, &src0_c1, &ids_c);
++        } else {
++            ggml_cuda_mul_mat_q_pair(ctx, node, next);
++        }
++        moe_cache_fusion_launched(serve, 2);
 +        return 1;
 +    }
 +    return 0;
@@ -18975,7 +19084,26 @@ index c7e39db84..0ebb176e8 100644
 +        ggml_cuda_should_use_mmq(weights->type, cc, mmq_cols, n_experts);
 +
 +    if (use_mmq && ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, next->op }, { i + 1 })) {
-+        ggml_cuda_mul_mat_q_swiglu(ctx, weights, ids, next, node);
++        if (!has_ids) {
++            ggml_cuda_mul_mat_q_swiglu(ctx, weights, ids, next, node);
++            return 1;
++        }
++        // TODO #327: the fold reads the DOWN expert table directly, so a cache-served table must reach it as
++        // the arena copy (with the remapped routing) exactly as it reaches the per-op dispatch.  No gate lane
++        // here.  MIXED means one lane flipped unserveable mid-call: stand the fold down for the per-op chain.
++        ggml_tensor src0_c, ids_c;
++        const moe_cache_serve_status serve = moe_cache_fusion_serve(
++            next, weights, nullptr, ids, ctx.device, ctx.stream(), &src0_c, &ids_c, nullptr);
++        if (serve == MOE_CACHE_SERVE_MIXED) {
++            moe_cache_fusion_launched(serve, 3);
++            return 0;
++        }
++        if (serve == MOE_CACHE_SERVE_IN_PLACE) {
++            ggml_cuda_mul_mat_q_swiglu(ctx, &src0_c, &ids_c, next, node);
++        } else {
++            ggml_cuda_mul_mat_q_swiglu(ctx, weights, ids, next, node);
++        }
++        moe_cache_fusion_launched(serve, 3);
 +        return 1;
 +    }
 +    return 0;
@@ -19009,7 +19137,7 @@ index c7e39db84..0ebb176e8 100644
 +    return 0;
 +}
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index f2c5754c3..4f090b0d7 100644
+index f2c5754c3..de281a724 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
 @@ -1,7 +1,9 @@
@@ -19069,7 +19197,19 @@ index f2c5754c3..4f090b0d7 100644
  
          const int descriptor_blocks = (args.ncols_dst + J - 1) / J;
          const dim3 block_nums_compact(nti, descriptor_blocks, args.nsamples_y);
-@@ -2047,3 +2060,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+@@ -2040,10 +2053,19 @@ void ggml_cuda_mul_mat_q_swiglu_dense(
+ void ggml_cuda_mul_mat_q_swiglu(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * swiglu);
+ 
++// `src0_0`/`src0_1`/`ids_o` (TODO #327): optional arena-backed replacements for the two expert tables and the
++// routing, as resolved by `moe_cache_fusion_serve()`.  Null keeps the graph's own (staged) tensors.
+ void ggml_cuda_mul_mat_q_pair(
+-        ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1);
++        ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1,
++        const ggml_tensor * src0_0 = nullptr, const ggml_tensor * src0_1 = nullptr,
++        const ggml_tensor * ids_o = nullptr);
+ 
+ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
  
  // prec_requested: the src1 precision requested by the fused MUL_MATs.
  bool ggml_cuda_mmq_fusion_is_efficient(ggml_type type, ggml_prec prec_requested, int64_t nrows_x, int64_t ncols, int64_t nchannels, int device);
@@ -22408,10 +22548,10 @@ index 35f625eaa..ea7ce5ad9 100644
  void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index a060b0b29..db46e544a 100644
+index 0f20161ea..1776a4ba3 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -1872,6 +1872,40 @@ static void pool_rank_from_prefill_locked() {
+@@ -1879,6 +1879,40 @@ static void pool_rank_from_prefill_locked() {
  // an eviction victim.  Without this, an expert admitted earlier in the same token can be evicted by a later
  // one (its freshly-seeded count is the smallest), which is what made the hook's `all` flag flip from token
  // to token - and that variability is what broke CUDA graph replay.
@@ -22452,7 +22592,7 @@ index a060b0b29..db46e544a 100644
  moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
                                const int32_t * protect = nullptr, int n_protect = 0,
                                bool * out_cold = nullptr) {
-@@ -2028,6 +2062,22 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -2035,6 +2069,22 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
              const bool pool_sync = (n_protect > pool->slots);
              pool_expert = pool_slot_locked(*pool, expert, &pool_slot, pool_sync);
          }
@@ -22475,7 +22615,7 @@ index a060b0b29..db46e544a 100644
          const bool from_pool = pool_expert != nullptr;
          const cudaMemcpyKind kind = from_pool ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice;
          const char * src = from_pool
-@@ -2077,6 +2127,25 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -2084,6 +2134,25 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
  
  // wip/moe-expert-cache prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): one-shot bulk admission of the
  // experts the prefill routing touched most, applied at arena sizing (after the arena/policy state exist).
@@ -22501,7 +22641,7 @@ index a060b0b29..db46e544a 100644
  // `t.prefill_count` was accumulated in `moe_cache_update_host`'s prefill branch; here it is ranked
  // (count desc, expert id asc), the top `min(slots, cap)` are placed in slots 0.. and copied from the
  // pinned host master - the same bytes a decode fill would fetch, just front-loaded.  The host mirrors are
-@@ -2085,7 +2154,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
+@@ -2092,7 +2161,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
  void apply_prefill_seed_locked(table_t & t) {
      const bool from_tally = g_prefill_seed;
      if (!g_prefill_seed || t.identity || t.slots <= 0 || t.host == nullptr ||
@@ -22510,7 +22650,7 @@ index a060b0b29..db46e544a 100644
          return;
      }
      if (from_tally && (int) t.prefill_count.size() != t.n_experts) {
-@@ -2174,7 +2243,8 @@ void apply_prefill_seed_locked(table_t & t) {
+@@ -2181,7 +2250,8 @@ void apply_prefill_seed_locked(table_t & t) {
  // MOE_EXPERT_CACHE_PREFILL_SEED.  Call it BEFORE `apply_prefill_seed_locked` so the persisted prior
  // wins the (empty-arena) race for slots 0...
  void apply_heat_seed_locked(table_t & t) {
@@ -22520,7 +22660,7 @@ index a060b0b29..db46e544a 100644
          return;
      }
      if ((int) t.heat.size() != t.n_experts || t.n_experts <= 0) {
-@@ -3005,23 +3075,11 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -3012,23 +3082,11 @@ void alloc_table_locked(table_t & t, int slots) {
      // because the arena is not read until a later token.  A partial copy rolls the table back to the
      // normal remap path.
      t.identity = false;
@@ -22547,7 +22687,7 @@ index a060b0b29..db46e544a 100644
              if (err != cudaSuccess) {
                  (void) cudaGetLastError();
                  ok = false;
-@@ -3097,7 +3155,24 @@ static bool moe_cache_tables_complete_locked() {
+@@ -3104,7 +3162,24 @@ static bool moe_cache_tables_complete_locked() {
              expected += g_preflight_device_bytes[d];
          }
      }
@@ -22573,7 +22713,7 @@ index a060b0b29..db46e544a 100644
  }
  
  // Deferred, budget-adaptive, UNIFORM sizing.  Every table gets the same slot count
-@@ -5069,7 +5144,8 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
+@@ -5076,7 +5151,8 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
  
  int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes,
                      size_t host_bytes, size_t src_off, size_t host_pitch, int split_axis,
@@ -22583,7 +22723,7 @@ index a060b0b29..db46e544a 100644
      if (!g_enabled) {
          return -1;
      }
-@@ -5087,6 +5163,13 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -5094,6 +5170,13 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
          cold_safe = host_bytes > 0 && host_bytes % host_pitch == 0 &&
                      expert_bytes > 0 && expert_bytes % (host_bytes / host_pitch) == 0;
      }
@@ -22597,7 +22737,7 @@ index a060b0b29..db46e544a 100644
  
      const std::pair<const void*, int> key = { src0, device };
      const auto it = g_key_to_id.find(key);
-@@ -5116,6 +5199,11 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -5123,6 +5206,11 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
      t.host_pitch   = host_pitch;
      t.split_axis   = split_axis;
      t.cold_safe    = cold_safe;
@@ -22609,7 +22749,7 @@ index a060b0b29..db46e544a 100644
      // TEMP diagnostic (wip/moe-verify-fusions): print the per-table split geometry, to compare the
      // residency-sensitive qwen4exp tables against the residency-insensitive qwen35moe ones.
      if (ggml_cuda_cache_geom_debug()) {
-@@ -5184,7 +5272,7 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
+@@ -5191,7 +5279,7 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
      if (it != t.expert_slot.end()) {
          return { (char *) t.arena + (size_t) it->second * t.expert_bytes, true };
      }
@@ -22618,7 +22758,7 @@ index a060b0b29..db46e544a 100644
          return { (void *) ((const char *) t.host + (size_t) expert * t.host_bytes + t.src_off), false };
      }
      return { nullptr, false };
-@@ -5458,6 +5546,27 @@ static bool moe_cache_slice_addr_ok(size_t host_bytes, size_t expert_bytes, size
+@@ -5465,6 +5553,27 @@ static bool moe_cache_slice_addr_ok(size_t host_bytes, size_t expert_bytes, size
      return span <= host_bytes - src_off;
  }
  
@@ -22646,7 +22786,7 @@ index a060b0b29..db46e544a 100644
  bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                             const ggml_tensor * ids, void * stream, int device,
                             size_t slice_off, int split_axis) {
-@@ -5705,7 +5814,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -5712,7 +5821,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
  bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                             const int32_t * ids, int64_t n_used, int64_t n_tok,
                             size_t ids_nb0, size_t ids_nb1, void * stream,
@@ -22656,7 +22796,7 @@ index a060b0b29..db46e544a 100644
      g_write_seq++;
      if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
          return false;
-@@ -5748,7 +5858,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5755,7 +5865,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
              host_pitch = weight->nb[1];   // a strided axis-0 slice needs a 2-D fill
          }
      }
@@ -22682,7 +22822,7 @@ index a060b0b29..db46e544a 100644
          static bool warned = false;
          if (!warned) {
              warned = true;
-@@ -5765,7 +5892,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5772,7 +5899,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          return false;
      }
      const int table = moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes,
@@ -22692,7 +22832,7 @@ index a060b0b29..db46e544a 100644
      if (table < 0) {
          return false;
      }
-@@ -5842,7 +5970,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5849,7 +5977,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // (issue #116's copy-side twin).  Decline the partial-residency case so the scheduler's
      // pageable-safe host path serves the op.  An identity (whole-resident) table needs no fill and is
      // left alone.
@@ -22701,7 +22841,7 @@ index a060b0b29..db46e544a 100644
          g_decline_all++;
          return false;
      }
-@@ -6197,7 +6325,7 @@ static bool devremap_cold_ok_locked(const table_t & t) {
+@@ -6204,7 +6332,7 @@ static bool devremap_cold_ok_locked(const table_t & t) {
  
  // Constant for a table and shape once the cache is sized (a graph replay needs a constant take-over decision).
  static bool devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok, int device) {
@@ -22710,7 +22850,7 @@ index a060b0b29..db46e544a 100644
             t.arena != nullptr && t.slots > 0 && t.device == device && t.n_experts > 0 &&
             n_used < t.n_experts && t.remap_dev != nullptr && n_used * n_tok <= t.remap_cap &&
             (t.dr_device < 0 || (t.dr_device == device && t.dr_cap == t.remap_cap));
-@@ -6448,7 +6576,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
+@@ -6455,7 +6583,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
                  return true;
              }
          }
@@ -22720,7 +22860,7 @@ index a060b0b29..db46e544a 100644
          }
          // Fold in this device's slice offset so the kernel never needs to know the tensor-split
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index e6b328148..6fb4ff8cb 100644
+index 006e62f4b..000e97e92 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
 @@ -196,9 +196,13 @@ bool moe_cache_is_sized();

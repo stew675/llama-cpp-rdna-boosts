@@ -1,3 +1,69 @@
+## 261116.004 (r297, RELEASE v16-4f9dfa0e3-r297) -- `TODO` #327 retired, and it was a refutation: the prefill MoE fusions cannot fire for a cache-managed table, so the coupling they were blamed for never existed -- and the residency-dependent text is the in-place READ (two new items, #335/#336)
+
+**Amends blocks 09 and 10** (no new block: the cache engine and its fusion contract in **09**, the fusion dispatcher
+and the MMQ pair/`swiglu` folds in **10**).  Patches regenerated and re-cut from a canonical apply at `4f9dfa0e3`;
+`release.json` at **`v16-4f9dfa0e3-r297`** (`tip 8983054be`, `tree a638c8b76`; optional `0100` -> `bdaf5de9c`,
+`0101` -> `962e5779b`, cumulative `d6645f573`), `validate-set.sh` GREEN, `gate-per-block-build.sh --changed-from
+1282102c6` GREEN on 09/10/12/15.  Record:
+[`benchmarks/2026-11-16-prefill-in-place-fusion-contract.md`](benchmarks/2026-11-16-prefill-in-place-fusion-contract.md),
+`INVARIANTS.md` r297, `GREEDY-PURITY.md` §89 (corrected) + §93.
+
+**The item as written.**  `MOE_EXPERT_PREFILL_IN_PLACE` (r258/r266) buys its prefill win by skipping the staged copy,
+and the three prefill MoE fusions read the expert table **directly**, so they stood down for a table served in place;
+residency therefore "selected the kernel set", the two sets were not bit-identical (r284), and a run's greedy text was
+a function of the persisted heat prior.  The maintainer's chosen fix (2026-11-14) was to teach the fusions the in-place
+contract.
+
+**What the census says instead.**  `ggml_cuda_try_fuse` runs per **split** graph, and a routed `MUL_MAT_ID` whose
+weight is a host buffer is a split of its own -- so `gate`, `up` and `GLU` never share a graph when the tables are
+host-resident.  Measured split sizes on 35B-A3B Q3_K_M `-ncmoe 48 -ub 2048` 2 devices: **117 x 1 node, 117 x 2
+nodes**, and the multi-node splits are the attention and the device-resident layers (26/72/74/99 nodes).  The new
+`-lv 4` census reads **all four kinds at zero** on every cache-managed arm measured -- 35B-A3B Q8_0 / Q4_K_M / Q3_K_M
+and Flash-Next GSQ-IQ3_XXS, `-sm layer` and `-sm tensor`, `-ncmoe 48`, `get_ok` 951-7510 in-place reads -- and
+`pair=0/117` only on a **fully device-resident** 35B-A3B (no `-ncmoe`), where the cache has no tables at all.  So the
+above-band stand-down was dead code, r284's `GGML_CUDA_MMB=0` differential was MMB's **dense** GEMM (router + shared
+expert), and the item's premise does not hold.
+
+**What shipped anyway, and why it is inert.**  `moe_cache_fusion_serve()` answers the same per-lane question as
+`moe_cache_get_table()` and returns `NONE` (keep the graph's staged tensors), `IN_PLACE` (launch on the arena copies +
+the remapped ids) or `MIXED` (**stand the fusion down** -- one lane's copy was never filled, so only the per-op chain,
+which resolves each table itself, is correct).  Taught sites: the MMB routed gate+up+GLU triple, both MMQ gate+up+GLU
+triples (RDNA and the NVIDIA dense arm), the MMQ shared-quantize pair (`ggml_cuda_mul_mat_q_pair` gained optional
+`src0`/`ids`) and the MMQ `swiglu->down` fold; the guard's above-band stand-down is gone.  The staged arms are
+byte-identical to r296: 35B-A3B Q3_K_M device-resident, `-ub 2048 -c 8192`, `prompts/prose-rdna-boosts.txt`, 16 tokens
+-> `73 chars sha=86b7f9b5aa80` on **both** builds, `pair=0/117`; the 4B coherence gate is `sha=1c5d32ac537d` on 1
+device `-sm layer` and 3 devices `-sm tensor`.  No new environment variable; `MOE_EXPERT_PREFILL_IN_PLACE` stays the
+kill switch and the per-fusion bisect arms are unchanged.
+
+**The new `-lv 4` census** is the durable part: `report_locked: prefill MoE fusions: mmb_glu=<in_place>/<staged>
+mmq_triple=... pair=... swiglu_down=... mixed_lanes=N` makes the claim above checkable in any future run, and
+`mixed_lanes` names a broken lane-agreement assumption instead of a slow run.
+
+**What actually moves the text (two items opened, not filed as deferrals).**  Both are the in-place **read**, and both
+vanish with `MOE_EXPERT_PREFILL_IN_PLACE=0` -- so r284's rule (a fresh-process text comparison must pin the cache
+state) stands; only its carrier was misattributed.
+
+* **#335 (correctness, pre-existing on r296).**  Flash-Next GSQ-IQ3_XXS + MTP sidecar, 2 devices `-sm layer`,
+  `-ncmoe 48`, `-c 16384` (VRAM at `free-clamped=2`): in place reads **82 chars `sha=a753000294c9`** -- `...3333333...`,
+  degenerate -- against the staged arm's `328 chars 7c5a512a8447`, while `GGML_CUDA_DISABLE_GRAPHS=1` (`04ca2590aebf`),
+  `GGML_CUDA_SLAB=0` (`7c5a512a8447`) and `MOE_EXPERT_CACHE_MIB=20000` (`04ca2590aebf`) are each coherent.  Ruled out:
+  the arena's bytes (`MOE_EXPERT_CACHE_VALIDATE=3`, 157 sampled dispatches, 36 of them `resident=132 down=12`: 0
+  `MISMATCH`), the skipped `input_cpy` copy (filling it changes nothing) and the fusions (census 0).  The carrier is a
+  **captured graph replaying an arena pointer whose table `moe_cache_evict_slab_range` stood down mid-run** -- the
+  eviction *and* its re-arm land inside the prompt (`evicted 3946.0 MiB ... 12 table(s) stood down`, then `re-armed
+  12`), and `GGML_CUDA_DISABLE_GRAPHS=1` removing the symptom is the direct evidence.
+* **#336 (measurement owed).**  `-c 32768`, prior absent: `f40ae789f219` in place against `7a3474cbe5f1` staged
+  (coherent; the prior-present arm reads `7a3474cbe5f1` either way).  r284's KLD instrument still cannot see it
+  (`llama-perplexity` cannot load a drafter), so the magnitude is owed: give perplexity an `-md`, or force partial
+  residency without one and run `gate-prefill-logits.sh --ab "MOE_EXPERT_PREFILL_IN_PLACE=0"` there.
+
+**Release mechanics worth knowing.**  The per-block gate caught the fold twice: a first attempt moved block 10's
+`g_total_one_expert_bytes` declaration into block 09 while the block-09 `--fixup` carried tip-based content, and the
+gate failed block 09 in 4 s with `use of undeclared identifier`.  The final chain keeps every block's own content
+(09 = the cache engine + the census + the contract; 10 = the dispatcher, the pair and the `swiglu` fold sites), and the
+tip tree is byte-identical to the tested build.  `--changed-from 1282102c6` builds 09, 10, 12 and 15 (the blocks whose
+own delta moved) plus the tip.
+
 ## 261116.003 (r296, RELEASE v16-4f9dfa0e3-r296) -- `TODO` #330 and #333 retired: the Meta split-state walk can no longer be stranded (so the seqpar floor is the fused-HC band's 17, not 128), and `--load-mode mlock` no longer pins the pageable `-lme` holes
 
 **Amends blocks 09, 12 and 14** (no new block; split by code ownership: the split-state cache in **09**, the seqpar

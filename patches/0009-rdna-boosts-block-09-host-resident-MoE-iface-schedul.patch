@@ -1,4 +1,4 @@
-From 8b660235a1a4d7a29c207124ec65758710f7c54a Mon Sep 17 00:00:00 2001
+From 84466bf9f9064c8b94e62eca24164959f2c77dab Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/16] rdna-boosts: block 09: host-resident MoE (iface,
@@ -83,8 +83,8 @@ text/acceptance byte-identical everywhere.
  ggml/src/ggml-cuda/graph.cuh                  |    4 +
  ggml/src/ggml-cuda/mmvq.cu                    |  276 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 6955 +++++++++++++++++
- ggml/src/ggml-cuda/moe-expert-cache.h         |  347 +
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 7019 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.h         |  382 +
  ggml/src/ggml-cuda/norm.cu                    |   35 +
  ggml/src/ggml-cuda/norm.cuh                   |    1 +
  ggml/src/ggml-cuda/vendors/hip.h              |   13 +
@@ -122,7 +122,7 @@ text/acceptance byte-identical everywhere.
  tests/test-backend-tensor.cpp                 |    3 +
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 70 files changed, 17995 insertions(+), 540 deletions(-)
+ 70 files changed, 18094 insertions(+), 540 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -10952,10 +10952,10 @@ index 4140f681a..35f625eaa 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..a060b0b29
+index 000000000..0f20161ea
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,6955 @@
+@@ -0,0 +1,7019 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -11404,6 +11404,13 @@ index 000000000..a060b0b29
 +int64_t                             g_decline_all     = 0;
 +int64_t                             g_get_ok          = 0;
 +int64_t                             g_total_one_expert_bytes = 0;  // sum of one expert per table (the zero-slot reserve)
++// TODO #327: the prefill MoE fusion census.  `[kind][0]` counts a fusion launched on the scheduler's STAGED
++// copy, `[kind][1]` one launched on an IN-PLACE arena (the redirect `moe_cache_redirect_fused` does).  This is
++// the instrument the residency-neutrality gate asserts on: the same fusion kinds must fire with a nonzero
++// count in BOTH columns across two residency states, or residency is still selecting the kernel set.
++// Kinds: 0 = mmb-glu, 1 = mmq gate+up+GLU triple, 2 = mmq shared-quantize pair, 3 = mmq swiglu->down fold.
++int64_t                             g_pf_fuse[4][2]   = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
++int64_t                             g_pf_fuse_mixed   = 0;  // a fused consumer's lanes disagreed on residency (stood down)
 +// Fail-soft / --fit interaction (issue #33).  The arena is the LOWEST-priority VRAM consumer: it is
 +// sized from what is actually FREE at sizing time (after --fit, the compute reserve and the KV cache
 +// have taken theirs) minus `g_reserve_mib`, so it cannot over-commit and `--fit` does not need to know
@@ -17481,6 +17488,52 @@ index 000000000..a060b0b29
 +    return true;
 +}
 +
++moe_cache_serve_status moe_cache_fusion_serve(const ggml_tensor * op, const ggml_tensor * src0,
++                                             const ggml_tensor * gate, const ggml_tensor * ids,
++                                             int device, void * stream,
++                                             ggml_tensor * src0_cpy, ggml_tensor * ids_cpy, ggml_tensor * gate_cpy) {
++    if (!g_enabled || src0 == nullptr || ids == nullptr) {
++        return MOE_CACHE_SERVE_NONE;
++    }
++    // Ask each lane the SAME question the per-op consumer asks, through the same entry point, so the
++    // placement this returns is exactly the one the per-op chain would have resolved -- and so `get_ok`
++    // keeps counting one redirected TABLE READ rather than one fused launch.
++    const auto lane_serves = [&](const ggml_tensor * w) -> bool {
++        void *    a  = nullptr;
++        void *    rm = nullptr;
++        int64_t   ns = 0, nu = 0, nt = 0;
++        size_t    eb = 0;
++        if (w == nullptr || !moe_cache_get_table(op, w, device, &a, &ns, &eb, &rm, &nu, &nt)) {
++            return false;
++        }
++        // The same routing-shape check the per-op consumer applies before it reads a remap.
++        return rm == nullptr || (nu == ids->ne[0] && nt == ids->ne[1]);
++    };
++    const bool up_ok   = lane_serves(src0);
++    const bool gate_ok = gate == nullptr || lane_serves(gate);
++    if (!up_ok && !gate_ok) {
++        return MOE_CACHE_SERVE_NONE;   // staged: the scheduler's copies are what every fused lane reads
++    }
++    if (!up_ok || !gate_ok) {
++        return MOE_CACHE_SERVE_MIXED;  // one lane in the arena and one on a copy the scheduler may not have filled
++    }
++    // Both lanes are served: build the shallow arena/remap copies.  The redirect re-resolves under the
++    // lock, so a table that flips unserveable in between lands as MIXED (the caller stands down).
++    if (!moe_cache_redirect_fused(op, src0, gate, ids, device, stream, src0_cpy, ids_cpy, gate_cpy)) {
++        return MOE_CACHE_SERVE_MIXED;
++    }
++    return MOE_CACHE_SERVE_IN_PLACE;
++}
++
++moe_cache_serve_status moe_cache_fusion_launched(moe_cache_serve_status status, int kind) {
++    if (status == MOE_CACHE_SERVE_MIXED) {
++        g_pf_fuse_mixed++;
++    } else if (kind >= 0 && kind < 4) {
++        g_pf_fuse[kind][status == MOE_CACHE_SERVE_IN_PLACE ? 1 : 0]++;
++    }
++    return status;
++}
++
 +// Per-table fusion-guard query (wip/moe-verify-fusions OPEN 2).  Mirrors `moe_cache_take_over`'s
 +// `identity` decision for THIS table, with no side effects, so the fusion guard and the scheduler
 +// take-over agree per table instead of on the whole-graph `moe_cache_has_arena()`.
@@ -17678,6 +17731,17 @@ index 000000000..a060b0b29
 +    GGML_LOG_INFO("%s: takeover=%lld decline_all=%lld get_ok=%lld cold=%s cold_reaches=%lld\n",
 +                  __func__, (long long) g_takeover, (long long) g_decline_all, (long long) g_get_ok,
 +                  g_cold_uva ? "uva" : "off", (long long) g_cold_reaches);
++    // TODO #327: the prefill MoE fusion census.  `staged` = the fusion ran on the scheduler's copy, `in_place` =
++    // it ran on an arena table (the redirect).  A residency state that reroutes a kind from one column to the
++    // other is exactly what this item removes, so a gate reads both columns and requires the same set of
++    // nonzero kinds in both residency states.
++    GGML_LOG_INFO("%s: prefill MoE fusions: mmb_glu=%lld/%lld mmq_triple=%lld/%lld pair=%lld/%lld "
++                  "swiglu_down=%lld/%lld (in_place/staged) mixed_lanes=%lld\n",
++                  __func__, (long long) g_pf_fuse[0][1], (long long) g_pf_fuse[0][0],
++                  (long long) g_pf_fuse[1][1], (long long) g_pf_fuse[1][0],
++                  (long long) g_pf_fuse[2][1], (long long) g_pf_fuse[2][0],
++                  (long long) g_pf_fuse[3][1], (long long) g_pf_fuse[3][0],
++                  (long long) g_pf_fuse_mixed);
 +    if (g_cold_uva) {
 +        static const char * const admit_names[] = { "always", "value", "touch" };
 +        GGML_LOG_INFO("%s: cold admission=%s, admission-rejected (served cold)=%lld\n",
@@ -17913,10 +17977,10 @@ index 000000000..a060b0b29
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..e6b328148
+index 000000000..006e62f4b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,347 @@
+@@ -0,0 +1,382 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -18247,6 +18311,41 @@ index 000000000..e6b328148
 +                              struct ggml_tensor * src0_cpy,
 +                              struct ggml_tensor * ids_cpy,
 +                              struct ggml_tensor * gate_cpy);
++
++// TODO #327: the PREFILL fusions' in-place contract.  A prefill MoE fusion (the MMB gate+up+GLU triple, the MMQ
++// gate+up+GLU triple, the MMQ shared-quantize pair, the MMQ swiglu->down fold) reads its expert table DIRECTLY
++// instead of going through the `ggml_cuda_mul_mat_id` dispatch, so it never saw the dispatch's redirect and used
++// to stand down for a table served in place -- which made a fully resident table run a different kernel set
++// from a staged one, and a run's greedy text a function of the persisted heat prior (TODO #321, r284).  This
++// answers the same question per lane as `moe_cache_get_table` and returns the placement the fusion must use:
++//
++//   MOE_CACHE_SERVE_NONE      -- no lane is served: keep the graph's tensors (the scheduler staged them).
++//   MOE_CACHE_SERVE_IN_PLACE  -- every lane is served: pass `src0_cpy`/`gate_cpy`/`ids_cpy` to the fused launch.
++//   MOE_CACHE_SERVE_MIXED     -- the lanes disagree (or a lane flipped unserveable mid-call): STAND THE FUSION
++//                                DOWN.  A one-lane redirect would read a table the scheduler never copied (its
++//                                in-place decision is per split), so the per-op chain, which resolves each table
++//                                on its own, is the only correct consumer of that state.
++//
++// Every returned placement must be fed to `moe_cache_fusion_launched()` with the fusion's census `kind`
++// (0 = mmb-glu, 1 = mmq gate+up+GLU triple, 2 = mmq shared-quantize pair, 3 = mmq swiglu->down fold), once the
++// launch actually happens: that census is what a gate reads to prove residency no longer selects the kernel set.
++enum moe_cache_serve_status {
++    MOE_CACHE_SERVE_NONE     = 0,
++    MOE_CACHE_SERVE_IN_PLACE = 1,
++    MOE_CACHE_SERVE_MIXED    = 2,
++};
++
++enum moe_cache_serve_status moe_cache_fusion_serve(const struct ggml_tensor * op,
++                                                  const struct ggml_tensor * src0,
++                                                  const struct ggml_tensor * gate,
++                                                  const struct ggml_tensor * ids,
++                                                  int device,
++                                                  void * stream,
++                                                  struct ggml_tensor * src0_cpy,
++                                                  struct ggml_tensor * ids_cpy,
++                                                  struct ggml_tensor * gate_cpy);
++
++enum moe_cache_serve_status moe_cache_fusion_launched(enum moe_cache_serve_status status, int kind);
 +
 +// Phase 1b/3 UVA cold seam.  Given the arena base the op is reading (`src0->data` after the slot-remap
 +// redirect), return the pinned host master's device-accessible alias, the resident slot count, and the
