@@ -334,6 +334,38 @@ fighting.
 | **max-min fair share (this) + cap (§4.4)** | **all active slots, every step** | slightly worse (equal-length, §4.6) | **≤ one step** | **≤ the cap** |
 | shortest-remaining-first, with aging | all active slots, biased to the small ones | best overall | ≤ one step | ≤ the cap |
 
+### 4.2.2 `LLAMA_SERVER_PREFILL_SKEW` — the droop toward shortest-remaining-first (default 1 = off)
+
+The fair share above is 1:1.  `LLAMA_SERVER_PREFILL_SKEW=N` weights **the slot with the shortest remaining
+prompt** `N` times against the others (1..64, clamped; default 1).  It is *not* SRPT: every other slot keeps
+advancing on every step, so it still gives feedback **and starvation stays impossible by construction** —
+the one-token-each pre-pass plus strictly positive weights means no slot can be denied.  1 allocates exactly
+what the plain share did, so it is bit-identical to the measured equal-share behaviour.
+
+Measured (4B, `-np 4`, `-b 2048`, chunk = `n_ubatch` = 512, four prompts arriving together):
+
+| prompt | skew 1 ttft / done | skew 5 | skew 20 |
+|---|---|---|---|
+| ~6000 | 2.201 / 2.236 s | 1.999 / 2.032 | 1.975 / 2.009 |
+| ~3000 | 1.912 / 2.161 s | 1.356 / 1.595 | 1.267 / 1.503 |
+| ~1500 | 1.266 / 1.542 s | 0.747 / 1.026 | 0.692 / 0.966 |
+| ~400 | 0.223 / 0.543 s | 0.227 / 0.534 | 0.225 / 0.479 |
+| **mean ttft** | **1.401 s** | **1.082 s** (−23 %) | **1.040 s** (−26 %) |
+| **mean done** | **1.621 s** | **1.297 s** (−20 %) | **1.239 s** (−24 %) |
+
+The result that matters: **the long prompts do not pay.**  Their TTFT improves too (2.201 → 1.975 s at skew 20)
+because the short slots *retire* early and stop competing — the work is conserved, but the sharing set shrinks
+sooner.  The shortest finishes marginally sooner (0.543 → 0.479 s) while every other prompt gains 10-26 %.
+This is the "they accelerate in turn" effect, and it is why the skew dominates the equal share on *both* mean
+and max, rather than trading one for the other.
+
+So the ordering of the three policies on this shape is: **skewed share > equal share > FCFS** on mean, with the
+skew also improving the long tail.  Pure SRPT would still be better on mean for the short jobs (it would finish
+the 400-token prompt in one step) but it can starve; the skew is the safe part of that gain.
+
+Harness: `./probe.py skew` runs the four-way heterogeneous mix (needs `-np 4`) and prints per-request ttft /
+done plus the starvation check — run it once per skew value and compare.
+
 **Max-min fair share is the default and the first thing to build.**  It is the policy that makes `--parallel
 N` mean what a user expects, it needs no aging rule to be safe (a long prompt always receives its share, so
 it cannot be starved), and it costs nothing measurable.  Shortest-remaining-first is a *follow-up*: it is
@@ -573,7 +605,8 @@ the `-ncmoe` streaming arm it is 2.7 × *and that is the ceiling* (below).  On t
 the arm is clean.  Recorded as `TODO` **#338**: the fairness bound must be derived from `L/(k·chunk)` rather
 than a fixed 3.0, or `--min-ttft-ratio` must be set per shape with the reason stated.
 
-Knobs, as shipped in the prototype: `LLAMA_SERVER_PREFILL_FAIR` (on unless `0`, a kill-switch) and
+Knobs, as shipped in the prototype: `LLAMA_SERVER_PREFILL_FAIR` (on unless `0`, a kill-switch),
+`LLAMA_SERVER_PREFILL_SKEW` (**default 1 = equal share**, `N` = weight the shortest-remaining slot N:1), and
 `LLAMA_SERVER_PREFILL_CHUNK` (**unset = one `n_ubatch`**, `0` = off, `N` = explicit).  §4.2.1 has the cost
 model behind the default.  The chunk is applied in **both** modes, because it is a separate
 mechanism — so `FAIR=0 CHUNK=512` is a valid arm (today's fill, bounded per step), which is exactly the

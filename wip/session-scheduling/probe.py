@@ -10,6 +10,8 @@ privileges; it only needs a running `llama-server` (see README §2 for the invoc
     ./probe.py --port 8099 itl        # 2.5 a decoder's ITL while another slot prefills
     ./probe.py --port 8099 tps        # 2.6 aggregate throughput at concurrency 1 and 2
     ./probe.py --port 8099 agg        # 2.7 co-batched prefill (server at -b 16384)
+    ./probe.py --port 8099 skew       # 4.2.2 a heterogeneous prompt mix: who finishes first, and when
+                                      #       (needs -np 4; compare LLAMA_SERVER_PREFILL_SKEW=1 vs 5 vs 20)
 
 Every arm is greedy (temperature 0, seed 42) with `cache_prompt: false`, because the server's prompt cache
 would otherwise make the second request instant and hide the effect.  Prompts are synthetic (a repeated
@@ -185,10 +187,34 @@ def arm_agg():
           "run-to-run spread: a second sequence in the batch costs no throughput.")
 
 
+def arm_skew():
+    """4.2.2: four prompts of different sizes, all at once.  Prints each request's time-to-first-token and
+    completion, so a skew policy can be judged on who benefits and whether anyone is starved."""
+    sizes = [545, 272, 136, 36]   # ~6000 / 3000 / 1500 / 400 tokens
+    prompts = [sentence(r) for r in sizes]
+    print("    prompt tokens:", [toklen(p) for p in prompts])
+    out = {}
+    th = [threading.Thread(target=stream, args=(p, 4, out, i, 0.0, i)) for i, p in enumerate(prompts)]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    print("    size   slot   ttft(s)   done(s)")
+    for i, p in enumerate(prompts):
+        ev, _, wall = out[i]
+        print(f"    {toklen(p):5d}  {i:4d}   {ev[0]:7.3f}   {wall:7.3f}")
+    n = len(prompts)
+    print(f"    mean ttft {sum(out[i][0][0] for i in range(n)) / n:.3f}s   "
+          f"mean done {sum(out[i][2] for i in range(n)) / n:.3f}s   "
+          f"max done {max(out[i][2] for i in range(n)):.3f}s")
+    print("\n    starvation check: every request must appear above with a finite ttft; a 0.000 or a missing")
+    print("    row means a slot was denied admission.")
+
+
 def main():
     global BASE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("arm", choices=["decode", "prefill", "starve", "itl", "tps", "agg"])
+    ap.add_argument("arm", choices=["decode", "prefill", "starve", "itl", "tps", "agg", "skew"])
     ap.add_argument("--port", default="8099")
     ap.add_argument("--reps", type=int, default=1200, help="sentence repetitions (11 tokens each)")
     ap.add_argument("--delay", type=float, default=0.05, help="delay of the second request, seconds")
@@ -213,6 +239,8 @@ def main():
         arm_tps(300, a.n)
     elif a.arm == "agg":
         arm_agg()
+    elif a.arm == "skew":
+        arm_skew()
 
 
 if __name__ == "__main__":
