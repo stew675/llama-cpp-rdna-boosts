@@ -70,8 +70,11 @@ merged GGUF.  All three are fixed, and the gate now pins both variables itself.
 disagrees across the combine arms (446 `a5d0ec7b809d` vs 459 `9f8819c4c2c5`) with **identical shas on the
 r302 build**, i.e. it predates this change and gate 9's byte-identity invariant no longer holds on that
 class (PPL is identical, 2.1640 in both arms, so it is a ULP-class divergence); and upstream's llama-ui
-`latest` bundle now lacks `workbox[hash].js`, which breaks any FRESH configure (`ui-assets.cmake:137`) --
-`HF_UI_VERSION=b12387` is the workaround, recorded in `scripts/gate-per-block-build.sh`'s header.
+`latest` bundle now lacks `workbox[hash].js`, which breaks a fresh SOURCE configure (`ui-assets.cmake:137`, i.e.
+the per-block ladder and any clean checkout) -- `HF_UI_VERSION=b12387` is the workaround, recorded in
+`scripts/gate-per-block-build.sh`'s header.  The **container images are not affected** (their `web` stage
+supplies `tools/ui/dist`, `ui-assets.cmake`'s Priority 1, so neither the bucket nor its validator is reached) --
+checked on `radiance` while it built r303.
 
 **The fixtures are on this box** (`make-merged-hc-gguf.py` rebuilds them from the separate-tensor files in
 ~2 min each): `/llm/models/Qwen3.8/Flash-Next/MERGED-Q8_0/` -- the target (70.63 GiB, 96 merged pairs, byte

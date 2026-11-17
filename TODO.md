@@ -41,7 +41,7 @@ left in this file.  The r236 re-base
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **341** | the IQ4_NL (chain-mixer) qwen4exp hc class no longer reads byte-identical across the `LLAMA_FUSED_HC_COMBINE` arms (446 `a5d0ec7b809d` vs 459 `9f8819c4c2c5`; identical at r302 too, PPL equal in both arms) | correctness / gate invariant (block 11) | **OPEN** — pre-existing, gate 9's hard-arm invariant does not hold on that class until it is root-caused — §341 |
-| **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so every FRESH configure dies in `ui-assets.cmake:137` (per-block gate, container build, any clean checkout) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround; re-check before the next container release — §342 |
+| **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure (per-block gate, clean checkout, hosted CI) dies in `ui-assets.cmake:137` -- the container images are unaffected (their `web` stage supplies `tools/ui/dist`) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround where it bites; re-check before the next per-block ladder — §342 |
 
 ## Handle numbering
 
@@ -335,10 +335,16 @@ prints FAIL for that class, which is the honest state -- do not add an anchor to
 ### #342 -- a broken upstream UI asset bundle breaks every fresh configure
 
 **Waiting on upstream** (r303). The llama-ui bucket's `latest` archive (75 files, 3.3 MB, 2026-11-17) has no
-`workbox[hash].js`, and `scripts/ui-assets.cmake:137` validates that file, so a **clean** configure aborts with
-`UI: missing required asset(s): workbox[hash].js`.  Incremental builds never see it -- `build-rocm`'s stamp
-caches the resolved bundle -- so it appears exactly where a build dir is wiped: `gate-per-block-build.sh`,
-`build-containers.sh`, a fresh clone, CI on a hosted runner.  `HF_UI_VERSION=b12387` (the bundle this box had
-stamped) carries `workbox-b3c04f83.js` and validates; the per-block gate's header records it.  Check the bucket
-before the next container release and drop the pin when `latest` validates again; if it stays broken, pin
-`HF_UI_VERSION` in `build-containers.sh` and in the CI workflow rather than teaching the gate a local exception.
+`workbox[hash].js`, and `scripts/ui-assets.cmake:137` validates that file, so a configure with no
+`tools/ui/dist` aborts with `UI: missing required asset(s): workbox[hash].js`.  Incremental builds never see it
+(`build-rocm`'s stamp caches the resolved bundle), so it appears exactly where a source tree is configured
+fresh: `gate-per-block-build.sh` (wipes its build dir per commit), a clean checkout, the hosted CI tiers.
+
+**The container release path is NOT affected, verified on `radiance` for r303**: `.devops/rdna-rocm.Dockerfile`
+builds the UI in its own `web` stage (`npm ci` + `npm run build`) and copies it in before the cmake step
+(`COPY --from=web /app/tools/ui/dist tools/ui/dist`), which is `ui-assets.cmake`'s Priority 1 -- pre-built
+assets win over both npm and the HF fetch, so that build never downloads or validates the bucket's bundle.
+Do not add a `HF_UI_VERSION` pin to `build-containers.sh` for this.
+
+Where it does bite, `HF_UI_VERSION=b12387` (the bundle this box had stamped) carries `workbox-b3c04f83.js` and
+validates; the per-block gate's header records it.  Drop the pin when `latest` validates again.

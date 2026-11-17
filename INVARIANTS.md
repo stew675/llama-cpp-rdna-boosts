@@ -372,8 +372,12 @@
    the divergence predates r303 and gate 9's hard-arm invariant (r148, `GREEDY-PURITY.md`) does not currently
    hold on that class.  PPL is identical in both arms (2.1640), so it is ULP-class, not degenerate: it needs
    an owner (`TODO` #341) rather than a waiver, and the class's arms must not be quoted as a pass until then.
-6. **An upstream UI asset bundle can break every FRESH configure, which the per-block gate and the container
-   build both are.**  On 2026-11-17 `ggml-org/llama-ui`'s `latest` (75 files) has no `workbox[hash].js`, so
-   `ui-assets.cmake:137` aborts the configure; `HF_UI_VERSION=b12387` (the bundle `build-rocm` had stamped)
-   carries `workbox-b3c04f83.js` and validates.  Incremental builds never see it -- the stamp caches the
-   resolved bundle -- so it surfaces only in gates that wipe their build dir and in clean container builds.
+6. **An upstream UI asset bundle can break every fresh SOURCE configure -- and only that one.**  On
+   2026-11-17 `ggml-org/llama-ui`'s `latest` (75 files) has no `workbox[hash].js`, so `ui-assets.cmake:137`
+   aborts a configure that has no `tools/ui/dist`: `gate-per-block-build.sh` (it wipes the build dir per
+   commit), a clean checkout, the hosted CI tiers.  Incremental builds never see it (the stamp caches the
+   resolved bundle) and **the container images are NOT affected**: `.devops/rdna-rocm.Dockerfile` builds the UI
+   in its `web` stage and `COPY --from=web /app/tools/ui/dist tools/ui/dist` runs BEFORE the cmake step, which
+   is `ui-assets.cmake`'s Priority 1 (pre-built assets win over npm and over the HF fetch, so a container build
+   neither downloads that bundle nor validates it).  The workaround where it does bite is
+   `HF_UI_VERSION=b12387` (the bundle `build-rocm` had stamped; it carries `workbox-b3c04f83.js`).
