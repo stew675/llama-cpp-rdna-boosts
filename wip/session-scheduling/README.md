@@ -58,6 +58,48 @@ takes one token per sequence set per round, so a batch holding two prompts is sp
 (`src/llama-batch.cpp:668-913`).  **The sharing primitive exists; the admission policy is what is missing.**
 That is why P0 is small.
 
+### 1.1 Are decode and prefill concurrent?  Three layers, and the middle one is a surprise
+
+Measured with `LLAMA_BATCH_DEBUG=1` on a mixed step (one slot decoding, one slot prefilling):
+
+1. **Same batch / same `llama_process()` call — YES.**  `update_slots()` adds each generating slot's sampled
+   token first (`:4318`), then fills prompt tokens.  Both are in the one `common_batch`.
+2. **Same ubatch / same GEMM — NO.**  The ubatches of that step were:
+
+   ```
+   tok=2   n_seq_tokens=1  n_seqs_unq=2     <- 1 decode token + 1 prompt token
+   tok=512 n_seq_tokens=512 n_seqs_unq=1    <- prompt only
+   tok=512 n_seq_tokens=512 n_seqs_unq=1    <- prompt only
+   tok=443 n_seq_tokens=443 n_seqs_unq=1    <- prompt only
+   ```
+
+   The decode token does **not** ride the wide prompt ubatch.  `split_equal()` advances one token per sequence
+   set per round and stops when the shortest set is exhausted, and a decoding sequence has exactly **one**
+   token — so the mixed ubatch is 2 tokens, and the prompt then continues alone.  This is why `n_seq_tokens`
+   is 1 there and 512 elsewhere.
+3. **Simultaneous execution (overlapping kernels/streams) — NO.**  One `ggml_backend_sched`, one stream; the
+   ubatches are dispatched back to back.
+
+**The consequence is the campaign's central number.**  `decode()` calls `llama_synchronize()` after the *whole*
+`llama_process()` returns when the step has outputs (`:5061`), so a decoder's token is only visible once every
+ubatch of the step is done.  Its latency is **the step**, not its own ubatch — which is why the fair share
+alone moved nothing (336 ms before and after: it does not change the step's prompt tokens) and the per-step
+chunk moved it to 87-99 ms.
+
+**Why your "pack them together" layout is not what happens — and where it does happen.**  Qwen3.5 is a
+**hybrid** model (GDN + attention: `llama_memory_recurrent` per GDN layer), so it goes through
+`llama_memory_hybrid::init_batch()`, which always uses `split_equal` (`src/llama-memory-hybrid.cpp:99`) — that
+is the 2-token ubatch above, and `--kv-unified` changes nothing (verified: identical shapes).  For a
+**pure-attention** model, `llama_kv_cache::init_batch()` picks `split_simple` when `n_stream == 1`, i.e. under
+`--kv-unified` (`src/llama-kv-cache.cpp:2055`, `n_stream = unified ? 1 : n_seq_max` at `:541`), and
+`split_simple` packs tokens **in batch order** — which is exactly "decode at 0, prompt at 1..511".  So the
+layout is reachable; it is just gated behind a cache mode and unavailable on the hybrid models this repo runs.
+
+**A follow-up this suggests (not pursued):** if the decode token sat in the *first* ubatch and its logits were
+extracted right after that ubatch, ITL would be bounded by one ubatch without any cap.  That is what the
+optional `0100` two-lane-prefill artifact does per lane (`extract_outputs` per scheduler).  The chunk cap
+reaches the same bound far more cheaply, so this is recorded, not scheduled.
+
 ## 2. Measurements
 
 Server used throughout (the `-b`/`-np` are the only variables):
