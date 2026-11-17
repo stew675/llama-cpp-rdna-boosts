@@ -1,7 +1,7 @@
 # `session-scheduling` — fair, preemptive prefill admission in `llama-server`
 
 **PROMOTED into block `0012` at r300 (2026-11-16) and archived here.**  The delivered code is
-`tools/server/server-context.cpp` inside `patches/0012-…`; the knobs are catalogued in `ENVIRONMENT.md` §25;
+`tools/server/server-context.cpp` inside `patches/0012-…`; the knobs are catalogued in `ENVIRONMENT.md` §22;
 the gate is `scripts/gate-prefill-fairness.sh`; the apply order and the block's verification are in
 `MANIFESTS.md`.  This directory keeps the measurements, the design record and the two open items
 (`TODO` #338 and #339) — it is not itself applied by anything.

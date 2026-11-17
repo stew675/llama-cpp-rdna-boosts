@@ -42,10 +42,11 @@ left in this file.  The r236 re-base
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **338** | the fairness gate's short-TTFT ratio is shape-dependent: on a streamed-prefill shape it reads 2.7x against a 3.0x default, at its derived ceiling | gate design (`scripts/gate-prefill-fairness.sh`) | **OPEN** — derive the bound from `L/(k*chunk)`, or set `--min-ttft-ratio` per shape with the reason — §338 |
 | **339** | block 12 now carries two unrelated features -- the campaign remainder and (r300) fair-share server prompt admission -- and should be split | delivery structure | **OPEN, maintainer's call** -- the split is deferred to a later session by the maintainer; a new `0016` or a `03xx` temporary are both options — §339 |
+| **340** | `LLAMA_SERVER_PREFILL_DUTY=K`: leave most steps decode-only and batch the prompt into one wide step per cycle, so a decoder gets a burst instead of one token per 4.5 s | policy (`wip/prefill-duty-cycle/`, branch `sched-prefill-duty`) | **OPEN, experiment** -- ~4x the decode tokens for the same prefill wall on the host-expert shape; the arena alternation, the K sweet spot, the MTP composition and the default-on decision are unsettled — §340 |
 
 ## Handle numbering
 
-**New handles append after `#339`, and a number is never reused.**  (`#337` was opened and retired the
+**New handles append after `#340`, and a number is never reused.**  (`#337` was opened and retired the
 same day, 2026-11-17: the attendance pool *does* engage on Qwen3.8-Flash-Next under `--kv-unified`, so the
 "cannot be exercised" premise was wrong; the arm and its numbers are in `wip/session-scheduling/`.)  (`#335`/`#336` were retired at r298 -- an alias
 ROLE gap in the expert cache, `WORKLOG.md` 261116.005 -- and `#282` at r299 -- the mid-run latch's mixture is gated on
@@ -350,3 +351,23 @@ bisect or revert of either feature drags the other, and the block is already the
 split options: (a) a new official `0016` for the server admission, (b) a `03xx` temporary block if the policy
 is still moving, or (c) leave it and let `patches/README.md`'s r300 amendment carry the description (what it
 does today).  Nothing is broken; this is bookkeeping that gets more expensive the longer it waits.
+
+### #340 -- the prefill/decode duty cycle: batch the prompt into one step per cycle
+
+**Open, experiment; code on branch `sched-prefill-duty` in `~/llama.cpp`, not in the delivery.**  r300 fixed
+prompt-versus-prompt fairness and did nothing for prefill-versus-decode: a decoding slot gets one token per
+step, so its rate is `1/step_time` and the step is dominated by the prompt tokens sharing it.  Measured on the
+Flash-Next field shape (3 GPU tensor, `-b 16384 -ub 16384`, no chunk cap) with a 16k prefill against an active
+decode: **0.25 t/s**, i.e. one token per ~4.5 s.
+
+`LLAMA_SERVER_PREFILL_DUTY=K` runs `K-1` decode-only steps and then one prefill step.  A step costs
+`a*tokens + b` with `b` fixed, so the cycle pays `b` once instead of K times.  Measured: the same 4.8 s of
+prefill yielded **15 decode tokens instead of 4**, at ~20 ms each, with the prefill wall unchanged.  The
+deferral is only taken when the step already carries decode work, because a step with neither prompt nor
+decode tokens is an empty batch and `decode()` aborts after four of those.
+
+Open: the arena (a sharper wide/narrow alternation than r300, and r292/`TODO` #317 exist because that costs
+prefill on host-expert shapes); the `K` sweet spot, which cannot be one number when `b` spans 2 ms to 196 ms
+across shapes; the MTP composition (a start, no number); and whether it is default-on, given it is a burstiness
+trade rather than a free win.  Record: `wip/prefill-duty-cycle/`, and `TODO` #339 is the block-split question
+that folding a third mechanism into block 12 would make worse.
