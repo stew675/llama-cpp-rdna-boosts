@@ -12,7 +12,7 @@ upstream moves.  It is not a changelog — the current release, tip/tree and per
 | item | value |
 |---|---|
 | fork point (upstream `ggml-org/llama.cpp` master) | **`release.json .base`** |
-| delivery | **17 default patches**: 16 official blocks `0000`-`0015` + the temporary `0300` (`release.json .n_default`; `v<N>` names `.n_blocks` = 16).  Block 14 is the streamed KV window/pool, block 15 the UMA GTT expert store, **block `0300` is temporary**.  The optional blocks `0100` (two-lane prefill) and `0101` (mixed K/V cache types — block 17 of r287 until the r288 re-org) are under `optional/`, never in the default tree (`release.json .n_optional` / `.optional`) |
+| delivery | **18 default patches**: 17 official blocks `0000`-`0016` + the temporary `0300` (`release.json .n_default`; `v<N>` names `.n_blocks` = 17).  Block 14 is the streamed KV window/pool, block 15 the UMA GTT expert store, block 16 the server's prompt admission policy (split out of block 12 at r301, `TODO` #339), **block `0300` is temporary**.  The optional blocks `0100` (two-lane prefill) and `0101` (mixed K/V cache types — block 17 of r287 until the r288 re-org) are under `optional/`, never in the default tree (`release.json .n_optional` / `.optional`) |
 | canonical chain | `release.json .tip` / `.tree` |
 | release identity | `release.json .release` (`v<blocks>-<base>-r<N>`) |
 

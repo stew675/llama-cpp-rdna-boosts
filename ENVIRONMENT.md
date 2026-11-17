@@ -1446,7 +1446,7 @@ notes it is not in the default build); the artifact, its trees and its measureme
 | `GGML_SCHED_PAIR_DEBUG` | `0` | diagnostic (value) | `1` logs each pair decision; `>= 2` also runs the cache-hazard self-test; `>= 3` logs per-lane/per-backend GPU event spans (this is the only consumer of `ggml_backend_event_elapsed_time`, and it makes the backend create **timing** events — that cost is why it is not the default). |
 | `GGML_SCHED_PAIR_HAZARD` | on | diagnostic (value) | `0` keeps only the split-name guard and skips the cache-hazard analysis of the two lanes.  A/B only: the hazard analysis is what makes a mis-matched pair run one-after-the-other instead of racing on the KV cache. |
 
-## 22. Server prompt admission (block 12, r300) — the fair share, the skew, and the chunk
+## 22. Server prompt admission (block 16, r301; block 12 at r300) — the fair share, the skew, the chunk and the duty cycle
 
 `update_slots()` assembles ONE batch per step and it cannot be joined mid-flight, so the policy that decides
 **which prompt tokens enter that batch** is also the policy that decides how long every other slot waits.
@@ -1459,6 +1459,7 @@ fairly and exposes three variables.  Full record: `archive/work/session-scheduli
 | `LLAMA_SERVER_PREFILL_FAIR` | **on** (set `0` to disable) | **kill-switch** (default-on feature) | the max-min fair share: water-filling over the slots that still have prompt tokens, so every active prompt is admitted to every step and a slot that needs less returns the difference to the pool for the others.  `0` restores the r299 slot-order fill exactly. |
 | `LLAMA_SERVER_PREFILL_SKEW` | **1** | **tuning** | weights the slot with the **shortest remaining** prompt `N:1` against the others (1..64, clamped).  Not SRPT: every other slot still advances every step, so starvation is impossible.  `1` is the plain equal share and allocates exactly what it did before this variable existed.  Measured (4 prompts of 6000/3000/1500/400 tokens, `-np 4`): mean TTFT 1.401 s at 1, **1.082 s at 5**, 1.040 s at 20, and the *longest* prompt improves too (2.201 → 1.975 s) because short slots retire and stop competing. |
 | `LLAMA_SERVER_PREFILL_CHUNK` | **unset = one `n_ubatch`** | **tuning** | caps the prompt tokens admitted per step.  This is the bound on a decoding slot's ITL and on the worst-case wait for a newly arrived request.  `0` = off; `N` = explicit.  **Below `n_ubatch` is dominated**: the step still issues one `llama_process()` and the same kernel launches, so it re-pays the step's fixed cost for nothing. |
+| `LLAMA_SERVER_PREFILL_DUTY` | **16** | **kill-switch** (default-on feature; `0` or `1` disables) | up to `K-1` consecutive **decode-only** steps, then one step that carries prompt tokens: the decoding slot gets a burst of `K-1` tokens at the decode-only step time instead of one token per (slow) prefill step.  **The burst is BOUNDED in time, not just in steps**: the deferral stops as soon as the idle time accumulated since the last prefill step reaches that step's own measured duration, so a concurrent prefill takes at most ~2x its uncontended wall.  Never defers into an empty batch (a step with no decode work prefills immediately), so an idle server and a lone prompt are untouched.  Measured (2026-11-16, pinned slots, `-np 2`; `scripts/gate-prefill-duty.sh`): dense 4B at a 512-token chunk **16 -> 137** decode tokens for +113 % prefill wall; 27B + `draft-mtp n3` **46 -> 200** for +25 % (acceptance unchanged to 2 of 269 drafts); a streamed host-expert 35B-class shape **9 -> 109** for +56 %; the field shape (3 GPU tensor, one 16k-token step) **5 -> 41** for +10 %.  `K` alone is not one number -- `1 + (K-1)*decode_step/prefill_step` spans 1.03x to 16x -- which is what the time bound exists to fix.  Class: default-on because it helps, with the prefill stretch as the documented trade (`scripts/gate-prefill-duty.sh`). |
 
 **The chunk's cost is shape-dependent and the fixed per-step cost is the whole story.**  Fitting
 `step = a·tokens + b` on the field `runme` (Flash-Next, PLE on CPU + host experts + attendance pool) gives
@@ -1469,8 +1470,17 @@ lowering `-ub` as well: llama-benchy at `--parallel 4`, `pp16384`, read **3036 t
 
 Starvation is impossible in every mode: a one-token floor per active prompt is applied before the weighted
 split, so even `SKEW=64` with `n_parallel` at `n_batch` admits every prompt on every step.  `-lv 4` prints the
-configuration once at startup (`prefill admission: fair share = on, chunk = n_ubatch, skew = 1`); `-lv 5` adds
-the per-step `fair share: budget/added/batch` line.
+configuration once at startup (`prefill admission: fair share = on, chunk = n_ubatch, skew = 1, duty = 16`);
+`-lv 5` adds the per-step `fair share: budget/added/batch` line.
+
+**The duty cycle is the one that has to be bounded, and the bound is measured, not assumed.**  The duty
+exploits a step's shape `step = a·tokens + b`: the `K-1` decode-only steps pay only `b + a`, the prefill step
+pays `b + a·chunk`.  So the prefill's stretch is `1 + (K-1)·decode_step/prefill_step` -- 1.03x on the field
+shape (one 16k-token step against 15 ms decode steps) but 3.0x on a dense 4B at a 512-token chunk and up to 16x
+on a shape whose decode step is as slow as its prefill step.  `K` therefore cannot be the only knob: the code
+also caps the accumulated idle time at the previous prefill step's own wall time, which holds the stretch under
+2x on every shape measured (2.13x dense, 1.56x streamed host-expert, 1.25x MTP, 1.09x field).  That cap is
+also why the default of 16 is safe to ship on.
 
 ## Maintaining this file
 

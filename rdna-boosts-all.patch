@@ -115202,7 +115202,7 @@ index 066ecb4dd..e9bfbfeb8 100644
  | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
  | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a6059ab38..aee311baa 100644
+index a6059ab38..304b60770 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -299,6 +299,14 @@ struct server_slot {
@@ -115267,7 +115267,7 @@ index a6059ab38..aee311baa 100644
      }
  
      json to_json(bool only_metrics = false) const {
-@@ -1112,8 +1146,212 @@ private:
+@@ -1112,8 +1146,240 @@ private:
  
      int n_empty_consecutive = 0;
  
@@ -115312,6 +115312,34 @@ index a6059ab38..aee311baa 100644
 +        const int v = atoi(e);
 +        return v < 1 ? 1 : v > 64 ? 64 : v;
 +    }();
++
++    // LLAMA_SERVER_PREFILL_DUTY (0/1 = off, K > 1 = one prefill step every K steps at most): the other steps,
++    // up to K-1 of them, admit NO prompt tokens, so they are decode-only.  A decoding slot's rate is
++    // 1/step_time, and a step that carries prompt tokens is the slow one, so a burst of decode-only steps
++    // followed by one prefill step gives the decoder K-1 tokens at the decode-only step time instead of one
++    // token per prefill step.  The cost is the prefill's own wall time, so the burst is BOUNDED: the deferral
++    // stops as soon as the idle time accumulated since the last prefill step reaches that step's own duration
++    // (measured, no model knowledge), which holds the stretch of a concurrent prefill under ~2x.  Without the
++    // bound the stretch is `1 + (K-1) * decode_step / prefill_step`, which measured 1.1x on the field shape
++    // (one 16k step, 15 ms decode steps) but 3.0x on a dense 4B at a 512-token chunk -- and 16x on a shape
++    // whose decode step is as slow as its prefill step.  Never defers into an EMPTY batch: a step with no
++    // decode work prefills immediately, so an idle server (or one prompt arriving with nothing decoding) is
++    // untouched and the tick does not advance.
++    const int32_t prefill_duty = [] {
++        const char * e = getenv("LLAMA_SERVER_PREFILL_DUTY");
++        if (e == nullptr) {
++            return 16; // default ON: the bound above is what makes it safe on every shape
++        }
++        const int v = atoi(e);
++        return v < 2 ? 0 : (v > 1024 ? 1024 : v);
++    }();
++
++    int32_t prefill_idle_steps = 0;     // decode-only steps since the last prefill step
++    int64_t prefill_idle_us    = 0;     // their accumulated wall time: the prefill's stretch
++    int64_t prefill_step_us    = 0;     // the last prefill step's wall time: the stretch budget
++    int64_t prefill_step_start = 0;     // start of the step being assembled
++    bool    prefill_step_prev  = false; // the step that just finished carried prompt tokens
++    bool    prefill_idle_prev  = false; // the previous step was a deferred (decode-only) step
 +
 +    // rotating start for the fair-share walk, so the tie-break is not always slot 0
 +    int32_t slot_next = 0;
@@ -115480,7 +115508,7 @@ index a6059ab38..aee311baa 100644
      server_metrics metrics;
  
      // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
-@@ -1216,10 +1454,8 @@ private:
+@@ -1216,10 +1482,8 @@ private:
          params_base.n_outputs_max_per_seq = output_limits.per_seq;
  
          const bool has_mmproj = !params.mmproj.path.empty();
@@ -115493,7 +115521,7 @@ index a6059ab38..aee311baa 100644
          const bool has_spec = has_draft || spec_mtp;
  
          if (callback_state) {
-@@ -1305,7 +1541,7 @@ private:
+@@ -1305,7 +1569,7 @@ private:
              params_base.load_progress_callback_user_data = &load_progress_text;
          }
  
@@ -115502,7 +115530,7 @@ index a6059ab38..aee311baa 100644
  
          model_tgt = llama_init->model();
          ctx_tgt   = llama_init->context();
-@@ -1345,7 +1581,7 @@ private:
+@@ -1345,7 +1609,7 @@ private:
                  params_dft.load_progress_callback           = load_progress_callback;
                  params_dft.load_progress_callback_user_data = &load_progress_spec;
  
@@ -115511,20 +115539,21 @@ index a6059ab38..aee311baa 100644
                  model_dft = spec_init->model();
                  ctx_dft   = spec_init->context();
  
-@@ -1485,6 +1721,12 @@ private:
+@@ -1485,6 +1749,13 @@ private:
          SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                  params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
  
 +        // the prompt admission policy, so a log always says which one ran (wip/session-scheduling)
-+        SRV_INF("prefill admission: fair share = %s, chunk = %s, skew = %d\n",
++        SRV_INF("prefill admission: fair share = %s, chunk = %s, skew = %d, duty = %d\n",
 +                prefill_fair ? "on" : "off",
 +                prefill_chunk < 0 ? "n_ubatch" : prefill_chunk == 0 ? "off" : std::to_string(prefill_chunk).c_str(),
-+                prefill_skew);
++                prefill_skew,
++                prefill_duty <= 1 ? 1 : prefill_duty);
 +
          // initialize slots
          for (int i = 0; i < params_base.n_parallel; i++) {
              slots.emplace_back();
-@@ -1892,9 +2134,21 @@ private:
+@@ -1892,9 +2163,21 @@ private:
  
                  const int64_t t_start = ggml_time_us();
  
@@ -115547,7 +115576,7 @@ index a6059ab38..aee311baa 100644
                      ret->prompt_clear();
                  }
  
-@@ -1907,18 +2161,218 @@ private:
+@@ -1907,18 +2190,218 @@ private:
          return ret;
      }
  
@@ -115767,7 +115796,7 @@ index a6059ab38..aee311baa 100644
          for (auto & slot : slots) {
              if (slot.is_processing()) {
                  continue;
-@@ -2728,6 +3182,28 @@ private:
+@@ -2728,6 +3211,28 @@ private:
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
@@ -115796,7 +115825,7 @@ index a6059ab38..aee311baa 100644
          // evict checkpoints within min-step of a previous checkpoint, unless they were
          // created by the current task
          // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-@@ -2740,6 +3216,7 @@ private:
+@@ -2740,6 +3245,7 @@ private:
                  SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                          cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
  
@@ -115804,7 +115833,7 @@ index a6059ab38..aee311baa 100644
                  it = slot.prompt.checkpoints.erase(it);
                  continue;
              }
-@@ -2750,7 +3227,8 @@ private:
+@@ -2750,7 +3256,8 @@ private:
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
              // make room for the new checkpoint, if needed
@@ -115814,7 +115843,7 @@ index a6059ab38..aee311baa 100644
  
              SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                      cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
-@@ -2764,6 +3242,7 @@ private:
+@@ -2764,6 +3271,7 @@ private:
              for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                  if ((*it)->n_tokens == n_tokens_new) {
                      SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", (*it)->n_tokens);
@@ -115822,7 +115851,7 @@ index a6059ab38..aee311baa 100644
                      it = slot.prompt.checkpoints.erase(it);
                  } else {
                      ++it;
-@@ -2781,6 +3260,12 @@ private:
+@@ -2781,6 +3289,12 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -115835,7 +115864,7 @@ index a6059ab38..aee311baa 100644
          cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
          cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
          // stash the draft's speculative state with the checkpoint
-@@ -3080,7 +3565,11 @@ private:
+@@ -3080,7 +3594,11 @@ private:
                          break; // drop the task
                      }
  
@@ -115848,7 +115877,7 @@ index a6059ab38..aee311baa 100644
                          for (auto & slot : slots) {
                              if (!slot.is_processing()) {
                                  SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-@@ -3904,7 +4393,14 @@ private:
+@@ -3904,7 +4422,14 @@ private:
                              slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                          }
  
@@ -115864,7 +115893,7 @@ index a6059ab38..aee311baa 100644
  
                          const bool spec_reject = slot.use_spec_rejection();
  
-@@ -3913,7 +4409,7 @@ private:
+@@ -3913,7 +4438,7 @@ private:
                              /* .n_max    = */ n_draft_max,
                              /* .pos0     = */ slot.prompt.tokens.pos_next(),
                              /* .id_last  = */ slot.sampled,
@@ -115873,7 +115902,7 @@ index a6059ab38..aee311baa 100644
                              /* .result   = */ &slot.spec_draft,
                              /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                              /* .temp     = */ slot.task->params.sampling.temp,
-@@ -3964,7 +4460,7 @@ private:
+@@ -3964,7 +4489,7 @@ private:
                  if (use_ckpt_tgt) {
                      //const int64_t t_start = ggml_time_us();
  
@@ -115882,14 +115911,53 @@ index a6059ab38..aee311baa 100644
  
                      //const int64_t t_total = ggml_time_us() - t_start;
                      //printf("checkpoint total: %f ms\n", t_total / 1000.0);
-@@ -3993,6 +4489,33 @@ private:
+@@ -3993,6 +4518,72 @@ private:
          auto & alora_scale       = batch.alora_scale;
          auto & alora_disabled_id = batch.alora_disabled_id;
  
 +        // max-min fair share of the prompt window: the decode tokens are already in the batch, so share what
 +        // is left across every slot that still has prompt tokens.  See share_prompt_budget().
 +        std::vector<int32_t> prompt_budget(slots.size(), 0);
-+        {
++        // The cycle is up to K-1 DECODE steps followed by one prefill step, so the decode burst comes first
++        // and the prefill stall comes last.  Two stop conditions, and either one ends the burst:
++        //   * K-1 decode-only steps (LLAMA_SERVER_PREFILL_DUTY, the burst length), and
++        //   * the idle time accumulated since the last prefill step reaching that step's own duration.
++        // The second is what keeps the prefill's wall time bounded: without it the stretch is
++        // 1 + (K-1)*decode_step/prefill_step, i.e. unbounded in K and worst on a shape whose per-step fixed
++        // cost dominates (measured 3.0x on a dense 4B at a 512-token chunk, 1.7x on a streamed host-expert
++        // 35B-class shape, 1.1x on the field shape's one 16k step).  Both are measured here, not assumed:
++        // `prefill_step_us` is the wall time of the last step that carried prompt tokens.
++        // The deferral is only taken when this step already carries decode work: a step with no prompt tokens
++        // and no decode tokens is an empty batch, which decode() calls "no tokens to decode" and aborts on
++        // after four in a row.  So an idle server (or a prompt arriving with nothing decoding) is prefilled
++        // immediately and neither counter advances -- which is also what calibrates `prefill_step_us`.
++        const size_t n_batch_decode = batch.size(); // the decode tokens are already in; prompt tokens are not
++        const int64_t t_step_now = ggml_time_us();
++        const int64_t step_us    = prefill_step_start > 0 ? t_step_now - prefill_step_start : 0;
++        if (prefill_step_prev) {
++            prefill_step_us = step_us;
++        }
++        prefill_step_start = t_step_now;
++        bool prefill_now = true;
++        if (prefill_duty > 1 && batch.size() > 0) {
++            const bool steps_left = prefill_idle_steps < prefill_duty - 1;
++            const bool time_left  = prefill_step_us <= 0 || prefill_idle_us < prefill_step_us;
++            prefill_now = !(steps_left && time_left);
++        }
++        if (prefill_now) {
++            prefill_idle_steps = 0;
++            prefill_idle_us    = 0;
++        } else {
++            prefill_idle_steps += 1;
++            // the elapsed time of THIS burst so far: the first deferred step adds nothing (its own duration is
++            // not known yet), every later one adds the step that just finished
++            prefill_idle_us = prefill_idle_prev ? prefill_idle_us + step_us : 0;
++        }
++        prefill_idle_prev = !prefill_now;
++        if (!prefill_now) {
++            // a decode-only step: no prompt slot is admitted, and the zero budgets make the fill loop skip
++            // them (its guard is `n_tokens() > 0 && prompt_budget <= 0`)
++        } else {
 +            // -1 = follow the ubatch (the default), 0 = no cap, >0 = explicit
 +            const int32_t want   = prefill_chunk > 0 ? prefill_chunk
 +                                 : prefill_chunk < 0 ? (int32_t) n_ubatch
@@ -115916,7 +115984,7 @@ index a6059ab38..aee311baa 100644
          // next, batch any pending prompts without exceeding n_batch
          if (params_base.cont_batching || batch.size() == 0) {
              bool add_ok = true; // false means the batch is full, skip remaining slots
-@@ -4006,6 +4529,13 @@ private:
+@@ -4006,6 +4597,13 @@ private:
                      return;
                  }
  
@@ -115930,7 +115998,7 @@ index a6059ab38..aee311baa 100644
                  // check if we can batch this slot with the previous one
                  if (slot_batched && !slot_batched->can_batch_with(slot)) {
                      return;
-@@ -4036,6 +4566,12 @@ private:
+@@ -4036,6 +4634,12 @@ private:
  
                          slot.state = SLOT_STATE_PROCESSING_PROMPT;
  
@@ -115943,7 +116011,7 @@ index a6059ab38..aee311baa 100644
                          SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                  slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
  
-@@ -4287,6 +4823,8 @@ private:
+@@ -4287,6 +4891,8 @@ private:
  
                                      bool do_reset = it == slot.prompt.checkpoints.rend();
  
@@ -115952,7 +116020,7 @@ index a6059ab38..aee311baa 100644
                                      if (!do_reset) {
                                          const auto & cur = **it;
  
-@@ -4310,6 +4848,8 @@ private:
+@@ -4310,6 +4916,8 @@ private:
  
                                          pos_next = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max));
                                          n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) cur.n_tokens);
@@ -115961,7 +116029,7 @@ index a6059ab38..aee311baa 100644
                                          SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_past, (float) cur.size() / 1024 / 1024);
                                      }
  
-@@ -4328,6 +4868,7 @@ private:
+@@ -4328,6 +4936,7 @@ private:
                                      const auto & cur = **it;
                                      if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                          SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
@@ -115969,7 +116037,7 @@ index a6059ab38..aee311baa 100644
                                          it = slot.prompt.checkpoints.erase(it);
                                      } else {
                                          ++it;
-@@ -4484,8 +5025,12 @@ private:
+@@ -4484,8 +5093,12 @@ private:
  
                      const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
  
@@ -115984,7 +116052,7 @@ index a6059ab38..aee311baa 100644
                          // get next token to process
                          llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                          if (cur_tok == LLAMA_TOKEN_NULL) {
-@@ -4558,6 +5103,9 @@ private:
+@@ -4558,6 +5171,9 @@ private:
                      // the number of tokens added to the batch for the current slot
                      const auto n_tokens_cur = batch.size() - n_tokens_prev;
  
@@ -115994,7 +116062,18 @@ index a6059ab38..aee311baa 100644
                      const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
  
                      const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
-@@ -4994,7 +5542,12 @@ private:
+@@ -4617,6 +5233,10 @@ private:
+                 }
+             });
+         }
++
++        // a step counts as a prefill step for the stretch budget only if it really carried prompt tokens: a
++        // prefill_now step with nothing left to place is a decode-only step and its duration is not a budget
++        prefill_step_prev = prefill_now && batch.size() > n_batch_decode;
+     }
+ 
+     // see https://github.com/ggml-org/llama.cpp/pull/29969
+@@ -4994,7 +5614,12 @@ private:
                              SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                          }
  
@@ -116008,7 +116087,7 @@ index a6059ab38..aee311baa 100644
                          slot.spec_is_replay = true;
                          slot.spec_draft = std::move(accepted);
  
-@@ -5002,7 +5555,7 @@ private:
+@@ -5002,7 +5627,7 @@ private:
  
                          SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
  

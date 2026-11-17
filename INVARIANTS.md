@@ -270,3 +270,36 @@
    `LLAMA_QSA_DENSE_DECODE_UNTIL=0` (a forced-sparse decode the pool arms do not set).  The section now asserts `pmlegacy == pmres` and `pmres == pres` (2-device pool text == 1-device pool
    text: the multi-device placement's real signature) and REPORTS the resident number; do not restore the
    `pmres == pmref` form, and do not quote pool-on text as byte-identical to pool-off.
+
+## r301 (2026-11-16, `WORKLOG.md` 261116.008)
+
+1. **A server step's cost is `a·tokens + b`, and `b` is what decides every admission policy.**  On the
+   Flash-Next field shape `b ≈ 196 ms`; on a dense 4B it is `≈ 2 ms`; a pooled/streamed KV adds a per-STEP term
+   that does not scale with the chunk at all (measured **1 144 ms vs 878 ms** per step for the same prompt with
+   and without `--kv-attendance-pool`, 1.30x).  Consequences, all measured: `CHUNK = n_ubatch` is a floor and not
+   a sweet spot; the duty cycle's prefill stretch is `1 + (K-1)·decode_step/prefill_step` and therefore spans
+   1.03x to 16x for one `K`; and on a shape whose `b` dominates, **fair-share chunking cannot shorten a short
+   prompt's wait at all**, because its 3 narrow steps cost what the baseline's 3 wide ones did (5.17 s vs 5.21 s
+   on the pooled arm).  Do not judge such a shape as a failed fix -- the gate reports it as no-room-to-improve.
+2. **A prompt-progress chunk is not a token arrival, and counting it collapses TTFT.**  With `return_progress`
+   enabled, every step's `prompt_progress` chunk also carries `tokens: [0]` and an empty `content`, so a harness
+   that counts "any of content/reasoning/tokens" measures the *arrival* (0.002 s) instead of the first generated
+   token (0.052 s on the same request).  Both admission gates skip a chunk that carries `prompt_progress`; a
+   pre-existing "count any of the three" rule is only safe without it.
+3. **The single-slot greedy-text oracle needs a fresh server per arm on a pooled or streamed KV.**  The cells a
+   request is given follow the page residency the earlier requests left behind, and FA's summation depends on the
+   cells' tile indices, so a near tie flips between two arms that did nothing wrong: `[P1]` read
+   `643670b3ea353558` after the interaction arms in one arm and `79bd7d7fd684b399` in the other, and
+   `643670b3ea353558` on a fresh server in both.  This is `GREEDY-PURITY.md` §52's mechanism reached through a
+   cache's *placement*, not through a resize -- do not "document away" a text oracle, give it a clean server.
+4. **The duty cycle is safe to default on because it is capped in TIME, not in steps.**  The cap is the previous
+   prefill step's own measured wall time, so the stretch is bounded at ~2x on any shape (measured 2.13x dense,
+   1.58x streamed host-expert, 2.13x MTP, 1.10x field) while the decode burst is `K-1` tokens at the decode-only
+   step time (16 -> 137 dense, 46 -> 200 MTP, 9 -> 109 streamed).  A step-shape duty does **not** cost the expert
+   cache: `h` 0.7358 -> 0.7345, evictions 28 291 -> 27 157 on a really streaming arena -- `TODO` #317's
+   wide/narrow warning is about a slab **band move**, which this is not.
+5. **A block that carries a second feature is a structure debt, and the split is tree-identical.**  Block 12's
+   admission amendment became `0016` by replaying the chain and reverting exactly the amendment's hunks in block
+   12 (`git cherry-pick` + `git checkout <pre-amendment> -- tools/server/server-context.cpp`): blocks 00-11 and
+   13-15 byte-identical, and the applied tree after 0016 identical to the unsplit tip plus the new change.  The
+   `From` ids change (the chain is re-cut), the tree is the contract -- compare trees, never ids.

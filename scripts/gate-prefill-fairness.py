@@ -9,10 +9,17 @@ WHY THIS EXISTS
   a decoding slot inherits the other slot's prefill chunk as its inter-token latency (10 ms -> 336 ms).
 
 WHAT IT CHECKS  (two arms on the same binary, `-np 2`, one GPU)
-  arm `baseline`   FAIR=0 CHUNK=0   today's slot-order fill (the reference)
-  arm `candidate`  FAIR=1 CHUNK=<ubatch>   max-min fair share + a per-step chunk cap
+  arm `baseline`   FAIR=0 CHUNK=0 DUTY=0   today's slot-order fill (the reference)
+  arm `candidate`  FAIR=1 CHUNK=<ubatch> DUTY=<--duty>   max-min fair share + a per-step chunk cap + the
+                   prefill/decode duty cycle (16 = the shipped default; pinned on BOTH arms, so the baseline
+                   stays the r299 fill and the self-test reproduces it)
 
-  HARD  * the short prompt's TTFT behind a long one improves by >= --min-ttft-ratio (default 3x)
+  HARD  * ADMISSION: the short prompt's TTFT <= (its own measured admission step count) x (its own measured
+          per-step cost) x --min-admission-slack.  This is the policy claim ("the wait is the request's own
+          steps, not the other request's prompt") and it is tight: the r299 fill reads 6x its own floor.
+  HARD  * FAIRNESS: the TTFT ratio >= min(--min-ttft-ratio, 0.8 x this shape's own ceiling), where the ceiling
+          is the baseline's wait over that floor.  The bound is DERIVED, not a fixed 3x (TODO #338): the fixed
+          number failed the streamed host-expert arm (2.7x) where the arm was at its real ceiling.
   HARD  * the candidate's worst decoder ITL during a foreign prefill is <= --max-itl-ms (default 120)
   HARD  * a lone long prompt's prefill throughput is within --max-prefill-loss of the baseline (3 %)
   HARD  * ONE request's greedy text is byte-identical between the arms (the single-slot oracle; a two-slot
@@ -121,10 +128,15 @@ def stream(prompt, n_predict, out, key, delay=0.0, id_slot=None):
     time.sleep(delay)
     t0 = time.time()
     arrivals = []
+    progress = []
     timings = None
     body = {
         "prompt": prompt, "n_predict": n_predict, "stream": True,
         "temperature": 0, "seed": 42, "cache_prompt": False,
+        # a per-step progress chunk: one per step that placed prompt tokens, plus one at arrival.  This is how
+        # the gate MEASURES the short prompt's step count instead of assuming it (TODO #338): a 7-token prompt
+        # is split 3+4 by the checkpoint tail rule, so its step count is a property of the model, not of K.
+        "return_progress": True,
     }
     if id_slot is not None:
         # PIN the slot.  Slot assignment is LRU/similarity-based, and the fill policy gives the LOWEST slot
@@ -145,12 +157,20 @@ def stream(prompt, n_predict, out, key, delay=0.0, id_slot=None):
             # a progress chunk is not always `content`: a reasoning model streams `reasoning_content`, and a
             # chunk can carry token ids with an empty text field.  Count any of them, or a reasoning arm
             # measures a TTFT of None.
-            if d.get("content") or d.get("reasoning_content") or d.get("tokens"):
+            prog = d.get("prompt_progress")
+            if prog is not None:
+                progress.append(prog)
+            # An ARRIVAL is a generation chunk.  A prompt-progress chunk is NOT one, and it carries
+            # `tokens: [0]` with an empty `content`, so the old "any of content/reasoning/tokens" rule counted
+            # the arrival progress chunk and collapsed TTFT to the launch time (measured 2026-11-16: a 7-token
+            # prompt "arrived" at 0.002 s and generated at 0.052 s).  Progress chunks are skipped instead.
+            if prog is None and (d.get("content") or d.get("reasoning_content") or d.get("tokens")):
                 arrivals.append(time.time())
             if d.get("stop"):
                 timings = d.get("timings")
                 break
     out[key] = {"arrivals": arrivals, "timings": timings, "wall": time.time() - t0,
+                "progress": progress,
                 "ttft": (arrivals[0] - t0) if arrivals else None}
 
 
@@ -206,20 +226,20 @@ def measure(srv, reps, dec_n, agg_n):
     else:
         res["itl"] = None
 
-    # 2. single-request greedy text (the purity oracle)
-    for p in TEXT_PROMPTS:
-        r = requests.post(srv.base + "/completion", json={
-            "prompt": p, "n_predict": 64, "stream": False,
-            "temperature": 0, "seed": 42, "cache_prompt": False,
-        }).json()
-        c = (r.get("content") or "") + (r.get("reasoning_content") or "")
-        res["text"][p[:6]] = hashlib.sha256(c.encode()).hexdigest()[:16]
+    # (the greedy-text oracle is pass 1b, on its own fresh server -- see measure_text)
 
     # 3. starvation: a long prompt, then a 7-token prompt 50 ms later
     long_s = sentence(reps, "STARVE")
     o = run_pair([(long_s, 4, "L", 0.0, 0), (SHORT_PROMPT, 4, "S", 0.05, 1)])
     res["short_ttft"] = o["S"]["ttft"]
     res["long_ttft"] = o["L"]["ttft"]
+    # the short prompt's own admission steps: the arrival chunk (processed = 0) plus one per step that placed
+    # tokens, so k == len(progress).  `prompt_ms` is the wall time of those same steps (k-1 of them), i.e. the
+    # per-step cost the shape really charges -- which is what the bound below is derived from.
+    res["short_steps"] = len(o["S"]["progress"])
+    res["short_prompt_ms"] = (o["S"]["timings"] or {}).get("prompt_ms") or 0.0
+    res["short_prompt_n"] = (o["S"]["timings"] or {}).get("prompt_n") or 0
+    res["long_n"] = (o["L"]["timings"] or {}).get("prompt_n") or 0
 
     # 5. aggregate decode at concurrency 2
     p = sentence(200, "T")
@@ -250,13 +270,36 @@ def spec_stats(log):
     return (acc, gen, n) if n else None
 
 
+def measure_text(srv):
+    """The single-slot greedy text oracle, on its OWN fresh server.
+
+    It must not share the interaction server: on a POOLED / streamed cache the KV cells a request gets follow
+    the pages the earlier requests left resident, and FA's summation depends on the cells' tile indices, so a
+    near tie can flip between two arms that did nothing wrong (GREEDY-PURITY.md section 52 and 63).  Measured
+    2026-11-16 on Flash-Next + `--kv-attendance-pool`: P1 read 6436... in one arm and 79bd... in the other when
+    hashed after the interaction arms, and 6436... on a fresh server in BOTH arms.  A fresh server keeps the
+    oracle strict instead of documenting it away.
+    """
+    global BASE
+    BASE = srv.base
+    out = {}
+    for p in TEXT_PROMPTS:
+        r = requests.post(srv.base + "/completion", json={
+            "prompt": p, "n_predict": 64, "stream": False,
+            "temperature": 0, "seed": 42, "cache_prompt": False,
+        }).json()
+        c = (r.get("content") or "") + (r.get("reasoning_content") or "")
+        out[p[:6]] = hashlib.sha256(c.encode()).hexdigest()[:16]
+    return out
+
+
 def check_arm_config(log, fair, chunk):
     # chunk is `off`, `n_ubatch` or an explicit count (it stopped being an integer when the default
     # became "follow the ubatch")
-    m = re.search(r"prefill admission: fair share = (\w+), chunk = (\w+)", log)
+    m = re.search(r"prefill admission: fair share = (\w+), chunk = (\w+), skew = (\d+), duty = (\d+)", log)
     if not m:
         return None
-    return (m.group(1), m.group(2))
+    return (m.group(1), m.group(2), m.group(3), m.group(4))
 
 
 def main():
@@ -272,9 +315,15 @@ def main():
     ap.add_argument("--server-args", default="",
                     help='extra llama-server args, e.g. "-ncmoe 48" or "-sm tensor --device 0,1,2"')
     ap.add_argument("--tag", default="", help="log-name tag, e.g. moe35b or tensor3gpu")
+    ap.add_argument("--env", default="", help='extra env for BOTH arms, e.g. "MOE_EXPERT_CACHE_MIB=8192"')
     ap.add_argument("--chunk", type=int, default=0, help="candidate chunk; 0 = the ubatch size (the free point)")
     ap.add_argument("--reps", type=int, default=1200, help="long-prompt repetitions (~11 tokens each)")
-    ap.add_argument("--min-ttft-ratio", type=float, default=3.0)
+    ap.add_argument("--min-ttft-ratio", type=float, default=3.0,
+                    help="the CAP on the short-TTFT ratio; the bound actually applied is this or the shape's "
+                         "own ceiling, whichever is smaller (derived, not fixed -- TODO #338)")
+    ap.add_argument("--duty", type=int, default=16, help="the candidate's LLAMA_SERVER_PREFILL_DUTY")
+    ap.add_argument("--min-admission-slack", type=float, default=1.25,
+                    help="slack over the short prompt's own step count x its measured per-step cost")
     ap.add_argument("--max-itl-ms", type=float, default=0.0,
                     help="absolute ITL bound; 0 = DERIVE it from the candidate's own prefill rate (default)")
     ap.add_argument("--itl-slack", type=float, default=1.75,
@@ -303,9 +352,18 @@ def main():
     os.makedirs(logdir, exist_ok=True)
     faults = os.path.join(REPO, "scripts", "check-gpu-faults.sh")
 
-    arms = [("baseline", {"LLAMA_SERVER_PREFILL_FAIR": "0", "LLAMA_SERVER_PREFILL_CHUNK": "0"}, False, 0)]
-    cand_env = {"LLAMA_SERVER_PREFILL_FAIR": "0" if a.self_test else "1",
-                "LLAMA_SERVER_PREFILL_CHUNK": "0" if a.self_test else str(a.chunk)}
+    # DUTY is pinned on BOTH arms: the baseline must be the r299 fill, and the self-test must reproduce it
+    # with the duty off too, or the "unfixed build" it claims to reject is not the unfixed build.
+    shared = {}
+    for kv in filter(None, a.env.split(",")):
+        k, _, v = kv.partition("=")
+        shared[k.strip()] = v.strip()
+    arms = [("baseline", dict(shared, LLAMA_SERVER_PREFILL_FAIR="0", LLAMA_SERVER_PREFILL_CHUNK="0",
+                              LLAMA_SERVER_PREFILL_DUTY="0"), False, 0)]
+    cand_env = dict(shared,
+                    LLAMA_SERVER_PREFILL_FAIR="0" if a.self_test else "1",
+                    LLAMA_SERVER_PREFILL_CHUNK="0" if a.self_test else str(a.chunk),
+                    LLAMA_SERVER_PREFILL_DUTY="0" if a.self_test else str(a.duty))
     arms.append(("candidate", cand_env, True, a.chunk))
 
     results = {}
@@ -324,12 +382,21 @@ def main():
             finally:
                 srv.stop()
 
+            # pass 1b: the text oracle on its own fresh server (see measure_text)
+            srv = Server(a, env, os.path.join(logdir, f"{tag}.text.log"))
+            try:
+                srv.start()
+                text = measure_text(srv)
+            finally:
+                srv.stop()
+
             # pass 2: the interaction arms
             srv = Server(a, env, log_path)
             try:
                 srv.start()
                 cfg = check_arm_config(srv.log_text(), env["LLAMA_SERVER_PREFILL_FAIR"], chunk)
                 results[name] = measure(srv, a.reps, dec_n, agg_n)
+                results[name]["text"] = text
                 results[name]["census"] = cfg
                 results[name]["lone_tps"] = lone_tps
                 results[name]["spec"] = spec_stats(srv.log_text())
@@ -362,9 +429,45 @@ def main():
             warns.append(name)
 
     ratio = (b["short_ttft"] / c["short_ttft"]) if c["short_ttft"] else 0.0
-    hard(ratio >= a.min_ttft_ratio, "fairness",
-         f"short-prompt TTFT {b['short_ttft']:.3f}s -> {c['short_ttft']:.3f}s "
-         f"({ratio:.1f}x, need >= {a.min_ttft_ratio:.1f}x)")
+
+    # ---- TODO #338: the ratio bound is DERIVED, not 3.0.
+    # The claim is "the short prompt waits for its own admission steps, not for the long prompt".  k is that
+    # step count, MEASURED from the short request's progress events (a 7-token prompt is split 3+4 by the
+    # checkpoint tail rule, so k is a property of the model); p is the per-step cost the shape really charges,
+    # measured as the short prompt's own prompt_ms / (k-1).  Their product is the floor.
+    #   * the ADMISSION check is the policy claim, and it is tight: a late admission cannot pass it (the
+    #     r299 fill measures 6x its own floor);
+    #   * the RATIO check is the user-visible claim, whose ceiling is the baseline's own wait over that floor.
+    #     L/(k*chunk) alone is NOT that ceiling: it assumes the baseline's step is chunk-wide and its per-step
+    #     fixed cost is zero.  On the streamed host-expert shape the baseline's step is n_batch-wide (4x the
+    #     tokens, so 4x the a-part but the same b), which is why that shape measured 5.3x where L/(k*chunk)
+    #     promises 7.3x -- the arm was at its real ceiling all along, and the fixed 3.0 was the thing that was
+    #     wrong (measured 2026-11-16, TODO #338).
+    k = c["short_steps"] or 0
+    p_step_s = (c["short_prompt_ms"] / 1000.0 / (k - 1)) if k > 1 else 0.0
+    # k-1 placement steps plus one ARRIVAL-ALIGNMENT step: a request that arrives inside a step cannot join
+    # it, and that step is not in its own prompt_ms.  The slack covers arriving part-way through it.
+    floor = (k + 1) * p_step_s
+    admitted = bool(floor) and c["short_ttft"] <= floor * a.min_admission_slack
+    hard(admitted, "admission",
+         f"the short prompt's TTFT {c['short_ttft']:.3f}s <= {floor:.3f}s x {a.min_admission_slack:.2f} "
+         f"({k - 1} placement + 1 alignment step(s) x {p_step_s * 1000:.0f} ms, its own measured cost; a "
+         f"late admission cannot pass)")
+    ceiling = (b["short_ttft"] / floor) if floor else 0.0
+    bound = min(a.min_ttft_ratio, ceiling * 0.8)
+    hard(ratio >= bound, "fairness",
+         f"short-prompt TTFT {b['short_ttft']:.3f}s -> {c['short_ttft']:.3f}s ({ratio:.1f}x); bound "
+         f"{bound:.1f}x = min({a.min_ttft_ratio:.1f}, 0.8 x this shape's own ceiling {ceiling:.1f}x)")
+    naive = (f"{c['long_n'] / (k * a.chunk):.1f}x" if a.chunk > 0 else "n/a (no chunk)")
+    if ceiling < 1.5:
+        print(f"  [INFO] this shape has NO room to improve: its per-step cost is dominated by a fixed term "
+              f"(a pooled/streamed KV re-reads spilled cells once per STEP, so a smaller chunk buys nothing "
+              f"there), so its ceiling is {ceiling:.1f}x and the bound above is the shape's own, not 3x.  The "
+              f"arm is judged on ADMISSION, which is what the policy actually promises")
+    print(f"  [INFO] shape: a {c['short_prompt_n']}-token short prompt over a {c['long_n']}-token one, "
+          f"chunk {a.chunk}, {k} admission step(s) at {p_step_s * 1000:.0f} ms each.  L/(k*chunk) would "
+          f"promise {naive}; the ceiling above is the MEASURED one, and it is lower because the baseline's "
+          f"step is n_batch-wide, not chunk-wide")
 
     # A decoder's ITL is bounded by the step it waits on, so the honest bound is "one chunk of prompt at
     # this shape's prefill rate" -- NOT a fixed millisecond count, which would fail a slow host-expert model
@@ -373,6 +476,7 @@ def main():
     # and p95 alone would hide the 1 s spike the baseline has.  Both are reported; the HARD check is max,
     # because "the wait is bounded by one chunk" is the claim, and p95 legitimately rises.
     ci, bi = c["itl"] or {}, b["itl"] or {}
+    itl_bound_ms = 0.0   # unset on the "no cap, no explicit bound" path below (the self-test's arm)
     if a.chunk <= 0 and a.max_itl_ms <= 0:
         # no cap and no explicit bound: nothing smaller than the step bounds the decoder, so this is not a
         # check.  Say so instead of inventing a threshold (the self-test's candidate has chunk 0).
@@ -428,8 +532,9 @@ def main():
     hard(c["text"] == b["text"], "single-request text",
          f"{c['text']} vs {b['text']} (must be identical)")
 
-    ok_census = b["census"] == ("off", "off") and c["census"] == (
-        "off" if a.self_test else "on", "off" if a.self_test else str(a.chunk))
+    ok_census = b["census"] == ("off", "off", "1", "1") and c["census"] == (
+        "off" if a.self_test else "on", "off" if a.self_test else str(a.chunk), "1",
+        str(a.duty) if not a.self_test else "1")
     hard(ok_census, "census", f"baseline {b['census']}, candidate {c['census']}")
 
     aborts = [n for n, p in logs.items() if ABORT_RE.search(open(p, errors="replace").read())]
@@ -470,7 +575,7 @@ def main():
 
     if a.self_test:
         # the candidate IS the baseline config: the gate must reject it
-        fairness_failed = "fairness" in fails or "decode ITL" in fails
+        fairness_failed = ("fairness" in fails or "decode ITL" in fails) and "admission" in fails
         print(f"\n=== self-test: gate must reject the unfixed build -> "
               f"{'PASS (it does)' if fairness_failed else 'FAIL (it accepts the defect)'}")
         if not a.keep:

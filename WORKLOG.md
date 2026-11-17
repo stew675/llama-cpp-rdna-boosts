@@ -1,3 +1,102 @@
+## 261116.008 (r301, RELEASE v17-4f9dfa0e3-r301) -- the server's prompt admission becomes its own block (NEW official `0016`), gains the PREFILL/DECODE DUTY CYCLE default-on at 16, and retires `TODO` #338/#339/#340
+
+**New block `0016`** (17 official blocks; `n_blocks` 16 -> 17, `n_default` 18), cut from block 12, which is the
+campaign remainder again.  Blocks 00-11 and 13-15 are **byte-identical** to r300, block 12 loses exactly the
+admission hunks (205 lines of `tools/server/server-context.cpp`), and the applied tree is identical once `0016`
+lands.  Patches regenerated from a canonical apply at `4f9dfa0e3`; `release.json` at **`v17-4f9dfa0e3-r301`**
+(tip `52174079a`, tree `d5435845a`); optional `0100`/`0101` re-cut against the new default tree.  Records:
+[`archive/work/prefill-duty-cycle/`](archive/work/prefill-duty-cycle/README.md) (this release's campaign),
+`archive/work/session-scheduling/` (r300), `ENVIRONMENT.md` §22, `MANIFESTS.md` gates 30 and 31 +
+block 16, `patches/README.md` blocks 12/16, `scripts/gate-prefill-duty.sh`.
+
+**`TODO` #340: the duty cycle ships, and the design changed because of a measurement.**  A decoding slot gets one
+token per step, so its rate is `1/step_time` and a prefill step is the slow one: on the field shape a decoder
+sharing the server with a 20k-token prefill delivered **5 tokens in 6.0 s** (worst gap 4.3 s).  r300's chunk
+bounds that stall; the duty cycle leaves up to `K-1` steps **decode-only** and puts the prompt into one step per
+cycle.  The campaign's own draft was a strict cycle, and its cost is `1 + (K-1)*decode_step/prefill_step` -- 1.03x
+on the field shape, **2.96x on a dense 4B at a 512-token chunk**, up to 16x on a shape whose decode step is as slow
+as its prefill step.  So `K` cannot be a default on its own: **the shipped cap is TIME, not steps** -- the
+deferral also stops once the idle time since the last prefill step reaches that step's own measured duration,
+which holds the stretch at ~2x on every shape without any model knowledge.  Measured (pinned slots, `-np 2`):
+
+| shape | duty 0 | strict `K=16` | shipped |
+|---|---|---|---|
+| dense 4B, chunk 512 | 0.97 s / 15 tok | 2.86 s (2.96x) / 207 | **2.06 s (2.13x) / 126** |
+| Flash-Next streamed, 1 GPU | 5.00 s / 9 | 8.42 s (1.68x) / 129 | **7.90 s (1.58x) / 109** |
+| Flash-Next 3 GPU tensor, chunk off, 20.3k | 6.02 s / 5 | 6.56 s (1.09x) / 36 | **6.64 s (1.10x) / 41** |
+| 27B + `draft-mtp n3`, chunk 512 | 5.41 s / 46 | 13.26 s (2.45x) / 879 | **11.50 s (2.13x) / 684** |
+
+**`LLAMA_SERVER_PREFILL_DUTY` defaults to 16** (`0`/`1` = off), a default-on feature with the prefill stretch as
+its documented trade.  Gate `scripts/gate-prefill-duty.sh`: **16 -> 137** decode tokens (dense, +113 % prefill),
+**46 -> 200** (MTP n3, +25 %, acceptance 234/269 -> 233/271 judged for collapse), **9 -> 109** (streamed
+host-expert, +56 %), lone prompt within 1 %, **0** "no tokens to decode" lines, text byte-identical, no GPU fault.
+
+**`TODO` #340's five open questions, settled by measurement rather than argument.**  (1) **The arena is
+unaffected**: on a really streaming arena (`MOE_EXPERT_CACHE_MIB=8192`, 8 127 MiB of a 76 GiB model) the `-lv 4`
+census reads `h` 0.7358 -> 0.7345, evictions 28 291 -> 27 157, hit 73.58 % -> 73.45 %, i.e. the prefill rate falls
+by exactly the stretch and the cache is untouched -- `TODO` #317's warning is about a *slab band move*, which a
+step-shape change is not.  (2) `K` is not one number (`b` spans 2 ms to 196 ms), which is why the bound is time.
+(3) MTP composes: 14.9x the decode tokens, text identical, acceptance moved by two verify events.  (4) default-on,
+maintainer's call, safe because of the cap.  (5) block 16, see below.
+
+**`TODO` #339: the block 12 split, decided here (the maintainer deferred it to this session).**  A new official
+`0016` rather than a `03xx`: the policy is settled and gated (two gates, one with a `--self-test`), it is a
+default-on product behaviour, and `03xx` means "expect to drop it".  Block 12's title describes its contents
+again and either feature can now be reverted alone.
+
+**`TODO` #338: the fairness gate's bound is DERIVED, and the attendance-pool arm was never short of its ceiling.**
+(a) The short-TTFT ratio bound is now `min(3.0, 0.8 x the shape's own ceiling)`, where the ceiling is the
+baseline's own wait over the candidate's measured floor, and the floor is `(k-1 placement + 1 alignment) x p` with
+`k` from the short request's `return_progress` chunks and `p` from its own `prompt_ms`.  A second HARD check
+(ADMISSION) asserts the floor directly, so a late admission cannot pass: the r299 fill reads **6x** it.  The
+streamed host-expert arm reads **2.6x** with a derived bound of 1.5x -- and `L/(k*chunk)` promises 2.9x there
+because it assumes the baseline's step is *chunk*-wide with no fixed cost, while it is `n_batch`-wide.  (b) The
+pooled arm's "2.6x against a 5.7x ceiling" **does not reproduce**, and the discriminating experiment (slot 1's
+admission from the `-lv 5` `fair share: budget=..., added=...` line) says the carrier is the **pool's per-step
+cost**, not the scheduler: slot 1 is admitted on the *first step after its arrival* in both the pooled and the
+unpooled arm (`budget = 7, added = 3`, then 4 for the checkpoint tail), its TTFT is exactly its own 3 steps, and
+the pool costs **1.30x per step** (1 144 ms vs 878 ms) because a spilled-cell page read does not shrink with the
+chunk.  Same prompt, pinned slots: 17.913 s (r299 fill) -> 3.353 s pooled (5.34x) -> 2.741 s unpooled (6.54x).
+
+**Two measurement corrections this session made, kept so they are not re-derived.**  (i) **`return_progress`
+breaks a TTFT harness**: a prompt-progress chunk carries `tokens: [0]` with empty `content`, so the gate's
+"any content/reasoning/tokens is an arrival" rule counted the *arrival* progress chunk and collapsed TTFT to the
+launch time (0.002 s for a 52 ms prefill; the baseline arm read 1.63 s instead of 1.94 s).  Both gates now skip a
+chunk that carries `prompt_progress`.  (ii) **The single-slot text oracle needs a fresh server per arm on a pooled
+cache**: the KV cells a request gets follow the page residency the earlier arms left behind and FA's summation
+depends on the cell tile indices, so `[P1]` flipped between two arms that did nothing wrong and read identically
+on fresh servers; the gate now hashes text in its own pass (three server starts per arm).  A third, older one was
+re-confirmed: the pools' own `--kv` arms are not oracles for a *chunked* candidate unless the ubatch shape is
+equalised, which is exactly what (ii) makes irrelevant.
+
+**Gates (all green, on the release tree).**  `gate-prefill-fairness.sh`: dense 4B **6.3x** (1.94 -> 0.31 s),
+admission 0.31 s against a 0.34 s x 1.25 floor, ITL 334 -> 79 ms, lone prefill -1.0 %; streamed 2-GPU tensor
+`-ncmoe 47` **2.6x** (bound 1.5x, the derived one); pooled `--kv-attendance-pool on` 1.6x, reported as
+no-room-to-improve and judged on admission (5.17 s vs a 5.37 s x 1.25 floor); 27B + `draft-mtp n3` **8.7x**
+(11.648 -> 1.343 s, ITL 1883 -> 555 ms, acceptance **identical** 0.866 = 58/67 in both arms); `--self-test`
+rejects the r299 fill (6x its own floor, ratio 1.0).  `gate-prefill-duty.sh` PASS on the dense 4B
+(16 -> 137 tokens, 2.13x stretch), the 27B + `draft-mtp n3` (46 -> 200, 1.25x) and the streamed host-expert
+shape (9 -> 109, 1.56x).  `validate-set.sh` GREEN (18 patches strict on a fresh tarball, tree `d5435845a`,
+2 optional artifacts and the cumulative optional tree `b9e234af6`); `gate-per-block-build.sh --changed-from
+24211c158 --fast` **3/3** (blocks 12, 16, 0300); `fork-refresh.sh --build --gates` green with the applied tip
+`52174079a` == `release.json.tip`; prefill-logit **mean KLD 0.000000 / same-top-p 100.000 %**; `check-gpu-faults.sh`
+clean with `--since` bounded to each run.  Coherence is an actual A/B here, because the change is unreachable
+outside `update_slots()`: `llama-cli` 4B 3-GPU `-n 64` reads **`280 chars sha=7386359e5dac` on the r300 tree and
+on the r301 tree** (the r300 build was re-verified to carry no `duty` string, so neither run could be the other's
+binary).
+
+**Two process corrections worth keeping.**  (i) A gate run was **discarded** because `fork-refresh.sh` had left
+`~/llama.cpp` checked out at `4f9dfa0e3` while a background gate started a server from `build-rocm`: the census
+line came back without `duty` and the census check failed, which is what caught it.  A background GPU run and a
+fork re-cut must not overlap; the run was repeated on the rebuilt release tree.  (ii) A pre-existing nit, NOT
+introduced here: block 10's patch adds a blank line at EOF, so `git am` prints one
+`new blank line at EOF` whitespace warning (it did at r299 too -- the patch body is unchanged).  It is recorded
+rather than fixed because a fix is a block-10 content change and therefore a tree change.
+
+**Not run, and recorded as a gap:** `gate-prefill-server-slots.sh` -- its default model is 122B-A10B **Q8_0**,
+which this box does not hold (Q4_K_XL only), and the duty gate's streamed host-expert arm measures the same
+two-slot question far more cheaply.
+
 ## 261116.007 (r300, RELEASE v16-4f9dfa0e3-r300) -- block 12 gains FAIR-SHARE server prompt admission: `--parallel N` stops serialising prompts (7-token TTFT 1.91 s -> 0.28 s, decoder ITL 334 -> 107 ms), with the skew and chunk as tunables
 
 **Amends block 12** (no new block: the maintainer's call, and block 12 already owns the server's prompt/idle-slot

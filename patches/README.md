@@ -392,6 +392,7 @@ packed one on a tile-selected layout, +0.6-1.3 % pp512 there and one abort class
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +575 / −16 | 19 |
 | 14 | `0014-…-block-14-the-streamed-KV-a-fixed-VRAM-re` | **streamed KV** (opt-in, `--kv-window N\|auto`; the attendance pool `--kv-attendance-pool on\|off`; the MTP draft window `--spec-draft-kv-window N\|auto`, default `0`) (+ r248: the MTP draft window is a true ring for batches whose positions do not advance, a drafter failure can no longer fail a request, and the reserve reads the draft context's own ubatch — issue #297; + r264: the attendance pool is NOT SUPPORTED on a shared host/device pool (refused by design, one WARN — `TODO` #300 retired), `--fit` offers a placement only where this model+device can take it and prints the advice at WARN, and `gate-kv-residency.sh` grades the refusal, the hint and its own UMA reference arm; + r286: a region-backed buffer's 2-D state directions are **1-D only in both interfaces** (a 2-D device copy on the window's VMM region is refused by the driver on some stacks, which aborted a mixed gfx1100+gfx1201 `-sm tensor` server's prompt-cache save — issue #313), the block is gathered/scattered on the device (`ggml_cuda_cpy_2d_rows`) so a slot save+load went 4 686 → 24.5 ms on a windowed split, `--kv-window`/`--kv-attendance-pool` are common options (they were missing from `llama-bench` and every other non-server tool), `llama-bench` accepts `--kv-window`, and the spill's per-token cost is modelled on the **calibrated in-place read rate** (16-29 GB/s on gfx1201, its own measurement rather than the copy engine's, which is the number that diverges on a card reading its aperture slowly) — `ENVIRONMENT.md` §17.0, `benchmarks/2026-11-14-kv-window-313.md`); **r294: this is the block that makes a hole MAPPING-BACKED, so it carries the storage/transport split** — `host_expert_master_mapped()` (a hole set exists and `llama_mmap::SUPPORTED`) replaces five `use_mmap` tests, in `host_expert_buft`, both pool gates, `init_mappings` and the per-tensor mapped-or-read decision, so NO load mode can turn `-lme` into "pin the whole set" (measured: `-lme 30` under `--load-mode dio` pinned 48 284.6 MiB with no pool before, 31 363.7 MiB with the pool after, 0 mapping memcpys in both); **r295: the shipped text loses the superseded `11-26 %` spill cost** — `common/arg.cpp`'s `--kv-window` help line and `common/fit.cpp`'s placement hint now say the cost is linear in the depth past the window (nothing at or above the run depth), which is what the docs have said since r292 -- `TODO` #331, no computed number moves | +7908 / −971 | 49 |
 | 15 | `0015-…-block-15-the-UMA-GTT-expert-store-an-APU` | **the UMA GTT expert store** (an APU's MoE expert set in one registered, mlocked region; `-lme` sizes it and is the streaming opt-in) | new in r263: the arena tier per `-lme`, the MTP head pinned outside that budget, the direct fill, the RDNA3_5 transport start arm and prefill streaming.  A model whose weights do not fit RAM is refused at load with the fix; the store/arena is inert on a discrete GPU (measured); **r294: the PLACEMENT transport is the one decision that must NOT follow `--load-mode`,** so `MOE_HOST_POOL_BULK_DIO` is renamed `MOE_HOST_POOL_PLACEMENT_MODE=dio|buffered` and is reported once per load (`+1 675 MiB` of page cache on `dio` against `+31 796 MiB` on `buffered` for a 47.9 GiB placement, measured cold), and `-lme mirror` reaches the GTT store's budget too; **r295: the pool exchange's inertness is NAMED** — the exit census reports `sink no-demote tables (...)`, the sub-mirror pools whose demote cannot be expressed (`n_slices != 0` or `host_bytes != expert_bytes`), so a `-sm tensor` split's `0 demoted / 0 declines / 0 retirements` carries its reason -- `TODO` #334 | +4876 / −353 | 16 |
+| 16 | `0016-…-block-16-the-server-s-prompt-admission-p` | **the server's prompt admission policy**: the max-min fair share of the step, the per-step `CHUNK`, the shortest-remaining `SKEW` and the prefill/decode `DUTY` cycle (moved OUT of block 12 at r301 -- `TODO` #339; `ENVIRONMENT.md` §22) | +279 / −2 | 1 |
 | 0300 | `0300-…-block-0300-relaxed-tensor-split-mode-TEM` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` (in the default apply, but NOT an official block: it is not counted in `v<N>`) | +130 / −16 | 11 |
 
 Block 05's file count is `template-instances/*.cu` (the FA kernel instantiations); block 10 is the
@@ -3409,8 +3410,15 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 
 ## Block 12 — campaign remainder
 
-> **r300 promotion: FAIR-SHARE SERVER PROMPT ADMISSION (the maintainer's call: no new block; this block already
-> owns the server's prompt/idle-slot code).**  `update_slots()` used to add the decode tokens and then walk the
+> **r301: THE ADMISSION POLICY IS NO LONGER IN THIS BLOCK — it is block 16** (`TODO` #339; the maintainer
+> deferred the structure call to the r301 session, which chose a new official `0016` over a `03xx` because the
+> policy is settled and gated).  The note below is kept as the r300 record of **why** the policy exists; the code
+> it describes now lives in `0016`, and this block is the campaign remainder again (r301 removes exactly the
+> admission hunks: −205 lines of `tools/server/server-context.cpp`, tree-identical after `0016` is applied).
+>
+> **r300 promotion: FAIR-SHARE SERVER PROMPT ADMISSION (the maintainer's call at the time: no new block; this
+> block already owns the server's prompt/idle-slot code).**  `update_slots()` used to add the decode tokens and
+> then walk the
 > prompt slots in **slot-index order**, each filling `n_batch`: the lowest slot took the whole window and every
 > other prompt waited for that slot's *entire* prompt.  Measured: a 7-token prompt behind a 13204-token one
 > waited **1.91 s** (and reported a nonsense 24 tok/s because it was a 7-token prompt inside someone else's
@@ -5327,6 +5335,32 @@ under a 1 GiB `ulimit -l` refuses naming the 21 741.3 MiB shortfall, and **`-lme
 (tree `39ad82e0e`), `validate-set.sh` green, `gate-per-block-build.sh --fast --changed-from 6a4af82e2` (block 15,
 18 s), coherence identical on this box (4B 1 GPU `a77fa8c1107a`, 3 GPU tensor `eab86065e67e`).  Record:
 `WORKLOG.md` 261114.005, `INVARIANTS.md` (r284).
+
+## Block 16 — the server's prompt admission policy (the fair share, the chunk, the skew, the duty cycle)
+
+New block at **r301** (`TODO` #339): the code was folded into block 12 at r300 and moved out here when the
+maintainer's deferred structure decision was taken.  **Why an official `0016` and not a `03xx`:** the policy is
+settled and gated (two gates, one with a `--self-test`), it is now a *default-on* product behaviour rather than a
+moving experiment, and `03xx` means "expect to drop it".  Nothing else moved: blocks 00-11 and 13-15 are
+byte-identical to r300, block 12 loses exactly these hunks, and the applied tree is identical once `0016` lands.
+
+**What it owns.**  `update_slots()`' batch assembly, and nothing else: `share_prompt_budget()` (water-filling
+max-min share of `n_batch - (decode tokens)`, a one-token floor so starvation is impossible at any
+`n_parallel`), `LLAMA_SERVER_PREFILL_FAIR` (kill-switch, **on**), `LLAMA_SERVER_PREFILL_CHUNK` (**unset = one
+`n_ubatch`**, `0` = off), `LLAMA_SERVER_PREFILL_SKEW` (**1**, a shortest-remaining weighting) and
+`LLAMA_SERVER_PREFILL_DUTY` (**16**, up to `K-1` decode-only steps before a prefill step, capped in TIME by the
+last prefill step's own duration).  The `-lv 4` census prints all four at startup.  `ENVIRONMENT.md` §22 is the
+variable catalogue; `archive/work/session-scheduling/` is the r300 design record and
+`archive/work/prefill-duty-cycle/` is the r301 duty-cycle record.
+
+**The two measurements that decide it.**  The fair share fixes *prompt versus prompt* (a 7-token prompt behind a
+13.2 k one: **1.94 -> 0.31 s**, decoder ITL **334 -> 79 ms**), and the duty cycle fixes *prompt versus decode*
+(a decoder sharing a server with a prefill: **16 -> 137** decode tokens on the dense 4B, **46 -> 200** under
+`draft-mtp n3`, **9 -> 109** on a streamed host-expert shape), each with a bounded prefill stretch.  Both gates
+are in `MANIFESTS.md` (30 and 31).  **What the duty cycle is not:** it is not a throughput win on a shape whose
+per-step cost is dominated by a fixed term (a pooled/streamed KV), where the time cap collapses the burst to one
+or two steps and the prefill stretch is what is left; the gate reports that shape as "no room to improve"
+instead of pretending.
 
 ## Block 0300 — `-sm relaxed-tensor` for the MoE amax arches (**TEMPORARY**, expect removal)
 

@@ -11,7 +11,7 @@ support, and an attention-memory campaign that frees several GiB of VRAM.
 whether it is a kill-switch (default-on, set to disable), an opt-in, a tuning value, or a diagnostic.
 
 It ships as **17 default patches** for a clean llama.cpp checkout at the fork point **`4f9dfa0e3`**
-(upstream master): the **16 official supported blocks `0000`-`0015`** plus the **temporary block
+(upstream master): the **17 official supported blocks `0000`-`0016`** plus the **temporary block
 `0300`**, which is applied last.  Each block is one `git am` commit, and the series is linear (a block
 assumes its predecessors), so the set is applied whole.  **Block `0300` is temporary** -- a local
 `-sm relaxed-tensor` relaxation for the MoE amax architectures, kept separate so it can be dropped; see
@@ -40,7 +40,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh --include-optional-all .   # every
 bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 17 default blocks + beta/*/*.patch
 ```
 
-- One-line summary of each block: [The blocks](#the-blocks-official-0000-0015--temporary-0300--optional-01000101)
+- One-line summary of each block: [The blocks](#the-blocks)
 - What each block contains, its knobs and its purity notes: [`patches/README.md`](patches/README.md)
 - The folded `mmb`/QSA campaign: [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery)
 - Every environment variable, with its default and class: [`ENVIRONMENT.md`](ENVIRONMENT.md)
@@ -140,8 +140,8 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── ENVIRONMENT.md         # every env var the set adds or repoints, with its default and class
 ├── CONTAINERS.md          # the ROCm container images + the off-host build watcher
 ├── COMMUNITY-CONFIG.md    # running a model bigger than VRAM (`-ncmoe` + the expert cache)
-├── rdna-boosts-all.patch  # convenience: the entire 17-patch default net as ONE patch
-├── patches/               # the delivery set: official 0000-0015 + temporary 0300 (one `git am` block each)
+├── rdna-boosts-all.patch  # convenience: the entire 18-patch default net as ONE patch
+├── patches/               # the delivery set: official 0000-0016 + temporary 0300 (one `git am` block each)
 │   └── README.md          # apply instructions + block-12 env knobs + server config
 ├── scripts/               # apply / regenerate / validate / publish tooling; index: scripts/README.md
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift; --include-beta)
@@ -324,7 +324,7 @@ git checkout "$BASE"
 
 # 2. apply the set (automated; strict 18/18 git am on the recorded base)
 bash <path-to-this-repo>/scripts/apply-all.sh .
-#    = git am patches/0000…0015 then patches/0300  (one commit per block on a fresh `rdna-boosts` branch)
+#    = git am patches/0000…0016 then patches/0300  (one commit per block on a fresh `rdna-boosts` branch)
 
 # 3. build + verify (trim -DGPU_TARGETS to your GPU arch for a faster build)
 cmake -B build -DGGML_HIP=ON -DGGML_HIP_RCCL=1 -DGPU_TARGETS="gfx1100;gfx1151;gfx1201" -DCMAKE_BUILD_TYPE=Release
@@ -380,7 +380,7 @@ avoids the tier that the driver runtime cannot grow.  See `ENVIRONMENT.md` for b
 ### Manual equivalent
 
 ```bash
-git am patches/00*.patch patches/0300-*.patch   # official 0000-0015, then the temporary 0300
+git am patches/00*.patch patches/0300-*.patch   # official 0000-0016, then the temporary 0300
 ```
 
 ### The `mmb` campaign is in the delivery
