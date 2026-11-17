@@ -473,6 +473,8 @@ prompt budget do not fight over the same rows.
 | 4B, **2 GPU `-sm tensor`** (`--device 0,2`) | 1.472 → **0.256 s** (5.7 ×) | 255 → **96 ms** | −0.6 % | identical |
 | 4B, **3 GPU `-sm tensor`** | 1.904 → **0.272 s** (7.0 ×) | 321 → **122 ms** | −1.7 % | identical |
 | 4B, **gfx1151** (Strix Halo, UMA APU) | 4.974 → **0.870 s** (5.7 ×) | 1089 → **410 ms** (0.38 ×) | −0.2 % | identical |
+| Flash-Next IQ3_XXS, 2 GPU, `-ncmoe 47`, **arena fully resident** | 4.854 → **1.397 s** (3.5 ×) | 1528 → **509 ms** | +1.2 % | identical |
+| Flash-Next IQ3_XXS, 2 GPU, **arena forced to 8 GiB — really streaming** | 7.397 → **2.757 s** (2.7 ×) ⚠ | 3473 → **1085 ms** (3.2 ×) | −0.3 % | identical |
 
 Plus `scripts/gate-ckpt-reuse.sh` PASS on the prototype (5 vs 8 checkpoints, text identical, no fault) — the
 context-checkpoint path survives prompts being split across more steps.
@@ -486,8 +488,32 @@ The gfx1151 arm ran on the `halo` box: the patch applied to an **identical blob*
 file does not), the build was a single-file recompile, and the single-request greedy text came out with the
 **same sha256 as gfx1201** — a bonus cross-arch purity signal, not a claim (text is per-config).
 
-**Not yet covered:** gfx1100, and a `--kv-unified` / streaming-KV (block 14 window/pool) layout, which is a
-different attention regime (`GREEDY-PURITY.md` §77) and needs its own arm.
+Two more layouts, both green, plus **one documented limitation**:
+
+* **`--kv-unified`** passes unchanged (1.897 → 0.268 s, ITL 334 → 106 ms, prefill −0.6 %).  Note that for a
+  *hybrid* model this changes the KV pool semantics but not the ubatch splitter (§1.1), so the mechanism is
+  untouched.
+* **`--kv-window 2048`** (streaming KV, 896 MiB spilled) passes (2.75 → 0.295 s, ITL 492 → 251 ms, prefill
+  −0.9 %).  `--kv-window auto` **declined to engage** on this shape ("no window is needed — the 16384-cell KV
+  fits fully resident"), so `auto` must be checked for engagement before any streaming claim: an arm that
+  spills nothing tests nothing.
+* **`--kv-attendance-pool on` cannot be exercised here** — it declines on Qwen3.5-4B ("the compress ratio
+  (page size) is not uniform across its layers") and on a multi-stream cache.  It needs a single-stream
+  (`--kv-unified`), device-offloaded, non-MLA cache with a uniform page size, i.e. the QSA / Flash-Next shape.
+  Recorded as `TODO` **#337** (a validation gap, not a defect).
+
+**The streamed-prefill case (`-ncmoe` with the experts really streaming) — the answer is good news.**  On
+Flash-Next IQ3_XXS, 2 GPUs, `-ncmoe 47 -ot per_layer_token_embd.*=CPU`: with the default arena everything is
+resident (arena 40012 MiB = **100.0 %**, `evictions=0`), so that arm does *not* test streaming.  Forcing
+`MOE_EXPERT_CACHE_MIB=8192` gives real streaming (`evictions=48166`) and the numbers above: **lone prefill
+563 → 561 t/s (−0.3 %)**, i.e. chunked admission costs the streaming prefill nothing, and the decoder's
+worst wait falls 3.2 ×.  This is the case the campaign was most likely to get wrong, and it holds.
+
+**The one ⚠: the fairness ratio on that streaming arm is 2.7 × against the gate's 3.0 default — and that is
+the ceiling, not a shortfall.**  The short prompt needs ~3 steps (the checkpoint split makes a 7-token prompt
+3 + 4, plus arrival alignment), so the ceiling is `L / (3 × chunk) = 4400 / 1536 = 2.86`.  Everything else on
+the arm is clean.  Recorded as `TODO` **#338**: the fairness bound must be derived from `L/(k·chunk)` rather
+than a fixed 3.0, or `--min-ttft-ratio` must be set per shape with the reason stated.
 
 Knobs, as shipped in the prototype: `LLAMA_SERVER_PREFILL_FAIR` (on unless `0`, a kill-switch) and
 `LLAMA_SERVER_PREFILL_CHUNK` (`0` = off).  The chunk is applied in **both** modes, because it is a separate
@@ -643,7 +669,12 @@ census), not per-step internals, so the promotion does not need it.
    arms differs between a 512-token-step arm and a 2048-token-step one, and that reported **+25.1 %** on the
    host-expert shape.  Isolated on four fresh loads the two configs read **2065-2073 t/s — identical**.  The
    gate now measures solo prefill on its own server per arm, and that phantom win would have been shipped.
-3. **`max` and `p95` disagree, and both are honest.**  The cap converts a *few* ~1 s stalls into *many*
+3. **A throughput metric that includes prefill is not a decode metric.**  The aggregate-decode arm first used
+   wall time, which on a streamed-prefill shape is seconds of prefill against 80 decode tokens — it reported
+   "−8 %" on one run and "+22.7 %" on another, both meaningless.  It now uses each request's first-to-last
+   token span, and is **skipped as unmeasurable** (INFO, no verdict) on a shape whose responses stream a
+   single chunk.  A metric that cannot be measured must not produce a verdict.
+4. **`max` and `p95` disagree, and both are honest.**  The cap converts a *few* ~1 s stalls into *many*
    ~300 ms ones, so `max` falls 3 × while `p95` rises (334 → 95 ms on the 4 B it falls too, but on the MoE
    shape it goes 1021 → 313 ms only because the baseline's stalls are 3.5 % of steps).  The HARD check is
    `max` (the claim is a bound), and the distribution is always printed.

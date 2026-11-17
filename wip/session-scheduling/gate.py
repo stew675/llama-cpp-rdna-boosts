@@ -54,6 +54,7 @@ TEXT_PROMPTS = [
     "[P2] List the first eight prime numbers, comma separated.",
 ]
 SHORT_PROMPT = "[SHORT] Name three planets."
+STREAMING_RE = re.compile(r"WINDOWED KV ENABLED|taking the ATTENDANCE POOL|is_streaming|pool .*enabled", re.I)
 SPEC_RE = re.compile(r"draft acceptance = ([0-9.]+) \(\s*(\d+) accepted /\s*(\d+) generated\)")
 ABORT_RE = re.compile(r"GGML_ASSERT|GGML_ABORT|terminate called|Segmentation fault|fatal error", re.I)
 
@@ -223,8 +224,19 @@ def measure(srv, reps, dec_n, agg_n):
     # 5. aggregate decode at concurrency 2
     p = sentence(200, "T")
     o = run_pair([(p, agg_n, "a", 0.0, 0), (p, agg_n, "b", 0.0, 1)])
-    wall = max(v["wall"] for v in o.values())
-    res["agg_tps"] = (2.0 * agg_n) / wall if wall else 0.0
+    # Use the GENERATION phase only.  Wall time here includes both requests' prefill, which on a shape whose
+    # prefill streams routed experts is seconds against 80 decode tokens -- that made this metric mostly
+    # prefill variance ("-8 %" on one arm, "+22.7 %" on another, both meaningless).  predicted_ms is each
+    # request's own decode span, so max() of them is the concurrent decode window.
+    # ... and the span is first-arrival to last-arrival per request, which excludes prefill entirely.
+    # (`timings.predicted_ms` is NOT usable for a streamed completion -- it reads back as a fraction of a
+    # millisecond here, which reported 2e6 t/s.)
+    spans = [(v["arrivals"][-1] - v["arrivals"][0], len(v["arrivals"]))
+             for v in o.values() if len(v["arrivals"]) > 1]
+    if spans:
+        res["agg_tps"] = sum(n for _, n in spans) / max(sp for sp, _ in spans)
+    else:
+        res["agg_tps"] = 0.0
     return res
 
 
@@ -320,6 +332,7 @@ def main():
                 results[name]["lone_tps"] = lone_tps
                 results[name]["spec"] = spec_stats(srv.log_text())
                 results[name]["spec_on"] = "adding speculative implementation" in srv.log_text()
+                results[name]["streaming"] = bool(STREAMING_RE.search(srv.log_text()))
             finally:
                 srv.stop()
             logs[name] = log_path
@@ -369,8 +382,17 @@ def main():
         # RELATIVE to the baseline's own worst step, scaled by chunk/n_batch.  Deriving it from the lone-prefill
         # rate instead is wrong on a bandwidth-shared box: on gfx1151 (UMA) a co-batched prefill runs at ~1550
         # t/s, not the 2604 t/s it reaches alone, which made a correct 405 ms look like a 344 ms failure.
+        streaming = b.get("streaming") or c.get("streaming")
         if a.max_itl_ms > 0:
             itl_bound_ms, itl_why = a.max_itl_ms, f"--max-itl-ms {a.max_itl_ms:.0f}"
+        elif streaming:
+            # A windowed / pooled KV re-reads the spilled cells IN PLACE once per STEP, and that read does not
+            # shrink with the chunk: fitting two chunk sizes here gives step = 0.158 ms/token x chunk + ~167 ms
+            # at full depth, so the achievable ratio floors at ~0.34 instead of chunk/b = 0.25.  The bound
+            # therefore asks for a 25 % improvement rather than a proportional one -- and says why.
+            itl_bound_ms = bi.get("max", 0) * 0.75
+            itl_why = (f"streaming KV: baseline max ({bi.get('max', 0):.0f}ms) x 0.75 -- a per-step spill "
+                       f"floor (~167 ms at full depth here) does not scale with the chunk")
         else:
             frac = (a.chunk / a.b) if a.b else 1.0
             itl_bound_ms = (bi.get("max", 0) * frac * a.itl_slack) if bi.get("max") else float("inf")
@@ -434,9 +456,15 @@ def main():
                  f"{br:.3f} ({b['spec'][0]}/{b['spec'][1]}) -> {cr:.3f} ({c['spec'][0]}/{c['spec'][1]}); "
                  f"need >= {0.5 * br:.3f} (a collapse, not equality -- §63)")
 
-    dg = (c["agg_tps"] / b["agg_tps"]) if b["agg_tps"] else 0.0
-    soft(dg >= 1.0 - a.max_decode_loss, "aggregate decode",
-         f"{b['agg_tps']:.0f} -> {c['agg_tps']:.0f} t/s ({100 * (dg - 1):+.1f} %)")
+    if b["agg_tps"] and c["agg_tps"]:
+        dg = c["agg_tps"] / b["agg_tps"]
+        soft(dg >= 1.0 - a.max_decode_loss, "aggregate decode",
+             f"{b['agg_tps']:.0f} -> {c['agg_tps']:.0f} tok/s ({100 * (dg - 1):+.1f} %)")
+    else:
+        # a metric that cannot be measured must not produce a verdict: a shape that streams one chunk per
+        # request has no inter-token span to measure, and an earlier wall-clock version silently measured
+        # PREFILL instead (which is how "-8 %" and "+22.7 %" both appeared on the same arm).
+        print("  [INFO] aggregate decode: not measurable on this shape (no inter-token span); skipped")
 
     if a.self_test:
         # the candidate IS the baseline config: the gate must reject it

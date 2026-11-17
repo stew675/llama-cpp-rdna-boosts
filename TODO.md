@@ -40,10 +40,12 @@ left in this file.  The r236 re-base
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
+| **337** | the attention-pool KV and the fair-share prompt admission are untested together — the pool declines on every model the fairness gate can run | validation gap (`wip/session-scheduling/`) | **OPEN, not scheduled** — the pool needs a single-stream, device-offloaded, non-MLA K/V with a uniform indexer page size, i.e. the QSA shape — §337 |
+| **338** | the fairness gate's short-TTFT ratio is shape-dependent: on a streamed-prefill shape it reads 2.7x against a 3.0x default, at its derived ceiling | gate design (`wip/session-scheduling/gate.py`) | **OPEN** — derive the bound from `L/(k*chunk)`, or set `--min-ttft-ratio` per shape with the reason — §338 |
 
 ## Handle numbering
 
-**New handles append after `#336`, and a number is never reused.**  (`#335`/`#336` were retired at r298 -- an alias
+**New handles append after `#338`, and a number is never reused.**  (`#335`/`#336` were retired at r298 -- an alias
 ROLE gap in the expert cache, `WORKLOG.md` 261116.005 -- and `#282` at r299 -- the mid-run latch's mixture is gated on
 the logits, `WORKLOG.md` 261116.006 -- so the next free handle is `#337`.)  `#NN` is a permanent handle: a `WORKLOG.md` entry
 that cites `TODO #74` still means the same subject after that item has closed and left this file.
@@ -305,3 +307,43 @@ candidate: the delivery's own adaptive-MTP drafts produce 2..8-column verify bat
 across that whole band is a pure win instead of a config-shaped opt-in.  Until then it stays opt-in with a
 floor of 7 and the purity note in `GREEDY-PURITY.md` §91 -- do not lower the floor without measuring the
 low band on both a single card and a 2-GPU `tensor` split (the crossover moves).
+
+### #337 -- the attention-pool KV and the fair-share prompt admission are untested together (the pool declines everywhere the fairness gate can run)
+
+**Open, validation gap** (2026-11-17, `wip/session-scheduling/`).  The campaign validated fair-share prompt
+admission on seven layouts (dense 1/2/3 GPU, MTP, host-expert arena, gfx1151, gfx1100, `--kv-unified`,
+`--kv-window 2048`).  The **attendance pool** (`--kv-attendance-pool`, block 14 Goal B) could not be added to
+that list, because it declines on every model the gate can run:
+
+* Qwen3.5-4B, `-np 2`: "this cache's shape (it needs a device-offloaded, single-stream, non-MLA K/V cache)" --
+  a multi-stream cache declines by design;
+* Qwen3.5-4B, `--kv-unified` (single stream): "the compress ratio (page size) is not uniform across its
+  layers".
+
+So the pool needs a **single-stream, device-offloaded, non-MLA cache whose indexer page size is uniform across
+layers** -- the QSA / `qwen4exp` shape (Qwen3.8-Flash-Next), not a dense 4B.  This is not a defect: the pool
+declining is by design and documented.  It is a **validation gap**: `--kv-attendance-pool` combined with the
+fair-share admission policy is unverified, and it is the one block-14 arm the campaign cannot speak for.
+
+**To close it:** run `wip/session-scheduling/gate.py --server-args="--kv-unified --kv-attendance-pool on"` on
+Qwen3.8-Flash-Next with enough VRAM for the pool (2 GPUs), and confirm the same four properties (short TTFT,
+ITL bound, lone-prefill cost, single-request text).  If the pool's residency changes the picture, note that it
+is a different attention *regime* (`GREEDY-PURITY.md` §77) and the oracle is pooled-vs-pooled, never
+pooled-vs-dense.
+
+### #338 -- the fairness gate's short-TTFT ratio is shape-dependent, and on a streamed-prefill shape it sits at its ceiling
+
+**Open, gate design** (2026-11-17).  `gate.py` requires the short-prompt TTFT behind a 13.2 k prompt to improve
+by >= 3x.  On Qwen3.8-Flash-Next IQ3_XXS (2 GPUs, `-ncmoe 47`, `MOE_EXPERT_CACHE_MIB=8192` so the arena really
+streams -- `evictions=48166`) the arm reads **2.7x**: 7.397 -> 2.757 s.
+
+That is the **ceiling**, not a weak fix.  The short prompt needs ~3 steps (a 7-token prompt is split 3 + 4 by
+the checkpoint tail rule, plus one step of arrival alignment), so with a 4400-token long prompt and chunk 512
+the ceiling is `L / (3*chunk) = 4400/1536 = 2.86`.  Everything else on the arm is clean: decoder ITL
+3473 -> 1085 ms (3.2x), lone prefill 563 -> 561 t/s (-0.3 %, so chunked admission does not tax the streaming
+prefill), single-request text identical, no GPU fault.
+
+**Fix:** derive the bound from `L/(k*chunk)` with `k` the short prompt's measured step count, instead of a
+fixed 3.0 -- the same correction the ITL bound already needed on the UMA box (a fixed millisecond count cannot
+be shape-independent).  Until then, a streamed-prefill run must pass `--min-ttft-ratio 2.5` and say why; the
+alternative (a default low enough for every shape) would stop the gate rejecting a partial fix.
