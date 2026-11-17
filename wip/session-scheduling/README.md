@@ -358,6 +358,21 @@ gives **`b ≈ 2 ms`** (chunk 512 vs no cap on a lone 13.2 k prompt: 2.030 s vs 
 38 ms of difference).  **`b` differs by 100×, and that is the whole story** — which is why "chunk = ubatch is
 the sweet spot" was a single-GPU-dense conclusion that does not transfer.
 
+**The ubatch width is the unit of work** (same shape, `-np 1`, one 16504-token prompt, experts resident,
+`c` = 1).  This prices the "-b 16384 -ub 4096" recommendation directly:
+
+| `-ub` | solo prefill | vs 16384 |
+|---|---|---|
+| 16384 | 3197 t/s | — |
+| 8192 | 2921 t/s | −8.6 % |
+| 4096 | 2828 t/s | −11.5 % |
+| 2048 | 2736 t/s | −14.4 % |
+
+2828 t/s at `-ub 4096` matches the c4 `chunk=4096` aggregate of 2832 almost exactly — the ubatch, not the
+batch, is what the kernels see.  So buying a ~1.45 s decoder bound instead of ~5.4 s costs 7 % (c4) to 11.5 %
+(c1) of prefill on this shape; the bound at `-ub 512` would cost ~half (§ above), which is why `b ≈ 196 ms`
+sets a floor on how cheap a short chunk can be.
+
 Two consequences, both now in the code:
 
 1. **`chunk = n_ubatch` is a FLOOR, not a sweet spot.**  Below `n_ubatch` a step still issues one
