@@ -251,10 +251,12 @@ def spec_stats(log):
 
 
 def check_arm_config(log, fair, chunk):
-    m = re.search(r"prefill admission: fair share = (\w+), chunk = (\d+)", log)
+    # chunk is `off`, `n_ubatch` or an explicit count (it stopped being an integer when the default
+    # became "follow the ubatch")
+    m = re.search(r"prefill admission: fair share = (\w+), chunk = (\w+)", log)
     if not m:
         return None
-    return (m.group(1), int(m.group(2)))
+    return (m.group(1), m.group(2))
 
 
 def main():
@@ -426,8 +428,8 @@ def main():
     hard(c["text"] == b["text"], "single-request text",
          f"{c['text']} vs {b['text']} (must be identical)")
 
-    ok_census = b["census"] == ("off", 0) and c["census"] == (
-        "off" if a.self_test else "on", 0 if a.self_test else a.chunk)
+    ok_census = b["census"] == ("off", "off") and c["census"] == (
+        "off" if a.self_test else "on", "off" if a.self_test else str(a.chunk))
     hard(ok_census, "census", f"baseline {b['census']}, candidate {c['census']}")
 
     aborts = [n for n, p in logs.items() if ABORT_RE.search(open(p, errors="replace").read())]

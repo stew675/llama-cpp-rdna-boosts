@@ -340,6 +340,36 @@ it cannot be starved), and it costs nothing measurable.  Shortest-remaining-firs
 strictly better on mean TTFT, but it needs aging and a starvation bound to be defensible, and it is much
 harder to write a gate for.  Do not conflate the two.
 
+### 4.2.1 The chunk's cost model, and why the default is now one ubatch (llama-benchy, 2026-11-17)
+
+`llama-benchy` on the field `runme` (Qwen3.8-Flash-Next GSQ-RCO-IQ3_XXS, 3 GPU tensor, `--parallel 4`,
+`--batch-size 16384 --ubatch-size 16384`, attendance pool on, PLE on CPU), `pp16384 (c4)` = 65536 tokens:
+
+| `LLAMA_SERVER_PREFILL_CHUNK` | total t/s | per-req t/s | ttfr | steps | s/step |
+|---|---|---|---|---|---|
+| 512 | 1453.6 | 364.6 | 40.6 s | 128 | 0.352 |
+| 4096 | 2832.3 | 708.1 | 21.0 s | 16 | 1.447 |
+| 16384 (= no cap here) | 3035.9 | 759.0 | 19.5 s | 4 | 5.398 |
+
+Fitting `step = a·tokens + b` over the first two rows gives `a = 0.306 ms/token` and **`b ≈ 196 ms`**, which
+predicts the third row within 4 %.  `b` is the **fixed per-step cost** — PLE on CPU, the host-expert tier and
+the attendance-pool mirror, all read over PCIe once per step whatever its width.  On the dense 4B the same fit
+gives **`b ≈ 2 ms`** (chunk 512 vs no cap on a lone 13.2 k prompt: 2.030 s vs 1.992 s, 19 extra steps,
+38 ms of difference).  **`b` differs by 100×, and that is the whole story** — which is why "chunk = ubatch is
+the sweet spot" was a single-GPU-dense conclusion that does not transfer.
+
+Two consequences, both now in the code:
+
+1. **`chunk = n_ubatch` is a FLOOR, not a sweet spot.**  Below `n_ubatch` a step still issues one
+   `llama_process()` and the same kernel launches, so it re-pays `b` for no reduction in launch count — it is
+   dominated by construction.  The prototype's default therefore changed from `0` (off) to **follow
+   `n_ubatch`**, with `0` now meaning explicitly off.  On the field `runme` (`ub == b == 16384`) that default
+   is a **no-op that reproduces its best row**; on the 4B (`ub 512`, `b 2048`, `b≈2 ms`) it is the measured
+   near-free point.
+2. **A real ITL bound is only purchasable by lowering `-ub` as well.**  With `ub == b` there is no chunk that
+   both binds and stays above the ubatch, so the coupling is honest rather than hidden: to bound a decoder's
+   wait you must give up ubatch width, and the price is `(n_batch/chunk − 1) × b` per request's prefill.
+
 **The mean-TTFT cost is real and is accepted deliberately.**  For two equal-length prompts, fair sharing
 moves 1.90/3.86 s to ~3.7/3.7 s: mean rises (2.88 → 3.7 s), max falls.  A server should not hand one
 caller a lottery win at the expense of an unbounded wait for the next — that is the whole argument of §3.1 —
@@ -529,7 +559,8 @@ the arm is clean.  Recorded as `TODO` **#338**: the fairness bound must be deriv
 than a fixed 3.0, or `--min-ttft-ratio` must be set per shape with the reason stated.
 
 Knobs, as shipped in the prototype: `LLAMA_SERVER_PREFILL_FAIR` (on unless `0`, a kill-switch) and
-`LLAMA_SERVER_PREFILL_CHUNK` (`0` = off).  The chunk is applied in **both** modes, because it is a separate
+`LLAMA_SERVER_PREFILL_CHUNK` (**unset = one `n_ubatch`**, `0` = off, `N` = explicit).  §4.2.1 has the cost
+model behind the default.  The chunk is applied in **both** modes, because it is a separate
 mechanism — so `FAIR=0 CHUNK=512` is a valid arm (today's fill, bounded per step), which is exactly the
 bisection pair the gate needs.  One-shot census line at startup: `prefill admission: fair share = on/off,
 chunk = N`.
