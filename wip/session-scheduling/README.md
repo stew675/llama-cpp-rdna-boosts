@@ -447,6 +447,22 @@ So on the shape where the per-step token count *is* the arena's band input, the 
 in solo prefill and cuts the decoder's worst wait 3.1 ×.  The one-shot census line also confirms the arena
 is unchanged (same 83.6 % residency in both arms).
 
+**A third shape — MTP speculative decoding, the `LLAMA_SPEC_ALIGN` interaction** (4B, `--spec-type draft-mtp
+--spec-draft-n-max 3`, `-c 32768`, gate = `--quick`):
+
+| arm | short TTFT | decoder ITL max | lone prefill | single-req text | draft acceptance |
+|---|---|---|---|---|---|
+| `FAIR=0 CHUNK=0` | 2.091 s | 310 ms | 6162 t/s | ref | 0.853 (261/306) |
+| `FAIR=1 CHUNK=512` | **0.220 s** (9.5 ×) | **89 ms** | 6173 t/s (+0.2 %) | identical | **0.853 (261/306)** |
+
+**Acceptance is identical, and it is not a coincidence.**  `split_equal()` gives each drafting sequence its
+`n_verify` rows *and* one prompt row per round, so the verify ubatch has the same shape in both arms — the
+fair share only trims the prompt side.  The drafting slot's numerics are therefore untouched, which is the
+result to want: a scheduling policy must not perturb the speculative path.  The **two-slot drafting** case
+(the one `LLAMA_SPEC_ALIGN` exists for) is the aggregate-decode arm — both slots drafting at once — and it
+also read identical (132 → 133 t/s, +0.6 %), with the same acceptance totals.  So the align pass and the
+prompt budget do not fight over the same rows.
+
 Knobs, as shipped in the prototype: `LLAMA_SERVER_PREFILL_FAIR` (on unless `0`, a kill-switch) and
 `LLAMA_SERVER_PREFILL_CHUNK` (`0` = off).  The chunk is applied in **both** modes, because it is a separate
 mechanism — so `FAIR=0 CHUNK=512` is a valid arm (today's fill, bounded per step), which is exactly the
@@ -565,6 +581,12 @@ cannot reject the unfixed build is not a gate — run this before trusting a gre
 
 Cost: ~90 s (two cold loads, 13.2 k-token prompts, `-lv 4` for the census and the fault scan; the HTTP
 responses are hashed, so `-lv 4` does not pollute the text — `AGENTS.md` → Verify).
+
+**Speculative arms are self-checking.**  When `--server-args` carries a `--spec-type`, the gate asserts that
+spec really initialized in **both** arms (a spec arm that silently failed to initialize would otherwise pass
+every other check) and that acceptance did not *collapse* (≥ 50 % of the baseline).  Acceptance is
+deliberately not asserted equal: the fair share changes the ubatch composition, and a verify width is a
+numerics reference (`GREEDY-PURITY.md` §63), so it is reported and only a collapse fails.
 
 Promotion path: on the block decision this becomes `scripts/gate-prefill-fairness.sh` (a bash wrapper,
 repo conventions) and joins `MANIFESTS.md` → Release gates as the gate for "the server's prompt admission

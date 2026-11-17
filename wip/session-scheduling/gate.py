@@ -54,6 +54,7 @@ TEXT_PROMPTS = [
     "[P2] List the first eight prime numbers, comma separated.",
 ]
 SHORT_PROMPT = "[SHORT] Name three planets."
+SPEC_RE = re.compile(r"draft acceptance = ([0-9.]+) \(\s*(\d+) accepted /\s*(\d+) generated\)")
 ABORT_RE = re.compile(r"GGML_ASSERT|GGML_ABORT|terminate called|Segmentation fault|fatal error", re.I)
 
 
@@ -227,6 +228,16 @@ def measure(srv, reps, dec_n, agg_n):
     return res
 
 
+def spec_stats(log):
+    """(accepted, generated, n_lines) from the per-request `draft acceptance` lines, or None if no spec ran."""
+    acc = gen = n = 0
+    for m in SPEC_RE.finditer(log):
+        acc += int(m.group(2))
+        gen += int(m.group(3))
+        n += 1
+    return (acc, gen, n) if n else None
+
+
 def check_arm_config(log, fair, chunk):
     m = re.search(r"prefill admission: fair share = (\w+), chunk = (\d+)", log)
     if not m:
@@ -307,6 +318,8 @@ def main():
                 results[name] = measure(srv, a.reps, dec_n, agg_n)
                 results[name]["census"] = cfg
                 results[name]["lone_tps"] = lone_tps
+                results[name]["spec"] = spec_stats(srv.log_text())
+                results[name]["spec_on"] = "adding speculative implementation" in srv.log_text()
             finally:
                 srv.stop()
             logs[name] = log_path
@@ -362,10 +375,13 @@ def main():
         hard(itl_ok, "decode ITL max",
              f"{ci.get('max', 0):.0f}ms <= {itl_bound_ms:.0f}ms ({itl_why}); "
              f"baseline max {bi.get('max', 0):.0f}ms")
-    if ci and ci["p95"] and ci["max"] > 3.0 * ci["p95"]:
-        warns.append("ITL tail")
-        print(f"  [WARN] ITL tail: max {ci['max']:.0f}ms is > 3x p95 {ci['p95']:.0f}ms -- one single-event "
-              f"stall, not a steady state (arena settle / pool fill); recorded, not failed")
+    # a max close to the bound is expected (it IS one chunk of prompt); only a max that overshoots it while
+    # still passing is worth naming.  Comparing against p95 instead produced a false "single-event stall" on
+    # an arm whose median was 0 ms and whose max was simply the last chunk (88 ms of a 144 ms bound).
+    if ci and itl_bound_ms > 0 and ci["max"] > 0.9 * itl_bound_ms:
+        warns.append("ITL near bound")
+        print(f"  [WARN] ITL near the bound: max {ci['max']:.0f}ms of {itl_bound_ms:.0f}ms -- within limits "
+              f"but with little headroom; the cap is what sets this, so lower --chunk to buy margin")
     # The cap BOUNDS the tail but touches MORE steps (it converts a few 1 s stalls into many short ones), so
     # p95 legitimately gets worse while max gets better.  Both are reported; only max is asserted, because
     # "the wait is bounded by one chunk" is the claim being made.
@@ -398,6 +414,19 @@ def main():
     else:
         warns.append("GPU faults")
         print(f"  [WARN] GPU faults: no {faults}; not checked")
+
+    # speculative decoding: with `--spec-type ...` in --server-args, assert that it really ran in BOTH arms
+    # (a spec arm that silently failed to initialize would pass every other check) and that acceptance did not
+    # collapse.  Acceptance is NOT asserted equal: the fair share changes the ubatch composition, and a verify
+    # width is a numerics reference (GREEDY-PURITY.md §63), so it is reported and only a collapse is a failure.
+    if c["spec_on"] or b["spec_on"]:
+        ok_on = b["spec_on"] and c["spec_on"]
+        hard(ok_on, "spec active", f"baseline {b['spec_on']}, candidate {c['spec_on']}")
+        if ok_on and b["spec"] and c["spec"]:
+            br, cr = b["spec"][0] / b["spec"][1], c["spec"][0] / c["spec"][1]
+            hard(cr >= 0.5 * br, "spec acceptance",
+                 f"{br:.3f} ({b['spec'][0]}/{b['spec'][1]}) -> {cr:.3f} ({c['spec'][0]}/{c['spec'][1]}); "
+                 f"need >= {0.5 * br:.3f} (a collapse, not equality -- §63)")
 
     dg = (c["agg_tps"] / b["agg_tps"]) if b["agg_tps"] else 0.0
     soft(dg >= 1.0 - a.max_decode_loss, "aggregate decode",
