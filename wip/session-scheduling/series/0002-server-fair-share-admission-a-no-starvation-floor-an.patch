@@ -1,0 +1,65 @@
+From 1b4f9a705d4404a85100efc8ebb5a74e886ecb27 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Mon, 16 Nov 2026 18:27:44 -0600
+Subject: [PATCH 2/4] server: fair-share admission -- a no-starvation floor and
+ an explicit mixed-batch carve-out
+
+Two hardening items found while writing the gate (`wip/session-scheduling/gate.py`):
+
+* **No permanent starvation.**  `budget = n_batch - (decode tokens)` is 0 when the decode tokens alone commit
+  the window, which happens when `n_parallel >= n_batch`.  With a plain max-min share that is a permanent
+  denial: the decoding slots hold the batch forever and no prompt ever advances (today's slot-order fill has
+  the same hole via the `batch.size() >= n_batch` return).  The share now floors at one token per active
+  prompt, so the batch may exceed `n_batch` by at most `n_active` and the outer `llama_process()` loop splits
+  it.  That extra pass is only paid in the degenerate `n_parallel >= n_batch` case.
+
+* **Mixed / non-causal batches opt out.**  `use_mixed_batch()` (no memory, or no causal attention) goes
+  through `add_prompt_mixed()`, which places a whole prompt at once, so a per-sequence share is not
+  expressible there.  The policy is now left OFF for those contexts rather than half-applied -- a
+  half-applied share would let one slot exceed its budget silently.
+
+Both are inert on the causal text path the campaign measures: same arms, same numbers (short TTFT 1.91 s ->
+0.28 s, decoder ITL 331 -> 99 ms, lone prefill -0.8 %, single-request text identical).
+---
+ tools/server/server-context.cpp | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 3f434f9f0..50bb6d8f5 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2247,6 +2247,13 @@ private:
+             remaining[k] = r;
+         }
+ 
++        // No permanent starvation: even when the decode tokens have committed the whole window (only
++        // possible when n_parallel is at or above n_batch), every active prompt still gets one token.  The
++        // batch then exceeds n_batch by at most n_active tokens and the outer llama_process() loop splits it
++        // into a second pass, which is the price of never starving a prompt.  Without this, a config with
++        // n_parallel >= n_batch would let the decoding slots deny prompt admission forever.
++        budget = std::max(budget, (int32_t) active.size());
++
+         while (!active.empty() && budget > 0) {
+             const int32_t share = budget / (int32_t) active.size();
+             if (share <= 0) {
+@@ -4427,12 +4434,16 @@ private:
+             const int32_t cap    = prefill_chunk > 0 ? std::min(n_batch, prefill_chunk) : n_batch;
+             const int32_t budget = std::max(0, cap - (int32_t) batch.size());
+ 
+-            if (prefill_fair) {
++            if (prefill_fair && !use_mixed_batch()) {
+                 share_prompt_budget(prompt_budget, budget);
+             } else {
+                 // kill-switch: keep today's slot-order fill.  The per-step cap is a separate mechanism and
+                 // still applies -- every slot may add up to the whole remaining window, so the lowest slot
+                 // that wants one wins, exactly as before.
++                //
++                // A mixed / non-causal batch (use_mixed_batch(): no memory, or no causal attention) is the
++                // same path: add_prompt_mixed() places a whole prompt at once, so a per-sequence share is not
++                // expressible there.  The policy is left off rather than half-applied.
+                 for (auto & b : prompt_budget) {
+                     b = budget;
+                 }
+-- 
+2.56.0
+

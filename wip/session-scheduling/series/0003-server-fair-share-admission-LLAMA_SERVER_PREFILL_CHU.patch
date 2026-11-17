@@ -1,0 +1,77 @@
+From 153c288cd67cf251cd1648c2a0cb732c0a8593b7 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Mon, 16 Nov 2026 20:12:02 -0600
+Subject: [PATCH 3/4] server: fair-share admission --
+ LLAMA_SERVER_PREFILL_CHUNK defaults to one n_ubatch (0 = explicit off),
+ because a sub-ubatch chunk is dominated by the per-step fixed cost
+
+Measured with llama-benchy on the field runme (see the delivery repo's wip/session-scheduling 4.2.1):
+a step costs a*tokens + b with b ~= 196 ms on that shape (PLE on CPU + host experts + attendance pool, each
+read over PCIe once per step) and b ~= 2 ms on a dense 4B.  Below n_ubatch a step issues the same one
+llama_process() and the same launches, so it re-pays b for nothing -- the value is dominated by construction,
+which makes n_ubatch a floor rather than a tuned sweet spot.
+
+Census now prints chunk = n_ubatch | off | N.
+---
+ tools/server/server-context.cpp | 29 +++++++++++++++++++++--------
+ 1 file changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 50bb6d8f5..159ca7c02 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1156,13 +1156,21 @@ private:
+         return e == nullptr || atoi(e) != 0;
+     }();
+ 
+-    // LLAMA_SERVER_PREFILL_CHUNK (0 = off): cap the prompt tokens admitted per step.  This is also the
+-    // worst-case wait for a newly arrived request and the bound on a decoding slot's inter-token latency,
+-    // because a batch is assembled once per step and cannot be joined mid-flight.  Off by default: the fair
+-    // share is the measured-free half, the cap is a trade nobody has measured yet.
++    // LLAMA_SERVER_PREFILL_CHUNK (unset = one ubatch, 0 = off): cap the prompt tokens admitted per step.  This
++    // is also the worst-case wait for a newly arrived request and the bound on a decoding slot's inter-token
++    // latency, because a batch is assembled once per step and cannot be joined mid-flight.
++    //
++    // The default is ONE UBATCH because a smaller chunk is dominated: below `n_ubatch` a step still issues the
++    // same one `llama_process()` call and the same kernel launches, so it pays the step's fixed cost again for
++    // no reduction in launch count.  That fixed cost is what decides the trade and it is shape-dependent --
++    // ~2 ms on a dense model on one GPU, ~196 ms on a PLE-on-CPU + host-expert + attendance-pool shape (fitted
++    // from llama-benchy: 128 steps of 512 tok cost 45.1 s against 4 steps of 16384 at 21.6 s for the same
++    // 65536 tokens).  So `chunk = n_ubatch` is a no-op where the ubatch is already the batch (a big-prefill
++    // config), and near-free where the ubatch is a quarter of it -- and a real ITL bound requires lowering
++    // -ub as well as this, which is the honest coupling.
+     const int32_t prefill_chunk = [] {
+         const char * e = getenv("LLAMA_SERVER_PREFILL_CHUNK");
+-        return e != nullptr ? std::max(0, atoi(e)) : 0;
++        return e != nullptr ? std::max(0, atoi(e)) : -1; // -1: follow n_ubatch
+     }();
+ 
+     // rotating start for the fair-share walk, so the tie-break is not always slot 0
+@@ -1699,8 +1707,9 @@ private:
+                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
+ 
+         // the prompt admission policy, so a log always says which one ran (wip/session-scheduling)
+-        SRV_INF("prefill admission: fair share = %s, chunk = %d\n",
+-                prefill_fair ? "on" : "off", prefill_chunk);
++        SRV_INF("prefill admission: fair share = %s, chunk = %s\n",
++                prefill_fair ? "on" : "off",
++                prefill_chunk < 0 ? "n_ubatch" : prefill_chunk == 0 ? "off" : std::to_string(prefill_chunk).c_str());
+ 
+         // initialize slots
+         for (int i = 0; i < params_base.n_parallel; i++) {
+@@ -4431,7 +4440,11 @@ private:
+         // is left across every slot that still has prompt tokens.  See share_prompt_budget().
+         std::vector<int32_t> prompt_budget(slots.size(), 0);
+         {
+-            const int32_t cap    = prefill_chunk > 0 ? std::min(n_batch, prefill_chunk) : n_batch;
++            // -1 = follow the ubatch (the default), 0 = no cap, >0 = explicit
++            const int32_t want   = prefill_chunk > 0 ? prefill_chunk
++                                 : prefill_chunk < 0 ? (int32_t) n_ubatch
++                                 : n_batch;
++            const int32_t cap    = std::min(n_batch, want);
+             const int32_t budget = std::max(0, cap - (int32_t) batch.size());
+ 
+             if (prefill_fair && !use_mixed_batch()) {
+-- 
+2.56.0
+

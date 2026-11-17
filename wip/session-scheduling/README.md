@@ -4,7 +4,8 @@
 `rdna-boosts` branch or a release gate, and nothing is applied by `scripts/apply-all.sh`.  No `TODO` handle
 yet (the maintainer assigns one when this is accepted as work).
 
-Status: **OPEN — design + a first-cut prototype (2026-11-17).**  The prototype lives in the fork on branch
+Status: **OPEN — design + a first-cut prototype (2026-11-17).**  The prototype is **backed up here as a
+four-commit patch series plus a net diff** (§9: trees, sha256, apply instructions, and the size of the change).  The prototype lives in the fork on branch
 **`sched-fair-prefill`** (commit `a1f8a1613`, off `rdna-boosts`, one file, +130/-2); it is not a delivery
 block and must not be promoted without the maintainer's go-ahead.  §4.7 records what it measured.  The §2
 baseline numbers were taken on the delivery at `rdna-boosts` tip `c215c77f3` (r299 tree), gfx1201 ×1,
@@ -797,6 +798,37 @@ slot permutation, not the memory policy.
 **Lesson, recorded on purpose:** an anomaly seen twice in a harness that was later found to be uncontrolled is
 not a defect report.  It should have been held until it reproduced.
 
+### 6.2 `TODO` #338 — the fairness ratio is shape-dependent, and one streaming arm is short of its ceiling
+
+`gate.py` requires the short-prompt TTFT to improve by >= 3x.  Two arms miss it, for **different** reasons, and
+neither is a defect in the policy:
+
+**(a) `-ncmoe` streamed-prefill arm — 2.7x, and that IS the ceiling.**  Qwen3.8-Flash-Next IQ3_XXS, 2 GPU,
+`MOE_EXPERT_CACHE_MIB=8192` (real streaming, `evictions=48166`): 7.397 → 2.757 s.  A 7-token prompt is split
+3 + 4 by the checkpoint tail rule and needs one step of arrival alignment, i.e. ~3 steps, so the ceiling is
+`L/(3*chunk) = 4400/1536 = 2.86`.  Everything else on the arm is clean (ITL 3473 → 1085 ms = 3.2x, lone prefill
+−0.3 %, text identical, no fault).  **A fixed ratio cannot express this**: the same threshold is comfortable on
+a 13.2 k prompt and unreachable on a 4.4 k one at the same chunk.
+
+**(b) attendance-pool arm — 2.6x against a 5.7x ceiling, genuinely short and NOT explained.**  Qwen3.8-Flash-Next,
+1 discrete GPU, `-ncmoe 47`, `--kv-unified --kv-attendance-pool on` (the pool engages: 4096 pages x 4 cells,
+384 MiB device + 384 MiB pinned mirror): 9.914 → 3.886 s.  Here 2.6x is well below `8800/1536 = 5.7`, so the
+step-count argument above does **not** cover it: the short prompt took ~5 chunks where 2-3 were expected.
+Everything else is clean (ITL 3535 → 1090 ms = 3.2x, lone prefill −0.3 %, text identical, no fault).
+
+**The likely carrier, not established:** the attendance pool's prefill reads the authoritative KV from the
+pinned host mirror over PCIe, so the short slot's page fills may queue behind the long slot's.  But "the pool
+adds a fixed per-step fill cost" and "the scheduler admits the short prompt late under the pool" are different
+defects with different fixes, and this session did not disambiguate them.  **The discriminating experiment** is
+to time the short slot's *admission* (the `-lv 5` `fair share: budget=…/added=…` line for slot 1) against
+5 chunks of prefill: if it is admitted in step 1 and still takes 5 chunks, the carrier is the pool; if the
+budget line shows it admitted late, the carrier is the scheduler.
+
+**Fix for both:** derive the bound from `L/(k*chunk)` with `k` the short prompt's measured step count, rather
+than a fixed ratio — the same correction the ITL bound already needed on the UMA box.  Until then a
+streamed-prefill or pooled run must pass `--min-ttft-ratio 2.5` and say why; the alternative (a default low
+enough for every shape) would stop the gate rejecting a partial fix.
+
 ## 7. Risks / open questions
 
 * **Prefill throughput vs ITL.**  §4.4's cap is a real trade; the default must come from measurement on
@@ -826,3 +858,46 @@ not a defect report.  It should have been held until it reproduced.
   invocation are in this README and the script's header).  The numbers here are one session on one card —
   a gate must re-take them on the release build and on gfx1151.  This is a scoping note, not a validated
   result.
+
+## 9. The patch series (backup, and how to reproduce the branch)
+
+The prototype lives on branch `sched-fair-prefill` in `~/llama.cpp` (and was applied over ssh to `halo` and
+`fingon`).  It is backed up here as a **four-commit series with full messages** plus a **net diff**:
+
+| file | what |
+|---|---|
+| `series/0001-*.patch` .. `series/0004-*.patch` | the four commits, `git format-patch` output (messages included) |
+| `sched-fair-prefill.patch` | the net diff, applyable to a clean checkout of the delivery tree |
+
+```
+base tree  3da54a4c10d7350eddc5c0d8eae384086a306b0f   (= release.json.tree, i.e. the r299 delivery tree)
+tip tree   4baf1b67ae591e6661a1e3c5365457a747b688ab
+```
+
+```
+sha256  3d4a9d699ea64212749c259ff836a390e9433c34afb80525df57d61cb06f3ec8  sched-fair-prefill.patch
+        6dc5c2b4...  d5e78cac...  7e9511bf...  fad9f9db...                 series/0001..0004
+```
+
+Reproduce the branch from the delivery tree:
+
+```bash
+git clone <llama.cpp> && cd llama.cpp && git checkout 4f9dfa0e3     # release.json.base
+bash <delivery>/scripts/apply-all.sh .                              # the default set (tree 3da54a4c…)
+git checkout -b sched-fair-prefill
+git apply <delivery>/wip/session-scheduling/sched-fair-prefill.patch
+# or, to keep the four commit messages:  git am <delivery>/wip/session-scheduling/series/*.patch
+```
+
+Verified: `git apply --check` of the net diff on a worktree at tree `3da54a4c…` passes (done 2026-11-17).
+
+**Size of the change.**  One file, `tools/server/server-context.cpp`:
+
+| | lines |
+|---|---|
+| added (net) | **207** — of which **128 code**, 54 comment, 25 blank |
+| removed (net) | **2** (1 code, 1 comment) |
+| **net** | **+205 lines, +127 code lines, 1 file** |
+
+For scale: `wip/session-scheduling/gate.py` (the gate) is ~390 lines of Python and `probe.py` ~230, neither of
+which is delivery code.

@@ -1,0 +1,129 @@
+From d37abe237ac299eb5ca09da85e66c5c4cc4cea56 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Mon, 16 Nov 2026 20:43:00 -0600
+Subject: [PATCH 4/4] server: LLAMA_SERVER_PREFILL_SKEW (default 1 = the equal
+ share) -- weight the shortest-remaining slot N:1 so the shortest answers and
+ retires first while the others keep advancing
+
+Default 1 leaves the allocation bit-identical to the measured max-min share; 1..64 is a tunable droop toward
+shortest-remaining-first.  Not SRPT: a one-token-each pre-pass plus strictly positive weights keeps starvation
+impossible, and every non-shortest slot still makes progress every step.
+
+Measured on 4B -np 4 (four prompts, 6000/3000/1500/400 tokens, chunk=n_ubatch): mean TTFT 1.401 -> 1.082 s at
+skew 5 and 1.040 s at 20; mean completion 1.621 -> 1.297 / 1.239 s.  The long prompts improve too (2.201 ->
+1.975 s) because the short slots retire early and stop competing, so the policy wins on mean AND max here.
+Census prints 'skew = N'.
+---
+ tools/server/server-context.cpp | 69 +++++++++++++++++++++++++++++----
+ 1 file changed, 61 insertions(+), 8 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 159ca7c02..aee311baa 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1173,6 +1173,21 @@ private:
+         return e != nullptr ? std::max(0, atoi(e)) : -1; // -1: follow n_ubatch
+     }();
+ 
++    // LLAMA_SERVER_PREFILL_SKEW (default 1 = off): weight the slot with the SHORTEST remaining prompt this
++    // many times against the others.  >1 is a tunable droop from the max-min fair share toward
++    // shortest-remaining-first: the shortest answers and finishes sooner, every other slot still advances on
++    // every step (and so still gives feedback), and the rest accelerate as slots retire.  Any value >= 1 keeps
++    // starvation impossible.  1 is the plain max-min share and allocates EXACTLY what it did before this knob
++    // existed, so the equal-share measurements stay valid.
++    const int32_t prefill_skew = [] {
++        const char * e = getenv("LLAMA_SERVER_PREFILL_SKEW");
++        if (e == nullptr) {
++            return 1;
++        }
++        const int v = atoi(e);
++        return v < 1 ? 1 : v > 64 ? 64 : v;
++    }();
++
+     // rotating start for the fair-share walk, so the tie-break is not always slot 0
+     int32_t slot_next = 0;
+ 
+@@ -1707,9 +1722,10 @@ private:
+                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
+ 
+         // the prompt admission policy, so a log always says which one ran (wip/session-scheduling)
+-        SRV_INF("prefill admission: fair share = %s, chunk = %s\n",
++        SRV_INF("prefill admission: fair share = %s, chunk = %s, skew = %d\n",
+                 prefill_fair ? "on" : "off",
+-                prefill_chunk < 0 ? "n_ubatch" : prefill_chunk == 0 ? "off" : std::to_string(prefill_chunk).c_str());
++                prefill_chunk < 0 ? "n_ubatch" : prefill_chunk == 0 ? "off" : std::to_string(prefill_chunk).c_str(),
++                prefill_skew);
+ 
+         // initialize slots
+         for (int i = 0; i < params_base.n_parallel; i++) {
+@@ -2263,15 +2279,49 @@ private:
+         // n_parallel >= n_batch would let the decoding slots deny prompt admission forever.
+         budget = std::max(budget, (int32_t) active.size());
+ 
++        // One token each FIRST, whatever the weights are: that is what keeps a low-weight slot in every step,
++        // and it leaves the default allocation identical to the plain share (budget/n == 1 + (budget-n)/n).
++        {
++            std::vector<size_t> next;
++            for (const size_t k : active) {
++                prompt_budget[k] += 1;
++                remaining[k]     -= 1;
++                budget           -= 1;
++                if (remaining[k] > 0) {
++                    next.push_back(k);
++                }
++            }
++            active.swap(next);
++        }
++
++        // then share the remainder, weighting the shortest-remaining slot `prefill_skew` times
+         while (!active.empty() && budget > 0) {
+-            const int32_t share = budget / (int32_t) active.size();
+-            if (share <= 0) {
+-                break; // the window is committed (decode tokens, or shares already handed out)
++            size_t skew_i = active.size();
++            if (prefill_skew > 1 && active.size() > 1) {
++                int64_t best = -1;
++                for (size_t i = 0; i < active.size(); ++i) {
++                    if (best < 0 || remaining[active[i]] < best) {
++                        best   = remaining[active[i]];
++                        skew_i = i; // ties keep the first in the rotated order
++                    }
++                }
+             }
+ 
++            int64_t wsum = 0;
++            for (size_t i = 0; i < active.size(); ++i) {
++                wsum += (i == skew_i ? prefill_skew : 1);
++            }
++            if (wsum <= 0) {
++                break;
++            }
++
++            const int32_t budget_before = budget;
+             std::vector<size_t> next;
+-            for (const size_t k : active) {
+-                const int64_t take = std::min<int64_t>(remaining[k], share);
++            for (size_t i = 0; i < active.size(); ++i) {
++                const size_t  k = active[i];
++                const int64_t w = (i == skew_i ? prefill_skew : 1);
++                const int64_t share_i = (int64_t) budget * w / wsum;
++                const int64_t take    = std::min<int64_t>(remaining[k], share_i);
+ 
+                 prompt_budget[k] += (int32_t) take;
+                 remaining[k]     -= take;
+@@ -2281,8 +2331,11 @@ private:
+                     next.push_back(k);
+                 }
+             }
+-
+             active.swap(next);
++
++            if (budget == budget_before) {
++                break; // integer truncation gave nobody a token; the window is effectively committed
++            }
+         }
+ 
+         slot_next = (slot_next + 1) % (int32_t) slots.size();
+-- 
+2.56.0
+
