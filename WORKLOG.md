@@ -1,7 +1,7 @@
 ## 261117.002 (r303, RELEASE v17-4f9dfa0e3-r303) -- the merged-layout qwen4exp GGUF (post-#31028 `hc_*_down_inject`) gets a graph that builds AND the fused mixer, folded into official block 11 with a synthetic fixture, a CI arm and a repaired gate
 
 **What shipped.**  Block 11 only (`src/models/qwen4exp.cpp`, `src/llama-model-loader.cpp`,
-`tests/test-llama-archs.cpp`); `release.json` at **`v17-4f9dfa0e3-r303`** (tip `8f70fbc62`, tree `f80b71fab`,
+`tests/test-llama-archs.cpp`); `release.json` at **`v17-4f9dfa0e3-r303`** (tip `af497e7ba` = the re-cut `rdna-boosts` branch tip, tree `f80b71fab`,
 optional trees re-cut `81e6abfe6` / `05488f858`, cumulative `394796a10`).  Contributor PR #321
 (`briansp2020`) reported the crash; the fold is its guard plus the rest of the layout's support.
 
