@@ -399,11 +399,20 @@ mechanism — so `FAIR=0 CHUNK=512` is a valid arm (today's fill, bounded per st
 bisection pair the gate needs.  One-shot census line at startup: `prefill admission: fair share = on/off,
 chunk = N`.
 
-Still open for the first cut to become a block: the `-lv 5` per-step `fair share: budget/added/batch` line is
-debug-only and should become the gate's assertion source; `n_parallel`-above-`n_batch` sizing; the
-`can_batch_with()` homogeneity case (two LoRA classes still serialise — unfixable from the fill policy); and
-the mixed / mtmd path (`add_prompt_mixed()`) which ignores the budget because a non-causal batch cannot be
-chunked per sequence.
+Two hardening items landed with the gate (commit `1b4f9a705`), both inert on the causal text path:
+
+* **No permanent starvation.**  `budget = n_batch - (decode tokens)` is 0 when the decode tokens alone commit
+  the window — possible when `n_parallel >= n_batch` — and a plain max-min share then denies prompts forever
+  (today's fill has the same hole via the `batch.size() >= n_batch` return).  The share now floors at one
+  token per active prompt; the batch may exceed `n_batch` by at most `n_active` and the outer
+  `llama_process()` loop splits it, so the extra pass is paid only in that degenerate case.
+* **Mixed / non-causal batches opt out.**  `use_mixed_batch()` goes through `add_prompt_mixed()`, which
+  places a whole prompt at once, so a per-sequence share is not expressible there.  The policy is left OFF
+  for those contexts rather than half-applied.
+
+Still open for the first cut to become a block: the `-lv 5` per-step `fair share: budget/added/batch` line
+should become a `-lv 4` census (it is the gate's assertion source); and the `can_batch_with()` homogeneity
+case — two LoRA classes still serialise, which is not fixable from the fill policy.
 
 ## 5. Not P0 — three questions kept separate
 
@@ -474,21 +483,39 @@ feature there; on 3 GPUs `-sm tensor` already spreads every step across all thre
 parallelism would mean replicating weights.  P0 delivers most of the felt benefit for a fraction of the
 cost, which is why it is first.
 
-## 6. Gate this campaign would add (on acceptance)
+## 6. The gate — implemented (`gate.py`, this directory)
 
-A sibling of `scripts/gate-prefill-server-slots.sh` (same two-slot server, same shape), on a small dense
-model so it runs anywhere:
+`./gate.py` — two arms on the same binary, `-np 2`, one GPU:
 
-* **HARD** short-prompt TTFT behind a ≥8 k prompt ≤ `--max-short-ttft` (default 0.2 s).
-* **HARD** decoder p95 ITL during the other slot's prefill ≤ `--max-itl` (default 100 ms).
-* **HARD** both arms produce the same greedy text **per request** (a single-slot comparison, never a
-  two-slot diff — §63).
-* **SOFT** lone-long-prompt prefill t/s within 3 % of the pre-change build; aggregate decode at
-  concurrency 2 within 2 %.
-* **HARD** no GPU fault (`scripts/check-gpu-faults.sh`), no abort.
+| arm | config |
+|---|---|
+| `baseline` | `FAIR=0 CHUNK=0` — today's slot-order fill |
+| `candidate` | `FAIR=1 CHUNK=<ubatch>` — fair share + the per-step cap |
 
-`llama-batched-bench -npl 1,4,8` is a throughput control, not a fairness oracle; it cannot see any of this
-(it has no per-request latency).
+**HARD**
+* short-prompt TTFT behind a 13.2 k prompt improves by ≥ `--min-ttft-ratio` (3 ×) — measured 6.9 ×;
+* the candidate's worst decoder ITL during a foreign prefill ≤ `--max-itl-ms` (120 ms) — measured 99 ms;
+* a lone long prompt's prefill throughput within `--max-prefill-loss` (3 %) — measured −0.8 %;
+* **one** request's greedy text byte-identical between the arms (the single-slot oracle; a two-slot pair is
+  never a text oracle, §63);
+* each arm's startup census states the configuration it claims (`prefill admission: fair share = ...`);
+* no abort/assert in either log, and `scripts/check-gpu-faults.sh` clean — **with `--since` bounded to the
+  run**.  An unbounded journal check fails on yesterday's faults (it did: the first run reported faults from
+  2026-11-15, `journalctl -k --since "40 min ago"` showed 0).  A gate must scope its own window.
+
+**SOFT** aggregate decode at concurrency 2 within `--max-decode-loss` (5 %) — measured +0.6 %.
+
+`--self-test` runs the candidate **as** the baseline configuration and requires the HARD fairness checks to
+fail.  Verified: it reports 1.0 × and 335 ms and exits 0 ("the gate rejects the defect").  A gate that
+cannot reject the unfixed build is not a gate — run this before trusting a green run.
+
+Cost: ~90 s (two cold loads, 13.2 k-token prompts, `-lv 4` for the census and the fault scan; the HTTP
+responses are hashed, so `-lv 4` does not pollute the text — `AGENTS.md` → Verify).
+
+Promotion path: on the block decision this becomes `scripts/gate-prefill-fairness.sh` (a bash wrapper,
+repo conventions) and joins `MANIFESTS.md` → Release gates as the gate for "the server's prompt admission
+policy".  The `-lv 5` per-step `fair share: budget/added/batch` line is the assertion source for the
+per-step checks and should become a `-lv 4` census before that.
 
 ## 7. Risks / open questions
 
