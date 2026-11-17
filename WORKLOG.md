@@ -73,6 +73,11 @@ class (PPL is identical, 2.1640 in both arms, so it is a ULP-class divergence); 
 `latest` bundle now lacks `workbox[hash].js`, which breaks any FRESH configure (`ui-assets.cmake:137`) --
 `HF_UI_VERSION=b12387` is the workaround, recorded in `scripts/gate-per-block-build.sh`'s header.
 
+**The fixtures are on this box** (`make-merged-hc-gguf.py` rebuilds them from the separate-tensor files in
+~2 min each): `/llm/models/Qwen3.8/Flash-Next/MERGED-Q8_0/` -- the target (70.63 GiB, 96 merged pairs, byte
+identical to the hand-built one) and the MTP draft (2.60 GiB, 2 pairs).  They are test fixtures, not a second
+distribution: 73 GiB of `/llm`, and the tool says so in its header.
+
 Record: `INVARIANTS.md` r303, `patches/README.md` block 11, gate row `MANIFESTS.md` (gate 9), contributor
 reply on PR #321.  The `From` ids move (the chain is re-cut); the tree is the contract.
 
