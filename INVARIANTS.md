@@ -381,3 +381,35 @@
    is `ui-assets.cmake`'s Priority 1 (pre-built assets win over npm and over the HF fetch, so a container build
    neither downloads that bundle nor validates it).  The workaround where it does bite is
    `HF_UI_VERSION=b12387` (the bundle `build-rocm` had stamped; it carries `workbox-b3c04f83.js`).
+
+## r304 (2026-11-17, `WORKLOG.md` 261117.003)
+
+1. **A fusion whose reads are a *staged copy* may ignore an overlap with the tensor it was staged from -- and
+   must not ignore it otherwise.**  The GDN K-quant epilogue replaces the generic fusion-window check for its own
+   window because that check declines ~29 of 30 layers, and the declines are real: the allocator places the
+   gate `MUL` output **inside `attn_norm-N`**, the F32 layer input the projections read (measured on every GDN
+   layer of Qwen3.6-35B-A3B; `GGML_CUDA_GDN_EPI_DBG`-style instrumentation, r304).  That is harmless only because
+   `ggml_cuda_mul_mat_vec_q` quantizes the activation to a **Q8_1 copy in a separate launch** and the matvec reads
+   the copy.  So the invariant is: the written set must be disjoint from `dt`/`ssm_a` (weights) **and, when the
+   activation's type is already `Q8_1`, from the activation** (no copy exists then).  An F16/BF16/F32 activation
+   with no staging copy in the launch would make the same allowance a corruption -- check the kernel's read set,
+   not its argument list.
+2. **A fusion that consumes a reshaped chain needs one test arm per weight type, and the arm must be
+   negative-tested.**  The r202 test covered BF16 + Q8_0 and would have passed a `2*ne01` row-count mistake in
+   the F32 branch (the beta rows would overwrite the alpha store region and the *text* hash can still match if
+   the store order hides it).  Dropping the doubling now fails 11/11 F32 shapes at maxdiff 0.7-1.4, which is what
+   makes the F32 arm a control rather than a formality.
+3. **The ksplit row concat's segment boundaries are already protected for these shapes, by `launch_ksplit`'s own
+   one-row fallback.**  Its `nrows_x % rpb != 0 || nrows_x < rpb * GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS` rule forces
+   `rows_per_block = 1`, and GDN `ssm_alpha`/`ssm_beta` have 32-48 rows -- far below `512 * rpb` -- so no block
+   can straddle a boundary and the epilogue's per-block segment id is exact.  Do not "simplify" that fallback
+   away: it is what the per-segment epilogue relies on, and the same reasoning is why the decode path only needs
+   even row counts on RDNA4.
+4. **`-ub 1` is not reachable from `llama-cli` on these models.**  `-b 1 -ub 1` aborts in `common.cpp`'s
+   `get_sub_batch` (`failed to add token 0 at index 1`), unrelated to any fusion, so a gate that sweeps ubatches
+   must start at 2 and take the 1-token prefill point from `llama-perplexity --ub 1` (`gate-prefill-logits.sh`).
+   A gate that captured `llama-cli`'s failure output into a variable while incrementing its own failure counter in
+   a subshell reported PASS with a failed arm -- run the failure accounting in the parent shell.
+5. **The F32 and BF16 gate/beta arms share one mmvf launch but not one row-count rule.**  `mul_mat_vec_f_cuda`
+   takes `gb && gb->gb_x2 ? 2*ne01 : ne01` on the BF16 *and* the F32 branch; only the BF16 branch had it before
+   r304.  Anything that extends this launch to another `T` must extend the row count with it.

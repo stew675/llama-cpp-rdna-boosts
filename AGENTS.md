@@ -371,6 +371,7 @@ tier runs what); this table is the quick answer for a change in flight.
 | the chunked-GDN prefill threshold (`GDN_CHUNKED_MIN_TOKENS`), `n_rs_batch`'s use as a kernel input, or a speculator's draft width | `scripts/gate-spec-gdn-split.sh` |
 | the MTP target h-rows path (`LLAMA_MTP_DEV_ROWS`), the `h_nextn` device buffer, or `llama_set_ctx_state_src` | `scripts/gate-mtp-dev-rows.sh` |
 | a qwen4exp hyper-connection op, chain or matcher | `scripts/gate-hc-fusions.sh MODEL.gguf` |
+| a GDN gate/beta chain fusion (the mmvf launch, the ksplit epilogue, its memory rule) or the concat reorder's `GGML_CUDA_FUSE_GDN_EPI` branch | `scripts/gate-gdn-epi.sh` (+ `tests/test-fusion-gate-beta-multiseq`) |
 | the narrow-row norm fusion (`norm-gated.cu`), its alloc-dep registration, or a new fusion that pre-dispatches a node | `scripts/gate-norm-rows-alias.sh` |
 | the hc base copy, `bf16_src1_cache_put()`, or the device `pool_stack` | `scripts/gate-hc-base-copy.sh` |
 | the fusion-window range check (`ggml_cuda_check_fusion_memory_ranges()`), a fusion's out-node set, or a host-expert scheduler copy | `scripts/gate-fusion-alias-copy.sh` |

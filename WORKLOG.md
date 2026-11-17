@@ -1,3 +1,73 @@
+## 261117.003 (r304, RELEASE v17-4f9dfa0e3-r304) -- the GDN gate/beta chain fused for F32 and K-quant projections (contributor PR #322), folded into block 10
+
+**What shipped.**  Block **10** only (`mmvf.cu`, `mmvq.cu`, `mmvq.cuh`, `mmvq-ksplit-body.inc`, `common.cuh`,
+`ggml-cuda.cu`, `ggml-cuda-try-fuse.cu`, `tests/test-fusion-gate-beta-multiseq.cpp`); `release.json` at
+**`v17-4f9dfa0e3-r304`** (tip `c4d421cc2`, tree `e4791d001`; optional re-cut `f1f7d18e8` / `25fbd3c7b`, cumulative
+`52ad58504`).  Contributor PR #322 (`briansp2020`) extends both chain fusions block 10 already owns -- BF16 in
+`mmvf` and Q8_0 in `mmvq` -- to the projection types the published Qwen3.5/3.6/3.8 GGUFs actually use: **F32**
+(`GGML_CUDA_FUSE_GATE_BETA_F32`; unsloth's UD quants keep `ssm_alpha`/`ssm_beta` F32) and **Q4_K / Q5_K / Q6_K /
+IQ4_XS / MXFP4** (the ksplit body's `gdn_epi` epilogue, `GGML_CUDA_FUSE_GDN_EPI`: folded into the decode
+alpha/beta/`attn_gate` row concat, and alpha + beta as ONE row-concat launch in the 2..8-token verify band).
+Block **03** was considered and rejected as the home: it owns the GDN *math* (chunked prefill, the rollback
+tracker) and touches none of these seven files; block 10 introduced every function the series extends, including
+the concat reorder that has to put the larger `attn_gate` projection in front for the verify-band launch.
+
+**The report was accurate, and its numbers are conservative.**  Applied clean to the r303 tree (plain
+`git apply`, no 3-way fuzz; the resulting tree is byte-identical to the set that was measured).  Their "output =
+stock" claim holds exactly: prefill-logit KLD **-0.000001 / 100.000 %** on the F32 arm (35B-A3B UD-Q4_K_M) and
+**0.000000 / 100.000 %** on the Q4_K arm (LMStudio Q4_K_M) at `-ub 1`, **4** and **8** -- each against a base
+recorded from the *previous build's binary*, so it is a stock-vs-series compare and not a self-compare.  Their
+"decode +0.9-1.1 %" reproduces and is beaten here: `llama-bench` tg128 (r=3, two interleaved rounds, 1 GPU
+`-sm layer`, `ROCBLAS_USE_HIPBLASLT=0`) **114.84/114.92 -> 117.10/117.12 (+1.9 %)** on the F32 arm and
+**148.62/148.61 -> 150.21/150.08 (+1.0 %)** on the Q4_K arm, with the single-switch controls landing back on the
+old number (`FUSE_GATE_BETA_F32=0` 115.61, `FUSE_GDN_EPI=0` 150.00).  Flash-Next IQ4_NL -- the *reorder-only*
+class, whose projection type takes neither epilogue -- is byte-identical at `df389355f5e8` and 68.8 -> 69.7 t/s.
+
+**Three things were added before it could be a block.**  (1) **A hole in 0003's memory rule.**  The epilogue
+replaces `ggml_cuda_check_fusion_memory_ranges` for its own window, on the argument that the launch reads only
+the weights, `dt`, `ssm_a` and the activation's **Q8_1 copy**; the check itself now covers `dt`/`ssm_a` as weights
+and requires no written tensor to overlap them.  The argument is right -- and load-bearing: instrumented, the
+gate `MUL` lands **inside `attn_norm-N`** (the F32 layer input) on every GDN layer of the 35B-A3B, which is why
+the generic check declined ~29 of 30 layers.  It is harmless only while that copy exists, so the rule now also
+requires disjointness **when the activation's type is already `Q8_1`** (no quantize launch then, and the kernel
+reads it in place).  (2) **The F32 arm could not be gated.**  The submission's `GGML_CUDA_GDN_EPI_LOG` line only
+existed in the mmvq half, so nothing could prove the mmvf F32 fusion fires; it now prints for both families
+(`gdn_epi: gate_beta decode|verify f32 ...`), which is what `scripts/gate-gdn-epi.sh` checks.  (3) **No test and
+no gate.**  `tests/test-fusion-gate-beta-multiseq.cpp` grew F32 and Q4_K arms (77 shapes, all bit-identical) and
+its F32 arm is **negative-tested**: reverting the F32 branch's `gb_x2 ? 2*ne01 : ne01` row count fails all 11 F32
+shapes at maxdiff 0.7-1.4, which is the bug class the doubling exists for.  `scripts/gate-gdn-epi.sh` is new.
+Two README nits, no code change: `GGML_CUDA_FUSE_GATE_BETA_BF16` is not new (it has shipped since r102), and the
+series is cut against r298/r299, two releases behind this base.
+
+**Verification.**  `scripts/gate-gdn-epi.sh` **PASS**: mechanism lines `gate_beta decode|verify f32` and
+`decode|verify q4_K` present, the other family's lines absent (the matchers are type-disjoint), the OFF arm
+silent, and `22bfcf93c0ab` identical in ON/OFF at `-ub 2`, `4`, `8` and `512` on both models (+0.2-2.4 % t/s in
+the ON arms); `--self-test` against the r303 binary reports no `gdn_epi` line, so the mechanism check has teeth.
+`test-fusion-gate-beta-multiseq` **77/77** shapes fused and bit-identical.  `scripts/gate-fusion-alias-copy.sh`
+PASS with its anchor `3fab4da87774` unmoved (this fusion replaced that check for its own window).
+`scripts/validate-set.sh` **GREEN** (18 default + 2 optional, Windows portability 512 files clean, fresh-tarball
+strict apply); `scripts/gate-per-block-build.sh --changed-from af497e7ba` **3/3** on the `all` profile (blocks
+10, 14, 0300 -- block 14's delta is the `cat_reorder` line the fold touches), with `HF_UI_VERSION=b12387`: the
+current `ggml-org/llama-ui` bundle breaks a fresh configure (`INVARIANTS.md` r303 item 6), not this change.
+MTP Protocol A, four axes, `-n 2000`, 1 GPU (r303 -> r304): R 106.6->187.2 / **108.4->189.0**, P 105.7->188.6 /
+**107.6->190.6**, C 106.6->208.3 / **108.4->210.2**, K 106.2->225.0 / **107.9->227.1** t/s, every axis's text
+byte-identical between the builds and `none == draft-mtp` on both (`61a693160ecb` 6165 / `b8ea708ffddc` 6020 /
+`f03a24e52c17` 8580 / `5ebd156073f6` 2167 chars).  Rule-5 `llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8` (q8_0 KV,
+two interleaved rounds): TG 106.7/320.9/454.7 -> 107.9/327.4/458.6 (F32 arm), 138.8/357.7/489.8 -> 139.9/364.9/497.5
+(Q4_K arm), and the Q8_0-alpha 27B control flat (PP 359.9/820.5/1015.2 -> 359.8/855.6/1014.0, TG
+32.78/111.0/172.1 -> 32.80/111.1/171.4).  Prefill at realistic prompt lengths is unchanged (B=1 PP at
+`npp` 512: 4001/4022 -> 4053/4025 t/s; 1024: 4605/4632 -> 4632/4591; `llama-bench` pp512 5383/5410 -> 5362/5397);
+the `npp 16/128` B=1 PP cell reads 3-10 % lower for both this build **and** the un-amended submission build with
+both switches off, i.e. it is a fixed-cost/layout artifact of a one-wave prefill, not a regression -- do not quote
+it.  No GPU fault in any arm.
+
+**Two facts for the next reader.**  The ksplit row-concat's segment-boundary assumption is already enforced for
+these shapes (`launch_ksplit` forces one row per block below `512 * rpb` rows, and GDN alpha/beta have 32-48), so
+the epilogue's per-block segment id is exact; and `-ub 1` is not reachable from `llama-cli` on these models
+(`-b 1` aborts in `common.cpp`'s `get_sub_batch`), which is why the gate sweeps `2/4/8/512` and the 1-token point
+comes from `gate-prefill-logits.sh --ub 1`.  `INVARIANTS.md` r304 records both, plus the memory-rule rule and the
+subshell-PASS trap the gate's first cut fell into.
+
 ## 261117.002 (r303, RELEASE v17-4f9dfa0e3-r303) -- the merged-layout qwen4exp GGUF (post-#31028 `hc_*_down_inject`) gets a graph that builds AND the fused mixer, folded into official block 11 with a synthetic fixture, a CI arm and a repaired gate
 
 **What shipped.**  Block 11 only (`src/models/qwen4exp.cpp`, `src/llama-model-loader.cpp`,

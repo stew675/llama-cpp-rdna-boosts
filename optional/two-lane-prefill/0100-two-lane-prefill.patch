@@ -1,4 +1,4 @@
-From 51163e5c923bba80d95a529b5d8b1aac5ebdae88 Mon Sep 17 00:00:00 2001
+From fbb3574d2829ca11da3a48c9f4b181e6046f6eca Mon Sep 17 00:00:00 2001
 From: "Slava P." <slavap@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 11:54:47 -0600
 Subject: [PATCH] rdna-boosts: block 0100: two-lane prefill
@@ -930,10 +930,10 @@ index 79a70b16e..73c3c407a 100644
      GGML_ASSERT(sched);
      for (int i = 0; i < sched->n_backends; i++) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index d0b9997ad..3659de620 100644
+index 14c6bf07b..b4af296f6 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -11568,7 +11568,20 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
+@@ -11575,7 +11575,20 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
      ggml_cuda_set_device(dev_ctx->device);
  
      cudaEvent_t event;
@@ -955,7 +955,7 @@ index d0b9997ad..3659de620 100644
  
      return new ggml_backend_event {
          /* .device  = */ dev,
-@@ -11589,6 +11602,27 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -11596,6 +11609,27 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -983,7 +983,7 @@ index d0b9997ad..3659de620 100644
  // wip/slab-ring-region (issue #164): the H2D staging-ring cap.  `GGML_CUDA_SLAB_RING_MIB` is a verbatim
  // per-GPU override; otherwise the context auto-sizes it (`slab_set_ring_cap`) from the ubatch and the
  // host-expert device count.  `g_ring_max_table` is stashed by the preflight so the recompute has the model
-@@ -11985,6 +12019,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -11992,6 +12026,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .gtt_store_arena           = */ ggml_backend_cuda_device_gtt_store_arena,
      /* .gtt_store_free_bytes      = */ ggml_backend_cuda_device_gtt_store_free_bytes,
      /* .gtt_store_arena_min       = */ ggml_backend_cuda_device_gtt_store_arena_min,

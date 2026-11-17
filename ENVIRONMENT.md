@@ -678,13 +678,22 @@ gate chain's `MUL` as the `mmvf` dst, which gave the launch `n_seq_tokens` colum
 flat one-channel `y`, so every sequence but the first got sequence 0's alpha/beta gates (invisible to
 single-stream text/MTP gates; only multi-sequence serving saw it).  The switch still exists as an A/B
 kill-switch, and `tests/test-fusion-gate-beta-multiseq.cpp` is the gate that covers it — no model needed, so
-run it after touching any fusion that consumes a reshaped chain (`GREEDY-PURITY.md` §49; **r202**: 33 cases —
-`{BF16,1024}`, `{Q8_0,1024}`, `{Q8_0,5120}` x 11 `(T,S)` shapes — because a delivered GDN model's
-`ssm_alpha/beta.weight` is Q8_0 at K=5120, and BF16-at-1024 alone hid the softplus rounding for ten
-releases).  **`GGML_CUDA_FUSE_GATE_BETA_VERIFY` gates only the VERIFY band**: the `ne[1] == 1` decode arm is
+run it after touching any fusion that consumes a reshaped chain (`GREEDY-PURITY.md` §49; **r304**: 77 cases —
+`{BF16,1024}`, `{F32,1024}`, `{Q8_0,1024}`, `{Q8_0,5120}`, `{F32,5120}`, `{Q4_K,1024}`, `{Q4_K,5120}` x 11
+`(T,S)` shapes — because a delivered GDN model's `ssm_alpha/beta.weight` is Q8_0 at K=5120 **or** F32 or a
+K-quant, and BF16-at-1024 alone hid the softplus rounding for ten releases).  **`GGML_CUDA_FUSE_GATE_BETA_VERIFY` gates only the VERIFY band**: the `ne[1] == 1` decode arm is
 unconditional, so `=0` compares the fused kernel at one token against the chain from two tokens on (a valid
 control -- it was an invalid one only while the fused kernel was not the chain, r201/r202), and the *default*
 build is the fused kernel at every width (`GREEDY-PURITY.md` §81).
+
+**r304 extended both chain fusions to the remaining projection types** published GGUFs use, each with its own
+kill-switch, and added a census for both families:
+
+| variable | default | class | what |
+|---|---|---|---|
+| `GGML_CUDA_FUSE_GATE_BETA_F32` | **on** (r304, block 10) | **kill-switch** | the mmvf gate/beta launch for **F32** `ssm_alpha`/`ssm_beta` (unsloth's UD quants keep them F32: the UD-Q4_K_* files, Flash-Next UD-IQ*): one launch computes both projections and applies `softplus(alpha + dt) * a`, each row the plain F32 `mul_mat_vec_f` instantiation, so both outputs are bit-identical.  The F32 branch needs its own `gb_x2 ? 2*ne01 : ne01` row count (the appended beta rows); without it they overwrite the alpha store region — `tests/test-fusion-gate-beta-multiseq.cpp`'s F32 arm is the negative-tested control.  Worth **+1.9 %** tg128 (Qwen3.6-35B-A3B UD-Q4_K_M, 1 GPU). |
+| `GGML_CUDA_FUSE_GDN_EPI` | **on** (r304, block 10) | **kill-switch** | the same chain as the **ksplit body's epilogue** for `Q4_K` / `Q5_K` / `Q6_K` / `IQ4_XS` / `MXFP4` projections, per row-concat segment: decode folds it into the existing alpha/beta/`attn_gate` row concat (3 launches -> 1 per GDN layer), the 2..8-token verify band runs alpha + beta as ONE row-concat launch (5 -> 2), and the concat reorder puts the larger `attn_gate` projection in front so the pair stays adjacent for that launch.  Every row keeps its own ksplit dot product (same `nwarps` / `long_k` / `small_m` as its unfused launch; the segments are 32-48 rows, so `launch_ksplit`'s "row count not a multiple of the block height" fallback puts one row per block and no block straddles a segment).  Its memory rule REPLACES the generic fusion-window check for this one fusion (that check declines ~29 of 30 layers: the allocator places the ADD / SOFTPLUS / MUL outputs in place over the alpha matmul output the fused launch never materializes) — what it enforces instead is that `dt` / `ssm_a` are weights and that no written tensor overlaps them, **nor the activation when that activation is already `Q8_1`** (no quantize launch then, so the kernel reads it in place).  Worth **+1.0 %** tg128 (Qwen3.6-35B-A3B LMStudio Q4_K_M, 1 GPU). |
+| `GGML_CUDA_GDN_EPI_LOG` | unset | **diagnostic** | presence prints one line the first time each band of either family fires: `gdn_epi: gate_beta decode\|verify <type> rows N K M tokens T` (mmvf) and `gdn_epi: decode\|verify <type> rows N K M tokens T` (the ksplit epilogue).  This is what `scripts/gate-gdn-epi.sh` checks to prove the fusions are not inert, and it is the reason a `-lv 4` run of a GDN model is attributable. |
 
 The same idiom — and therefore also default-on despite the name — covers
 `GGML_CUDA_DISABLE_IDX_RELU_SUM`, `GGML_CUDA_CONCAT_VERIFY`, (r46, block 15) `GGML_CUDA_FUSE_GDN_STATE_GATHER` and

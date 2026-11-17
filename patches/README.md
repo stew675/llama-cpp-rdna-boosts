@@ -1,5 +1,38 @@
 # The delivery patches — what each block is and what it does
 
+> **r304: the GDN gate/beta chain fused for F32 and K-quant projections (contributor PR #322, `briansp2020`), folded into block 10.**
+> Block **10** owns both chain fusions this extends (`GGML_CUDA_FUSE_GATE_BETA_BF16` in `mmvf.cu`,
+> `GGML_CUDA_FUSE_GATE_BETA_VERIFY` in `mmvq.cu`), the ksplit body (`mmvq-ksplit-body.inc`), the row concat and the
+> concat reorder that carries it — so it is an amendment, not a new block, and the block count is unchanged (17
+> official + `0300`).  A GDN layer's `ssm_alpha`/`ssm_beta` projections feed `ADD(dt) -> SOFTPLUS -> MUL(ssm_a)` and
+> `SIGMOID`, and until now only BF16 (qwen4exp) and Q8_0 projections had it fused; the other types every published
+> Qwen3.5/3.6/3.8 GGUF uses ran each step as its own launch.  Two pieces, one kill switch each:
+> **`GGML_CUDA_FUSE_GATE_BETA_F32`** — the mmvf launch with `T = float` (unsloth's UD quants keep `ssm_alpha`/`ssm_beta`
+> F32: the UD-Q4_K_* files, Flash-Next UD-IQ*), each row the plain F32 `mul_mat_vec_f` instantiation and the epilogue
+> `add_softplus_mul_bcast_f32`'s arithmetic; **`GGML_CUDA_FUSE_GDN_EPI`** — the ksplit body's epilogue for
+> `Q4_K`/`Q5_K`/`Q6_K`/`IQ4_XS`/`MXFP4` projections, per row-concat segment: decode folds the chain into the existing
+> alpha/beta/`attn_gate` row concat (3 launches -> 1 per GDN layer) and the 2..8-token verify band runs alpha + beta as
+> one row-concat launch (5 -> 2), with the concat reorder putting the larger `attn_gate` projection in front so the pair
+> stays adjacent.  Every row keeps its own ksplit dot product (`nwarps`/`long_k`/`small_m` per shape, and the segments
+> are 32-48 rows so `launch_ksplit`'s one-row fallback means no block straddles a segment), so both outputs are
+> bit-identical.  **Three adjustments were made on acceptance.**  (1) Both fusions are now provable: `GGML_CUDA_GDN_EPI_LOG=1`
+> prints a `gdn_epi:` line the first time each band of *either* family fires (the submission instrumented only the
+> mmvq half, so the F32 arm could not be gated).  (2) The ksplit epilogue's memory rule — which replaces the generic
+> window check, since that check declines ~29 of 30 layers over allocator artefacts the fused launch never reads —
+> gained the case the submission left open: when the activation is **already `Q8_1`** there is no quantize copy, the
+> kernel reads it in place, and no written tensor may overlap it (with an F32 activation the writes do land inside
+> `attn_norm-N` on every layer, and that is harmless precisely because the matvec reads the copy).  (3) The submission
+> shipped no test or gate, so `tests/test-fusion-gate-beta-multiseq.cpp` grew **F32 and Q4_K arms** (77 cases, all
+> bit-identical, with the F32 case **negative-tested**: dropping the F32 branch's `gb_x2 ? 2*ne01 : ne01` row count
+> fails all 11 F32 shapes at maxdiff 0.7-1.4) and `scripts/gate-gdn-epi.sh` was added.  Bit-identical: prefill-logit
+> KLD **-0.000001 / 100.000 %** (F32 arm) and **0.000000 / 100.000 %** (Q4_K arm) at `-ub 1/4/8` against a base
+> recorded from the previous build, same-seed greedy text identical on both arms, `none == draft-mtp`, and the
+> reorder-only Flash-Next IQ4_NL arm (`df389355f5e8`) unchanged given that its projection type takes neither epilogue.
+> Worth **+1.9 %** tg128 (Qwen3.6-35B-A3B UD-Q4_K_M, F32 arm) and **+1.0 %** (LMStudio Q4_K_M, Q4_K arm), MTP
+> +1.0/+0.8 %, `llama-batched-bench -npl 1,4,8` TG +2.1/+1.3/+0.9 % and +0.9/+2.8/+1.8 % with pp512 and the
+> Q8_0-alpha 27B control flat.  Record: `WORKLOG.md` 261117.003, `INVARIANTS.md` r304, `ENVIRONMENT.md` §7.1,
+> `MANIFESTS.md` (block 10 row).
+
 > **r299: a mid-run pinned-tier latch's MIXTURE is gated on the LOGITS (`TODO` #282 retired).**  Block **12** (the
 > `MOE_HOST_POOL_PIN_FAULT` diagnostic and its `late` latch).  `late` used to fire on the first bounce-ring grow after
 > `g_sized`; when sizing moved to REGISTRATION (r254/r292) that fired while the pool tier was still being built, so the
@@ -13,9 +46,9 @@
 > the generated text.  Record: `benchmarks/2026-11-16-pinlate-mixture-logits.md`, `INVARIANTS.md` r299,
 > `GREEDY-PURITY.md` §95.
 
-**16 official blocks (`0000`-`0015`) + the temporary block `0300` = 17 default patches** against
+**17 official blocks (`0000`-`0016`) + the temporary block `0300` = 18 default patches** against
 `release.json.base` (**`4f9dfa0e3`**; the base is the 2026-11-13 r278 re-base, which replaced the
-2026-11-08 r236 `a691b2345` base), one `git am` commit each, applied in filename order (`0000`-`0015`
+2026-11-08 r236 `a691b2345` base), one `git am` commit each, applied in filename order (`0000`-`0016`
 then `0300`).  The optional artifacts (`optional/*/01xx-*.patch`: `0100` two-lane prefill, `0101` mixed
 K/V) are **not** in this set and never in the default apply.  The base is a `release.json` field — this
 line only states which re-base it is.
