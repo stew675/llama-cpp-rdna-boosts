@@ -165,10 +165,10 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 > in `archive/docs/` (see also `archive/work/` for the closed experiments).
 > Do not mix them with the current `patches/` files.
 
-## The blocks: official `0000`-`0015` + temporary `0300` + optional `0100`/`0101`
+## The blocks: official `0000`-`0016` + temporary `0300` + optional `0100`/`0101`
 
 `release.json` (the current release).  Each row is one `git am` commit, applied in filename order:
-`0000`-`0015` then `0300`.  The optional `0100`/`0101` are **not** in this table and never in the default
+`0000`-`0016` then `0300`.  The optional `0100`/`0101` are **not** in this table and never in the default
 apply -- see [`optional/README.md`](optional/README.md).
 
 **r263 adds block 15 — the UMA GTT expert store.**  On an **integrated GPU** (an APU: `gfx1151`, and any newer
@@ -186,6 +186,19 @@ arm, +63-67 % prefill from streaming only what is not resident — with the logi
 is **inert on a discrete GPU, measured** (zero census lines with its envs forced on; `gate-host-pool.sh` 42/42).
 `ENVIRONMENT.md` §20 is the knob list, `patches/README.md` → Block 15 the detail, and
 `archive/work/apu-expert-gtt/` the campaign record.
+
+**r301 added block 16 — the server's prompt admission policy; r306 made its per-step cap a CONTENDED bound and a
+first-class option.**  `update_slots()` assembles one batch per step and it cannot be joined mid-flight, so the
+policy that decides *which* prompt tokens enter that step also decides how long every other slot waits: the window
+is now shared **max-min fairly** (every active prompt is admitted to every step), `--interactive-batch-size` / `-ib`
+caps the prompt tokens admitted per step **while a decoder is waiting** (the bound on a decoding slot's inter-token
+latency), and `LLAMA_SERVER_PREFILL_DUTY` leaves up to `K-1` steps decode-only so a decoder gets a burst of tokens
+instead of one per slow step, bounded in time.  **r306 fixes the cap's scope:** r300/r301 applied it to *every*
+step, including one with nothing decoding, where it bounds nothing -- on the field shape that cost **1454 vs
+3036 t/s** for the same 65536 tokens.  A step with no slot generating now takes the whole `-b` window (shared
+max-min fairly, so the number of concurrent prompts is irrelevant); `LLAMA_SERVER_PREFILL_CHUNK` is the option's
+deprecated alias.  Gates: `scripts/gate-prefill-fairness.sh` and `scripts/gate-prefill-duty.sh`;
+`ENVIRONMENT.md` §22.
 
 **r287 added block 17 — mixed K/V cache types (PR #312); r288 made it optional block `0101`.**  The
 delivery refused every `type_k != type_v` pair since 2026-09-11 because a mixed pair could not take the

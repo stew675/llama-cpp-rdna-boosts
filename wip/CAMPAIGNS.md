@@ -1,5 +1,10 @@
 # Open WIP campaigns (index)
 
+> **Promoted (r306, 2026-11-17):** `prefill-chunk-adaptive` is folded into **block 16** (the maintainer's decision
+> at r306).  Its record moved to [`archive/work/prefill-chunk-adaptive/`](../archive/work/prefill-chunk-adaptive/README.md),
+> the knob is `-ib` / `--interactive-batch-size` (`ENVIRONMENT.md` §22), the gates are 30/31, and the one open
+> coverage gap is `TODO` #344.  It is not an open campaign and it is not kept here as a stub.
+>
 > **Promoted (r300, 2026-11-16):** `session-scheduling` is folded into **block 12** (the maintainer's decision:
 > a new block was declined "for now"; block 12 is the campaign-remainder block and already owns the server
 > prompt/idle-slot code).  Its record moved to [`archive/work/session-scheduling/`](../archive/work/session-scheduling/README.md),

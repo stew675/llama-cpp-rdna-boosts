@@ -1,3 +1,89 @@
+## 261117.005 (r306, RELEASE v17-4f9dfa0e3-r306) -- block 16: the prompt-admission cap becomes a CONTENDED bound and a first-class option (`-ib`), so an uncontended prefill stops paying for a decoder that is not there
+
+**What shipped.**  Block **16** only, in three files (`tools/server/server-context.cpp`, `common/common.h`,
+`common/arg.cpp`); `release.json` at **`v17-4f9dfa0e3-r306`** (tip `a93c90ffc`, tree `f12b1a0c8`; optional re-cut
+`d1dbe7733` / `cef109647`, cumulative `445ace247`).  Block count unchanged (17 official + `0300`).  Records:
+`patches/README.md` blocks 16/12 and the r306 headline, `ENVIRONMENT.md` §22, `MANIFESTS.md` gates 30/31 +
+block 16, `INVARIANTS.md` r306, `TODO` #344, and `archive/work/prefill-chunk-adaptive/` (the prototype's measurement record).
+
+**The defect.**  `LLAMA_SERVER_PREFILL_CHUNK` (env-only, r300) capped the prompt tokens admitted per step on
+**every** step, including a step that carries no decode work.  The cap exists to bound a *decoding* slot's
+inter-token latency and a newcomer's wait for admission -- with nothing generating it bounds nothing, and below
+`-ub` it only re-pays the step's fixed cost.  The r300 record already priced that on the field shape (**1454 vs
+3036 t/s** for the same 65536 tokens, `b ≈ 196 ms`) but shipped it anyway because the maintainer's own `runme`
+runs `-ub == -b`, where the default chunk is a no-op: the tax landed only on configurations with a wide ubatch
+and a small interactive chunk, which is exactly the configuration the knob exists for.
+
+**The rule.**  A step with **no slot in `SLOT_STATE_GENERATING`** takes the whole `-b` window (`n_batch`,
+ubatch-split internally), shared max-min fairly; a step with a decoder waiting is capped exactly as before.  The
+test is the **slot state**, not `batch.size() == 0`: slots that cannot batch together still serialise
+(`can_batch_with()`), so a generating slot can be left out of the step's batch while a decoder is in fact
+waiting.  A wide step can never carry a decode token -- the decode token is added before the budget is computed
+-- so a decoder's first **contended** step is already capped and only an in-flight uncontended step can delay
+it.  The number of concurrent **prompts** is irrelevant (the window is shared fairly either way).
+
+**`-ib`.**  The variable is a first-class option now: `-ib N` / `--interactive-batch-size N` (env
+`LLAMA_ARG_INTERACTIVE_BATCH_SIZE`), `-1` = one `n_ubatch` (the default), `0` = no bound, `N` = explicit.
+`LLAMA_SERVER_PREFILL_CHUNK` is the option's deprecated alias: still read, one WARN, and the option wins if both
+are given -- so shipped scripts and gate invocations are unaffected.  The value is resolved in
+`resolve_prefill_admission()` from `load_model()`, because the member initializers run at construction, before
+`params_base` is copied in, so a member lambda cannot read a parsed option.
+
+**Measured** (one R9700, gfx1201, ROCm 10.1, greedy, `-lv 5` step widths from the `fair share: added=` line):
+
+| arm | prompt steps | max `added` | t/s | text |
+|---|---|---|---|---|
+| 4B, `-b/-ub 512`, lone 8401 tok: r305 `CHUNK=512` | 18 x 512 | 512 | 7139.5 | `332/07a82d55e623` |
+| ... r305 `CHUNK=0` | 6 | 2048 | 7144.8 | same |
+| ... r306 default / `-ib 512` | 6 (3 x 2048) | 2048 | 7129.3 | same |
+| ... r306 `-ib 0` (kill switch) | 6 | 2048 | 7151.9 | same |
+
+* **The contended path is provably untouched**: with a decoder already generating, the prefilling slot's step
+  list is IDENTICAL on the r305 and r306 binaries (`511 x 9, 486, 511, 1, 4`) at the same 950 ms.
+* **Four concurrent prompts, nothing decoding** (4B `-np 4`, four ~7k-token prompts): 177 slot-steps / 4.89 s
+  with the cap against **46 / 3.40 s** (1.44x) -- `b ≈ 49 ms` at four slots, so the multi-prompt case carries
+  the mechanism even where the lone-prompt arm shows nothing.
+* **What the cap buys the decoder** (4B `-np 2`, `gate-prefill-duty.sh --env LLAMA_SERVER_PREFILL_CHUNK=N`):
+  `-ib 512` **137** tokens per 2.18 s prefill against `-ib 2048` **69** per 1.48 s (1.35x), worst gap 89 vs
+  276 ms; with the duty cycle off, 15 vs 7 tokens per second of prefill (2.1x).  Median ITL is 10 ms in every
+  arm -- the win is the tail and the count.
+* **The carrier is the UBATCH width** (Flash-Next IQ3_XXS, 1 GPU, `-ncmoe 47`, 8401 tokens): at `-b/-ub 16384`
+  `CHUNK=512` reads **683.7 t/s** against **1885.8** uncapped (2.76x), and the r306 default lands on the
+  uncapped arm within 0.2 %; at `-b/-ub 512` the same cap is **free** (826.5 vs 828.8 t/s on 5601 tokens).  So
+  the r300 record's `b ≈ 196 ms` is that shape's wide-ubatch fixed cost, not a property of host-resident
+  experts as such (`INVARIANTS.md` r306.1).
+
+**Gates (all green, on the release tree).**  `validate-set.sh` **GREEN** (18 patches strict on a fresh tarball,
+tree `f12b1a0c8`, both optional artifacts and the cumulative optional tree re-cut and verified, Windows
+portability 512 files); `gate-per-block-build.sh --changed-from 73295b281 --fast` **2/2** (blocks 16, 0300);
+`gate-prefill-duty.sh` **PASS** on the dense 4B (**16 -> 138** tokens, 8.6x, stretch **2.17x**, lone prefill
+-0.4 %) and on the 27B + `draft-mtp n3` shape (**56 -> 388**, 6.9x, stretch 1.58x, acceptance 0.89461 ->
+0.89252, judged for collapse); `gate-prefill-fairness.sh` **PASS** (short TTFT 1.913 -> 0.833 s, ITL max 331 ->
+87 ms, lone prefill **-0.3 %**); `gate-prefill-logits.sh` **mean KLD 0.000000 / same-top-p 100.000 %**;
+`fork-refresh.sh --build --gates` green with the applied tip `a93c90ffc` == `release.json.tip` and the tree ==
+`.tree`; coherence `llama-cli` 4B reads **`280 chars sha=7386359e5dac` on both builds** (the change is
+unreachable outside `update_slots()`, so this is an actual A/B rather than a formality); each gate's own
+`check-gpu-faults.sh --since` arm clean.
+
+**Gate changes with the release.**  Gate **31** gained the two-sided width assertion, which is what enforces the
+new rule: two dedicated passes (one server each, `-lv 5`) require at least one step **wider** than the chunk with
+nothing decoding, and **no** step that carries decode tokens to admit more than the chunk (`batch - added` is the
+decode count, since each pass fills one prompt slot).  Gate **30**'s lone-prefill arm tightened on its own: its
+baseline is already `CHUNK=0`, so from r306 both arms take the wide window and the arm reads -0.3 % instead of the
+-2 % the cap used to cost.  Both gates still parse the census (the new static `no-decode = n_batch` field is
+appended, so their regexes were not disturbed).
+
+**Two things recorded rather than fixed.**  (i) The 27B **Q8_0** + `draft-mtp n3` arm of gate 31 does not fit this
+box's single 32 GiB card (27B Q8 + a 65536 context split over 2 slots + the drafter: `--fit` refuses and a decode
+allocates into 268 MiB free, then aborts), so the arm was run on the **27B UD-IQ3_S** -- the shape the r301 record
+used -- and its numbers are above.  (ii) The host-expert shape has **no greedy-text oracle**: six identical-config
+runs on Flash-Next `-ncmoe 47` read four different texts, which is `GREEDY-PURITY.md` §89's residency mechanism and
+this GGUF ships no `.moe-heatmap` to pin it with.  So that shape's *default-path* numerics under r306 are
+unverified (it is inert at `-b/-ub 16384`, altered at `-b/-ub 512`) -- `TODO` #344 names the arm that would close
+it (`gate-prefill-logits.sh` on that model, or a fully determined residency with repeats reported as a spread).
+The four-axis MTP Protocol A was **not** run: no kernel, fusion or decode path is touched (the prefill-logit gate
+is 0.000000), and the drafter composition is covered by gate 31's `--spec-args` arm.
+
 ## 261117.004 (r305, RELEASE v17-4f9dfa0e3-r305) -- GitHub issue #323: a host-expert routed MoE is offloaded to the GPU at every ubatch width (block 09), so a 17..31-token ubatch stops running its experts on the CPU at 31x the cost
 
 **What shipped.**  Block **09** only (`ggml/src/ggml-cuda/ggml-cuda.cu`: `ggml_backend_cuda_device_offload_op()`

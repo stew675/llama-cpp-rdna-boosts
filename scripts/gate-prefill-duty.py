@@ -59,6 +59,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, ".."))
 ABORT_RE = re.compile(r"GGML_ASSERT|GGML_ABORT|terminate called|Segmentation fault|fatal error", re.I)
 CENSUS_RE = re.compile(r"prefill admission: fair share = (\w+), chunk = (\w+), skew = (\d+), duty = (\d+)")
+# `-lv 5`: the per-step admission line (LOG_DBG, so -lv 4 does NOT show it).  `batch - added` is exactly the
+# decode tokens the step already carried, because these passes fill ONE prompt slot.
+WIDTH_RE = re.compile(r"slot\s+\S+: id\s+(\d+) \| task \d+ \| fair share: budget =\s*(-?\d+), "
+                      r"added =\s*(\d+), batch =\s*(\d+) / (\d+)")
 SPEC_RE = re.compile(r"draft acceptance = ([0-9.]+) \(\s*(\d+) accepted /\s*(\d+) generated\)")
 
 BASE = None
@@ -78,7 +82,7 @@ class Server:
         env.update(self.env_extra)
         cmd = [self.a.server, "-m", self.a.model, "-ngl", "99", "-np", "2", "-c", str(self.a.ctx),
                "-b", str(self.a.b), "-ub", str(self.a.ub), "-t", str(self.a.threads),
-               "--no-warmup", "--port", str(self.a.port), "-lv", "4"] \
+               "--no-warmup", "--port", str(self.a.port), "-lv", "5"] \
               + shlex.split(self.a.server_args) + shlex.split(self.a.spec_args)
         self.log = open(self.log_path, "w")
         self.proc = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT, env=env,
@@ -217,6 +221,53 @@ def spec_stats(log):
     return (acc, gen, n) if n else None
 
 
+def width_pass(a, env, log_path, contended):
+    """One server, one request shape, no other traffic -- the r306 two-sided width check.
+
+    With NOTHING decoding a step must take the whole `-b` window (r301 capped it at the interactive chunk,
+    which cost the field shape half of its uncontended prefill), and a step that DOES carry decode tokens
+    must admit at most the chunk.  One prompt slot per pass, so a line's `batch - added` is exactly the
+    decode tokens that step already carried -- that is the contention test, and it does not depend on
+    guessing when the decoder's first token landed.
+    """
+    global BASE
+    srv = Server(a, env, log_path)
+    srv.start()
+    try:
+        BASE = srv.base
+        out = {}
+        th = None
+        if contended:
+            # the decoder must ALREADY be generating when the prompt is assembled, or the first steps are
+            # legitimately uncontended (a newcomer's first step is the arrival cost, not a violation)
+            th = threading.Thread(target=stream, args=(
+                "[DEC] Count slowly from one to five hundred, one number per line.",
+                a.dec_n, out, "dec", 0.0, 0))
+            th.start()
+            time.sleep(1.5)
+        stream(sentence(a.reps, "W" + ("C" if contended else "U")), 2, out, "pf", 0.0, 1)
+        if th is not None:
+            th.join()
+        log = srv.text()
+    finally:
+        srv.stop()
+
+    m = CENSUS_RE.search(log)
+    chunk = a.ub
+    if m is not None:
+        chunk = a.b if m.group(2) == "off" else a.ub if m.group(2) == "n_ubatch" else int(m.group(2))
+    # only the PROMPT slot (pinned to 1 above): the decoder's own prefill lines are a prompt too, but mixing
+    # them in would mis-read `batch - added` on the step where both are being filled
+    rows = [(int(x.group(3)), int(x.group(4))) for x in WIDTH_RE.finditer(log) if int(x.group(1)) == 1]
+    return {
+        "chunk": chunk,
+        "rows": rows,
+        "wide": [ad for ad, ba in rows if ba - ad == 0 and ad > chunk],
+        "overlap": [1 for ad, ba in rows if ba - ad > 0],
+        "violations": [(ad, ba) for ad, ba in rows if ba - ad > 0 and ad > chunk],
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--server", default=os.path.expanduser("~/llama.cpp/build-rocm/bin/llama-server"))
@@ -286,6 +337,16 @@ def main():
               f"decoder ITL med/max {r['itl_median']:.0f}/{r['itl_max']:.0f}ms  "
               f"win med/max {r['win_median']:.0f}/{r['win_max']:.0f}ms  lone {r['lone_tps']:.0f} t/s")
 
+    # the r306 width passes, on the candidate env, each in its own server so the log is unambiguous
+    width = {}
+    for tag, cont in (("width.uncontended", False), ("width.contended", True)):
+        log_path = os.path.join(logdir, f"{tag}.log")
+        print(f"\n=== width pass {tag} -> {log_path}")
+        width[cont] = width_pass(a, arms[1][1], log_path, cont)
+        w = width[cont]
+        print(f"    chunk {w['chunk']}, {len(w['rows'])} prompt step(s), "
+              f"added {[ad for ad, _ in w['rows']]}")
+
     b, c = res["baseline"], res["candidate"]
     fails, warns = [], []
 
@@ -326,6 +387,21 @@ def main():
          f"into an empty batch)")
     aborts = [n for n, p in logs.items() if ABORT_RE.search(open(p, errors="replace").read())]
     hard(not aborts, "no abort", "clean" if not aborts else f"abort in {aborts}")
+
+    wu, wc = width[False], width[True]
+    if wu["chunk"] < a.b:
+        hard(bool(wu["wide"]), "uncontended window",
+             f"{-1 if not wu['wide'] else len(wu['wide'])} step(s) wider than the chunk {wu['chunk']} with "
+             f"nothing decoding (r301 capped every step; a wide step is the whole -b window)")
+    else:
+        soft(True, "uncontended window", f"chunk {wu['chunk']} == -b, nothing to widen")
+    hard(not wc["violations"], "contended width",
+         f"{len(wc['violations'])} step(s) admitted more than the chunk {wc['chunk']} while carrying decode "
+         f"tokens {wc['violations'][:4]}{' (the cap must bound a waiting decoder)' if wc['violations'] else ''}"
+         f", over {len(wc['overlap'])} contended step(s)")
+    if not wc["overlap"]:
+        warns.append("contended width not reached")
+        print("  [WARN] contended width not reached: no step carried decode tokens; the assertion was vacuous")
 
     soft(c["itl_max"] <= b["itl_max"] * 1.1, "decoder worst gap",
          f"{b['itl_max']:.0f} -> {c['itl_max']:.0f}ms (the burst's last gap is one prefill step, so it may "

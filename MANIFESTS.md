@@ -10,7 +10,7 @@ current delivery.
 
 ## Current delivery
 
-**16 official blocks (`0000`-`0015`) + the temporary block `0300` = 17 default patches** against
+**17 official blocks (`0000`-`0016`) + the temporary block `0300` = 18 default patches** against
 `release.json.base`, canonical chain `release.json.tip` / `.tree` (`release.json.n_default` is the apply
 count; `release.json.n_blocks` is the **official** count that names the `v<N>` tag).  The optional blocks
 (`optional/*/01xx-*.patch`: `0100` two-lane prefill, `0101` mixed K/V) are **not** part of this set:
@@ -702,16 +702,21 @@ in CI.  The model-level gates are manual:
    about the arithmetic -- `MOE_HOST_POOL_FILL_ORDER=rank` reproduces `ref`'s text on a build that diverges
    (`INVARIANTS.md` r299, `GREEDY-PURITY.md` §95).
 
-30. **The server's prompt admission policy** (r300, block 16 since r301) — `scripts/gate-prefill-fairness.sh`:
-    two arms on one binary (`-np 2`, one GPU), `baseline` = `FAIR=0 CHUNK=0 DUTY=0` (the r299 slot-order fill)
-    against `candidate` = the fair share + a per-step chunk + the duty cycle.  HARD: **ADMISSION** — the short
+30. **The server's prompt admission policy** (r300, block 16 since r301, the contended-only cap and `-ib` at
+    r306) — `scripts/gate-prefill-fairness.sh`:
+    two arms on one binary (`-np 2`, one GPU), `baseline` = `FAIR=0 CHUNK=0 DUTY=0` (the r299 slot-order fill,
+    which is also the *uncontended* window at r306, so the lone-prefill arm below is now a like-for-like
+    comparison rather than a 3 % tolerance for the cap) against `candidate` = the fair share + `-ib` + the duty
+    cycle.  HARD: **ADMISSION** — the short
     prompt's TTFT `<= (k-1 placement + 1 alignment step) x p x 1.25`, where `k` is its own measured step count
     (from its `return_progress` chunks) and `p` its own measured per-step cost (`prompt_ms/(k-1)`); **FAIRNESS**
     — the TTFT ratio `>= min(3.0, 0.8 x the shape's own ceiling)`, the ceiling being the baseline's wait over
     that floor, so the bound is DERIVED and not a fixed 3x (a streamed host-expert arm reads 2.6x where
     `L/(k*chunk)` promises 2.9x and a fixed 3.0 rejected a correct fix; a pooled shape honestly reads ~1x and
     says why); the worst decoder ITL `<= baseline_max x (chunk/n_batch) x 1.75` (and `x0.75` on a streaming KV,
-    where a per-step spill read does not scale with the chunk); a lone long prompt's prefill within 3 %; **one**
+    where a per-step spill read does not scale with the chunk); a lone long prompt's prefill within 3 % (r306:
+    reads -0.4 %, because with nothing decoding both arms take the whole `-b` window -- and that is the arm that
+    would catch a regression that re-capped an uncontended step); **one**
     request's greedy text byte-identical **on a fresh server per arm** (a pooled cache carries the earlier
     requests' page residency into the oracle and can flip a near tie — §52/§63); each arm's startup census
     matches the configuration it claims; no abort and `check-gpu-faults.sh` clean with `--since` bounded to the
@@ -725,7 +730,11 @@ in CI.  The model-level gates are manual:
     prefill step, so the analytic bound is 2x; the slack is the first, still-uncalibrated cycle); a lone prompt
     (nothing decoding) within 3 % and **0** "no tokens to decode" lines, because the deferral must never fire
     into an empty batch; one request's greedy text byte-identical; the census states `duty`; no abort; GPU
-    faults clean.  With `--spec-args` it also requires the gain to hold under a drafter with acceptance not
+    faults clean.  **r306**: the lone-prompt arm is now the two-sided one -- with nothing decoding the step must
+    be the WHOLE `-b` window (r301 capped it at the chunk), and with a decoder already generating the prefilling
+    slot's per-step admission must stay `<= -ib`; the `-lv 5` `fair share: budget/added/batch` line is the
+    instrument (wide steps carry no decode token by construction, so the two assertions cannot both be satisfied
+    by a step that admits a decoder's wait).  With `--spec-args` it also requires the gain to hold under a drafter with acceptance not
     collapsed (`>= 0.5x`, judged for collapse only — §63).  Run it on the dense 4B shape, on the 27B +
     `draft-mtp n3` shape, and on a host-expert/streamed shape (`--server-args "--n-cpu-moe 47" --env
     "MOE_EXPERT_CACHE_MIB=8192,MOE_EXPERT_HEATMAP=load"`).

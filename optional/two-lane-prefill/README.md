@@ -1,7 +1,9 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r288`** (against the
-r288 default delivery tree `79d18f41b9ab9b235d35fd3a5034858eddd94844` = official blocks `0000`-`0015` plus the
+**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r306`** (against the r306
+default delivery tree `f12b1a0c8ee6c24b77467f93550322e74762aef0` = official blocks `0000`-`0016` plus the
+temporary `0300`; the r288 re-cut is at the bottom of the list, against the r288 default delivery tree
+`79d18f41b9ab9b235d35fd3a5034858eddd94844` = official blocks `0000`-`0015` plus the
 temporary `0300`; the r259, r254, r247, r246, r243, r241 and r229 cuts and their measurements are kept below
 as the dated record).  The r288 re-cut is **mechanical**: the r285 patch applied STRICTLY on the r288 default
 tree with nothing to reconcile, so the artifact's diff is byte-identical to the r285 cut and the r285 numbers
@@ -19,7 +21,13 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `d025be5f683d1594556803a0db0baaad7d8d17ca3c0496aac428cc55673a299f` (the r299 cut; the earlier cuts are recorded below)
+  `00abb040e7debc4b6499f5262936c392019c93b2414d360cdb66fda7526eacb0` (the r306 cut; the earlier cuts are recorded below)
+* **r306 re-cut verification**: applies strictly at the r306 default tree
+  `f12b1a0c8ee6c24b77467f93550322e74762aef0` and produces `d1dbe7733171065b99f0f2adee189c1bfd0bc309`; cumulative with the other optional artifact, numeric order, is `445ace2475eb41c0ae543242efcee636513898ac`.
+  The patch file moved (sha256 `00abb040e7debc4b6499f5262936c392019c93b2414d360cdb66fda7526eacb0`) because the exported commit id moved -- block 16's r306 amendment rewrites
+  the commit this artifact is cut on top of -- and **only the `From <sha>` line changed**: the artifact owns no
+  `tools/server/server-context.cpp` hunk, so the default tree's new admission code is the only difference in the
+  produced tree.  `validate-set.sh` check 8 verifies all three trees on every run.
 * **r300 re-cut verification**: applies strictly at the r300 default tree
   `4baf1b67ae591e6661a1e3c5365457a747b688ab` and produces `49f3086f63ce7683705be315060b25a828152d61`; cumulative with the other optional artifact,
   numeric order, is `dc9a8815bd56be9a2e9cae48f7b19d26e7da922a`.  **The patch file is unchanged** (sha256 `d025be5f683d1594556803a0db0baaad7d8d17ca3c0496aac428cc55673a299f`,

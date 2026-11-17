@@ -12,7 +12,7 @@ index e38485ca0..688639a72 100644
      fit.h
      file-lock.cpp
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 6bf9355fb..fcc945273 100644
+index 6bf9355fb..6bdece79f 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -341,9 +341,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -133,7 +133,31 @@ index 6bf9355fb..fcc945273 100644
      add_opt(common_arg(
          {"-ctk", "--cache-type-k"}, "TYPE",
          string_format(
-@@ -2658,7 +2749,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2537,6 +2628,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.cont_batching = value;
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
++    add_opt(common_arg(
++        {"-ib", "--interactive-batch-size"}, "N",
++        string_format("the prompt tokens admitted per step WHILE a decoder is waiting -- the interactive bound on "
++                      "a decoding slot's inter-token latency and on a newcomer's wait for admission (default: "
++                      "%d = one n_ubatch, 0 = no bound).  A step with NOTHING decoding always takes the whole -b "
++                      "window: with no decoder waiting there is nothing to bound, and below n_ubatch a smaller "
++                      "step only re-pays the step's fixed cost.  So this bounds interactivity and never caps an "
++                      "uncontended prefill.  LLAMA_SERVER_PREFILL_CHUNK is this option's deprecated alias",
++                      params.interactive_batch_size),
++        [](common_params & params, int value) {
++            if (value < -1) {
++                throw std::invalid_argument("error: invalid value for interactive-batch-size (-1 = one n_ubatch, 0 = no bound, N > 0 = tokens per step)");
++            }
++            params.interactive_batch_size     = value;
++            params.interactive_batch_size_set = true;
++        }
++    ).set_env("LLAMA_ARG_INTERACTIVE_BATCH_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+     add_opt(common_arg(
+         {"-mm", "--mmproj"}, "FILE",
+         "path to a multimodal projector file. see tools/mtmd/README.md\n"
+@@ -2658,7 +2766,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          "- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)\n"
          "- mlock: force system to keep model in RAM rather than swapping or compressing\n"
          "- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
@@ -148,7 +172,7 @@ index 6bf9355fb..fcc945273 100644
          [](common_params & params, const std::string & value) {
              /**/ if (value == "auto")       { params.load_mode = LLAMA_LOAD_MODE_AUTO;       }
              else if (value == "none")       { params.load_mode = LLAMA_LOAD_MODE_NONE;       }
-@@ -2666,19 +2763,163 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2666,19 +2780,163 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              else if (value == "mlock")      { params.load_mode = LLAMA_LOAD_MODE_MLOCK;      }
              else if (value == "mmap+mlock") { params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK; }
              else if (value == "dio")        { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;  }
@@ -318,7 +342,7 @@ index 6bf9355fb..fcc945273 100644
              else { throw std::invalid_argument("invalid value"); }
          }
      ).set_env("LLAMA_ARG_LAZY_MODE"));
-@@ -2728,11 +2969,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2728,11 +2986,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
      ).set_env("LLAMA_ARG_CPU_MOE"));
      add_opt(common_arg(
          {"-ncmoe", "--n-cpu-moe"}, "N",
@@ -333,7 +357,7 @@ index 6bf9355fb..fcc945273 100644
              llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
          }
      ).set_env("LLAMA_ARG_N_CPU_MOE"));
-@@ -2788,12 +3031,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2788,12 +3048,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          }
      ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
      add_opt(common_arg(
@@ -352,7 +376,7 @@ index 6bf9355fb..fcc945273 100644
          [](common_params & params, const std::string & value) {
              if (value == "none") {
                  params.split_mode = LLAMA_SPLIT_MODE_NONE;
-@@ -2803,6 +3050,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2803,6 +3067,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                  params.split_mode = LLAMA_SPLIT_MODE_ROW;
              } else if (value == "tensor") {
                  params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
@@ -361,7 +385,7 @@ index 6bf9355fb..fcc945273 100644
              } else {
                  throw std::invalid_argument("invalid value");
              }
-@@ -4134,12 +4383,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4134,12 +4400,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          string_format(
              "KV cache data type for K for the draft model\n"
              "allowed values: %s\n"
@@ -379,7 +403,7 @@ index 6bf9355fb..fcc945273 100644
          }
      ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
      add_opt(common_arg(
-@@ -4147,12 +4397,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4147,12 +4414,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          string_format(
              "KV cache data type for V for the draft model\n"
              "allowed values: %s\n"
@@ -397,7 +421,7 @@ index 6bf9355fb..fcc945273 100644
          }
      ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
      add_opt(common_arg(
-@@ -4170,25 +4421,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4170,25 +4438,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
      add_opt(common_arg(
          {"--spec-draft-n-cpu-moe", "--spec-draft-ncmoe", "-ncmoed", "--n-cpu-moe-draft"}, "N",
@@ -442,7 +466,7 @@ index 6bf9355fb..fcc945273 100644
      add_opt(common_arg(
          {"--spec-draft-n-min"}, "N",
          string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
-@@ -4206,6 +4474,59 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4206,6 +4491,59 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_ubatch = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
@@ -1075,7 +1099,7 @@ index 657dcdbf5..673849c86 100644
      cparams.type_k = params.cache_type_k;
      cparams.type_v = params.cache_type_v;
 diff --git a/common/common.h b/common/common.h
-index 6043ab342..83aa5f12f 100644
+index 6043ab342..970abbad5 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -20,6 +20,7 @@
@@ -1273,7 +1297,24 @@ index 6043ab342..83aa5f12f 100644
      common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
  
      // multimodal models (see tools/mtmd)
-@@ -1007,12 +1107,21 @@ common_gguf_info common_get_gguf_info(const std::string & fname);
+@@ -657,6 +757,16 @@ struct common_params {
+     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
+ 
++    // `-ib` / `--interactive-batch-size`: the prompt tokens admitted per step WHILE a decoder is waiting (some
++    // slot owes a decode token) -- the interactive bound on a decoding slot's inter-token latency and on a
++    // newcomer's wait for admission.  A step with NOTHING decoding always takes the whole `-b` window, because
++    // with no decoder waiting there is nothing to bound (and a chunk below `n_ubatch` re-pays the step's fixed
++    // cost for nothing), so this is an interactivity knob, not a throughput one.  -1 = one `n_ubatch` (the
++    // default), 0 = no bound, N = explicit.  The legacy env var `LLAMA_SERVER_PREFILL_CHUNK` is the option's
++    // deprecated alias and is still read, with one WARN.
++    int32_t interactive_batch_size     = -1;
++    bool    interactive_batch_size_set = false; // set by -ib/--interactive-batch-size (flag or env form)
++
+     // llama-connect params
+     bool        server_connect      = false;
+     std::string server_connect_code = "";
+@@ -1007,12 +1117,21 @@ common_gguf_info common_get_gguf_info(const std::string & fname);
  
  // note: defines the model, context, samplers, ets. lifetimes
  struct common_init_result {
@@ -1296,7 +1337,7 @@ index 6043ab342..83aa5f12f 100644
      common_sampler * sampler(llama_seq_id seq_id);
      void reset_samplers();
  
-@@ -1025,7 +1134,7 @@ private:
+@@ -1025,7 +1144,7 @@ private:
  
  using common_init_result_ptr = std::unique_ptr<common_init_result>;
  
@@ -1305,7 +1346,7 @@ index 6043ab342..83aa5f12f 100644
  
  struct llama_model_params   common_model_params_to_llama  (      common_params & params);
  struct llama_context_params common_context_params_to_llama(const common_params & params);
-@@ -1091,6 +1200,13 @@ struct common_memory {
+@@ -1091,6 +1210,13 @@ struct common_memory {
      void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
      void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
      void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
@@ -1319,7 +1360,7 @@ index 6043ab342..83aa5f12f 100644
  };
  
  //
-@@ -1291,6 +1407,8 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
+@@ -1291,6 +1417,8 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
  inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vector<llama_model_tensor_buft_override> & overrides) {
      // keep strings alive and avoid leaking memory by storing them in a static list
      static std::list<std::string> buft_override_strings;
@@ -116065,7 +116106,7 @@ index 066ecb4dd..e9bfbfeb8 100644
  | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
  | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a6059ab38..304b60770 100644
+index a6059ab38..54774f70c 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -299,6 +299,14 @@ struct server_slot {
@@ -116130,7 +116171,7 @@ index a6059ab38..304b60770 100644
      }
  
      json to_json(bool only_metrics = false) const {
-@@ -1112,8 +1146,240 @@ private:
+@@ -1112,8 +1146,242 @@ private:
  
      int n_empty_consecutive = 0;
  
@@ -116144,22 +116185,24 @@ index a6059ab38..304b60770 100644
 +        return e == nullptr || atoi(e) != 0;
 +    }();
 +
-+    // LLAMA_SERVER_PREFILL_CHUNK (unset = one ubatch, 0 = off): cap the prompt tokens admitted per step.  This
-+    // is also the worst-case wait for a newly arrived request and the bound on a decoding slot's inter-token
-+    // latency, because a batch is assembled once per step and cannot be joined mid-flight.
-+    //
-+    // The default is ONE UBATCH because a smaller chunk is dominated: below `n_ubatch` a step still issues the
-+    // same one `llama_process()` call and the same kernel launches, so it pays the step's fixed cost again for
-+    // no reduction in launch count.  That fixed cost is what decides the trade and it is shape-dependent --
-+    // ~2 ms on a dense model on one GPU, ~196 ms on a PLE-on-CPU + host-expert + attendance-pool shape (fitted
-+    // from llama-benchy: 128 steps of 512 tok cost 45.1 s against 4 steps of 16384 at 21.6 s for the same
-+    // 65536 tokens).  So `chunk = n_ubatch` is a no-op where the ubatch is already the batch (a big-prefill
-+    // config), and near-free where the ubatch is a quarter of it -- and a real ITL bound requires lowering
-+    // -ub as well as this, which is the honest coupling.
-+    const int32_t prefill_chunk = [] {
-+        const char * e = getenv("LLAMA_SERVER_PREFILL_CHUNK");
-+        return e != nullptr ? std::max(0, atoi(e)) : -1; // -1: follow n_ubatch
-+    }();
++    // `-ib` / `--interactive-batch-size` (env form `LLAMA_ARG_INTERACTIVE_BATCH_SIZE`; the legacy
++    // `LLAMA_SERVER_PREFILL_CHUNK` env var is the option's deprecated alias, still read, with one WARN): the
++    // prompt tokens admitted per step WHILE a decoder is waiting (some slot owes a decode token).  This is the
++    // bound on a decoding slot's inter-token latency and on the worst-case wait for a request arriving behind a
++    // running prompt, because a batch is assembled once per step and cannot be joined mid-flight.  A step with
++    // NOTHING decoding takes the whole window (n_batch) instead: with no decoder waiting the cap bounds
++    // nothing, and below `n_ubatch` it is strictly dominated anyway (the step still issues one
++    // `llama_process()` and the same kernel launches, so it re-pays the step's fixed cost for no fewer
++    // launches).  That fixed cost is what decides the trade and it is shape-dependent -- ~2 ms on a dense
++    // model on one GPU, ~196 ms on a PLE-on-CPU + host-expert + attendance-pool shape (fitted from
++    // llama-benchy: 128 steps of 512 tok cost 45.1 s against 4 steps of 16384 at 21.6 s for the same 65536
++    // tokens), which is why an unconditioned cap cost the field shape half of its uncontended prefill (1454 vs
++    // 3036 t/s on the same 65536 tokens).  So this is an interactivity knob, not a throughput one: `-ub` at or
++    // above n_batch makes it a no-op, and a cheap decoder bound still requires lowering `-ub` as well, which is
++    // the honest coupling.  -1 = one `n_ubatch` (the default), 0 = no bound, N = explicit.  Resolved in
++    // resolve_prefill_admission(): the member initializers here run before load_model() copies the parsed
++    // params in, so this cannot read params_base.
++    int32_t prefill_chunk = -1;
 +
 +    // LLAMA_SERVER_PREFILL_SKEW (default 1 = off): weight the slot with the SHORTEST remaining prompt this
 +    // many times against the others.  >1 is a tunable droop from the max-min fair share toward
@@ -116371,9 +116414,45 @@ index a6059ab38..304b60770 100644
      server_metrics metrics;
  
      // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
-@@ -1216,10 +1482,8 @@ private:
+@@ -1203,6 +1471,32 @@ private:
+ 
+     // load the model and initialize llama_context
+     // this may also be called to resume from sleeping state
++    // Resolve the prompt-admission knobs once the parsed params are in hand.  The member initializers run at
++    // construction, BEFORE load_model() copies the caller's params into params_base, so anything that comes
++    // from a command-line option has to be resolved here.  Also the one place the legacy env aliases are read,
++    // so they can be reported once with the option that replaced them.
++    void resolve_prefill_admission() {
++        prefill_chunk = params_base.interactive_batch_size < -1 ? -1 : params_base.interactive_batch_size;
++
++        // the legacy env var is `-ib`'s deprecated alias: it only speaks when the option did not (it is named
++        // in shipped scripts and gate invocations, so it keeps working rather than breaking them)
++        const char * e = getenv("LLAMA_SERVER_PREFILL_CHUNK");
++        if (e != nullptr && e[0] != '\0') {
++            static bool warned = false;
++            if (!warned) {
++                warned = true;
++                if (params_base.interactive_batch_size_set) {
++                    SRV_WRN("%s\n", "LLAMA_SERVER_PREFILL_CHUNK is the deprecated alias of -ib/--interactive-batch-size and is IGNORED (the option was given)");
++                } else {
++                    SRV_WRN("%s\n", "LLAMA_SERVER_PREFILL_CHUNK is the deprecated alias of -ib/--interactive-batch-size; prefer -ib N");
++                }
++            }
++            if (!params_base.interactive_batch_size_set) {
++                prefill_chunk = std::max(0, atoi(e));
++            }
++        }
++    }
++
+     bool load_model(common_params & params) {
+         load_progress_data load_progress_text  (this, "text_model");
+         load_progress_data load_progress_mmproj(this, "mmproj_model");
+@@ -1215,11 +1509,11 @@ private:
+         params_base.n_outputs_max = output_limits.total;
          params_base.n_outputs_max_per_seq = output_limits.per_seq;
  
++        resolve_prefill_admission();
++
          const bool has_mmproj = !params.mmproj.path.empty();
 -        const bool has_draft = params.speculative.has_dft();
 -        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
@@ -116384,7 +116463,7 @@ index a6059ab38..304b60770 100644
          const bool has_spec = has_draft || spec_mtp;
  
          if (callback_state) {
-@@ -1305,7 +1569,7 @@ private:
+@@ -1305,7 +1599,7 @@ private:
              params_base.load_progress_callback_user_data = &load_progress_text;
          }
  
@@ -116393,7 +116472,7 @@ index a6059ab38..304b60770 100644
  
          model_tgt = llama_init->model();
          ctx_tgt   = llama_init->context();
-@@ -1345,7 +1609,7 @@ private:
+@@ -1345,7 +1639,7 @@ private:
                  params_dft.load_progress_callback           = load_progress_callback;
                  params_dft.load_progress_callback_user_data = &load_progress_spec;
  
@@ -116402,12 +116481,14 @@ index a6059ab38..304b60770 100644
                  model_dft = spec_init->model();
                  ctx_dft   = spec_init->context();
  
-@@ -1485,6 +1749,13 @@ private:
+@@ -1485,6 +1779,15 @@ private:
          SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                  params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
  
 +        // the prompt admission policy, so a log always says which one ran (wip/session-scheduling)
-+        SRV_INF("prefill admission: fair share = %s, chunk = %s, skew = %d, duty = %d\n",
++        // `chunk` is the cap on a step that carries decode work; a step with no decoder waiting takes the
++        // whole window (`no-decode = n_batch`), which is why the chunk is not a throughput setting.
++        SRV_INF("prefill admission: fair share = %s, chunk = %s, skew = %d, duty = %d, no-decode = n_batch\n",
 +                prefill_fair ? "on" : "off",
 +                prefill_chunk < 0 ? "n_ubatch" : prefill_chunk == 0 ? "off" : std::to_string(prefill_chunk).c_str(),
 +                prefill_skew,
@@ -116416,7 +116497,7 @@ index a6059ab38..304b60770 100644
          // initialize slots
          for (int i = 0; i < params_base.n_parallel; i++) {
              slots.emplace_back();
-@@ -1892,9 +2163,21 @@ private:
+@@ -1892,9 +2195,21 @@ private:
  
                  const int64_t t_start = ggml_time_us();
  
@@ -116439,7 +116520,7 @@ index a6059ab38..304b60770 100644
                      ret->prompt_clear();
                  }
  
-@@ -1907,18 +2190,218 @@ private:
+@@ -1907,18 +2222,218 @@ private:
          return ret;
      }
  
@@ -116659,7 +116740,7 @@ index a6059ab38..304b60770 100644
          for (auto & slot : slots) {
              if (slot.is_processing()) {
                  continue;
-@@ -2728,6 +3211,28 @@ private:
+@@ -2728,6 +3243,28 @@ private:
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
@@ -116688,7 +116769,7 @@ index a6059ab38..304b60770 100644
          // evict checkpoints within min-step of a previous checkpoint, unless they were
          // created by the current task
          // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-@@ -2740,6 +3245,7 @@ private:
+@@ -2740,6 +3277,7 @@ private:
                  SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                          cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
  
@@ -116696,7 +116777,7 @@ index a6059ab38..304b60770 100644
                  it = slot.prompt.checkpoints.erase(it);
                  continue;
              }
-@@ -2750,7 +3256,8 @@ private:
+@@ -2750,7 +3288,8 @@ private:
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
              // make room for the new checkpoint, if needed
@@ -116706,7 +116787,7 @@ index a6059ab38..304b60770 100644
  
              SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                      cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
-@@ -2764,6 +3271,7 @@ private:
+@@ -2764,6 +3303,7 @@ private:
              for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                  if ((*it)->n_tokens == n_tokens_new) {
                      SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", (*it)->n_tokens);
@@ -116714,7 +116795,7 @@ index a6059ab38..304b60770 100644
                      it = slot.prompt.checkpoints.erase(it);
                  } else {
                      ++it;
-@@ -2781,6 +3289,12 @@ private:
+@@ -2781,6 +3321,12 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -116727,7 +116808,7 @@ index a6059ab38..304b60770 100644
          cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
          cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
          // stash the draft's speculative state with the checkpoint
-@@ -3080,7 +3594,11 @@ private:
+@@ -3080,7 +3626,11 @@ private:
                          break; // drop the task
                      }
  
@@ -116740,7 +116821,7 @@ index a6059ab38..304b60770 100644
                          for (auto & slot : slots) {
                              if (!slot.is_processing()) {
                                  SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-@@ -3904,7 +4422,14 @@ private:
+@@ -3904,7 +4454,14 @@ private:
                              slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                          }
  
@@ -116756,7 +116837,7 @@ index a6059ab38..304b60770 100644
  
                          const bool spec_reject = slot.use_spec_rejection();
  
-@@ -3913,7 +4438,7 @@ private:
+@@ -3913,7 +4470,7 @@ private:
                              /* .n_max    = */ n_draft_max,
                              /* .pos0     = */ slot.prompt.tokens.pos_next(),
                              /* .id_last  = */ slot.sampled,
@@ -116765,7 +116846,7 @@ index a6059ab38..304b60770 100644
                              /* .result   = */ &slot.spec_draft,
                              /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                              /* .temp     = */ slot.task->params.sampling.temp,
-@@ -3964,7 +4489,7 @@ private:
+@@ -3964,7 +4521,7 @@ private:
                  if (use_ckpt_tgt) {
                      //const int64_t t_start = ggml_time_us();
  
@@ -116774,7 +116855,7 @@ index a6059ab38..304b60770 100644
  
                      //const int64_t t_total = ggml_time_us() - t_start;
                      //printf("checkpoint total: %f ms\n", t_total / 1000.0);
-@@ -3993,6 +4518,72 @@ private:
+@@ -3993,6 +4550,101 @@ private:
          auto & alora_scale       = batch.alora_scale;
          auto & alora_disabled_id = batch.alora_disabled_id;
  
@@ -116817,6 +116898,27 @@ index a6059ab38..304b60770 100644
 +            prefill_idle_us = prefill_idle_prev ? prefill_idle_us + step_us : 0;
 +        }
 +        prefill_idle_prev = !prefill_now;
++
++        // The per-step chunk is an INTERACTIVITY bound: it exists so a decoding slot's inter-token latency
++        // and a newly arrived request's wait are bounded by one chunk-sized step.  It is not a throughput
++        // setting, and below the ubatch it is strictly dominated (the step still issues one llama_process()
++        // and the same kernel launches, so it re-pays the step's fixed cost `b` for nothing).  So it applies
++        // only to a step that carries DECODE work: with nothing generating, the only work in flight is the
++        // prompts themselves and the whole logical window (n_batch, ubatch-split internally) is available.
++        //
++        // The test is "some slot owes a decode token", not `batch.size() == 0`: slots that cannot batch
++        // together still serialise (two LoRA classes, can_batch_with()), so a generating slot can be left
++        // OUT of this step's batch and `batch.size()` would read zero while a decoder is in fact waiting.
++        // An audio/TTS slot is not in the shared batch either.  Both cases stay chunked here, which is the
++        // safe direction -- a wide step handed to a waiting decoder is exactly the stall this bounds.
++        bool decode_active = false;
++        for (const auto & slot : slots) {
++            if (slot.state == SLOT_STATE_GENERATING) {
++                decode_active = true;
++                break;
++            }
++        }
++
 +        if (!prefill_now) {
 +            // a decode-only step: no prompt slot is admitted, and the zero budgets make the fill loop skip
 +            // them (its guard is `n_tokens() > 0 && prompt_budget <= 0`)
@@ -116825,7 +116927,15 @@ index a6059ab38..304b60770 100644
 +            const int32_t want   = prefill_chunk > 0 ? prefill_chunk
 +                                 : prefill_chunk < 0 ? (int32_t) n_ubatch
 +                                 : n_batch;
-+            const int32_t cap    = std::min(n_batch, want);
++            // no decoder is waiting: nothing to bound, so the step takes the whole window.  A wide step never
++            // carries a decode token by construction (the decode token is added above, before this), so a
++            // decoder's first contended step is already chunk-bounded -- it only waits out an in-flight
++            // uncontended step.  This is the shape r300's c4 measurement priced: 1454 t/s at chunk 512 against
++            // 3036 t/s at no cap on the field `runme` (b ~= 196 ms, 128 steps vs 4), and it is also the better
++            // TTFR there (40.6 s vs 19.5 s).  The number of concurrent PROMPTS is irrelevant: the window is
++            // shared max-min fairly either way, so several prompts prefilling with nothing decoding is still
++            // the uncontended case.
++            const int32_t cap    = decode_active ? std::min(n_batch, want) : n_batch;
 +            const int32_t budget = std::max(0, cap - (int32_t) batch.size());
 +
 +            if (prefill_fair && !use_mixed_batch()) {
@@ -116847,7 +116957,7 @@ index a6059ab38..304b60770 100644
          // next, batch any pending prompts without exceeding n_batch
          if (params_base.cont_batching || batch.size() == 0) {
              bool add_ok = true; // false means the batch is full, skip remaining slots
-@@ -4006,6 +4597,13 @@ private:
+@@ -4006,6 +4658,13 @@ private:
                      return;
                  }
  
@@ -116861,7 +116971,7 @@ index a6059ab38..304b60770 100644
                  // check if we can batch this slot with the previous one
                  if (slot_batched && !slot_batched->can_batch_with(slot)) {
                      return;
-@@ -4036,6 +4634,12 @@ private:
+@@ -4036,6 +4695,12 @@ private:
  
                          slot.state = SLOT_STATE_PROCESSING_PROMPT;
  
@@ -116874,7 +116984,7 @@ index a6059ab38..304b60770 100644
                          SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                  slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
  
-@@ -4287,6 +4891,8 @@ private:
+@@ -4287,6 +4952,8 @@ private:
  
                                      bool do_reset = it == slot.prompt.checkpoints.rend();
  
@@ -116883,7 +116993,7 @@ index a6059ab38..304b60770 100644
                                      if (!do_reset) {
                                          const auto & cur = **it;
  
-@@ -4310,6 +4916,8 @@ private:
+@@ -4310,6 +4977,8 @@ private:
  
                                          pos_next = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max));
                                          n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) cur.n_tokens);
@@ -116892,7 +117002,7 @@ index a6059ab38..304b60770 100644
                                          SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_past, (float) cur.size() / 1024 / 1024);
                                      }
  
-@@ -4328,6 +4936,7 @@ private:
+@@ -4328,6 +4997,7 @@ private:
                                      const auto & cur = **it;
                                      if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                          SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
@@ -116900,7 +117010,7 @@ index a6059ab38..304b60770 100644
                                          it = slot.prompt.checkpoints.erase(it);
                                      } else {
                                          ++it;
-@@ -4484,8 +5093,12 @@ private:
+@@ -4484,8 +5154,12 @@ private:
  
                      const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
  
@@ -116915,7 +117025,7 @@ index a6059ab38..304b60770 100644
                          // get next token to process
                          llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                          if (cur_tok == LLAMA_TOKEN_NULL) {
-@@ -4558,6 +5171,9 @@ private:
+@@ -4558,6 +5232,9 @@ private:
                      // the number of tokens added to the batch for the current slot
                      const auto n_tokens_cur = batch.size() - n_tokens_prev;
  
@@ -116925,7 +117035,7 @@ index a6059ab38..304b60770 100644
                      const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
  
                      const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
-@@ -4617,6 +5233,10 @@ private:
+@@ -4617,6 +5294,10 @@ private:
                  }
              });
          }
@@ -116936,7 +117046,7 @@ index a6059ab38..304b60770 100644
      }
  
      // see https://github.com/ggml-org/llama.cpp/pull/29969
-@@ -4994,7 +5614,12 @@ private:
+@@ -4994,7 +5675,12 @@ private:
                              SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                          }
  
@@ -116950,7 +117060,7 @@ index a6059ab38..304b60770 100644
                          slot.spec_is_replay = true;
                          slot.spec_draft = std::move(accepted);
  
-@@ -5002,7 +5627,7 @@ private:
+@@ -5002,7 +5688,7 @@ private:
  
                          SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
  

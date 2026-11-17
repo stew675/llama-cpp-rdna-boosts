@@ -8,7 +8,12 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `b64c825acfe2e0736d18b75ffd5b047ae670aa6ea3e5ec282aee4eb90e22fff2` (the r299 cut; the earlier cuts are recorded below)
+  `b5b223baa8d8b8ed5f45aebd885702c783c0193f547d3db1ccfe31e256d32e34` (the r306 cut; the earlier cuts are recorded below)
+* **r306 re-cut verification**: applies strictly at the r306 default tree
+  `f12b1a0c8ee6c24b77467f93550322e74762aef0` and produces `cef109647023afdb32ef4570edb0aa752cb0c09f`; cumulative with the other optional artifact, numeric order, is `445ace2475eb41c0ae543242efcee636513898ac`.
+  The patch file moved (sha256 `b5b223baa8d8b8ed5f45aebd885702c783c0193f547d3db1ccfe31e256d32e34`) because the exported commit id moved -- block 16's r306 amendment rewrites
+  the commit this artifact is cut on top of -- and **only the `From <sha>` line changed**.  `validate-set.sh`
+  check 8 verifies all three trees on every run.
 * **r300 re-cut verification**: applies strictly at the r300 default tree
   `4baf1b67ae591e6661a1e3c5365457a747b688ab` and produces `03ec82a1dd5a97d6ac6e266397897aa0c58debcb`; cumulative with the other optional artifact,
   numeric order, is `dc9a8815bd56be9a2e9cae48f7b19d26e7da922a`.  **The patch file is unchanged** (sha256 `b64c825acfe2e0736d18b75ffd5b047ae670aa6ea3e5ec282aee4eb90e22fff2`,

@@ -441,3 +441,33 @@
    exposed while `Qwen3.6-35B-A3B-Q4_K_M -sm tensor` was not (its host master is merged into
    `Meta(ROCm0,ROCm1)#...`, so buffer ownership already assigns it to the GPUs).  Do not conclude from one
    model's `-sm tensor` arm that the offload decision is unreachable.
+
+## r306 (2026-11-17, `WORKLOG.md` 261117.005)
+
+1. **The admission chunk's cost is the UBATCH width, not the step count.** A capped step is a
+   `chunk`-wide ubatch instead of an `-ub`-wide one, and the ubatch is the unit of work
+   (`archive/work/session-scheduling/README.md` §4.2.1): on Flash-Next IQ3_XXS with host-resident experts
+   (1 GPU, `-ncmoe 47`, an 8401-token prompt) a 512-token cap reads **683.7 t/s** against **1885.8** with no
+   cap at `-b/-ub 16384` (2.76x), while at `-b/-ub 512` the same cap is **free** (826.5 vs 828.8 t/s on a
+   5601-token prompt -- the two-point fit gives `b ≈ 0`, so the r300 record's `b ≈ 196 ms` is that shape's
+   *wide-ubatch* fixed cost, not a property of host-resident experts as such). So "a host-expert arm will show
+   the chunk penalty" is only true at a wide `-ub`; a `-b/-ub 512` arm measures ~0 and is not evidence about
+   the field shape.
+2. **A per-step cap must not be applied to a step that carries no decode work.** It bounds a decoding slot's
+   inter-token latency and a newcomer's admission wait and nothing else, so r300/r301's unconditional cap
+   charged half of the field shape's uncontended prefill (**1454 vs 3036 t/s** for the same 65536 tokens) for
+   a bound nothing was waiting on. The contended-only rule is safe because a wide step can never carry a decode
+   token -- the decode token is added before the budget is computed -- so a decoder's first *contended* step is
+   already capped; only an in-flight uncontended step can delay it. The test must be "some slot is in
+   `SLOT_STATE_GENERATING`", not `batch.size() == 0`: slots that cannot batch together still serialise
+   (`can_batch_with()`), so a waiting decoder's slot can be left out of the step's batch.
+3. **The number of concurrent PROMPTS is irrelevant to the rule, and a small cap is worst there.** The window
+   is shared max-min fairly either way, so N prompts with nothing decoding are still the uncontended case; four
+   ~7k prompts on a 4B (`-np 4`) go 177 slot-steps / 4.89 s with a 512-token cap against **46 / 3.40 s** with
+   the whole window (1.44x), even though the same shape's *lone*-prompt arm shows nothing.
+4. **A greedy-text oracle is not available on a host-expert shape without pinning the residency prior.** Six
+   identical-config runs on Flash-Next `-ncmoe 47` (same tree, same `-b/-ub`, same chunk, same prompt, greedy)
+   produced four different texts (three distinct hashes and a fourth length), across both binaries. That is
+   `GREEDY-PURITY.md` §89's mechanism (residency selects the MoE kernel set) rather than the change under test,
+   and this GGUF ships no `.moe-heatmap` for `MOE_EXPERT_HEATMAP=load`, so a text assertion on that shape needs
+   a fully resident arena, repeats with a stated spread, or `scripts/gate-prefill-logits.sh` instead.

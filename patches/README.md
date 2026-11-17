@@ -1,5 +1,26 @@
 # The delivery patches — what each block is and what it does
 
+> **r306: block 16's per-step prompt-admission cap becomes a CONTENDED bound and a first-class option, `-ib` / `--interactive-batch-size`.**
+> The cap exists to bound a **decoding** slot's inter-token latency and a newcomer's wait for admission; r300/r301
+> applied it to **every** step, including one that carries no decode work, where it bounds nothing and a chunk
+> below `-ub` only re-pays the step's fixed cost.  Measured on the field shape that cost **1454 vs 3036 t/s** for
+> the same 65536 tokens with nothing decoding.  A step with **no slot in `SLOT_STATE_GENERATING`** now takes the
+> whole `-b` window (shared max-min fairly, so the number of concurrent **prompts** is irrelevant); a step with a
+> decoder waiting is capped exactly as before.  A wide step can never carry a decode token (it is added before the
+> budget is computed), so a decoder's first contended step is already capped.  The variable is now
+> `-ib N` / `--interactive-batch-size N` (env `LLAMA_ARG_INTERACTIVE_BATCH_SIZE`; `-1` = one `n_ubatch`, `0` = no
+> bound), and `LLAMA_SERVER_PREFILL_CHUNK` keeps working as its deprecated alias with one WARN.  **Measured** (one
+> R9700): a lone 8401-token prompt on the 4B goes 18 x 512 -> 6 x 2048 steps with the text **byte-identical**
+> (`332/07a82d55e623` in all four arms, including the r305 binary); with a decoder already generating, the
+> prefilling slot's step list is **identical to r301's** (`511 x 9, 486, 511, 1, 4`) at the same wall time, while
+> the decoder gets **137** tokens per 2.18 s at `-ib 512` against **69** per 1.48 s at `-ib 2048` (worst gap 89 vs
+> 276 ms); four concurrent ~7k prompts with nothing decoding go 177 slot-steps / 4.89 s -> **46 / 3.40 s**; and on
+> Flash-Next with host-resident experts at `-b/-ub 16384` a small cap is **683.7 vs 1885.8 t/s** (2.76x) while at
+> `-b/-ub 512` it is free -- the carrier is the **ubatch width**, not the step count.  Gates 30/31 PASS (31 gained
+> two `-lv 5` width passes: an uncontended step must be wider than the chunk, a step carrying decode tokens must
+> not exceed it), prefill-logit KLD **0.000000 / 100.000 %**.  Record: `WORKLOG.md` 261117.005, `INVARIANTS.md`
+> r306, `ENVIRONMENT.md` §22, `TODO` #344 (the host-expert shape's text is not an oracle here).
+
 > **r305: a host-expert routed `MUL_MAT_ID` is offloaded at EVERY ubatch width (GitHub issue #323, `briansp2020`), an amendment to block 09.**
 > Block **09** owns `ggml_backend_cuda_device_offload_op()` and the scheduler that consults it, so the fix lives there
 > and the block count is unchanged (17 official + `0300`).  The hook relaxed a *cache-managed* routed MoE into the
@@ -423,7 +444,7 @@ bash /path/to/rdna-boosts/scripts/apply-all.sh --include-beta .   # + beta/*/*.p
 
 All blocks with **`git am`**, in order.  `git apply` on the concatenated series silently drops hunks; the
 manual equivalent is `git am patches/00[0-9][0-9]-*.patch patches/03[0-9][0-9]-*.patch` (official
-`0000`-`0015`, then the temporary `0300`).  `apply-all.sh` asserts the applied tree equals
+`0000`-`0016`, then the temporary `0300`).  `apply-all.sh` asserts the applied tree equals
 `release.json.tree` on the strict path.
 
 ## Block index
@@ -3555,9 +3576,10 @@ cannot tell the two arms apart).  Record: `archive/work/qsa-topk-regular/`.
 > admitted to every step, and a slot that needs less returns the difference to the pool).  Three variables, all
 > catalogued in `ENVIRONMENT.md` §22: `LLAMA_SERVER_PREFILL_FAIR` (kill-switch, **on**), `SKEW` (**1** = the
 > equal share; `N` weights the shortest-remaining slot N:1 — measured mean TTFT 1.401 → 1.082 s at 5, with the
-> *longest* prompt improving too because short slots retire), and `CHUNK` (**unset = one `n_ubatch`**; below
-> `n_ubatch` is dominated because the step re-pays its fixed cost for no fewer launches — `b ≈ 196 ms` on the
-> Flash-Next field shape against `b ≈ 2 ms` on a dense 4B).  A one-token floor per active prompt makes
+> *longest* prompt improving too because short slots retire), and the per-step cap (**r306: `-ib`, the prompt
+> tokens admitted per step while a decoder waits**; below `n_ubatch` is dominated because the step re-pays its
+> fixed cost for no fewer launches — `b ≈ 196 ms` on the Flash-Next field shape against `b ≈ 2 ms` on a dense
+> 4B).  A one-token floor per active prompt makes
 > starvation impossible in every mode.  Gate: `scripts/gate-prefill-fairness.sh` (two arms, 8 checks,
 > `--self-test` verified to reject the r299 build).  Measured on the promoted tree: short-prompt TTFT
 > **1.90 → 0.28 s (6.8x)**, decoder ITL **334 → 107 ms**, lone prefill **−0.8 %**, one request's greedy text
@@ -5463,7 +5485,7 @@ under a 1 GiB `ulimit -l` refuses naming the 21 741.3 MiB shortfall, and **`-lme
 18 s), coherence identical on this box (4B 1 GPU `a77fa8c1107a`, 3 GPU tensor `eab86065e67e`).  Record:
 `WORKLOG.md` 261114.005, `INVARIANTS.md` (r284).
 
-## Block 16 — the server's prompt admission policy (the fair share, the chunk, the skew, the duty cycle)
+## Block 16 — the server's prompt admission policy (the fair share, `-ib`, the skew, the duty cycle)
 
 New block at **r301** (`TODO` #339): the code was folded into block 12 at r300 and moved out here when the
 maintainer's deferred structure decision was taken.  **Why an official `0016` and not a `03xx`:** the policy is
@@ -5473,12 +5495,33 @@ byte-identical to r300, block 12 loses exactly these hunks, and the applied tree
 
 **What it owns.**  `update_slots()`' batch assembly, and nothing else: `share_prompt_budget()` (water-filling
 max-min share of `n_batch - (decode tokens)`, a one-token floor so starvation is impossible at any
-`n_parallel`), `LLAMA_SERVER_PREFILL_FAIR` (kill-switch, **on**), `LLAMA_SERVER_PREFILL_CHUNK` (**unset = one
-`n_ubatch`**, `0` = off), `LLAMA_SERVER_PREFILL_SKEW` (**1**, a shortest-remaining weighting) and
-`LLAMA_SERVER_PREFILL_DUTY` (**16**, up to `K-1` decode-only steps before a prefill step, capped in TIME by the
-last prefill step's own duration).  The `-lv 4` census prints all four at startup.  `ENVIRONMENT.md` §22 is the
-variable catalogue; `archive/work/session-scheduling/` is the r300 design record and
-`archive/work/prefill-duty-cycle/` is the r301 duty-cycle record.
+`n_parallel`), `LLAMA_SERVER_PREFILL_FAIR` (kill-switch, **on**), `-ib N` / `--interactive-batch-size` (the
+per-step cap, **`-1` = one `n_ubatch`**, `0` = off; env `LLAMA_ARG_INTERACTIVE_BATCH_SIZE`, with
+`LLAMA_SERVER_PREFILL_CHUNK` as the deprecated alias -- see the r306 amendment below), `LLAMA_SERVER_PREFILL_SKEW`
+(**1**, a shortest-remaining weighting) and `LLAMA_SERVER_PREFILL_DUTY` (**16**, up to `K-1` decode-only steps
+before a prefill step, capped in TIME by the last prefill step's own duration).  The `-lv 4` census prints all of
+them at startup.  `ENVIRONMENT.md` §22 is the variable catalogue; `archive/work/session-scheduling/` is the r300
+design record and `archive/work/prefill-duty-cycle/` is the r301 duty-cycle record; `wip/prefill-chunk-adaptive/`
+is the r306 amendment's record (§7 there is the promotion, `TODO` #344 the unverified part).
+
+**r306 amendment — the cap is a CONTENDED bound, and it is an option.**  r300/r301 applied the chunk to **every**
+step, including a step that carries no decode work, where it bounds nothing: on the field shape that cost
+**1454 vs 3036 t/s** for the same 65536 tokens (nothing decoding), i.e. half of uncontended prefill for a bound
+nobody was waiting on.  The cap now applies only while some slot is in `SLOT_STATE_GENERATING` (the slot state,
+not `batch.size() == 0`: slots that cannot batch together still serialise, so a generating slot can be left out
+of a step while a decoder is in fact waiting); with nothing decoding the step takes the whole `-b` window,
+shared max-min fairly, so **the number of concurrent prompts is irrelevant**.  A wide step can never carry a
+decode token -- the decode token is added before the budget is computed -- so a decoder's first contended step is
+already chunk-bounded.  Promoted from the env variable to `-ib` / `--interactive-batch-size` in the same change
+(`LLAMA_SERVER_PREFILL_CHUNK` keeps working as the deprecated alias, one WARN; the option wins if both are
+given).  Measured (one R9700, 4B Q8_0): the default and `-ib 512` both prefill a lone 8401-token prompt in
+2048-wide steps (18 x 512 -> 6 x 2048), the same text byte for byte; with a decoder generating, the prefilling
+slot's step list is **identical to r301** (511 x 9, 486, 511, 1, 4) at the same wall time; four concurrent ~7k
+prompts with nothing decoding go 177 slot-steps / 4.89 s -> **46 / 3.40 s**; and on Flash-Next with host-resident
+experts at `-b/-ub 16384` a small cap costs **683.7 vs 1885.8 t/s** (2.76x) while at `-b/-ub 512` it is free --
+the carrier is the ubatch width, not the step count.  Gates: `gate-prefill-fairness.sh` (its lone-prefill arm
+went from -2 % to -0.4 %) and `gate-prefill-duty.sh` (the r301 numbers reproduced: 16 -> 137 tokens, 2.17x
+stretch), both PASS on the promoted tree.
 
 **The two measurements that decide it.**  The fair share fixes *prompt versus prompt* (a 7-token prompt behind a
 13.2 k one: **1.94 -> 0.31 s**, decoder ITL **334 -> 79 ms**), and the duty cycle fixes *prompt versus decode*

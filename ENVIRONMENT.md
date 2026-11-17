@@ -1458,7 +1458,7 @@ notes it is not in the default build); the artifact, its trees and its measureme
 | `GGML_SCHED_PAIR_DEBUG` | `0` | diagnostic (value) | `1` logs each pair decision; `>= 2` also runs the cache-hazard self-test; `>= 3` logs per-lane/per-backend GPU event spans (this is the only consumer of `ggml_backend_event_elapsed_time`, and it makes the backend create **timing** events — that cost is why it is not the default). |
 | `GGML_SCHED_PAIR_HAZARD` | on | diagnostic (value) | `0` keeps only the split-name guard and skips the cache-hazard analysis of the two lanes.  A/B only: the hazard analysis is what makes a mis-matched pair run one-after-the-other instead of racing on the KV cache. |
 
-## 22. Server prompt admission (block 16, r301; block 12 at r300) — the fair share, the skew, the chunk and the duty cycle
+## 22. Server prompt admission (block 16, r301; block 12 at r300; the `-ib` option and the contended-only cap at r306) — the fair share, the skew, the interactive batch size and the duty cycle
 
 `update_slots()` assembles ONE batch per step and it cannot be joined mid-flight, so the policy that decides
 **which prompt tokens enter that batch** is also the policy that decides how long every other slot waits.
@@ -1466,11 +1466,23 @@ Before r300 the prompt slots were filled in **slot-index order**, each to `n_bat
 whole window and every other prompt waited for that slot's *entire* prompt.  r300 shares the window max-min
 fairly and exposes three variables.  Full record: `archive/work/session-scheduling/`.
 
+**r306: the per-step cap is a CONTENDED bound.**  It exists to bound a *decoding* slot's inter-token latency and
+a newcomer's wait for admission -- a step with **nothing decoding** has nothing to bound, so it takes the whole
+`-b` window (`n_batch`, ubatch-split internally) and the cap applies only while some slot owes a decode token
+(`SLOT_STATE_GENERATING`: a slot that cannot batch with the others is still a waiter, which is why the test is
+the slot state and not `batch.size()`).  This is what `-ib` names, and the variable that used to cap every step
+was `LLAMA_SERVER_PREFILL_CHUNK` -- on the field shape that cost **1454 vs 3036 t/s** for the same 65536 tokens
+(uncontended, nothing decoding).  The number of concurrent **prompts** is irrelevant: the window is shared
+max-min fairly either way, so several prompts prefilling with nothing decoding is still the uncontended case
+(4B, `-np 4`, four ~7k prompts: 177 slot-steps / 4.89 s capped vs **46 / 3.40 s**).  Wide steps are also not a
+throughput lever: the failure mode is a chunk smaller than `-ub` (Flash-Next host-resident experts, 8401 tokens,
+`-b/-ub 16384`: 18 x 512 = 683.7 t/s against 2 x 8400 = 1885.8 t/s; at `-b/-ub 512` the same cap is free).
+
 | variable | default | class | what it does |
 |---|---|---|---|
 | `LLAMA_SERVER_PREFILL_FAIR` | **on** (set `0` to disable) | **kill-switch** (default-on feature) | the max-min fair share: water-filling over the slots that still have prompt tokens, so every active prompt is admitted to every step and a slot that needs less returns the difference to the pool for the others.  `0` restores the r299 slot-order fill exactly. |
 | `LLAMA_SERVER_PREFILL_SKEW` | **1** | **tuning** | weights the slot with the **shortest remaining** prompt `N:1` against the others (1..64, clamped).  Not SRPT: every other slot still advances every step, so starvation is impossible.  `1` is the plain equal share and allocates exactly what it did before this variable existed.  Measured (4 prompts of 6000/3000/1500/400 tokens, `-np 4`): mean TTFT 1.401 s at 1, **1.082 s at 5**, 1.040 s at 20, and the *longest* prompt improves too (2.201 → 1.975 s) because short slots retire and stop competing. |
-| `LLAMA_SERVER_PREFILL_CHUNK` | **unset = one `n_ubatch`** | **tuning** | caps the prompt tokens admitted per step.  This is the bound on a decoding slot's ITL and on the worst-case wait for a newly arrived request.  `0` = off; `N` = explicit.  **Below `n_ubatch` is dominated**: the step still issues one `llama_process()` and the same kernel launches, so it re-pays the step's fixed cost for nothing. |
+| `-ib N` / `--interactive-batch-size N` (env `LLAMA_ARG_INTERACTIVE_BATCH_SIZE`; **`LLAMA_SERVER_PREFILL_CHUNK` is the option's deprecated alias**, still read with one WARN) | **`-1` = one `n_ubatch`** | **tuning** (first-class option since r306) | caps the prompt tokens admitted per step **while a decoder is waiting**.  That is the bound on a decoding slot's ITL and on the worst-case wait for a newly arrived request; `-1` = one `n_ubatch`, `0` = no bound, `N` = explicit.  A step with **nothing decoding** always takes the whole `-b` window, so `-ib` never caps an uncontended prefill.  **Below `n_ubatch` is dominated**: the step still issues one `llama_process()` and the same kernel launches, so it re-pays the step's fixed cost for nothing -- and when `-ub` is wide, a small chunk is the whole difference (**683.7 vs 1885.8 t/s** on the Flash-Next host-expert shape at `-b/-ub 16384`).  What it buys is the decoder: on the 4B at `-np 2`, **137** decode tokens per 2.18 s prefill at `-ib 512` against **69** per 1.48 s at `-ib 2048`, with a worst inter-token gap of 89 vs 276 ms. |
 | `LLAMA_SERVER_PREFILL_DUTY` | **16** | **kill-switch** (default-on feature; `0` or `1` disables) | up to `K-1` consecutive **decode-only** steps, then one step that carries prompt tokens: the decoding slot gets a burst of `K-1` tokens at the decode-only step time instead of one token per (slow) prefill step.  **The burst is BOUNDED in time, not just in steps**: the deferral stops as soon as the idle time accumulated since the last prefill step reaches that step's own measured duration, so a concurrent prefill takes at most ~2x its uncontended wall.  Never defers into an empty batch (a step with no decode work prefills immediately), so an idle server and a lone prompt are untouched.  Measured (2026-11-16, pinned slots, `-np 2`; `scripts/gate-prefill-duty.sh`): dense 4B at a 512-token chunk **16 -> 137** decode tokens for +113 % prefill wall; 27B + `draft-mtp n3` **46 -> 200** for +25 % (acceptance unchanged to 2 of 269 drafts); a streamed host-expert 35B-class shape **9 -> 109** for +56 %; the field shape (3 GPU tensor, one 16k-token step) **5 -> 41** for +10 %.  `K` alone is not one number -- `1 + (K-1)*decode_step/prefill_step` spans 1.03x to 16x -- which is what the time bound exists to fix.  Class: default-on because it helps, with the prefill stretch as the documented trade (`scripts/gate-prefill-duty.sh`). |
 
 **The chunk's cost is shape-dependent and the fixed per-step cost is the whole story.**  Fitting
@@ -1479,6 +1491,13 @@ fairly and exposes three variables.  Full record: `archive/work/session-scheduli
 **no-op** where `-ub` already equals `-b` (a big-prefill config), and why a sub-second ITL bound requires
 lowering `-ub` as well: llama-benchy at `--parallel 4`, `pp16384`, read **3036 t/s** with no cap, **2832** at
 `chunk 4096` (−7 %) and **1454** at `chunk 512` (−52 %).
+
+**r306 measured the carrier directly, and it is the UBATCH width, not the step count.**  On the Flash-Next
+host-resident-expert shape (1 GPU, `-ncmoe 47`): at `-b/-ub 512` a 512-token cap costs nothing (12 steps vs 5,
+826.5 vs 828.8 t/s for 5601 tokens -- the fit gives `b ≈ 0`); at `-b/-ub 16384` the same cap is **683.7 t/s
+against 1885.8** (2.76x) because a capped step is a 512-wide ubatch instead of a 16384-wide one.  So the honest
+statement is: `-ub` sets the unit of work, `-ib` below it buys the decoder, and r306 stops that purchase from
+being charged to steps that have no decoder to protect.
 
 Starvation is impossible in every mode: a one-token floor per active prompt is applied before the weighted
 split, so even `SKEW=64` with `n_parallel` at `n_batch` admits every prompt on every step.  `-lv 4` prints the

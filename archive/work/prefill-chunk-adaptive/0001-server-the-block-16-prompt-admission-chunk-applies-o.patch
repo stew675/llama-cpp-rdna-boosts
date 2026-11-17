@@ -1,0 +1,129 @@
+From 0fc5bb60c74feb7b0db87719f8e15d4f7d337a47 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Tue, 17 Nov 2026 15:16:04 -0600
+Subject: [PATCH] server: the block-16 prompt-admission chunk applies only
+ while a decoder is waiting
+
+LLAMA_SERVER_PREFILL_CHUNK bounded EVERY step at r300/r301 (unset = one n_ubatch,
+0 = off, N = explicit), including a step that carries no decode work.  The cap
+exists to bound a decoding slot's inter-token latency and a newcomer's wait for
+admission -- with nothing generating it bounds nothing, and a chunk below
+n_ubatch is dominated anyway (the step still issues one llama_process() and the
+same kernel launches, so it re-pays the step's fixed cost b for nothing).
+
+A step with no slot in SLOT_STATE_GENERATING now takes the whole logical window
+(n_batch, ubatch-split internally); a step with a decoder waiting keeps the
+chunk exactly as before.  A wide step can never carry a decode token (the decode
+token is added before the budget is computed), so a decoder's first contended
+step is already chunk-bounded.  The number of concurrent PROMPTS is irrelevant:
+the window is shared max-min fairly either way.
+
+Measured (one R9700, 4B Q8_0, -b 2048 -ub 512, lone 8401-token prompt):
+r305 reads 18 steps x 512 (7139.5 t/s), this tree reads 6 steps x 2048
+(7129.3 t/s) -- step-identical to r305's CHUNK=0 arm, text byte-identical in
+all four arms.  With a decoder already generating, the prefilling slot's step
+list is IDENTICAL to r305 element for element (511 x 9, 486, 511, 1, 4) at the
+same wall time, i.e. the contended path is untouched.  gate-prefill-duty and
+gate-prefill-fairness both PASS on this tree.
+
+No new variable: CHUNK=0 is the kill switch (no cap at all), and the r301
+behaviour is simulated with 0 plus a smaller -b/-ub.
+---
+ tools/server/server-context.cpp | 60 +++++++++++++++++++++++++--------
+ 1 file changed, 46 insertions(+), 14 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 304b60770..2a9f4c90f 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1156,18 +1156,19 @@ private:
+         return e == nullptr || atoi(e) != 0;
+     }();
+ 
+-    // LLAMA_SERVER_PREFILL_CHUNK (unset = one ubatch, 0 = off): cap the prompt tokens admitted per step.  This
+-    // is also the worst-case wait for a newly arrived request and the bound on a decoding slot's inter-token
+-    // latency, because a batch is assembled once per step and cannot be joined mid-flight.
+-    //
+-    // The default is ONE UBATCH because a smaller chunk is dominated: below `n_ubatch` a step still issues the
+-    // same one `llama_process()` call and the same kernel launches, so it pays the step's fixed cost again for
+-    // no reduction in launch count.  That fixed cost is what decides the trade and it is shape-dependent --
+-    // ~2 ms on a dense model on one GPU, ~196 ms on a PLE-on-CPU + host-expert + attendance-pool shape (fitted
+-    // from llama-benchy: 128 steps of 512 tok cost 45.1 s against 4 steps of 16384 at 21.6 s for the same
+-    // 65536 tokens).  So `chunk = n_ubatch` is a no-op where the ubatch is already the batch (a big-prefill
+-    // config), and near-free where the ubatch is a quarter of it -- and a real ITL bound requires lowering
+-    // -ub as well as this, which is the honest coupling.
++    // LLAMA_SERVER_PREFILL_CHUNK (unset = one ubatch, 0 = off): cap the prompt tokens admitted per step,
++    // WHILE a decoder is active (some slot owes a decode token).  This is the bound on a decoding slot's
++    // inter-token latency and on the worst-case wait for a request arriving behind a running prompt, because
++    // a batch is assembled once per step and cannot be joined mid-flight.  A step with NOTHING decoding takes
++    // the whole window (n_batch) instead: with no decoder waiting the cap bounds nothing, and below `n_ubatch`
++    // it is strictly dominated anyway (the step still issues one `llama_process()` and the same kernel
++    // launches, so it re-pays the step's fixed cost for no fewer launches).  That fixed cost is what decides
++    // the trade and it is shape-dependent -- ~2 ms on a dense model on one GPU, ~196 ms on a PLE-on-CPU +
++    // host-expert + attendance-pool shape (fitted from llama-benchy: 128 steps of 512 tok cost 45.1 s against
++    // 4 steps of 16384 at 21.6 s for the same 65536 tokens), which is why an unconditioned cap cost the field
++    // shape half of its uncontended prefill (1454 vs 3036 t/s on the same 65536 tokens).  So the chunk is an
++    // interactivity knob, not a throughput one: `-b 16384 -ub 16384` makes it a no-op, and a cheap decoder
++    // bound still requires lowering -ub as well, which is the honest coupling.
+     const int32_t prefill_chunk = [] {
+         const char * e = getenv("LLAMA_SERVER_PREFILL_CHUNK");
+         return e != nullptr ? std::max(0, atoi(e)) : -1; // -1: follow n_ubatch
+@@ -1750,7 +1751,9 @@ private:
+                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
+ 
+         // the prompt admission policy, so a log always says which one ran (wip/session-scheduling)
+-        SRV_INF("prefill admission: fair share = %s, chunk = %s, skew = %d, duty = %d\n",
++        // `chunk` is the cap on a step that carries decode work; a step with no decoder waiting takes the
++        // whole window (`no-decode = n_batch`), which is why the chunk is not a throughput setting.
++        SRV_INF("prefill admission: fair share = %s, chunk = %s, skew = %d, duty = %d, no-decode = n_batch\n",
+                 prefill_fair ? "on" : "off",
+                 prefill_chunk < 0 ? "n_ubatch" : prefill_chunk == 0 ? "off" : std::to_string(prefill_chunk).c_str(),
+                 prefill_skew,
+@@ -4557,6 +4560,27 @@ private:
+             prefill_idle_us = prefill_idle_prev ? prefill_idle_us + step_us : 0;
+         }
+         prefill_idle_prev = !prefill_now;
++
++        // The per-step chunk is an INTERACTIVITY bound: it exists so a decoding slot's inter-token latency
++        // and a newly arrived request's wait are bounded by one chunk-sized step.  It is not a throughput
++        // setting, and below the ubatch it is strictly dominated (the step still issues one llama_process()
++        // and the same kernel launches, so it re-pays the step's fixed cost `b` for nothing).  So it applies
++        // only to a step that carries DECODE work: with nothing generating, the only work in flight is the
++        // prompts themselves and the whole logical window (n_batch, ubatch-split internally) is available.
++        //
++        // The test is "some slot owes a decode token", not `batch.size() == 0`: slots that cannot batch
++        // together still serialise (two LoRA classes, can_batch_with()), so a generating slot can be left
++        // OUT of this step's batch and `batch.size()` would read zero while a decoder is in fact waiting.
++        // An audio/TTS slot is not in the shared batch either.  Both cases stay chunked here, which is the
++        // safe direction -- a wide step handed to a waiting decoder is exactly the stall this bounds.
++        bool decode_active = false;
++        for (const auto & slot : slots) {
++            if (slot.state == SLOT_STATE_GENERATING) {
++                decode_active = true;
++                break;
++            }
++        }
++
+         if (!prefill_now) {
+             // a decode-only step: no prompt slot is admitted, and the zero budgets make the fill loop skip
+             // them (its guard is `n_tokens() > 0 && prompt_budget <= 0`)
+@@ -4565,7 +4589,15 @@ private:
+             const int32_t want   = prefill_chunk > 0 ? prefill_chunk
+                                  : prefill_chunk < 0 ? (int32_t) n_ubatch
+                                  : n_batch;
+-            const int32_t cap    = std::min(n_batch, want);
++            // no decoder is waiting: nothing to bound, so the step takes the whole window.  A wide step never
++            // carries a decode token by construction (the decode token is added above, before this), so a
++            // decoder's first contended step is already chunk-bounded -- it only waits out an in-flight
++            // uncontended step.  This is the shape r300's c4 measurement priced: 1454 t/s at chunk 512 against
++            // 3036 t/s at no cap on the field `runme` (b ~= 196 ms, 128 steps vs 4), and it is also the better
++            // TTFR there (40.6 s vs 19.5 s).  The number of concurrent PROMPTS is irrelevant: the window is
++            // shared max-min fairly either way, so several prompts prefilling with nothing decoding is still
++            // the uncontended case.
++            const int32_t cap    = decode_active ? std::min(n_batch, want) : n_batch;
+             const int32_t budget = std::max(0, cap - (int32_t) batch.size());
+ 
+             if (prefill_fair && !use_mixed_batch()) {
+-- 
+2.56.1
+
