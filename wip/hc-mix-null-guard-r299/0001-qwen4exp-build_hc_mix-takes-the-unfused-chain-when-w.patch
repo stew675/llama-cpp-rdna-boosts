@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Mon, 16 Nov 2026 22:38:39 +0000
+Subject: [PATCH] qwen4exp: build_hc_mix takes the unfused chain when w_down is
+ null (merged hc_*_down_inject GGUFs)
+
+GGUFs from the upstream #31028 converter (e.g. ggml-org Qwen3.8-Flash-Next Q8_0) merge hc_down and
+hc_inject, so w_down is null and the fused_bf16 / fused_ok checks dereferenced it at graph build.
+---
+ src/models/qwen4exp.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 0229abbfa..e93b9c50a 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -888,10 +888,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     // (LLAMA_HC_MIX_BF16=0 keeps the unfused chain)
+     static const bool hc_mix_bf16 = [] { const char * e = getenv("LLAMA_HC_MIX_BF16"); return !e || atoi(e) != 0; }();
+     // only the GPU backend implements the BF16 variant: hc weights in a host buffer (CPU-only, -ot) keep the chain
+-    const bool fused_bf16 = hc_mix_bf16 && hc == 4 && w_down->ne[1] == 320 && w_down->type == GGML_TYPE_BF16 && w_up->type == GGML_TYPE_BF16 &&
++    // merged [hc_down | hc_inject] GGUFs (upstream #31028 converter) have no separate w_down: take the unfused chain
++    const bool fused_bf16 = w_down != nullptr && hc_mix_bf16 && hc == 4 && w_down->ne[1] == 320 && w_down->type == GGML_TYPE_BF16 && w_up->type == GGML_TYPE_BF16 &&
+                             (w_inject == nullptr || w_inject->type == GGML_TYPE_BF16) &&
+                             w_down->buffer != nullptr && !ggml_backend_buffer_is_host(w_down->buffer);
+-    const bool fused_ok = fused_bf16 || (w_down->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0 &&
++    const bool fused_ok = fused_bf16 || (w_down != nullptr && w_down->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0 &&
+                           (w_inject == nullptr || w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0));
+     // nt == 0 appears in the reservation-only graphs (the old nt == 1 gate excluded them).
+     // The band covers decode AND short prefill chunks: a <= HC_FUSED_MAX_TOKENS-token batch
+-- 
+2.53.0
+
