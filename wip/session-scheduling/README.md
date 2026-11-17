@@ -589,12 +589,31 @@ per-step checks and should become a `-lv 4` census before that.
    shape it goes 1021 → 313 ms only because the baseline's stalls are 3.5 % of steps).  The HARD check is
    `max` (the claim is a bound), and the distribution is always printed.
 
-**A pre-existing defect found on the way (NOT this campaign's, reported not fixed):** the **first** prefill
-step after a previous request's KV state costs a one-off **~1.8 s (fair on) / ~2.5 s (fair off)** on the
-host-expert shape — the first gap only, then steady state.  It is symmetric across both arms, so it does not
-affect this gate's comparison, but it is a real multi-second stall on a server that has just served another
-request.  It needs its own investigation (`TODO` handle not yet assigned; it belongs with the idle-slot
-parking / prompt-cache restore path rather than here).
+**RETRACTED observation — a first-step stall that does not reproduce (read this before quoting it).**  Two
+early runs of this harness showed a one-off **~1.8 s (fair on) / ~2.5 s (fair off)** in the *first* gap after
+a foreign prefill started, on the host-expert shape, then steady state.  It was reported as a pre-existing
+idle-slot/parking defect.  **It is not one, and the claim is withdrawn.**  Six controlled runs since — three
+reproduction designs (a 4 k warm context; a 13.2 k warm context on one slot; the gate's old
+`text -> starve -> itl` order with both slots left with 13.2 k) × the three idle-slot knobs
+(`LLAMA_SERVER_PARK_IDLE_SLOTS=0`, `LLAMA_SERVER_LAZY_IDLE_SLOTS=0`, `--no-cache-idle-slots`) — all read the
+**same** maximum, 1023-1070 ms at `-b 2048`, i.e. exactly one 2048-token step:
+
+| arm | max gap after the first | |
+|---|---|---|
+| default (parking on) | 1042 ms | |
+| `LLAMA_SERVER_PARK_IDLE_SLOTS=0` | 1038 ms | parking is **not** the carrier |
+| `LLAMA_SERVER_LAZY_IDLE_SLOTS=0` | 1036 ms | nor lazy idle slots |
+| `--no-cache-idle-slots` | 1040 ms | nor the save/clear path |
+
+So there is **no knob to recommend and no trade-off to document**: disabling a default-on *purity* feature
+(`GREEDY-PURITY.md` §57 — parking is what makes a lone request see the same attention range whoever else is
+resident) would buy nothing.  The most likely explanation for the two original readings is the harness: slot
+assignment was unpinned then, so the requests landed on different slots, and **pinning (`id_slot`) was added
+in the same commit that retired the observation**.  If it ever resurfaces, the first thing to check is the
+slot permutation, not the memory policy.
+
+**Lesson, recorded on purpose:** an anomaly seen twice in a harness that was later found to be uncontrolled is
+not a defect report.  It should have been held until it reproduced.
 
 ## 7. Risks / open questions
 
