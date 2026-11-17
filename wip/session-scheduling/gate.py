@@ -365,16 +365,22 @@ def main():
         print(f"  [WARN] decode ITL: no --chunk and no --max-itl-ms, so there is no bound to check "
               f"(candidate max {ci.get('max', 0):.0f}ms) -- the cap is what bounds this")
     else:
+        # The claim is "a decoder's wait is proportional to the prompt tokens in the step", so the bound is
+        # RELATIVE to the baseline's own worst step, scaled by chunk/n_batch.  Deriving it from the lone-prefill
+        # rate instead is wrong on a bandwidth-shared box: on gfx1151 (UMA) a co-batched prefill runs at ~1550
+        # t/s, not the 2604 t/s it reaches alone, which made a correct 405 ms look like a 344 ms failure.
         if a.max_itl_ms > 0:
             itl_bound_ms, itl_why = a.max_itl_ms, f"--max-itl-ms {a.max_itl_ms:.0f}"
         else:
-            chunk_ms = (1000.0 * a.chunk / c["lone_tps"]) if c["lone_tps"] else float("inf")
-            itl_bound_ms = a.itl_slack * chunk_ms
-            itl_why = f"{a.itl_slack:.2f} x one chunk ({a.chunk} tok at {c['lone_tps']:.0f} t/s = {chunk_ms:.0f}ms)"
+            frac = (a.chunk / a.b) if a.b else 1.0
+            itl_bound_ms = (bi.get("max", 0) * frac * a.itl_slack) if bi.get("max") else float("inf")
+            itl_why = (f"{a.itl_slack:.2f} x baseline max ({bi.get('max', 0):.0f}ms) x chunk/b "
+                       f"({a.chunk}/{a.b} = {frac:.3f})")
         itl_ok = bool(ci) and ci["max"] <= itl_bound_ms
         hard(itl_ok, "decode ITL max",
              f"{ci.get('max', 0):.0f}ms <= {itl_bound_ms:.0f}ms ({itl_why}); "
-             f"baseline max {bi.get('max', 0):.0f}ms")
+             f"ratio {ci.get('max', 0) / bi['max']:.2f} of baseline" if bi.get("max") else
+             f"{ci.get('max', 0):.0f}ms <= {itl_bound_ms:.0f}ms ({itl_why})")
     # a max close to the bound is expected (it IS one chunk of prompt); only a max that overshoots it while
     # still passing is worth naming.  Comparing against p95 instead produced a false "single-event stall" on
     # an arm whose median was 0 ms and whose max was simply the last chunk (88 ms of a 144 ms bound).

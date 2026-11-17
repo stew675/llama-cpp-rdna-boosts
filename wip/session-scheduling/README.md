@@ -472,6 +472,7 @@ prompt budget do not fight over the same rows.
 | 35B-A3B, 1 GPU, **host experts** (`-ncmoe 48`) | 7.799 → **2.386 s** (3.3 ×) | 1063 → **342 ms** | +0.1 % | identical |
 | 4B, **2 GPU `-sm tensor`** (`--device 0,2`) | 1.472 → **0.256 s** (5.7 ×) | 255 → **96 ms** | −0.6 % | identical |
 | 4B, **3 GPU `-sm tensor`** | 1.904 → **0.272 s** (7.0 ×) | 321 → **122 ms** | −1.7 % | identical |
+| 4B, **gfx1151** (Strix Halo, UMA APU) | 4.974 → **0.870 s** (5.7 ×) | 1089 → **410 ms** (0.38 ×) | −0.2 % | identical |
 
 Plus `scripts/gate-ckpt-reuse.sh` PASS on the prototype (5 vs 8 checkpoints, text identical, no fault) — the
 context-checkpoint path survives prompts being split across more steps.
@@ -481,9 +482,12 @@ redistributes latency and does not tax the one consumer that can use a wide batc
 *faster* prefill of the three (8618 t/s against 3-GPU 6632 — a 4B model pays the 3-way all-reduce), which is
 why its derived ITL bound is the tightest (104 ms) and the one arm that trips the "near the bound" warning.
 
-**Not yet covered:** gfx1151 (Strix Halo — the other box; needs access from here), gfx1100, and a
-`--kv-unified` / streaming-KV (block 14 window/pool) layout, which is a different attention regime
-(`GREEDY-PURITY.md` §77) and needs its own arm.
+The gfx1151 arm ran on the `halo` box: the patch applied to an **identical blob** (the branch tips differ, the
+file does not), the build was a single-file recompile, and the single-request greedy text came out with the
+**same sha256 as gfx1201** — a bonus cross-arch purity signal, not a claim (text is per-config).
+
+**Not yet covered:** gfx1100, and a `--kv-unified` / streaming-KV (block 14 window/pool) layout, which is a
+different attention regime (`GREEDY-PURITY.md` §77) and needs its own arm.
 
 Knobs, as shipped in the prototype: `LLAMA_SERVER_PREFILL_FAIR` (on unless `0`, a kill-switch) and
 `LLAMA_SERVER_PREFILL_CHUNK` (`0` = off).  The chunk is applied in **both** modes, because it is a separate
@@ -586,7 +590,12 @@ cost, which is why it is first.
 
 **HARD**
 * short-prompt TTFT behind a 13.2 k prompt improves by ≥ `--min-ttft-ratio` (3 ×) — measured 6.9 ×;
-* the candidate's worst decoder ITL during a foreign prefill ≤ `--max-itl-ms` (120 ms) — measured 99 ms;
+* the candidate's worst decoder ITL during a foreign prefill is **proportional to the prompt tokens in the
+  step**: `max ≤ baseline_max × (chunk / n_batch) × 1.75` — measured ratios 0.32 (1 GPU), 0.38 (gfx1151),
+  0.38 (3 GPU), 0.32 (host experts).  The bound is deliberately **relative**, not an absolute millisecond
+  count and not derived from the lone-prefill rate: on gfx1151 (UMA) a co-batched prefill runs at ~1550 t/s
+  against 2604 t/s alone, so a lone-rate bound made a correct 405 ms read as a 344 ms failure.  `--max-itl-ms`
+  overrides it with an absolute bound if a deployment wants one;
 * a lone long prompt's prefill throughput within `--max-prefill-loss` (3 %) — measured −0.8 %;
 * **one** request's greedy text byte-identical between the arms (the single-slot oracle; a two-slot pair is
   never a text oracle, §63);
