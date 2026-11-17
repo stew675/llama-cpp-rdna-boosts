@@ -1,5 +1,31 @@
 # The delivery patches — what each block is and what it does
 
+> **r305: a host-expert routed `MUL_MAT_ID` is offloaded at EVERY ubatch width (GitHub issue #323, `briansp2020`), an amendment to block 09.**
+> Block **09** owns `ggml_backend_cuda_device_offload_op()` and the scheduler that consults it, so the fix lives there
+> and the block count is unchanged (17 official + `0300`).  The hook relaxed a *cache-managed* routed MoE into the
+> device's decode band (16 tokens on RDNA4) and left everything wider to `GGML_OP_OFFLOAD_MIN_BATCH` (upstream's,
+> default **32**) — so a **17..31-token** ubatch ran its routed MoE on the **CPU**, which is the width a chat server
+> lives at (a short prompt chunk, a follow-up turn's new tokens, one slot's prefill step while another decodes).
+> The generic threshold's premise — a host weight is uploaded whole, so a small batch is cheaper on the CPU — is false
+> twice over in this tier: the GPU arm uploads no whole table (the cache serves the routed set from the arena/pool, or
+> streams only the non-resident experts through the pool's own coalesced read engine), and the CPU arm reads the **same
+> bytes** out of the pageable model mapping through a page fault per 4 KiB (the reporter's own `perf` profile: 38 %
+> kernel, `do_sync_mmap_readahead`, every OpenMP thread on one page-cache lock).  The rule is now width-independent:
+> a `MUL_MAT_ID` whose expert bank is in the delivery's host tier (`ROCm_Host` pinned master or `ROCm_HostMap` pageable
+> master) is offloaded, whatever the width.  `GGML_MOE_HOST_OFFLOAD=0` restores the pre-r305 decision (A/B and
+> bisection only).  **Measured** (Flash-Next GSQ-RCO IQ3_S, 2 x R9700, `-ncmoe 47 -lme 47`, cold page cache, a
+> 19-token prompt, prompt eval): `-sm tensor` pool tier **2.4 -> 76.2 t/s (31x)**, `-sm layer` **2.5 -> 80.5**,
+> `--host-experts pinned` — the cheapest CPU arm there is, the experts already in RAM — **58.7 -> 70.7 (+20 %) on a
+> 9950X3D**, `MOE_EXPERT_CACHE_MIB=0` (a whole-table upload is the GPU arm) **1.1 -> 7.9**; a 436-token prompt is
+> unchanged in both arms (442.2 / 435.2), so the rule closes exactly that window.  Greedy text at the affected width is
+> byte-identical across both arms and to the all-VRAM build (`105 chars sha=c16075337035` on 35B-A3B UD-Q4_K_M), and
+> `gate-host-pool.sh` reads its recorded anchors unchanged (59/59, `a99ccbd97ecb`).  A plain CPU-buffer expert bank
+> (`--override-tensor 'exps=CPU'`, the tier bypassed) keeps the generic threshold; the APU GTT store is a device
+> buffer type that never reaches the decision.  New gate: `scripts/gate-moe-host-offload.sh` (the scheduler dump must
+> place **zero** `MUL_MAT_ID` nodes on the CPU at 19 tokens, the kill switch must place **some** — non-vacuity — and a
+> `>=` 64-token control must be identical in both arms).  Record: `WORKLOG.md` 261117.004, `INVARIANTS.md` r305,
+> `ENVIRONMENT.md` §2, `benchmarks/2026-11-17-issue-323-host-expert-offload.md`.
+
 > **r304: the GDN gate/beta chain fused for F32 and K-quant projections (contributor PR #322, `briansp2020`), folded into block 10.**
 > Block **10** owns both chain fusions this extends (`GGML_CUDA_FUSE_GATE_BETA_BF16` in `mmvf.cu`,
 > `GGML_CUDA_FUSE_GATE_BETA_VERIFY` in `mmvq.cu`), the ksplit body (`mmvq-ksplit-body.inc`), the row concat and the
@@ -1465,6 +1491,27 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 ---
 
 ## Block 09 — host-resident MoE: iface, scheduler, expert cache, staging rings
+
+> **r305 amendment (GitHub issue #323): a host-expert routed `MUL_MAT_ID` is offloaded at EVERY ubatch width.**
+> `ggml_backend_cuda_device_offload_op()` relaxed the op into the decode band and left everything wider to the
+> generic `GGML_OP_OFFLOAD_MIN_BATCH` (default **32**), so a **17..31-token** ubatch ran its routed MoE on the
+> **CPU**: above the band (16 on RDNA4) the cache take-over did not apply, below 32 the generic threshold
+> refused the offload.  In this tier the generic threshold's premise is false twice over -- the GPU arm uploads
+> no whole table (the cache serves the routed set from the arena/pool or streams only the non-resident experts
+> through the pool's coalesced read engine) and the CPU arm reads the **same bytes** out of the pageable model
+> mapping, one page fault per 4 KiB.  The rule is now: `op == MUL_MAT_ID` and the expert bank is in the
+> delivery's host tier (`ROCm_Host` pinned master or `ROCm_HostMap` pageable master) -> offload, whatever the
+> width (`GGML_MOE_HOST_OFFLOAD=0` restores the old decision, A/B and bisection only).  Measured (Flash-Next
+> GSQ-RCO IQ3_S, 2 x R9700, `-ncmoe 47 -lme 47`, cold page cache, a 19-token prompt, prompt eval): `-sm tensor`
+> pool tier **2.4 -> 76.2 t/s** (31x), `-sm layer` **2.5 -> 80.5**, `--host-experts pinned` -- the cheapest CPU
+> arm there is, the experts are already in RAM -- **58.7 -> 70.7 (+20 %) on a 9950X3D**, `MOE_EXPERT_CACHE_MIB=0`
+> (a whole-table upload is the GPU arm) **1.1 -> 7.9**.  A 436-token prompt is unchanged in both arms
+> (442.2 / 435.2), so the rule closes exactly that window; greedy text at the affected width is byte-identical
+> across both arms and to the all-VRAM build.  A plain CPU-buffer expert bank ("--override-tensor 'exps=CPU'",
+> the tier bypassed) keeps the generic threshold, and the APU GTT store is a device buffer type that never
+> reaches this decision.  Numbers, reproduction and the shapes that are *not* affected:
+> `benchmarks/2026-11-17-issue-323-host-expert-offload.md`; `ENVIRONMENT.md` §2 (`GGML_MOE_HOST_OFFLOAD`),
+> `INVARIANTS.md` r305 items 1-3.
 
 > **r296 amendment (`TODO` #330): the split-state cache's pre-warm walk can no longer be stranded by a version
 > switch.**  The walk fills the cache version that is current when it starts, and a nested lookup of a tensor

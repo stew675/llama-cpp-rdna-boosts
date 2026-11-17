@@ -1,4 +1,4 @@
-From 5b4e8c0b25f002f483ea86be11af96361609b500 Mon Sep 17 00:00:00 2001
+From 8f7dea5be96ec1b4e60d51b411924f35df1054b6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH 15/17] rdna-boosts: block 15: the UMA GTT expert store -- an
@@ -543,7 +543,7 @@ index d82930ec3..69f0d4411 100644
  bool   ggml_backend_cuda_moe_cache_pending(ggml_backend_t backend);
  bool   ggml_backend_cuda_moe_cache_stage_ready(ggml_backend_t backend, const ggml_tensor * weight);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 503045841..14c6bf07b 100644
+index cafcc01c2..3ed22112e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -127,6 +127,7 @@
@@ -751,7 +751,7 @@ index 503045841..14c6bf07b 100644
          (ggml_backend_buft_is_cuda_kv_pool_mirror(buft) && buft->device == dev);
  }
  
-@@ -11441,6 +11618,16 @@ void ggml_cuda_h2d_ring_cap_set(size_t bytes) {
+@@ -11491,6 +11668,16 @@ void ggml_cuda_h2d_ring_cap_set(size_t bytes) {
  static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes, size_t max_host_table_bytes) {
      ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool on = moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
@@ -768,7 +768,7 @@ index 503045841..14c6bf07b 100644
      if (on) {
          // fit-slab-accounting revival (G3): remember the draft-context estimate for the slab reserve (it
          // is created BEFORE the draft context, so the reserve has to leave room for it).
-@@ -11524,9 +11711,10 @@ static void ggml_backend_cuda_device_moe_cache_set_host_fill_mode(ggml_backend_d
+@@ -11574,9 +11761,10 @@ static void ggml_backend_cuda_device_moe_cache_set_host_fill_mode(ggml_backend_d
      moe_cache_set_host_fill_mode(direct);
  }
  
@@ -781,7 +781,7 @@ index 503045841..14c6bf07b 100644
  }
  
  static void ggml_backend_cuda_device_moe_heat_open(ggml_backend_dev_t dev, const char * model_path) {
-@@ -11553,13 +11741,110 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -11603,13 +11791,110 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
  // GPU, so there is no pinned duplicated copy to drop and its host buffers are directly usable -- it
  // keeps the historical pinned master.
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_moe_host_master_buft(ggml_backend_dev_t dev) {
@@ -894,7 +894,7 @@ index 503045841..14c6bf07b 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -11701,6 +11986,12 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -11751,6 +12036,12 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_heat_open             = */ ggml_backend_cuda_device_moe_heat_open,
      /* .moe_heat_score            = */ ggml_backend_cuda_device_moe_heat_score,
      /* .moe_cache_set_host_fill_mode = */ ggml_backend_cuda_device_moe_cache_set_host_fill_mode,

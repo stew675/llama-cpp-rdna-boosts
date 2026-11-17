@@ -1,3 +1,69 @@
+## 261117.004 (r305, RELEASE v17-4f9dfa0e3-r305) -- GitHub issue #323: a host-expert routed MoE is offloaded to the GPU at every ubatch width (block 09), so a 17..31-token ubatch stops running its experts on the CPU at 31x the cost
+
+**What shipped.**  Block **09** only (`ggml/src/ggml-cuda/ggml-cuda.cu`: `ggml_backend_cuda_device_offload_op()`
+and two helpers); `release.json` at **`v17-4f9dfa0e3-r305`** (tip `73295b281`, tree `ef8a4adcc`; optional re-cut
+`c47157994` / `0d86727bf`, cumulative `20cdb42f1`).  Block 09 owns the offload hook and the scheduler that
+consults it, so this is an amendment and the block count is unchanged (17 official + `0300`).
+
+**The report was right, and it is worse than "a tuning gap".**  `ggml_backend_cuda_device_offload_op()` relaxed a
+cache-managed `MUL_MAT_ID` into the device's decode band (16 on RDNA4) and left everything wider to
+`GGML_OP_OFFLOAD_MIN_BATCH` (upstream's, default 32).  A ubatch between the band and 32 tokens therefore ran its
+routed MoE on the **CPU** -- and that is the width a chat server lives at, not a benchmark shape: a short prompt
+chunk, a follow-up turn's new tokens, one slot's prefill step while another decodes.  The generic threshold's
+premise (a host weight is uploaded whole, so a small batch is cheaper on the CPU) is false twice over in this
+tier: the GPU arm uploads no whole table (the cache serves the routed set from the arena/pool, or streams only the
+non-resident experts through the pool's own coalesced read engine), and the CPU arm reads the **same bytes** out of
+the pageable model mapping through a page fault per 4 KiB -- exactly the reporter's `perf` profile (38 % kernel,
+`native_queued_spin_lock_slowpath` under `filemap_fault`/`do_sync_mmap_readahead`, 19 % libgomp, 15 %
+`ggml_vec_dot_iq*_q8_*`).
+
+**Reproduced on this box, on his model and his flags.**  The reachability detail matters: `ggml_backend_buft_is_cuda()`
+is a function-pointer identity on the DEVICE buffer name, so a `ROCm_Host`/`ROCm_HostMap` expert weight is owned by no
+GPU backend and pass 1's `1.off` path decides it by `offload_op` -- which is why `-sm layer` and Flash-Next +
+`-sm tensor` were exposed while `Qwen3.6-35B-A3B-Q4_K_M -sm tensor` was not (its host master is merged into a
+per-layer Meta buffer, so buffer ownership already assigns it to the GPUs; that arm is unchanged).  Cold page cache
+(`sync; echo 3 > /proc/sys/vm/drop_caches` before every run), a 19-token prompt, prompt eval, "before" = the new
+`GGML_MOE_HOST_OFFLOAD=0` kill switch, `mmid@CPU` = `MUL_MAT_ID` nodes the scheduler placed on the CPU:
+
+| arm (Flash-Next GSQ-RCO IQ3_S, 2 x R9700, `-ncmoe 47 -lme 47`) | before | after | ratio |
+|---|---:|---:|---:|
+| `-sm tensor`, pool tier (pageable master) | 2.4 / 2.5 t/s, 138 | **76.2 / 78.5**, 0 | **31x** |
+| `-sm layer`, pool tier | 2.5, 138 | **80.5**, 0 | 32x |
+| `-sm tensor`, `--host-experts pinned` | 58.7, 138 | **70.7**, 0 | +20 % |
+| `-sm tensor`, `MOE_EXPERT_CACHE_MIB=0` | 1.1, 2271 | **7.9**, 0 | 7.2x |
+| control: 436-token prompt, `-sm tensor` | 442.2, 0 | 435.2, 0 | inert |
+
+The pinned-master arm is the important one for the rule: it is the *cheapest possible CPU arm* (the experts are
+already in RAM, nothing is read from disk) and the GPU arm still wins by 20 % **on the fastest consumer CPU there
+is** (9950X3D), so the rule is not tuned to a slow CPU; the cache-off arm is the most expensive GPU arm the delivery
+has (a plain whole-table upload) and still wins 7.2x.  Purity: the same-seed greedy text at the affected width is
+byte-identical across the two arms and to the all-VRAM build (`105 chars sha=c16075337035`, 35B-A3B UD-Q4_K_M,
+`-sm layer -ncmoe 40`), so on the measured arms this moves a backend, not a number -- it also removes a split where
+the same routed op ran on a different backend depending on how many tokens happened to share its ubatch.
+
+**Why the default threshold stays.**  It is upstream's and it is still right for a *plain* host weight, including a
+CPU-buffer expert bank (`--override-tensor 'exps=CPU'`, i.e. the delivery's tier bypassed): there is no pool or
+stream to serve the GPU arm from, so the upload really is the CPU's competition.  The APU GTT store is a DEVICE
+buffer type, so its ops are assigned by ownership and never reach this decision (`gate-uma-experts.sh` covers that
+tier and is not reachable by this change).  `GGML_MOE_HOST_OFFLOAD=0` is the kill switch (A/B and bisection only).
+
+**Gates.**  `gate-host-pool.sh` **59/59** with its recorded anchors unmoved (`182 chars a99ccbd97ecb` on all eight
+single-device arms, `171 chars 8c39335bbceb` on the two `-sm tensor` arms, `pinlate` KLD 0.000000 / 100.000 %);
+`gate-prefill-logits.sh` **PASS, mean KLD 0.000000** against the recorded base; the standard coherence arm
+(Qwen3.5-4B Q8_0, 3 GPU `-sm tensor`) `100 chars sha=1c5d32ac537d` -- unchanged since r152; `gate-per-block-build.sh
+--fast --changed-from c4d421cc2` **1/1** (block 09 is the only changed block); new **`scripts/gate-moe-host-offload.sh`
+PASS** (19-token prompt: default 0 `MUL_MAT_ID` on the CPU at 188.5 t/s, kill switch 117 nodes at 2.6 t/s -- the arm
+is not vacuous -- and the text identical across the default, the kill switch and `GGML_OP_OFFLOAD_MIN_BATCH=9`; a
+>= 64-token control 0/0 with equal text; `check-gpu-faults.sh` clean); `validate-set.sh` **GREEN** on a fresh tarball
+(strict 18/18, applied tree `ef8a4adcc`, both optional artifacts re-cut and re-verified alone and cumulatively,
+Windows portability clean over 512 files).
+
+**Two findings recorded while fixing it.**  (1) The 17..31-token window is invisible to every existing gate: the
+host-expert gate drives `-ub 1024` and a 6-token prompt (inside the band), and a `llama-cli` run with a long ubatch
+never shows it -- hence the new gate, and `AGENTS.md`/`MANIFESTS.md` now say so.  (2) The reachability depends on
+whether the loader merges a device's host-master buffer into a per-layer Meta buffer, so one model's `-sm tensor` arm
+is not evidence that the decision is unreachable (`INVARIANTS.md` r305 item 3).
+
 ## 261117.003 (r304, RELEASE v17-4f9dfa0e3-r304) -- the GDN gate/beta chain fused for F32 and K-quant projections (contributor PR #322), folded into block 10
 
 **What shipped.**  Block **10** only (`mmvf.cu`, `mmvq.cu`, `mmvq.cuh`, `mmvq-ksplit-body.inc`, `common.cuh`,

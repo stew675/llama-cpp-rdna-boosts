@@ -413,3 +413,31 @@
 5. **The F32 and BF16 gate/beta arms share one mmvf launch but not one row-count rule.**  `mul_mat_vec_f_cuda`
    takes `gb && gb->gb_x2 ? 2*ne01 : ne01` on the BF16 *and* the F32 branch; only the BF16 branch had it before
    r304.  Anything that extends this launch to another `T` must extend the row count with it.
+
+## r305 (2026-11-17, `WORKLOG.md` 261117.004)
+
+1. **A host-expert routed `MUL_MAT_ID` is a GPU op at every ubatch width; `GGML_OP_OFFLOAD_MIN_BATCH` is not
+   its gate.**  When the expert bank is in the delivery's host tier (`ROCm_Host` pinned master /
+   `ROCm_HostMap` pageable master), neither premise of the generic threshold holds: the GPU arm uploads no
+   whole table (the cache serves the routed set from the arena/pool or streams only the non-resident experts),
+   and the CPU arm reads the *same* bytes out of the pageable mapping through a page fault per 4 KiB.  Between
+   the cache band (16 on RDNA4) and 32 tokens the CPU arm was chosen and is **31x** worse (2.4 vs 76.2 t/s
+   prompt eval, Flash-Next IQ3_S, 2 devices, a 19-token prompt, cold page cache), **20 %** worse even with a
+   fully pinned master (**on a 9950X3D**, i.e. the best CPU arm this box can build), and **7.2x** worse with
+   the cache off (a whole-table upload is still the cheaper GPU arm).  A 436-token prompt is identical in both
+   arms, so the rule closes exactly that window.  `GGML_MOE_HOST_OFFLOAD=0` restores the old decision; a plain
+   CPU-buffer expert bank (`--override-tensor 'exps=CPU'`) keeps the threshold, and the APU GTT store is a
+   device buffer type that never reaches the decision.  Numbers: `benchmarks/2026-11-17-issue-323-host-expert-offload.md`.
+2. **The 17..31-token window is not a benchmark shape -- it is the *server's* shape.**  `llama-cli` with a long
+   ubatch never shows it (a 436-token prompt is inert under the change); what reaches it is a chat server's
+   short prompt chunk, a follow-up turn's new tokens, or one slot's prefill step while another slot decodes.
+   So a host-expert gate that only ever drives `llama-cli` at `-ub 1024` cannot see this class of regression:
+   judge it with a short prompt (`<= 31` tokens) at the default `GGML_OP_OFFLOAD_MIN_BATCH`, which is what the
+   reporter's trace was.
+3. **An expert-bank buffer that survives as a per-device host buffer reaches the offload hook; one the loader
+   merges into a per-layer Meta buffer does not.**  `ggml_backend_buft_is_cuda()` is a function-pointer identity
+   on the DEVICE buffer name, so `ROCm_Host`/`ROCm_HostMap` slices are owned by no GPU backend and pass 1's
+   `1.off` path decides them by `offload_op` -- that is how `-sm layer` and Flash-Next + `-sm tensor` were
+   exposed while `Qwen3.6-35B-A3B-Q4_K_M -sm tensor` was not (its host master is merged into
+   `Meta(ROCm0,ROCm1)#...`, so buffer ownership already assigns it to the GPUs).  Do not conclude from one
+   model's `-sm tensor` arm that the offload decision is unreachable.

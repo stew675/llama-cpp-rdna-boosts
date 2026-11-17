@@ -1,4 +1,4 @@
-From 7550126fb7cf43df0592aa6ae532524c487cd720 Mon Sep 17 00:00:00 2001
+From 9965bc16df63b779878cc5fddc78ca5e484bac49 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 14/17] rdna-boosts: block 14: the streamed KV -- a fixed-VRAM
@@ -3470,7 +3470,7 @@ index 000000000..5f47fce87
 +// can call it before the KV buft lands.
 +bool   ggml_cuda_vmm_region_selftest(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 1b6bdf0a7..503045841 100644
+index aa98746d2..cafcc01c2 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -31,6 +31,7 @@
@@ -5571,7 +5571,7 @@ index 1b6bdf0a7..503045841 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -10002,8 +11792,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -10052,8 +11842,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
  }
  
  
@@ -5637,7 +5637,7 @@ index 1b6bdf0a7..503045841 100644
      if (strcmp(name, "ggml_backend_cuda_fattn_stage_bound") == 0) {
          return (void *) ggml_backend_cuda_fattn_stage_bound;
      }
-@@ -10131,6 +11978,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -10181,6 +12028,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
      // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
      moe_cache_init(device);
  
