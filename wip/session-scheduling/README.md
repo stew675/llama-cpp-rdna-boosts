@@ -4,9 +4,11 @@
 `rdna-boosts` branch or a release gate, and nothing is applied by `scripts/apply-all.sh`.  No `TODO` handle
 yet (the maintainer assigns one when this is accepted as work).
 
-Status: **OPEN — measurement + design only (2026-11-17).**  P0 is unimplemented.  The numbers below were
-taken on the delivery at `rdna-boosts` tip `c215c77f3` (r299 tree), gfx1201 ×1, ROCm 10.1.0, one
-`Qwen3.5-4B-Q8_0` (`/llm/models/Qwen3.5/4B/Q8_0/`), greedy, `--cache-prompt off`.
+Status: **OPEN — design + a first-cut prototype (2026-11-17).**  The prototype lives in the fork on branch
+**`sched-fair-prefill`** (commit `a1f8a1613`, off `rdna-boosts`, one file, +130/-2); it is not a delivery
+block and must not be promoted without the maintainer's go-ahead.  §4.7 records what it measured.  The §2
+baseline numbers were taken on the delivery at `rdna-boosts` tip `c215c77f3` (r299 tree), gfx1201 ×1,
+ROCm 10.1.0, one `Qwen3.5-4B-Q8_0` (`/llm/models/Qwen3.5/4B/Q8_0/`), greedy, `--cache-prompt off`.
 
 ## 0. What this campaign is, and what it is deliberately not
 
@@ -359,6 +361,49 @@ case in the same loop and each has a correctness meaning:
 **Falsification:** if a long prompt's own total time degrades by more than a few percent, the budget is
 stealing from the only consumer that can use a wide batch; if the short-prompt TTFT does not collapse, the
 rotation is not running.  Both are cheap to measure (§2 harness).
+
+### 4.7 First cut — implemented and measured (branch `sched-fair-prefill`, 2026-11-17)
+
+Implemented in the fork at `~/llama.cpp`, branch **`sched-fair-prefill`** (commit `a1f8a1613`), off
+`rdna-boosts`.  Not a delivery block, not on `rdna-boosts`, nothing in `patches/`.  One file:
+`tools/server/server-context.cpp` (+130/-2), with `share_prompt_budget()` as the water-filling helper.
+
+| config | short TTFT (behind 13.2 k) | decoder max ITL | long-prompt TTFT |
+|---|---|---|---|
+| `FAIR=0 CHUNK=0` (today) | 1.907 s | 336 ms | 1.992 s |
+| `FAIR=1 CHUNK=0` | 0.834 s | **336 ms** | 2.027 s |
+| `FAIR=1 CHUNK=1024` | 0.434 s | 177 ms | 2.047 s |
+| **`FAIR=1 CHUNK=512`** | **0.293 s** | **87 ms** | 2.030 s |
+| `FAIR=1 CHUNK=256` | 0.196 s | — | 2.465 s (**+24 %**) |
+
+Four things the measurement *taught* that the design did not predict:
+
+1. **The fair share alone does not fix decode ITL at all** (336 → 336 ms).  A decoding slot is not a *prompt*
+   slot, so the long prompt still receives the whole window; only the per-step chunk bounds what a decoder
+   waits for.  The two knobs are genuinely independent, which validates splitting them (§4.4).
+2. **`chunk = n_ubatch` is the sweet spot**, and it is principled rather than tuned: one `llama_process()`
+   per step carries exactly one ubatch, so the cap adds no ubatch split, and a lone long prefill pays only
+   **+1.9 %** for a 4x better ITL bound.  `chunk = n_ubatch/2` (256) costs **+24 %** — the per-call overhead
+   is the whole difference, so "smaller is better for latency" is false below the ubatch width.
+3. **A 7-token prompt still needs two steps**, and not because of the budget: the checkpoint tail rule
+   (`4 + n_ubatch`, then `4`) splits it at 3 tokens so a checkpoint can land on a state boundary.  Any
+   gate's short-prompt bound must therefore be **two chunks**, not one.
+4. **Purity holds on the single-slot oracle**: a single request's 64-token greedy continuation is
+   byte-identical across `FAIR=0/0`, `FAIR=1/0` and `FAIR=1/512` (two prompts, `sha256` compared).  The
+   two-slot pair is deliberately *not* a text oracle — co-batching changes the ubatch shape and hence the
+   kernel family (`GREEDY-PURITY.md` §63, issue #234).
+
+Knobs, as shipped in the prototype: `LLAMA_SERVER_PREFILL_FAIR` (on unless `0`, a kill-switch) and
+`LLAMA_SERVER_PREFILL_CHUNK` (`0` = off).  The chunk is applied in **both** modes, because it is a separate
+mechanism — so `FAIR=0 CHUNK=512` is a valid arm (today's fill, bounded per step), which is exactly the
+bisection pair the gate needs.  One-shot census line at startup: `prefill admission: fair share = on/off,
+chunk = N`.
+
+Still open for the first cut to become a block: the `-lv 5` per-step `fair share: budget/added/batch` line is
+debug-only and should become the gate's assertion source; `n_parallel`-above-`n_batch` sizing; the
+`can_batch_with()` homogeneity case (two LoRA classes still serialise — unfixable from the fill policy); and
+the mixed / mtmd path (`add_prompt_mixed()`) which ignores the budget because a non-causal batch cannot be
+chunked per sequence.
 
 ## 5. Not P0 — three questions kept separate
 
