@@ -42,6 +42,7 @@ left in this file.  The r236 re-base
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **341** | the IQ4_NL (chain-mixer) qwen4exp hc class no longer reads byte-identical across the `LLAMA_FUSED_HC_COMBINE` arms (446 `a5d0ec7b809d` vs 459 `9f8819c4c2c5`; identical at r302 too, PPL equal in both arms) | correctness / gate invariant (block 11) | **OPEN** — pre-existing, gate 9's hard-arm invariant does not hold on that class until it is root-caused — §341 |
 | **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure (per-block gate, clean checkout, hosted CI) dies in `ui-assets.cmake:137` -- the container images are unaffected (their `web` stage supplies `tools/ui/dist`) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround where it bites; re-check before the next per-block ladder — §342 |
+| **343** | `Q5_K` / `Q6_K` / `IQ4_XS` `ssm_alpha` projections take block 10's gate/beta epilogue but no GDN GGUF on this box or the contributor's has that type, so the path is untested for them | coverage / accepted limitation (block 10) | **ACCEPTED** — the mechanism check in `scripts/gate-gdn-epi.sh` is what would close it; do not add a KLD arm before the `gdn_epi` line is observed — §343 |
 
 ## Handle numbering
 
@@ -348,3 +349,18 @@ Do not add a `HF_UI_VERSION` pin to `build-containers.sh` for this.
 
 Where it does bite, `HF_UI_VERSION=b12387` (the bundle this box had stamped) carries `workbox-b3c04f83.js` and
 validates; the per-block gate's header records it.  Drop the pin when `latest` validates again.
+
+### #343 -- Q5_K / Q6_K / IQ4_XS `ssm_alpha` projections are on the r304 path with no local GGUF to test it
+
+**Accepted limitation** (r304).  Block 10's GDN gate/beta epilogue takes `Q4_K`, `Q5_K`, `Q6_K`, `IQ4_XS` and
+`MXFP4` (`mmvq_gdn_epi_type`), but neither this box nor the contributor's has a GDN GGUF whose
+`ssm_alpha`/`ssm_beta` are `Q5_K`, `Q6_K` or `IQ4_XS`, so those three quant types run the same code path
+*untested* by anything: the class survey in `ENVIRONMENT.md` §7.1 covers Q8_0 (most files), F32 (the UD and
+`Q6_K` files), `Q4_K` (lmstudio-community's 35B-A3B Q4_K_M) and `IQ4_NL` (which the epilogue declines by type,
+so it is the reorder-only control).  What would close it: any GDN-architecture GGUF quantized by llama.cpp's own
+`llama-quantize` from a UD-Q4_K_* source with `--token-embedding-type`/default rules (a `Q6_K` requant is the
+cheapest), then `scripts/gate-gdn-epi.sh MODEL_Q=<that file>` — the gate's mechanism check is what would catch a
+wrong `qk`/`vdr` in the ksplit body for that type (the arithmetic is the body's, shared with `Q4_K`, and the
+per-row dot product is unchanged by construction).  Do not add a KLD arm for it before the mechanism line is
+observed: an arm that never fires passes vacuously.  The same gap is recorded in the r304 release entry and in
+the PR #322 reply, so it is a stated limitation, not a claim.
