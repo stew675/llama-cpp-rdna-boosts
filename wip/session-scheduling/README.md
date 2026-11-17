@@ -435,6 +435,18 @@ Four things the measurement *taught* that the design did not predict:
    two-slot pair is deliberately *not* a text oracle — co-batching changes the ubatch shape and hence the
    kernel family (`GREEDY-PURITY.md` §63, issue #234).
 
+**A second shape, the one that could have regressed — 35B-A3B Q8_0 with the host-expert arena**
+(`-ncmoe 48`, 1 GPU, arena 27.0 GiB at 83.6 % residency, `-c 32768 -b 2048 -ub 512`, gate = `--quick`):
+
+| arm | short TTFT (behind 13.2 k) | decoder ITL med/p95/max | lone prefill | single-req text |
+|---|---|---|---|---|
+| `FAIR=0 CHUNK=0` | 7.799 s | 16 / 1021 / **1063** ms | 2070 t/s | ref |
+| `FAIR=1 CHUNK=512` | **2.386 s** (3.3 ×) | 19 / 313 / **342** ms | 2073 t/s (**+0.1 %**) | identical |
+
+So on the shape where the per-step token count *is* the arena's band input, the policy still costs nothing
+in solo prefill and cuts the decoder's worst wait 3.1 ×.  The one-shot census line also confirms the arena
+is unchanged (same 83.6 % residency in both arms).
+
 Knobs, as shipped in the prototype: `LLAMA_SERVER_PREFILL_FAIR` (on unless `0`, a kill-switch) and
 `LLAMA_SERVER_PREFILL_CHUNK` (`0` = off).  The chunk is applied in **both** modes, because it is a separate
 mechanism — so `FAIR=0 CHUNK=512` is a valid arm (today's fill, bounded per step), which is exactly the
@@ -558,6 +570,31 @@ Promotion path: on the block decision this becomes `scripts/gate-prefill-fairnes
 repo conventions) and joins `MANIFESTS.md` → Release gates as the gate for "the server's prompt admission
 policy".  The `-lv 5` per-step `fair share: budget/added/batch` line is the assertion source for the
 per-step checks and should become a `-lv 4` census before that.
+
+### 6.1 Three instrumentation traps the gate had to fix (each produced a wrong verdict first)
+
+1. **Slot assignment is not under the harness's control.**  `update_slots()` gives the *lowest slot index*
+   priority, and the server assigns slots by LRU/similarity — so an unpinned two-request arm silently
+   measures whichever side of the race it gets.  Measured: the same starvation arm read **0.828 s unpinned**
+   (the long prompt landed in slot 1) vs **1.907 s pinned** (slot 0).  Both `gate.py` and `probe.py` now pass
+   `id_slot`, which the API supports.  **Any two-slot measurement in this repo without `id_slot` is
+   unreliable** — that includes the §2 numbers, which happened to be the pinned case only because a fresh
+   server puts the first request in slot 0.
+2. **A "lone prefill" measured in the 4th position is not lone.**  The arena/graph state left by the earlier
+   arms differs between a 512-token-step arm and a 2048-token-step one, and that reported **+25.1 %** on the
+   host-expert shape.  Isolated on four fresh loads the two configs read **2065-2073 t/s — identical**.  The
+   gate now measures solo prefill on its own server per arm, and that phantom win would have been shipped.
+3. **`max` and `p95` disagree, and both are honest.**  The cap converts a *few* ~1 s stalls into *many*
+   ~300 ms ones, so `max` falls 3 × while `p95` rises (334 → 95 ms on the 4 B it falls too, but on the MoE
+   shape it goes 1021 → 313 ms only because the baseline's stalls are 3.5 % of steps).  The HARD check is
+   `max` (the claim is a bound), and the distribution is always printed.
+
+**A pre-existing defect found on the way (NOT this campaign's, reported not fixed):** the **first** prefill
+step after a previous request's KV state costs a one-off **~1.8 s (fair on) / ~2.5 s (fair off)** on the
+host-expert shape — the first gap only, then steady state.  It is symmetric across both arms, so it does not
+affect this gate's comparison, but it is a real multi-second stall on a server that has just served another
+request.  It needs its own investigation (`TODO` handle not yet assigned; it belongs with the idle-slot
+parking / prompt-cache restore path rather than here).
 
 ## 7. Risks / open questions
 

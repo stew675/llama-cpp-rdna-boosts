@@ -35,20 +35,28 @@ def sentence(n_rep, tag=""):
     return (f"[{tag}] " if tag else "") + "The history of computing is a long and tangled story. " * n_rep
 
 
-def stream(prompt, n_predict, out, key, delay=0.0):
-    """One streaming completion.  Records (token arrival times, final timings)."""
+def stream(prompt, n_predict, out, key, delay=0.0, id_slot=None):
+    """One streaming completion.  Records (token arrival times, final timings).
+
+    `id_slot` PINS the slot.  Slot assignment is LRU/similarity-based and the fill policy gives the LOWEST
+    slot index priority, so an unpinned starvation arm measures whichever side of the race it happens to get:
+    measured 1.907 s pinned (long in slot 0) vs 0.828 s unpinned (the long prompt landing in slot 1).
+    """
     time.sleep(delay)
     t0 = time.time()
     ev = []
     timings = None
-    with requests.post(BASE + "/completion", json={
+    body = {
         "prompt": prompt,
         "n_predict": n_predict,
         "stream": True,
         "temperature": 0,
         "seed": 42,
         "cache_prompt": False,
-    }, stream=True) as r:
+    }
+    if id_slot is not None:
+        body["id_slot"] = id_slot
+    with requests.post(BASE + "/completion", json=body, stream=True) as r:
         r.raise_for_status()
         for line in r.iter_lines():
             if not line:
@@ -111,8 +119,9 @@ def arm_starve(reps, delay):
         out = {}
         p = {"L": long_p, "S": short_p}
         # the second entry is delayed so the admission order is deterministic
-        arms = [(p[order[0]], 4, out, order[0]),
-                (p[order[1]], 4, out, order[1], delay)]
+        # pin: the first-admitted request gets slot 0 (the priority slot), the other slot 1
+        arms = [(p[order[0]], 4, out, order[0], 0.0, 0),
+                (p[order[1]], 4, out, order[1], delay, 1)]
         run_pair(arms)
         s = out["S"][1] or {}
         print(f"  {label:22s} long TTFT {out['L'][0][:1]}  short TTFT {out['S'][0][:1]} "
@@ -125,7 +134,7 @@ def arm_itl(reps, delay, n_predict):
     long_p = sentence(reps, "LONG")
     dec_p = "[DEC] Count slowly from one to five hundred, one number per line."
     out = {}
-    run_pair([(dec_p, n_predict, out, "dec"), (long_p, 2, out, "pf", delay)])
+    run_pair([(dec_p, n_predict, out, "dec", 0.0, 0), (long_p, 2, out, "pf", delay, 1)])
     ev = out["dec"][0]
     gaps = [round(ev[i + 1] - ev[i], 3) for i in range(len(ev) - 1)]
     if not gaps:
