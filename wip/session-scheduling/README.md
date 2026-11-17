@@ -463,6 +463,28 @@ result to want: a scheduling policy must not perturb the speculative path.  The 
 also read identical (132 → 133 t/s, +0.6 %), with the same acceptance totals.  So the align pass and the
 prompt budget do not fight over the same rows.
 
+### The validation matrix so far (all `--quick`, gate = `gate.py`, 2026-11-17)
+
+| shape | short TTFT (behind 13.2 k) | decoder ITL max | lone prefill | single-req text |
+|---|---|---|---|---|
+| 4B, 1 GPU, dense | 1.906 → **0.275 s** (6.9 ×) | 334 → **106 ms** | −0.8 % | identical |
+| 4B, 1 GPU, **MTP n3** | 2.091 → **0.220 s** (9.5 ×) | 310 → **89 ms** | +0.2 % | identical (acceptance identical) |
+| 35B-A3B, 1 GPU, **host experts** (`-ncmoe 48`) | 7.799 → **2.386 s** (3.3 ×) | 1063 → **342 ms** | +0.1 % | identical |
+| 4B, **2 GPU `-sm tensor`** (`--device 0,2`) | 1.472 → **0.256 s** (5.7 ×) | 255 → **96 ms** | −0.6 % | identical |
+| 4B, **3 GPU `-sm tensor`** | 1.904 → **0.272 s** (7.0 ×) | 321 → **122 ms** | −1.7 % | identical |
+
+Plus `scripts/gate-ckpt-reuse.sh` PASS on the prototype (5 vs 8 checkpoints, text identical, no fault) — the
+context-checkpoint path survives prompts being split across more steps.
+
+Reading the matrix: the **lone-prefill cost stays inside ±2 %** everywhere, which is the point — the policy
+redistributes latency and does not tax the one consumer that can use a wide batch.  The 2-GPU split is the
+*faster* prefill of the three (8618 t/s against 3-GPU 6632 — a 4B model pays the 3-way all-reduce), which is
+why its derived ITL bound is the tightest (104 ms) and the one arm that trips the "near the bound" warning.
+
+**Not yet covered:** gfx1151 (Strix Halo — the other box; needs access from here), gfx1100, and a
+`--kv-unified` / streaming-KV (block 14 window/pool) layout, which is a different attention regime
+(`GREEDY-PURITY.md` §77) and needs its own arm.
+
 Knobs, as shipped in the prototype: `LLAMA_SERVER_PREFILL_FAIR` (on unless `0`, a kill-switch) and
 `LLAMA_SERVER_PREFILL_CHUNK` (`0` = off).  The chunk is applied in **both** modes, because it is a separate
 mechanism — so `FAIR=0 CHUNK=512` is a valid arm (today's fill, bounded per step), which is exactly the
@@ -590,8 +612,14 @@ numerics reference (`GREEDY-PURITY.md` §63), so it is reported and only a colla
 
 Promotion path: on the block decision this becomes `scripts/gate-prefill-fairness.sh` (a bash wrapper,
 repo conventions) and joins `MANIFESTS.md` → Release gates as the gate for "the server's prompt admission
-policy".  The `-lv 5` per-step `fair share: budget/added/batch` line is the assertion source for the
-per-step checks and should become a `-lv 4` census before that.
+policy".
+
+**Census decision (settled — this revises the earlier plan).**  The startup line
+`prefill admission: fair share = on/off, chunk = N` stays the `-lv 4` census, and it is what the gate asserts
+(configuration identity: an arm cannot pass by measuring a policy it did not run).  The per-step
+`fair share: budget/added/batch` line **stays at `-lv 5`** and is not promoted: it fires per slot per step, so
+at `-lv 4` it would bury the log it is supposed to help.  The gate asserts *behaviour* (TTFT, ITL, text,
+census), not per-step internals, so the promotion does not need it.
 
 ### 6.1 Three instrumentation traps the gate had to fix (each produced a wrong verdict first)
 
