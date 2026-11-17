@@ -497,10 +497,22 @@ Two more layouts, both green, plus **one documented limitation**:
   −0.9 %).  `--kv-window auto` **declined to engage** on this shape ("no window is needed — the 16384-cell KV
   fits fully resident"), so `auto` must be checked for engagement before any streaming claim: an arm that
   spills nothing tests nothing.
-* **`--kv-attendance-pool on` cannot be exercised here** — it declines on Qwen3.5-4B ("the compress ratio
-  (page size) is not uniform across its layers") and on a multi-stream cache.  It needs a single-stream
-  (`--kv-unified`), device-offloaded, non-MLA cache with a uniform page size, i.e. the QSA / Flash-Next shape.
-  Recorded as `TODO` **#337** (a validation gap, not a defect).
+* **`--kv-attendance-pool on` — engaged on Qwen3.8-Flash-Next and measured** (this corrects an earlier claim
+  in this doc that it could not be exercised; it declines on Qwen3.5-4B because "the compress ratio (page
+  size) is not uniform across its layers", but Flash-Next has the uniform QSA indexer geometry it needs).
+  With `--kv-unified --kv-attendance-pool on` on one discrete GPU the pool engages in **both** arms:
+  `ATTENDANCE POOL ENABLED ... 4096 pages x 4 cells per layer, 384 MiB device pool + 384 MiB pinned host
+  mirror, 12 layers x 128 dims`.  Measured (8800-token prompt, chunk 512): short TTFT 9.914 → **3.886 s**
+  (2.6 ×), ITL 3535 → **1090 ms** (3.2 ×), lone prefill 636 → 634 t/s (**−0.3 %**), single-request text
+  identical, no fault.  **Note `--kv-attendance-pool` is NOT supported on gfx1151 by design** (`TODO` #300,
+  retired r264): on a UMA device the KV is already in the memory the GPU reads, so there is nothing to buy
+  back — which is also why halo cannot be the box for this arm.
+
+  The 2.6 × is **below** this shape's ceiling (`L/(3·chunk)` = 8800/1536 ≈ 5.7), so unlike the earlier
+  streaming arm it is *not* explained by the step-count ceiling: the short prompt took ~5 chunks where 2-3
+  were expected.  The plausible cause is the pool's prefill path (it reads the mirror over PCIe), with the
+  short slot's page fills queueing behind the long slot's — **unexplained, recorded as an open question** in
+  `TODO` #338 rather than asserted.
 
 **The streamed-prefill case (`-ncmoe` with the experts really streaming) — the answer is good news.**  On
 Flash-Next IQ3_XXS, 2 GPUs, `-ncmoe 47 -ot per_layer_token_embd.*=CPU`: with the default arena everything is
@@ -509,8 +521,9 @@ resident (arena 40012 MiB = **100.0 %**, `evictions=0`), so that arm does *not* 
 563 → 561 t/s (−0.3 %)**, i.e. chunked admission costs the streaming prefill nothing, and the decoder's
 worst wait falls 3.2 ×.  This is the case the campaign was most likely to get wrong, and it holds.
 
-**The one ⚠: the fairness ratio on that streaming arm is 2.7 × against the gate's 3.0 default — and that is
-the ceiling, not a shortfall.**  The short prompt needs ~3 steps (the checkpoint split makes a 7-token prompt
+**The fairness ratio on the streaming arms is short of the 3.0 default — for two different reasons.**  On
+the `-ncmoe` streaming arm it is 2.7 × *and that is the ceiling* (below).  On the attendance-pool arm it is
+2.6 × against a ceiling of ~5.7, i.e. genuinely short and unexplained.  Both are recorded in `TODO` #338.  The short prompt needs ~3 steps (the checkpoint split makes a 7-token prompt
 3 + 4, plus arrival alignment), so the ceiling is `L / (3 × chunk) = 4400 / 1536 = 2.86`.  Everything else on
 the arm is clean.  Recorded as `TODO` **#338**: the fairness bound must be derived from `L/(k·chunk)` rather
 than a fixed 3.0, or `--min-ttft-ratio` must be set per shape with the reason stated.
