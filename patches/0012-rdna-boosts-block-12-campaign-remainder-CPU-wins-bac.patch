@@ -1,4 +1,4 @@
-From 3f51c009f5297357a9e43d1ea8a5795b99368ecf Mon Sep 17 00:00:00 2001
+From c53533267d7757d29c482b4f305024b3e34548e8 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/17] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -13552,7 +13552,7 @@ index 37d01ed11..bd1e900ab 100644
      // state write/read
      //
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index a900d82af..21b29753a 100644
+index d30bc89d6..d1211ca16 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -40,11 +40,19 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
@@ -13698,7 +13698,7 @@ index a900d82af..21b29753a 100644
      // place, which a pageable `CPU_Mapped` master cannot do without XNACK (issue #116).  The pageable
      // `--host-experts mmap` mode and the legacy `LLAMA_MMAP_HOST_EXPERTS=0` were removed for RDNA.
      this->host_experts_mode = host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP ? LLAMA_HOST_EXPERTS_MODE_PINNED : host_experts_mode;
-@@ -2730,9 +2802,18 @@ bool llama_model_loader::load_all_data(
+@@ -2735,9 +2807,18 @@ bool llama_model_loader::load_all_data(
                  ggml_backend_buffer_is_host(cur->buffer) &&
                  !host_expert_is_pinned(ggml_get_name(cur)) &&
                  std::string(ggml_get_name(cur)).find("exps") != std::string::npos) {
@@ -14023,7 +14023,7 @@ index 69c72eee3..bbaf25b0b 100644
          ggml_tensor * build_norm_gated(
                      ggml_tensor * input,
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 11bc16f6b..18368da5b 100644
+index cae6a7d9f..fdd60dd0e 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -4,6 +4,10 @@
@@ -14140,7 +14140,7 @@ index 11bc16f6b..18368da5b 100644
  static bool qwen4exp_want_derived_vis(const llama_model & model, const llama_hparams & hparams, int il, const llama_cparams & cparams, int64_t n_tokens);
  
  // Sparse-draft attention arm.  The draft's dense attention is O(n_q*n_kv) while the sparse cap is
-@@ -1011,6 +1111,31 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -1031,6 +1131,31 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
      // built as a second tail, so the logits tail can stay gathered (see below)
      ggml_tensor * res_hc_export = nullptr;
  
@@ -14172,7 +14172,7 @@ index 11bc16f6b..18368da5b 100644
      for (int il = 0; il < n_layer; ++il) {
          // Export the layer input only when a drafter taps it (dflash/dspark set these from the head's
          // target_layers): the tap wants the n_embd-wide mean over the hc streams, not the wide residual
-@@ -1022,10 +1147,26 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -1042,10 +1167,26 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
              ggml_build_forward_expand(gf, res->t_layer_inp[il]);
          }
  
@@ -14199,7 +14199,7 @@ index 11bc16f6b..18368da5b 100644
          ggml_tensor * inject = nullptr;
          ggml_tensor * cur = build_hc_mix(res_hc,
                  model.layers[il].hc_attn_norm,
-@@ -1035,6 +1176,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -1055,6 +1196,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
                  model.layers[il].hc_attn_down_inject,
                  &inject, il);
  
@@ -14211,7 +14211,7 @@ index 11bc16f6b..18368da5b 100644
          ggml_build_forward_expand(gf, cur);
  
          if (hparams.is_recr(il)) {
-@@ -1043,6 +1189,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -1063,6 +1209,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
              cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
          }
  
@@ -14223,7 +14223,7 @@ index 11bc16f6b..18368da5b 100644
          // The last layer's tail is always computed on the gathered output rows, so the
          // logits path is bit-identical to `--spec-type none` (a plain decode gathers here
          // too).  An unmasked MTP export additionally needs a hidden row for *every* token,
-@@ -1083,7 +1234,13 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -1103,7 +1254,13 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
                  model.layers[il].hc_ffn_down_inject,
                  &inject, il);
  
@@ -14238,7 +14238,7 @@ index 11bc16f6b..18368da5b 100644
          cb(cur, "ffn_out", il);
  
          res_hc = build_hc_combine(res_hc, cur, inject, il);
-@@ -1107,6 +1264,15 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -1127,6 +1284,15 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
          }
      }
  
@@ -14254,7 +14254,7 @@ index 11bc16f6b..18368da5b 100644
      // The MTP head consumes the wide residual before the head mixer collapses it. Export the
      // combine result itself rather than a reshape of it: a pure view gets no backend
      // assignment from the scheduler, and the readback in llama_context looks one up. It is
-@@ -2762,7 +2928,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+@@ -2782,7 +2948,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
      return cur;
  }
  
@@ -14264,7 +14264,7 @@ index 11bc16f6b..18368da5b 100644
      GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
  
      // The shared expert is mirrored under -sm tensor while the MoE output is a partial sum: expanding the shared
-@@ -2786,7 +2953,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -2806,7 +2973,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
      }
  
      ggml_tensor * moe_out =
@@ -14273,7 +14273,7 @@ index 11bc16f6b..18368da5b 100644
              model.layers[il].ffn_gate_inp,
              model.layers[il].ffn_up_exps,
              model.layers[il].ffn_gate_exps,
-@@ -2802,6 +2969,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -2822,6 +2989,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
              model.layers[il].ffn_down_exps_s);
      cb(moe_out, "ffn_moe_out", il);
  
@@ -14288,7 +14288,7 @@ index 11bc16f6b..18368da5b 100644
      if (ffn_shexp != nullptr) {
          // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index 9727dcc98..34f220686 100644
+index c58f3e07d..780060681 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
 @@ -197,16 +197,29 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
@@ -14322,7 +14322,7 @@ index 9727dcc98..34f220686 100644
  // writes arch-resolved GGUF keys into the fixture context, the test-side equivalent of llama_model_saver
  struct kv_writer {
      struct gguf_context * gguf_ctx;
-@@ -1357,6 +1370,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
+@@ -1381,6 +1394,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                  if (dc.host_experts && (!moe || !host_experts_test(arch))) {
                      continue;
                  }

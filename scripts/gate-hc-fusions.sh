@@ -157,9 +157,17 @@ if not found:
 for k in sorted(found):
     print('%-34s %s' % (k, found[k]))
 dn = found.get('blk.0.hc_attn_down.weight')
+di = found.get('blk.0.hc_attn_down_inject.weight')
 if dn is not None:
     print('class: %s mixer (%s hc_attn_down)' %
           ('FUSED' if dn in ('Q8_0', 'BF16') else 'CHAIN', dn))
+elif di is not None:
+    # post-#31028 converter layout: the down and inject products share one tensor, so the fused
+    # mixer cannot serve it (the op needs w_down and w_inject separately) and build_hc_mix takes
+    # the chain.  Name it instead of printing nothing, which read as "class unknown".
+    print('class: CHAIN mixer (merged hc_attn_down_inject %s, post-#31028 layout)' % di)
+else:
+    print('class: unknown (no blk.0 hc_attn_down / hc_attn_down_inject tensor)')
 PY
 }
 
@@ -192,11 +200,23 @@ mkdir -p "$KEEPOUT"
 GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 PROMPT_SHA="$(printf '%s' "$PROMPT" | sha256sum | awk '{print $1}')"
 
+# A fresh-process comparison needs the library pinned (`INVARIANTS.md`, r302 \u00a744): hipBLASLt's
+# per-process selection reorders the prefill GEMMs, so ONE unpinned arm in the set reads different
+# text -- measured 2026-11-17 on GSQ-IQ3_XXS all-VRAM `-sm tensor`: 449 `6a102dbc62d6` on
+# chain_chain/mixed_comb and 459 `7c5e5463fd6a` on the other five, identical to the arm set with
+# every other env pinned, i.e. a library artefact, not a fusion disagreement.  With the pin the
+# same seven arms are all byte-identical to the chain.
+export ROCBLAS_USE_HIPBLASLT="${ROCBLAS_USE_HIPBLASLT:-0}"
+# The MoE residency prior is an INPUT (`GREEDY-PURITY.md` \u00a789): a learned heat-map selects a
+# different expert kernel set, and the sets are not bit-identical.
+export MOE_EXPERT_HEATMAP="${MOE_EXPERT_HEATMAP:-load}"
+
 echo "==> qwen4exp hyper-connection fusion-equivalence gate"
 echo "    cli=$LLAMA_CLI"
 echo "    model=$MODEL"
 types_of "$MODEL" | sed 's/^/    /'
 echo "    ctx=$CTX ngen=$NGEN extra='$EXTRA_ARGS'"
+echo "    ROCBLAS_USE_HIPBLASLT=$ROCBLAS_USE_HIPBLASLT MOE_EXPERT_HEATMAP=$MOE_EXPERT_HEATMAP"
 echo "    prompt sha256=$PROMPT_SHA  (extractor: scripts/extract-generated.py)"
 echo "    logs: $KEEPOUT"
 echo
@@ -248,12 +268,19 @@ printf '%-14s %-6s %8s %14s  %s\n' arm rc chars sha verdict
 for arm in "${ARMS[@]}"; do
     name="${arm%%:*}"
     envs="${arm#*:}"
+    [ "$envs" = "-" ] && envs=""          # the default arm: no env prefix at all (see below)
     name="$(echo "$name" | tr -d ' ')"
     soft=0
     for s in "${SOFT_ARMS[@]}"; do [ "${s%%:*}" = "${arm%%:*}" ] && soft=1; done
     log="$KEEPOUT/$name.log"
+    # The default arm carries no env prefix, so it must run WITHOUT `env`: GNU `env -`
+    # (which `env $envs` with envs="-" expands to) is `env -i` and wipes the caller's
+    # environment -- HIP_VISIBLE_DEVICES included -- so the baseline arm would enumerate
+    # the iGPU under `-sm tensor` and die with `ROCm error: invalid kernel file` while
+    # every other arm ran.  (#321's session found this; the arm had been silently failing
+    # on any pinned multi-device run.)
     # shellcheck disable=SC2086
-    env $envs timeout "$TIME_LIMIT" "$LLAMA_CLI" -m "$MODEL" -c "$CTX" \
+    ${envs:+env $envs} timeout "$TIME_LIMIT" "$LLAMA_CLI" -m "$MODEL" -c "$CTX" \
         $EXTRA_ARGS -p "$PROMPT" -n "$NGEN" --seed 42 --temp 0 \
         --no-display-prompt --single-turn > "$log" 2>&1
     rc=$?

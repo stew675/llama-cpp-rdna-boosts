@@ -1,4 +1,4 @@
-From cbb1736c6942f5ba578e6014ad3f1a923bd93dab Mon Sep 17 00:00:00 2001
+From 967b9a3bed404f9e51b628076b76e66542744b20 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 14/17] rdna-boosts: block 14: the streamed KV -- a fixed-VRAM
@@ -8595,7 +8595,7 @@ index 1bdfdc8df..4bd830278 100644
      // held resident and the pages are ordinary reclaimable page cache
      size_t size() const;
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 21b29753a..fc8728dc5 100644
+index d1211ca16..f763b77c6 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -53,902 +53,949 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
@@ -10352,7 +10352,7 @@ index 21b29753a..fc8728dc5 100644
                      if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                          // Host-resident MoE experts: a device's host buffer type carries that device, and
                          // the scheduler places the consumers of its tensors there.  Picking the device-0
-@@ -2299,13 +2359,18 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
+@@ -2304,13 +2364,18 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
  // is unmapped outright (madvise(MADV_DONTNEED) is not enough: the ROCm runtime re-faults those pages on
  // the next pageable H2D copy).  Default on; LLAMA_LOAD_RELEASE_MMAP=0 disables it.
  static bool llama_load_release_mmap() {
@@ -10373,7 +10373,7 @@ index 21b29753a..fc8728dc5 100644
          mappings.reserve(files.size());
          mmaps_used.reserve(files.size());
          for (uint32_t idx = 0; idx < files.size(); idx++) {
-@@ -2644,7 +2709,10 @@ bool llama_model_loader::load_all_data(
+@@ -2649,7 +2714,10 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -10385,7 +10385,7 @@ index 21b29753a..fc8728dc5 100644
  
          if (from_mapping) {
              const auto & mapping = mappings.at(weight->idx);
-@@ -2673,7 +2741,33 @@ bool llama_model_loader::load_all_data(
+@@ -2678,7 +2746,33 @@ bool llama_model_loader::load_all_data(
                  // locking a lazy tensor would fault all of it in, which is what lazy avoids
                  if (lmlocks && !lazy.has(cur)) {
                      const auto & lmlock = lmlocks->at(weight->idx);
@@ -10793,7 +10793,7 @@ index a4065bea4..dc6b8b4b9 100644
      uint64_t n_elements() const;
  
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 467880d94..0229abbfa 100644
+index d3c2f38ec..d88a924cc 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -269,6 +269,34 @@ static bool qwen4exp_mtp_sparse_arm(int64_t n_tokens, int64_t n_kv,
@@ -10837,19 +10837,19 @@ index 467880d94..0229abbfa 100644
      // (LLAMA_HC_MIX_BF16=0 keeps the unfused chain)
 -    static const bool hc_mix_bf16 = !getenv("LLAMA_HC_MIX_BF16") || atoi(getenv("LLAMA_HC_MIX_BF16")) != 0;
 +    static const bool hc_mix_bf16 = [] { const char * e = getenv("LLAMA_HC_MIX_BF16"); return !e || atoi(e) != 0; }();
-     // only the GPU backend implements the BF16 variant: hc weights in a host buffer (CPU-only, -ot) keep the chain
-     const bool fused_bf16 = hc_mix_bf16 && hc == 4 && w_down->ne[1] == 320 && w_down->type == GGML_TYPE_BF16 && w_up->type == GGML_TYPE_BF16 &&
-                             (w_inject == nullptr || w_inject->type == GGML_TYPE_BF16) &&
-@@ -875,7 +903,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
-         const int64_t out_n = n_embd + (w_inject ? hc : 0);
+     // A post-#31028 converter GGUF stores the down and inject products as ONE [hc_down | hc_inject] tensor, so
+     // `w_down` is null and the merged branch below does the pair with one GEMM.  The FUSED mixer needs the two
+     // weights separately, and a row view of the merged tensor IS that weight: the kernel addresses every weight
+@@ -895,7 +923,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+         const int64_t out_n = n_embd + (w_inject_f ? hc : 0);
          // planar output (BF16 path): mixed [n_embd, nt] then inject [hc, nt], both contiguous, so the verify band
          // needs no ggml_cont of the mixed head; byte-identical at nt == 1.  LLAMA_HC_MIX_PLANAR=0 disables it.
 -        static const bool planar_env = !getenv("LLAMA_HC_MIX_PLANAR") || atoi(getenv("LLAMA_HC_MIX_PLANAR")) != 0;
 +        static const bool planar_env = [] { const char * e = getenv("LLAMA_HC_MIX_PLANAR"); return !e || atoi(e) != 0; }();
-         const bool planar = planar_env && fused_bf16 && w_inject != nullptr;
+         const bool planar = planar_env && fused_bf16 && w_inject_f != nullptr;
          if (planar) {
              ggml_hc_mix_set_planar(dst_t);
-@@ -1021,7 +1049,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+@@ -1041,7 +1069,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
      // 256K.  The CUDA combine+norm matcher checks the fused outputs against block_out at run time
      // and reads block_out from a copy when one of them reuses its buffer, so the pin is not needed.
      // LLAMA_HC_PIN_BLOCK_OUT=1 restores it for A/B.  inject is tiny and stays pinned.
@@ -10858,7 +10858,7 @@ index 467880d94..0229abbfa 100644
      if (pin_block_out) {
          ggml_set_output(block_out);
      }
-@@ -2537,9 +2565,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -2557,9 +2585,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
      }
  
@@ -10887,7 +10887,7 @@ index 467880d94..0229abbfa 100644
      // the natural cache views, kept for the qsa3 packs (which must cast before permuting)
      ggml_tensor * k_raw = k;
      ggml_tensor * v_raw = v;
-@@ -2558,6 +2603,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -2578,6 +2623,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          // derives each cell's visibility from cell_vis/q_vis instead - see findings 2c
          cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f,
                  qsa_cell_vis, qsa_q_vis);
@@ -10898,7 +10898,7 @@ index 467880d94..0229abbfa 100644
          // qsa3 (packed-block WMMA) needs the packed F16 layouts; it is prefill-only, so the whole
          // W=1..8 decode/verify band keeps the VEC kernel and width purity holds by construction.
          // Compile-time gate (see LLAMA_QSA3_ENABLE at the top of this file, default 1) plus the
-@@ -2718,10 +2767,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -2738,10 +2787,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
          const int64_t qsa_decode_band = std::max<int64_t>(QSA_DECODE_BAND, (int64_t) cparams.n_rs_batch);
          if (shortcut && n_kv <= width) {
              build_qsa_store_k(mctx_hyb, cur, il);
@@ -10913,7 +10913,7 @@ index 467880d94..0229abbfa 100644
              build_qsa_store_k(mctx_hyb, cur, il);
          } else if (qsa_dense_prefill_until > 0 && n_tokens > qsa_decode_band &&
                     n_kv < qsa_dense_prefill_until) {
-@@ -3282,7 +3334,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+@@ -3302,7 +3354,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
  
          // copy the strided tail straight into the slot (one copy, a 2D memcpy on CUDA) instead of cont + cpy;
          // LLAMA_CONV_TAIL_CONT=1 restores the intermediate contiguous copy for A/B

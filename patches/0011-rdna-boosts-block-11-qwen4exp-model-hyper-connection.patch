@@ -1,4 +1,4 @@
-From b9721e59d1a2ae54cedf2757256e322d4fc38cb7 Mon Sep 17 00:00:00 2001
+From c2bacac080cf3598c017be6d70ab5ed3bafd5ecc Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/17] rdna-boosts: block 11: qwen4exp (model,
@@ -132,7 +132,7 @@ r243 (contributor PR #289, bsp2020): the host PLE gather fans out over --threads
  ggml/src/ggml-cuda/ggml-cuda.cu          |  231 ++
  ggml/src/ggml-cuda/hc-mix.cu             | 1409 ++++++++++++
  ggml/src/ggml-cuda/hc-mix.cuh            |    8 +
- ggml/src/ggml-cuda/hyperconn.cu          | 1195 +++++++++++
+ ggml/src/ggml-cuda/hyperconn.cu          | 1195 ++++++++++
  ggml/src/ggml-cuda/hyperconn.cuh         |   77 +
  ggml/src/ggml-cuda/indexer-score.cu      |  774 +++++++
  ggml/src/ggml-cuda/indexer-score.cuh     |   24 +
@@ -155,18 +155,18 @@ r243 (contributor PR #289, bsp2020): the host PLE gather fans out over --threads
  src/llama-memory-hybrid-idx.cpp          |  792 ++++++-
  src/llama-memory-hybrid-idx.h            |  100 +
  src/llama-memory-recurrent.cpp           |   22 +-
- src/llama-model-loader.cpp               |   76 +-
+ src/llama-model-loader.cpp               |   83 +-
  src/llama-model-loader.h                 |   13 +
  src/llama-model.cpp                      |   46 +-
  src/llama-model.h                        |    1 +
  src/llama.cpp                            |   18 +-
  src/models/models.h                      |   74 +-
- src/models/qwen4exp.cpp                  | 2506 ++++++++++++++++++----
+ src/models/qwen4exp.cpp                  | 2526 ++++++++++++++++++----
  tests/CMakeLists.txt                     |    3 +
  tests/test-backend-ops.cpp               |  491 +++++
  tests/test-lazy-reader.cpp               |  264 +++
- tests/test-llama-archs.cpp               |   33 +-
- 52 files changed, 12924 insertions(+), 506 deletions(-)
+ tests/test-llama-archs.cpp               |  146 +-
+ 52 files changed, 13062 insertions(+), 508 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
@@ -11024,7 +11024,7 @@ index 479065dac..4048d27f5 100644
              // Clearing the state mid-batch would require special-casing which isn't done.
              LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index d607d4337..a900d82af 100644
+index d607d4337..d30bc89d6 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -16,17 +16,35 @@
@@ -11125,7 +11125,21 @@ index d607d4337..a900d82af 100644
  
              size_data -= nbytes;
              n_created++;
-@@ -2129,10 +2137,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -2074,7 +2082,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     };
+ 
+     if (files.empty()) {
+-        if (flags & TENSOR_SKIP_IF_VIRTUAL) {
++        // A tensor that another one subsumes on the virtual (metadata-only) path is created only when the metadata
++        // actually NAMES it: a post-#31028 qwen4exp GGUF carries hc_*_down and hc_*_inject as ONE
++        // hc_*_down_inject tensor, so build_hc_mix's merged branch (w_down == nullptr) is the shape such a model
++        // takes -- and tests/test-llama-archs.cpp covers it by naming the merged tensor in its fixture.  Real
++        // loads are unaffected (they have files and fall through to the weights map).
++        if ((flags & TENSOR_SKIP_IF_VIRTUAL) && gguf_find_tensor(metadata, tn.str().c_str()) < 0) {
+             return nullptr;
+         }
+         ggml_type type = GGML_TYPE_F32;
+@@ -2129,10 +2142,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
          return NULL;
      }
  
@@ -11139,7 +11153,7 @@ index d607d4337..a900d82af 100644
          const llama_tensor_weight * w = no_alloc ? nullptr : &require_weight(tn.str().c_str());
          is_lazy = lazy.add(tn.str(), cur, w);
  
-@@ -2722,8 +2730,10 @@ bool llama_model_loader::load_all_data(
+@@ -2722,8 +2735,10 @@ bool llama_model_loader::load_all_data(
                  ggml_backend_buffer_is_host(cur->buffer) &&
                  !host_expert_is_pinned(ggml_get_name(cur)) &&
                  std::string(ggml_get_name(cur)).find("exps") != std::string::npos) {
@@ -11456,7 +11470,7 @@ index cfef363b6..69c72eee3 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 181e4dca4..11bc16f6b 100644
+index 181e4dca4..cae6a7d9f 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -5,6 +5,333 @@
@@ -12020,7 +12034,7 @@ index 181e4dca4..11bc16f6b 100644
      return std::make_unique<graph>(params);
  }
  
-@@ -343,20 +732,85 @@ static ggml_tensor * hc_stream_mean(ggml_context * ctx, ggml_tensor * x) {
+@@ -343,20 +732,105 @@ static ggml_tensor * hc_stream_mean(ggml_context * ctx, ggml_tensor * x) {
  }
  
  // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
@@ -12054,31 +12068,51 @@ index 181e4dca4..11bc16f6b 100644
 +    // BF16 hc weights (Flash-Next GSQ-RCO): the BF16 variant of the op replays the BF16 chain bit for bit
 +    // (LLAMA_HC_MIX_BF16=0 keeps the unfused chain)
 +    static const bool hc_mix_bf16 = !getenv("LLAMA_HC_MIX_BF16") || atoi(getenv("LLAMA_HC_MIX_BF16")) != 0;
++    // A post-#31028 converter GGUF stores the down and inject products as ONE [hc_down | hc_inject] tensor, so
++    // `w_down` is null and the merged branch below does the pair with one GEMM.  The FUSED mixer needs the two
++    // weights separately, and a row view of the merged tensor IS that weight: the kernel addresses every weight
++    // row packed at ggml_row_size(ne[0]), which a row range of a row-major tensor preserves (ne[0] is the same,
++    // so the row pitch is unchanged).  Slice them here so a merged GGUF keeps the decode/verify band fused
++    // instead of dropping to the chain (measured -10 % tg128 on GSQ-IQ3_XXS 3 GPU `-sm tensor`).
++    // `LLAMA_FUSED_HC_MIX=0` remains the kill switch for both layouts.
++    ggml_tensor * w_down_f   = w_down;
++    ggml_tensor * w_inject_f = w_inject;
++    if (w_down == nullptr) {
++        if (w_down_inject != nullptr) {
++            const int64_t n_in  = w_down_inject->ne[0];
++            const int64_t n_lo  = w_down_inject->ne[1] - hc;
++            const size_t  pitch = ggml_row_size(w_down_inject->type, n_in);
++            w_down_f   = ggml_view_2d(ctx0, w_down_inject, n_in, n_lo, pitch, 0);
++            w_inject_f = ggml_view_2d(ctx0, w_down_inject, n_in, hc,   pitch, (size_t) n_lo*pitch);
++        }
++    }
++    // the buffer probe belongs to the tensor that OWNS the rows (a view has no buffer of its own at graph build)
++    const ggml_tensor * w_down_buf = w_down != nullptr ? w_down : w_down_inject;
 +    // only the GPU backend implements the BF16 variant: hc weights in a host buffer (CPU-only, -ot) keep the chain
-+    const bool fused_bf16 = hc_mix_bf16 && hc == 4 && w_down->ne[1] == 320 && w_down->type == GGML_TYPE_BF16 && w_up->type == GGML_TYPE_BF16 &&
-+                            (w_inject == nullptr || w_inject->type == GGML_TYPE_BF16) &&
-+                            w_down->buffer != nullptr && !ggml_backend_buffer_is_host(w_down->buffer);
-+    const bool fused_ok = fused_bf16 || (w_down->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0 &&
-+                          (w_inject == nullptr || w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0));
++    const bool fused_bf16 = w_down_f != nullptr && hc_mix_bf16 && hc == 4 && w_down_f->ne[1] == 320 && w_down_f->type == GGML_TYPE_BF16 && w_up->type == GGML_TYPE_BF16 &&
++                            (w_inject_f == nullptr || w_inject_f->type == GGML_TYPE_BF16) &&
++                            w_down_buf->buffer != nullptr && !ggml_backend_buffer_is_host(w_down_buf->buffer);
++    const bool fused_ok = fused_bf16 || (w_down_f != nullptr && w_down_f->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0 &&
++                          (w_inject_f == nullptr || w_inject_f->type == GGML_TYPE_F32 || w_inject_f->type == GGML_TYPE_Q8_0));
 +    // nt == 0 appears in the reservation-only graphs (the old nt == 1 gate excluded them).
 +    // The band covers decode AND short prefill chunks: a <= HC_FUSED_MAX_TOKENS-token batch
 +    // cannot be told apart from a verify batch, and both must use the decode arithmetic.
 +    if (nt > 0 && nt <= (fused_bf16 ? HC_BF16_MAX_TOKENS : HC_FUSED_MAX_TOKENS) && cparams.fused_hc_mix && fused_ok) {
 +        // w_inject == nullptr only for the head call (il = -1): no tail
-+        ggml_tensor * dst_t = ggml_hc_mix(ctx0, x, w_norm, w_down, w_up, w_inject,
++        ggml_tensor * dst_t = ggml_hc_mix(ctx0, x, w_norm, w_down_f, w_up, w_inject_f,
 +                hc, hparams.f_norm_rms_eps);
-+        const int64_t out_n = n_embd + (w_inject ? hc : 0);
++        const int64_t out_n = n_embd + (w_inject_f ? hc : 0);
 +        // planar output (BF16 path): mixed [n_embd, nt] then inject [hc, nt], both contiguous, so the verify band
 +        // needs no ggml_cont of the mixed head; byte-identical at nt == 1.  LLAMA_HC_MIX_PLANAR=0 disables it.
 +        static const bool planar_env = !getenv("LLAMA_HC_MIX_PLANAR") || atoi(getenv("LLAMA_HC_MIX_PLANAR")) != 0;
-+        const bool planar = planar_env && fused_bf16 && w_inject != nullptr;
++        const bool planar = planar_env && fused_bf16 && w_inject_f != nullptr;
 +        if (planar) {
 +            ggml_hc_mix_set_planar(dst_t);
 +        }
 +        ggml_tensor * mixed;
 +        if (planar) {
 +            mixed = ggml_view_2d(ctx0, dst_t, n_embd, nt, ggml_row_size(GGML_TYPE_F32, n_embd), 0);
-+        } else if (w_inject) {
++        } else if (w_inject_f) {
 +            // mixed = the head of dst [n_embd]; inject = the tail [hc]
 +            mixed = ggml_view_2d(ctx0, dst_t, n_embd, nt,
 +                    ggml_row_size(GGML_TYPE_F32, out_n), 0);
@@ -12094,7 +12128,7 @@ index 181e4dca4..11bc16f6b 100644
 +            mixed = dst_t;
 +        }
 +        cb(mixed, "hc_mixed", il);
-+        if (inject && w_inject) {
++        if (inject && w_inject_f) {
 +            *inject = planar
 +                ? ggml_view_2d(ctx0, dst_t, hc, nt, ggml_row_size(GGML_TYPE_F32, hc), ggml_row_size(GGML_TYPE_F32, n_embd*nt))
 +                : ggml_view_2d(ctx0, dst_t, hc, nt,
@@ -12109,7 +12143,7 @@ index 181e4dca4..11bc16f6b 100644
      // grouped RMSNorm: reduce over one stream, then scale all streams with the [n_embd, hc] gamma
      // the converter folded each gamma to (1 + w)
      ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), w_norm);
-@@ -364,18 +818,41 @@ llama_model_qwen4exp::graph::build_hc_mix(
+@@ -364,18 +838,41 @@ llama_model_qwen4exp::graph::build_hc_mix(
      cb(xn, "hc_norm", il);
  
      ggml_tensor * lo = nullptr;
@@ -12157,7 +12191,7 @@ index 181e4dca4..11bc16f6b 100644
      }
      lo = ggml_silu(ctx0, lo);
      ggml_tensor * gate = build_lora_mm(w_up, lo);
-@@ -406,12 +883,7 @@ llama_model_qwen4exp::graph::build_hc_mix(
+@@ -406,12 +903,7 @@ llama_model_qwen4exp::graph::build_hc_mix(
      }
      cb(mixed, "hc_mixed", il);
  
@@ -12171,7 +12205,7 @@ index 181e4dca4..11bc16f6b 100644
  }
  
  ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
-@@ -422,10 +894,49 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+@@ -422,10 +914,49 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
      const int64_t hc = hparams.dsv4_hc_mult;
      const int64_t nt = residual->ne[2];
  
@@ -12221,7 +12255,7 @@ index 181e4dca4..11bc16f6b 100644
      ggml_tensor * cur = nullptr;
      if (cparams.fused_dsv4_hc_post && il >= 0) {
          // identity comb: every stream adds the same block output, scaled by its own weight
-@@ -433,6 +944,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+@@ -433,6 +964,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
          res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, cur, il});
      } else {
          w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
@@ -12234,7 +12268,7 @@ index 181e4dca4..11bc16f6b 100644
  
          ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
          b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
-@@ -450,6 +967,9 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -450,6 +987,9 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
  
      GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
  
@@ -12244,7 +12278,7 @@ index 181e4dca4..11bc16f6b 100644
      auto * inp = build_inp_mem_hybrid();
  
      // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
-@@ -462,10 +982,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -462,10 +1002,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
                  "the indexer cache must track the attention cache cell for cell");
      }
  
@@ -12257,7 +12291,7 @@ index 181e4dca4..11bc16f6b 100644
          ggml_build_forward_expand(gf, ple_emb);
      }
  
-@@ -473,13 +994,6 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -473,13 +1014,6 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
      cb(inpL, "model.input_embed", -1);
      ggml_build_forward_expand(gf, inpL);
  
@@ -12271,7 +12305,7 @@ index 181e4dca4..11bc16f6b 100644
      ggml_tensor * inp_pos     = build_inp_pos();
      ggml_tensor * inp_out_ids = build_inp_out_ids();
  
-@@ -488,10 +1002,20 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -488,10 +1022,20 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
              ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
              n_embd, hc, n_tokens, 1);
      cb(res_hc, "hc_init", -1);
@@ -12293,7 +12327,7 @@ index 181e4dca4..11bc16f6b 100644
          if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
              res->t_layer_inp[il] = hc_stream_mean(ctx0, res_hc);
              cb(res->t_layer_inp[il], "layer_inp", il);
-@@ -502,69 +1026,106 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -502,69 +1046,106 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
              res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
          }
  
@@ -12424,7 +12458,7 @@ index 181e4dca4..11bc16f6b 100644
  
      cb(cur, "result_norm", -1);
      res->t_embd = cur;
-@@ -574,19 +1135,40 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -574,19 +1155,40 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
      res->t_logits = cur;
  }
  
@@ -12471,7 +12505,7 @@ index 181e4dca4..11bc16f6b 100644
  
      auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd_out());
  
-@@ -597,70 +1179,205 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
+@@ -597,70 +1199,205 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
      ggml_set_input(inp->embd);
  
      inp->h = build_inp_embd_state(inp.get(), hparams.n_embd_out());
@@ -12571,11 +12605,21 @@ index 181e4dca4..11bc16f6b 100644
 +            layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject,
 +            layer.hc_attn_down_inject, &inject, il);
 +    cb(cur, "mtp_hc_attn_pre", il);
-+
+ 
+-    hc_mix ffn_mix = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, layer.hc_ffn_down_inject, il);
+-    cur    = ffn_mix.cur;
+-    cur    = build_layer_ffn(cur, il);
+-    res_hc = build_hc_combine(res_hc, cur, ffn_mix.inject, il);
 +    // ---- dense attention, mirroring the trunk's full-attention branch ----
 +    const int64_t n_embd_head = hparams.n_embd_head_v();
 +    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-+
+ 
+-    // the next draft step reads this residual as its h
+-    ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens);
+-    ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
+-    res->t_h_nextn = cparams.embeddings_nextn_masked ? flat_out : flat;
+-    cb(res->t_h_nextn, "h_nextn", il);
+-    ggml_build_forward_expand(gf, res->t_h_nextn);
 +    ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
 +    cb(Qcur_full, "mtp_Qcur_full", il);
 +
@@ -12597,10 +12641,7 @@ index 181e4dca4..11bc16f6b 100644
 +    Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
 +    cb(Kcur, "mtp_Kcur_normed", il);
  
--    hc_mix ffn_mix = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, layer.hc_ffn_down_inject, il);
--    cur    = ffn_mix.cur;
--    cur    = build_layer_ffn(cur, il);
--    res_hc = build_hc_combine(res_hc, cur, ffn_mix.inject, il);
+-    hc_mix head_mix = build_hc_mix(ggml_reshape_3d(ctx0, flat_out, n_embd, hc, flat_out->ne[1]),
 +    ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
 +    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 +    cb(Vcur, "mtp_Vcur", il);
@@ -12649,17 +12690,10 @@ index 181e4dca4..11bc16f6b 100644
 +
 +    cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
 +    cb(cur, "mtp_attn_gated", il);
- 
--    // the next draft step reads this residual as its h
--    ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens);
--    ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
--    res->t_h_nextn = cparams.embeddings_nextn_masked ? flat_out : flat;
--    cb(res->t_h_nextn, "h_nextn", il);
--    ggml_build_forward_expand(gf, res->t_h_nextn);
++
 +    cur = build_lora_mm(layer.wo, cur, layer.wo_s);
 +    cb(cur, "mtp_attn_out", il);
- 
--    hc_mix head_mix = build_hc_mix(ggml_reshape_3d(ctx0, flat_out, n_embd, hc, flat_out->ne[1]),
++
 +    if (inp_out_ids) {
 +        cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
 +        inject = ggml_get_rows(ctx0, inject, inp_out_ids);
@@ -12716,7 +12750,7 @@ index 181e4dca4..11bc16f6b 100644
      cb(cur, "result_output", -1);
      res->t_logits = cur;
  }
-@@ -710,16 +1427,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
+@@ -710,16 +1447,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
      return ggml_mul(ctx0, normalized, gated);
  }
  
@@ -12739,7 +12773,7 @@ index 181e4dca4..11bc16f6b 100644
      }
  
      bool can_reuse(const llm_graph_params & params) override {
-@@ -730,238 +1447,844 @@ public:
+@@ -730,238 +1467,844 @@ public:
              return false;
          }
  
@@ -12853,9 +12887,7 @@ index 181e4dca4..11bc16f6b 100644
 -    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, packed, inp_kpool->k_idxs, il));
 +    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, qsa_k_inp->k_idxs, il));
 +}
- 
--    // the raw keys and the persistent pooled slots, see llama_memory_hybrid_idx::mem_idx_stale
--    auto kpool_cache = mctx_hyb->get_kpool_access(ctx0, il, idx_dim);
++
 +// QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
 +// one mean-pooled indexer key scores each block; set_input resolves the cache layout
 +//
@@ -12880,7 +12912,9 @@ index 181e4dca4..11bc16f6b 100644
 +    }();
 +    return enabled;
 +}
-+
+ 
+-    // the raw keys and the persistent pooled slots, see llama_memory_hybrid_idx::mem_idx_stale
+-    auto kpool_cache = mctx_hyb->get_kpool_access(ctx0, il, idx_dim);
 +// The per-cell half of the same bias (the attention mask) is derived from two compact keys as
 +// well: cell_vis is a cell's compaction key (-1 for an empty or foreign cell) and q_vis is the
 +// query's key, and a cell is visible iff 0 <= cell_vis <= q_vis.  GGML_QSA_DERIVED_VIS=0 keeps
@@ -12926,7 +12960,12 @@ index 181e4dca4..11bc16f6b 100644
 +    const bool kv_native = qsa_op_supported(model, hparams, il, cparams.type_k);
 +    return enabled && cparams.flash_attn && kv_native;
 +}
-+
+ 
+-    // mean over the members; kpool is small, so summing slices beats a transpose plus sum_rows
+-    ggml_tensor * pooled_new = nullptr;
+-    for (int64_t i = 0; i < kpool; ++i) {
+-        ggml_tensor * slice = ggml_view_2d(ctx0, rows, idx_dim, n_new, rows->nb[2], i*rows->nb[1]);
+-        pooled_new = pooled_new ? ggml_add(ctx0, pooled_new, slice) : ggml_cont(ctx0, slice);
 +// the mask may be dropped (never created, hence never allocated) only when nothing in the graph
 +// reads it: the derived-visibility path plus the sparse FA that derives the cell visibility in
 +// its kernel.  This is the -800 MiB win; the predicate is exactly the one blk_bias would have
@@ -12937,12 +12976,7 @@ index 181e4dca4..11bc16f6b 100644
 +            qsa_derived_vis_supported(model, hparams, il, cparams.type_k) &&
 +            n_tokens > 1 && cparams.causal_attn && !hparams.use_alibi;
 +}
- 
--    // mean over the members; kpool is small, so summing slices beats a transpose plus sum_rows
--    ggml_tensor * pooled_new = nullptr;
--    for (int64_t i = 0; i < kpool; ++i) {
--        ggml_tensor * slice = ggml_view_2d(ctx0, rows, idx_dim, n_new, rows->nb[2], i*rows->nb[1]);
--        pooled_new = pooled_new ? ggml_add(ctx0, pooled_new, slice) : ggml_cont(ctx0, slice);
++
 +// [QSA_SCORE_BOUNDS] prefill queries are scored in strips of at most this many tokens; each strip is
 +// then trimmed to the blocks it can actually see (qsa_score_key_limits), so the indexer scorer runs
 +// on roughly half its columns.  Only the single-sequence prefill case is stripped; anything else
@@ -13007,7 +13041,13 @@ index 181e4dca4..11bc16f6b 100644
 +        if (cell_blk == nullptr || cell_blk->buffer == nullptr) {
 +            return;
 +        }
-+
+ 
+-    // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
+-    // the older pools come from the rows earlier ubatches wrote
+-    ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
+-    ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
+-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
+-    cb(pooled, "indexer_k", il);
 +        if (rng != nullptr) {
 +            // derived-cache decode: emit the per-step fill range [from, lim) into the leaf
 +            int32_t * d = (int32_t *) rng->data;
@@ -13024,7 +13064,7 @@ index 181e4dca4..11bc16f6b 100644
 +        if (idx == nullptr) {
 +            return false;
 +        }
-+
+ 
 +        const int64_t n_kv     = idx->get_n_kv();
 +        const int64_t n_stream = mctx->get_n_stream();
 +        // blocks are keyed by position, which can run ahead of the occupied cells (M-RoPE image + MTP)
@@ -13109,13 +13149,7 @@ index 181e4dca4..11bc16f6b 100644
 +    // whether the acting device supports the derived-visibility FA/top-k form; baked into the
 +    // graph, and what can_reuse compares against (the predicate needs the layer's device)
 +    const bool vis_supported;
- 
--    // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
--    // the older pools come from the rows earlier ubatches wrote
--    ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
--    ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
--    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
--    cb(pooled, "indexer_k", il);
++
 +    // [QSA_SCORE_BOUNDS] strip size and per-strip score column limits baked into this graph
 +    int64_t score_strip = 0;
 +    std::vector<int64_t> score_key_limits;
@@ -13280,7 +13314,7 @@ index 181e4dca4..11bc16f6b 100644
 +        res->add_input(std::move(qsa));
 +        qsa_inps.emplace((uint32_t) r, inp);
 +    }
- 
++
 +    // cached indexer keys are raw: pooling precedes norm and rotation, so apply neither
 +    ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
 +    k_raw = ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens);
@@ -13482,7 +13516,9 @@ index 181e4dca4..11bc16f6b 100644
 +            }
 +            return summed;
 +        };
-+
+ 
+-    // flash attention requires an f16 mask
+-    const ggml_type type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 +        auto compute_score = [&](int64_t first, int64_t n_query, int64_t score_blocks) {
 +            ggml_tensor * pooled_s = score_blocks == n_blocks ? pooled :
 +                    ggml_view_3d(ctx0, pooled, idx_dim, score_blocks, n_stream,
@@ -13589,8 +13625,10 @@ index 181e4dca4..11bc16f6b 100644
 +                strip_score = head_sum(strip_score, score_blocks, n_query);
 +            }
  
--    // flash attention requires an f16 mask
--    const ggml_type type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+-    // keep the cells of the live picked pools and the tail, -inf elsewhere
+-    // all retained cells are in the token's sequence, so the kq_mask is not needed
+-    if (cparams.fused_top_k_mask) {
+-        GGML_ASSERT(kpool*n_top_pool + inp_kpool->tail_idxs->ne[0] == inp_kpool->n_sel);
 +            // one value per block, so it is cheaper to bias here than after the cells are expanded
 +            // (the derived path drops this tensor and lets the top-k add the bias in-kernel instead)
 +            if (blk_bias && !derived_bias) {
@@ -13599,28 +13637,21 @@ index 181e4dca4..11bc16f6b 100644
 +                strip_score = ggml_add(ctx0, strip_score, bias_s);
 +            }
  
--    // keep the cells of the live picked pools and the tail, -inf elsewhere
--    // all retained cells are in the token's sequence, so the kq_mask is not needed
--    if (cparams.fused_top_k_mask) {
--        GGML_ASSERT(kpool*n_top_pool + inp_kpool->tail_idxs->ne[0] == inp_kpool->n_sel);
-+            return strip_score;
-+        };
- 
 -        ggml_tensor * keep = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, type_mask, inp_kpool->n_kv), 0.0f);
 -        ggml_tensor * sel  = ggml_top_k_mask(ctx0, keep, top_k, score, inp_kpool->pool_idxs, inp_kpool->tail_idxs); // [n_kv, n_tokens]
 -        res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, sel, il});
 -        cb(sel, "indexer_sel", il);
++            return strip_score;
++        };
+ 
+-        return sel;
+-    }
 +        std::vector<ggml_tensor *> strips;
 +        for (int64_t first = 0; first < n_tps; first += strip) {
 +            const int64_t n_query = std::min(strip, n_tps - first);
 +            const int64_t score_blocks = inp->score_key_limits.empty()
 +                    ? n_blocks : inp->score_key_limits[first/strip];
 +            GGML_ASSERT(score_blocks > 0 && score_blocks <= n_blocks);
- 
--        return sel;
--    }
-+            ggml_tensor * sc = compute_score(first, n_query, score_blocks);
-+            cb(sc, "indexer_score", il);
  
 -    // the top blocks, then the incomplete tail with n_kv for missing cells
 -    ggml_tensor * sel_idx = ggml_get_rows(ctx0, inp_kpool->pool_idxs,
@@ -13629,12 +13660,16 @@ index 181e4dca4..11bc16f6b 100644
 -    sel_idx = ggml_concat(ctx0, sel_idx, inp_kpool->tail_idxs, 0);
 -    const int64_t n_sel = sel_idx->ne[0];
 -    GGML_ASSERT(n_sel == inp_kpool->n_sel);
++            ggml_tensor * sc = compute_score(first, n_query, score_blocks);
++            cb(sc, "indexer_score", il);
+ 
+-    ggml_build_forward_expand(gf, sel_idx);
 +            ggml_tensor * tk = run_top_k(sc, first, n_query, score_blocks);
 +            cb(tk, "indexer_top_k", il);
 +            strips.push_back(tk);
 +        }
  
--    ggml_build_forward_expand(gf, sel_idx);
+-    // TODO: figure out to reduce the large copmute buffer that this creates
 +        // balanced concatenation along the query dimension keeps the strips in order
 +        while (strips.size() > 1) {
 +            ggml_tensor * right = strips.back(); strips.pop_back();
@@ -13651,13 +13686,16 @@ index 181e4dca4..11bc16f6b 100644
 +        cb(top_k, "indexer_top_k", il);
 +    }
  
--    // TODO: figure out to reduce the large copmute buffer that this creates
-+    return top_k;
-+}
- 
 -    // scatter zeros for the selected cells into an all -inf row, each dead slot into its own dump row n_kv + slot
 -    // seeding from sel_idx ties the scatter storage lifetime to this layer
 -    const int64_t n_kv = inp_kpool->n_kv;
++    return top_k;
++}
+ 
+-    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, type_mask, n_kv + n_sel, 1, 1, 1);
+-    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
+-    mask_all = ggml_repeat_4d(ctx0, mask_all, n_kv + n_sel, n_tokens, 1, 1);
+-    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens);
 +// qsa3 packed-block layouts (the F16 layouts the WMMA prefill kernel reads, ggml/src/ggml-cuda/
 +// fattn-qsa3.cu).  The pack itself is done by the launcher in one fused pass per tensor
 +// (qsa3_pack_{keys,values}_kernel, session 7); the graph only materialises the natural contiguous F16
@@ -13681,20 +13719,6 @@ index 181e4dca4..11bc16f6b 100644
 +        default:
 +            return false;
 +    }
-+}
- 
--    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, type_mask, n_kv + n_sel, 1, 1, 1);
--    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
--    mask_all = ggml_repeat_4d(ctx0, mask_all, n_kv + n_sel, n_tokens, 1, 1);
--    mask_all = ggml_reshape_3d(ctx0, mask_all, 1, n_kv + n_sel, n_tokens);
-+// qsa3 works on F16 packs.  Materialize the cache view as F16 from its *natural* (contiguous)
-+// layout before any permute: a quantized tensor cannot be permuted, and the backend dup only
-+// dequantizes to F32, so those route through an F32 intermediate.  The permute/cont that follows
-+// is then a plain F16 copy.
-+static ggml_tensor * qsa3_f16_cast(ggml_context * ctx0, ggml_tensor * raw) {
-+    if (raw->type == GGML_TYPE_F16)  { return raw; }
-+    if (raw->type == GGML_TYPE_BF16) { return ggml_cast(ctx0, raw, GGML_TYPE_F16); }
-+    return ggml_cast(ctx0, ggml_cast(ctx0, raw, GGML_TYPE_F32), GGML_TYPE_F16);
 +}
  
 -    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, type_mask, n_sel, 1, 1, 1);
@@ -13727,13 +13751,23 @@ index 181e4dca4..11bc16f6b 100644
 -    cb(sel, "indexer_sel", il);
 -
 -    return sel;
++// qsa3 works on F16 packs.  Materialize the cache view as F16 from its *natural* (contiguous)
++// layout before any permute: a quantized tensor cannot be permuted, and the backend dup only
++// dequantizes to F32, so those route through an F32 intermediate.  The permute/cont that follows
++// is then a plain F16 copy.
++static ggml_tensor * qsa3_f16_cast(ggml_context * ctx0, ggml_tensor * raw) {
++    if (raw->type == GGML_TYPE_F16)  { return raw; }
++    if (raw->type == GGML_TYPE_BF16) { return ggml_cast(ctx0, raw, GGML_TYPE_F16); }
++    return ggml_cast(ctx0, ggml_cast(ctx0, raw, GGML_TYPE_F32), GGML_TYPE_F16);
+ }
+ 
+-// Dense GQA self-attention over the cells that the QSA mask keeps.
 +static ggml_tensor * qsa3_f16_natural(ggml_context * ctx0, ggml_tensor * raw) {
 +    ggml_tensor * t = qsa3_f16_cast(ctx0, raw);
 +    if (!ggml_is_contiguous(t)) { t = ggml_cont(ctx0, t); }
 +    return t;
- }
- 
--// Dense GQA self-attention over the cells that the QSA mask keeps.
++}
++
 +// Dense GQA self-attention restricted to the cells that top_k names.
 +// The mask build below copies the MLA sparse path in llm_graph_context::build_attn.
  ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
@@ -13764,7 +13798,7 @@ index 181e4dca4..11bc16f6b 100644
      }
  
      // these nodes are added to the graph together so that they are not reordered
-@@ -982,41 +2305,259 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -982,41 +2325,259 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
      }
  
@@ -14037,7 +14071,7 @@ index 181e4dca4..11bc16f6b 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -1050,8 +2591,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1050,8 +2611,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
  
      // Apply IMRoPE
@@ -14057,7 +14091,7 @@ index 181e4dca4..11bc16f6b 100644
  
      cb(Qcur, "Qcur", il);
      cb(Kcur, "Kcur", il);
-@@ -1059,8 +2609,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1059,8 +2629,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
  
      const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
  
@@ -14068,7 +14102,7 @@ index 181e4dca4..11bc16f6b 100644
      } else {
          cur = build_attn(inp,
                      nullptr, nullptr, nullptr,
-@@ -1215,6 +2765,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+@@ -1215,6 +2785,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
  ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
      GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
  
@@ -14095,7 +14129,7 @@ index 181e4dca4..11bc16f6b 100644
      ggml_tensor * moe_out =
          build_moe_ffn(cur,
              model.layers[il].ffn_gate_inp,
-@@ -1233,16 +2803,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -1233,16 +2823,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
      cb(moe_out, "ffn_moe_out", il);
  
      // shared experts, as in the Qwen3Next reference
@@ -14113,7 +14147,7 @@ index 181e4dca4..11bc16f6b 100644
          // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
          ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
          cb(shared_gate, "shared_expert_gate", il);
-@@ -1266,49 +2827,59 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -1266,49 +2847,59 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
  //   mixed_n = (t[p]*m[0]) ^ ... ^ (t[p-n+1]*m[n-1]);  row = mixed_n % vocab[h] + offset[h]
  // The hash runs host-side because ggml has no int64 and no xor. EOS resets the window.
  
@@ -14189,7 +14223,7 @@ index 181e4dca4..11bc16f6b 100644
      const int64_t n_prev   = n_gram - 1;
  
      std::vector<int32_t> idx(n_heads * n_tokens);
-@@ -1338,29 +2909,136 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
+@@ -1338,29 +2929,136 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
          }
  
          for (int64_t n = 2; n <= n_gram; ++n) {
@@ -14337,7 +14371,7 @@ index 181e4dca4..11bc16f6b 100644
  }
  
  // Read a conv history out of its own recurrent row and write the new tail back.
-@@ -1372,6 +3050,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+@@ -1372,6 +3070,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
          int64_t              state_cols,
          int64_t              channels,
          int                  il) {
@@ -14348,7 +14382,7 @@ index 181e4dca4..11bc16f6b 100644
      const int64_t n_seqs    = ubatch.n_seqs;
      const int64_t row_total = conv_states_all->ne[0];
  
-@@ -1389,7 +3071,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+@@ -1389,7 +3091,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
  
      ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
  
@@ -14381,7 +14415,7 @@ index 181e4dca4..11bc16f6b 100644
  
      return conv_input;
  }
-@@ -1399,7 +3105,45 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+@@ -1399,7 +3125,45 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
      const int64_t n_heads = hparams.ple_n_heads;
  
      // the attention cells see every ubatch regardless of the layer types
@@ -15278,7 +15312,7 @@ index 000000000..f4fd3f599
 +
 +#endif
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index 1f4c8a46b..9727dcc98 100644
+index 1f4c8a46b..c58f3e07d 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
 @@ -13,6 +13,7 @@
@@ -15289,7 +15323,47 @@ index 1f4c8a46b..9727dcc98 100644
  #include <cstring>
  #include <cstdint>
  #include <filesystem>
-@@ -818,10 +819,32 @@ static llama_model_ptr get_model(
+@@ -247,7 +248,10 @@ struct kv_writer {
+     }
+ };
+ 
+-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0) {
++// `merged_hc`: write the post-#31028 qwen4exp layout (hc_{attn,ffn}_down and hc_*_inject as ONE
++// blk.N.hc_*_down_inject tensor) instead of relying on the virtual path's separate-tensor default.  The
++// declaration is what makes the loader materialise it on the no-file path (TENSOR_SKIP_IF_VIRTUAL).
++static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0, const bool merged_hc = false) {
+     gguf_context_ptr ret(gguf_init_empty());
+     kv_writer ms(arch, ret.get());
+     const uint32_t n_ctx = 256;
+@@ -802,6 +806,27 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const
+         ggml_format_name(&t, "convnext.%" PRIu32 ".dw.weight", il);
+         gguf_add_tensor(ms.gguf_ctx, &t);
+     }
++    if (merged_hc) {
++        GGML_ASSERT(arch == LLM_ARCH_QWEN4EXP);
++        // hc = LLM_KV_HYPER_CONNECTION_COUNT, hc_lr = LLM_KV_HYPER_CONNECTION_LOW_RANK, as the qwen4exp
++        // block above sets them
++        const int64_t hc     = 4;
++        const int64_t hc_lr  = 8;
++        const int64_t hc_dim = hc * (int64_t) n_embd;
++        for (uint32_t il = 0; il < n_layer; il++) {
++            ggml_tensor t;
++            memset(&t, 0, sizeof(ggml_tensor));
++            t.type = GGML_TYPE_F32;
++            t.ne[0] = hc_dim;
++            t.ne[1] = hc_lr + hc;
++            t.ne[2] = 1;
++            t.ne[3] = 1;
++            ggml_format_name(&t, "%s", ("blk." + std::to_string(il) + ".hc_attn_down_inject.weight").c_str());
++            gguf_add_tensor(ms.gguf_ctx, &t);
++            ggml_format_name(&t, "%s", ("blk." + std::to_string(il) + ".hc_ffn_down_inject.weight").c_str());
++            gguf_add_tensor(ms.gguf_ctx, &t);
++        }
++    }
+     return ret;
+ }
+ 
+@@ -818,10 +843,32 @@ static llama_model_ptr get_model(
          struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
          const std::vector<ggml_backend_dev_t> & devs,
          const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
@@ -15323,7 +15397,7 @@ index 1f4c8a46b..9727dcc98 100644
      std::vector<ggml_backend_dev_t> devs_copy = devs;
      devs_copy.push_back(nullptr);
      model_params.devices = devs_copy.data();
-@@ -842,8 +865,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+@@ -842,8 +889,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
          struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
          const std::vector<ggml_backend_dev_t> & devs,
          const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
@@ -15335,7 +15409,7 @@ index 1f4c8a46b..9727dcc98 100644
  
      llama_context_params ctx_params = llama_context_default_params();
      ctx_params.n_ctx = 0;
-@@ -1422,7 +1446,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
+@@ -1422,7 +1470,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                          GGML_ASSERT(file != nullptr);
  
                          {
@@ -15345,6 +15419,100 @@ index 1f4c8a46b..9727dcc98 100644
                              const std::vector<float> logits_roundtrip = get_logits(
                                  model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                              status_roundtrip = "\033[1;32mOK\033[0m";
+@@ -1455,6 +1504,93 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
+         }
+     }
+ 
++    // ---- qwen4exp merged-HC layout (the post-#31028 converter shape) ----
++    // hc_{attn,ffn}_down and hc_*_inject are ONE GGUF tensor there, so build_hc_mix runs with w_down ==
++    // nullptr and takes its merged branch.  Nothing else in this suite reaches that shape: the virtual
++    // fixture path only materialises a merged tensor the fixture NAMES.  It used to SEGFAULT -- the
++    // fused-mixer gate read w_down->ne[1] before testing it, and sched_reserve's reservation probe
++    // (nt == 0) builds the graph -- and a text gate cannot see it, because the model never loads.  So the
++    // arm IS the graph build, plus a save -> reload round trip of the merged model (the saver must carry
++    // hc_*_down_inject; if it does not, the reload falls back to the separate tensors and the logits move).
++    if (arch_matches(arch_filter, LLM_ARCH_QWEN4EXP)) {
++        const std::string config_name = "merged HC";
++        LOG(template_row_cfg.c_str(), llama_arch_name(LLM_ARCH_QWEN4EXP), "CPU", config_name.c_str());
++        fflush(stdout);
++
++        const char * status_nmse     = "\033[1;32mOK\033[0m";
++        std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
++        char nmse_str[12] = {0};
++        bool test_ok = true;
++
++        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, /*moe*/ true, 0, /*merged_hc*/ true);
++        auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {});
++
++        // decode band + verify band: the graph build is the oracle, these logits only have to be finite
++        std::vector<float> logits_ref;
++        for (uint32_t n_tok : {4u, 64u}) {
++            // each width starts from an empty memory: get_logits() continues at the next position
++            llama_memory_clear(llama_get_memory(model_and_ctx.second.get()), true);
++            const std::vector<llama_token> part(tokens.begin(), tokens.begin() + n_tok);
++            const std::vector<float> l = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), part);
++            if (n_tok == 64u) {
++                logits_ref = l;
++            }
++            for (const float v : l) {
++                if (!std::isfinite(v)) {
++                    test_ok = false;
++                    status_nmse = "\033[1;31mFAIL\033[0m (nan)";
++                }
++            }
++        }
++        snprintf(nmse_str, sizeof(nmse_str), "(merged)");
++
++        // the model must really carry the merged weights, or the arm is vacuous: save it and look
++        const std::string path = get_tmp_gguf_path();
++        llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
++        {
++            gguf_init_params params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
++            gguf_context_ptr saved(gguf_init_from_file(path.c_str(), params));
++            GGML_ASSERT(saved);
++            if (gguf_find_tensor(saved.get(), "blk.0.hc_attn_down_inject.weight") < 0 ||
++                gguf_find_tensor(saved.get(), "blk.0.hc_attn_down.weight")          >= 0) {
++                test_ok = false;
++                status_nmse = "\033[1;31mFAIL\033[0m (separate)";
++            }
++        }
++
++        // reload the merged file: its logits must equal the in-memory model's, bit for bit
++        {
++            FILE * file = fopen(path.c_str(), "rb");
++            GGML_ASSERT(file != nullptr);
++            auto model_and_ctx_reload = get_model_and_ctx(nullptr, file, seed, stdev, {});
++            llama_memory_clear(llama_get_memory(model_and_ctx_reload.second.get()), true);
++            const std::vector<llama_token> part(tokens.begin(), tokens.begin() + 64);
++            const std::vector<float> logits_reload = get_logits(model_and_ctx_reload.first.get(), model_and_ctx_reload.second.get(), part);
++            status_roundtrip = "\033[1;32mOK\033[0m";
++            if (logits_reload.size() != logits_ref.size()) {
++                test_ok = false;
++                status_roundtrip = "\033[1;31mFAIL\033[0m";
++            } else {
++                for (size_t i = 0; i < logits_reload.size(); i++) {
++                    if (logits_reload[i] != logits_ref[i]) {
++                        test_ok = false;
++                        status_roundtrip = "\033[1;31mFAIL\033[0m";
++                        break;
++                    }
++                }
++            }
++            fclose(file);
++        }
++        std::filesystem::remove(path);
++
++        n_tests++;
++        if (!test_ok) {
++            n_failed++;
++            all_ok = false;
++        }
++        LOG(template_row_res.c_str(), status_nmse, nmse_str, status_roundtrip.c_str(), "\033[1;33mSKIP\033[0m", "");
++    }
++
+     if (n_tests == 0) {
+         LOG("Summary: no tests executed\n");
+     } else if (n_failed == 0) {
 -- 
 2.56.1
 

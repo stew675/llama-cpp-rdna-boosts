@@ -1,3 +1,81 @@
+## 261117.002 (r303, RELEASE v17-4f9dfa0e3-r303) -- the merged-layout qwen4exp GGUF (post-#31028 `hc_*_down_inject`) gets a graph that builds AND the fused mixer, folded into official block 11 with a synthetic fixture, a CI arm and a repaired gate
+
+**What shipped.**  Block 11 only (`src/models/qwen4exp.cpp`, `src/llama-model-loader.cpp`,
+`tests/test-llama-archs.cpp`); `release.json` at **`v17-4f9dfa0e3-r303`** (tip `8f70fbc62`, tree `f80b71fab`,
+optional trees re-cut `81e6abfe6` / `05488f858`, cumulative `394796a10`).  Contributor PR #321
+(`briansp2020`) reported the crash; the fold is its guard plus the rest of the layout's support.
+
+**The report was accurate, and the crash reproduces exactly as described.**  `build_hc_mix` computed
+`fused_bf16`/`fused_ok` from `w_down->ne[1]` / `w_down->type` before any null test, and
+`create_merged()` leaves `w_down == nullptr` when `blk.N.hc_{attn,ffn}_down_inject` is present.  On the
+r302 build with a merged-layout GGUF: **SIGSEGV in `build_hc_mix`, reached
+`graph_reserve -> resolve_fused_ops -> sched_reserve`** (the reporter named `sched_reserve`), on a merged
+*target* and on a merged MTP *draft* (which the report did not mention).  The fleet had no such
+checkpoint -- the r141 note in this file says so -- so the path had shipped unexercised since r138.
+
+**Folded as submitted, plus the reason to keep the band fused.**  Its guard makes a merged GGUF take the
+chain; the mixer's weights are two row ranges of the one tensor and the kernel addresses every weight row
+packed at `ggml_row_size(ne[0])`, so `build_hc_mix` now passes the fused op two `ggml_view_2d` row views
+(`w_down_f` / `w_inject_f`) and a merged file keeps the fused decode band.  `LLAMA_FUSED_HC_MIX=0` stays
+the kill switch for both layouts.  Measured, one `llama-bench` invocation with both models (r=5, 3 GPU
+`-sm tensor`, all-VRAM, `ROCBLAS_USE_HIPBLASLT=0` + `MOE_EXPERT_HEATMAP=load` pinned):
+
+| arm | pp2048 | pp512 | tg128 |
+|---|---:|---:|---:|
+| separate layout, fused mixer (default) | 1647.5 | 1723.1 | **86.49** |
+| separate layout, `LLAMA_FUSED_HC_MIX=0` | 1647.6 | 1725.3 | 74.71 |
+| merged layout, fused mixer | 1804.1 | 1897.1 | **84.50** |
+| merged layout, `LLAMA_FUSED_HC_MIX=0` | 1805.0 | 1897.2 | 75.82 |
+
+The mixer fusion is worth **+15.8 % tg128** on the separate layout and **+11.4 %** on the merged one (i.e.
+the extension fires: without it the merged row sits on the chain, 75.8); the merged layout is **-2.3 %
+decode and +9.5/-10.1 % prefill** against the separate-tensor file of the same weights, which is
+upstream's reason for the layout.
+
+**Verification.**  `scripts/gate-hc-fusions.sh` on the merged fixture: **6/6 hard arms byte-identical to
+the chain** (449 chars `6a102dbc62d6`, i.e. the same text as the separate-tensor file of the same
+weights), `dsv4_pre_chain` the one numeric arm (448 `/` `e45e77d50544`, unanchored class -> reported); the
+separate BF16-hc class stays **7/7** (its r236 anchors, unchanged).  Same-seed greedy text: dense 4B 3-GPU
+`1c5d32ac537d`, 35B-A3B 2-GPU `-sm layer -ncmoe 40` `627b2ebd7792`, qwen4exp separate AND merged
+`6a102dbc62d6`.  Prefill-logit gate vs the 2026-11-16 base: **KLD 0.000000 / 100.000 %**.  Merged-vs-separate
+prefill logits are **0.017579 / 96.863 %** (10 chunks) and PPL 1.9934 vs 2.0182 (8 chunks): the merged
+branch does the pair as ONE 324-row GEMM instead of a 320-row plus a 4-row one, so prefill reorders at
+the ULP level while single-token decode is bit-identical -- do not expect `merged == separate` on a
+prefill oracle.  `test-backend-ops -o HC_MIX -o HC_COMBINE -o HC_COMBINE_MIX` 6/6 on 4/4 backends.  MTP
+(`draft-mtp n3`, `-n 1000`, prose): merged draft decodes, acceptance **0.58818 sep / 0.60526 merged**,
+generation 146.9 t/s both.  Protocol A (35B-A3B Q8_0, 3 GPU, `-n 3000`, bf16 KV, draft-mtp vs none):
+R 129.7 -> **222.4** t/s (acc 0.725), P 129.3 -> **223.7** (0.718), C 130.2 -> **246.6** (0.854), K 129.4 ->
+**261.2** (0.995) -- healthy on all four axes.  Rule-5 `llama-batched-bench -npl 1,4,8`: dense 4B PP
+5271.6/8748.5/9533.2 TG 127.0/508.1/836.2; 35B-A3B PP 2573.1/4863.4/5280.9 TG 116.3/364.5/563.6.
+`scripts/validate-set.sh` GREEN, `scripts/gate-per-block-build.sh --changed-from 5510b8a3f` **3/3** (blocks
+11, 14, 0300), no GPU fault in the journal or in 74 arm logs.
+
+**Three things were added before it could be a block.**  (1) A **merged-layout arm in CI**: the virtual
+fixture path skipped merged tensors (`TENSOR_SKIP_IF_VIRTUAL`), so `test-llama-archs` could not reach the
+shape at all; the loader now materialises one the metadata NAMES (real loads are unaffected -- they have
+files), `get_gguf_ctx(..., merged_hc)` writes it, and the new arm asserts the graph builds, the logits are
+finite at nt = 4 and 64, the saved file really carries `hc_attn_down_inject`, and a save -> reload round trip
+reproduces the logits bit for bit.  **Negative control: with r302's `qwen4exp.cpp` the arm SIGSEGVs (exit
+139)**, so it has teeth.  (2) `scripts/make-merged-hc-gguf.py`, the fixture generator, because otherwise the
+merged path is untestable again the moment the local file is deleted: its output is byte-identical
+(identical tensor headers AND data offsets) to the fixture this session validated, and its type table is
+verified against the file (each tensor must tile the gap to the next one).  (3) Three repairs to
+`scripts/gate-hc-fusions.sh`, found while running it: its **`fused_fused` arm ran `env -`, which is GNU
+`env -i`**, so on any pinned multi-device run that arm wiped `HIP_VISIBLE_DEVICES` and died with `ROCm
+error: invalid kernel file` while the others passed; it pinned neither `ROCBLAS_USE_HIPBLASLT=0` (r302
+fact 1) nor `MOE_EXPERT_HEATMAP=load`, and unpinned arms split 449/459/447; and it printed NO class for a
+merged GGUF.  All three are fixed, and the gate now pins both variables itself.
+
+**Two pre-existing findings, reported and NOT fixed here** (`TODO` #341 / #342): the IQ4_NL hc class still
+disagrees across the combine arms (446 `a5d0ec7b809d` vs 459 `9f8819c4c2c5`) with **identical shas on the
+r302 build**, i.e. it predates this change and gate 9's byte-identity invariant no longer holds on that
+class (PPL is identical, 2.1640 in both arms, so it is a ULP-class divergence); and upstream's llama-ui
+`latest` bundle now lacks `workbox[hash].js`, which breaks any FRESH configure (`ui-assets.cmake:137`) --
+`HF_UI_VERSION=b12387` is the workaround, recorded in `scripts/gate-per-block-build.sh`'s header.
+
+Record: `INVARIANTS.md` r303, `patches/README.md` block 11, gate row `MANIFESTS.md` (gate 9), contributor
+reply on PR #321.  The `From` ids move (the chain is re-cut); the tree is the contract.
+
 ## 261117.001 (r302, RELEASE v17-4f9dfa0e3-r302) -- the QSA indexer top-k gets a REGULAR-LAYOUT fast path (contributor PR #320), folded into official block 11 with a census, eight new oracle cases and a gate
 
 **What shipped.**  Block 11 only, `ggml/src/ggml-cuda/indexer-topk.cu` + `tests/test-backend-ops.cpp`; every other

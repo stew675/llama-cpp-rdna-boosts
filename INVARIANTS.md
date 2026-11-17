@@ -333,3 +333,47 @@
    **2545 t/s** at ~24k in one phase and **1905 t/s** at ~15k in another (both arms move together, ~25 %), while
    the on/off delta stayed +1.3 %, +3.5 % and +2.0 % across those phases.  The gate's floor (1.0 %) carries 2x
    margin on the slow phase; never quote an absolute prefill rate from one run as a baseline.
+
+## r303 (2026-11-17, `WORKLOG.md` 261117.002)
+
+1. **A post-#31028 merged qwen4exp GGUF is a SECOND graph shape, and it was never exercised until r303.**  The
+   converter writes `hc_{attn,ffn}_down` and `hc_*_inject` as one `blk.N.hc_*_down_inject` tensor, so
+   `create_merged()` leaves `w_down == nullptr` and `build_hc_mix` takes its merged branch.  Every local
+   Flash-Next GGUF is separate-tensor (the r141 note above says the merged path "needs a post-#31028 GGUF this
+   fleet still does not have"), so `build_hc_mix`'s fused-mixer gate dereferenced the null `w_down` for six
+   releases: **SIGSEGV at `sched_reserve`** (`graph_reserve -> resolve_fused_ops`), on a target and on an MTP
+   draft.  Reproduce with `scripts/make-merged-hc-gguf.py` (row-concat the pair; the tool's output is
+   byte-identical to the session's hand-built fixture) and gate with `scripts/gate-hc-fusions.sh MODEL.gguf`
+   plus the `test-llama-archs -a qwen4exp` "merged HC" arm.
+2. **A row view of the merged tensor IS the fused mixer's weight, so the layout does not have to lose the band.**
+   The kernel addresses each weight row packed at `ggml_row_size(ne[0])`, and `ne[0]` is unchanged, so
+   `ggml_view_2d(down_inject, n_in, n_lo, pitch, 0)` / `(..., hc, pitch, n_lo*pitch)` are the two weights; the
+   buffer probe must use the tensor that OWNS the rows (a view has no buffer at graph build).  Worth **+11.4 %
+   tg128** on the merged layout and **+15.8 %** on the separate one (same invocation, `-sm tensor` 3 GPU
+   all-VRAM); merged-vs-separate is **-2.3 % decode, +9.5-10.1 % prefill**.  Its prefill logits differ from the
+   separate layout by **0.017579 KLD / 96.863 % top-p** (one 324-row GEMM instead of 320+4), while single-token
+   decode is bit-identical -- never use `merged == separate` on a prefill oracle, and do not use the pair as a
+   regression oracle in either direction.
+3. **`TENSOR_SKIP_IF_VIRTUAL` means "skip on the no-file path", which is why a synthetic fixture cannot reach a
+   merged layout unless it NAMES the merged tensor.**  The flag is not "this tensor does not exist": a
+   metadata-only load creates no merged tensor at all, so `test-llama-archs` covered only the separate shape.
+   The loader now creates one the metadata names (real loads have files and never take that branch), and the
+   fixture writes it -- which is what makes the CI arm possible.  Negative control: r302's `qwen4exp.cpp` makes
+   that arm SIGSEGV.
+4. **The HC gate must pin `ROCBLAS_USE_HIPBLASLT=0` and `MOE_EXPERT_HEATMAP=load` itself, and its default arm
+   must not be `env -`.**  Unpinned, its seven fresh processes split into 449/459/447 chars; with the library
+   pinned they are 7/7 byte-identical (r302 fact 1, reached again).  And `env -` is GNU `env -i`: the
+   `fused_fused` (default) arm ran with an EMPTY environment, so on a pinned multi-device run it enumerated the
+   iGPU and died with `ROCm error: invalid kernel file` while every other arm passed -- a gate whose baseline
+   arm cannot run looks like a real fusion failure.
+5. **The IQ4_NL hc class no longer shows byte-identical combine arms, and that is PRE-EXISTING.**  On
+   Flash-Next IQ4_NL (chain mixer; hc weights IQ4_NL in all 48 layers) the `LLAMA_FUSED_HC_COMBINE` arms read
+   446 `a5d0ec7b809d` while the chain reads 459 `9f8819c4c2c5`, with **identical shas on the r302 build**, so
+   the divergence predates r303 and gate 9's hard-arm invariant (r148, `GREEDY-PURITY.md`) does not currently
+   hold on that class.  PPL is identical in both arms (2.1640), so it is ULP-class, not degenerate: it needs
+   an owner (`TODO` #341) rather than a waiver, and the class's arms must not be quoted as a pass until then.
+6. **An upstream UI asset bundle can break every FRESH configure, which the per-block gate and the container
+   build both are.**  On 2026-11-17 `ggml-org/llama-ui`'s `latest` (75 files) has no `workbox[hash].js`, so
+   `ui-assets.cmake:137` aborts the configure; `HF_UI_VERSION=b12387` (the bundle `build-rocm` had stamped)
+   carries `workbox-b3c04f83.js` and validates.  Incremental builds never see it -- the stamp caches the
+   resolved bundle -- so it surfaces only in gates that wipe their build dir and in clean container builds.

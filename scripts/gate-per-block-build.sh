@@ -82,6 +82,15 @@
 #   --targets "T1 T2 ..."        an explicit target list (default: `all`)
 #   --list-only                  print the commits that would be built, then exit
 #
+#   HF_UI_VERSION=<tag>          upstream's own knob (tools/ui/CMakeLists.txt) for the llama-ui
+#                                asset bundle a fresh configure downloads.  Unset (the default) it
+#                                resolves `latest`.  Set it when upstream publishes a bundle that
+#                                llama.cpp's validator rejects -- measured 2026-11-17: `latest`
+#                                (75 files) has no `workbox[hash].js`, so every block's configure dies
+#                                in ui-assets.cmake:137, while `HF_UI_VERSION=b12387` carries
+#                                `workbox-b3c04f83.js` and validates.  This gate wipes the build dir
+#                                per commit, so a broken upstream bundle hits it first.
+#
 # Exit: 0 = every commit built, 1 = at least one failed, 2 = usage/prereq error.
 #
 # ccache is used when present (disable with CCACHE=0).  This is a local,

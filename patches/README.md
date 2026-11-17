@@ -3208,6 +3208,16 @@ slab/dispatcher/ring code of its own beyond the arms implemented in its own TUs.
   relied on `bf16_src1_cache`).  The separate tensors are still accepted — the loader falls back when the
   merged tensor is absent — and the **MTP branch stays the delivery's own** attention (QSA top-k +
   derived visibility), not upstream's `build_layer_attn(...)`/fused-mask path.
+* **The merged layout is a second graph shape, and it is gated (r303, contributor PR #321).**  With
+  `hc_*_down_inject` present `w_down` is null, so `build_hc_mix` resolves the fused mixer's two weights as
+  row views of that one tensor (`w_down_f` / `w_inject_f`) and the decode/verify band stays fused — worth
+  +11.4 % tg128 against the chain — instead of dropping a merged GGUF to the unfused chain.  The gate is
+  `scripts/gate-hc-fusions.sh MODEL.gguf` on a merged file plus the `test-llama-archs -a qwen4exp` "merged
+  HC" arm (graph builds, finite logits, save→reload bit-identical); the fixture comes from
+  `scripts/make-merged-hc-gguf.py`, because the fleet's own GGUFs are all separate-tensor.  Do not expect
+  `merged == separate` on a prefill oracle: the pair is one 324-row GEMM there (KLD 0.017579 / 96.863 %
+  against the 320+4-row form), while decode is bit-identical.  `LLAMA_FUSED_HC_MIX=0` remains the kill
+  switch for both layouts.
 * **qwen4exp** (`src/models/qwen4exp.cpp`, `src/llama-memory-hybrid-idx.cpp`): QSA sparse attention and the
   fused indexer top-k/score (`indexer-topk.cu`, `lightning-indexer`), hyper-connections (`hc-mix.cu`,
   `hyperconn.cu`), the managed lazy reader, PLE n-gram loading, the MTP draft head, and the **keys-only

@@ -214,12 +214,20 @@ in CI.  The model-level gates are manual:
    Required for any change to `build_hc_mix`, `build_hc_combine`,
    `GGML_OP_HC_MIX` / `GGML_OP_HC_COMBINE` (kernel, CPU reference or op definition) or a matcher that fuses
    either.  **Run it once per hc-down weight class** — Q8_0/BF16 `hc_attn_down` takes the fused mixer, any
-   other quant takes the chain (`--types MODEL.gguf` prints the class).  The defect class it exists for only
+   other quant takes the chain (`--types MODEL.gguf` prints the class) — **and once per GGUF layout**, since r303
+   a **merged** `hc_*_down_inject` file is a different graph shape (the class line names it; build the fixture
+   with `scripts/make-merged-hc-gguf.py`, and pair it with the `test-llama-archs -a qwen4exp` "merged HC" arm,
+   whose negative control is a SIGSEGV on the pre-r303 tree).  The gate pins `ROCBLAS_USE_HIPBLASLT=0` and
+   `MOE_EXPERT_HEATMAP=load` itself and its default arm must never run through `env -` (GNU `env -i`, which
+   wipes `HIP_VISIBLE_DEVICES` on a pinned multi-device run — r303, `INVARIANTS.md`).  The defect class it
+   exists for only
    shows on the arms where the two halves disagree, and `test-backend-ops` cannot see it: it compares each
    op against a CPU reference that can share the op's mistake.  Issue #228 was invisible to gates 1-6 for
    the same reason (a wrong combine feeds every residual stream the same value, so text stays coherent on
    the arms that happen to be self-consistent), and it silently degraded every non-Q8_0/BF16 qwen4exp quant
-   for ten releases.
+   for ten releases.  **Known open: the IQ4_NL (chain-mixer) class does not read byte-identical across the
+   combine arms at r303 and already did not at r302** (446 `a5d0ec7b809d` vs 459 `9f8819c4c2c5`, PPL identical
+   in both arms) — `TODO` #341 owns it; do not quote that class as a pass until it is closed.
 
 10. **Batched state save / restore** — `scripts/gate-state-pipe.sh`: drives the server's **in-memory prompt
    cache** (`--cache-ram`), i.e. the path a real chat turn pays for, in four arms (`LLAMA_STATE_PIPE_GROUPS=8`,

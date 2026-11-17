@@ -40,11 +40,13 @@ left in this file.  The r236 re-base
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
+| **341** | the IQ4_NL (chain-mixer) qwen4exp hc class no longer reads byte-identical across the `LLAMA_FUSED_HC_COMBINE` arms (446 `a5d0ec7b809d` vs 459 `9f8819c4c2c5`; identical at r302 too, PPL equal in both arms) | correctness / gate invariant (block 11) | **OPEN** — pre-existing, gate 9's hard-arm invariant does not hold on that class until it is root-caused — §341 |
+| **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so every FRESH configure dies in `ui-assets.cmake:137` (per-block gate, container build, any clean checkout) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround; re-check before the next container release — §342 |
 
 ## Handle numbering
 
-**New handles append after `#340` (the highest issued so far; #338-#340 were all retired at r301), and a
-number is never reused.**  (`#337` was opened and retired the
+**New handles append after `#342` (the highest issued so far; #338-#340 were all retired at r301, and #341/#342
+were issued at r303), and a number is never reused.**  (`#337` was opened and retired the
 same day, 2026-11-16: the attendance pool *does* engage on Qwen3.8-Flash-Next under `--kv-unified`, so the
 "cannot be exercised" premise was wrong; the arm and its numbers are in `archive/work/session-scheduling/`.)  (`#335`/`#336` were retired at r298 -- an alias
 ROLE gap in the expert cache, `WORKLOG.md` 261116.005 -- and `#282` at r299 -- the mid-run latch's mixture is gated on
@@ -309,3 +311,34 @@ across that whole band is a pure win instead of a config-shaped opt-in.  Until t
 floor of 7 and the purity note in `GREEDY-PURITY.md` §91 -- do not lower the floor without measuring the
 low band on both a single card and a 2-GPU `tensor` split (the crossover moves).
 
+
+### #341 -- the IQ4_NL hc class disagrees across the combine arms, and it did so before r303
+
+**Open, not scheduled** (r303).  `scripts/gate-hc-fusions.sh` on Flash-Next IQ4_NL (hc weights IQ4_NL in all 48
+layers -> the CHAIN mixer, so `LLAMA_FUSED_HC_MIX` is inert for the file) reads:
+
+| arm | chars | sha |
+|---|---:|---|
+| `chain_chain`, `mixed_comb` (`LLAMA_FUSED_HC_COMBINE=0`) | 459 | `9f8819c4c2c5` |
+| every arm with the combine fusion ON (`fused_fused`, `mixfused_comb`, `no_cuda_fuse`) | 446 | `a5d0ec7b809d` |
+
+The same two shas reproduce **identically on the r302 build**, so this is not r303's (that release touched
+`build_hc_mix`'s entry checks and the merged layout only, and both layouts of the BF16-hc class stay 100 %
+byte-identical).  Quality is not the symptom: PPL is **2.1640 in both arms** (4 x 512 wikitext chunks), so it is
+a ULP-class reordering that flips a greedy near-tie, not the #228-style `/hc` degeneration.  What it costs is
+the *invariant*: gate 9 (and `GREEDY-PURITY.md`, r148/r236) says every hard arm is byte-identical to the chain,
+and that claim is false on this class.  Root-cause before quoting the class as a pass: the fused
+`GGML_OP_HC_COMBINE` against its own chain on a *chain-mixer* file, `LLAMA_HC_CN_DEBUG=1` to see whether the
+combine+norm matcher or the op itself is the arm that moves, and a chunk-by-chunk PPL diff.  Until then the gate
+prints FAIL for that class, which is the honest state -- do not add an anchor to hide it.
+
+### #342 -- a broken upstream UI asset bundle breaks every fresh configure
+
+**Waiting on upstream** (r303). The llama-ui bucket's `latest` archive (75 files, 3.3 MB, 2026-11-17) has no
+`workbox[hash].js`, and `scripts/ui-assets.cmake:137` validates that file, so a **clean** configure aborts with
+`UI: missing required asset(s): workbox[hash].js`.  Incremental builds never see it -- `build-rocm`'s stamp
+caches the resolved bundle -- so it appears exactly where a build dir is wiped: `gate-per-block-build.sh`,
+`build-containers.sh`, a fresh clone, CI on a hosted runner.  `HF_UI_VERSION=b12387` (the bundle this box had
+stamped) carries `workbox-b3c04f83.js` and validates; the per-block gate's header records it.  Check the bucket
+before the next container release and drop the pin when `latest` validates again; if it stays broken, pin
+`HF_UI_VERSION` in `build-containers.sh` and in the CI workflow rather than teaching the gate a local exception.
