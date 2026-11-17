@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prefill fairness gate for `llama-server --parallel N` (wip/session-scheduling).
+"""Prefill fairness gate for `llama-server --parallel N` (block 12, r300).
 
 WHY THIS EXISTS
   Every other gate in this repo runs ONE request at a time, and `llama-batched-bench` measures throughput,
@@ -47,7 +47,7 @@ except ImportError:
     sys.exit("gate: python 'requests' is required")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
+REPO = os.path.abspath(os.path.join(HERE, ".."))
 
 TEXT_PROMPTS = [
     "[P1] Explain why the sky is blue in two sentences.",
@@ -299,7 +299,7 @@ def main():
         sys.exit(f"gate: no model at {a.model}")
 
     t_start = time.strftime("%Y-%m-%d %H:%M:%S")
-    logdir = os.path.join(HERE, "gate-logs")
+    logdir = os.path.join(HERE, "runs", "gate-prefill-fairness")
     os.makedirs(logdir, exist_ok=True)
     faults = os.path.join(REPO, "scripts", "check-gpu-faults.sh")
 

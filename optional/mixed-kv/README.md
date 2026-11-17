@@ -9,6 +9,12 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
   `b64c825acfe2e0736d18b75ffd5b047ae670aa6ea3e5ec282aee4eb90e22fff2` (the r299 cut; the earlier cuts are recorded below)
+* **r300 re-cut verification**: applies strictly at the r300 default tree
+  `4baf1b67ae591e6661a1e3c5365457a747b688ab` and produces `03ec82a1dd5a97d6ac6e266397897aa0c58debcb`; cumulative with the other optional artifact,
+  numeric order, is `dc9a8815bd56be9a2e9cae48f7b19d26e7da922a`.  **The patch file is unchanged** (sha256 `b64c825acfe2e0736d18b75ffd5b047ae670aa6ea3e5ec282aee4eb90e22fff2`,
+  byte-identical to the r299 cut): the artifact does not touch `tools/server/server-context.cpp`, which is the
+  only file block 12's r300 amendment changes, so nothing had to be reconciled -- only the produced tree moved
+  with the base.  `validate-set.sh` check 8 verifies all three trees on every run.
 * **r299 re-cut verification**: applies strictly at the r299 default tree
   `3da54a4c10d7350eddc5c0d8eae384086a306b0f` and produces `9068f9c8aa15a50544d1ae20bb1ed5dce16400ca`; cumulative with
   the other optional artifact, numeric order, is `3eeb8f6f1dea6d7d550980afde5072049b5ac665`.  The default tree moved by

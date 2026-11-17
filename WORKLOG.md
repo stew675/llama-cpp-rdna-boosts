@@ -1,3 +1,48 @@
+## 261116.007 (r300, RELEASE v16-4f9dfa0e3-r300) -- block 12 gains FAIR-SHARE server prompt admission: `--parallel N` stops serialising prompts (7-token TTFT 1.91 s -> 0.28 s, decoder ITL 334 -> 107 ms), with the skew and chunk as tunables
+
+**Amends block 12** (no new block: the maintainer's call, and block 12 already owns the server's prompt/idle-slot
+code -- `LLAMA_SERVER_LAZY_IDLE_SLOTS`, the idle-slot prompt cache, the spec-checkpoint placement).  Patches
+regenerated from a canonical apply at `4f9dfa0e3`; `release.json` at **`v16-4f9dfa0e3-r300`** (tip `3e5dd2e40`,
+tree `4baf1b67`); `n_blocks` unchanged at 16.  `TODO` #339 records that block 12 now carries two unrelated
+features and should be split, and `TODO` #338 keeps the one shape-limited gate ratio.  Record:
+[`archive/work/session-scheduling/`](archive/work/session-scheduling/README.md) (design, all nine layouts, the
+patch series backup), `ENVIRONMENT.md` §22, `MANIFESTS.md` gate 30 + block 12, `patches/README.md` block 12.
+
+**The defect.**  `update_slots()` adds the decode tokens first, then walked the prompt slots in **slot-index
+order**, each filling `n_batch` (`server-context.cpp`).  The lowest slot therefore took the whole window and every
+other prompt waited for that slot's *entire* prompt: a 7-token prompt arriving 50 ms behind a 13204-token one
+waited **1.91 s** (`prompt_ms` 270 ms -- it was never slow, it was unseated), and a *decoding* slot's
+inter-token latency went **10 ms -> 266-331 ms** for six consecutive tokens while the other slot prefilled.
+`-b 512` did not help (1.92 s): it changes the grab size, not the order.  The ubatch splitter was already fair
+(`split_equal` takes one token per sequence per round); the *admission* policy was the whole defect, so no KV,
+kernel or scheduler work was needed.
+
+**The change.**  `share_prompt_budget()` shares `n_batch - (decode tokens)` max-min fairly: water-filling over
+the slots that still have prompt tokens, every active prompt admitted to every step, and a slot that needs less
+returns the difference to the pool for the slots that can still use it.  A one-token floor per active prompt
+makes starvation impossible in every mode, including `n_parallel >= n_batch`.  Three variables
+(`ENVIRONMENT.md` §22): `LLAMA_SERVER_PREFILL_FAIR` (kill-switch, **on**), `LLAMA_SERVER_PREFILL_SKEW`
+(**1** = the equal share; `N` weights the shortest-remaining slot N:1) and `LLAMA_SERVER_PREFILL_CHUNK`
+(**unset = one `n_ubatch`**, `0` = off).
+
+**Measured** (4B dense, 1 GPU, `-np 2`, `-b 2048 -ub 512`, gate `scripts/gate-prefill-fairness.sh`): short-prompt
+TTFT **1.90 -> 0.28 s (6.8x)**, decoder ITL **334 -> 107 ms**, lone prefill **-0.8 %**, one request's greedy text
+byte-identical.  Nine layouts green: 1/2/3-GPU `-sm tensor`, MTP n3 (acceptance identical, 0.853 both arms),
+host-expert arena resident and really streaming (`evictions=48166`, prefill -0.3 %), gfx1151, gfx1100,
+`--kv-unified`, `--kv-window 2048` (ITL 492 -> 251 ms).  `SKEW` on a heterogeneous mix: mean TTFT 1.401 -> 1.082 s
+at 5 and 1.040 s at 20 -- and the *longest* prompt improves too (2.201 -> 1.975 s), because short slots retire
+and stop competing, so the skew is not a mean-vs-tail trade here.
+
+**What the measurements corrected, kept so it is not re-derived:** the fair share alone moves ITL by **0 ms**
+(a decoding slot is not a prompt slot, so the long prompt still takes the window -- only the chunk bounds it);
+`chunk = n_ubatch` is a **floor, not a sweet spot** (below it a step re-pays its fixed cost for no fewer
+launches: `b ~= 196 ms` on the Flash-Next field shape against `b ~= 2 ms` on a dense 4B, so ubatch-sized chunks
+cost ~52 % of prefill there while costing +1.9 % on the 4B); an ITL bound derived from the *lone* prefill rate
+is wrong on a UMA box; and `max`/`p95` disagree honestly (the cap trades a few ~1 s stalls for many ~300 ms
+ones).  Two phantom findings were retracted rather than shipped: a "pre-existing first-step stall" that did not
+survive six controlled runs, and a "+25 %" solo-prefill win that was arm-ordering, not the policy -- both caused
+by an **unpinned slot assignment**, which matters for any two-slot measurement in this repo.
+
 ## 261116.006 (r299, RELEASE v16-4f9dfa0e3-r299) -- `TODO` #282 retired: the mid-run latch's mixture is a ~1e-5 fp32 path difference, NOT corruption -- and the `pinlate` arm had degenerated to 1 pool of 141, so it is now gated on the LOGITS
 
 **Amends block 12** (no new block: the `MOE_HOST_POOL_PIN_FAULT` diagnostic and its `late` latch live there).  The gate

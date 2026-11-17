@@ -1446,6 +1446,32 @@ notes it is not in the default build); the artifact, its trees and its measureme
 | `GGML_SCHED_PAIR_DEBUG` | `0` | diagnostic (value) | `1` logs each pair decision; `>= 2` also runs the cache-hazard self-test; `>= 3` logs per-lane/per-backend GPU event spans (this is the only consumer of `ggml_backend_event_elapsed_time`, and it makes the backend create **timing** events — that cost is why it is not the default). |
 | `GGML_SCHED_PAIR_HAZARD` | on | diagnostic (value) | `0` keeps only the split-name guard and skips the cache-hazard analysis of the two lanes.  A/B only: the hazard analysis is what makes a mis-matched pair run one-after-the-other instead of racing on the KV cache. |
 
+## 22. Server prompt admission (block 12, r300) — the fair share, the skew, and the chunk
+
+`update_slots()` assembles ONE batch per step and it cannot be joined mid-flight, so the policy that decides
+**which prompt tokens enter that batch** is also the policy that decides how long every other slot waits.
+Before r300 the prompt slots were filled in **slot-index order**, each to `n_batch`: the lowest slot took the
+whole window and every other prompt waited for that slot's *entire* prompt.  r300 shares the window max-min
+fairly and exposes three variables.  Full record: `archive/work/session-scheduling/`.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `LLAMA_SERVER_PREFILL_FAIR` | **on** (set `0` to disable) | **kill-switch** (default-on feature) | the max-min fair share: water-filling over the slots that still have prompt tokens, so every active prompt is admitted to every step and a slot that needs less returns the difference to the pool for the others.  `0` restores the r299 slot-order fill exactly. |
+| `LLAMA_SERVER_PREFILL_SKEW` | **1** | **tuning** | weights the slot with the **shortest remaining** prompt `N:1` against the others (1..64, clamped).  Not SRPT: every other slot still advances every step, so starvation is impossible.  `1` is the plain equal share and allocates exactly what it did before this variable existed.  Measured (4 prompts of 6000/3000/1500/400 tokens, `-np 4`): mean TTFT 1.401 s at 1, **1.082 s at 5**, 1.040 s at 20, and the *longest* prompt improves too (2.201 → 1.975 s) because short slots retire and stop competing. |
+| `LLAMA_SERVER_PREFILL_CHUNK` | **unset = one `n_ubatch`** | **tuning** | caps the prompt tokens admitted per step.  This is the bound on a decoding slot's ITL and on the worst-case wait for a newly arrived request.  `0` = off; `N` = explicit.  **Below `n_ubatch` is dominated**: the step still issues one `llama_process()` and the same kernel launches, so it re-pays the step's fixed cost for nothing. |
+
+**The chunk's cost is shape-dependent and the fixed per-step cost is the whole story.**  Fitting
+`step = a·tokens + b` on the field `runme` (Flash-Next, PLE on CPU + host experts + attendance pool) gives
+`b ≈ 196 ms`; on a dense 4B it is `b ≈ 2 ms`.  That is why `chunk = n_ubatch` is near-free on the 4B and a
+**no-op** where `-ub` already equals `-b` (a big-prefill config), and why a sub-second ITL bound requires
+lowering `-ub` as well: llama-benchy at `--parallel 4`, `pp16384`, read **3036 t/s** with no cap, **2832** at
+`chunk 4096` (−7 %) and **1454** at `chunk 512` (−52 %).
+
+Starvation is impossible in every mode: a one-token floor per active prompt is applied before the weighted
+split, so even `SKEW=64` with `n_parallel` at `n_batch` admits every prompt on every step.  `-lv 4` prints the
+configuration once at startup (`prefill admission: fair share = on, chunk = n_ubatch, skew = 1`); `-lv 5` adds
+the per-step `fair share: budget/added/batch` line.
+
 ## Maintaining this file
 
 The tables were derived from the code, so re-derive rather than trust them after a block change:

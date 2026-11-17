@@ -1,8 +1,9 @@
-From 6f5cfd41705725b552c7988249cda397f5a9f6ca Mon Sep 17 00:00:00 2001
+From 202bfde7388457800b803296d103afc875e3ab04 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/16] rdna-boosts: block 12: campaign remainder (CPU wins,
- backend iface fills, DFlash, FA build grouping, server prompt cache)
+ backend iface fills, DFlash, FA build grouping, server prompt cache + fair
+ prefill admission)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -128,6 +129,25 @@ token-split ubatch from the band that is not trustworthy (a 2-token graph trips 
 assertion; a 48..112-token one can overflow the Meta split-state recursion, block 09's cache).  The value is now
 clamped to 128 with one WARN naming `TODO` #330, so a wrong setting degrades to "off" for the ubatches it cannot
 handle instead of aborting; the shipped default (512) is above the clamp and unchanged.  Nothing below 128 can split.
+
+Server prompt admission (r300, wip/session-scheduling + 540-server-scheduling): update_slots() used to
+add the decode tokens and then walk the prompt slots in INDEX order, each filling n_batch, so the lowest
+slot took the whole window and every other prompt waited for that slot's ENTIRE prompt -- a 7-token prompt
+behind a 13204-token one waited 1.91 s, and a decoding slot's inter-token latency went 10 ms -> 266-331 ms
+while the other slot prefilled.  -b did not help: it changed the grab size, not the order.
+
+The window is now shared max-min fairly (share_prompt_budget, water-filling: every active prompt is admitted
+to every step, and a slot that needs less returns the difference to the pool, which is redistributed among
+the slots that can still use it).  Two knobs, both kill-switches with the measured behaviour as the default:
+LLAMA_SERVER_PREFILL_FAIR (on unless 0), LLAMA_SERVER_PREFILL_SKEW (default 1 = the equal share; N weights
+the shortest-remaining slot N:1), LLAMA_SERVER_PREFILL_CHUNK (unset = one n_ubatch, 0 = off).  A one-token
+floor per active prompt keeps starvation impossible in every mode.
+
+Measured (4B dense 1 GPU unless noted; gate wip/session-scheduling/gate.py, promoted with this block):
+short-prompt TTFT 1.91 s -> 0.28 s (6.9x), decoder ITL 334 -> 106 ms, lone prefill -0.8 %, single-request
+text identical; green on 9 layouts (1/2/3 GPU tensor, MTP n3, host-expert arena resident and streaming,
+gfx1151, gfx1100, --kv-unified, --kv-window).  SKEW=5 improves EVERY request on a heterogeneous mix
+(mean TTFT 1.401 -> 1.082 s) because the short slots retire early.  See the record for the open items.
 ---
  common/arg.cpp                                |   32 +-
  common/common.cpp                             |   11 +
@@ -189,11 +209,11 @@ handle instead of aborting; the shipped default (512) is above the clamp and unc
  src/models/qwen4exp.cpp                       |  180 +-
  tests/test-llama-archs.cpp                    |   18 +-
  tools/llama-bench/llama-bench.cpp             |    4 +-
- tools/server/server-context.cpp               |  333 +-
+ tools/server/server-context.cpp               |  542 +-
  tools/server/server-task.cpp                  |  107 +-
  tools/server/server-task.h                    |   16 +-
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 64 files changed, 9890 insertions(+), 1246 deletions(-)
+ 64 files changed, 10097 insertions(+), 1248 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 676a2861a..69b117204 100644
@@ -14479,7 +14499,7 @@ index 7546f82ad..0057d9a74 100644
                          invalid_param = true;
                          break;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index ff06b961b..53ed1c794 100644
+index ff06b961b..aee311baa 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -299,6 +299,14 @@ struct server_slot {
@@ -14506,8 +14526,55 @@ index ff06b961b..53ed1c794 100644
          last_nl_pos    = 0;
          generated      = {};
          has_new_line   = false;
-@@ -1138,6 +1148,165 @@ private:
+@@ -1136,8 +1146,212 @@ private:
  
+     int n_empty_consecutive = 0;
+ 
++    // LLAMA_SERVER_PREFILL_FAIR (on unless 0): give the slots that have prompt tokens a max-min fair share of
++    // the batch window instead of letting the lowest slot fill n_batch first.  Every active prompt is then
++    // admitted to every step, and a slot that needs less than its share returns the difference to the pool,
++    // which is redistributed among the slots that can still use it.  A kill-switch for bisection, not an
++    // opt-in: the share is measured to cost no throughput (a second sequence in the batch is free).
++    const bool prefill_fair = [] {
++        const char * e = getenv("LLAMA_SERVER_PREFILL_FAIR");
++        return e == nullptr || atoi(e) != 0;
++    }();
++
++    // LLAMA_SERVER_PREFILL_CHUNK (unset = one ubatch, 0 = off): cap the prompt tokens admitted per step.  This
++    // is also the worst-case wait for a newly arrived request and the bound on a decoding slot's inter-token
++    // latency, because a batch is assembled once per step and cannot be joined mid-flight.
++    //
++    // The default is ONE UBATCH because a smaller chunk is dominated: below `n_ubatch` a step still issues the
++    // same one `llama_process()` call and the same kernel launches, so it pays the step's fixed cost again for
++    // no reduction in launch count.  That fixed cost is what decides the trade and it is shape-dependent --
++    // ~2 ms on a dense model on one GPU, ~196 ms on a PLE-on-CPU + host-expert + attendance-pool shape (fitted
++    // from llama-benchy: 128 steps of 512 tok cost 45.1 s against 4 steps of 16384 at 21.6 s for the same
++    // 65536 tokens).  So `chunk = n_ubatch` is a no-op where the ubatch is already the batch (a big-prefill
++    // config), and near-free where the ubatch is a quarter of it -- and a real ITL bound requires lowering
++    // -ub as well as this, which is the honest coupling.
++    const int32_t prefill_chunk = [] {
++        const char * e = getenv("LLAMA_SERVER_PREFILL_CHUNK");
++        return e != nullptr ? std::max(0, atoi(e)) : -1; // -1: follow n_ubatch
++    }();
++
++    // LLAMA_SERVER_PREFILL_SKEW (default 1 = off): weight the slot with the SHORTEST remaining prompt this
++    // many times against the others.  >1 is a tunable droop from the max-min fair share toward
++    // shortest-remaining-first: the shortest answers and finishes sooner, every other slot still advances on
++    // every step (and so still gives feedback), and the rest accelerate as slots retire.  Any value >= 1 keeps
++    // starvation impossible.  1 is the plain max-min share and allocates EXACTLY what it did before this knob
++    // existed, so the equal-share measurements stay valid.
++    const int32_t prefill_skew = [] {
++        const char * e = getenv("LLAMA_SERVER_PREFILL_SKEW");
++        if (e == nullptr) {
++            return 1;
++        }
++        const int v = atoi(e);
++        return v < 1 ? 1 : v > 64 ? 64 : v;
++    }();
++
++    // rotating start for the fair-share walk, so the tie-break is not always slot 0
++    int32_t slot_next = 0;
++
      std::unique_ptr<server_prompt_cache> prompt_cache;
  
 +    // LLAMA_SERVER_LAZY_IDLE_SLOTS (on unless 0): with a unified KV cache, an idle slot keeps its context when a new task
@@ -14672,7 +14739,20 @@ index ff06b961b..53ed1c794 100644
      server_metrics metrics;
  
      // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
-@@ -1914,9 +2083,21 @@ private:
+@@ -1507,6 +1721,12 @@ private:
+         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
+                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
+ 
++        // the prompt admission policy, so a log always says which one ran (wip/session-scheduling)
++        SRV_INF("prefill admission: fair share = %s, chunk = %s, skew = %d\n",
++                prefill_fair ? "on" : "off",
++                prefill_chunk < 0 ? "n_ubatch" : prefill_chunk == 0 ? "off" : std::to_string(prefill_chunk).c_str(),
++                prefill_skew);
++
+         // initialize slots
+         for (int i = 0; i < params_base.n_parallel; i++) {
+             slots.emplace_back();
+@@ -1914,9 +2134,21 @@ private:
  
                  const int64_t t_start = ggml_time_us();
  
@@ -14695,7 +14775,7 @@ index ff06b961b..53ed1c794 100644
                      ret->prompt_clear();
                  }
  
-@@ -1929,18 +2110,105 @@ private:
+@@ -1929,18 +2161,218 @@ private:
          return ret;
      }
  
@@ -14766,6 +14846,119 @@ index ff06b961b..53ed1c794 100644
 +        }
 +    }
 +
++    // Max-min fair (water-filling) split of the prompt window across the slots that still have prompt tokens
++    // to place.  Each pass gives every remaining slot budget/n_active tokens; a slot that needs less leaves
++    // the difference in the pool, and the pool is shared again among the slots that can still use it.  The
++    // result is that nobody fills n_batch first and every active prompt is admitted to every step.  Rotation
++    // makes the tie-break fair across steps.  WIP: wip/session-scheduling/ in the delivery repo.
++    void share_prompt_budget(std::vector<int32_t> & prompt_budget, int32_t budget) {
++        if (slots.empty()) {
++            return;
++        }
++
++        std::vector<size_t>  active;
++        std::vector<int64_t> remaining(slots.size(), 0);
++
++        for (size_t i = 0; i < slots.size(); ++i) {
++            const size_t k = (slot_next + i) % slots.size();
++            const auto & s = slots[k];
++
++            if (!s.is_processing() || s.task == nullptr) {
++                continue;
++            }
++            if (s.state != SLOT_STATE_PROCESSING_PROMPT && s.state != SLOT_STATE_STARTED) {
++                continue;
++            }
++            if (s.state == SLOT_STATE_WAIT_OTHER) {
++                continue; // a child waits for its parent's shared prefix
++            }
++            if (s.task->type == SERVER_TASK_TYPE_TTS || s.task->type == SERVER_TASK_TYPE_REALTIME ||
++                s.task->type == SERVER_TASK_TYPE_TRANSCRIBE_RT) {
++                continue; // these bypass the shared batch
++            }
++
++            // a STARTED slot still has its whole prompt to place; the cache-reuse prefix is only known inside
++            // the fill loop, so this is an upper bound (a slot that finishes early simply uses less)
++            const int64_t r = s.state == SLOT_STATE_STARTED
++                ? (int64_t) s.task->n_tokens()
++                : (int64_t) s.task->n_tokens() - (int64_t) s.prompt.n_tokens();
++            if (r <= 0) {
++                continue;
++            }
++
++            active.push_back(k);
++            remaining[k] = r;
++        }
++
++        // No permanent starvation: even when the decode tokens have committed the whole window (only
++        // possible when n_parallel is at or above n_batch), every active prompt still gets one token.  The
++        // batch then exceeds n_batch by at most n_active tokens and the outer llama_process() loop splits it
++        // into a second pass, which is the price of never starving a prompt.  Without this, a config with
++        // n_parallel >= n_batch would let the decoding slots deny prompt admission forever.
++        budget = std::max(budget, (int32_t) active.size());
++
++        // One token each FIRST, whatever the weights are: that is what keeps a low-weight slot in every step,
++        // and it leaves the default allocation identical to the plain share (budget/n == 1 + (budget-n)/n).
++        {
++            std::vector<size_t> next;
++            for (const size_t k : active) {
++                prompt_budget[k] += 1;
++                remaining[k]     -= 1;
++                budget           -= 1;
++                if (remaining[k] > 0) {
++                    next.push_back(k);
++                }
++            }
++            active.swap(next);
++        }
++
++        // then share the remainder, weighting the shortest-remaining slot `prefill_skew` times
++        while (!active.empty() && budget > 0) {
++            size_t skew_i = active.size();
++            if (prefill_skew > 1 && active.size() > 1) {
++                int64_t best = -1;
++                for (size_t i = 0; i < active.size(); ++i) {
++                    if (best < 0 || remaining[active[i]] < best) {
++                        best   = remaining[active[i]];
++                        skew_i = i; // ties keep the first in the rotated order
++                    }
++                }
++            }
++
++            int64_t wsum = 0;
++            for (size_t i = 0; i < active.size(); ++i) {
++                wsum += (i == skew_i ? prefill_skew : 1);
++            }
++            if (wsum <= 0) {
++                break;
++            }
++
++            const int32_t budget_before = budget;
++            std::vector<size_t> next;
++            for (size_t i = 0; i < active.size(); ++i) {
++                const size_t  k = active[i];
++                const int64_t w = (i == skew_i ? prefill_skew : 1);
++                const int64_t share_i = (int64_t) budget * w / wsum;
++                const int64_t take    = std::min<int64_t>(remaining[k], share_i);
++
++                prompt_budget[k] += (int32_t) take;
++                remaining[k]     -= take;
++                budget           -= (int32_t) take;
++
++                if (remaining[k] > 0) {
++                    next.push_back(k);
++                }
++            }
++            active.swap(next);
++
++            if (budget == budget_before) {
++                break; // integer truncation gave nobody a token; the window is effectively committed
++            }
++        }
++
++        slot_next = (slot_next + 1) % (int32_t) slots.size();
++    }
++
      // return true if at least one slot has been cleared
      // TODO: improve logic
      //       - smarter decision which slot to clear (LRU or longest prompt?)
@@ -14802,7 +14995,7 @@ index ff06b961b..53ed1c794 100644
          for (auto & slot : slots) {
              if (slot.is_processing()) {
                  continue;
-@@ -2750,6 +3018,28 @@ private:
+@@ -2750,6 +3182,28 @@ private:
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
@@ -14831,7 +15024,7 @@ index ff06b961b..53ed1c794 100644
          // evict checkpoints within min-step of a previous checkpoint, unless they were
          // created by the current task
          // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-@@ -2762,6 +3052,7 @@ private:
+@@ -2762,6 +3216,7 @@ private:
                  SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                          cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
  
@@ -14839,7 +15032,7 @@ index ff06b961b..53ed1c794 100644
                  it = slot.prompt.checkpoints.erase(it);
                  continue;
              }
-@@ -2772,7 +3063,8 @@ private:
+@@ -2772,7 +3227,8 @@ private:
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
              // make room for the new checkpoint, if needed
@@ -14849,7 +15042,7 @@ index ff06b961b..53ed1c794 100644
  
              SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                      cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
-@@ -2786,6 +3078,7 @@ private:
+@@ -2786,6 +3242,7 @@ private:
              for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                  if ((*it)->n_tokens == n_tokens_new) {
                      SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", (*it)->n_tokens);
@@ -14857,7 +15050,7 @@ index ff06b961b..53ed1c794 100644
                      it = slot.prompt.checkpoints.erase(it);
                  } else {
                      ++it;
-@@ -2803,6 +3096,12 @@ private:
+@@ -2803,6 +3260,12 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -14870,7 +15063,7 @@ index ff06b961b..53ed1c794 100644
          cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
          cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
          // stash the draft's speculative state with the checkpoint
-@@ -3102,7 +3401,11 @@ private:
+@@ -3102,7 +3565,11 @@ private:
                          break; // drop the task
                      }
  
@@ -14883,7 +15076,7 @@ index ff06b961b..53ed1c794 100644
                          for (auto & slot : slots) {
                              if (!slot.is_processing()) {
                                  SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-@@ -3926,7 +4229,14 @@ private:
+@@ -3926,7 +4393,14 @@ private:
                              slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                          }
  
@@ -14899,7 +15092,7 @@ index ff06b961b..53ed1c794 100644
  
                          const bool spec_reject = slot.use_spec_rejection();
  
-@@ -3935,7 +4245,7 @@ private:
+@@ -3935,7 +4409,7 @@ private:
                              /* .n_max    = */ n_draft_max,
                              /* .pos0     = */ slot.prompt.tokens.pos_next(),
                              /* .id_last  = */ slot.sampled,
@@ -14908,7 +15101,7 @@ index ff06b961b..53ed1c794 100644
                              /* .result   = */ &slot.spec_draft,
                              /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                              /* .temp     = */ slot.task->params.sampling.temp,
-@@ -3986,7 +4296,7 @@ private:
+@@ -3986,7 +4460,7 @@ private:
                  if (use_ckpt_tgt) {
                      //const int64_t t_start = ggml_time_us();
  
@@ -14917,7 +15110,55 @@ index ff06b961b..53ed1c794 100644
  
                      //const int64_t t_total = ggml_time_us() - t_start;
                      //printf("checkpoint total: %f ms\n", t_total / 1000.0);
-@@ -4058,6 +4368,8 @@ private:
+@@ -4015,6 +4489,33 @@ private:
+         auto & alora_scale       = batch.alora_scale;
+         auto & alora_disabled_id = batch.alora_disabled_id;
+ 
++        // max-min fair share of the prompt window: the decode tokens are already in the batch, so share what
++        // is left across every slot that still has prompt tokens.  See share_prompt_budget().
++        std::vector<int32_t> prompt_budget(slots.size(), 0);
++        {
++            // -1 = follow the ubatch (the default), 0 = no cap, >0 = explicit
++            const int32_t want   = prefill_chunk > 0 ? prefill_chunk
++                                 : prefill_chunk < 0 ? (int32_t) n_ubatch
++                                 : n_batch;
++            const int32_t cap    = std::min(n_batch, want);
++            const int32_t budget = std::max(0, cap - (int32_t) batch.size());
++
++            if (prefill_fair && !use_mixed_batch()) {
++                share_prompt_budget(prompt_budget, budget);
++            } else {
++                // kill-switch: keep today's slot-order fill.  The per-step cap is a separate mechanism and
++                // still applies -- every slot may add up to the whole remaining window, so the lowest slot
++                // that wants one wins, exactly as before.
++                //
++                // A mixed / non-causal batch (use_mixed_batch(): no memory, or no causal attention) is the
++                // same path: add_prompt_mixed() places a whole prompt at once, so a per-sequence share is not
++                // expressible there.  The policy is left off rather than half-applied.
++                for (auto & b : prompt_budget) {
++                    b = budget;
++                }
++            }
++        }
++
+         // next, batch any pending prompts without exceeding n_batch
+         if (params_base.cont_batching || batch.size() == 0) {
+             bool add_ok = true; // false means the batch is full, skip remaining slots
+@@ -4028,6 +4529,13 @@ private:
+                     return;
+                 }
+ 
++                // no share of the window this step: the prompt slots get a max-min fair share of
++                // n_batch - (decode tokens), so a slot with a zero share waits for the next step instead of
++                // filling the batch itself.  An empty prompt still goes through so it can be released.
++                if (slot.task->n_tokens() > 0 && prompt_budget[slot.id] <= 0) {
++                    return;
++                }
++
+                 // check if we can batch this slot with the previous one
+                 if (slot_batched && !slot_batched->can_batch_with(slot)) {
+                     return;
+@@ -4058,6 +4566,8 @@ private:
  
                          slot.state = SLOT_STATE_PROCESSING_PROMPT;
  
@@ -14926,7 +15167,7 @@ index ff06b961b..53ed1c794 100644
                          if (spec) {
                              common_speculative_set_prompt_end(spec.get(), slot.id, slot.task->tokens.pos_next());
                          }
-@@ -4313,6 +4625,8 @@ private:
+@@ -4313,6 +4823,8 @@ private:
  
                                      bool do_reset = it == slot.prompt.checkpoints.rend();
  
@@ -14935,7 +15176,7 @@ index ff06b961b..53ed1c794 100644
                                      if (!do_reset) {
                                          const auto & cur = **it;
  
-@@ -4336,6 +4650,8 @@ private:
+@@ -4336,6 +4848,8 @@ private:
  
                                          pos_next = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max));
                                          n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) cur.n_tokens);
@@ -14944,7 +15185,7 @@ index ff06b961b..53ed1c794 100644
                                          SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_past, (float) cur.size() / 1024 / 1024);
                                      }
  
-@@ -4354,6 +4670,7 @@ private:
+@@ -4354,6 +4868,7 @@ private:
                                      const auto & cur = **it;
                                      if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                          SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
@@ -14952,7 +15193,32 @@ index ff06b961b..53ed1c794 100644
                                          it = slot.prompt.checkpoints.erase(it);
                                      } else {
                                          ++it;
-@@ -5033,7 +5350,7 @@ private:
+@@ -4510,8 +5025,12 @@ private:
+ 
+                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
+ 
+-                    // add prompt tokens for processing in the current batch
+-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
++                    // add prompt tokens for processing in the current batch, at most this slot's fair share
++                    const int32_t n_prompt_start  = (int32_t) slot.prompt.n_tokens();
++                    const int32_t n_prompt_budget = prompt_budget[slot.id];
++
++                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch &&
++                           (int32_t) slot.prompt.n_tokens() - n_prompt_start < n_prompt_budget) {
+                         // get next token to process
+                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
+                         if (cur_tok == LLAMA_TOKEN_NULL) {
+@@ -4584,6 +5103,9 @@ private:
+                     // the number of tokens added to the batch for the current slot
+                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+ 
++                    SLT_DBG(slot, "fair share: budget = %d, added = %d, batch = %d / %d\n",
++                            n_prompt_budget, (int32_t) n_tokens_cur, (int32_t) batch.size(), n_batch);
++
+                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
+ 
+                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+@@ -5033,7 +5555,7 @@ private:
  
                          SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
  

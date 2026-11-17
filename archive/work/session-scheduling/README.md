@@ -1,15 +1,17 @@
 # `session-scheduling` — fair, preemptive prefill admission in `llama-server`
 
-**WIP campaign — NOT part of the delivery.**  Nothing here is in `patches/`, `release.json`, the fork's
-`rdna-boosts` branch or a release gate, and nothing is applied by `scripts/apply-all.sh`.  No `TODO` handle
-yet (the maintainer assigns one when this is accepted as work).
+**PROMOTED into block `0012` at r300 (2026-11-16) and archived here.**  The delivered code is
+`tools/server/server-context.cpp` inside `patches/0012-…`; the knobs are catalogued in `ENVIRONMENT.md` §25;
+the gate is `scripts/gate-prefill-fairness.sh`; the apply order and the block's verification are in
+`MANIFESTS.md`.  This directory keeps the measurements, the design record and the two open items
+(`TODO` #338 and #339) — it is not itself applied by anything.
 
-Status: **OPEN — design + a first-cut prototype (2026-11-17).**  The prototype is **backed up here as a
-four-commit patch series plus a net diff** (§9: trees, sha256, apply instructions, and the size of the change).  The prototype lives in the fork on branch
-**`sched-fair-prefill`** (commit `a1f8a1613`, off `rdna-boosts`, one file, +130/-2); it is not a delivery
-block and must not be promoted without the maintainer's go-ahead.  §4.7 records what it measured.  The §2
-baseline numbers were taken on the delivery at `rdna-boosts` tip `c215c77f3` (r299 tree), gfx1201 ×1,
+Status at promotion: **design + first-cut prototype + 9 validated layouts, promoted with `SKEW` defaulting to
+the measured equal share.**  The prototype was backed up as a four-commit series plus a net diff (§9: trees,
+sha256, apply instructions, size of the change) and that series is what block 12 now carries, squashed.  The
+§2 baseline numbers were taken on the delivery at `rdna-boosts` tip `c215c77f3` (r299 tree), gfx1201 ×1,
 ROCm 10.1.0, one `Qwen3.5-4B-Q8_0` (`/llm/models/Qwen3.5/4B/Q8_0/`), greedy, `--cache-prompt off`.
+
 
 ## 0. What this campaign is, and what it is deliberately not
 
@@ -373,7 +375,7 @@ it cannot be starved), and it costs nothing measurable.  Shortest-remaining-firs
 strictly better on mean TTFT, but it needs aging and a starvation bound to be defensible, and it is much
 harder to write a gate for.  Do not conflate the two.
 
-### 4.2.1 The chunk's cost model, and why the default is now one ubatch (llama-benchy, 2026-11-17)
+### 4.2.1 The chunk's cost model, and why the default is now one ubatch (llama-benchy, 2026-11-16)
 
 `llama-benchy` on the field `runme` (Qwen3.8-Flash-Next GSQ-RCO-IQ3_XXS, 3 GPU tensor, `--parallel 4`,
 `--batch-size 16384 --ubatch-size 16384`, attendance pool on, PLE on CPU), `pp16384 (c4)` = 65536 tokens:
@@ -482,7 +484,7 @@ case in the same loop and each has a correctness meaning:
 stealing from the only consumer that can use a wide batch; if the short-prompt TTFT does not collapse, the
 rotation is not running.  Both are cheap to measure (§2 harness).
 
-### 4.7 First cut — implemented and measured (branch `sched-fair-prefill`, 2026-11-17)
+### 4.7 First cut — implemented and measured (branch `sched-fair-prefill`, 2026-11-16)
 
 Implemented in the fork at `~/llama.cpp`, branch **`sched-fair-prefill`** (commit `a1f8a1613`), off
 `rdna-boosts`.  Not a delivery block, not on `rdna-boosts`, nothing in `patches/`.  One file:
@@ -541,7 +543,7 @@ result to want: a scheduling policy must not perturb the speculative path.  The 
 also read identical (132 → 133 t/s, +0.6 %), with the same acceptance totals.  So the align pass and the
 prompt budget do not fight over the same rows.
 
-### The validation matrix so far (all `--quick`, gate = `gate.py`, 2026-11-17)
+### The validation matrix so far (all `--quick`, gate = `gate.py`, 2026-11-16)
 
 | shape | short TTFT (behind 13.2 k) | decoder ITL max | lone prefill | single-req text |
 |---|---|---|---|---|
@@ -889,7 +891,7 @@ git apply <delivery>/wip/session-scheduling/sched-fair-prefill.patch
 # or, to keep the four commit messages:  git am <delivery>/wip/session-scheduling/series/*.patch
 ```
 
-Verified: `git apply --check` of the net diff on a worktree at tree `3da54a4c…` passes (done 2026-11-17).
+Verified: `git apply --check` of the net diff on a worktree at tree `3da54a4c…` passes (done 2026-11-16).
 
 **Size of the change.**  One file, `tools/server/server-context.cpp`:
 

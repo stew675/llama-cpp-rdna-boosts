@@ -3409,6 +3409,27 @@ form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_N
 
 ## Block 12 — campaign remainder
 
+> **r300 promotion: FAIR-SHARE SERVER PROMPT ADMISSION (the maintainer's call: no new block; this block already
+> owns the server's prompt/idle-slot code).**  `update_slots()` used to add the decode tokens and then walk the
+> prompt slots in **slot-index order**, each filling `n_batch`: the lowest slot took the whole window and every
+> other prompt waited for that slot's *entire* prompt.  Measured: a 7-token prompt behind a 13204-token one
+> waited **1.91 s** (and reported a nonsense 24 tok/s because it was a 7-token prompt inside someone else's
+> batch), while a *decoding* slot's inter-token latency went **10 ms → 266-331 ms** for six consecutive tokens
+> whenever the other slot prefilled.  `-b` does not help — it changes the grab size, not the order.
+> The window is now shared **max-min fairly** (`share_prompt_budget()`, water-filling: every active prompt is
+> admitted to every step, and a slot that needs less returns the difference to the pool).  Three variables, all
+> catalogued in `ENVIRONMENT.md` §22: `LLAMA_SERVER_PREFILL_FAIR` (kill-switch, **on**), `SKEW` (**1** = the
+> equal share; `N` weights the shortest-remaining slot N:1 — measured mean TTFT 1.401 → 1.082 s at 5, with the
+> *longest* prompt improving too because short slots retire), and `CHUNK` (**unset = one `n_ubatch`**; below
+> `n_ubatch` is dominated because the step re-pays its fixed cost for no fewer launches — `b ≈ 196 ms` on the
+> Flash-Next field shape against `b ≈ 2 ms` on a dense 4B).  A one-token floor per active prompt makes
+> starvation impossible in every mode.  Gate: `scripts/gate-prefill-fairness.sh` (two arms, 8 checks,
+> `--self-test` verified to reject the r299 build).  Measured on the promoted tree: short-prompt TTFT
+> **1.90 → 0.28 s (6.8x)**, decoder ITL **334 → 107 ms**, lone prefill **−0.8 %**, one request's greedy text
+> byte-identical; green on nine layouts (1/2/3-GPU tensor, MTP n3, host-expert arena resident and streaming,
+> gfx1151, gfx1100, `--kv-unified`, `--kv-window 2048`).  **This block now carries two unrelated features** —
+> the campaign remainder and server prompt admission — and should be split (`TODO` #339).  Record:
+> `archive/work/session-scheduling/` (design, all arms, `TODO` #338 open on a shape-dependent gate ratio).
 > **r296 amendment (`TODO` #330, `TODO` #333): the seqpar floor is the fused-HC band's 17, and `--load-mode`'s
 > help says what `mlock` is.**  A token-split ubatch at or below the fused hyper-connection band cannot be served:
 > `GGML_OP_HC_MIX`/`HC_COMBINE` assert mirrored inputs and have no token-split form, and they are selected for

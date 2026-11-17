@@ -20,6 +20,12 @@ are in the PRs; this file records what *this repo* verified, what it measures he
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
   `d025be5f683d1594556803a0db0baaad7d8d17ca3c0496aac428cc55673a299f` (the r299 cut; the earlier cuts are recorded below)
+* **r300 re-cut verification**: applies strictly at the r300 default tree
+  `4baf1b67ae591e6661a1e3c5365457a747b688ab` and produces `49f3086f63ce7683705be315060b25a828152d61`; cumulative with the other optional artifact,
+  numeric order, is `dc9a8815bd56be9a2e9cae48f7b19d26e7da922a`.  **The patch file is unchanged** (sha256 `d025be5f683d1594556803a0db0baaad7d8d17ca3c0496aac428cc55673a299f`,
+  byte-identical to the r299 cut): the artifact does not touch `tools/server/server-context.cpp`, which is the
+  only file block 12's r300 amendment changes, so nothing had to be reconciled -- only the produced tree moved
+  with the base.  `validate-set.sh` check 8 verifies all three trees on every run.
 * **r299 re-cut verification**: applies strictly at the r299 default tree
   `3da54a4c10d7350eddc5c0d8eae384086a306b0f` and produces `1d389b8db32c28462aae2aca2f413daf31344022`; cumulative with
   the other optional artifact, numeric order, is `3eeb8f6f1dea6d7d550980afde5072049b5ac665`.  The default tree moved by

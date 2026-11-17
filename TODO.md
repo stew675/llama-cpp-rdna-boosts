@@ -40,11 +40,12 @@ left in this file.  The r236 re-base
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
-| **338** | the fairness gate's short-TTFT ratio is shape-dependent: on a streamed-prefill shape it reads 2.7x against a 3.0x default, at its derived ceiling | gate design (`wip/session-scheduling/gate.py`) | **OPEN** — derive the bound from `L/(k*chunk)`, or set `--min-ttft-ratio` per shape with the reason — §338 |
+| **338** | the fairness gate's short-TTFT ratio is shape-dependent: on a streamed-prefill shape it reads 2.7x against a 3.0x default, at its derived ceiling | gate design (`scripts/gate-prefill-fairness.sh`) | **OPEN** — derive the bound from `L/(k*chunk)`, or set `--min-ttft-ratio` per shape with the reason — §338 |
+| **339** | block 12 now carries two unrelated features -- the campaign remainder and (r300) fair-share server prompt admission -- and should be split | delivery structure | **OPEN, maintainer's call** -- the split is deferred to a later session by the maintainer; a new `0016` or a `03xx` temporary are both options — §339 |
 
 ## Handle numbering
 
-**New handles append after `#338`, and a number is never reused.**  (`#337` was opened and retired the
+**New handles append after `#339`, and a number is never reused.**  (`#337` was opened and retired the
 same day, 2026-11-17: the attendance pool *does* engage on Qwen3.8-Flash-Next under `--kv-unified`, so the
 "cannot be exercised" premise was wrong; the arm and its numbers are in `wip/session-scheduling/`.)  (`#335`/`#336` were retired at r298 -- an alias
 ROLE gap in the expert cache, `WORKLOG.md` 261116.005 -- and `#282` at r299 -- the mid-run latch's mixture is gated on
@@ -335,3 +336,17 @@ late under the pool" have different fixes.
 fixed 3.0 -- the same correction the ITL bound already needed on the UMA box (a fixed millisecond count cannot
 be shape-independent).  Until then, a streamed-prefill run must pass `--min-ttft-ratio 2.5` and say why; the
 alternative (a default low enough for every shape) would stop the gate rejecting a partial fix.
+
+### #339 -- block 12 carries two unrelated features since r300 and should be split
+
+**Open, delivery structure; the maintainer's call and deferred to a later session on purpose.**  At r300 the
+fair-share server prompt admission was folded into **block 12** ("campaign remainder") rather than given its own
+block, because block 12 already owns the server's prompt/idle-slot code (`LLAMA_SERVER_LAZY_IDLE_SLOTS`, the
+idle-slot prompt cache, the spec-checkpoint device placement) and a new block carries release churn
+(`n_blocks`, renumbering, `release.json`).
+
+The cost is what the block convention exists to avoid: `0012`'s title no longer describes its contents, a
+bisect or revert of either feature drags the other, and the block is already the largest in the set.  The
+split options: (a) a new official `0016` for the server admission, (b) a `03xx` temporary block if the policy
+is still moving, or (c) leave it and let `patches/README.md`'s r300 amendment carry the description (what it
+does today).  Nothing is broken; this is bookkeeping that gets more expensive the longer it waits.
