@@ -12,7 +12,8 @@ taken on the delivery at `rdna-boosts` tip `c215c77f3` (r299 tree), gfx1201 ×1,
 
 **P0 (the whole point).**  `--parallel N` should behave concurrently:
 
-1. **No prefill starvation.**  A request's prompt must not wait behind another request's entire prompt.
+1. **No prefill starvation.**  Every active prompt is admitted to every step; a request's prompt must not
+   wait behind another request's entire prompt.
 2. **Bounded decode interference.**  A slot that is decoding must not inherit another slot's prefill chunk
    as its inter-token latency.
 3. **One slot prefilling while another decodes** must be the normal steady state, not an accident of the
@@ -201,6 +202,41 @@ For a bench harness like `llama-benchy`, the sequence at concurrency 2 with prom
 is: request 2 admitted, no prompt progress, then request 1's prefill done, then request 2's prefill.  That
 is §2.3/§2.4, and it is real — it is just *admission*, not execution.
 
+### 3.1 `n_batch` is the admission granularity, not just the batch size
+
+Three layers, and a request can only pass between them at one point:
+
+```
+update_slots() iteration
+├── process_new_tasks()          <- a new request is admitted HERE (also on the worker thread)
+├── assemble ONE common_batch    <- up to n_batch tokens, a flat list of (seq_id, pos) -- then FROZEN
+└── decode() -> llama_process()
+                 └── split into n_ubatch chunks, executed back to back
+```
+
+The `n_ubatch` chunks are a *subdivision* of a batch that is already fixed, so a request arriving mid-step
+cannot join **any** chunk of that step — not the current ubatch, not a later one.  It joins the next
+assembly.  What it *does* get immediately is a slot: `decode()` wraps `llama_process()` in
+`yield_to_queue()` (`:5059`) and that worker runs `process_new_tasks(true)` (`server-queue.cpp:195`), so the
+slot is launched and the HTTP headers go out while the GPU is busy.  **Noticed ≠ admitted to the batch.**
+
+So the worst-case wait for a seat is the duration of one in-flight step, i.e.
+
+```
+worst-case admission delay  ≈  n_batch / prefill_rate
+```
+
+which is the same number as the decode ITL spike in §2.5: **~290 ms at `-b 2048`** (measured 266-331 ms),
+**~2.3 s at `-b 16384`** (8803 tokens in 1.26 s).  That identity is the reason the per-step cap (§4.4) is
+the primary knob and `n_batch` should be a ceiling rather than a target: at the stock batch sizes the
+admission granularity is already the same 300 ms as the ITL jitter, so a cap that bounds one bounds both.
+
+Worked example of the starvation this produces (measured, §2.4): long prompt in slot 0, 7-token prompt
+arriving 50 ms later.  Slot 0 fills positions 0..`n_batch-1` on every step, the fill loop returns at the
+`batch.size() >= n_batch` check before reaching slot 1, and this repeats until slot 0's *remaining* prompt
+drops below `n_batch` (~1.64 s in, at step 6 of 7 for a 13204-token prompt at `-b 2048`).  The short
+request then reports `prompt_ms = 270 ms` — it was never slow, it was *unseated*.  Total wait 1.91 s.
+
 ## 4. P0 — the change
 
 ### 4.1 Insertion point
@@ -208,43 +244,63 @@ is §2.3/§2.4, and it is real — it is just *admission*, not execution.
 Only `update_slots()` (`server-context.cpp:4328-5000`).  Keep everything else: one context, one batch, the
 existing ubatch splitter, the existing `can_batch_with()` homogeneity rule.
 
-### 4.2 Per-slot prefill budget with a rotating cursor
+### 4.2 Max-min fair share of the window — everyone is in every step
 
-Replace "fill to `n_batch` slot by slot" with "share what is left":
+Two independent decisions, and they must not be confused:
+
+* **who gets the window** — the policy, below;
+* **how big the window is per step** — the chunk cap (§4.4), which is the ITL/admission bound.
+
+**The policy is max-min fair share (water-filling): every active prompt slot is admitted to every step.**
+Replace "fill to `n_batch` slot by slot" with:
 
 ```
-budget_left  = max(0, n_batch - batch.size())        // after decode tokens are in
-n_prompt     = number of slots that still have prompt tokens
-per_slot     = budget_left / n_prompt                 // 0 -> admit no prompt tokens this step
-start        = rotating slot cursor (++ each step)
-// walk the prompt slots from `start`, adding at most `min(remaining, per_slot)` each
+budget   = max(0, n_batch - batch.size())     // after the decode tokens are in
+active   = prompt slots that can join this batch (they have tokens left)
+while active is not empty:
+    share = budget / |active|                 // integer; 0 means the window is committed
+    if share == 0: break
+    for s in active, from a rotating cursor:
+        take = min(remaining[s], share)
+        admit[s] += take;  remaining[s] -= take
+        budget -= take
+    drop from `active` every slot with remaining[s] == 0   // its unspent share returns to the pool
 ```
 
-Note the `per_slot == 0` case: when decode tokens have already consumed the window (only possible when
-`n_parallel` is close to or above `n_batch`), admit no prompt tokens rather than one per slot — the outer
-`llama_process` loop would otherwise split the batch and charge a second pass (`update_slots()`, `:3974`).
+Properties, and they are the point of the campaign:
 
-This is the same *mechanism* `split_equal()` already applies inside a batch (one token per sequence per
-round, evenly), lifted one level to the decision of what enters the batch.  With an equal share, equal-length
-prompts finish **together** (§2.2 behaviour extended to any length) and a short prompt finishes in ~one step
-instead of ~1.9 s.
+* **Nobody hogs.**  A slot that needs less than its share returns the difference to the pool, and the pool
+  is **redistributed equally** among the slots that can still use it — not handed to the head of the queue.
+  The window is still fully used, so sharing costs no throughput (§2.7: a second sequence is free).
+* **Everyone is in every step.**  With `7 + 20K` tokens at `-b 1024`: share 512 → the short prompt takes its
+  7, the surplus 505 goes back and the long prompt takes 1017.  Both are admitted, window full.  The short
+  request's wait is bounded by one step, which is exactly the property §3.1 says is missing today.
+* **Equal-length prompts finish together** (§2.2 behaviour extended to any length), and a long prompt
+  finishes no later than it does today in total.
+* **Rotation makes the tie-break fair across steps**, so no slot is permanently first when several are
+  clamped to the same share.
 
-**But equal share is the simple variant, not the best one.**  The mechanism is a **per-step chunk cap**;
-what you do with the remaining budget is a policy choice, and the choices differ on whose latency you
-optimise:
+This is the same policy `split_equal()` already applies *inside* a batch (one token per sequence per
+round), lifted one level to the decision of what enters the batch — so the two levels now agree instead of
+fighting.
 
-| policy | mean TTFT | max TTFT | decode ITL |
-|---|---|---|---|
-| today: greedy fill, no cap | best for equal-length prompts | unbounded by the peer's prompt (2.4) | unbounded (2.5) |
-| **equal share** | worse for equal-length prompts (4.6) | bounded | bounded by the chunk |
-| **greedy fill with a hard per-slot chunk cap** | near-today (the head of the queue keeps a wide batch) | bounded | bounded by the chunk |
-| **shortest-remaining-first, with aging** | best | bounded | bounded; needs aging or a long prompt starves |
+| policy | who is in the batch | mean TTFT | max TTFT | decode ITL |
+|---|---|---|---|---|
+| today: greedy block fill | slot 0 to exhaustion | best (equal-length) | unbounded by the peer's prompt (§2.4) | unbounded (§2.5) |
+| **max-min fair share (this) + cap (§4.4)** | **all active slots, every step** | slightly worse (equal-length, §4.6) | **≤ one step** | **≤ the cap** |
+| shortest-remaining-first, with aging | all active slots, biased to the small ones | best overall | ≤ one step | ≤ the cap |
 
-Start with **greedy fill plus a hard per-slot chunk cap**, not equal share: it keeps today's good
-mean-TTFT behaviour for the request at the head of the queue, bounds everything else, and needs no aging
-rule to be safe.  Then measure short-remaining-first as a follow-up if mean TTFT matters on the real
-workload.  §2.7 says a second sequence in the batch is free, so neither policy owes a throughput penalty —
-this is purely a choice of whose latency to optimise.
+**Max-min fair share is the default and the first thing to build.**  It is the policy that makes `--parallel
+N` mean what a user expects, it needs no aging rule to be safe (a long prompt always receives its share, so
+it cannot be starved), and it costs nothing measurable.  Shortest-remaining-first is a *follow-up*: it is
+strictly better on mean TTFT, but it needs aging and a starvation bound to be defensible, and it is much
+harder to write a gate for.  Do not conflate the two.
+
+**The mean-TTFT cost is real and is accepted deliberately.**  For two equal-length prompts, fair sharing
+moves 1.90/3.86 s to ~3.7/3.7 s: mean rises (2.88 → 3.7 s), max falls.  A server should not hand one
+caller a lottery win at the expense of an unbounded wait for the next — that is the whole argument of §3.1 —
+so the campaign takes the mean cost knowingly and measures it (§4.6).  If a deployment is throughput-batch
+shaped (offline, equal prompts, no arrivals) it can set the cap to 0 and get today's behaviour back.
 
 ### 4.3 Preemption is free here — and it is not KV preemption
 
@@ -262,11 +318,16 @@ this is purely a choice of whose latency to optimise.
 
 ### 4.4 Bound the per-step prefill to protect decode ITL (§2.5)
 
-The budget above shares fairly but still admits up to `n_batch` prompt tokens per step.  To bound a
-decoder's ITL, cap the **per-step total** prompt tokens (a new `--prefill-chunk`-style knob, default
-something `n_ubatch`-shaped): `cap = min(n_batch, chunk)`; the same budget then divides `cap`.  This is the
-only tuning decision in P0, and it is the direct trade: smaller chunk → lower ITL jitter, lower prefill
-throughput.  Measure both; do not guess the default.
+The fair share above still admits up to `n_batch` prompt tokens per step, and §3.1 shows that `n_batch` *is*
+the admission granularity and the ITL bound.  To bound a decoder's ITL, cap the **per-step total** prompt
+tokens: `cap = min(n_batch, chunk)`, then the same max-min share divides `cap`.  Knob: `--prefill-chunk N` /
+`LLAMA_PREFILL_CHUNK` (proposed).
+
+This is the only tuning decision in P0, and it is a direct trade: smaller chunk → lower ITL jitter and a
+finer admission granularity, but more `llama_process()` calls per prompt and a little prefill throughput.
+Measure both ends; do not guess the default.  The first cut ships the fairness **on with the cap off (=0)**,
+because fairness is measured free (§2.7) and the cap is not yet measured — that keeps the default-on rule
+(`AGENTS.md`) honest: the beneficial half is on, the unproven half is an explicit knob.
 
 ### 4.5 Guards a fair budget must not break
 
@@ -290,7 +351,7 @@ case in the same loop and each has a correctness meaning:
 |---|---|---|
 | short prompt behind a 13 k prompt, TTFT | 1.91 s (2.4) | ~1 step (10-50 ms) — **the win** |
 | decoder ITL during another slot's 13 k prefill | 266-331 ms (2.5) | ≤ `chunk` / prefill rate — **the win** |
-| two equal 13 k prompts, TTFT | 1.90 / **3.86** s (2.3) | both ≈ 3.6-3.8 s.  This **raises mean TTFT** (2.88 → 3.7 s) and lowers max (3.86 → 3.7 s): a deliberate redistribution, not a win.  Aggregate prefill improves ~2-4 % (§2.7).  A *capped greedy* fill (§4.2) keeps the first request near 1.9 s and moves only the tail |
+| two equal 13 k prompts, TTFT | 1.90 / **3.86** s (2.3) | both ≈ 3.6-3.8 s.  This **raises mean TTFT** (2.88 → 3.7 s) and lowers max (3.86 → 3.7 s): a deliberate redistribution, accepted because max TTFT is what a server must bound (§3.1, §4.2) |
 | prefill throughput of a lone long prompt | 6788 t/s (2.4) | unchanged within a few percent (it still gets the whole remaining budget) |
 | aggregate decode at concurrency 2 | 120.5 t/s (2.6) | unchanged (±2 %) |
 | aggregate prefill, 2 concurrent prompts | within ±3 % of the co-batched case (§2.7) | unchanged — the serialisation is not buying throughput |
