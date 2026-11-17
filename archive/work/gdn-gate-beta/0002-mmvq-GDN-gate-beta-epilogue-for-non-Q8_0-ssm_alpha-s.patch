@@ -1,0 +1,508 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 15 Nov 2026 16:07:03 +0000
+Subject: [PATCH 2/3] mmvq: GDN gate/beta epilogue for non-Q8_0
+ ssm_alpha/ssm_beta (GGML_CUDA_FUSE_GDN_EPI=0: off)
+
+Qwen3.5/3.6/3.8 GDN layers whose ssm_alpha/ssm_beta are Q4_K/Q5_K/Q6_K/IQ4_XS/MXFP4 ran the
+two small projections, then ADD(dt) -> SOFTPLUS -> MUL(ssm_a) and SIGMOID as separate launches.
+The ksplit body now applies that chain in its epilogue (template flag gdn_epi, per row-concat
+segment): decode folds it into the existing alpha/beta/z row concat (3 -> 1 launches per GDN
+layer), the verify band (2..8 tokens) runs alpha + beta as one row-concat launch with the
+epilogue (5 -> 2). Every row keeps its own ksplit dot product (same nwarps / long_k / small_m
+as its unfused launch, <= 256 rows so one row per block); the epilogue is the softplus /
+sigmoid of unary.cu with rounded add / mul. The graph reorder puts z in front of the small pair.
+
+KLD on vs off (1 GPU, ROCBLAS_USE_HIPBLASLT=0, -ub 1/4/8): mean 0.000000, same top 100 %, max
+equal to the off-vs-off process noise; greedy and 30k-depth hashes identical. Decode: 27B
+Q4_K_M MTP +0.9 %, plain +0.3 %, 27B MXFP4 MTP +1.0 %, 35B-A3B Q4_K_M +0.4 %.
+---
+ ggml/src/ggml-cuda/common.cuh            |   9 +
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |   3 +
+ ggml/src/ggml-cuda/ggml-cuda.cu          |   9 +-
+ ggml/src/ggml-cuda/mmvq-ksplit-body.inc  |  15 +-
+ ggml/src/ggml-cuda/mmvq.cu               | 269 ++++++++++++++++++++++-
+ ggml/src/ggml-cuda/mmvq.cuh              |   3 +
+ 6 files changed, 299 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 127a4a142..f2808c006 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -2849,6 +2849,12 @@ struct ggml_cuda_mm_fusion_args_host {
+     // appended after the rows of src0 in the same launch, each written to its own destination
+     const ggml_tensor * cat_x[2] = { nullptr, nullptr };
+     ggml_tensor * cat_dst[2] = { nullptr, nullptr };
++    // GDN gate / beta epilogue on the row concat (mmvq_gdn_epi_find, mmvq.cu): segment gdn_gate_seg (0 = src0, k + 1 =
++    // cat_x[k]) writes softplus(v + gdn_dt[row]) * gdn_a[row], segment gdn_beta_seg writes sigmoid(v); -1: none
++    const ggml_tensor * gdn_dt = nullptr;
++    const ggml_tensor * gdn_a = nullptr;
++    int gdn_gate_seg = -1;
++    int gdn_beta_seg = -1;
+ };
+ struct ggml_cuda_mm_fusion_args_device {
+     const void * x_bias = nullptr;
+@@ -2889,6 +2895,9 @@ struct ggml_cuda_mm_fusion_args_device {
+     const float * gb_dt = nullptr;
+     const float * gb_a = nullptr;
+     int gb_nrows = 0;
++    // mmvq row concat GDN epilogue (ggml_cuda_mm_fusion_args_host::gdn_*): reads gb_dt / gb_a; -1: no such segment
++    int gdn_gate_seg = -1;
++    int gdn_beta_seg = -1;
+     // dense row concat (ksplit, 1 token): rows >= cat_row[k] read cat_x[k] and write cat_dst[k], at row - cat_row[k]
+     const void * cat_x[2] = { nullptr, nullptr };
+     float * cat_dst[2] = { nullptr, nullptr };
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index f70fe3ae2..b7906b2b9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -2789,6 +2789,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+     if (const int n_row_concat = ggml_cuda_mul_mat_row_concat_try_fuse(*cuda_ctx, cgraph, i)) {
+         return n_row_concat;
+     }
++    if (const int n_gdn_epi = ggml_cuda_gdn_epi_verify_try_fuse(*cuda_ctx, cgraph, i)) {
++        return n_gdn_epi;
++    }
+     if (const int n_dual_output = ggml_cuda_mul_mat_dual_output_try_fuse(*cuda_ctx, cgraph, i)) {
+         return n_dual_output;
+     }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index d0b9997ad..14c6bf07b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -10160,6 +10160,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         // (the ssm_conv_in fusion skips the nodes up to its CONCAT, e.g. attn_qkv), not Q8_0 (the GDN prescan matches
+         // positions).  Only nodes reading that activation and a weight move earlier: bit-identical.  Structural only, every
+         // ubatch size, idempotent.  GGML_CUDA_MMVQ_CONCAT_REORDER=0: off.
++        // With the GDN gate / beta epilogue on (GGML_CUDA_FUSE_GDN_EPI, mmvq.cu) the larger one goes in front of the small ones
++        // ([z, beta, alpha]), so the small pair and its gate chains stay adjacent for the verify band's epilogue launch; the
++        // decode row concat takes the same three in any order.
+         static const bool cat_reorder = [] { const char * e = getenv("GGML_CUDA_MMVQ_CONCAT_REORDER"); return e == nullptr || atoi(e) != 0; }();
+         const int cc_reorder = ggml_cuda_info().devices[cuda_ctx->device].cc;
+         if (cat_reorder && (GGML_CUDA_CC_IS_RDNA4(cc_reorder) || GGML_CUDA_CC_IS_RDNA3_0(cc_reorder))) {
+@@ -10200,10 +10203,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                             (b->src[0]->ne[1] > 256 && large) || feeds_concat(j)) {
+                         continue;
+                     }
+-                    large = large || b->src[0]->ne[1] > 256;
++                    const bool b_large = b->src[0]->ne[1] > 256;
++                    large = large || b_large;
+                     if (j != pos) {
+                         std::rotate(n + pos, n + j, n + j + 1);
+                     }
++                    if (b_large && ggml_cuda_gdn_epi_enabled()) {
++                        std::rotate(n + i, n + pos, n + pos + 1);
++                    }
+                     ++pos;
+                 }
+                 i = pos - 1;
+diff --git a/ggml/src/ggml-cuda/mmvq-ksplit-body.inc b/ggml/src/ggml-cuda/mmvq-ksplit-body.inc
+index cbac1aaa5..a2f3c24de 100644
+--- a/ggml/src/ggml-cuda/mmvq-ksplit-body.inc
++++ b/ggml/src/ggml-cuda/mmvq-ksplit-body.inc
+@@ -29,6 +29,7 @@
+     }
+     dst = dst_ptr;
+     int row0 = row0_g;
++    [[maybe_unused]] int gdn_seg = 0;   // the row concat segment of this block (GDN epilogue)
+     if constexpr (row_cat) {
+         vx = vx_ptr;
+         // row concat: the rows of the appended weights (segment boundaries are multiples of rows_per_cuda_block)
+@@ -36,10 +37,12 @@
+             vx    = fusion.cat_x[1];
+             dst   = fusion.cat_dst[1];
+             row0 -= fusion.cat_row[1];
++            gdn_seg = 2;
+         } else if (fusion.cat_dst[0] != nullptr && uint32_t(row0) >= fusion.cat_row[0]) {
+             vx    = fusion.cat_x[0];
+             dst   = fusion.cat_dst[0];
+             row0 -= fusion.cat_row[0];
++            gdn_seg = 1;
+         }
+     }
+     const     int blocks_per_row_x = ncols_x / qk;
+@@ -252,7 +255,11 @@
+             const int j = lf_idx / rows_per_cuda_block;
+             const int i = lf_idx % rows_per_cuda_block;
+             if (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst) {
+-                dst[j*stride_col_dst + i] = lf_sum;
++                if constexpr (gdn_epi) {
++                    dst[j*stride_col_dst + i] = mmvq_gdn_epi(lf_sum, gdn_seg, row0 + i, fusion);
++                } else {
++                    dst[j*stride_col_dst + i] = lf_sum;
++                }
+             }
+         }
+     } else {
+@@ -332,7 +339,11 @@
+                         conv_input[cs*c + k] = v;
+                     }
+                 } else if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+-                    dst[j*stride_col_dst + i] = result_val;
++                    if constexpr (gdn_epi) {
++                        dst[j*stride_col_dst + i] = mmvq_gdn_epi(result_val, gdn_seg, row0 + i, fusion);
++                    } else {
++                        dst[j*stride_col_dst + i] = result_val;
++                    }
+                 }
+             }
+         }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 29c0b215e..e280b0b9f 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1020,7 +1020,27 @@ static __device__ __forceinline__ float ggml_cuda_lf_reduce_scatter(const float
+ // 12-block release kernel (same per-row chunk->group mapping as the old
+ // ncols_dst == 1 path).
+ // ---------------------------------------------------------------------------
+-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false, bool small_m = false, bool row_cat = false>
++// GDN gate / beta epilogue of a row concat (ggml_cuda_mm_fusion_args_host::gdn_*, mmvq_gdn_epi_find): the ADD(dt) ->
++// SOFTPLUS -> MUL(ssm_a) and SIGMOID nodes after ssm_alpha / ssm_beta, computed as unary.cu's op_softplus / op_sigmoid and
++// the binbcast add / mul compute them, with rounded add / mul so nothing contracts into an FMA: bit-identical.
++static constexpr __host__ __device__ bool mmvq_gdn_epi_type(ggml_type type) {
++    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS ||
++           type == GGML_TYPE_MXFP4;
++}
++
++static __device__ __forceinline__ float mmvq_gdn_epi(const float v, const int seg, const int row,
++                                                     const ggml_cuda_mm_fusion_args_device & fusion) {
++    if (seg == fusion.gdn_gate_seg) {
++        const float x = __fadd_rn(v, fusion.gb_dt[row]);
++        return __fmul_rn((x > 20.0f) ? x : log1pf(expf(x)), fusion.gb_a[row]);
++    }
++    if (seg == fusion.gdn_beta_seg) {
++        return 1.0f / (1.0f + expf(-v));
++    }
++    return v;
++}
++
++template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false, bool small_m = false, bool row_cat = false, bool gdn_epi = false>
+ static __device__ __forceinline__ void mul_mat_vec_q_ksplit_body(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+@@ -1031,7 +1051,7 @@ static __device__ __forceinline__ void mul_mat_vec_q_ksplit_body(
+ #include "mmvq-ksplit-body.inc"
+ }
+ 
+-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false, bool small_m = false, bool row_cat = false>
++template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false, bool small_m = false, bool row_cat = false, bool gdn_epi = false>
+ __launch_bounds__(calc_nwarps_weight(type, ncols_dst, get_device_table_id(), long_k, small_m)*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q_ksplit(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+@@ -1147,6 +1167,19 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
+                             fusion.conv_input != nullptr;
++    if (fusion.gdn_gate_seg >= 0) {
++        // row concat with the GDN gate / beta epilogue: decode (alpha, beta and z) and the verify band (alpha and beta)
++        if constexpr (mmvq_gdn_epi_type(type) && !small_k && !halve_iters && c_ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
++            GGML_ASSERT(!has_fusion && fusion.cat2_k < 0 && fusion.cat_dst[0] != nullptr);
++            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
++            ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, false, false, false, rows_per_block, long_k, small_m, true, true>, launch_params,
++                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
++                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
++                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
++            return;
++        }
++        GGML_ABORT("GDN epilogue: unsupported launch");
++    }
+     if constexpr (c_ncols_dst == 1) {
+         if (fusion.cat_dst[0] != nullptr) {
+             GGML_ASSERT(!has_fusion);
+@@ -1782,7 +1815,7 @@ void ggml_cuda_mul_mat_vec_q(
+     if (fusion) {
+         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
+-        GGML_ASSERT(  ids || dst->ne[1] == 1);
++        GGML_ASSERT(  ids || dst->ne[1] == 1 || (fusion->gdn_gate_seg >= 0 && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE));
+         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
+         // non-negligible for some models such as gpt-oss-20b. The per-token MoE scale is a second exception.
+         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4 || fusion->x_scale_channel_dst);
+@@ -1904,6 +1937,13 @@ void ggml_cuda_mul_mat_vec_q(
+             fusion_local.cat_row[k] = nrows_launch;
+             nrows_launch += x->ne[1];
+         }
++        if (fusion->gdn_gate_seg >= 0) {
++            GGML_ASSERT(fusion->cat_x[0] != nullptr && fusion->gdn_beta_seg >= 0 && fusion->gdn_dt != nullptr && fusion->gdn_a != nullptr);
++            fusion_local.gb_dt        = (const float *) fusion->gdn_dt->data;
++            fusion_local.gb_a         = (const float *) fusion->gdn_a->data;
++            fusion_local.gdn_gate_seg = fusion->gdn_gate_seg;
++            fusion_local.gdn_beta_seg = fusion->gdn_beta_seg;
++        }
+     }
+ 
+     // MoE down + weighted reduction fold, armed by ggml_cuda_mwr_fold_mark for this MUL_MAT_ID
+@@ -3077,6 +3117,135 @@ int ggml_cuda_mul_mat_dual_output_try_fuse(ggml_backend_cuda_context & ctx, cons
+     return 0;
+ }
+ 
++// GDN gate / beta epilogue (Qwen3.5 / 3.6 / 3.8 ssm_alpha and ssm_beta of a type mmvq_gdn_epi_type takes; Q8_0 has the
++// prescan and gate/beta kernels): the chains after the two matmuls,
++//   alpha: RESHAPE -> ADD(dt) -> SOFTPLUS -> MUL(ssm_a),   beta: RESHAPE -> SIGMOID,
++// as the nodes directly after node `last` (any interleaving, nothing else in between) run as the epilogue of their
++// launch, which writes the MUL and SIGMOID outputs.  Returns the index of the last chain node, 0 when there is no match.
++// The ADD / MUL operand order does not matter (one IEEE add / multiply).  GGML_CUDA_FUSE_GDN_EPI=0: off.
++bool ggml_cuda_gdn_epi_enabled() {
++    static const bool on = [] { const char * e = getenv("GGML_CUDA_FUSE_GDN_EPI"); return e == nullptr || atoi(e) != 0; }();
++    return on;
++}
++
++struct mmvq_gdn_epi_m {
++    int ia = -1;                    // alpha / beta: indices into mm
++    int ib = -1;
++    ggml_tensor * gate = nullptr;   // MUL(softplus, ssm_a)
++    ggml_tensor * beta = nullptr;   // SIGMOID
++    const ggml_tensor * dt = nullptr;
++    const ggml_tensor * a  = nullptr;
++};
++
++static int mmvq_gdn_epi_find(const ggml_cgraph * cgraph, const int first, const int last, ggml_tensor * const * mm,
++                             const int n_mm, const int * mm_idx, mmvq_gdn_epi_m & m) {
++    if (!ggml_cuda_gdn_epi_enabled()) {
++        return 0;
++    }
++    const ggml_tensor * view[3] = { nullptr, nullptr, nullptr };   // the RESHAPE of mm[k]
++    int view_idx[3] = { -1, -1, -1 };
++    const ggml_tensor * add = nullptr;
++    const ggml_tensor * sp  = nullptr;
++    int add_idx = -1, sp_idx = -1, gate_idx = -1, beta_idx = -1;
++    const auto view_of = [&](const ggml_tensor * t) {
++        for (int k = 0; k < n_mm; ++k) {
++            if (view[k] != nullptr && t == view[k]) {
++                return k;
++            }
++        }
++        return -1;
++    };
++    int end = 0;
++    for (int k = last + 1; k < std::min(cgraph->n_nodes, last + 12) && end == 0; ++k) {
++        ggml_tensor * t = cgraph->nodes[k];
++        int v = -1;
++        if (t->op == GGML_OP_RESHAPE && m.gate != nullptr && t->src[0] == m.gate) {
++            // the gate's own RESHAPE (a view, nothing to run)
++        } else if (t->op == GGML_OP_RESHAPE) {
++            for (int q = 0; q < n_mm; ++q) {
++                if (t->src[0] == mm[q] && view[q] == nullptr) {
++                    v = q;
++                }
++            }
++            if (v < 0) {
++                return 0;
++            }
++            view[v] = t;
++            view_idx[v] = k;
++        } else if (t->op == GGML_OP_ADD && add == nullptr && (view_of(t->src[0]) >= 0 || view_of(t->src[1]) >= 0)) {
++            const bool s0 = view_of(t->src[0]) >= 0;
++            m.ia = view_of(s0 ? t->src[0] : t->src[1]);
++            m.dt = s0 ? t->src[1] : t->src[0];
++            add = t;
++            add_idx = k;
++        } else if (t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SOFTPLUS && add != nullptr && t->src[0] == add) {
++            sp = t;
++            sp_idx = k;
++        } else if (t->op == GGML_OP_MUL && sp != nullptr && (t->src[0] == sp || t->src[1] == sp) && m.gate == nullptr) {
++            m.gate = t;
++            m.a = t->src[0] == sp ? t->src[1] : t->src[0];
++            gate_idx = k;
++        } else if (t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID && m.beta == nullptr && view_of(t->src[0]) >= 0) {
++            m.ib = view_of(t->src[0]);
++            m.beta = t;
++            beta_idx = k;
++        } else {
++            return 0;
++        }
++        if (m.gate != nullptr && m.beta != nullptr) {
++            end = k;
++        }
++    }
++    if (end == 0 || m.ia < 0 || m.ib < 0 || m.ia == m.ib) {
++        return 0;
++    }
++    const ggml_tensor * x_a = mm[m.ia];
++    const ggml_tensor * x_b = mm[m.ib];
++    const int64_t nvh = x_a->ne[0];
++    const auto f32c = [](const ggml_tensor * t) { return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); };
++    if (x_a->src[0]->type != x_b->src[0]->type || !mmvq_gdn_epi_type(x_a->src[0]->type) || x_b->ne[0] != nvh ||
++            !ggml_are_same_shape(x_a, x_b) || !f32c(x_a) || !f32c(x_b) || !f32c(add) || !f32c(sp) || !f32c(m.gate) || !f32c(m.beta) ||
++            !f32c(m.dt) || !f32c(m.a) || m.dt->ne[0] != nvh || ggml_nelements(m.dt) != nvh || m.a->ne[0] != nvh || ggml_nelements(m.a) != nvh ||
++            ggml_nelements(add) != ggml_nelements(x_a) || ggml_nelements(m.gate) != ggml_nelements(x_a) ||
++            ggml_nelements(m.beta) != ggml_nelements(x_b) || view_idx[m.ia] < 0 || view_idx[m.ib] < 0) {
++        return 0;
++    }
++    // the intermediates have no consumer outside the chain
++    const int idxs[8] = { mm_idx[m.ia], mm_idx[m.ib], view_idx[m.ia], add_idx, sp_idx, gate_idx, view_idx[m.ib], beta_idx };
++    const ggml_op ops[8] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL,
++                             GGML_OP_RESHAPE, GGML_OP_UNARY };
++    const int outs[2] = { gate_idx, beta_idx };
++    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 8, ops, outs, 2)) {
++        return 0;
++    }
++    // every node of the window that the launch writes (the chain outputs and any other matmul of the group)
++    int wr[4];
++    int n_wr = 0;
++    wr[n_wr++] = gate_idx;
++    wr[n_wr++] = beta_idx;
++    for (int k = 0; k < n_mm; ++k) {
++        if (k != m.ia && k != m.ib) {
++            wr[n_wr++] = mm_idx[k];
++        }
++    }
++    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, first, end - first + 1, wr, n_wr)) {
++        return 0;
++    }
++    return end;
++}
++
++// GGML_CUDA_GDN_EPI_LOG=1: one line the first time each epilogue launch runs (proves the fusion fires).
++static void mmvq_gdn_epi_log(const char * what, const ggml_tensor * x, const int ncols) {
++    static const bool on = getenv("GGML_CUDA_GDN_EPI_LOG") != nullptr;
++    static bool seen[2] = { false, false };
++    const int w = ncols > 1;
++    if (on && !seen[w]) {
++        seen[w] = true;
++        fprintf(stderr, "gdn_epi: %s %s rows %d K %d tokens %d\n", what, ggml_type_name(x->src[0]->type), (int) x->ne[0],
++                (int) x->src[0]->ne[0], ncols);
++    }
++}
++
+ // Dense row concat: two or three 1-token matmuls over the same activation with the same weight type and K (e.g. the
+ // V, K and Q projections of an attention layer) run as one ksplit launch, the rows of the others appended after the
+ // largest weight.  Every row keeps its own unchanged dot product.  RDNA3_0: the launch config depends on the row count
+@@ -3110,6 +3279,7 @@ int ggml_cuda_mul_mat_row_concat_try_fuse(ggml_backend_cuda_context & ctx, const
+         return 0;
+     }
+     ggml_tensor * mm[3] = { node, nullptr, nullptr };
++    int mm_idx[3] = { i, -1, -1 };
+     int n_mm = 1;
+     int last = i;
+     for (int j = i + 1; j < std::min(cgraph->n_nodes, i + 8) && n_mm < 3; ++j) {
+@@ -3120,6 +3290,7 @@ int ggml_cuda_mul_mat_row_concat_try_fuse(ggml_backend_cuda_context & ctx, const
+         if (!ok(t) || t->src[0] == node->src[0]) {
+             break;
+         }
++        mm_idx[n_mm] = j;
+         mm[n_mm++] = t;
+         last = j;
+     }
+@@ -3198,15 +3369,101 @@ int ggml_cuda_mul_mat_row_concat_try_fuse(ggml_backend_cuda_context & ctx, const
+         }
+     }
+     ggml_cuda_mm_fusion_args_host fusion_data{};
++    // GDN gate / beta epilogue: alpha and beta write their chains' MUL / SIGMOID outputs (same layout, the matmul
++    // node keeps the shape), the launch skips to the end of the chains
++    bool same_type = true;
++    for (int k = 0; k < n_mm; ++k) {
++        same_type = same_type && mm[k]->src[0]->type == type;
++    }
++    mmvq_gdn_epi_m gm;
++    const int gdn_end = same_type ? mmvq_gdn_epi_find(cgraph, i, last, mm, n_mm, mm_idx, gm) : 0;
++    ggml_tensor out_c[2];
++    ggml_tensor * out[3] = { mm[0], mm[1], mm[2] };
++    if (gdn_end > 0) {
++        out_c[0] = *mm[gm.ia];
++        out_c[0].data = gm.gate->data;
++        out_c[1] = *mm[gm.ib];
++        out_c[1].data = gm.beta->data;
++        out[gm.ia] = &out_c[0];
++        out[gm.ib] = &out_c[1];
++        fusion_data.gdn_dt = gm.dt;
++        fusion_data.gdn_a  = gm.a;
++    }
+     for (int k = 0, c = 0; k < n_mm; ++k) {
+         if (k != main_k) {
+             fusion_data.cat_x[c]   = mm[k]->src[0];
+-            fusion_data.cat_dst[c] = mm[k];
++            fusion_data.cat_dst[c] = out[k];
+             ++c;
++            if (gdn_end > 0 && k == gm.ia) {
++                fusion_data.gdn_gate_seg = c;
++            } else if (gdn_end > 0 && k == gm.ib) {
++                fusion_data.gdn_beta_seg = c;
++            }
++        } else if (gdn_end > 0 && k == gm.ia) {
++            fusion_data.gdn_gate_seg = 0;
++        } else if (gdn_end > 0 && k == gm.ib) {
++            fusion_data.gdn_beta_seg = 0;
+         }
+     }
+-    ggml_cuda_mul_mat_vec_q(ctx, mm[main_k]->src[0], mm[main_k]->src[1], nullptr, mm[main_k], &fusion_data);
+-    return last - i;
++    if (gdn_end > 0) {
++        mmvq_gdn_epi_log("decode", mm[gm.ia], 1);
++    }
++    ggml_cuda_mul_mat_vec_q(ctx, mm[main_k]->src[0], mm[main_k]->src[1], nullptr, out[main_k], &fusion_data);
++    return (gdn_end > 0 ? gdn_end : last) - i;
++}
++
++// GDN gate / beta epilogue in the verify band (2..MMVQ_MAX_BATCH_SIZE tokens, RDNA4 / RDNA3_0): ssm_alpha and ssm_beta, the
++// two matmuls at nodes i and i + 1 (the reorder puts the attn_gate z matmul in front of them), as one row concat launch
++// with the epilogue.  Every row keeps its own dot product: the launch takes the same nwarps (K and, on RDNA3_0, the row
++// count must select the same small_m for one weight and for both) and a row does not depend on the rows per block.
++int ggml_cuda_gdn_epi_verify_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
++    ggml_tensor * node = cgraph->nodes[i];
++    // at most 256 rows: the fused and the unfused launches both take one row per block (no block straddles the segments)
++    if (node->op != GGML_OP_MUL_MAT || i + 1 >= cgraph->n_nodes || node->ne[1] < 2 || node->ne[1] > MMVQ_MAX_BATCH_SIZE || node->ne[0] > 256 ||
++            !mmvq_gdn_epi_type(node->src[0]->type) || !ggml_cuda_gdn_epi_enabled()) {
++        return 0;
++    }
++    ggml_tensor * mm[2] = { node, cgraph->nodes[i + 1] };
++    const int mm_idx[2] = { i, i + 1 };
++    const auto ok = [&](const ggml_tensor * t) {
++        return t->op == GGML_OP_MUL_MAT && (t->flags & GGML_TENSOR_FLAG_COMPUTE) && t->src[1] == node->src[1] && t->src[2] == nullptr &&
++               t->src[0]->type == node->src[0]->type && t->src[0]->ne[0] == node->src[0]->ne[0] &&
++               t->src[0]->nb[1] == node->src[0]->nb[1] && ggml_is_matrix(t->src[0]) && t->src[0]->buffer != nullptr &&
++               ggml_backend_buffer_get_usage(t->src[0]->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
++               t->ne[2] == 1 && t->ne[3] == 1 && ggml_is_contiguous(t) && ggml_cuda_should_fuse_mul_mat_vec_q(t, true);
++    };
++    if (!ok(mm[0]) || !ok(mm[1]) || mm[0]->src[0] == mm[1]->src[0]) {
++        return 0;
++    }
++    const int cc = ggml_cuda_info().devices[ctx.device].cc;
++    const int table_id = get_device_table_id(cc);
++    if (table_id != MMVQ_PARAMETERS_RDNA4 && table_id != MMVQ_PARAMETERS_RDNA3_0) {
++        return 0;
++    }
++    const ggml_type type = node->src[0]->type;
++    if (table_id == MMVQ_PARAMETERS_RDNA3_0 &&
++            mmvq_rdna3_0_small_m_weight(type, mm[0]->ne[0]) != mmvq_rdna3_0_small_m_weight(type, mm[0]->ne[0] + mm[1]->ne[0])) {
++        return 0;
++    }
++    mmvq_gdn_epi_m gm;
++    const int gdn_end = mmvq_gdn_epi_find(cgraph, i, i + 1, mm, 2, mm_idx, gm);
++    if (gdn_end == 0) {
++        return 0;
++    }
++    ggml_tensor gate_c = *mm[gm.ia];
++    gate_c.data = gm.gate->data;
++    ggml_tensor beta_c = *mm[gm.ib];
++    beta_c.data = gm.beta->data;
++    ggml_cuda_mm_fusion_args_host fusion_data{};
++    fusion_data.cat_x[0]     = mm[gm.ib]->src[0];
++    fusion_data.cat_dst[0]   = &beta_c;
++    fusion_data.gdn_dt       = gm.dt;
++    fusion_data.gdn_a        = gm.a;
++    fusion_data.gdn_gate_seg = 0;
++    fusion_data.gdn_beta_seg = 1;
++    mmvq_gdn_epi_log("verify", mm[gm.ia], (int) node->ne[1]);
++    ggml_cuda_mul_mat_vec_q(ctx, mm[gm.ia]->src[0], mm[gm.ia]->src[1], nullptr, &gate_c, &fusion_data);
++    return gdn_end - i;
+ }
+ 
+ // MoE down fold: ffn_moe_weighted = moe_down * topk_weights.  Fold the MUL into the matmul epilogue
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index ea7ce5ad9..711fb1651 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -63,6 +63,9 @@ int ggml_cuda_ssm_prescan_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c
+ 
+ int ggml_cuda_mul_mat_dual_output_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+ int ggml_cuda_mul_mat_row_concat_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
++// GDN gate / beta epilogue (GGML_CUDA_FUSE_GDN_EPI=0: off): the row concat's in decode, and this verify-band launch.
++bool ggml_cuda_gdn_epi_enabled();
++int ggml_cuda_gdn_epi_verify_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+ 
+ int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+-- 
+2.53.0
+

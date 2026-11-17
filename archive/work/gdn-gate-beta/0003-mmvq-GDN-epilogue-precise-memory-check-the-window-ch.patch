@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 15 Nov 2026 17:52:07 +0000
+Subject: [PATCH 3/3] mmvq GDN epilogue: precise memory check (the window check
+ declined ~29 of 30 layers)
+
+ggml_cuda_check_fusion_memory_ranges over the matched window declined almost every layer: the
+allocator places the ADD / SOFTPLUS / MUL outputs in place over the alpha matmul output, which
+the fused launch never materializes. The launch reads only the weights, the activation's Q8_1
+copy (quantized by an earlier launch), dt and ssm_a, so the check is now: dt / ssm_a are weights
+(not compute-buffer copies) and no written tensor overlaps them.
+
+Qwen3.6-35B-A3B Q4_K_M decode: add_softplus_mul launches 29/token -> 0; tg128 147.7 -> 149.7
+t/s (+1.4 %); Qwen3.8-27B Q4_K_M / MXFP4 +0.6 %. KLD on vs off (ub 1 / 4) at the off-vs-off
+noise floor, 0 faults.
+---
+ ggml/src/ggml-cuda/mmvq.cu | 31 ++++++++++++++++++++-----------
+ 1 file changed, 20 insertions(+), 11 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index e280b0b9f..eec6e3118 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -3218,19 +3218,28 @@ static int mmvq_gdn_epi_find(const ggml_cgraph * cgraph, const int first, const
+     if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 8, ops, outs, 2)) {
+         return 0;
+     }
+-    // every node of the window that the launch writes (the chain outputs and any other matmul of the group)
+-    int wr[4];
+-    int n_wr = 0;
+-    wr[n_wr++] = gate_idx;
+-    wr[n_wr++] = beta_idx;
+-    for (int k = 0; k < n_mm; ++k) {
+-        if (k != m.ia && k != m.ib) {
+-            wr[n_wr++] = mm_idx[k];
+-        }
+-    }
+-    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, first, end - first + 1, wr, n_wr)) {
++    // Memory: the launch reads only the weights, the activation's Q8_1 copy (quantized by an earlier launch), dt and ssm_a,
++    // and writes the MUL and SIGMOID outputs and any other matmul of the group.  The chain's intermediates are never
++    // materialized, so the allocator placing the MUL / SIGMOID in place over them (it does, in most layers) is harmless;
++    // the generic window check (ggml_cuda_check_fusion_memory_ranges) counts those reads and declined ~29 of 30 layers.
++    // What must hold: dt / ssm_a are weights (not compute-buffer copies) and no written tensor overlaps them.
++    const auto weight = [](const ggml_tensor * t) {
++        return t->buffer != nullptr && ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE;
++    };
++    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++        const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a), b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
++        return a0 < b1 && b0 < a1;
++    };
++    if (!weight(m.dt) || !weight(m.a)) {
+         return 0;
+     }
++    for (int k = -2; k < n_mm; ++k) {
++        const ggml_tensor * w = k == -2 ? m.gate : k == -1 ? m.beta : (k != m.ia && k != m.ib) ? mm[k] : nullptr;
++        if (w != nullptr && (overlap(w, m.dt) || overlap(w, m.a))) {
++            return 0;
++        }
++    }
++    GGML_UNUSED(first);
+     return end;
+ }
+ 
+-- 
+2.53.0
+
