@@ -1,0 +1,124 @@
+From a65228263c906715b256ead91d41d26f8152747b Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 14 Nov 2026 17:23:25 +0000
+Subject: [PATCH 2/3] hc-mix: Q8_0 up band kernel loads its weights before the
+ prologue barrier (GGML_CUDA_HC_UP_PRELOAD=0: off)
+
+Each thread loads its weight ints and scales into registers before the y_pre copy barrier, the item math uses
+the compile-time BPR, and MAXI is 3 (the items per thread at 16 rows x 10 blocks).  The dot is the same
+vec_dot_q8_0_q8_1_impl on the same values, so the output is bit-identical.
+
+---
+ ggml/src/ggml-cuda/hc-mix.cu | 63 +++++++++++++++++++++++++++---------
+ 1 file changed, 48 insertions(+), 15 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index 265797f056..dbc0344f6c 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -447,7 +447,10 @@ static __global__ void hc_mix_up_silu_dot(
+ // the warp butterfly and the warp-0 + warps 1..7 sum order are exactly those of
+ // hc_mix_up_silu_dot<8, RPB>, so every output is bit-identical to it at any nt.
+ // MAXI bounds the items per thread (ceil(RPB*blocks_per_row / n_groups)).
+-template <int nwarps, int RPB, int NT, int MAXI, int BPR, bool PRE>
++// PL (GGML_CUDA_HC_UP_PRELOAD, default on): each thread loads its weight ints and scales before the prologue barrier
++// and the item math uses the compile-time BPR; the dot is the same vec_dot_q8_0_q8_1_impl on the same values, so the
++// outputs are bit-identical to PL = false.
++template <int nwarps, int RPB, int NT, int MAXI, int BPR, bool PRE, bool PL = false>
+ static __global__ void hc_mix_up_silu_dot_band(
+         const float * lo, const block_q8_1 * y_pre, const block_q8_0 * w,
+         float * dst, const int nrows, const int blocks_per_row,
+@@ -465,6 +468,31 @@ static __global__ void hc_mix_up_silu_dot_band(
+     for (int k0 = 32*threadIdx.y + lane; k0 < NT*RPB; k0 += 32*nwarps) {
+         (&tmp_w0[0][0])[k0] = 0.0f;
+     }
++    const int row0 = RPB*blockIdx.x;
++    constexpr int qi  = QI8_0;
++    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
++    const int tid      = 32*threadIdx.y + threadIdx.x;
++    const int n_groups = nwarps*32 / (qi/vdr);
++    const int bpr      = PL ? BPR : blocks_per_row;
++    const int n_items  = RPB * bpr;
++    const int kqs = vdr * (tid % (qi/vdr));
++    const int it0 = tid / (qi/vdr);
++    int  wq[PL ? MAXI : 1][vdr];
++    half wdq[PL ? MAXI : 1];
++    if (PL) {
++#pragma unroll
++        for (int k = 0; k < MAXI; ++k) {
++            const int it = it0 + k*n_groups;
++            if (it < n_items && row0 + it / BPR < nrows) {
++                const block_q8_0 * b = w + (int64_t) (row0 + it / BPR) * BPR + it % BPR;
++#pragma unroll
++                for (int j = 0; j < vdr; ++j) {
++                    wq[PL ? k : 0][j] = get_int_b2(b->qs, kqs + j);
++                }
++                wdq[PL ? k : 0] = b->d;
++            }
++        }
++    }
+     // BPR == blocks_per_row. All lo loads of this warp are issued before any is used (one
+     // memory latency instead of one per task); the per-task arithmetic is unchanged.
+     if (PRE) {
+@@ -504,15 +532,6 @@ static __global__ void hc_mix_up_silu_dot_band(
+     }
+     __syncthreads();
+ 
+-    const int row0 = RPB*blockIdx.x;
+-    constexpr int qi  = QI8_0;
+-    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+-    const int tid      = 32*threadIdx.y + threadIdx.x;
+-    const int n_groups = nwarps*32 / (qi/vdr);
+-    const int n_items  = RPB * blocks_per_row;
+-    const int kqs = vdr * (tid % (qi/vdr));
+-    const int it0 = tid / (qi/vdr);
+-
+     // this thread's items (it0, it0 + n_groups, ...): the dot of each against every token
+     float val[MAXI][NT];
+     int   row_of[MAXI];
+@@ -525,14 +544,24 @@ static __global__ void hc_mix_up_silu_dot_band(
+             val[k][t] = 0.0f;
+         }
+         if (it < n_items) {
+-            const int i   = it / blocks_per_row;
+-            const int kbx = it % blocks_per_row;
++            const int i   = it / bpr;
++            const int kbx = it % bpr;
+             if (row0 + i < nrows) {
+                 row_of[k] = i;
+-                const block_q8_0 * wr = w + (int64_t) (row0 + i) * blocks_per_row;
++                const block_q8_0 * wr = w + (int64_t) (row0 + i) * bpr;
+ #pragma unroll
+                 for (int t = 0; t < NT; ++t) {
+-                    val[k][t] = vec_dot_q8_0_q8_1(wr, &y_s[t*blocks_per_row + kbx], kbx, kqs);
++                    if (PL) {
++                        const block_q8_1 * yb = &y_s[t*BPR + kbx];
++                        int u[vdr];
++#pragma unroll
++                        for (int j = 0; j < vdr; ++j) {
++                            u[j] = get_int_b4(yb->qs, kqs + j);
++                        }
++                        val[k][t] = vec_dot_q8_0_q8_1_impl<float, vdr>(wq[PL ? k : 0], u, wdq[PL ? k : 0], __low2half(yb->ds));
++                    } else {
++                        val[k][t] = vec_dot_q8_0_q8_1(wr, &y_s[t*blocks_per_row + kbx], kbx, kqs);
++                    }
+                 }
+             }
+         }
+@@ -1348,8 +1377,12 @@ static void ggml_cuda_op_hc_mix_q8(ggml_backend_cuda_context & ctx, ggml_tensor
+         const dim3 block_dims(32, 8);
+         const size_t smem = (size_t) n_tokens*blocks_up*sizeof(block_q8_1);
+         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, smem, stream};
++        // GGML_CUDA_HC_UP_PRELOAD=0: the previous kernel (MAXI 4, runtime blocks_per_row, weights read in the dot)
++        static const bool up_preload = [] { const char * e = getenv("GGML_CUDA_HC_UP_PRELOAD"); return !e || std::atoi(e); }();
+ #define HC_UP_BAND(NT) (pre \
+-        ? ggml_cuda_kernel_launch(hc_mix_up_silu_dot_band<8, 16, NT, 4, 10, true>,  launch_params, lo, y_v, (const block_q8_0 *) w_up->data, gate, (int) hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, hc_dim) \
++        ? (up_preload \
++            ? ggml_cuda_kernel_launch(hc_mix_up_silu_dot_band<8, 16, NT, 3, 10, true, true>, launch_params, lo, y_v, (const block_q8_0 *) w_up->data, gate, (int) hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, hc_dim) \
++            : ggml_cuda_kernel_launch(hc_mix_up_silu_dot_band<8, 16, NT, 4, 10, true>,  launch_params, lo, y_v, (const block_q8_0 *) w_up->data, gate, (int) hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, hc_dim)) \
+         : ggml_cuda_kernel_launch(hc_mix_up_silu_dot_band<8, 16, NT, 4, 10, false>, launch_params, lo, y_v, (const block_q8_0 *) w_up->data, gate, (int) hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, hc_dim))
+         switch (n_tokens) {
+             case 1: HC_UP_BAND(1); break;
+-- 
+2.53.0
+
