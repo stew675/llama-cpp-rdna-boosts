@@ -303,3 +303,33 @@
    12 (`git cherry-pick` + `git checkout <pre-amendment> -- tools/server/server-context.cpp`): blocks 00-11 and
    13-15 byte-identical, and the applied tree after 0016 identical to the unsplit tip plus the new change.  The
    `From` ids change (the chain is re-cut), the tree is the contract -- compare trees, never ids.
+
+## r302 (2026-11-17, `WORKLOG.md` 261117.001)
+
+1. **A qwen4exp prefill-logit point needs `ROCBLAS_USE_HIPBLASLT=0` on BOTH arms, and the trap reads like a
+   real regression.**  A base recorded from the r301 build (default env) against a candidate run with the pin
+   reads **mean KLD 0.019670 / same-top-p 96.627 %** -- 4x the limit, the exact signature of the issue #113
+   class.  The **pre-change** build reads the identical 0.019670 / 96.627 % with the same mismatch, and with the
+   pin on both arms the same pair is **0.000000 / 100.000 %**.  So the carrier is hipBLASLt (which selects a
+   different Tensile kernel: a per-block score matmul reorders), not the change -- §44's rule, reached at a new
+   point.  Record the base with the pin, not just the candidate.
+2. **A fast path guarded by a device-side layout check has an invisible fallback, so its gate must assert a
+   DELTA.**  The indexer top-k's regular-layout path validates the cache layout per launch and silently falls
+   back to the cell-level path; every text and every KLD arm stays green in both states because the two paths are
+   bit-identical by construction.  What separates them is time (`+2.22 %` prefill at ~84k all-VRAM, `+0.16 %` on
+   the streamed shape) and the census (`GGML_QSA_TOPK_REGULAR_LOG=1`), so the gate asserts both -- a gate built
+   on text can only ever prove "not wrong", never "still taken".
+3. **The check kernel must read back through mapped pinned host memory, not a D2H copy.**  The check kernel is
+   part of a captured graph, and neither a `cudaMemcpyAsync` D2H nor a stream sync is legal inside a capture, so
+   the verdict is mirrored by the kernel itself into mapped pinned host memory (`cudaHostAllocMapped` +
+   `cudaHostGetDevicePointer`) and the host prints the PREVIOUS launch's value: a census, not a barrier.  Cost is
+   zero when unset (the pool slot is used and the census pointer is `nullptr`), and a `GGML_QSA_TOPK_REGULAR=0`
+   arm reports 0 lines, which is what makes the census sensitive.
+4. **Pointing a graded kernel at mapped host memory corrupts the measurement, not just the text.**  Passing the
+   census pointer as the kernels' `reg` argument would put a PCIe/cache-coherent read of `reg->ok` behind every
+   thread of every pass (a few thousand per launch), which is invisible in the text and fatal to the timing arm.
+   The graded path keeps the pool-allocated device struct; only the check kernel writes the pinned mirror.
+5. **The box is period-2 bimodal on this shape, so only an interleaved A/B is a measurement.**  The same arm read
+   **2545 t/s** at ~24k in one phase and **1905 t/s** at ~15k in another (both arms move together, ~25 %), while
+   the on/off delta stayed +1.3 %, +3.5 % and +2.0 % across those phases.  The gate's floor (1.0 %) carries 2x
+   margin on the slow phase; never quote an absolute prefill rate from one run as a baseline.

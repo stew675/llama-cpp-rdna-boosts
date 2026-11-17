@@ -3408,6 +3408,43 @@ ms/token**; wall A/B `-n 512`, interleaved, **40.48/40.48 -> 42.11/42.11 t/s (+4
 100.000 % (decode-only), no GPU faults.  `GGML_QSA_DERIVED_VIS=0` is the kill switch for the derived per-cell
 form (it also changes prefill policy, so it is not a no-op A/B; `LLAMA_INDEXER_NOBLOCK=1` is the isolation arm).
 
+### r302 (block 11 amendment, contributor PR #320): the indexer top-k's regular-layout fast path
+
+`ggml/src/ggml-cuda/indexer-topk.cu`.  With ONE stream and derived visibility the indexer cache is usually
+laid out in position order: every visible cell j holds position j (`cell_pos[j] == j`), sits in block `j/r`
+(`cell_blk[j] == j/r`), and the visible cells are a prefix of the cell range.  A query at position q then sees
+exactly the cells `[0, min(q, n_used - 1)]`, so block b's visible cells are its leading
+`w(b) = clamp(min(q, n_used-1) - b*r + 1, 0, n_in)` cells and every per-cell quantity of the radix passes follows
+from the BLOCK: pass 1 and the block passes compute `w(b)` instead of reading `cell_blk`/`cell_pos` per cell,
+`wvis` is not written, `count_cells_grouped` returns early (there is no cell/block partition mismatch to
+recount), and the gather walks whole blocks in ascending cell order (visible cells carry the block key, the rest
+`-inf`), so every cell lands where the cell-level gather puts it.
+
+`indexer_topk_regular_check()` validates the layout on the DEVICE on every call (one workgroup, 30 us/launch)
+and writes an ok flag plus `n_used`; it is part of the captured graph, so a replay re-validates.  Anything else
+(a second stream, no derived visibility, a pool/window/foreign cell, an offset cache) fails the check and the
+op runs exactly as before.  Kill switch `GGML_QSA_TOPK_REGULAR=0`; census `GGML_QSA_TOPK_REGULAR_LOG=1`
+(`ENVIRONMENT.md` §8).
+
+**Worth** (r302, gfx1201, Flash-Next GSQ-IQ3_XXS): 3-GPU `-sm tensor` all-VRAM (`-ncmoe 0`, PLE on the host,
+`-ub 4096 -b 4096`, 16 copies of `prompts/prose-rdna-boosts.txt`): prompt **1975.9 vs 1933.0 t/s (+2.22 %)**,
+2 interleaved pairs, no overlap (the contributor measured the same direction and shape: +1.7-1.9 % at 31.5k and
++3.8-3.9 % at 101k on 2 GPUs); 1-GPU `-sm layer -ncmoe 48` streamed shape **494.87 vs 494.10 t/s (+0.16 %)**,
+where the prefill is host-expert bound.  Decode unchanged, kernel time of the whole top-k bucket roughly halves
+on the contributor's rocprofv3 trace (8.5 % -> 4.3 % of kernel time at 101k).  **Purity:** greedy text
+byte-identical to r301 in every arm (`1c5d32ac537d` dense 4B 3-GPU; `b3de97c70c88` qwen4exp 1-GPU `-sm layer`
+at 24k; `5120581a3300` qwen4exp 3-GPU `-sm tensor` at 84k; `2cf39d00172c` qwen4exp + `draft-mtp n4` at
+`-n 600`), prefill-logit KLD **0.000000 / 100.000 %** at the canonical point, **0.000000 / 99.990 %** on the
+3-device `-sm tensor` point and **0.000000 / 100.000 %** on a qwen4exp (Flash-Next) point recorded from the r301
+build (the same 0.019670 / 96.627 % appears on the *pre-change* build when only one arm is run with
+`ROCBLAS_USE_HIPBLASLT=0`, i.e. the pin is part of the comparison, `INVARIANTS.md` §44).  `INDEXER_TOPK`
+**12/12 on both arms** (8 new cases cover the fast path's reachable state: partial visibility, a single visible
+block, a partial tail block, visibility across that tail, a trimmed cell range, `k == n_kv`, `k` above the visible
+count, `blk_idx == -1` blocks) and `FLASH_ATTN_QSA` green; `llama-batched-bench -npl 1,4,8` flat; the
+quant-coherence gate's sparse QSA section byte-identical to its chain; per-block build 2/2; no GPU faults.
+Gate: `scripts/gate-qsa-topk-regular.sh` (it asserts a measured delta AND the census, because a text oracle
+cannot tell the two arms apart).  Record: `archive/work/qsa-topk-regular/`.
+
 ## Block 12 — campaign remainder
 
 > **r301: THE ADMISSION POLICY IS NO LONGER IN THIS BLOCK — it is block 16** (`TODO` #339; the maintainer

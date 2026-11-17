@@ -1,3 +1,72 @@
+## 261117.001 (r302, RELEASE v17-4f9dfa0e3-r302) -- the QSA indexer top-k gets a REGULAR-LAYOUT fast path (contributor PR #320), folded into official block 11 with a census, eight new oracle cases and a gate
+
+**What shipped.**  Block 11 only, `ggml/src/ggml-cuda/indexer-topk.cu` + `tests/test-backend-ops.cpp`; every other
+block is byte-identical to r301 (the chain was re-cut, so the `From` ids move -- the tree is the contract).  With
+one stream and derived visibility the indexer cache is usually laid out in position order, and then a block's
+visible cells are its leading `w(b) = clamp(min(q, n_used-1) - b*r + 1, 0, n_in)` cells: pass 1 and the block
+passes compute `w(b)` instead of reading `cell_blk`/`cell_pos` per cell, `wvis` is not written,
+`count_cells_grouped` returns early and the gather walks whole blocks in ascending cell order.  A one-workgroup
+device check re-validates the layout on **every call (including every graph replay)** and anything else runs the
+existing code, so the fast path is inert rather than wrong on a pool/window/offset/multi-stream cache.
+`release.json` at **`v17-4f9dfa0e3-r302`** (tip `5510b8a3f`, tree `97bcb47a3`, optional trees re-cut:
+`a2c20d716` / `87b4979e0`, cumulative `35781eb6c`).  Record: [`archive/work/qsa-topk-regular/`](archive/work/qsa-topk-regular/README.md) (the
+contributor's material as submitted + this repo's re-measurement), knobs `ENVIRONMENT.md` §8, gate
+`scripts/gate-qsa-topk-regular.sh`, block note `patches/README.md`, gate row `MANIFESTS.md`.
+
+**The PR's claims, checked rather than taken.**  It applied unchanged (r298's `indexer-topk.cu` is byte-identical
+to r301's), and its "output identical" claim holds far beyond its own evidence: `INDEXER_TOPK` **12/12 on both
+arms** with 8 new cases covering the fast path's reachable state (partial visibility, a single visible block, a
+partial tail block, visibility across that tail, a QSA-trimmed range, `k == n_kv`, `k` above the visible count,
+`blk_idx == -1` blocks), and a deliberate gather probe fails exactly the 9 regular layouts -- so the path is
+really taken and the guard really declines.  Model text byte-identical to r301 in every arm (`1c5d32ac537d` dense
+4B 3-GPU; `b3de97c70c88` qwen4exp 1-GPU `-sm layer` at 24k; `5120581a3300` qwen4exp 3-GPU `-sm tensor` at 84k;
+`2cf39d00172c` qwen4exp + `draft-mtp n4`).  A temporary device printf showed **708/708** launches taking the fast
+path on the tested shape.
+
+**Magnitude: same direction, ~10 % smaller here, and neutral on the streamed shape.**  Interleaved on/off, same
+binary, `ROCBLAS_USE_HIPBLASLT=0` + `MOE_EXPERT_HEATMAP=load` on both arms: 3-GPU `-sm tensor` all-VRAM
+**+1.26 %** at ~24k (2509.5 -> 2541.1 t/s) and **+3.47 %** at ~96k (2432.8 -> 2517.3); 1-GPU `-sm layer -ncmoe 48`
+(streamed, host-expert bound) **+0.16 %** (494.10 -> 494.87).  They claimed +1.7-1.9 % at 31.5k and +3.8-3.9 % at
+101k on 2 GPUs and -2.5 % wall on a host-pool shape; their +9.3 % was against their own tree, which we do not
+run.  Decode unchanged; their `rocprofv3` trace (top-k 8.5 % -> 4.3 % of kernel time at 101k) is the mechanism.
+
+**Three things were added before it could be a block** (the maintainer's call: fold, do not hold up a good idea
+over a handful of missing lines):
+1. **`GGML_QSA_TOPK_REGULAR_LOG=1`** -- the fallback is SILENT by construction, so a later re-derivation that
+   breaks the layout would lose the whole win with every text gate green (`GGML_CUDA_QSA_SCORE_LOG`'s blind spot,
+   §r236).  The verdict is mirrored by the check kernel into **mapped pinned host memory**: a `cudaMemcpyAsync`
+   D2H and a stream sync are both illegal inside the graph capture this kernel is part of, so the host prints the
+   previous launch's verdict (a census, not a barrier).  0 cost when unset, 0 lines on the kill-switch arm.
+2. **Eight oracle cases** (above).  The shipped suite's only regular case was "everything visible, exact tail",
+   so the analytic `w(b)`'s edges were untested.
+3. **`scripts/gate-qsa-topk-regular.sh`** -- and the reason it is not a text gate: the two paths are
+   bit-identical by construction, so it asserts the ORACLE on both arms, the CENSUS, and a measured prefill DELTA
+   against the kill switch (`NGPU<3` FAILS the section rather than passing it vacuously).
+
+**The one trap that looked like a defect.**  A qwen4exp prefill-logit point recorded from the r301 build (default
+env) against a candidate run with `ROCBLAS_USE_HIPBLASLT=0` reads **0.019670 / 96.627 %** -- 4x the limit, the
+issue #113 signature.  The **pre-change** build reads the identical pair with the same mismatch, and with the pin
+on both arms r301 vs r302 is **0.000000 / 100.000 %**.  §44's rule at a new point: record the base with the pin.
+
+**Gates (all green, on the release tree).**  `INDEXER_TOPK` 12/12 both arms; `FLASH_ATTN_QSA` green;
+prefill-logit **0.000000 / 100.000 %** canonical, **0.000000 / 99.990 %** 3-device `-sm tensor`, **0.000000 /
+100.000 %** qwen4exp (base from the r301 build, pinned); `gate-qsa-topk-regular.sh` PASS (oracle + census +3
+engaged / 0 + delta **+2.22 %** at ~84k + dense arm inert + no faults); `gate-qwen4exp-quant-coherence.sh`
+(sparse QSA section: fused == chain `200edcd422c7`, dense `13406dc51399`, census 4/0/0; gather on == off
+`a99ccbd97ecb`); `llama-batched-bench -npl 1,4,8` flat (PP 4785/4822, 7498/7569, 8126/8112, 7726/7698, 7978/7985,
+8012/7997; TG within 1 %, both directions); `gate-per-block-build.sh --changed-from 52174079a` **2/2**;
+`validate-set.sh` **GREEN** (18 patches strict on a fresh tarball, tree `97bcb47a3`, per-artifact sha256, both
+optional artifacts and the cumulative optional tree re-cut and verified, Windows portability 512 files);
+`check-gpu-faults.sh` clean over every arm.  **Not run, with the reason:** the four-axis MTP protocol on the dense
+27B (the change is unreachable there -- no QSA indexer; the qwen4exp MTP arm was run instead and is
+byte-identical), `gate-hc-fusions` (no hc code touched), `gate-park-idle-slots` / `gate-state-pipe` /
+`gate-spec-*` / `gate-mixed-kv` (untouched paths, the last being an optional artifact).
+
+**Also recorded:** `INVARIANTS.md` r302 (5 facts: the hipBLASLt pin, "a device-validated fast path needs a delta
+assertion", the pinned-mirror census, why the graded kernels must not read host memory, and the box's period-2
+bimodality), and `TODO` gained nothing -- the PR's open items are the contributor's untested platforms, which is
+the documented acceptable state for a non-AMD backend.
+
 ## 261116.008 (r301, RELEASE v17-4f9dfa0e3-r301) -- the server's prompt admission becomes its own block (NEW official `0016`), gains the PREFILL/DECODE DUTY CYCLE default-on at 16, and retires `TODO` #338/#339/#340
 
 **New block `0016`** (17 official blocks; `n_blocks` 16 -> 17, `n_default` 18), cut from block 12, which is the

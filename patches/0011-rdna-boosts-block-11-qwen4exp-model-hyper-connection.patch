@@ -1,4 +1,4 @@
-From 435ebb77729a4da07f88422bce1c9c0323d5cded Mon Sep 17 00:00:00 2001
+From b9721e59d1a2ae54cedf2757256e322d4fc38cb7 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/17] rdna-boosts: block 11: qwen4exp (model,
@@ -136,7 +136,7 @@ r243 (contributor PR #289, bsp2020): the host PLE gather fans out over --threads
  ggml/src/ggml-cuda/hyperconn.cuh         |   77 +
  ggml/src/ggml-cuda/indexer-score.cu      |  774 +++++++
  ggml/src/ggml-cuda/indexer-score.cuh     |   24 +
- ggml/src/ggml-cuda/indexer-topk.cu       | 1011 +++++++++
+ ggml/src/ggml-cuda/indexer-topk.cu       | 1301 +++++++++++
  ggml/src/ggml-cuda/indexer-topk.cuh      |    7 +
  ggml/src/ggml-cuda/lightning-indexer.cu  |  196 +-
  ggml/src/ggml-cuda/norm.cu               |  113 +
@@ -163,10 +163,10 @@ r243 (contributor PR #289, bsp2020): the host PLE gather fans out over --threads
  src/models/models.h                      |   74 +-
  src/models/qwen4exp.cpp                  | 2506 ++++++++++++++++++----
  tests/CMakeLists.txt                     |    3 +
- tests/test-backend-ops.cpp               |  467 ++++
+ tests/test-backend-ops.cpp               |  491 +++++
  tests/test-lazy-reader.cpp               |  264 +++
  tests/test-llama-archs.cpp               |   33 +-
- 52 files changed, 12610 insertions(+), 506 deletions(-)
+ 52 files changed, 12924 insertions(+), 506 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
@@ -7035,10 +7035,10 @@ index 000000000..873068167
 +int  ggml_cuda_indexer_relu_sum_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
 new file mode 100644
-index 000000000..45a431566
+index 000000000..5b992b428
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/indexer-topk.cu
-@@ -0,0 +1,1011 @@
+@@ -0,0 +1,1301 @@
 +#include "indexer-topk.cuh"
 +#include "common.cuh"
 +
@@ -7456,6 +7456,236 @@ index 000000000..45a431566
 +    }
 +}
 +
++// ---------------------------------------------------------------------------
++// regular-layout fast path (GGML_QSA_TOPK_REGULAR=0 off).
++//
++// One stream whose cache is laid out in position order: every visible cell j holds position j
++// (cell_pos[j] == j) and sits in block j / r (cell_blk[j] == j / r), and the visible cells are a
++// prefix [0, n_used) of the cell range.  Then a query with position q sees exactly the cells
++// [0, min(q, n_used - 1)], block b's cells are [b*r, b*r + r), and every per-cell quantity of the
++// passes below follows from the block: its visible cells are the leading w(b) cells, the rest carry
++// the -inf key.  The fast path evaluates the same keys and the same counts per BLOCK instead of per
++// cell (no cell_blk / cell_pos reads, no wvis buffer), and writes the same cells in the same
++// ascending order, so histograms, selection and output are identical.  The check runs on the device
++// (one workgroup) so no host sync is needed and a reused graph re-checks every call.
++struct indexer_topk_reg {
++    int ok;
++    int n_used;
++};
++
++static __global__ void indexer_topk_regular_check(
++        const int * __restrict__ cell_blk, const int * __restrict__ cell_pos,
++        int n_cells, int r, indexer_topk_reg * __restrict__ reg,
++        indexer_topk_reg * __restrict__ census) {
++    constexpr int BS = 1024;
++    const int tid = threadIdx.x;
++    int bad = 0, maxvis = -1, mininv = INT_MAX;
++    for (int j = tid; j < n_cells; j += BS) {
++        const int cv = cell_pos[j];
++        if (cv >= 0) {
++            bad |= (cv != j) || (cell_blk[j] != j / r);
++            maxvis = max(maxvis, j);
++        } else {
++            mininv = min(mininv, j);
++        }
++    }
++    __shared__ int sb[BS / 32], smx[BS / 32], smn[BS / 32];
++    for (int off = 16; off > 0; off >>= 1) {
++        bad   |= __shfl_down(bad, off);
++        maxvis = max(maxvis, __shfl_down(maxvis, off));
++        mininv = min(mininv, __shfl_down(mininv, off));
++    }
++    if ((tid & 31) == 0) { sb[tid >> 5] = bad; smx[tid >> 5] = maxvis; smn[tid >> 5] = mininv; }
++    __syncthreads();
++    if (tid == 0) {
++        int b = 0, mx = -1, mn = INT_MAX;
++        for (int w = 0; w < BS / 32; ++w) { b |= sb[w]; mx = max(mx, smx[w]); mn = min(mn, smn[w]); }
++        reg->ok     = (!b && mx < mn) ? 1 : 0;
++        reg->n_used = mx + 1;
++        if (census != nullptr) {
++            census->ok     = reg->ok;
++            census->n_used = reg->n_used;
++        }
++    }
++}
++
++// visible cells of block b in the regular layout: the leading w of its n_in cells in [b*r, col1)
++static __device__ __forceinline__ void indexer_topk_reg_block(int b, int r, int col1, int qlim, int & n_in, int & w) {
++    const int c0 = b * r;
++    n_in = max(0, min(c0 + r, col1) - c0);
++    w    = max(0, min(qlim - c0 + 1, n_in));
++}
++
++static __device__ __forceinline__ int indexer_topk_reg_qlim(const indexer_topk_reg * reg, const indexer_topk_extra extra,
++        int t, int s, int n_tps) {
++    return min(extra.q_pos[t + s*n_tps], reg->n_used - 1);
++}
++
++// the regular-layout gather.  Each thread walks VEC whole blocks (VEC*r cells) of the range;
++// within a block the visible cells [b*r, b*r+w) carry the block key and the rest the -inf key, in
++// ascending cell order, so per-thread (greater, equal) counts, the same block scan and the same
++// base arithmetic place every cell exactly where the cell-level gather does.
++template<int VEC>
++static __device__ __forceinline__ void indexer_topk_write_regular(
++        const float * __restrict__ score,
++        const indexer_topk_extra extra,
++        const indexer_topk_radix_state * __restrict__ states,
++        const int * __restrict__ g_base, const int * __restrict__ e_base,
++        int * __restrict__ dst,
++        int ncols, int n_tps, int n_blocks, int k, int r,
++        int blocks_per_row, int chunk_in, const indexer_topk_reg * __restrict__ reg,
++        int row, int hb, int t, int s) {
++    constexpr int BLOCK_SIZE = 256;
++    const int tid   = threadIdx.x;
++    const int chunk = chunk_in > 0 ? chunk_in : (ncols + blocks_per_row - 1) / blocks_per_row;
++    const int col0  = hb * chunk;
++    const int col1  = min(col0 + chunk, ncols);
++    const int B0    = col0 / r;
++    const int B1    = (col1 + r - 1) / r;
++
++    int * row_dst = dst + (size_t) row*k;
++    const int g_base_b = g_base[row*blocks_per_row + hb];
++    const int e_base_b = e_base[row*blocks_per_row + hb];
++    const int rank = states[row].rank;
++    const uint32_t prefix  = states[row].prefix;
++    const uint32_t key_inf = indexer_topk_float_to_ordered(-INFINITY);
++    const int qlim = indexer_topk_reg_qlim(reg, extra, t, s, n_tps);
++    const int inf_g = key_inf >  prefix ? 1 : 0;
++    const int inf_e = key_inf == prefix ? 1 : 0;
++
++    __shared__ int carry_g, carry_e;
++    __shared__ int swg[BLOCK_SIZE / 32], swe[BLOCK_SIZE / 32];
++    if (tid == 0) { carry_g = 0; carry_e = 0; }
++    __syncthreads();
++    for (int tb = B0; tb < B1; tb += BLOCK_SIZE*VEC) {
++        const int running_g = carry_g;
++        const int running_e = carry_e;
++        const int b0 = tb + tid*VEC;
++        int lg = 0, le = 0;
++        int lgpre[VEC], lepre[VEC], wv[VEC], nv[VEC], kg[VEC], ke[VEC];
++        #pragma unroll
++        for (int v = 0; v < VEC; ++v) {
++            const int b = b0 + v;
++            int n_in = 0, w = 0, g = 0, e = 0;
++            if (b < B1) {
++                indexer_topk_reg_block(b, r, col1, qlim, n_in, w);
++                if (w > 0) {
++                    const uint32_t key = indexer_topk_block_key(score, extra, b, t, s, n_blocks, n_tps);
++                    g = key >  prefix ? 1 : 0;
++                    e = key == prefix ? 1 : 0;
++                }
++            }
++            wv[v] = w; nv[v] = n_in; kg[v] = g; ke[v] = e;
++            lgpre[v] = lg; lepre[v] = le;
++            lg += g*w + inf_g*(n_in - w);
++            le += e*w + inf_e*(n_in - w);
++        }
++        int wg = lg, we = le;
++#pragma unroll
++        for (int off = 1; off < 32; off <<= 1) {
++            const int vg = __shfl_up(wg, off);
++            const int ve = __shfl_up(we, off);
++            if ((tid & 31) >= off) { wg += vg; we += ve; }
++        }
++        if ((tid & 31) == 31) { swg[tid >> 5] = wg; swe[tid >> 5] = we; }
++        __syncthreads();
++        if (tid < BLOCK_SIZE / 32) {
++            int ag = 0, ae = 0;
++            for (int i = 0; i < tid; ++i) { ag += swg[i]; ae += swe[i]; }
++            swg[tid] = ag; swe[tid] = ae;
++        }
++        __syncthreads();
++        const int tex_g = wg + swg[tid >> 5] - lg;
++        const int tex_e = we + swe[tid >> 5] - le;
++        #pragma unroll
++        for (int v = 0; v < VEC; ++v) {
++            const int b = b0 + v;
++            if (b >= B1) {
++                continue;
++            }
++            int gp = g_base_b + running_g + tex_g + lgpre[v];
++            int ep = e_base_b + running_e + tex_e + lepre[v];
++            const int c0 = b * r;
++            for (int c = c0; c < c0 + nv[v]; ++c) {
++                const bool vis = c < c0 + wv[v];
++                const int  g   = vis ? kg[v] : inf_g;
++                const int  e   = vis ? ke[v] : inf_e;
++                if (g) {
++                    row_dst[gp++] = c;
++                } else if (e) {
++                    if (ep < rank) {
++                        row_dst[k - rank + ep] = c;
++                    }
++                    ep++;
++                }
++            }
++        }
++        __syncthreads();
++        if (tid == BLOCK_SIZE - 1) {
++            carry_g += wg + swg[tid >> 5];
++            carry_e += we + swe[tid >> 5];
++        }
++        __syncthreads();
++    }
++}
++
++// [QSA_TOPK_REGULAR_LOG] reachability census for the fast path above.  The layout verdict is a
++// DEVICE flag (the check kernel re-evaluates it on every call, including every replay of a captured
++// graph), and the fallback is SILENT: a cache that stops being laid out in position order takes the
++// cell-level path and every text gate stays green while the win is gone.  That is the same blind spot
++// GGML_CUDA_QSA_SCORE_LOG exists for on the fused indexer ops, so the census follows it: stderr (it
++// lands in every arm's log and can never perturb the generated text), first four launches, default
++// OFF.  The verdict is MIRRORED to mapped pinned host memory by the check kernel itself, so there is
++// no host sync and no device-to-host copy: a host read-back is not legal inside a graph capture, and
++// the check kernel is part of one.  The line therefore reports the verdict of the launch BEFORE it
++// (a census, not a barrier); after the first launch of a run the state is exact.
++static const int indexer_topk_reg_log_lv = []() {
++    const char * e = getenv("GGML_QSA_TOPK_REGULAR_LOG");
++    return e ? atoi(e) : 0;
++}();
++
++struct indexer_topk_reg_census {
++    indexer_topk_reg * host = nullptr;  // cudaFreeHost handle and the host-side view
++    indexer_topk_reg * dev  = nullptr;  // device-writable alias of `host` for the check kernel (nullptr = no census)
++
++    bool alloc() {
++        if (host != nullptr) {
++            return dev != nullptr;
++        }
++        void * h = nullptr;
++        if (cudaHostAlloc(&h, sizeof(indexer_topk_reg), cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) {
++            (void) cudaGetLastError();
++            return false;
++        }
++        host = (indexer_topk_reg *) h;
++        host->ok     = -1;
++        host->n_used = -1;
++        void * d = nullptr;
++        if (cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
++            (void) cudaGetLastError();
++            (void) cudaFreeHost(h);
++            host = nullptr;
++            return false;
++        }
++        dev = (indexer_topk_reg *) d;
++        return true;
++    }
++};
++
++static void indexer_topk_reg_log(const indexer_topk_reg * prev, int n_tps, int r, int n_blocks, int n_cells) {
++    if (indexer_topk_reg_log_lv < 1 || prev == nullptr) {
++        return;
++    }
++    static unsigned n_print = 0;
++    if (n_print++ >= 4) {
++        return;
++    }
++    const char * verdict = prev->n_used < 0 ? "pending" : (prev->ok ? "engaged" : "declined-layout");
++    fprintf(stderr, "indexer-topk regular: checked n_tps=%d r=%d n_blocks=%d n_cells=%d prev=%s prev_n_used=%d\n",
++            n_tps, r, n_blocks, n_cells, verdict, prev->n_used);
++    fflush(stderr);
++}
++
 +// block-key-sharing gather for the additive==null case.  each thread walks VEC contiguous cells
 +// and caches the block key; the block scan then runs over the per-thread totals (the cells stay in
 +// ascending column order across threads) so the placement is identical to indexer_topk_write_blocks.
@@ -7468,13 +7698,18 @@ index 000000000..45a431566
 +        const int * __restrict__ g_base, const int * __restrict__ e_base,
 +        int * __restrict__ dst,
 +        int ncols, int n_tps, int n_blocks, int n_kv, int k,
-+        int blocks_per_row, int chunk_in) {
++        int blocks_per_row, int chunk_in, const indexer_topk_reg * __restrict__ reg, int r) {
 +    constexpr int BLOCK_SIZE = 256;
 +    const int row = blockIdx.x / blocks_per_row;
 +    const int b   = blockIdx.x % blocks_per_row;
 +    const int tid = threadIdx.x;
 +    const int t = row % n_tps;
 +    const int s = row / n_tps;
++    if (reg != nullptr && reg->ok) {
++        indexer_topk_write_regular<VEC>(score, extra, states, g_base, e_base, dst, ncols, n_tps, n_blocks, k, r,
++                blocks_per_row, chunk_in, reg, row, b, t, s);
++        return;
++    }
 +
 +    const int chunk = chunk_in > 0 ? chunk_in : (ncols + blocks_per_row - 1) / blocks_per_row;
 +    const int col0  = b * chunk;
@@ -7594,7 +7829,7 @@ index 000000000..45a431566
 +        int * __restrict__ wvis,
 +        int ncols, int n_tps, int n_blocks, int n_kv,
 +        int blocks_per_row, int bchunk, int r,
-+        int shift) {
++        int shift, const indexer_topk_reg * __restrict__ reg) {
 +    constexpr int NBINS = 1 << RADIX_BITS;
 +    const int row = blockIdx.x / blocks_per_row;
 +    const int hb  = blockIdx.x % blocks_per_row;
@@ -7612,6 +7847,35 @@ index 000000000..45a431566
 +    const int q    = extra.q_pos != nullptr ? extra.q_pos[t + s*n_tps] : 0;
 +    const int nskv = s*n_kv;
 +    int * row_wvis = wvis + (size_t) row * n_blocks;
++
++    if (reg != nullptr && reg->ok) {
++        // regular layout - per block (see indexer_topk_regular_check); wvis is not written,
++        // the block passes derive w analytically the same way
++        const int qlim = indexer_topk_reg_qlim(reg, extra, t, s, n_tps);
++        const int col1 = min(hb * bchunk * r + bchunk * r, ncols);
++        const int B0   = hb * bchunk;
++        const int B1   = min(B0 + bchunk, (col1 + r - 1) / r);
++        const bool inf_match = (key_inf & state.prefix_mask) == state.prefix;
++        int inv = 0;
++        for (int b = B0 + tid; b < B1; b += BLOCK_SIZE) {
++            int n_in, w;
++            indexer_topk_reg_block(b, r, col1, qlim, n_in, w);
++            inv += n_in - w;
++            if (w > 0) {
++                const uint32_t key = indexer_topk_block_key(score, extra, b, t, s, n_blocks, n_tps);
++                if ((key & state.prefix_mask) == state.prefix) {
++                    atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], w);
++                }
++            }
++        }
++        if (inf_match && inv > 0) {
++            atomicAdd(&histogram[(key_inf >> shift) & (NBINS - 1)], inv);
++        }
++        __syncthreads();
++        const size_t off = ((size_t) row * blocks_per_row + hb) * NBINS;
++        block_histograms[off + tid] = histogram[tid];
++        return;
++    }
 +
 +    // every cell of a block shares the block key, and every invisible cell shares key_inf, so a
 +    // whole run bins into at most two bins.  accumulate per block (and one per-thread pending
@@ -7688,13 +7952,15 @@ index 000000000..45a431566
 +        int * __restrict__ block_histograms,
 +        int ncols, int n_tps, int n_blocks, int n_kv,
 +        int blocks_per_row, int bchunk, int r,
-+        int shift) {
++        int shift, const indexer_topk_reg * __restrict__ reg) {
 +    constexpr int NBINS = 1 << RADIX_BITS;
 +    const int row = blockIdx.x / blocks_per_row;
 +    const int hb  = blockIdx.x % blocks_per_row;
 +    const int tid = threadIdx.x;
 +    const int t = row % n_tps;
 +    const int s = row / n_tps;
++    const bool regular = reg != nullptr && reg->ok;
++    const int  qlim    = regular ? indexer_topk_reg_qlim(reg, extra, t, s, n_tps) : 0;
 +    __shared__ int histogram[NBINS];
 +    __shared__ int s_sumw;
 +    for (int i = tid; i < NBINS; i += BLOCK_SIZE) {
@@ -7717,7 +7983,13 @@ index 000000000..45a431566
 +        if (extra.blk_idx != nullptr && extra.blk_idx[b + nsblk] == -1) {
 +            continue;   // incomplete block: no cells
 +        }
-+        const int w = row_wvis[b];
++        int w;
++        if (regular) {
++            int n_in;
++            indexer_topk_reg_block(b, r, n_kv, qlim, n_in, w);   // = what pass1 would have put in wvis
++        } else {
++            w = row_wvis[b];
++        }
 +        mysum += w;
 +        if (w > 0) {
 +            const uint32_t key = indexer_topk_block_key(score, extra, b, t, s, n_blocks, n_tps);
@@ -7809,7 +8081,7 @@ index 000000000..45a431566
 +    if (grouped) {
 +        indexer_topk_write_blocks_grouped<4><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
 +                score, cell_blk, extra, states, g_base, e_base, dst,
-+                ncols, n_tps, n_blocks, n_kv, k, blocks_per_row, 0);
++                ncols, n_tps, n_blocks, n_kv, k, blocks_per_row, 0, nullptr, 0);
 +    } else {
 +        indexer_topk_write_blocks<kv_t><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
 +                score, cell_blk, additive, extra, states, g_base, e_base, dst,
@@ -7832,8 +8104,11 @@ index 000000000..45a431566
 +        const indexer_topk_radix_state * __restrict__ states,
 +        int * __restrict__ g_cnt, int * __restrict__ e_cnt,
 +        int ncols, int n_tps, int n_blocks, int n_kv,
-+        int blocks_per_row, int chunk) {
++        int blocks_per_row, int chunk, const indexer_topk_reg * __restrict__ reg) {
 +    constexpr int BLOCK_SIZE = 256;
++    if (reg != nullptr && reg->ok) {
++        return;   // block b's cells are [b*r, b*r+r), so the hist_accum counts already follow the gather ranges
++    }
 +    const int row = blockIdx.x / blocks_per_row;
 +    const int b   = blockIdx.x % blocks_per_row;
 +    const int tid = threadIdx.x;
@@ -7929,6 +8204,21 @@ index 000000000..45a431566
 +    int * g_base = gb_alloc.get();
 +    int * e_base = eb_alloc.get();
 +
++    // regular-layout fast path, one stream with derived visibility only (GGML_QSA_TOPK_REGULAR=0 off)
++    static const bool reg_on = []() { const char * e = getenv("GGML_QSA_TOPK_REGULAR"); return e == nullptr || atoi(e) != 0; }();
++    ggml_cuda_pool_alloc<indexer_topk_reg> reg_alloc(pool, 1);
++    const indexer_topk_reg * reg = nullptr;
++    const bool reg_checked = reg_on && nrows == n_tps && extra.cell_pos != nullptr &&
++            extra.q_pos != nullptr && r > 0;
++    if (reg_checked) {
++        static indexer_topk_reg_census census;
++        indexer_topk_reg * census_dev = (indexer_topk_reg_log_lv >= 1 && census.alloc()) ? census.dev : nullptr;
++        indexer_topk_reg_log(census_dev != nullptr ? census.host : nullptr, n_tps, r, n_blocks, n_cells);
++        indexer_topk_regular_check<<<1, 1024, 0, stream>>>(cell_blk, extra.cell_pos, n_cells, r,
++                reg_alloc.get(), census_dev);
++        reg = reg_alloc.get();
++    }
++
 +    indexer_topk_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
 +    (void) cudaMemsetAsync(wvis,  0, (size_t) nrows * n_blocks * sizeof(int), stream);
 +    (void) cudaMemsetAsync(g_cnt, 0, (size_t) nrows * blocks_per_row * sizeof(int), stream);
@@ -7939,12 +8229,12 @@ index 000000000..45a431566
 +            indexer_topk_histogram_pass1<BLOCK_SIZE, RADIX_BITS, 4>
 +                <<<row_grid, BLOCK_SIZE, 0, stream>>>(
 +                    score, cell_blk, extra, states, histograms, wvis,
-+                    n_cells, n_tps, n_blocks, n_cells, blocks_per_row, bchunk, r, shift);
++                    n_cells, n_tps, n_blocks, n_cells, blocks_per_row, bchunk, r, shift, reg);
 +        } else {
 +            indexer_topk_histogram_blocks<BLOCK_SIZE, RADIX_BITS>
 +                <<<row_grid, BLOCK_SIZE, 0, stream>>>(
 +                    score, extra, states, wvis, histograms,
-+                    n_cells, n_tps, n_blocks, n_cells, blocks_per_row, bchunk, r, shift);
++                    n_cells, n_tps, n_blocks, n_cells, blocks_per_row, bchunk, r, shift, reg);
 +        }
 +        indexer_topk_radix_select<BLOCK_SIZE, RADIX_BITS>
 +            <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
@@ -7959,12 +8249,12 @@ index 000000000..45a431566
 +    // the histogram-derived per-range counts follow block ranges; recount them over the gather's cell ranges
 +    indexer_topk_count_cells_grouped<4><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
 +            score, cell_blk, extra, states, g_cnt, e_cnt,
-+            n_cells, n_tps, n_blocks, n_cells, blocks_per_row, bchunk * r);
++            n_cells, n_tps, n_blocks, n_cells, blocks_per_row, bchunk * r, reg);
 +    indexer_topk_base_scan<<<nrows, BLOCK_SIZE, 0, stream>>>(
 +            g_cnt, e_cnt, g_base, e_base, nrows, blocks_per_row);
 +    indexer_topk_write_blocks_grouped<4><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
 +            score, cell_blk, extra, states, g_base, e_base, dst,
-+            n_cells, n_tps, n_blocks, n_cells, k, blocks_per_row, bchunk * r);
++            n_cells, n_tps, n_blocks, n_cells, k, blocks_per_row, bchunk * r, reg, r);
 +}
 +
 +void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -14160,7 +14450,7 @@ index aa3f72882..2098f2631 100644
      llama_build(test-fp8.cpp)
      set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index b2d2f5ad8..1c165cd41 100644
+index b2d2f5ad8..df778ba87 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -4158,6 +4158,131 @@ struct test_rms_norm_back : public test_case {
@@ -14295,7 +14585,7 @@ index b2d2f5ad8..1c165cd41 100644
  struct test_rms_norm_mul_add : public test_case {
      const ggml_type type;
      const std::array<int64_t, 4> ne;
-@@ -7842,6 +7967,133 @@ struct test_topk_qsa : public test_case {
+@@ -7842,6 +7967,140 @@ struct test_topk_qsa : public test_case {
      }
  };
  
@@ -14313,6 +14603,12 @@ index b2d2f5ad8..1c165cd41 100644
 +    const int     k;
 +    const int     offset;
 +    const bool    derived_bias;
++    // the regular-layout fast path (GGML_QSA_TOPK_REGULAR) evaluates the visibility from the block
++    // geometry, so its edge shapes are partial visibility (q below the last visible cell), a partial
++    // or trimmed cell range (n_kv not a multiple of r, or below n_blocks*r) and a k that exceeds the
++    // visible count.  -1 / 0 mean "the shipped form": q = n_kv, no -1 blk_idx.
++    int           q_override = -1;
++    int           neg_every = 0;
 +    ggml_tensor * out {};
 +    ggml_tensor * score_t {};
 +    ggml_tensor * cell_blk_t {};
@@ -14328,7 +14624,8 @@ index b2d2f5ad8..1c165cd41 100644
 +    }
 +
 +    std::string vars() override {
-+        return VARS_TO_STR7(n_blocks, n_kv, n_tps, n_stream, r, k, offset) + ",derived_bias=" + std::to_string(derived_bias);
++        return VARS_TO_STR7(n_blocks, n_kv, n_tps, n_stream, r, k, offset) + ",derived_bias=" + std::to_string(derived_bias)
++             + ",q=" + std::to_string(q_override) + ",neg=" + std::to_string(neg_every);
 +    }
 +
 +    // derived_bias = false is the plain-decode form: the score already carries the per-block bias
@@ -14388,13 +14685,13 @@ index b2d2f5ad8..1c165cd41 100644
 +                }
 +                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
 +            } else if (t == q_pos_t) {
-+                std::vector<int32_t> data(ggml_nelements(t), (int32_t) n_kv);
++                std::vector<int32_t> data(ggml_nelements(t), (int32_t) (q_override >= 0 ? q_override : n_kv));
 +                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
 +            } else if (t == blk_idx_t) {
 +                std::vector<int32_t> data(ggml_nelements(t));
 +                for (int64_t s = 0; s < n_stream; ++s) {
 +                    for (int64_t b = 0; b < n_blocks; ++b) {
-+                        data[b + s*n_blocks] = (int32_t) b;
++                        data[b + s*n_blocks] = (neg_every && b % neg_every == 0) ? -1 : (int32_t) b;
 +                    }
 +                }
 +                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
@@ -14429,7 +14726,7 @@ index b2d2f5ad8..1c165cd41 100644
  enum MoeGatingFunc {
      GATING_FUNC_SOFTMAX,
      GATING_FUNC_SIGMOID,
-@@ -9418,6 +9670,117 @@ struct test_flash_attn_ext_kv_rows : public test_case {
+@@ -9418,6 +9677,117 @@ struct test_flash_attn_ext_kv_rows : public test_case {
      }
  };
  
@@ -14547,7 +14844,7 @@ index b2d2f5ad8..1c165cd41 100644
  // GGML_OP_CROSS_ENTROPY_LOSS
  struct test_cross_entropy_loss : public test_case {
      const ggml_type type;
-@@ -10742,6 +11105,35 @@ static const ggml_type other_types[] = {
+@@ -10742,6 +11112,35 @@ static const ggml_type other_types[] = {
  // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
  static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      std::vector<std::unique_ptr<test_case>> test_cases;
@@ -14583,7 +14880,7 @@ index b2d2f5ad8..1c165cd41 100644
      std::default_random_engine rng(0);
  
      // unary ops
-@@ -10933,6 +11325,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10933,6 +11332,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      for (int n : {1, 3, 257}) {
          test_cases.emplace_back(new test_get_rows(GGML_TYPE_F8_E4M3, n, 5, 3, 1, 1, false));
      }
@@ -14595,7 +14892,7 @@ index b2d2f5ad8..1c165cd41 100644
      for (ggml_type type : all_types) {
          for (int b : {1, 7}) {
              for (bool v : {false, true}) {
-@@ -12935,6 +13332,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12935,6 +13339,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
      test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
  
@@ -14604,11 +14901,28 @@ index b2d2f5ad8..1c165cd41 100644
 +    test_cases.emplace_back(new test_indexer_topk_block(2048, 8192, 1, 1, 4, 512, 512));  // offset cells, one sequence
 +    test_cases.emplace_back(new test_indexer_topk_block(2048, 8192, 2, 2, 4, 512, 3));    // two streams (unified KV)
 +    test_cases.emplace_back(new test_indexer_topk_block(2048, 8192, 1, 1, 4, 512, 7, false)); // plain decode: null blk_idx/blk_tail
++    // (r302, PR #320) the regular-layout fast path: the cases above are the shapes a regular cache
++    // reaches, and only the first one is a regular layout (the rest decline).  These are the rest of
++    // the fast path's reachable state: partial visibility, a partial tail block, a trimmed cell range
++    // (QSA score bounds), a k at/above the visible count, and blocks the derived bias marks -1.
++    {   auto * tc = new test_indexer_topk_block(2048, 8192, 1, 1, 4, 512, 0);
++        tc->q_override = 8192/2 + 3;    test_cases.emplace_back(tc); }   // partial visibility
++    {   auto * tc = new test_indexer_topk_block(2048, 8192, 1, 1, 4, 512, 0);
++        tc->q_override = 10;            test_cases.emplace_back(tc); }   // a single visible block
++    {   auto * tc = new test_indexer_topk_block(2048, 8003, 1, 1, 4, 512, 0); test_cases.emplace_back(tc); } // partial tail block
++    {   auto * tc = new test_indexer_topk_block(2048, 8200, 1, 1, 4, 512, 0);
++        tc->q_override = 8199;          test_cases.emplace_back(tc); }   // visible across the tail
++    {   auto * tc = new test_indexer_topk_block(2048, 12000, 1, 1, 4, 512, 0); test_cases.emplace_back(tc); } // trimmed to n_blocks*r
++    {   auto * tc = new test_indexer_topk_block(2048, 8192, 1, 1, 4, 8192, 0); test_cases.emplace_back(tc); } // k == n_kv
++    {   auto * tc = new test_indexer_topk_block(2048, 8192, 1, 1, 4, 8192, 0);
++        tc->q_override = 1000;          test_cases.emplace_back(tc); }   // k above the visible count
++    {   auto * tc = new test_indexer_topk_block(2048, 8192, 1, 1, 4, 512, 0);
++        tc->neg_every = 8;              test_cases.emplace_back(tc); }   // derived bias -1 blocks
 +
      // exhaustive top_k tests
      //for (int i = 1; i < 9999; ++i) {
      //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
-@@ -13762,6 +14165,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13762,6 +14189,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_falcon(2));
  #endif
  
@@ -14643,7 +14957,7 @@ index b2d2f5ad8..1c165cd41 100644
      // lightning_indexer
      for (int kv : { 256 }) {
          for (int bs : { 1, 512 }) {
-@@ -13781,6 +14212,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13781,6 +14236,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -14661,7 +14975,7 @@ index b2d2f5ad8..1c165cd41 100644
      return test_cases;
  }
  #ifdef _MSC_VER
-@@ -13818,6 +14260,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -13818,6 +14284,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      // Qwen3.8-Flash-Next pooled indexer prefill.
      test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_F32));
      test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_Q4_0));
@@ -15032,5 +15346,5 @@ index 1f4c8a46b..9727dcc98 100644
                                  model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                              status_roundtrip = "\033[1;32mOK\033[0m";
 -- 
-2.56.0
+2.56.1
 
