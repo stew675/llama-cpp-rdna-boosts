@@ -471,3 +471,41 @@
    `GREEDY-PURITY.md` §89's mechanism (residency selects the MoE kernel set) rather than the change under test,
    and this GGUF ships no `.moe-heatmap` for `MOE_EXPERT_HEATMAP=load`, so a text assertion on that shape needs
    a fully resident arena, repeats with a stated spread, or `scripts/gate-prefill-logits.sh` instead.
+
+## r307 (2026-11-17, `WORKLOG.md` 261117.006)
+
+1. **A take-over promise is evidence about ONE pass, not about a buffer address.** `input_cpy` is recycled by the
+   scheduler across graphs and across the decode and prefill layouts, and a promise is not always consumed: a
+   **captured** decode graph replays its launches without dispatching, so `moe_cache_get_table` never runs and
+   `t.taken_cpy` is never cleared, and a pass that stages the copy through the gather/stage paths does not
+   re-promise. So an address that still matches at a later pass says nothing about whether *that* pass skipped a
+   copy, and reconstructing "the copy was skipped" from it is how 138 whole-table refills (206-450 MiB each,
+   ~27.8 GiB, ~10.4 s) landed on every 30-34 token prompt (issue #327). The lifetime is now enforced where a pass
+   ends (`moe_cache_pass_end`, at the end of every `graph_compute`), not at the promise sites: a promise that
+   outlives its pass is *unreachable*, so a new promise site cannot reintroduce the hole.
+2. **Which passes reach the repair at all is decided by the ARENA's residency, not by the prompt's width.** An
+   identity (fully resident) table takes the take-over path, whose consumer serves it, so a short prompt on a
+   fitting arena never touches the repair; the regression needed a **partial** arena (295 of 512 slots/table on
+   the issue's shape), where `pf_in_place_locked` declines and the width guard refuses the table. A gate for this
+   class therefore has to assert `stale > 0` (the promise path really ran) as well as `broken == 0`, or a fitting
+   configuration passes it vacuously.
+3. **A captured graph's non-dispatch is the general source of un-consumed promises, and it is benign.** On the
+   issue's shape 6486 promises were dropped at their pass end over 92 decode steps (~70 per step): the decode
+   graph replays its baked redirect and never asks the cache anything, so no repair is owed. Do not read `stale`
+   as a defect count.
+4. **r305 (issue #323) made this reachable, and that is not a reason to revert it.** Before it, a 17..31-token
+   ubatch ran its routed MoE on the **CPU** and the GPU cache's hooks were never reached at that width; the fix
+   is worth 31x on the prompt (`INVARIANTS.md` r305 item 1), so the second-order cost had to be paid off in the
+   promise's bookkeeping rather than by moving the op back. A width-independent rule must be re-checked against
+   every path it newly makes reachable.
+5. **A block may not name a symbol a LATER block defines.** r305's `#323` relaxation added
+   `ggml_backend_buft_is_cuda_host_expert()` to block 09 and identified the pageable master by comparing against
+   `ggml_backend_cuda_host_map_buffer_type_name` — a function **block 12** defines (it is the block that adds the
+   `ROCm_HostMap` buffer type). The tip builds, so nothing caught it: the per-block ladder is run with
+   `--changed-from <previous tip>`, and block 09's own delta is unchanged since the release that introduced it, so
+   blocks **09, 10 and 11 were never rebuilt** and had been uncompilable since r305. The predicate is now the
+   pinned tier's identity in block 09 and the pageable tier's arm in block 12, which is where the buffer type lives.
+   Two lessons for the ladder: a `--changed-from` run is a *delta* gate and says nothing about the trees whose own
+   delta did not move (run the full ladder after amending an early block, or after touching a block that defines a
+   symbol another block uses), and a symbol one block introduces for a later block's feature is the shape to grep
+   for when a mid-chain tree fails to build.

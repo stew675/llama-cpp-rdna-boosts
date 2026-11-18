@@ -174,7 +174,12 @@ in CI.  The model-level gates are manual:
    the model's own prefill shape) is the second, deterministic leg of a family-switch judgement.
 5. **Per-block build** — `scripts/gate-per-block-build.sh` on a clean `all` build per commit (bisection and
    review walk the blocks individually, so every block must build on its own).  Use `--changed-from` to
-   rebuild only the blocks a release changed.  **Run it against the long-lived checkout** (its default
+   rebuild only the blocks a release changed -- but understand what that buys: it is a **delta** gate, so a block
+   whose own patch-id did not move is not rebuilt even when its TREE moved (an amendment to an earlier block), and
+   a symbol one block introduces for a LATER block's feature makes every tree between them uncompilable while the
+   tip still builds.  That is exactly how blocks 09-11 stayed broken from r305 to r307 (`INVARIANTS.md` r307 fact
+   5), so **run the whole ladder after amending an early block** (measured r307: `--fast`, 18/18, ~12 min once the
+   cache is warm).  **Run it against the long-lived checkout** (its default
    `--repo`, or `scripts/scratch-tree.sh gate`): ccache keys on the source path, so a per-arm worktree makes
    the first block a full cold build (measured: 5m56s / 85 CPU-min at a new path vs 8.6s for the same
    content at the established one).  The gate prints each commit's build time and the run's total; a first
@@ -680,7 +685,10 @@ in CI.  The model-level gates are manual:
    * the **promise repair** — `MOE_EXPERT_TAKEOVER_FAULT=1` on the same model at `-c 8192` on
      `prompts/kld-corpus-35b-in-domain.txt`: the exit census must read `take-over promises broken=<n> repaired=<n>`
      with `n > 0` **and** `repaired == broken`, and its greedy text must be byte-identical to both no-fault arms
-     (r298: `595 chars sha=c0e7e91d84c4`) — a repair that is skipped, or that changes the text, is the failure;
+     (r298: `595 chars sha=c0e7e91d84c4`) — a repair that is skipped, or that changes the text, is the failure.
+     **Since r307 this arm is `scripts/gate-moe-promise.sh`'s `fault` arm (gate 34), which runs it as a control
+     next to the arm that keeps a STALE promise from being repaired — a promise is valid for one staging pass
+     only, and that half of the contract is the issue-#327 regression, not this one;**
    * **`gate-prefill-logits.sh --ab "MOE_EXPERT_PREFILL_IN_PLACE=0"`** on a host-expert arm of the same model
      (`--ctx 2048 --chunks 7` on `prompts/kld-corpus-35b-in-domain.txt`, 2 devices `-sm layer`, `-ncmoe 48`):
      mean KLD **0.000000** / same-top-p **100.000 %**.  This is the measurement that says the in-place read is a
@@ -954,3 +962,25 @@ fails to apply:
 Dated validation records, the retired block-structure churn and the pre-V2.0 per-block verification table:
 [`archive/docs/validation-history.md`](archive/docs/validation-history.md).  Baseline/re-base records:
 [`archive/docs/baseline-history.md`](archive/docs/baseline-history.md).
+34. **A take-over promise lives for ONE staging pass** (r307, block 10, GitHub issue #327) --
+    `scripts/gate-moe-promise.sh`.  A promise ("I skip filling `input_cpy`, the consumer reads the arena") was
+    identified by the buffer ADDRESS, and the scheduler recycles it: a captured decode graph replays its launches
+    without dispatching, so the consumer never runs and the promise is never cleared, and a later wide pass whose
+    `pf_in_place_locked` declines then matched that address and re-read every routed table from the host master
+    (138 x 206-450 MiB, ~10.4 s, on every 30-34 token prompt).  Pass scoping is now enforced at the END of every
+    `graph_compute` (`moe_cache_pass_end`), not at the promise sites.  HARD (`seq` arm, the issue's shape:
+    Flash-Next GSQ-RCO IQ3_XXS, one GPU, `-ncmoe 47 --host-experts pool -b/-ub 2048`, one slot, requests in order
+    so the short ones follow a decode pass): **no** `moe_cache_repair_copy` line in the whole run; the exit census
+    reads `take-over promises broken=0 repaired=0`; and `stale > 0` -- the non-vacuity check, because a pass only
+    reaches the repair when the arena is PARTIAL (295 of 512 slots/table on the issue's shape) and an identity
+    arena takes the take-over path and serves.  HARD: the short requests really prefill in the 17..64-token band
+    (`prompt_n`, not cached) and the repeated request's text is byte-identical.  HARD (`fault` arm, the repair
+    itself): `MOE_EXPERT_TAKEOVER_FAULT=1` on an IDENTITY arena (2 devices `-sm layer -ncmoe 48 -c 8192`,
+    `prompts/kld-corpus-35b-in-domain.txt`) must still read `broken = n > 0`, `repaired == broken` and `stale == 0`,
+    with the no-fault arm's text byte-identical (r298: `595 chars sha=c0e7e91d84c4`) -- the pair that proves the
+    pass scoping removed vacuous repairs rather than the repair.  Measured r307: `seq` 0 repairs / `stale=8178` and
+    the short prompts 2176 -> 252 ms and 2070 -> 167 ms; `fault` `285/285/0`.  **Negative-tested on the r306
+    build**: 3 checks fail (138 repairs, `broken=138 repaired=138`, `stale=0`) while the `fault` arm still passes.
+    Required for any change to `taken_cpy`/`moe_cache_pass_end`/`moe_cache_repair_copy`, to a promise site
+    (`moe_cache_take_over`, `moe_cache_update_host`'s prefill and eager branches, `moe_cache_remap_dev`), or to
+    when the CUDA backend ends a staging pass; every release that touches block 10.

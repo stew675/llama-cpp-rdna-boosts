@@ -19,8 +19,8 @@ assumes its predecessors), so the set is applied whole.  **Block `0300` is tempo
 and treat it as a stop-gap, not a feature.  Two further blocks are **optional** and are NOT in the
 default set: `0100` (two-lane prefill) and `0101` (mixed K/V cache types), applied only with
 `--include-optional` (see [`optional/README.md`](optional/README.md)).  The release `v<N>-...` prefix is
-the **official** block count (`N` = 16); `0300` and the optional blocks are not counted.  The current
-release is **`v16-4f9dfa0e3-r295`** (read `.release` in `release.json` -- it is the source of truth, not this
+the **official** block count (`N` = 17); `0300` and the optional blocks are not counted.  The current
+release is **`v17-4f9dfa0e3-r307`** (read `.release` in `release.json` -- it is the source of truth, not this
 line): the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
@@ -186,6 +186,15 @@ arm, +63-67 % prefill from streaming only what is not resident — with the logi
 is **inert on a discrete GPU, measured** (zero census lines with its envs forced on; `gate-host-pool.sh` 42/42).
 `ENVIRONMENT.md` §20 is the knob list, `patches/README.md` → Block 15 the detail, and
 `archive/work/apu-expert-gtt/` the campaign record.
+
+**r307 fixed issue #327 — the host-expert cache's take-over promise was scoped by buffer address, not by pass.**
+On a host-resident MoE (`-ncmoe`) a short prompt (about 17-64 tokens) could re-read **every** routed expert table
+from the host master on every pass: the scheduler recycles the copy buffer the promise names, and a promise left
+over from a decode pass (whose captured graph never asks the cache anything) matched a later pass' address, so the
+repair re-filled 138 tables x 206-450 MiB — about 10 s of prefill on the reporter's box — while producing the same
+text.  A promise now lives for exactly one staging pass.  Nothing to configure; the exit census prints
+`take-over promises broken=<n> repaired=<n> stale=<n>` and `stale` is the count of promises that died with their
+pass (normal on a captured decode).  Gate: `scripts/gate-moe-promise.sh`; `WORKLOG.md` 261117.006.
 
 **r301 added block 16 — the server's prompt admission policy; r306 made its per-step cap a CONTENDED bound and a
 first-class option.**  `update_slots()` assembles one batch per step and it cannot be joined mid-flight, so the

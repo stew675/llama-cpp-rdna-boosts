@@ -1,3 +1,89 @@
+## 261117.006 (r307, RELEASE v17-4f9dfa0e3-r307) -- issue #327: the MoE take-over PROMISE is scoped to its staging pass, so a recycled `input_cpy` address stops re-reading every routed expert table on a 30-34 token prompt
+
+**What shipped.**  Block **10** for the fix, in three files (`ggml/src/ggml-cuda/moe-expert-cache.cu`,
+`ggml/src/ggml-cuda/moe-expert-cache.h`, `ggml/src/ggml-cuda/ggml-cuda.cu`), plus a block 09/block 12 split of the
+#323 predicate for the per-block build defect found on the way (below); `release.json` at
+**`v17-4f9dfa0e3-r307`** (tip `c7de0704c`, tree `f91aa8120`; optional re-cut `7cafcacf5` / `38edbd0eb`, cumulative
+`db5d26d45`).  Block count unchanged (17 official + `0300`).  Records: `patches/README.md` block 10 and the r307
+headline, `MANIFESTS.md` gate 28 + the new gate **34**, `scripts/gate-moe-promise.sh` (new, the gate),
+`scripts/README.md`, `AGENTS.md`'s gate table, `INVARIANTS.md` r307.
+
+**The defect (issue #327, `DanoPTT`).**  A take-over hook tells the scheduler "do not fill this `input_cpy`, the
+consumer will read the table out of the arena", and the promise was recorded as a bare **address**
+(`t.taken_cpy`, `TODO` #335/#336).  The scheduler recycles `input_cpy` across graphs and across the decode and
+prefill layouts, and a promise is not always consumed: a **captured** decode graph replays its launches without
+dispatching, so `moe_cache_get_table` never runs and the promise is never cleared, and a pass that stages the
+copy through the gather/stage paths does not re-promise.  A later **wide** pass whose `pf_in_place_locked`
+declines (a partial, non-identity arena) then matches that recycled address, `moe_cache_get_table` refuses the
+table on its width guard, and `moe_cache_repair_copy` re-fills the WHOLE table from the host master -- 512
+experts, 206-450 MiB per table.  The reporter measured **138** `moe_cache_repair_copy` warnings per short prompt
+(46 layers x 3 roles), i.e. every routed table on every pass: ~27.8 GiB of H2D in ~10.5 s, which was the entire
+extra prefill time (4.8 s -> 12.6 s on their box), with bit-identical output.  It is the second-order cost of
+r305 (`#323`): before that change a 17..31-token ubatch ran its routed MoE on the **CPU**, so the GPU cache's
+hooks were never reached at that width at all.
+
+**The rule.**  A promise is valid for **one staging pass**.  The scheduler stages a split's inputs and then
+computes that split, so a promise and the op that honours it are always inside one `graph_compute` call, while
+the next call's staging -- or a captured replay that never dispatches -- is a different one.  The CUDA backend
+therefore calls `moe_cache_pass_end(device)` at the END of every `graph_compute` (a scope guard, so every return
+path), which **clears** every outstanding promise for that device and counts them as `stale` in the exit census.
+`broken`/`repaired` keep their exact meaning (a promise broken INSIDE its own pass by a mid-graph eviction) and
+the promises dropped at a pass end are no longer reachable by a later pass.  The lifetime is enforced in ONE
+place rather than at each of the four promise sites, so a new site cannot forget it and a pass that stages
+without promising cannot inherit an old one; the repair keeps its original text and its diagnostic
+(`MOE_EXPERT_TAKEOVER_FAULT=1`) unchanged.
+
+**Measured** (one R9700, gfx1201, ROCm 10.1, the reporter's shape: Flash-Next GSQ-RCO IQ3_XXS shard 1, 1 GPU,
+`-ncmoe 47 --host-experts pool -c 65536 -np 1 -b/-ub 2048 --cache-ram 0`, `MOE_HOST_POOL_RAM_PCT=75`,
+`GGML_CUDA_SLAB_HEADROOM_MIB=1536`, `ROCBLAS_USE_HIPBLASLT=0`, `MOE_EXPERT_HEATMAP=load`, one slot, requests in
+order so the short ones follow a decode pass):
+
+| arm | repairs | census | 30-token prefill | 34-token prefill (2nd) | text |
+|---|---|---|---|---|---|
+| r306 (`a93c90ffc`) | 276 (138 x 2) | `broken=276 repaired=276` | 2176 ms | 2070 ms | `fcc7ba375eed` / `1b04cb018e77` / `a8118c321012` / `f6194337e4fb` |
+| r307 | **0** | `broken=0 repaired=0 stale=6486` | **252 ms** (8.6x) | **167 ms** (12.4x) | **byte-identical in all six requests** |
+
+* The partial arena is the precondition (295 of 512 slots/table here): an identity table takes the take-over
+  path and never reaches the repair, which is why the gate asserts `stale > 0` as its non-vacuity check.
+* Text is unchanged, as the reporter's own A/B said it would be: the repair re-read the same bytes the
+  scheduler had already written.
+* The **genuine** repair still works -- `MOE_EXPERT_TAKEOVER_FAULT=1` on an identity arena (2 devices
+  `-sm layer -ncmoe 48 -c 8192`, the MANIFESTS gate 28 recipe) reads `broken=285 repaired=285 stale=0` and its
+  greedy text is `595 chars sha=c0e7e91d84c4`, the r298 record's value, on the no-fault arm too.
+
+**Gate.**  `scripts/gate-moe-promise.sh` (new; MANIFESTS gate **32**), two arms / eight checks: the `seq` arm is
+the issue's shape and asserts **no** `moe_cache_repair_copy` line, `broken=0 repaired=0`, `stale>0`, both short
+requests really prefilling in the 17..64-token band, and the repeated request byte-identical; the `fault` arm is
+the control above.  **Negative-tested on the r306 build**: the same command fails 3 checks (138 repairs,
+`broken=138 repaired=138`, `stale=0`) while the `fault` arm still passes, so the gate fails for exactly the
+reason it exists.
+
+**A delivery defect found on the way (and fixed in the same release).**  The per-block ladder failed on block 10
+with `use of undeclared identifier 'ggml_backend_cuda_host_map_buffer_type_name'` -- and that was not this change:
+r305's `#323` relaxation added `ggml_backend_buft_is_cuda_host_expert()` to **block 09** and identified the pageable
+master by comparing against a name function **block 12** defines, so blocks **09, 10 and 11 had been uncompilable
+since r305**.  The tip always built, and the ladder is run with `--changed-from <previous tip>`, so block 09's own
+delta never moved and its tree was never rebuilt: a *delta* gate cannot see a tree whose delta did not change.
+The predicate is now the pinned tier's identity in block 09 and the pageable tier's arm in block 12 (where that
+buffer type lives), and the ladder was re-run over the **whole chain** (`--fast`, 18/18) rather than by delta.
+`INVARIANTS.md` r307 fact 5.
+
+**Gates (all green, on the release tree).**  `validate-set.sh` **GREEN** (18 patches strict on a fresh tarball,
+both optional artifacts re-cut and verified, Windows portability 512 files); `gate-per-block-build.sh --fast`
+**18/18** over the whole chain (see above); `gate-host-pool.sh` **PASS** (all 13 arms, text
+`182 chars sha=a99ccbd97ecb`, `pinlate` KLD **0.000000 / 100.000 %**); `gate-moe-promise.sh` **PASS** (8/8, and
+**3 checks fail on the r306 build**); `gate-prefill-logits.sh` **mean KLD 0.000000 / same-top-p 100.000 %**; the
+coherence gate reads `572 chars sha=9ec2b0fc2de4` on **both** the r306 and r307 builds; `fork-refresh.sh --build
+--gates` green with the applied tip == `release.json.tip`.
+
+**Two things recorded rather than fixed.**  (i) The repair still fills the WHOLE table (all `n_experts`) where
+the scheduler's own upload is usually the pruned used-expert set; that is correct (it is the same bytes the
+skipped copy would have carried) and it is now only reached when a pass genuinely skips the copy and then loses
+the arena, so it is left alone -- shrinking it would need the routing on the host, which is the readback the
+take-over exists to avoid.  (ii) `stale` is a large number on any host-expert run (6486 here for 92 decode
+steps): it counts the promises a captured decode graph never consumes, which is normal and is what the pass
+scoping makes harmless.
+
 ## 261117.005 (r306, RELEASE v17-4f9dfa0e3-r306) -- block 16: the prompt-admission cap becomes a CONTENDED bound and a first-class option (`-ib`), so an uncontended prefill stops paying for a decoder that is not there
 
 **What shipped.**  Block **16** only, in three files (`tools/server/server-context.cpp`, `common/common.h`,

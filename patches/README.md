@@ -1,5 +1,30 @@
 # The delivery patches — what each block is and what it does
 
+> **r307: the MoE take-over PROMISE is scoped to its staging pass (GitHub issue #327, `DanoPTT`), an amendment to block 10.**
+> A take-over hook tells the scheduler "do not fill this `input_cpy`, the consumer reads the table out of the arena",
+> and the promise was recorded as a bare **address**.  The scheduler recycles those addresses across graphs and across
+> the decode and prefill layouts, and a promise is not always consumed — a **captured** decode graph replays its
+> launches without dispatching, so `moe_cache_get_table` never runs and the promise is never cleared — so a later
+> **wide** pass whose `pf_in_place_locked` declined matched a recycled address, the width guard refused the table, and
+> `moe_cache_repair_copy` re-filled the WHOLE table from the host master: **138** tables (46 layers x 3 roles,
+> 206-450 MiB each, ~27.8 GiB) on every 30-34 token prompt, i.e. ~10.5 s of the reporter's 12.6 s prefill, with
+> bit-identical output.  It is the second-order cost of r305 (`#323`), which stopped running a 17..31-token ubatch's
+> routed MoE on the **CPU** and so made the GPU cache's hooks reachable at that width.  A promise is now valid for
+> **one staging pass**: the CUDA backend clears every outstanding promise at the END of each `graph_compute`
+> (`moe_cache_pass_end`, a scope guard), which is ONE place rather than a rule each promise site has to remember, and
+> the promises dropped that way are reported as `stale=` next to `broken=`/`repaired=`.  **Measured** (one R9700, the
+> reporter's shape: Flash-Next IQ3_XXS, `-ncmoe 47 --host-experts pool -b/-ub 2048`, partial arena): repairs
+> **276 -> 0** over the sequence, census `broken=276 repaired=276` -> `broken=0 repaired=0 stale=6486`, the 30-token
+> prompt's prefill **2176 -> 252 ms** (8.6x) and the 34-token one **2070 -> 167 ms** (12.4x), text byte-identical in
+> all six requests; the genuine repair is untouched — `MOE_EXPERT_TAKEOVER_FAULT=1` still reads
+> `broken=285 repaired=285 stale=0` with the r298 text `595 chars sha=c0e7e91d84c4`.  New gate
+> `scripts/gate-moe-promise.sh` (MANIFESTS gate **34**), negative-tested on the r306 build (3 checks fail).
+> The same release repaired a **delivery** defect the ladder surfaced: r305's `#323` predicate in block 09 named
+> `ggml_backend_cuda_host_map_buffer_type_name`, which **block 12** defines, so blocks 09-11 had been uncompilable
+> since r305 (`--changed-from` never rebuilt them).  The predicate is now the pinned tier in block 09 and the
+> pageable tier's arm in block 12, and the ladder is run over the whole chain.  Record: `WORKLOG.md` 261117.006,
+> `INVARIANTS.md` r307.
+
 > **r306: block 16's per-step prompt-admission cap becomes a CONTENDED bound and a first-class option, `-ib` / `--interactive-batch-size`.**
 > The cap exists to bound a **decoding** slot's inter-token latency and a newcomer's wait for admission; r300/r301
 > applied it to **every** step, including one that carries no decode work, where it bounds nothing and a chunk
@@ -2297,6 +2322,21 @@ next item) and the census to expect is `direct` ~= 0 with `properties_changed` i
 ---
 
 ## Block 10 — the slab, the fusion dispatcher, the async input ring (infrastructure)
+
+> **r307 amendment (GitHub issue #327): the take-over promise is scoped to its staging pass.**  Block 10 owns the
+> promise's *consumption* (`moe_cache_repair_copy`) and its `broken`/`repaired` census, so the lifetime lives here
+> too: `int64_t moe_cache_pass_end(int device)` (declared in `moe-expert-cache.h`, defined outside the anonymous
+> namespace) **clears** every promise a table holds on that device and counts it as `stale`, and
+> `ggml_backend_cuda_graph_compute` calls it from a scope guard so every return path does it.  The scheduler stages a
+> split's inputs and then computes that split, so a promise and the op that honours it are always inside ONE
+> `graph_compute`; the next call's staging — or a captured replay, which never dispatches and so never consumes its
+> promise — is a different pass, and a promise left over from it can no longer match a recycled `input_cpy` address.
+> Four promise sites exist (identity take-over, the prefill in-place branch, the eager host-routing branch, the
+> device remap) and the enforcement is deliberately NOT at any of them: a fifth site cannot forget it, and a pass that
+> stages the copy through the gather/stage paths without promising cannot inherit an old one.  The repair's premise
+> ("this pass skipped the copy") is therefore exact, `broken == repaired` keeps its meaning, and the arms that
+> exercise it (`MOE_EXPERT_TAKEOVER_FAULT=1`, and `gate-moe-promise.sh`'s `seq` arm for the stale side) are in
+> MANIFESTS gate 34.  Measured and recorded in `WORKLOG.md` 261117.006 / `INVARIANTS.md` r307.
 
 > **r285 amendment (`TODO` #326 closed): the segmented async arm names BOTH callers that satisfy its contract.**
 > The Meta `set_tensor_async` comment required "(a) `offset` on a row boundary and (b) a caller whose source

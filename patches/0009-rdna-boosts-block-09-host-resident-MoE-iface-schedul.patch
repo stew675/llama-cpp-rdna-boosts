@@ -1,4 +1,4 @@
-From 126ff3116ea6dbfd453e5188a909f91a1330a07d Mon Sep 17 00:00:00 2001
+From 7095355fe7b6dc5962ec57a4d3111cf8afe8dd92 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/17] rdna-boosts: block 09: host-resident MoE (iface,
@@ -79,7 +79,7 @@ text/acceptance byte-identical everywhere.
  ggml/src/ggml-cuda/cpy-batch.cu               |  109 +
  ggml/src/ggml-cuda/cpy-batch.cuh              |    9 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   87 +
- ggml/src/ggml-cuda/ggml-cuda.cu               | 2801 ++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 2803 ++++++-
  ggml/src/ggml-cuda/graph.cuh                  |    4 +
  ggml/src/ggml-cuda/mmvq.cu                    |  276 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
@@ -122,7 +122,7 @@ text/acceptance byte-identical everywhere.
  tests/test-backend-tensor.cpp                 |    3 +
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 70 files changed, 18209 insertions(+), 540 deletions(-)
+ 70 files changed, 18211 insertions(+), 540 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -7438,7 +7438,7 @@ index 000000000..8005b57b4
 +void   ggml_cuda_slab_set_ring_region(size_t bytes);
 +void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index cfc0394ac..5db751515 100644
+index cfc0394ac..9d56c1f80 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -35,6 +35,7 @@
@@ -10395,19 +10395,21 @@ index cfc0394ac..5db751515 100644
  }
  
  // TODO: move these functions here
-@@ -8493,9 +10771,69 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -8493,9 +10771,71 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
      }
  }
  
 +// Issue #323: is this a HOST-EXPERT master buffer type -- the delivery's own tier for a `-ncmoe`/`-cmoe`
-+// expert bank?  `ROCm_Host` is the pinned whole-tensor master, `ROCm_HostMap` the pageable model mapping
-+// behind the pool.  Neither is a "cuda" buffer type for `ggml_backend_buft_is_cuda()` (that is a
++// expert bank?  Neither is a "cuda" buffer type for `ggml_backend_buft_is_cuda()` (that is a
 +// function-pointer identity on the DEVICE name), so under `-sm layer` / `-sm none` such a weight is not
 +// owned by any GPU backend and its routed op reaches `offload_op` with the generic threshold as the only
 +// gate -- which is what sent 17..31-token ubatches to the CPU (see the rule below).
++//
++// r307: this is the PINNED master (`ROCm_Host`).  The pageable `ROCm_HostMap` mapping is the other half of the
++// tier, and it is added by block 12, which defines that buffer type -- naming it here would leave blocks 09-11
++// uncompilable (`INVARIANTS.md` r307 fact 5).
 +static bool ggml_backend_buft_is_cuda_host_expert(ggml_backend_buffer_type_t buft) {
-+    return buft != nullptr && (ggml_backend_buft_is_cuda_host(buft) ||
-+        buft->iface.get_name == ggml_backend_cuda_host_map_buffer_type_name);
++    return buft != nullptr && ggml_backend_buft_is_cuda_host(buft);
 +}
 +
 +// Issue #323: the host-expert offload relaxation, default ON.  `GGML_MOE_HOST_OFFLOAD=0` restores the
@@ -10465,7 +10467,7 @@ index cfc0394ac..5db751515 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -8530,6 +10868,155 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -8530,6 +10870,155 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -10621,7 +10623,7 @@ index cfc0394ac..5db751515 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -8546,6 +11033,31 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -8546,6 +11035,31 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -10653,7 +10655,7 @@ index cfc0394ac..5db751515 100644
  };
  
  // backend reg
-@@ -8744,6 +11256,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8744,6 +11258,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  

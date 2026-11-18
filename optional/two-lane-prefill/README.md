@@ -1,7 +1,7 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r306`** (against the r306
-default delivery tree `f12b1a0c8ee6c24b77467f93550322e74762aef0` = official blocks `0000`-`0016` plus the
+**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r307`** (against the r307
+default delivery tree `f91aa81202fd32d060f9afb0f9c54824116758b9` = official blocks `0000`-`0016` plus the
 temporary `0300`; the r288 re-cut is at the bottom of the list, against the r288 default delivery tree
 `79d18f41b9ab9b235d35fd3a5034858eddd94844` = official blocks `0000`-`0015` plus the
 temporary `0300`; the r259, r254, r247, r246, r243, r241 and r229 cuts and their measurements are kept below
@@ -21,7 +21,14 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `00abb040e7debc4b6499f5262936c392019c93b2414d360cdb66fda7526eacb0` (the r306 cut; the earlier cuts are recorded below)
+  `00abb040e7debc4b6499f5262936c392019c93b2414d360cdb66fda7526eacb0` (the r307 cut -- byte-identical to the r306
+  one; the earlier cuts are recorded below)
+* **r307 re-cut verification**: applies strictly at the r307 default tree
+  `f91aa81202fd32d060f9afb0f9c54824116758b9` and produces `7cafcacf5dea9677c318aba7713ba80802d144f9`; cumulative with the other
+  optional artifact, numeric order, is `db5d26d45d5c8258b686151e3e42b63e139c301d`.  The patch file is
+  **unchanged** (same sha256) -- r307's block-10 amendment touches the host-expert cache's take-over promises, which
+  this artifact owns no hunk of, so only the produced tree moved with the default tree.  `validate-set.sh` check 8
+  verifies all three trees on every run.
 * **r306 re-cut verification**: applies strictly at the r306 default tree
   `f12b1a0c8ee6c24b77467f93550322e74762aef0` and produces `d1dbe7733171065b99f0f2adee189c1bfd0bc309`; cumulative with the other optional artifact, numeric order, is `445ace2475eb41c0ae543242efcee636513898ac`.
   The patch file moved (sha256 `00abb040e7debc4b6499f5262936c392019c93b2414d360cdb66fda7526eacb0`) because the exported commit id moved -- block 16's r306 amendment rewrites
