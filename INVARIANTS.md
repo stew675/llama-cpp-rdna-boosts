@@ -550,3 +550,33 @@ Established by the `--kv-unified` kv_rows defect (gfx1151 field report; `WORKLOG
 6. **`--kv-unified` is not itself a decode cost.**  With the flag, `--kv-unified -c 32768` reads the same 32.5 t/s
    as `--no-kv-unified`; the whole difference in the field report was the mis-probed feature.  Do not "fix" a
    unified-vs-per-stream gap by changing the cache — check the probe census first.
+
+## r309 (2026-11-17, `WORKLOG.md` 261117.008)
+
+1. **A gate arm must pin EVERY switch it does not name, because one of them has a split-dependent default.**
+   `cparams.fused_dsv4_hc_post = meta_split_active` (`src/llama-context.cpp`), so a `-sm tensor` run turns the
+   DSV4_HC_POST op ON by default — and `build_hc_mix`/`build_hc_combine` take their DSV4 branch only on the
+   CHAIN path, so `LLAMA_FUSED_HC_MIX=1`/`=COMBINE=1` makes those ops UNREACHABLE.  `gate-hc-fusions.sh`'s old
+   reference arm therefore was not the chain on a tensor split: the `LLAMA_FUSED_HC_COMBINE=0` arms ran
+   DSV4_HC_POST while the `=1` arms ran GGML_OP_HC_COMBINE, and the gate reported that difference as a combine
+   disagreement (IQ4_NL 446 `a5d0ec7b809d` vs 459 `9f8819c4c2c5`, at r303 and identically at r302 — the
+   split-dependent default predates r303).  With all four switches pinned, the true chain and every op arm on
+   that class read **450 `bc46095cf4c6`** at `-sm tensor`: the combine op and the CUDA matchers ARE exact.  The
+   general rule: an A/B arm that leaves a *defaulted* switch alone is two arms, and a reference arm must be the
+   all-switches-off state, not "whatever the model defaults to on this split".
+2. **The DSV4 HC pre/post ops and the fused HC_MIX op are numeric arms by measurement, not aliases.**  Both
+   replace the same intermediate the chain computes, at a different reduction order: the pre/post ops' HC16 bf16
+   producer slots are a documented re-baseline (**0.013217 / 96.392 %** and **0.013198 / 96.186 %** vs the chain
+   on the BF16-hc class, re-measured **0.015568 / 96.451 %** over 20 x 512 wikitext), and the fused mixer's
+   inject half is the fused band dot (`hc_mix_down_dots`) where the chain's is `build_lora_mm(w_inject, xn)`,
+   i.e. **mean KLD 0.000000 / same-top-p 100.000 %** — rounding level, and yet enough to flip a greedy near-tie
+   (GSQ-IQ3_XXS `-sm tensor`: chain 449 `d62340fbf566`, mixer 449 `6a102dbc62d6`; under `-sm layer` the two
+   coincide).  So a text hash is NOT a valid oracle for "the mixer fusion is inert", and an anchored arm per
+   (class, split state) is the honest instrument.  The convention defect issue #228 was about (a /hc in the
+   consumer) is a ~15-logit drift and still fails every arm.
+3. **A generated text is a per-split AND per-class-state reference, so record anchors per state, not per class.**
+   The `defaults` arm (no env at all) is the cheap way to know which state a run is in: it must equal `all_ops`
+   (a Meta device is present, `fused_dsv4_hc_post` auto-ON) or `ops_no_post` (one device / `-sm layer`).  Made
+   the gate print it and pick its anchor set from it, so the same script is anchored on `-sm tensor` and
+   `-sm layer` without an operator-supplied hint — and a change to the auto rule becomes a FAIL instead of a
+   silently different arm set.

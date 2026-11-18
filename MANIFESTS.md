@@ -202,37 +202,50 @@ in CI.  The model-level gates are manual:
    a second cache, or the server's park scheduling.  **Gates 1-3 never reach parking** — it is inert in
    `llama-cli`/`llama-bench`/`llama-perplexity`, so a server-only defect is invisible to them (issue #227
    shipped in r136 and survived r136-r145 on this fact).
-9. **qwen4exp hyper-connection fusions** — `scripts/gate-hc-fusions.sh MODEL.gguf`: runs the **four**
-   mix/combine arm combinations (`LLAMA_FUSED_HC_MIX` x `LLAMA_FUSED_HC_COMBINE`, selected independently)
-   plus the CUDA-side chain fusions, and requires every hard arm to be **byte-identical to the unfused
-   chain**.  The DSV4 HC pre/post pair are **numeric arms, sha-anchored** (r236, `TODO` #292): those two ops own
-   the HC16 bf16 producer slots and are a documented numeric re-baseline, so `LLAMA_FUSED_DSV4_HC_PRE=0` swaps
-   the producer precision as well as the fusion and byte-identity is **not** expected on any class.  Measured
-   on the BF16-hc class (3 devices `-sm layer`, wikitext 512 x 40, base PPL 2.8489): pre op **0.013217 /
-   96.392 %** and post op **0.013198 / 96.186 %** against their own chain.  Because each arm is deterministic
-   per class, its own text is the anchor instead: the gate defaults `SOFT_EXPECT` to the fused-mixer class's
-   recorded shas (`dsv4_pre_chain=dsv4_post_op=6a102dbc62d6`, 449 chars) and **FAILs when one moves**, which is
-   the regression signal a "reported" arm used to swallow.  (Historical, for scale only: the IQ4_NL class read
-   0.027936 / 96.471 % at base PPL 1.7888 in the gate's own r156 record and 0.021542 / 95.814 % in gate 11's
-   r148 row -- different points, neither is a target.  The r148 row's "BF16-hc 449 chars `6a102dbc62d6`" is
-   the *chain* of that date; the chain now reads `d62340fbf566`, which is what #292 mistook for drift.)
+9. **qwen4exp hyper-connection fusions** — `scripts/gate-hc-fusions.sh MODEL.gguf`: every arm **pins all
+   four switches** (`LLAMA_FUSED_HC_MIX`, `LLAMA_FUSED_HC_COMBINE`, `LLAMA_FUSED_DSV4_HC_PRE`,
+   `LLAMA_FUSED_DSV4_HC_POST`; the table is checked at startup), so each hard arm differs from the reference
+   by exactly **one** switch and must be **byte-identical to the true unfused chain (all four off)** — that is
+   `comb_op`, `both_ops` (graded against `mix_op`, so the combine stays hard with the mixer on), `cuda_fuse_off`
+   and, on a chain-mixer class, `mix_op`.  Pinning is the r309 fix (`TODO` #341, `INVARIANTS.md` r309): with
+   the DSV4 switches left at their defaults the reference arm was *not* the chain, because
+   `fused_dsv4_hc_post` defaults to `meta_split_active` and the DSV4 ops are mutually exclusive with the
+   mix/combine ops — so a `-sm tensor` run compared DSV4_HC_POST against HC_COMBINE and read 446 vs 459 on
+   Flash-Next IQ4_NL.  With them isolated the IQ4_NL class is **5/5 hard arms identical to the chain** at
+   `-sm tensor` (true chain, `mix_op`, `comb_op`, `both_ops`, `cuda_fuse_off` all 450 `bc46095cf4c6`).
+   **Numeric arms, sha-anchored per (hc-down class, split state)**: the DSV4 HC pre/post pair (r236, `TODO`
+   #292 — they own the HC16 bf16 producer slots, so `LLAMA_FUSED_DSV4_HC_PRE=0` swaps the producer precision as
+   well as the fusion; 3 devices `-sm layer`, wikitext 512 x 40, base PPL 2.8489: pre **0.013217 / 96.392 %**,
+   post **0.013198 / 96.186 %** against their own chain, and 0.015568 / 96.451 % for the pre op re-measured
+   at 20 chunks), the two **shipping states** (`all_ops` on a tensor split, `ops_no_post` otherwise), and
+   — r309 — `mix_op` on a **fused-mixer** class, because its inject half is the fused band dot where the
+   chain's is the lora GEMM (**mean KLD 0.000000 / same-top-p 100.000 %** vs the chain, 20 x 512 wikitext, but
+   a greedy near-tie can flip on a tensor split: that class reads 449 `d62340fbf566` through the chain and 449
+   `6a102dbc62d6` through the mixer).  An arm that moves off its anchor **FAILs**, which is the regression
+   signal a "reported" arm used to swallow; the `defaults` arm (no env at all) must equal one of the two
+   explicit states and prints which, so a flip in the split-dependent default is a FAIL too.  (Historical,
+   for scale only: the IQ4_NL class read 0.027936 / 96.471 % at base PPL 1.7888 in the gate's own r156 record
+   and 0.021542 / 95.814 % in gate 11's r148 row — different points, neither is a target.  The r148 row's
+   "BF16-hc 449 chars `6a102dbc62d6`" is the *chain* of that date; the true chain now reads `d62340fbf566`
+   under `-sm tensor`, which is what #292 mistook for drift.)
    Required for any change to `build_hc_mix`, `build_hc_combine`,
    `GGML_OP_HC_MIX` / `GGML_OP_HC_COMBINE` (kernel, CPU reference or op definition) or a matcher that fuses
    either.  **Run it once per hc-down weight class** — Q8_0/BF16 `hc_attn_down` takes the fused mixer, any
    other quant takes the chain (`--types MODEL.gguf` prints the class) — **and once per GGUF layout**, since r303
    a **merged** `hc_*_down_inject` file is a different graph shape (the class line names it; build the fixture
    with `scripts/make-merged-hc-gguf.py`, and pair it with the `test-llama-archs -a qwen4exp` "merged HC" arm,
-   whose negative control is a SIGSEGV on the pre-r303 tree).  The gate pins `ROCBLAS_USE_HIPBLASLT=0` and
-   `MOE_EXPERT_HEATMAP=load` itself and its default arm must never run through `env -` (GNU `env -i`, which
-   wipes `HIP_VISIBLE_DEVICES` on a pinned multi-device run — r303, `INVARIANTS.md`).  The defect class it
+   whose negative control is a SIGSEGV on the pre-r303 tree).  The gate pins `ROCBLAS_USE_HIPBLASLT=0`,
+   `MOE_EXPERT_HEATMAP=load`, `LLAMA_HC_BLK16=0`, `LLAMA_HC_RES16=0` and `GGML_CUDA_MMB_DOWN16=0` itself and its
+   default arm must never run through `env -` (GNU `env -i`, which wipes `HIP_VISIBLE_DEVICES` on a pinned
+   multi-device run — r303, `INVARIANTS.md`).  The defect class it
    exists for only
    shows on the arms where the two halves disagree, and `test-backend-ops` cannot see it: it compares each
    op against a CPU reference that can share the op's mistake.  Issue #228 was invisible to gates 1-6 for
    the same reason (a wrong combine feeds every residual stream the same value, so text stays coherent on
    the arms that happen to be self-consistent), and it silently degraded every non-Q8_0/BF16 qwen4exp quant
-   for ten releases.  **Known open: the IQ4_NL (chain-mixer) class does not read byte-identical across the
-   combine arms at r303 and already did not at r302** (446 `a5d0ec7b809d` vs 459 `9f8819c4c2c5`, PPL identical
-   in both arms) — `TODO` #341 owns it; do not quote that class as a pass until it is closed.
+   for ten releases.  The r303 report that the IQ4_NL class "does not read byte-identical across the combine
+   arms" was a **gate** defect, closed at r309 (`TODO` #341): it was DSV4_HC_POST vs HC_COMBINE, not the
+   combine op vs its chain.
 
 10. **Batched state save / restore** — `scripts/gate-state-pipe.sh`: drives the server's **in-memory prompt
    cache** (`--cache-ram`), i.e. the path a real chat turn pays for, in four arms (`LLAMA_STATE_PIPE_GROUPS=8`,

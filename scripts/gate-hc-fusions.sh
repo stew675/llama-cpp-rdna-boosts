@@ -34,10 +34,39 @@
 #   pair passed while the fused arms disagreed with the chain.  This gate is the oracle that
 #   compares the ARMS against each other on a real GGUF.
 #
+# ONE SWITCH AT A TIME (r309, `TODO` #341).  Until r309 the arms did NOT isolate the switch they
+# named: they left the two DSV4 HC switches at their defaults, and those defaults are not benign.
+#   * `LLAMA_FUSED_DSV4_HC_PRE`/`_POST` select GGML_OP_DSV4_HC_PRE / _POST, which own the HC16 bf16
+#     producer slots -- a DOCUMENTED numeric re-baseline, not an alias (see NUMERIC below).
+#   * `fused_dsv4_hc_post` DEFAULTS TO `meta_split_active` (src/llama-context.cpp), i.e. ON whenever a
+#     tensor split puts a Meta device in the graph, and the DSV4 ops are MUTUALLY EXCLUSIVE with the
+#     mix/combine ops: build_hc_mix/build_hc_combine take the DSV4 branch only on their CHAIN path.
+#   So on a `-sm tensor` run the old `chain_chain` arm was not the chain at all -- it was "chain mixer +
+#   DSV4_HC_POST", and every `LLAMA_FUSED_HC_COMBINE=1` arm bypassed that op and ran GGML_OP_HC_COMBINE
+#   instead.  The gate then compared TWO numeric fusions and reported the difference as a combine
+#   disagreement: Flash-Next IQ4_NL read 446 `a5d0ec7b809d` (every combine-op arm) vs 459 `9f8819c4c2c5`
+#   (`chain_chain`) at r303, and the same pair on the r302 build, which is why it looked pre-existing.
+#   It was: the DSV4_HC_POST default became split-dependent in the r242 era, and the gate kept a
+#   reference arm that silently changed meaning.
+#   Fix: every arm below PINS ALL FOUR switches (the table is checked at startup), the reference arm is
+#   the true chain (all four off), and the states that differ by design are NUMERIC arms.
+#   Measured 2026-11-17 (r308 build) on IQ4_NL, 3 devices `-sm tensor`: true chain 450 `bc46095cf4c6`;
+#   mix_op / comb_op / both_ops / cuda_fuse_off all 450, i.e. on THAT class both ops and the CUDA
+#   matchers ARE byte-identical to the chain; the DSV4 pre op 444 `7ea23f309705`, the post op 454
+#   `9b4b033b33f7`, all four on 446 `a5d0ec7b809d`.  So `TODO` #341 is a gate defect, not a numerics
+#   defect -- and `446`/`a5d0ec7b809d` is what the shipping default of that class reads.
+#
 # WHAT IT CHECKS
-#   HARD: every arm produces the same generated text (byte-identical, same sha) as the
-#         chain+chain reference arm, and the reference arm is not degenerate (>= MIN_CHARS
-#         and no `////` run).  A mismatch names the arm.
+#   HARD: the reference arm is the TRUE unfused chain (`LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0
+#         LLAMA_FUSED_DSV4_HC_PRE=0 LLAMA_FUSED_DSV4_HC_POST=0`), it must not be degenerate
+#         (>= MIN_CHARS and no `////` run), and the hard arms must produce the same text byte for byte:
+#           comb_op       -- the combine op, with both DSV4 ops off, vs the chain
+#           both_ops      -- vs `mix_op`, so the combine op is still exact with the mixer fused
+#           cuda_fuse_off -- the CUDA chain matchers vs the chain
+#           mix_op        -- on a CHAIN-mixer class only, where the switch is inert (`LLAMA_FUSED_HC_MIX`
+#                            selects a mixer this model never builds; the verdict says so instead of
+#                            implying coverage)
+#         A mismatch names the arm.
 #   NUMERIC (sha-anchored, r236): the DeepSeek-V4 HC pre/post op pair (which qwen4exp also
 #         builds through) does NOT reproduce its ggml chain and must not be required to: those
 #         two ops own the HC16 bf16 producer slots (`dsv4-hc.cu`: "a numerics change vs the F32
@@ -50,18 +79,45 @@
 #         base PPL 1.7888 (`MANIFESTS.md` gate 7 carries a second IQ4_NL figure, 0.021542 /
 #         95.814 %, from its own unnamed point -- both are historical, neither is a target).
 #         So byte-identity is NOT expected on any class, and the honest regression detector is
-#         the arm's OWN recorded text: each arm is deterministic per class (r235 and r236
-#         produce the same `6a102dbc62d6` on the BF16-hc class), so `SOFT_EXPECT` anchors it and
-#         a real numeric change in either op FAILS the gate instead of printing "reported".
-#         (Between r156 and r236 the CHAIN moved to `d62340fbf566`, not the ops -- the r156
-#         "both arms agree on BF16-hc" line was stale, never a re-base artefact: `TODO` #292.)
+#         the arm's OWN recorded text: each arm is deterministic per class, so `SOFT_EXPECT`
+#         anchors it and a real numeric change in either op FAILS the gate instead of printing
+#         "reported" (the hole `TODO` #292 exposed).
+#         The two SHIPPING states are numeric arms as well, because each is a combination that
+#         includes those ops: `all_ops` (the default on a Meta/tensor-split run, where
+#         `fused_dsv4_hc_post` auto-enables) and `ops_no_post` (the default on one device, where it
+#         auto-disables).  The `defaults` arm runs with NO env at all and must equal one of them --
+#         which is also what proves WHICH auto state the run took, so a flip in that default is a
+#         FAIL instead of a silently different arm set.
+#   NUMERIC, mixer (r309): on a FUSED-mixer class `mix_op` is a numeric arm as well, and it is the one
+#         finding that came out of isolating the switches.  The fused mixer's *inject* half is the fused
+#         band dot kernel (`hc_mix_down_dots`), where the chain's is `build_lora_mm(w_inject, xn)` plus a
+#         SCALE, so the two do not reduce in the same order: measured against the true chain on
+#         GSQ-IQ3_XXS, 3 devices `-sm tensor`, wikitext 20 x 512, `llama-perplexity --kl-divergence`:
+#         **mean KLD 0.000000 +- 0.000000 / same-top-p 100.000 %** -- rounding level, NOT a defect, and
+#         it does not move PPL.  It can still flip a greedy near-tie (that class reads 449
+#         `d62340fbf566` through the chain and 449 `6a102dbc62d6` through the mixer under `-sm tensor`,
+#         while under `-sm layer` the two coincide), which is why the arm is anchored instead of hard.
+#         The `LLAMA_FUSED_HC_MIX` convention itself (the /hc that issue #228 was about) is a LARGE
+#         drift and still fails here: an arm that moved by /hc cannot land on its anchor.
 #   The arms cover both halves independently and the CUDA-side chain fusions.
 #
 #   The hc weight TYPE decides which mixer runs, so run this once per class:
 #     * a Q8_0 or BF16 hc_attn_down GGUF  -> the fused BF16/Q8_0 mixer (fused mix arm is real)
-#     * any other quant (Q5_K, IQ4_NL, ...) -> the chain mixer (fused mix arm is a no-op)
+#     * a post-#31028 MERGED hc_*_down_inject GGUF -> ALSO fused-capable since r303 (the op takes two
+#       row views of the merged tensor), so its class line says so instead of "chain"
+#     * any other quant (Q5_K, IQ4_NL, ...) -> the chain mixer (`mix_op` is INERT: the model never
+#       builds GGML_OP_HC_MIX for it, so that arm passes without exercising the mixer fusion -- the
+#       gate says so in its class line and the arm's verdict instead of implying coverage)
 #   `scripts/gate-hc-fusions.sh --types MODEL.gguf` prints the class of a model (and its
 #   blk.0 hc_attn_* tensor types) without running anything.
+#
+# ANCHORS ARE PER (class, split state, 3 devices).  A generated text is a per-split, per-device-count
+# reference, so the built-in anchor sets cover the two states of the normal 3-device invocation:
+# `meta` (a tensor split, where `fused_dsv4_hc_post` auto-enables) and `local` (one device or
+# `-sm layer`), both at CTX 8192 / NGEN 96 / `EXTRA_ARGS` as the gate defaults it, on the 2026-11-17
+# build.  The `defaults` arm decides which state a run is in, so a `-sm tensor` and a `-sm layer` run
+# are both anchored out of the box; another device count, model or `EXTRA_ARGS` needs its own anchors
+# via `SOFT_EXPECT` (or prints `reported`), and the HARD arms must agree in every case.
 #
 # Usage:
 #   ./gate-hc-fusions.sh [--no-faults] [MODEL.gguf]
@@ -162,10 +218,12 @@ if dn is not None:
     print('class: %s mixer (%s hc_attn_down)' %
           ('FUSED' if dn in ('Q8_0', 'BF16') else 'CHAIN', dn))
 elif di is not None:
-    # post-#31028 converter layout: the down and inject products share one tensor, so the fused
-    # mixer cannot serve it (the op needs w_down and w_inject separately) and build_hc_mix takes
-    # the chain.  Name it instead of printing nothing, which read as "class unknown".
-    print('class: CHAIN mixer (merged hc_attn_down_inject %s, post-#31028 layout)' % di)
+    # post-#31028 converter layout: the down and inject products share ONE tensor.  Since r303 that is
+    # no longer a chain-only shape -- build_hc_mix hands the fused op two row views of the merged tensor
+    # (the kernel addresses every weight row packed at ggml_row_size(ne[0]), and ne[0] is unchanged), so
+    # the mixed layout keeps the fused decode band.  Name the layout AND say the mixer is reachable,
+    # because reading this line as "chain" is how the shape went unexercised for six releases.
+    print('class: FUSED-capable mixer (merged hc_attn_down_inject %s, post-#31028 layout)' % di)
 else:
     print('class: unknown (no blk.0 hc_attn_down / hc_attn_down_inject tensor)')
 PY
@@ -200,16 +258,22 @@ mkdir -p "$KEEPOUT"
 GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 PROMPT_SHA="$(printf '%s' "$PROMPT" | sha256sum | awk '{print $1}')"
 
-# A fresh-process comparison needs the library pinned (`INVARIANTS.md`, r302 \u00a744): hipBLASLt's
+# A fresh-process comparison needs the library pinned (`INVARIANTS.md`, r302 §44): hipBLASLt's
 # per-process selection reorders the prefill GEMMs, so ONE unpinned arm in the set reads different
-# text -- measured 2026-11-17 on GSQ-IQ3_XXS all-VRAM `-sm tensor`: 449 `6a102dbc62d6` on
-# chain_chain/mixed_comb and 459 `7c5e5463fd6a` on the other five, identical to the arm set with
-# every other env pinned, i.e. a library artefact, not a fusion disagreement.  With the pin the
-# same seven arms are all byte-identical to the chain.
+# text -- measured 2026-11-17 on GSQ-IQ3_XXS all-VRAM `-sm tensor`: 449 `6a102dbc62d6` on the two
+# chain-mixer arms and 459 `7c5e5463fd6a` on the other five, identical to the arm set with every
+# other env pinned, i.e. a library artefact, not a fusion disagreement.  With the pin the whole
+# (then seven-arm) set is byte-identical to the chain.
 export ROCBLAS_USE_HIPBLASLT="${ROCBLAS_USE_HIPBLASLT:-0}"
-# The MoE residency prior is an INPUT (`GREEDY-PURITY.md` \u00a789): a learned heat-map selects a
+# The MoE residency prior is an INPUT (`GREEDY-PURITY.md` §89): a learned heat-map selects a
 # different expert kernel set, and the sets are not bit-identical.
 export MOE_EXPERT_HEATMAP="${MOE_EXPERT_HEATMAP:-load}"
+# The HC BF16-stream marks are INPUTS too (they change the combine's producer/consumer precision),
+# and a model directory's own `runme` sets them, so an inherited value must not silently re-baseline
+# every arm (the anchors below assume them at their defaults).
+export LLAMA_HC_BLK16="${LLAMA_HC_BLK16:-0}"
+export LLAMA_HC_RES16="${LLAMA_HC_RES16:-0}"
+export GGML_CUDA_MMB_DOWN16="${GGML_CUDA_MMB_DOWN16:-0}"
 
 echo "==> qwen4exp hyper-connection fusion-equivalence gate"
 echo "    cli=$LLAMA_CLI"
@@ -217,6 +281,7 @@ echo "    model=$MODEL"
 types_of "$MODEL" | sed 's/^/    /'
 echo "    ctx=$CTX ngen=$NGEN extra='$EXTRA_ARGS'"
 echo "    ROCBLAS_USE_HIPBLASLT=$ROCBLAS_USE_HIPBLASLT MOE_EXPERT_HEATMAP=$MOE_EXPERT_HEATMAP"
+echo "    LLAMA_HC_BLK16=$LLAMA_HC_BLK16 LLAMA_HC_RES16=$LLAMA_HC_RES16 GGML_CUDA_MMB_DOWN16=$GGML_CUDA_MMB_DOWN16"
 echo "    prompt sha256=$PROMPT_SHA  (extractor: scripts/extract-generated.py)"
 echo "    logs: $KEEPOUT"
 echo
@@ -228,50 +293,104 @@ echo
 # against the chain.  Byte-identity is therefore NOT expected on any class.  Each arm IS
 # deterministic per class, so its text is anchored instead: SOFT_EXPECT (below) makes a real
 # numeric change FAIL rather than print "reported" -- the hole `TODO` #292 exposed.
+# EVERY PINNED ARM NAMES ALL FOUR SWITCHES, in the order MIX COMBINE PRE POST (r309, `TODO` #341).
+# An arm that leaves one at its default is not the arm it claims to be: `fused_dsv4_hc_post` defaults
+# to `meta_split_active`, and the DSV4 ops are unreachable from a mix/combine-op graph, so a
+# "combine on" arm that leaves the DSV4 switches alone is also a "DSV4 post op OFF" arm.
 HARD_ARMS=(
-    "chain_chain   :LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0"
-    "mixed_comb    :LLAMA_FUSED_HC_COMBINE=0"
-    "mixfused_comb :LLAMA_FUSED_HC_MIX=0"
-    "fused_fused   :-"
-    "no_cuda_fuse  :GGML_CUDA_DISABLE_HC_FUSION=1"
+    "chain_chain   :LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0 LLAMA_FUSED_DSV4_HC_PRE=0 LLAMA_FUSED_DSV4_HC_POST=0"
+    "mix_op        :LLAMA_FUSED_HC_MIX=1 LLAMA_FUSED_HC_COMBINE=0 LLAMA_FUSED_DSV4_HC_PRE=0 LLAMA_FUSED_DSV4_HC_POST=0"
+    "comb_op       :LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=1 LLAMA_FUSED_DSV4_HC_PRE=0 LLAMA_FUSED_DSV4_HC_POST=0"
+    "both_ops      :LLAMA_FUSED_HC_MIX=1 LLAMA_FUSED_HC_COMBINE=1 LLAMA_FUSED_DSV4_HC_PRE=0 LLAMA_FUSED_DSV4_HC_POST=0"
+    "cuda_fuse_off :LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0 LLAMA_FUSED_DSV4_HC_PRE=0 LLAMA_FUSED_DSV4_HC_POST=0 GGML_CUDA_DISABLE_HC_FUSION=1"
 )
 SOFT_ARMS=(
-    "dsv4_pre_chain:LLAMA_FUSED_DSV4_HC_PRE=0"
-    "dsv4_post_op  :LLAMA_FUSED_DSV4_HC_POST=1"
+    "dsv4_pre_op   :LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0 LLAMA_FUSED_DSV4_HC_PRE=1 LLAMA_FUSED_DSV4_HC_POST=0"
+    "dsv4_post_op  :LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0 LLAMA_FUSED_DSV4_HC_PRE=0 LLAMA_FUSED_DSV4_HC_POST=1"
+    "all_ops       :LLAMA_FUSED_HC_MIX=1 LLAMA_FUSED_HC_COMBINE=1 LLAMA_FUSED_DSV4_HC_PRE=1 LLAMA_FUSED_DSV4_HC_POST=1"
+    "ops_no_post   :LLAMA_FUSED_HC_MIX=1 LLAMA_FUSED_HC_COMBINE=1 LLAMA_FUSED_DSV4_HC_PRE=1 LLAMA_FUSED_DSV4_HC_POST=0"
 )
-ARMS=("${HARD_ARMS[@]}" "${SOFT_ARMS[@]}")
+# the shipping state itself: no env prefix at all.  It must equal one of the two explicit states
+# (`all_ops` on a Meta/tensor-split run, `ops_no_post` on one device), which is also what reports
+# WHICH side of the split-dependent `fused_dsv4_hc_post` default this run took.
+DEFAULT_ARM="defaults:-"
+ARMS=("${HARD_ARMS[@]}" "${SOFT_ARMS[@]}" "$DEFAULT_ARM")
 
-# The numeric (dsv4 pre/post) arms are anchored to their OWN recorded text, per hc-down class.
-#   SOFT_EXPECT="arm=sha arm=sha"  an explicit anchor set (other classes / a new model); an empty
-#                                  value disables anchoring for a class that has none recorded.
-# The default is the BF16-hc class's r236 measurement, applied only when the gate detects that
-# class (the fused-mixer class), so running the IQ4_NL/Q5_K classes does not inherit it and fail.
-#
-# Why this exists (`TODO` #292): the ops differ from the chain by design (bf16 producer slots), so
-# they cannot be byte-hard.  They were only *reported*, which meant a real numeric change in either
-# op passed silently -- and a stale "both arms agree" line in this header sent an earlier session
-# after a re-base drift that did not exist (r235 reproduces r236's split exactly).
+# Every pinned arm must name all four switches, with a 0/1 value: a typo or a dropped variable would
+# silently turn that arm into the default run (the `env -` class of mistake, r303).
+for arm in "${HARD_ARMS[@]}" "${SOFT_ARMS[@]}"; do
+    n=0
+    for sw in LLAMA_FUSED_HC_MIX LLAMA_FUSED_HC_COMBINE LLAMA_FUSED_DSV4_HC_PRE LLAMA_FUSED_DSV4_HC_POST; do
+        if printf '%s' "${arm#*:}" | grep -Eq "(^|[[:space:]])$sw=[01]([[:space:]]|$)"; then
+            n=$((n+1))
+        fi
+    done
+    if [ "$n" -ne 4 ]; then
+        echo "FAIL: arm '${arm%%:*}' pins $n of the 4 LLAMA_FUSED_* switches (all four are required)" >&2
+        exit 2
+    fi
+done
+unset n sw arm
+
+# NUMERIC-ARM ANCHORS (see the header).  They are recorded per (hc-down class, split state), because
+# a generated text is a per-split, per-device-count reference (INVARIANTS: a tensor-split text is a
+# reference for ITS device count).  `meta` is the state a TENSOR split takes -- a Meta device in the
+# graph, which is also what turns `fused_dsv4_hc_post` on -- and `local` is one device or `-sm layer`.
+# The `defaults` arm (below) is what decides which state this run is in, and every built-in set is a
+# 3-device measurement on the 2026-11-17 (r308) build:
+#   fused-mixer class (BF16/Q8_0 hc_attn_down), Flash-Next GSQ-IQ3_XXS
+#     `-sm tensor`: true chain 449 d62340fbf566 | mix_op/comb_op/both_ops/cuda_fuse_off all 449
+#                   dsv4_pre_op 449 6a102dbc62d6 | dsv4_post_op 447 3f049f67781c
+#                   all_ops 449 6a102dbc62d6 | ops_no_post 449 6a102dbc62d6
+#     `-sm layer` : true chain 449 6a102dbc62d6 | the four hard arms all 449 (identical)
+#                   dsv4_pre_op 444 a512ee68c4b3 | dsv4_post_op 449 6a102dbc62d6
+#                   all_ops 449 6a102dbc62d6 | ops_no_post 444 a512ee68c4b3
+#   chain-mixer class (any other hc quant), Flash-Next IQ4_NL -- the `TODO` #341 file
+#     `-sm tensor`: true chain 450 bc46095cf4c6 | the four hard arms all 450 (identical)
+#                   dsv4_pre_op 444 7ea23f309705 | dsv4_post_op 454 9b4b033b33f7
+#                   all_ops 446 a5d0ec7b809d | ops_no_post 444 7ea23f309705
+#     `-sm layer` : true chain 453 f242246a382b | the four hard arms all 453 (identical)
+#                   dsv4_pre_op 453 f242246a382b | dsv4_post_op 444 7ea23f309705
+#                   all_ops 459 9f8819c4c2c5 | ops_no_post 453 f242246a382b
+# `SOFT_EXPECT="arm=sha ..."` replaces the selected set (another model, another device count); an empty
+# value disables anchoring for a class that has none recorded.
 HC_TYPE="$(types_of "$MODEL" | sed -n 's/^blk\.0\.hc_attn_down\.weight[[:space:]]*//p' | head -1)"
-case "$HC_TYPE" in
-    BF16|Q8_0) SOFT_EXPECT="${SOFT_EXPECT-dsv4_pre_chain=6a102dbc62d6 dsv4_post_op=6a102dbc62d6}" ;;
-    *)         SOFT_EXPECT="${SOFT_EXPECT-}" ;;
+# which mixer the MODEL builds is a property of the class line, not of the anchor key (a Q5_K file is a
+# chain mixer with no anchors, a merged file is fused-capable, an unknown file could be either -- treat
+# an unknown as fused so `mix_op` is never waved through as "inert")
+case "$(types_of "$MODEL" | sed -n 's/^class: //p' | head -1)" in
+    FUSED*)   mixer_builds=fused ;;
+    *merged*) mixer_builds=fused ;;
+    CHAIN*)   mixer_builds=chain ;;
+    *)        mixer_builds=unknown ;;
 esac
-declare -A SOFT_EXPECT_MAP=()
-for kv in $SOFT_EXPECT; do SOFT_EXPECT_MAP["${kv%%=*}"]="${kv#*=}"; done
-[ -n "$SOFT_EXPECT" ] && echo "    numeric-arm anchors: $SOFT_EXPECT"
+case "$HC_TYPE" in
+    BF16|Q8_0) HC_CLASS=fusedmixer ;;
+    IQ4_NL)    HC_CLASS=iq4nl ;;
+    *)         HC_CLASS=none ;;
+esac
+anchors_for() { # $1 = hc class, $2 = split state (meta|local)
+    case "$1/$2" in
+        fusedmixer/meta)  echo "mix_op=6a102dbc62d6 dsv4_pre_op=6a102dbc62d6 dsv4_post_op=3f049f67781c all_ops=6a102dbc62d6 ops_no_post=6a102dbc62d6" ;;
+        fusedmixer/local) echo "mix_op=6a102dbc62d6 dsv4_pre_op=a512ee68c4b3 dsv4_post_op=6a102dbc62d6 all_ops=6a102dbc62d6 ops_no_post=a512ee68c4b3" ;;
+        iq4nl/meta)       echo "dsv4_pre_op=7ea23f309705 dsv4_post_op=9b4b033b33f7 all_ops=a5d0ec7b809d ops_no_post=7ea23f309705" ;;
+        iq4nl/local)      echo "dsv4_pre_op=f242246a382b dsv4_post_op=7ea23f309705 all_ops=9f8819c4c2c5 ops_no_post=f242246a382b" ;;
+        *)                echo "" ;;
+    esac
+}
+mixer_class="$mixer_builds"
+[ "$mixer_class" = "chain" ]   && echo "    mixer: chain (this class never builds GGML_OP_HC_MIX: the mix_op arm is inert)"
+[ "$mixer_class" = "fused" ]   && echo "    mixer: fused (the model builds GGML_OP_HC_MIX in the decode band)"
+[ "$mixer_class" = "unknown" ] && echo "    mixer: UNKNOWN (no hc_attn_down type line; mix_op is graded as numeric, never as inert)"
 
-ref_sha=""
-ref_chars=0
-fails=0
-warns=0
-printf '%-14s %-6s %8s %14s  %s\n' arm rc chars sha verdict
+declare -A RC_OF=()
+declare -A SHA_OF=()
+declare -A CHARS_OF=()
 for arm in "${ARMS[@]}"; do
     name="${arm%%:*}"
     envs="${arm#*:}"
     [ "$envs" = "-" ] && envs=""          # the default arm: no env prefix at all (see below)
     name="$(echo "$name" | tr -d ' ')"
-    soft=0
-    for s in "${SOFT_ARMS[@]}"; do [ "${s%%:*}" = "${arm%%:*}" ] && soft=1; done
     log="$KEEPOUT/$name.log"
     # The default arm carries no env prefix, so it must run WITHOUT `env`: GNU `env -`
     # (which `env $envs` with envs="-" expands to) is `env -i` and wipes the caller's
@@ -286,31 +405,96 @@ for arm in "${ARMS[@]}"; do
     rc=$?
     read -r chars sha < <(python3 "$REPO_DIR/scripts/extract-generated.py" "$log" 2>/dev/null |
         sed -n 's/^\([0-9]*\) chars sha=\([0-9a-f]*\)$/\1 \2/p' | head -1)
-    chars="${chars:-0}"; sha="${sha:-none}"
+    RC_OF[$name]="$rc"
+    SHA_OF[$name]="${sha:-none}"
+    CHARS_OF[$name]="${chars:-0}"
+done
+
+# ---- verdicts.  Two passes, because the `defaults` arm is what decides the split state, and the
+# state picks the anchor set for the numeric arms: the arms all run first, then are graded.
+STATE=""
+if [ "${SHA_OF[defaults]:-x}" = "${SHA_OF[all_ops]:-y}" ] && \
+   [ "${CHARS_OF[defaults]:-0}" = "${CHARS_OF[all_ops]:-1}" ]; then
+    STATE=meta
+elif [ "${SHA_OF[defaults]:-x}" = "${SHA_OF[ops_no_post]:-y}" ] && \
+     [ "${CHARS_OF[defaults]:-0}" = "${CHARS_OF[ops_no_post]:-1}" ]; then
+    STATE=local
+fi
+ANCHOR_SET="${SOFT_EXPECT-$(anchors_for "$HC_CLASS" "$STATE")}"
+declare -A ANCHOR_MAP=()
+for kv in $ANCHOR_SET; do ANCHOR_MAP["${kv%%=*}"]="${kv#*=}"; done
+if [ -n "$STATE" ]; then
+    echo "    split state: $STATE (dsv4_hc_post auto=$([ "$STATE" = meta ] && echo ON || echo OFF))"
+else
+    echo "    split state: UNKNOWN (the 'defaults' arm matched neither explicit state)"
+fi
+if [ -n "$ANCHOR_SET" ]; then echo "    numeric-arm anchors: $ANCHOR_SET"; else echo "    numeric-arm anchors: none"; fi
+
+ref_sha="${SHA_OF[chain_chain]:-}"
+ref_chars="${CHARS_OF[chain_chain]:-0}"
+fails=0
+warns=0
+echo
+printf '%-14s %-6s %8s %14s  %s\n' arm rc chars sha verdict
+for arm in "${ARMS[@]}"; do
+    name="$(echo "${arm%%:*}" | tr -d ' ')"
+    rc="${RC_OF[$name]:-1}"; chars="${CHARS_OF[$name]:-0}"; sha="${SHA_OF[$name]:-none}"
+    soft=0
+    for s in "${SOFT_ARMS[@]}"; do [ "${s%%:*}" = "${arm%%:*}" ] && soft=1; done
+    # on a class that BUILDS the fused mixer, mix_op is a numeric arm too: the op's inject half is
+    # the fused band dot kernel where the chain's is the lora GEMM, so its logits are rounding-level
+    # but not bit-identical (measured: KLD 0.000000 / same-top-p 100.000 %, 20 x 512 wikitext), and a
+    # greedy near-tie can flip.  On a chain-mixer class the switch is inert and it stays hard.
+    if [ "$name" = "mix_op" ] && [ "$mixer_class" != "chain" ]; then soft=1; fi
+    log="$KEEPOUT/$name.log"
     verdict=""
     if [ "$rc" -ne 0 ]; then
         verdict="FAIL (exit $rc)"
     elif [ "$name" = "chain_chain" ]; then
-        ref_sha="$sha"; ref_chars="$chars"
         if [ "$chars" -lt "$MIN_CHARS" ]; then
             verdict="FAIL (reference arm generated $chars < $MIN_CHARS chars)"
         elif grep -q '////' "$log"; then
             verdict="FAIL (reference arm shows the '////' corruption)"
         else
-            verdict="reference"
+            verdict="reference (true chain)"
+        fi
+    elif [ "$name" = "defaults" ]; then
+        # the shipping state must equal one of the two explicit states; naming which one is what
+        # proves the split-dependent `fused_dsv4_hc_post` default took the side it should
+        if [ -n "$STATE" ]; then
+            best=$([ "$STATE" = meta ] && echo all_ops || echo ops_no_post)
+            verdict="ok (== $best: dsv4_hc_post auto=$([ "$STATE" = meta ] && echo ON || echo OFF))"
+        else
+            verdict="FAIL (equals neither of 'all_ops ops_no_post': $chars chars $sha)"
+        fi
+    elif [ "$name" = "both_ops" ] && [ "$mixer_class" != "chain" ]; then
+        # the mixer op is on here AND in mix_op, so this pair isolates the COMBINE op with the
+        # mixer fused -- the combine must still be byte-identical (it is pure elementwise)
+        if [ "$sha" = "${SHA_OF[mix_op]:-x}" ] && [ "$chars" = "${CHARS_OF[mix_op]:-y}" ]; then
+            verdict="ok (== mix_op: the combine op is exact with the fused mixer on)"
+        else
+            verdict="FAIL (differs from mix_op: $chars chars $sha)"
         fi
     elif [ "$sha" = "$ref_sha" ] && [ "$chars" = "$ref_chars" ]; then
-        verdict="ok"
+        if [ "$name" = "mix_op" ] && [ "$mixer_class" = "chain" ]; then
+            verdict="ok (inert: this class has no fused mixer)"
+        elif [ "$soft" -eq 1 ]; then
+            # a numeric arm may coincide with the chain on a class where its bf16 slots do not engage;
+            # that is the documented state for that (class, split), so it is a pass, not "reported"
+            verdict="ok (numeric arm coincides with the chain on this class/state)"
+        else
+            verdict="ok"
+        fi
     elif [ "$soft" -eq 1 ]; then
-        # a numeric arm: it is not expected to match the chain, but its own text is deterministic
-        # per class, so a recorded anchor turns "the op's numerics moved" into a FAIL
-        exp="${SOFT_EXPECT_MAP[$name]:-}"
+        # a numeric arm: it is not expected to match the chain, but its own text is deterministic per
+        # (class, split state), so a recorded anchor turns "the op's numerics moved" into a FAIL
+        exp="${ANCHOR_MAP[$name]:-}"
         if [ -z "$exp" ]; then
-            verdict="reported (numeric arm, differs -- no anchor recorded for this class)"
+            verdict="reported (numeric arm, differs -- no anchor recorded for this class/state)"
         elif [ "$sha" = "$exp" ]; then
             verdict="reported (numeric arm, anchor $exp)"
         else
-            verdict="FAIL (numeric arm moved: $chars chars $sha, anchor $exp)"
+            verdict="FAIL (numeric arm moved: $chars chars $sha, anchor $exp; for another model/split shape pass SOFT_EXPECT)"
         fi
     else
         verdict="FAIL (differs from chain_chain)"
@@ -339,12 +523,10 @@ if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
 fi
 
 if [ "$fails" -ne 0 ]; then
-    echo "FAIL: $fails arm(s) disagreed with the unfused chain (see $KEEPOUT)"
+    echo "FAIL: $fails arm(s) failed their grading -- a hard arm moved, a numeric arm left its anchor," \
+         "or the shipping default matched neither explicit state (see $KEEPOUT)"
     exit 1
 fi
-if [ "$warns" -ne 0 ]; then
-    echo "PASS: all $(( ${#ARMS[@]} - warns )) hard arms are byte-identical to the unfused chain" \
-         "($ref_chars chars, sha $ref_sha); $warns numeric arm(s) differ as documented and match their anchor"
-else
-    echo "PASS: all ${#ARMS[@]} arms are byte-identical to the unfused chain ($ref_chars chars, sha $ref_sha)"
-fi
+echo "PASS: every hard arm is byte-identical to the arm it is graded against (true chain: $ref_chars" \
+     "chars, sha $ref_sha), the shipping default matches an explicit state, and $warns numeric arm(s)" \
+     "differ from the chain as documented and match their anchors"

@@ -1,3 +1,83 @@
+## 261117.008 (r309, RELEASE v17-4f9dfa0e3-r309) -- `TODO` #341 is a GATE defect, not a numerics defect: the hc arms never pinned the two DSV4 switches, so on `-sm tensor` the gate compared DSV4_HC_POST against HC_COMBINE and read 446 vs 459
+
+**What shipped.**  **No patch change** (`release.json` keeps tip `87d3629df` / tree `3e64b1473`, all 18 default
+patch hashes and both optional artifacts byte-identical -- the delta is `release.json`'s release id plus doc and
+gate text, so nothing to re-cut, nothing to refresh on the fork, no container image to rebuild).  The one
+functional artifact is `scripts/gate-hc-fusions.sh`: every arm now pins all four switches, the reference is the
+TRUE unfused chain, two more arms were added, the anchors are per (hc-down class, split state) and three
+environment inputs are pinned.  Records: `MANIFESTS.md` gate 9, `INVARIANTS.md` r309, `GREEDY-PURITY.md` §61 (a
+correction -- one of its claims was too strong), `ENVIRONMENT.md` (the HC row's "all four combinations agree"
+claim now names the DSV4 switches), `patches/README.md` untouched (no block changed), `TODO` #341 retired.
+
+**The item.**  r303's gate run on Flash-Next IQ4_NL read **446 `a5d0ec7b809d` for every `LLAMA_FUSED_HC_COMBINE=1`
+arm vs 459 `9f8819c4c2c5` for the chain arms**, identically on the r302 build, PPL equal (2.1640) in both, and it was
+recorded as "gate 9's byte-identity invariant does not hold on that class" with the root-cause deferred.
+
+**Reproduced, then bisected.**  The same pair reproduces on the r308 build, and only on a **multi-device tensor
+split**: 3 GPUs `-sm tensor` (all-VRAM or `-ncmoe 47`) reads 459 vs 446, while one device reads 453 in all four
+arms.  The arm that was missing from the table decides it: `LLAMA_FUSED_HC_COMBINE=0 **+ GGML_CUDA_DISABLE_HC_FUSION=1**`
+(a chain combine with no matcher fusion) also reads 459, so the matcher is not the carrier -- the *combine op* is.
+Then the matrix, with every switch pinned (`MIX COMBINE PRE POST`, `-sm tensor`, 3 GPUs, 96 tokens, seed 42):
+
+| arm | text |
+|---|---|
+| true chain `0 0 0 0` | 450 `bc46095cf4c6` |
+| `mix_op 1 0 0 0` / `comb_op 0 1 0 0` / `both_ops 1 1 0 0` | 450 `bc46095cf4c6` (all three) |
+| `cuda_fuse_off 0 0 0 0 + DISABLE_HC_FUSION` | 450 `bc46095cf4c6` |
+| `dsv4_pre_op 0 0 1 0` | 444 `7ea23f309705` |
+| `dsv4_post_op 0 0 0 1` | 454 `9b4b033b33f7` |
+| all four on (= the shipping default on this split) | 446 `a5d0ec7b809d` |
+
+**Root cause.**  `cparams.fused_dsv4_hc_post = meta_split_active` (`src/llama-context.cpp`): a Meta device (i.e.
+`-sm tensor`) turns the **DSV4_HC_POST op** on by default.  `build_hc_mix`/`build_hc_combine` take their DSV4
+branch only on the **chain** path, so the two DSV4 ops are **mutually exclusive** with the mix/combine ops.  The
+gate's `chain_chain` arm set only `LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0` and left `DSV4_HC_POST` at its
+(default) value, so on a tensor split it was not the chain -- it was "chain mixer + DSV4_HC_POST" -- and every
+`COMBINE=1` arm *lost* that op.  The gate was comparing two numeric fusions and calling the difference a combine
+disagreement.  446 and 459 are both correct numbers for the two states; on IQ4_NL the combine op and the CUDA
+matchers are in fact **byte-identical to the chain** (450 each), which is what gate 9 was supposed to assert.
+Why it looked pre-existing: the split-dependent default arrived in the r242 era, and the reference arm silently
+changed meaning with it (r156's 444 was the same class measured before the post op existed).
+
+**A second finding, from isolating the switches.**  On the **fused-mixer** class (GSQ-IQ3_XXS, BF16
+`hc_attn_down`) the mixer op is **not** byte-identical to its chain under `-sm tensor`: `mix_op` reads 449
+`6a102dbc62d6` while the true chain reads 449 `d62340fbf566` (under `-sm layer` the two coincide).  It is
+rounding-level, not a defect: `llama-perplexity --kl-divergence` against the chain, 3 GPUs `-sm tensor`, wikitext
+**20 x 512**, reads **mean KLD 0.000000 +- 0.000000 / same-top-p 100.000 %** (for scale, the DSV4 pre op at the
+same point reads **0.015568 / 96.451 %**).  Mechanism: the fused mixer's *inject* half is the fused band dot
+(`hc_mix_down_dots`) where the chain's is `build_lora_mm(w_inject, xn)` + a SCALE, i.e. a different reduction
+order, so a greedy near-tie can flip.  An aliased arm would be ULP-identical to the chain and cannot flip a
+near-tie; that is why it is anchored rather than hard, and why "byte-identical" is no longer claimed for it.
+
+**The gate now.**  10 arms, `MIX COMBINE PRE POST` all named (a startup check rejects any arm that leaves one
+out -- the `env -` class of mistake, r303): HARD = `chain_chain` (reference, all four off), `comb_op` and
+`cuda_fuse_off` against it, `both_ops` against `mix_op` (so the combine stays hard with the mixer fused), and
+`mix_op` against it on a **chain-mixer** class, where the switch is inert and the verdict says so.  NUMERIC
+(anchored) = `dsv4_pre_op`, `dsv4_post_op`, `all_ops` (the shipping state on a tensor split), `ops_no_post` (the
+shipping state on one device / `-sm layer`) and `mix_op` on a fused-mixer class.  The `defaults` arm (no env at
+all) must equal one of the two explicit shipping states and *prints which*, so the split-dependent default is
+reported and a change to it is a FAIL instead of a silently different arm set -- that is what picks the anchor
+set (per class **and** split state).  It also pins `LLAMA_HC_BLK16=0 LLAMA_HC_RES16=0 GGML_CUDA_MMB_DOWN16=0`
+alongside the r302-era `ROCBLAS_USE_HIPBLASLT=0`/`MOE_EXPERT_HEATMAP=load` (a model dir's `runme` sets the HC16
+marks, and they move this class's text).  `--types` also stops calling a post-#31028 **merged** GGUF a "CHAIN
+mixer": since r303 the fused mixer takes two row views of the merged tensor, so that line now says
+FUSED-capable -- the wording is how the shape went unexercised for six releases.
+
+**Verification.**  The fixed gate PASSes on all four shape/class combinations, with the recorded anchors:
+GSQ-IQ3_XXS `-sm layer` (chain 449 `6a102dbc62d6`, `mix_op`/`comb_op`/`both_ops`/`cuda_fuse_off` all identical,
+`defaults` == `ops_no_post`), GSQ-IQ3_XXS `-sm tensor` (chain 449 `d62340fbf566`, combine 449 == chain,
+`both_ops` == `mix_op`, `defaults` == `all_ops`), IQ4_NL `-sm layer` (chain 459 `9f8819c4c2c5`, 5/5 hard
+identical) and **IQ4_NL `-sm tensor` -- the #341 case, 5/5 hard arms 450 `bc46095cf4c6`** where r303/r308 read
+FAIL.  Negative control: `SOFT_EXPECT` with a bogus `dsv4_pre_op` anchor FAILs that arm and exits 1 (so the
+anchored arms have teeth, #292's requirement).  `#342` re-checked while here and still **WAITING**: the bucket's
+`latest` was rebuilt on 2026-11-18 04:23 (`sha256 45dfe5ac...`) and its 3.5 MB archive still has no
+`workbox[.*].js`, so `ui-assets.cmake:137` still aborts a fresh source configure and `HF_UI_VERSION=b12387` stays
+the per-block-gate workaround.
+
+**Not in this release.**  No `patches/` file changed, so no fork refresh (`rdna-boosts` still carries r308's
+`87d3629df`, which `release.json.tip` still names) and no container rebuild -- both remain the maintainer's call
+with the tag.
+
 ## 261117.007 (r308, RELEASE v17-4f9dfa0e3-r308) -- `--kv-unified` enabled a fused FA form that no AMD kernel can run: the kv_rows probe now REQUIRES the node (field report, gfx1151; 3.0x plain and 3.3-3.5x MTP decode)
 
 **What shipped.**  Block **05**, one descriptor (`src/llama-context.cpp`: `require_observed` on the kv_rows probe,

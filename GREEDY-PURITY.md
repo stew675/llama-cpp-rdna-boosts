@@ -1474,11 +1474,15 @@ same intermediate, each fused consumer must match the *chain*, never the sibling
 written hand in hand stays mutually consistent and can still both be wrong.
 
 **Rule.**
-1. **A fused op's reference is the model's chain, and the arms must be crossed.**  `scripts/gate-hc-fusions.sh
-   MODEL.gguf` runs all four mix/combine combinations (plus the CUDA-side chain fusions and the DSV4 HC
-   pre/post pair) and fails unless every hard arm is **byte-identical to the unfused chain**.  Run it once per
-   hc-down weight class -- Q8_0/BF16 `hc_attn_down` takes the fused mixer, any other quant takes the chain
-   (`--types MODEL.gguf` prints the class).  Two arms of a two-way switch is not coverage.
+1. **A fused op's reference is the model's chain, and the arms must be crossed - with EVERY switch pinned.**
+   `scripts/gate-hc-fusions.sh MODEL.gguf` runs the mix/combine arms (plus the CUDA-side chain fusions and the
+   DSV4 HC pre/post pair) with all four switches named, and fails unless each hard arm is **byte-identical to
+   the true unfused chain** (all four off).  Leaving a *defaulted* switch alone is not a control: the two DSV4
+   switches default non-uniformly (`fused_dsv4_hc_post` is `meta_split_active`) and the DSV4 ops are
+   unreachable from a fused mix/combine graph, which made the old reference arm a DSV4-op arm on any tensor
+   split (r309, `TODO` #341).  Run it once per hc-down weight class -- Q8_0/BF16 `hc_attn_down` takes the fused
+   mixer, any other quant takes the chain (`--types MODEL.gguf` prints the class) -- and once per split state;
+   the gate's `defaults` arm reports which state the run took.  Two arms of a two-way switch is not coverage.
 2. **An intermediate's scale belongs to the emitter.**  If two emitters can produce the same intermediate the
    convention is stated once and both implement it; a `/hc` (or any scalar) inside a *consumer* is a
    convention claim a re-base can invalidate.  `GGML_OP_HC_MIX`'s inject tail now carries the scaled logit
@@ -1505,6 +1509,18 @@ reads mean KLD **0.021542 / 95.814 %** against its own F32 chain, the same order
 always shown, because `dsv4_hc_pre_f32`'s `wbf16`/`xbf16` arms read the HC16 bf16 producer slots by design --
 so `LLAMA_FUSED_DSV4_HC_PRE=0` swaps the producer precision as well as the fusion.  The Flash-Next IQ4_NL base
 is recorded from the shipped default (`base_ppl` 2.7527) and the hard oracle is unchanged.
+
+**r309 correction (`TODO` #341).**  With every switch pinned the picture is sharper, and one earlier claim was
+too strong.  On the IQ4_NL class at 3 devices `-sm tensor` the true chain, `mix_op`, `comb_op`, `both_ops` and
+`GGML_CUDA_DISABLE_HC_FUSION=1` all read **450 `bc46095cf4c6`** -- the ops ARE exact there; what had looked
+like a combine disagreement was DSV4_HC_POST vs HC_COMBINE (444 `7ea23f309705` for the pre op alone, 454
+`9b4b033b33f7` for the post, 446 `a5d0ec7b809d` for all four).  On the *fused-mixer* class the mixer op is
+**numeric, not an alias**: its inject half is the fused band dot where the chain's is the lora GEMM, measured
+mean **KLD 0.000000 / same-top-p 100.000 %** against the chain (20 x 512 wikitext) -- rounding level -- and yet
+a greedy near-tie flips under `-sm tensor` (chain 449 `d62340fbf566`, mixer 449 `6a102dbc62d6`; they coincide
+under `-sm layer`).  So "byte-identical to the chain" holds for the combine op, the CUDA matchers and the
+whole chain-mixer class, and does not hold for the mixer op on a fused-mixer class: anchor it, do not quote a
+hash from one split as the class's oracle.
 
 Record: `WORKLOG.md` 261026.006 (r148), 261027.007/008 (r157); `patches/README.md` (block 11);
 `ENVIRONMENT.md` §7.4.
