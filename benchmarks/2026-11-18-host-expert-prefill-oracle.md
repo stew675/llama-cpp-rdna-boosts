@@ -169,9 +169,10 @@ the measurement.
 * `scripts/gate-prefill-logits.sh` gained `--pin "K=V,..."` (both arms, folded into the base file name, recorded
   in the meta, refused on mismatch) — without it a base recorded under one BLAS/heat-map state could be found
   and compared against another, which on this shape is a text *and* a kernel-set difference.
-* **Not covered:** the 2-slot concurrent arms stay non-oracles (`GREEDY-PURITY.md` §38/§82/§63) — nothing here
-  changes the two-slot rule.  The wide-step *multi-prompt* interleaving (`split_equal`) still has no text oracle
-  and is judged by KLD, as before.
+* **Out of scope by existing doctrine, not left open:** every arm here is single-slot.  A two-slot pair and the
+  wide-step multi-prompt interleaving (`split_equal`) are non-oracles by `GREEDY-PURITY.md` §63/§38 (per-config
+  determinism is a *single-slot* statement; `--kv-unified` serving is not deterministic), which predates this item
+  — such a shape is judged by KLD plus throughput, and this record claims nothing else about it.
 * **Bisected, and it is not any of the obvious candidates:** §1b eliminates the prior, the arena size, the
   residency breadth and r307's repair across 42 runs; only the BLAS library state moves the text, reproducibly.
   If a future release sees a spread again, `scripts/gate-host-expert-text.sh` fails instead of a reading being

@@ -98,9 +98,10 @@ compare with one) **refuses** as designed; coherence
 `llama-cli` 4B `-sm tensor` (3 GPUs) reads `100 chars sha=1c5d32ac537d` on a binary that is byte-identical to
 r309's (no patch changed); every run's kernel journal clean via `check-gpu-faults.sh --since`.
 
-**One thing recorded rather than fixed.**  The wide-step *multi-prompt* interleaving (`split_equal`) still has no
-text oracle on this shape and stays a KLD-only judgement (`GREEDY-PURITY.md` §63), exactly as before -- a
-two-slot or multi-prompt pair is not an oracle at any pin.
+**Scope, not a gap.**  Every arm above is single-slot (`-np 1`, one request).  A multi-prompt wide step
+(`split_equal`) or any two-slot pair is **not** a text oracle -- that is `GREEDY-PURITY.md` §63/§38, stated long
+before this item and unchanged by it, so nothing here claims or owes one: per-config determinism is a single-slot
+statement, and a shape change of that kind is judged by KLD plus throughput.
 
 ## 261117.009 (r309, published) -- `v17-4f9dfa0e3-r309` is PUBLISHED: delivery repo `main` + tag, and the fork's `rdna-boosts` already carries `.tip` because no patch changed
 
