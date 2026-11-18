@@ -1,3 +1,25 @@
+## 261118.008 (r313, published) -- `v17-4f9dfa0e3-r313` is PUBLISHED: delivery repo `main` + tag, and the fork's `rdna-boosts` is re-cut at `.tip`
+
+**Published.**  Delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main` `d09454d0..c074f170`, annotated
+tag **`v17-4f9dfa0e3-r313`** (`81bd767c`).  The fork `git@github.com:stew675/llama.cpp.git` `rdna-boosts` moved
+`8a9e34b57..6443c787e` (force-with-lease, lease read `8a9e34b57`), i.e. exactly `release.json.tip` (tree
+`a9b88bab5`), and `git ls-remote` re-read after the push confirms it.
+
+**Verified rather than assumed.**
+* **Fork refresh**: `scripts/fork-refresh.sh --build --gates` re-cut from `4f9dfa0e3` with `apply-all.sh`, asserted
+  the applied tree == `release.json.tree` (`a9b88bab5`), the commit count == `n_default` (18), printed tip
+  **`6443c787e`** -- the same id the independent re-cut into `/tmp/rcut` printed, so the deterministic re-cut holds
+  across two runs -- built it with `~/bin/build-llama-rocm`, and ran the coherence + prefill-logit gates
+  (**0.000000 / 100.000 %**).  The push ran with `--yes` after a first invocation was stopped at the confirmation
+  prompt (nothing had been pushed by that one).
+* **Delivery artifacts**: `validate-set.sh` GREEN twice on the final tree -- 18 default patches strict on a fresh
+  tarball at `4f9dfa0e3`, applied tree `a9b88bab5`, both optional artifacts re-cut and applying strictly
+  (`b40c32caa` / `f46c3778a`, cumulative `06013692f`), Windows portability 512 files.
+* **Remote state**: `origin/main` = `c074f170`, `refs/tags/v17-4f9dfa0e3-r313` = `81bd767c`, both as pushed.
+* **Container images**: the worker watcher (`scripts/container-watch.sh` on `radiance`) polls for the tag and will
+  rebuild + push both ROCm lines.  Nothing was built on the primary box (policy).
+* The contributor's PR is answered and the submission is archived verbatim under `archive/work/hc-mix-q8/pr326/`.
+
 ## 261118.007 (r313, RELEASE v17-4f9dfa0e3-r313) -- contributor PR #326: the Q8_0 hyper-connection mixer runs the BF16 mixer's launch count (UD quants, +7.1 % decode), folded into official block 11
 
 **What shipped.**  Block **11** only: the fused **Q8_0** `HC_MIX` op -- the one every unsloth UD qwen4exp file
