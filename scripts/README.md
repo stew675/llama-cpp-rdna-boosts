@@ -48,6 +48,7 @@ scripts/gate-spec-reuse-window.sh                      # drafter KV reuse gate: 
 scripts/gate-kv-window-split.sh                         # the windowed KV across a -sm tensor split, 3/2/1-device + uneven-ts + MTP + fit arms (TODO #124)
 scripts/gate-moe-promise.sh                             # MoE take-over promise LIFETIME gate (issue #327): a stale promise repairs nothing, a same-pass break still repairs every table byte for byte
 scripts/gate-kv-residency.sh                             # KV residency gate: the window and the pool, resident arm vs forced-miss arm (campaign P0), incl. a 2-device -sm layer pool section; since r217 it also asserts the pool keeps >= 40 % of the no-pool PROMPT rate (a correct-but-slow placement fails); since r222 it also gates the provider's selftest (PASS by default, FAIL without the quarantine hold)
+scripts/gate-fused-probe-splits.sh                    # fused-op PROBE gate (r308): a probed feature may not enable a graph the backend cannot run -- `splits == 1` on every arm, the placement and observation decline mechanisms graded separately, plain/dense-always/sparse/rows-off + the MTP pair (issue #345 tracks the remaining probes)
 scripts/gate-mixed-kv.sh                                 # mixed K/V gate (OPTIONAL block 0101, run on the optional-applied build): FLASH_ATTN_EXT default/MIXED=0/NATIVE=0, W=1..8 width purity for q8_0/q8_0 and the three pairs, text arms, and the non-256 / qwen4exp refusals
 ```
 

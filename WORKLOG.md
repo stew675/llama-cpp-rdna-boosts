@@ -1,3 +1,78 @@
+## 261117.007 (r308, RELEASE v17-4f9dfa0e3-r308) -- `--kv-unified` enabled a fused FA form that no AMD kernel can run: the kv_rows probe now REQUIRES the node (field report, gfx1151; 3.0x plain and 3.3-3.5x MTP decode)
+
+**What shipped.**  Block **05**, one descriptor (`src/llama-context.cpp`: `require_observed` on the kv_rows probe,
+its comment, and the positional-initializer warning next to it), `release.json` at
+**`v17-4f9dfa0e3-r308`** (tip `87d3629df`, tree `3e64b1473`; optional re-cut `1bdef645c` / `bb8354fb8`, cumulative
+`cbc02aedb`), and a new gate `scripts/gate-fused-probe-splits.sh` (the instrument for the class).  Block count
+unchanged (17 official + `0300`).  Records: `patches/README.md` block 05, `MANIFESTS.md` block 05 + the gate,
+`INVARIANTS.md` r308, `TODO` #345 (the same vacuity class in the OTHER fused-op probes), `scripts/README.md`,
+`AGENTS.md`'s gate table.
+
+**The report.**  A Flash-Next IQ4_NL server (the model dir's own flags: `--kv-unified --parallel 2 -c 163840`,
+one active slot) decoded at ~70 % of its `--no-kv-unified` rate.  Measured here on the same shape: plain decode
+**32.5 -> 11.0 t/s**, and the decode graph read **25 backend splits** (one per joint attention layer plus the
+output split) instead of 1.  Prefill was untouched (1341 vs 1318 t/s), which is why it looked like a decode-only
+tuning regression.
+
+**Root cause: a vacuous PROBE, not the unified cache.**  `cparams.auto_fkvr = cparams.kv_unified` is the only
+thing that probes upstream #29510's `ggml_flash_attn_ext_rows` ("attend to this sequence's K/V rows only"), and
+`resolve_fused_ops()` decides a fused feature by where the probe graph's node LANDED.  The reserve/probe context
+carries `n_kv = kv->get_size()` -- the whole **padded** cache extent, not the used depth -- and qwen4exp's decode
+arm depends on that extent: dense only while `n_kv < qsa_dense_decode_until`, which is **32768** on gfx1151.  So
+at `-c 32768` and above the probe graph took the SPARSE QSA arm, which builds no rows node at all; the probe did
+not require the node, so it reported `Flash Attention over K/V rows enabled` having verified nothing.  At decode
+time (a shallow used extent) the DENSE arm builds the node, **no kernel outside NVIDIA turing-MMA reads the rows
+form** (`ggml_cuda_get_best_fattn_kernel`'s kv_rows branch returns NONE on every AMD arch), so the scheduler
+placed every joint attention layer on the CPU backend -- silently: no fault, and identical text (the CPU rows FA
+is correct, and on an APU the KV is already host memory, so it is CPU-attention cost, not a copy storm).
+
+**MTP is affected too, and worse per step.**  The verify band is `n_tokens <= max(8, n_rs_batch)` (the
+width-purity rule that makes a verify batch take the same arm as W=1), so every speculative step built the rows
+form, and the drafter's OWN unified context was in the same state.  Flash-Next + `draft-mtp n3`, one slot, 15.5K
+depth: **18.7 -> 62.4-65.0 t/s (3.3-3.5x)**, every graph `splits = 1`.  With the flag the target context reads
+`was not used in the probe graph, set to disabled` and the drafter declines by placement (its single layer IS the
+rows node).
+
+**Why it was silent for a year of releases, and why the first cut of this fix measured nothing.**  Two traps, both
+recorded in `INVARIANTS.md` r308.  (1) The vacuity needs a model whose PROBE arm differs from its RUNTIME arm, so
+only qwen4exp on gfx1151 at `-c >= 32768` can reach it -- gfx1100/gfx1201 have `qsa_dense_decode_until` unbounded
+and decline by placement, and a non-QSA model never has an arm policy at all.  (2) `llm_fused_op_probe` is
+initialized **positionally** -- the `/*.field =*/` designators in this file are comments -- so the amendment's
+first cut (`/*.require_observed =*/ true` appended as the fourth value) initialized `n_seqs` and left the flag
+false: it compiled, it ran, and it changed nothing (measured: the target still logged `enabled`).  The initializer
+now lists every field in struct order and the struct carries a do-not-shorten warning; the MTP arm is what caught
+it, which is why the gate runs drafter arms.
+
+**Not affected, verified with the flag in place.**  gfx1100 (RDNA3_0) and gfx1201 (RDNA4): their QSA policy is
+dense-always, so the probe reaches the node and declines by placement -- exercised on this gfx1151 box by forcing
+that policy (`LLAMA_QSA_DENSE_DECODE_UNTIL=1000000000`), with the drafter: placement decline, `splits = 1`,
+60.9 t/s.  Non-QSA models: Qwen3.6-35B-A3B Q8_0 and Qwen3.8-27B Q8_0 (both embedded MTP) read the node in the
+probe, place it on the CPU, decline, and keep `splits = 1` (90.2 / 21.9 t/s decode, unchanged by the flag).
+`--no-kv-unified` never probes (unchanged), and `LLAMA_KV_ROWS_DISABLE=1` is the user-facing A/B arm (restores
+32.5 t/s).  The unified cache itself costs nothing measurable: with the flag, `--kv-unified -c 32768` reads 32.5
+t/s against `--no-kv-unified`'s 32.5.
+
+**Verification.**  `scripts/gate-fused-probe-splits.sh` (new) PASS on all six arms: **`worst splits = 1` in every
+arm**, `plain` 33.8 / `dense-always` 33.8 / `sparse` 32.0 / `rows-off` 33.8 / `mtp` 33.2 / `mtp-rdna34` 33.2 t/s at
+the gate's own point (48 tokens, so MTP acceptance — not the rate — is what that point measures; the 3.3-3.5x MTP
+number above is the 15.5K-depth arm), `plain == rows-off == dense-always` and `mtp == mtp-rdna34` texts identical
+(`126d589b663e`), the declines graded separately (`plain`/`sparse`/`mtp` by OBSERVATION, `dense-always`/
+`mtp-rdna34` by PLACEMENT), the `sparse` arm's different decode regime reported not asserted (`890cc358a6e7`), and
+`check-gpu-faults.sh` clean over the gate's window.  Negative test: `--log` mode on r307's two decisive lines
+(`Flash Attention over K/V rows enabled` + `splits = 25`) FAILs both assertions.  Also: coherence 4B
+`1c5d32ac537d`; the **full** per-block ladder **18/18** in 5950 s (mandatory after amending an early block,
+`INVARIANTS.md` r307 item 5 — the cache was cold for the early blocks on this box, hence the long run);
+`validate-set.sh` strict 18/18 with both optional artifacts re-cut (`a797d27a9` / `618feb669`, cumulative
+`cbc02aedb`) and applied; and `gate-prefill-logits.sh` on the 9B Q8_0 base: **mean KLD 0.000056 / same-top-p
+99.647 %** -- i.e. the prefill path did not move, as expected of a flag that only stops a graph form being built
+(the arm it removes was already the CPU fallback); its journal check was clean.  The fork refresh
+(`scripts/fork-refresh.sh --build --gates --push`) re-cut the personal fork's `rdna-boosts` branch and pushed it
+at **`87d3629df`** (the re-cut tip, reproducible: two independent re-cuts at the same base read the same id --
+`release.json.tip` is that value, never the working chain's).  Its `--gates` pass stopped at the *27B* KLD arm
+because this box has no base recorded for that model (the gate defaults to the largest model; the 9B arm above was
+run by hand with the base that exists) -- a box state, not a release property.  Numbers, per arm, in the block
+commit message.
+
 ## 261117.006 (r307, RELEASE v17-4f9dfa0e3-r307) -- issue #327: the MoE take-over PROMISE is scoped to its staging pass, so a recycled `input_cpy` address stops re-reading every routed expert table on a 30-34 token prompt
 
 **What shipped.**  Block **10** for the fix, in three files (`ggml/src/ggml-cuda/moe-expert-cache.cu`,

@@ -942,6 +942,22 @@ almost all of them `template-instances/*.cu`.
   (the padded arm is upstream's expression verbatim), which puts the instance ISA back on r250's exact counts.
   Gate: `FLASH_ATTN_EXT` (the padded instances are the reason the clamp exists), the prefill-logit pair, and a
   `rocprofv3` census of the prefill instantiation -- `benchmarks/2026-11-14-fa-prefill-min-codegen.md`.
+* **The kv_rows probe must OBSERVE its node (r308, field report on gfx1151).**  Upstream #29510's
+  `ggml_flash_attn_ext_rows` ("attend to this sequence's K/V rows only") is probed only under `--kv-unified`
+  (`cparams.auto_fkvr = cparams.kv_unified`), and `resolve_fused_ops()` accepts it on where the probe graph's
+  node landed.  The reserve/probe context carries `n_kv = kv->get_size()` -- the whole **padded** cache extent --
+  and qwen4exp's QSA decode arm is dense only while `n_kv < qsa_dense_decode_until` (**32768** on gfx1151), so at
+  `-c >= 32768` the probe built the SPARSE arm, contained no rows node, and still reported `enabled`
+  (`require_observed` was false).  No AMD arch has a kv_rows kernel (`ggml_cuda_get_best_fattn_kernel` returns
+  NONE), so every joint attention layer then ran on the CPU: `splits = 25` in the decode graph, plain decode
+  **32.5 -> 11.0 t/s** and MTP `draft-mtp n3` **62-65 -> 18.7 t/s** at 15.5K depth (prefill and text unchanged;
+  the verify band takes the same dense arm, and the drafter's own unified context was in the same state).  The
+  descriptor now sets `require_observed` and lists every field in struct order -- the initializers here are
+  positional and the `/*.field =*/` designators are comments.  gfx1100/gfx1201 decline by placement (their
+  `qsa_dense_decode_until` is unbounded) and non-QSA models never reach it; both re-verified.  Gate:
+  `scripts/gate-fused-probe-splits.sh` (6 arms incl. the MTP pair; `splits == 1`, the two decline mechanisms
+  graded separately).  Knob: `LLAMA_KV_ROWS_DISABLE=1` is the A/B arm (upstream's).  `WORKLOG.md` 261117.007,
+  `INVARIANTS.md` r308.
 * **The band kernels** (`fattn-rdna.cuh`): the RDNA4 head-256 GQA-6 band (the GQA group folded into
   `ncols2 = 8`, a round-robin KV split over a fixed `P`), extended to the 2-byte (f16/bf16) arm and capped
   by `GGML_HIP_FA_BAND_WMMA_GQA_MAX` (default 12) for GQA-12 models.  Since r92 the 2-byte arm uses the

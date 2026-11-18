@@ -509,3 +509,44 @@
    delta did not move (run the full ladder after amending an early block, or after touching a block that defines a
    symbol another block uses), and a symbol one block introduces for a later block's feature is the shape to grep
    for when a mid-chain tree fails to build.
+
+## r308 — the fused-op PROBE answers a question about a graph shape, not about the backend
+
+Established by the `--kv-unified` kv_rows defect (gfx1151 field report; `WORKLOG.md` 261117.007, block 05, gate
+`scripts/gate-fused-probe-splits.sh`).
+
+1. **A fused-op probe verifies PLACEMENT, so it is only valid if its graph contains the node.**  The reserve/probe
+   context carries `n_kv = kv->get_size()` — the whole **padded** cache extent (`llama-kv-cache.cpp`'s reserve
+   constructor), never the used depth — and a model's graph shape may depend on that extent: qwen4exp's decode arm
+   is dense only while `n_kv < qsa_dense_decode_until` (32768 on gfx1151, unbounded elsewhere).  At a large `-c`
+   the kv_rows probe therefore built the SPARSE arm, contained no rows node, and — with the descriptor's
+   `require_observed = false` — reported "enabled" having verified nothing.  A probe that does not require its op
+   is a probe of the graph's *current shape*, not of the backend.  `require_observed` is what turns "cannot
+   verify" into "disable".
+2. **Upstream's `ggml_flash_attn_ext_rows` (kv_rows) has no AMD implementation, so on this delivery it can only
+   ever be disabled.**  `ggml_cuda_get_best_fattn_kernel`'s kv_rows branch returns `MMA_F16` only for NVIDIA
+   turing-MMA with a mask; every AMD arch gets `NONE`, i.e. the node is placed on the CPU backend.  Enabling it
+   costs one CPU attention launch per joint layer per step plus a device→host round trip of every K/V view.  The
+   arm is still worth probing (the delivery claims portability), but a PASS there is a defect signal on AMD.
+3. **A CPU-placed attention node is silent, so judge it by `splits`, never by text.**  The text is byte-identical
+   (the CPU rows FA computes the same thing), there is no fault, and on an APU the K/V is already host memory, so
+   the only visible symptom is a 3x decode loss.  `sched_graph_realloc: … splits = N` (N > 1) at `-lv 4` is the
+   oracle; the r307 shape read **25** splits (one per joint layer + 1).  Cost measured at 15.5K depth, one active
+   slot: plain 32.5 → 11.0 t/s, MTP `draft-mtp n3` 62-65 → 18.7 t/s (a speculative step is the same dense arm
+   — its verify band is `n_tokens <= max(8, n_rs_batch)` — and the drafter's own unified context is a second
+   victim).
+4. **Only qwen4exp on gfx1151 at `-c >= 32768` can reach this vacuity, and that is a coverage fact, not a pass.**
+   gfx1100/gfx1201 have `qsa_dense_decode_until` unbounded, so their probe always contains the node and declines
+   by placement; a non-QSA model has no arm policy at all.  Verified with the flag: 35B-A3B Q8_0 90.2 t/s and
+   27B Q8_0 21.9 t/s (both embedded MTP, `splits = 1`), and the gfx1100/gfx1201 policy forced on gfx1151 with
+   `LLAMA_QSA_DENSE_DECODE_UNTIL=1000000000` (60.9 t/s with the drafter).  An explicit
+   `LLAMA_QSA_DENSE_DECODE_UNTIL` below the context reproduces the vacuity on ANY arch.
+5. **`llm_fused_op_probe` (and its siblings in `llama-context.cpp`) are initialized POSITIONALLY; the
+   `/*.field =*/` designators are comments, not C++20 designated initializers.**  Appending
+   `/*.require_observed =*/ true` as the fourth value initializes `n_seqs`, leaves the flag false, compiles
+   cleanly, and measures nothing — r308's first cut did exactly that and the `enabled` line did not move.  List
+   every field through the one you want, in struct order (the file's `kq_derived` probe is the model), and check
+   the compiled constant when a flag "has no effect" (`.data.rel.ro` of the object, or a one-line census print).
+6. **`--kv-unified` is not itself a decode cost.**  With the flag, `--kv-unified -c 32768` reads the same 32.5 t/s
+   as `--no-kv-unified`; the whole difference in the field report was the mis-probed feature.  Do not "fix" a
+   unified-vs-per-stream gap by changing the cache — check the probe census first.

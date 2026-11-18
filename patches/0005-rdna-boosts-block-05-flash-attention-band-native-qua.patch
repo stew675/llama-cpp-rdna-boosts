@@ -1,4 +1,4 @@
-From 731a4403526ed324d74023a689cb873438f13c3c Mon Sep 17 00:00:00 2001
+From 6405594db1f173f1ef7970b40ebddf3a814818d4 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 12 Nov 2026 08:22:10 -0600
 Subject: [PATCH 05/17] rdna-boosts: block 05: flash-attention band, native
@@ -45,6 +45,43 @@ launcher forced with GGML_CUDA_FA_WMMA_MAX_HEAD): all-logits byte-identical to t
 r267 on head 256/gqa 4 and head 128/gqa 8 (ncols2 4 and 8 vs 1), pp512 +0.6-1.0 % and +1.3 %, 27B
 coherence d45e2221805a unchanged.  tests/test-backend-ops.cpp gains the head-512 aligned derived case
 that reaches the tile GQA dispatch on a cap-320 layout (and is the MMA arm on gfx1201).
+
+r308 amendment (field report, gfx1151): the kv_rows probe now REQUIRES the node (`require_observed`), because
+its probe graph can be built on a shape that never creates one.  The reserve/probe context carries
+`n_kv = kv->get_size()` (the whole PADDED cache extent), and a model's decode arm may depend on that extent
+rather than on the used depth: qwen4exp (QSA) decodes dense only while `n_kv < qsa_dense_decode_until`, which
+is 32768 on gfx1151.  At `-c 32768` (or any larger ctx, including the model dir's `-c 163840`) the probe
+therefore took the SPARSE QSA arm, which builds no rows node at all, so nothing was verified and "Flash
+Attention over K/V rows enabled" was logged.  No kernel outside NVIDIA turing-MMA reads the rows form (the
+kv_rows branch of ggml_cuda_get_best_fattn_kernel returns NONE on every AMD arch), so the scheduler then
+placed every joint attention layer on the CPU backend, silently: on an APU (shared host/device pool) it is a
+correctness-preserving but ~3x decode loss, not a fault or a copy storm.
+
+Measured (Strix Halo, gfx1151, the model dir's own flags, `--kv-unified`, ONE active slot, 15.5K depth):
+- plain decode `-c 32768`: 25 backend splits in the decode graph and **11.0 t/s**, against **32.5 t/s** with
+  `LLAMA_KV_ROWS_DISABLE=1` and 32.5 t/s for `--no-kv-unified`; prefill unaffected (1318 vs 1341 t/s), text
+  identical in every arm (the CPU rows FA is correct -- this is a performance defect).
+- MTP `draft-mtp n3` with the separate Flash-Next MTP GGUF at `-c 32768`: **18.7 -> 62.4-65.0 t/s
+  (3.3-3.5x)**, because the verify band (`n_tokens <= max(8, n_rs_batch)`) takes the same dense arm, so every
+  verify step built the rows form too -- and the drafter's own unified context was in the same state.
+With the flag the target context reads "was not used in the probe graph, set to disabled", the drafter's
+context declines by placement (its one layer IS the rows node), and every graph reads `splits = 1`.
+
+Arches that cannot reach it, verified with the flag in place (the same placement path the fix leaves alone):
+gfx1100 (RDNA3_0) and gfx1201 (RDNA4) have `qsa_dense_decode_until` unbounded, so their probe always reaches
+the dense arm and declines by placement -- exercised on gfx1151 by forcing that policy
+(`LLAMA_QSA_DENSE_DECODE_UNTIL=1000000000`), with and without the drafter: placement decline, `splits = 1`,
+60.9 t/s with MTP; and a non-QSA model cannot reach the vacuity at all (Qwen3.6-35B-A3B Q8_0 and Qwen3.8-27B
+Q8_0, both with embedded MTP: the node is observed, placed on the CPU, declined, `splits = 1`, 90.2 / 21.9
+t/s decode, unchanged by the flag).  An explicit `LLAMA_QSA_DENSE_DECODE_UNTIL` below the context reproduces
+the vacuity on ANY arch, which the flag also closes.  A probe that cannot verify an op must disable it,
+exactly like the derived kq mask probe next to it.
+
+NOTE FOR THE NEXT EDITOR: `llm_fused_op_probe` is initialized POSITIONALLY -- the `/*.field =*/` designators
+in this file are comments, not C++20 designated initializers.  Adding `/*.require_observed =*/ true` as the
+fourth value initializes `n_seqs`, leaves the flag false, and measures nothing (the first cut of this
+amendment did exactly that); the initializer now lists every field through `require_observed` in struct
+order and carries that warning next to it.
 ---
  common/common.cpp                             |    6 +
  common/speculative.cpp                        |    4 +
@@ -378,7 +415,7 @@ that reaches the tile GQA dispatch on a cap-320 layout (and is the MMA arm on gf
  ggml/src/ggml-hip/CMakeLists.txt              |   11 +
  ggml/src/ggml.c                               |   41 +
  include/llama.h                               |    6 +
- src/llama-context.cpp                         |  369 ++++-
+ src/llama-context.cpp                         |  394 +++++-
  src/llama-context.h                           |   28 +-
  src/llama-cparams.h                           |    4 +
  src/llama-graph.cpp                           |  200 ++-
@@ -387,7 +424,7 @@ that reaches the tile GQA dispatch on a cap-320 layout (and is the MMA arm on gf
  src/llama-kv-cache.h                          |   23 +
  src/llama-kv-cells.h                          |   53 +
  tests/test-backend-ops.cpp                    |  181 ++-
- 341 files changed, 5905 insertions(+), 677 deletions(-)
+ 341 files changed, 5930 insertions(+), 677 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-rdna.cuh
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_4-ncols2_8-dkq256-dv256.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_8-ncols2_8-dkq256-dv256.cu
@@ -9510,7 +9547,7 @@ index 4c171aa3d..49bf5558a 100644
          // [EXPERIMENTAL]
          // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0f389ad8c..87ed80cdf 100644
+index 0f389ad8c..703ce53c3 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -7,6 +7,9 @@
@@ -9606,7 +9643,43 @@ index 0f389ad8c..87ed80cdf 100644
  };
  
  static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
-@@ -166,6 +238,81 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
+@@ -130,10 +202,35 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
+     /*.n_tokens_per_seq =*/ 1,
+ };
+ 
++// V5 (r308): the kv_rows probe must OBSERVE the node, because its probe graph can be built on a shape that
++// never creates one.  The reserve/probe context carries `n_kv = kv->get_size()` (the whole PADDED cache
++// extent, llama-kv-cache.cpp), not the used depth, and a model's decode arm can depend on that extent:
++// qwen4exp (QSA) decodes dense only while `n_kv < qsa_dense_decode_until`, which is 32768 on gfx1151, so at
++// `-c 32768` (or any larger ctx) the probe graph takes the SPARSE arm and builds no rows node at all.
++// Without this flag that is a vacuous PASS and "enabled" is logged - and since NO kernel outside NVIDIA
++// turing-MMA reads the rows form (fattn.cu's kv_rows branch returns NONE on every AMD arch, so the node lands
++// on the CPU backend), every joint attention layer then runs on the CPU at decode time.
++//
++// Measured (Strix Halo, gfx1151, Qwen3.8 Flash-Next IQ4_NL, `--kv-unified`, ONE active slot, 15.5K depth):
++// plain decode `-c 32768` 11.0 t/s and 25 backend splits in the decode graph, against 32.5 t/s with
++// `LLAMA_KV_ROWS_DISABLE=1` and 32.5 t/s for `--no-kv-unified` (prefill unaffected); MTP `draft-mtp n3`
++// `-c 32768` 18.7 -> 62.4-65.0 t/s (3.3-3.5x), because the verify band takes the same dense arm, so every
++// verify step built the rows form too.  RDNA3_0 (gfx1100) and RDNA4 (gfx1201) cannot reach it (their
++// `qsa_dense_decode_until` is unbounded, so the probe always reaches the node and declines by placement), and
++// a non-QSA model never can; both were re-verified with the flag.
++//
++// DO NOT SHORTEN THIS INITIALIZER.  The list is POSITIONAL - the `/*.field =*/` designators below are
++// comments, not C++20 designated initializers - so a value inserted at the wrong position initializes the
++// wrong field.  Writing only `{op, name, 1, /*.require_observed =*/ true}` sets `n_seqs = 1` and leaves the
++// flag false, which measures exactly nothing (r308's first cut did that).
+ static const llm_fused_op_probe llm_fused_op_flash_attn_kv_rows_probe = {
+     /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN_KV_ROWS,
+     /*.name             =*/ "Flash Attention over K/V rows",
+     /*.n_tokens_per_seq =*/ 1,
++    /*.n_seqs           =*/ 0,
++    /*.require_gpu      =*/ false,
++    /*.require_kq_derived =*/ false,
++    /*.require_observed =*/ true,
+ };
+ 
+ static const llm_fused_op_probe llm_fused_op_lid_probe = {
+@@ -166,6 +263,81 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
      /*.n_tokens_per_seq =*/ 1,
  };
  
@@ -9688,7 +9761,7 @@ index 0f389ad8c..87ed80cdf 100644
  llama_context::llama_context(
          const llama_model & model,
                llama_context_params params) :
-@@ -184,6 +331,8 @@ llama_context::llama_context(
+@@ -184,6 +356,8 @@ llama_context::llama_context(
  
      const auto & hparams = model.hparams;
  
@@ -9697,7 +9770,7 @@ index 0f389ad8c..87ed80cdf 100644
      cparams.n_seq_max = std::max(1u, params.n_seq_max);
      if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
          throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
-@@ -338,6 +487,45 @@ llama_context::llama_context(
+@@ -338,6 +512,45 @@ llama_context::llama_context(
          cparams.auto_fa    = false;
      }
  
@@ -9743,7 +9816,7 @@ index 0f389ad8c..87ed80cdf 100644
      cparams.fused_lid = true;
      cparams.auto_flid = false;
  
-@@ -666,19 +854,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -666,19 +879,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
              return;
          }
  
@@ -9769,7 +9842,7 @@ index 0f389ad8c..87ed80cdf 100644
              GGML_ASSERT(node.il >= 0);
  
              ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
-@@ -698,11 +890,46 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -698,11 +915,46 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                  device_mismatch = true;
                  break;
              }
@@ -9816,7 +9889,7 @@ index 0f389ad8c..87ed80cdf 100644
          } else {
              enabled = true;
              LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
-@@ -721,6 +948,31 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -721,6 +973,31 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
          cparams.auto_fkvr = false;
      }
  
@@ -9848,7 +9921,7 @@ index 0f389ad8c..87ed80cdf 100644
      if (cparams.auto_flid) {
          LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
          resolve(llm_fused_op_lid_probe, cparams.fused_lid);
-@@ -790,6 +1042,61 @@ void llama_context::sched_new(const sched_params & params) {
+@@ -790,6 +1067,61 @@ void llama_context::sched_new(const sched_params & params) {
      sched_params_cur = params;
  }
  
@@ -9910,7 +9983,7 @@ index 0f389ad8c..87ed80cdf 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -806,6 +1113,10 @@ void llama_context::sched_reserve() {
+@@ -806,6 +1138,10 @@ void llama_context::sched_reserve() {
      const uint32_t n_seqs = cparams.n_seq_max;
      const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
  
@@ -9921,7 +9994,7 @@ index 0f389ad8c..87ed80cdf 100644
      const size_t max_nodes = this->graph_max_nodes();
  
      LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
-@@ -857,7 +1168,8 @@ void llama_context::sched_reserve() {
+@@ -857,7 +1193,8 @@ void llama_context::sched_reserve() {
      // reserve pp (prompt processing) graph first so that buffers are only allocated once
      {
          auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
@@ -9931,7 +10004,7 @@ index 0f389ad8c..87ed80cdf 100644
          if (!gf) {
              if (cparams.pipeline_parallel) {
                  LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
-@@ -867,7 +1179,7 @@ void llama_context::sched_reserve() {
+@@ -867,7 +1204,7 @@ void llama_context::sched_reserve() {
                      /*.parallel   =*/ false,
                      /*.op_offload =*/ cparams.op_offload,
                  });
@@ -9940,7 +10013,7 @@ index 0f389ad8c..87ed80cdf 100644
              }
              if (!gf) {
                  throw std::runtime_error("failed to allocate compute pp buffers");
-@@ -888,7 +1200,7 @@ void llama_context::sched_reserve() {
+@@ -888,7 +1225,7 @@ void llama_context::sched_reserve() {
          n_splits_tg = n_splits_pp;
          n_nodes_tg  = n_nodes_pp;
      } else {
@@ -9949,7 +10022,7 @@ index 0f389ad8c..87ed80cdf 100644
          if (!gf) {
              throw std::runtime_error("failed to allocate compute tg buffers");
          }
-@@ -910,10 +1222,10 @@ void llama_context::sched_reserve() {
+@@ -910,10 +1247,10 @@ void llama_context::sched_reserve() {
                  // [TAG_RESERVE_DIAG_DECAY]
                  // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                  // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
@@ -9962,7 +10035,7 @@ index 0f389ad8c..87ed80cdf 100644
          };
  
          if (!gf) {
-@@ -1084,7 +1396,7 @@ bool llama_context::memory_update(bool optimize) {
+@@ -1084,7 +1421,7 @@ bool llama_context::memory_update(bool optimize) {
  
          const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
  
@@ -9971,7 +10044,7 @@ index 0f389ad8c..87ed80cdf 100644
          if (!gf) {
              LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
          }
-@@ -2254,6 +2566,26 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2254,6 +2591,26 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      output_swaps.clear();
      embd_batch_idxs.clear();
  
@@ -9998,7 +10071,7 @@ index 0f389ad8c..87ed80cdf 100644
      sched_reserve();
  
      bool did_optimize = false;
-@@ -3105,7 +3437,8 @@ static void ubatch_prepare_reserve(
+@@ -3105,7 +3462,8 @@ static void ubatch_prepare_reserve(
  }
  
  ggml_cgraph * llama_context::graph_reserve(
@@ -10008,7 +10081,7 @@ index 0f389ad8c..87ed80cdf 100644
      LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs_l);
      GGML_ASSERT(n_outputs_l >= 1);
  
-@@ -3135,7 +3468,22 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -3135,7 +3493,22 @@ ggml_cgraph * llama_context::graph_reserve(
  
      auto * res = gf_res_reserve.get();
  
@@ -10032,7 +10105,7 @@ index 0f389ad8c..87ed80cdf 100644
  
      res->reset();
  
-@@ -4546,6 +4894,7 @@ llama_context_params llama_context_default_params() {
+@@ -4546,6 +4919,7 @@ llama_context_params llama_context_default_params() {
          /*.op_offload                  =*/ true,
          /*.swa_full                    =*/ true,
          /*.kv_unified                  =*/ false,
