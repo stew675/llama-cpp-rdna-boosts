@@ -1,3 +1,28 @@
+## 261118.004 (r311, published) -- `v17-4f9dfa0e3-r311` is PUBLISHED: delivery repo `main` + tag, and the fork's `rdna-boosts` is re-cut at `.tip`
+
+**Published.**  Delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main` `d3fb2e42..b0c85ac1`, annotated tag
+**`v17-4f9dfa0e3-r311`** (`879f92ff`).  The fork `git@github.com:stew675/llama.cpp.git` `rdna-boosts` moved
+`87d3629df..32f6d6a45` (force-with-lease, lease read `87d3629df`), i.e. exactly `release.json.tip` (tree
+`4a3db2c29`).
+
+**Verified rather than assumed.**
+* **Fork refresh**: `scripts/fork-refresh.sh --push` re-cut from `4f9dfa0e3` with `apply-all.sh`, asserted the applied
+  tree == `release.json.tree` (`4a3db2c29`), the commit count == `n_default` (18) and printed tip **`32f6d6a45`** --
+  the same id the earlier `--build --gates` re-cut printed, so the deterministic re-cut holds across two independent
+  runs.  `git ls-remote` re-read after the push: `32f6d6a45f62c6cb0eb2e487c7d24d5850da0150`.
+* **Delivery artifacts**: `validate-set.sh` GREEN on the published tree -- 18 default patches strict on a fresh
+  tarball at `4f9dfa0e3`, applied tree `4a3db2c29`, both optional artifacts re-cut and applying strictly
+  (`48dbb7700` / `7ed22548c`, cumulative `5fa077f78`), Windows portability 512 files.
+* **Remote state**: `origin/main` = `b0c85ac1`, `refs/tags/v17-4f9dfa0e3-r311` = `879f92ff`, both as pushed.
+* **Container images**: the worker watcher (`scripts/container-watch.sh` on `radiance`) polls for the tag and will
+  rebuild + push both ROCm lines.  Nothing was built on the primary box (policy).
+* **MTP Protocol A was not run, deliberately**: this change cannot alter a dispatch.  The evidence is that it does
+  not -- the probe census is identical on every arch and arm, the six real-model arms' text is byte-identical to an
+  r310 build of the same tree, and the prefill-logit point reads 0.000000 / 100.000 % -- and the gate that MANIFESTS
+  pairs with a `resolve_fused_ops()` change is `gate-fused-probe-splits.sh`, whose own `mtp`/`mtp-rdna34` arms (a real
+  drafter, `--spec-type draft-mtp n3`) passed with text identical to `plain`.  r308, the same class of change, also
+  ran the gate's MTP arms rather than Protocol A.
+
 ## 261118.003 (r311, RELEASE v17-4f9dfa0e3-r311) -- `TODO` #345: the other fused-op probes reported `enabled` having verified nothing, and `require_observed` would have been a REGRESSION on three of them
 
 **What shipped.**  Block **05** (`src/llama-context.cpp`: a `query_supports_op` descriptor field, a minimal-op factory and a
