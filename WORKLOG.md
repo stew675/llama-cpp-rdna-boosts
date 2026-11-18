@@ -1,3 +1,20 @@
+## 261117.009 (r309, published) -- `v17-4f9dfa0e3-r309` is PUBLISHED: delivery repo `main` + tag, and the fork's `rdna-boosts` already carries `.tip` because no patch changed
+
+**Published, at the maintainer's direction.**  Delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main`
+`1949e31a..55553a49`, annotated tag **`v17-4f9dfa0e3-r309`** (`fd04f662`, `^{}` = `55553a49`) -- the record is
+`WORKLOG.md` 261117.008 above.
+
+**Nothing else was owed, and that was verified rather than assumed:**
+* **Fork refresh**: `git ls-remote git@github.com:stew675/llama.cpp.git refs/heads/rdna-boosts` reads
+  **`87d3629dfef4ebe222272e2082f918f8cf591bc2`**, i.e. exactly `release.json.tip` (tree `3e64b1473`) -- the
+  `.tip` contract holds, because r309 changed no patch.  A re-cut would produce the same commits (the
+  deterministic `apply-all.sh`), so there was nothing to refresh; the branch is not stale.
+* **Container images**: the worker watcher (`scripts/container-watch.sh` on `radiance`) polls for the tag and
+  will rebuild + push both ROCm lines from it.  Nothing was built on the primary box (policy), and the source is
+  identical to r308's, so the images are a rebuild of the same tree -- expected, not a new artifact.
+* **Delivery artifacts**: `rdna-boosts-all.patch` and all 18 default patches + both `optional/` artifacts are
+  byte-identical to r308 (`scripts/validate-set.sh` GREEN on the published tree).
+
 ## 261117.008 (r309, RELEASE v17-4f9dfa0e3-r309) -- `TODO` #341 is a GATE defect, not a numerics defect: the hc arms never pinned the two DSV4 switches, so on `-sm tensor` the gate compared DSV4_HC_POST against HC_COMBINE and read 446 vs 459
 
 **What shipped.**  **No patch change** (`release.json` keeps tip `87d3629df` / tree `3e64b1473`, all 18 default
