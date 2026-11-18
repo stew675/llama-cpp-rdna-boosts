@@ -21,8 +21,15 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `4b61ecb6c5658dc067e1e3378e7c714fb66c34cb1c7f1ace4b55a6b43bcb3524` (the r313 cut -- the re-cut moved the exported commit and
-  the hunk offsets, see below; every earlier cut is recorded below)
+  `4ad739ce8b66f53ddee3fab6bbce990d816b5b48bd5e5fddb3af11a3406a47fc` (the r315 cut -- every re-cut moves the exported commit
+  and the hunk offsets, see below; every earlier cut is recorded below)
+* **r315 re-cut verification**: applies strictly at the r315 default tree
+  `ff3c4d85732d9dda27a6a4914c728afb541d7ae6` and produces `6328a17fa5b71d5bb621ac74d6d906913935ae34`; cumulative with the other
+  optional artifact, numeric order, is `7aec397b249a6f968e1cc425d63d89fbf8fad291`.  **The patch file moved**
+  (sha256 `4ad739ce8b66f53ddee3fab6bbce990d816b5b48bd5e5fddb3af11a3406a47fc`): block 05's r315 amendment adds the 256-dim work gate (`ggml_cuda_fattn_band_wmma_h256_applies()` and the new rows of
+  `fattn-rdna.cuh`), which is a file this artifact owns no hunk of, so the exported commit id and the hunk offsets
+  moved while the produced diff is otherwise unchanged.  `validate-set.sh`
+  check 8 verifies all three trees on every run.
 * **r314 re-cut verification**: applies strictly at the r314 default tree
   `623e5a13f376e45f01fdecc6929c6dd5de0ab1d5` and produces `7704a44e6c7a629458fb5982a8a30b864b2dd117`; cumulative with the other
   optional artifact, numeric order, is `4ea663b57d2d150d7452657ec526c84241e4c1a9`.  The patch file moved

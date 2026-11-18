@@ -772,7 +772,10 @@ ratio, capped at 8), so a GQA 7 decode read each K/V head once per query head.  
 submission: the arm is **on where it pays** (`ggml_cuda_fattn_band_wmma_h128_applies()`), and the 2-D launch
 is guarded on the compiled instance.
 
-1. **`K->ne[1]` at the FA op is the layer's KV CACHE SIZE, not the used length.**  Measured on the fork's
+1. **`K->ne[1]` at the FA op is the layer's KV CACHE SIZE, not the used length.**  *(r315 correction: it is the
+   PADDED USED LENGTH -- `min(cells.size(), max(256, GGML_PAD(used, 256)))`, measured 256 at d0 and 5376 -> 5632
+   while generating; the cache-size values below are the graph-RESERVATION pass.  The rest of this item's
+   reasoning, the attribute's usefulness and every number in it stand; the crossing cost is r315 item 3.)*  Measured on the fork's
    graph (a one-shot print in the band predicate, ricursive 65B): with a 51-token prompt the global layers
    read `K->ne[1]` = 8192 at `-c 8192` and 16384 at `-c 16384`, and the windowed layers read **1536** =
    `GGML_PAD(min(size_base, n_swa + n_ubatch), 256)` = `1024 + 512` (`llama-kv-cache-iswa.cpp`).  The value
@@ -822,3 +825,57 @@ is guarded on the compiled instance.
 7. **Not validated.**  a 128-dim *non-SWA* odd-ratio model with a real context (the submission's Nanbeige /
    Qwen2.5 case): no such file on this box, so the win is quoted from the contributor and corroborated only at
    the op level.  gfx1100/gfx1151 and Windows are untested for this arm.
+
+## r315 (2026-11-18, `WORKLOG.md` 261118.010) — a band WORK gate has to key on the padded used length, and that costs one crossing; the 256-dim arm gets the gate, an adaptive `P` does not work
+
+**Changed.**  Official block 05 only (`TODO` #345): `ggml_cuda_fattn_band_wmma_applies()` now gates the
+**256-dim** head class (27B GQA 6, 35B-A3B GQA 8, qwen4exp GQA 12) with
+`K->ne[1] * max(passes_tile - passes_band, 1) >= GGML_HIP_FA_BAND_H256_MIN_WORK` (default 20000), i.e. band
+from 10000 cells for GQA 6 and from 20000 for GQA 8 and GQA 12.  Knobs: `GGML_HIP_FA_BAND_WMMA_H256`
+(`auto` / `0` / `1`) and `GGML_HIP_FA_BAND_H256_MIN_WORK`.  The shared pass computation moved into
+`ggml_cuda_fattn_band_passes_tile()` / `..._passes_band()` so the 128- and the 256-dim gates cannot disagree.
+
+1. **`K->ne[1]` at the FA op is the PADDED USED LENGTH.**  This corrects r314 item 1: probe-printed on the 27B
+   at `-c 8192`, a 51-token prompt reads 256 for every decode step, a 5246-token prompt reads 768/1280/…/3840
+   during its ubatches then 8192 (the multi-device prefill pad) and 5376 → 5632 while generating.  The
+   8192/16384 values r314 reported come from the graph-**reservation** context, whose constructor sets
+   `n_kv = kv->get_size()`.  `llama_kv_cache::get_n_kv()` is
+   `min(cells.size(), max(pad, GGML_PAD(used, pad)))` with `pad` 256 for a decode/verify batch.
+2. **It is still the right attribute, and r314's measurements are not affected.**  It is exactly the number of
+   KV iterations the kernel executes (`iter_k = ceil(ne11/nbatch_fa)`), which is what a per-launch cost has to
+   be amortized over — and r314's own d0 row reads 0.0 %, which only a used-length key produces (a
+   cache-size key would have banded those global layers at d0 and read -0.9 %).  Never key on `Q->ne[1]`.
+3. **What it costs: one crossing per run, where a verify batch can straddle a 256-cell boundary.**
+   `test-logits-width-probe` at P=9980 (cells 9984 → tile for W=1..4, 10240 → band for W=5..8) **FAILs with
+   maxdiff 0.327**, while every constant-family arm passes with maxdiff 0.  This is inherent to any monotone
+   function of the used extent (a shift or a quantization of the threshold only moves the crossing), it is
+   already shipped for the 128-dim arm since r314, and the alternative — the cache size — reintroduces the
+   shallow losses whenever `-c` is large.  `GGML_HIP_FA_BAND_WMMA_H256=0/1` pins the family.  Recorded in
+   `GREEDY-PURITY.md` §96/§97.
+4. **The 256-dim band is a verify-width kernel.**  Per op (head 256, 4 K/V heads, band ÷ tile, best `P`):
+   GQA 6 decode width 2.64 (q8_0) / 1.96 (f16) at 512 cells, 2.13/1.59 at 1024, 1.30/1.89 at 2048, 1.26/1.48 at
+   4096, 0.96/1.09 at 8192, 0.66/1.10 at 32768; verify width 8: 1.14/1.24 at 512, then 0.76/0.71, 0.39/0.47,
+   0.31/0.40, 0.25/0.33, 0.18/0.25.  GQA 8 and 12 lose at the decode width just as hard (2.46 / 2.54 at 1024
+   cells) even though GQA 8 folds whole outside the band, which is why the gate's `max(…, 1)` floor gates that
+   ratio by cells alone instead of disabling it (its deep verify row measures 0.45 at 8192 cells).
+5. **End to end, the gate is a win on every 256-dim arm this box validates, except one MTP arm.**  27B tg64
+   44.20/44.84/44.38/43.48/41.91 → 46.13/45.65/45.18/43.55/41.90 t/s at d0/4K/8K/16K/32K (+4.4/+1.8/+1.8/0/0),
+   35B-A3B 130.12/134.63 → 139.72/138.82 (+7.4/+3.1), Flash-Next 72.04/72.70 → 74.25/74.35 (+3.1/+2.3),
+   35B-A3B `draft-mtp n3` 234.5 → 239.3 (+2.0), 27B `draft-mtp n3` at a 5.2K prompt 87.0 → 86.0 (**-1.1 %**, the
+   band is worth ~1 % there); the deep arm keeps the band (27B `draft-mtp n7` at a 20.5K prompt 79.0 → 78.9).
+   Every changed arm reproduces the previous build's all-tile arm **byte for byte** (35B-A3B
+   `ae39ec41bc1e` → `265c381dbc11` = its `GGML_HIP_FA_BAND_WMMA=0` text; the four MTP axes R `7dca501eeb0e` /
+   `759c1a4515c6`, P `fcc0bdeb636b`, C `eb89102cb7d8`, K `a87c4318b649`).
+6. **An adaptive `P` does not work, on either half of its premise.**  At depth there are no idle blocks
+   (32768 cells / 64 = 512 iterations against `P` = `nsm` = 32); at a short cache the idle blocks are free (a
+   block owning no iteration writes a neutral partial and exits) and a smaller `P` serialises the KV
+   iterations (512 cells: P8 52.6 µs, P16 31.1, P32 39.2, P64 56.6, tile 15.8 — `min(nsm, ceil(cells/64))`
+   picks 8, the worst band value).  It is also not keyable (item 1).  `P` = 16 is the optimum in 30 of 36 rows
+   and the quantized default `P = nsm` is 10-20 % off it — a separate tuning item, since it moves every banded
+   model's numerics.
+7. **Not validated.**  gfx1100/gfx1151 and Windows were not exercised for this arm (selection-only change on
+   kernels those classes already use, with the same suite as its oracle); no non-SWA 256-dim model was
+   available, and the class's members on this box are weight-bound below the gate, which is its purpose.
+
+Record: `benchmarks/2026-11-18-fa-band-h256.md`, `MANIFESTS.md` gate 05, `patches/README.md` block 05,
+`ENVIRONMENT.md` §8, `GREEDY-PURITY.md` §96/§97.

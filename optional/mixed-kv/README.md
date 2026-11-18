@@ -8,8 +8,14 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `03fee67ffcc3c8ea6b23de1a7b53c23b5279a124c84077fee187bcc043e882a5` (the r313 cut -- the re-cut moved the exported commit and
-  the hunk offsets, see below; every earlier cut is recorded below)
+  `85bdd776ed5d2e77e74bc978563f7706376bb222cb29395934b2b6b94c74fe08` (the r315 cut -- every re-cut moves the exported commit
+  and the hunk offsets, see below; every earlier cut is recorded below)
+* **r315 re-cut verification**: applies strictly at the r315 default tree
+  `ff3c4d85732d9dda27a6a4914c728afb541d7ae6` and produces `dd400b9d74bf5d48cb8c96e2e2281e0cffe485e6`; cumulative with the other
+  optional artifact, numeric order, is `7aec397b249a6f968e1cc425d63d89fbf8fad291`.  **The patch file moved**
+  (sha256 `85bdd776ed5d2e77e74bc978563f7706376bb222cb29395934b2b6b94c74fe08`): block 05's r315 amendment adds the 256-dim work gate next to the `kv_quant` line this artifact edits, so the
+  exported commit id, the blob ids and the hunk offsets moved while the produced diff is otherwise unchanged.  `validate-set.sh`
+  check 8 verifies all three trees on every run.
 * **r314 re-cut verification**: applies strictly at the r314 default tree
   `623e5a13f376e45f01fdecc6929c6dd5de0ab1d5` and produces `b3cd09f79fcd7e5a6390f9225071e26c62a9e565`; cumulative with the other
   optional artifact, numeric order, is `4ea663b57d2d150d7452657ec526c84241e4c1a9`.  **The patch file moved**

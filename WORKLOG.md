@@ -1,3 +1,73 @@
+## 261118.010 (r315, RELEASE v17-4f9dfa0e3-r315) -- `TODO` #345 closed: the 256-dim band gets the 128-dim arm's work gate; its preferred route (an adaptive `P`) is refuted, and r314's "cache size" fact is corrected (official block 05)
+
+**What shipped.**  Block **05** only: `ggml_cuda_fattn_band_wmma_applies()` now gates the **256-dim** head class
+(27B GQA 6, 35B-A3B GQA 8, Flash-Next/qwen4exp GQA 12) with
+`K->ne[1] * max(passes_tile - passes_band, 1) >= GGML_HIP_FA_BAND_H256_MIN_WORK` (default **20000**), i.e. band
+from **10000** cells for GQA 6 and from **20000** for GQA 8 and GQA 12.  Two knobs: `GGML_HIP_FA_BAND_WMMA_H256`
+(`auto` / `0` / `1`) and `GGML_HIP_FA_BAND_H256_MIN_WORK`; the pass computation moved into shared helpers so the
+128- and 256-dim gates cannot disagree.  `release.json` at **`v17-4f9dfa0e3-r315`** (canonical tip
+`2a81262f6` = `.tip`, tree `ff3c4d857`; optional re-cut `6328a17fa` / `dd400b9d7`, cumulative `7aec397b2`).
+Block count unchanged (17 official + `0300`).  Records: `ENVIRONMENT.md` §8, `patches/README.md` block 05,
+`MANIFESTS.md` gate 05, `INVARIANTS.md` r315, `GREEDY-PURITY.md` §96 (amended) / §97 (new),
+`benchmarks/2026-11-18-fa-band-h256.md`, `TODO.md` (#345 deleted, `P` tuning split out as #346).
+
+**The item's preferred route did not survive measurement.**  `TODO` #345 recommended `(b)`, an adaptive
+`P = min(nsm, ceil(cells/nbatch_fa))`, on the grounds that it "removes the idle blocks -- the ONLY route that can
+fix the depth cases".  Both halves are wrong.  At depth there are **no idle blocks** (32768 cells / `nbatch_fa`
+64 = 512 KV iterations against `P` = 32 = `nsm`), so the rule returns the current value; and at a short cache the
+idle blocks are **free** -- a block that owns no iteration writes the neutral partial and exits -- while a
+smaller `P` serialises the KV reads with no more parallelism to hide them: at 512 cells (GQA 6, nb1) `P` 8 =
+52.6 µs, 16 = 31.1, 32 = 39.2, 64 = 56.6, tile 15.8, i.e. the adaptive rule picks the worst of the four band
+values.  A `GGML_HIP_FA_BAND_WMMA_SPLIT` sweep (4/8/16/32/64 × 6 KV sizes × 3 query widths × q8_0/f16) puts the
+optimum at `P` 16 in 30 of 36 rows, which also makes the quantized default `P = nsm` a 10-20 % tuning gap --
+split out as `TODO` #346, because `P` is a numeric-order change that moves every banded model's text.
+
+**What route (a) costs, and the win it buys.**  The 256-dim band is a **verify-width** kernel: per op (band ÷
+tile, best `P`) it loses 2.64 (q8_0) / 1.96 (f16) at 512 cells and 1.26 / 1.48 at 4096 at the decode width, is at
+best 0.96 / 1.09 at 8192, and wins 0.76 / 0.71 at 1024 and 0.18 / 0.25 at 32768 at verify width 8; GQA 8 and 12
+lose just as hard (2.46 / 2.54 at 1024 cells) even though GQA 8 folds whole outside the band -- which is why the
+gate's `max(..., 1)` floor gates that ratio by cells instead of disabling it (its deep verify row is 0.45 at
+8192 cells).  End to end against the r314 build (3 GPUs `-sm tensor`, `ROCBLAS_USE_HIPBLASLT=0`): 27B Q8_0 tg64
+**+4.4 / +1.8 / +1.8 / +0.2 / 0.0 %** at d0/4K/8K/16K/32K (44.20/44.84/44.38/43.48/41.91 ->
+46.13/45.65/45.18/43.55/41.90 t/s), 35B-A3B **+7.4 / +3.1 %** (130.12/134.63 -> 139.72/138.82), Flash-Next
+**+3.1 / +2.3 %** (72.04/72.70 -> 74.25/74.35), 35B-A3B `draft-mtp n3` **+2.0 %** (234.5 -> 239.3), 27B
+`draft-mtp n3` at a 5.2K prompt **-1.1 %** (87.0/86.9 -> 86.0/86.0 -- the band is worth ~1 % there), and the
+band kept where it pays: 27B `draft-mtp n7` at a 20.5K prompt is 78.9-79.4 against the tile kernel's 73.8-74.5
+t/s (**+6.4 %**), where the same config's plain decode is -1.5 % (43.5 vs 44.1).  A 27.3 B Q8_0 model at 44 t/s
+reads ~1.2 TB/s of weights per token, at the DRAM roof, so the decode width cannot pay for a faster attention
+op and the band's per-layer launch cost is paid in full -- which is exactly the split the gate now makes.
+
+**Numerics and purity.**  `test-backend-ops -o FLASH_ATTN_EXT` **7381/7381** in four arms (default/`auto`,
+`H256=1` -- now the band's own oracle, since under `auto` every short-cache case takes the tile kernel --,
+`WMMA=0`, and `WMMA=2`).  Width purity **PASS, worst maxdiff 0** on f16/bf16/q8_0 at P=3584/4096 (gate -> tile),
+at **P=10240 where the gate itself selects the band** (the arm that proves the new selection), and in
+`SPLIT=tensor`/`SPLIT=layer` multi-device arms; the **straddle** point P=9980 (W=1..4 tile, W=5..8 band) FAILs
+with maxdiff 0.327 and the same point with `H256=1`/`WMMA=0` passes with 0 -- see below.  Prefill logits: canonical
+**0.000000 / 100.000 %** against the r314 base, `--family-switch` on the 27B (`--ctx 16384 --chunks 2 --ub 4`,
+`--ab "GGML_HIP_FA_BAND_WMMA_H256=1"` = the previous behaviour) **0.004967 / 98.804 %** against a same-kernel
+`-ub 256` control of **0.005424 / 98.804 %** -- inside the limits and better than the control.  Coherence
+unchanged on 4B `8d89080db673`, 27B `da2e2d192e21` and Flash-Next `de61b9b1bed7`; 35B-A3B moves
+`ae39ec41bc1e` -> `265c381dbc11`, **exactly the r314 build's `GGML_HIP_FA_BAND_WMMA=0` arm**.  The four MTP axes
+(27B, `draft-mtp n3`, `-n 512`, bf16 KV, reasoning off except R) reproduce that arm on every axis (R
+`7dca501eeb0e` / draft `759c1a4515c6`, P `fcc0bdeb636b`, C `eb89102cb7d8`, K `a87c4318b649`) with
+`plain == draft-mtp` on all four; acceptance moved with the family, both ways (R 348/486 vs 349/486, P 357/460 vs
+351/474, C 368/427 vs 370/422, K 372/375 identical).  `llama-batched-bench -npl 1,4,8` unchanged
+(44.68/151.39/255.93 vs 44.21/150.10/256.98 t/s).  Per-block gate **`--fast --changed-from fe5fb46d2` 2/2**
+(block 05 and the tip), `validate-set.sh` GREEN (tree `ff3c4d857`), GPU journal and every log clean.
+
+**Corrected:** r314's item 1 ("`K->ne[1]` at the FA op is the layer's KV cache size, fixed for the run") is
+false.  Probe-printed on the 27B at `-c 8192`: a 51-token prompt reads 256 on every decode step, a 5246-token
+prompt reads 768/1280/…/3840 through its ubatches then 8192 (the multi-device prefill pad) and **5376 -> 5632
+while generating**; the 8192/16384 values came from the graph-**reservation** context, whose constructor sets
+`n_kv = kv->get_size()`.  The code is right -- it is the number of KV iterations the kernel executes, which is
+what a per-launch cost is amortized over, and r314's d0 row (0.0 %) is only explainable by a used-length key --
+but the justification is not, and it means the gate flips **once per run**, where a verify batch straddling the
+256-cell padding boundary takes the other family for that one step (measured 0.327 maxdiff against 0 everywhere
+else).  That is inherent to any monotone function of the extent, it has been shipped for the 128-dim arm since
+r314, and the documented alternative (the cache size) would band a shallow context on a large `-c` and give the
+shallow wins back; `GGML_HIP_FA_BAND_WMMA_H256=0/1` pins the family.  `INVARIANTS.md` r314 is corrected in place
+and `GREEDY-PURITY.md` §96 is amended, with the new rule in §97.
+
 ## 261118.009 (r314, RELEASE v17-4f9dfa0e3-r314) -- contributor PR #329: the FA band takes 128-dim heads with an odd GQA ratio, but only where the layer's KV cache is long enough to pay for it (official block 05)
 
 **What shipped.**  Block **05** only: the RDNA4 decode/verify band now also takes **128-dim heads whose GQA

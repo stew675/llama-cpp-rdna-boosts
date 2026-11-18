@@ -45,12 +45,35 @@ left in this file.  The r236 re-base
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
-| **345** | the 256-dim band: measured **-1.5..-4.7 %** end to end on a weight-bound 3-GPU 27B decode (and 1.5-3.9x per op at 512-4096 cells), but every published 256-dim band win was measured where attention is the bottleneck | performance / kernel selection (block 05) | **OPEN (scoped, r314)** — three candidate routes are priced in the section and in `benchmarks/2026-11-18-fa-band-h128.md` §5; the open question is (a) work gate (b) adaptive `P` (c) leave + document — see the section |
+| **346** | the band's fixup period `P`: `nsm` for the native-quantized K/V types, but `nsm/2` measures 10-20 % better at most sizes (30 of 36 rows) — a numeric-order change, so it moves every banded model's text | performance / kernel tuning (block 05) | **OPEN (r315)** — not shipped with #345: needs its own ladder and an end-to-end win; see the section |
 | **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure (per-block gate, clean checkout, hosted CI) dies in `ui-assets.cmake:137` -- the container images are unaffected (their `web` stage supplies `tools/ui/dist`) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround where it bites; re-check before the next per-block ladder — §342 |
+
+## 346. The band's fixup period `P` is `nsm` for the native-quantized K/V types, and `nsm/2` measures 10-20 % better at most sizes
+
+**Subject**: `ggml_cuda_fattn_band_wmma_split()` returns `nsm` for the native-quantized K/V types and `nsm/2` for
+the 2-byte ones. A `GGML_HIP_FA_BAND_WMMA_SPLIT` sweep of the 256-dim class (r315, `TODO` #345 scoping;
+`benchmarks/2026-11-18-fa-band-h256.md` §2/§5) puts the **optimum at `P` 16 = `nsm/2` in 30 of 36 rows**, both K/V
+type families and every query width, while the quantized arm's `P` 32 measures **10-20 % worse** at most sizes:
+512 cells nb1 q8_0 42.8 (`P`16) vs 63.3 (`P`32); 2048 38.2 vs 50.0; 4096 45.2 vs 54.6; 8192 59.7 vs 68.8; 32768
+146.8 vs 158.3 (and at verify widths 32768 nb8 287.4 vs 316.9). One row disagrees in the other direction (1024
+cells nb1: 53.3 vs 42.7) and the in-code note records the opposite conclusion from an earlier measurement ("flat
+for P = 48..96 at kv 20K..200K, degrading below 32") made at verify widths, so the two need reconciling before
+anything lands.
+
+**Why it is not part of r315**: `P` is a **numeric-order** attribute, so changing it moves the text of *every*
+banded model — both head classes, GQA 5..12, 128- and 256-dim — and needs the full ladder (band oracle, width
+purity on both classes and all three native K/V types, the four MTP axes, coherence on every class,
+`gate-prefill-logits`), plus a `GGML_HIP_FA_BAND_WMMA_SPLIT` default row in `ENVIRONMENT.md`.  Its end-to-end
+value is also unmeasured and would be small: below 10000 cells the 256-dim gate keeps the band off, and above it
+the box's arms are weight-bound except the deep verify shapes, where the band is already +6.4 % (#345's record).
+
+**Re-entry condition**: the next block-05 release, or an attention-bound arm where the op's 7-20 % is
+measurable end to end.  The measurement to reproduce is the `GGML_HIP_FA_BAND_WMMA_SPLIT` sweep in
+`benchmarks/2026-11-18-fa-band-h256.md` §2.
 
 ## Handle numbering
 
-**New handles append after `#345`, the highest issued so far, so the next free handle is `#346`; a number is
+**New handles append after `#346`, the highest issued so far, so the next free handle is `#347`; a number is
 never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
 subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
 
@@ -61,8 +84,11 @@ subject after that item has closed and left this file.  The recent ones, so the 
   K-split `mmvq` kernel is already at 92-98 % of the DRAM roof, so no narrower tile or dot-product low-band arm
   has anything to win; the family stays opt-in and width-split, and what shipped instead is the measured
   **per-type** `auto` floor (5 / 5 / 8 / 8 / 8).  Record: `archive/work/rdna4-wmma-verify/LOW-BAND-2026-11-18.md`.
-* **`#338`-`#340`** retired at r301, **`#341`** (issued r303) retired at r309 (`WORKLOG.md` 261117.008),
-  **`#345`** (issued r308) retired at r311 (`WORKLOG.md` 261118.003).
+* **`#345`** (issued r308 -- the 256-dim band) retired at **r315** (`WORKLOG.md` 261118.010): implemented as the
+  class's per-layer work gate, with its preferred route (an adaptive `P`) refuted by measurement.  It was
+  mistakenly listed here as retired at r311 while the open table still carried it; the r315 record is the
+  authoritative closure.
+* **`#338`-`#340`** retired at r301, **`#341`** (issued r303) retired at r309 (`WORKLOG.md` 261117.008).
 * **`#335`/`#336`** retired at r298 — an alias ROLE gap in the expert cache, `WORKLOG.md` 261116.005;
   **`#282`** at r299 — the mid-run latch's mixture is gated on the logits, `WORKLOG.md` 261116.006.
 * **`#342`** (r303) and **`#343`** (r304) are the newest still tracked; `#342` is WAITING on upstream, `#343`
@@ -191,54 +217,6 @@ Do not add a `HF_UI_VERSION` pin to `build-containers.sh` for this.
 
 Where it does bite, `HF_UI_VERSION=b12387` (the bundle this box had stamped) carries `workbox-b3c04f83.js` and
 validates; the per-block gate's header records it.  Drop the pin when `latest` validates again.
-
-## 345. The 256-dim band: a decode regression on a weight-bound arm, while its published wins are on arms where attention is the bottleneck — pick the route
-
-**Subject**: r314 gated the **128-dim** arm of `ggml_cuda_fattn_band_wmma_applies()` on the layer's KV cache size
-(`INVARIANTS.md` r314, `GREEDY-PURITY.md` 96).  The **256-dim** arm (default-on since r6: 27B GQA 6, 35B-A3B
-GQA 8, qwen4exp GQA 12) was left untouched, and it was then measured to scope this item.  It is **not** a
-regression r314 introduced.
-
-**What was measured** (`benchmarks/2026-11-18-fa-band-h128.md` §5; gfx1201, 3 GPUs `-sm tensor`,
-`ROCBLAS_USE_HIPBLASLT=0`):
-
-* Per op, decode width, q8_0, band / tile: GQA 6 **3.94** at 512 cells, 2.05 at 1024, 1.70 at 2048, **1.51** at
-  4096, then **1.01/1.00/1.00** at 16384/65536/131072.  Verify widths win early (1.26 at `nb` 4 / 0.92 at `nb`
-  8 at 1024 cells; 0.53 / 0.44 at 4096).
-* End to end, 27B Q8_0 tg64, 3-GPU tensor: band **44.04 / 44.97 / 44.49 / 43.59 / 41.93** against tile
-  **46.18 / 45.69 / 45.17 / 44.31 / 42.64** at d0 / 4K / 8K / 16K / 32K -- i.e. **-4.6 %** at depth 0 and
-  **-1.5..-1.7 %** at every depth above it.  With `draft-mtp n3` (5246-token prompt, `-c 8192`, `-n 512`):
-  **107.4** against **112.7 t/s** (**-4.7 %**).
-* The mechanism is the one `INVARIANTS.md` r314 item 4 names: a 27.3 B Q8_0 model decoding at ~44 t/s already
-  reads ~1.2 TB/s of weights per token, at the box's DRAM roof, so a 2x faster attention op buys nothing while
-  the band's per-layer launch cost (packed-mask prepass + `P = nsm` fixup) is paid in full.
-
-**Why it is not simply "do what r314 did"**: a cache-size work gate fixes 512-4096 cells and leaves every depth
-above it at -1.6 %, because there the op is at *parity* and the cost is the per-launch overhead rather than the
-idle blocks.  Three routes, each with a different cost:
-
-* (a) **The r314 work gate on the 256-dim arm too** (`cells * passes_saved >= 20000`, GQA 6 saving 3 -> 1 = 2,
-  so band from 10000 cells).  Cheapest, uses a rule already measured for this band, and it is *purely* a
-  selection change.  Fixes the shallow cases only; still -1.6 % at depth.
-* (b) **Adaptive `P = min(nsm, ceil(cells / nbatch_fa))`** -- keeps the fold and stops the idle blocks.  Legal
-  because `P` may depend on the *run-constant* cache size even though it may not depend on the used length or
-  on `n_q` (the width-purity contract, `GREEDY-PURITY.md` 36); also the only route that can fix the depth
-  cases, since the overhead it removes is the one being paid.  This is the preferred route on the evidence,
-  and the most invasive: it changes the fixup layout's period for every banded op.
-* (c) **Leave the default and document**: every published 256-dim band win (deep verify, deep single-GPU
-  prefill, the `GGML_HIP_FA_BAND_WIDE` / fetch-ahead arms) was measured on configurations where attention *is*
-  the bottleneck; the -1.5 % on a weight-bound 3-GPU decode may be the price of those.  `GGML_HIP_FA_BAND_WMMA=0`
-  is already the escape hatch.
-
-**Any of the three needs**: moves kernel selection for every GQA 5..12 256-dim model, so the full band ladder --
-`test-backend-ops -o FLASH_ATTN_EXT` with the band's variants, `test-logits-width-probe` at **P 3584 and >= 4096**
-on `KV=q8_0/f16/bf16` in 1-GPU and `-sm tensor`/`-sm layer` arms, the four MTP axes, `gate-prefill-logits`,
-`plain == draft-mtp`, and the `GGML_HIP_FA_BAND_WIDE` interaction at `K->ne[1] >= 4096` -- plus an end-to-end
-A/B on **both** a weight-bound arm (like the 27B above) and an attention-bound one, because a route that only
-helps the first will read flat on the second and vice versa.
-
-**Re-entry condition**: the next block-05 release.  Route (b) is the one to build first if the item is picked
-up; (a) is a one-line variant of r314 if a shallow-context fix is wanted sooner.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

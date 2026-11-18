@@ -1,4 +1,4 @@
-From f85bae91681ea5c5f74a163a67c3f816809bb9fa Mon Sep 17 00:00:00 2001
+From b3e2d0836cd31948512d001be65dd4228c597117 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 12 Nov 2026 08:22:10 -0600
 Subject: [PATCH 05/17] rdna-boosts: block 05: flash-attention band, native
@@ -112,6 +112,49 @@ Two things were changed from the submission, and both are gated:
 Tests: 384 cases -- ratios 5/6/7/12 on 8 and 4 K/V heads, query widths 1..16, q8_0/f16 at kv 512/1024/4096
 (a 256-cell masked group at 4096) for the dispatch/tile arm, plus q8_0/f16/bf16 at kv 32768 (past the gate for
 every ratio) for the band itself, which is also the band's first bf16 oracle for this head size.
+
+r315 (`TODO` #345): the 256-dim head class gets the same work gate.  The band has been a published default
+for head 256 since r6 and it is measured to lose on this box's weight-bound decode arms: per op (gfx1201,
+head 256, 4 K/V heads, band / tile, the best P of 4/8/16/32/64) GQA 6 at the decode width reads 2.64 (q8_0) /
+1.96 (f16) at 512 cells, 2.13 / 1.59 at 1024, 1.30 / 1.89 at 2048, 1.26 / 1.48 at 4096, 0.96 / 1.09 at 8192
+and 0.66 / 1.10 at 32768, and end to end (3 GPUs, `-sm tensor`, tg64 against `GGML_HIP_FA_BAND_WMMA=0`) the
+27B Q8_0 loses 4.6 % at d0, 35B-A3B Q8_0 9.8 % at d0 and 2.7 % at d8192, Flash-Next GSQ-IQ3_XXS 4.0 % / 2.7 %,
+plus 4.7 % on the 27B's `draft-mtp n3` arm.
+
+The gate is `ggml_cuda_fattn_band_wmma_h256_applies()`:
+`K->ne[1] * max(passes_saved, 1) >= GGML_HIP_FA_BAND_H256_MIN_WORK` (default 20000), i.e. band from 10000
+cells for GQA 6 (3 -> 1 passes) and from 20000 for GQA 8 and GQA 12.  The `max(..., 1)` floor is what handles
+a ratio that already folds whole outside the band (GQA 8: the tile kernel's ncols2 is 8 there too, so the band
+saves no passes at all) -- it is gated by cells alone instead of being disabled for the whole class, which
+would throw away the deep verify widths where it measures 0.45 at 8192 cells.  Per-op crossover of the class
+at the decode width is 4-10k cells and at verify widths 1-2k, so 20000 (the 128-dim arm's constant) is on the
+conservative side.
+
+Measured with the gate: 27B tg64 44.20 / 44.84 / 44.38 / 43.48 / 41.91 -> 46.13 / 45.65 / 45.18 / 43.55 / 41.90
+t/s at d0 / 4K / 8K / 16K / 32K (+4.4 / +1.8 / +1.8 / 0.0 / 0.0 %), 35B-A3B 130.12 / 134.63 -> 139.72 / 138.82
+(+7.4 / +3.1 %), Flash-Next 72.04 / 72.70 -> 74.25 / 74.35 (+3.1 / +2.3 %); the deep arm that keeps the band
+is unchanged (27B, MTP n7 at a 20.5K prompt, 79.0 -> 78.9 t/s, where the band is +6.7 % over the tile kernel),
+and the 27B's `draft-mtp n3` arm at a 5.4K prompt is -1.1 % (the band is worth ~1 % there).  Every changed arm
+reproduces the PREVIOUS build's all-tile arm byte for byte -- 35B-A3B `265c381dbc11`; the four MTP axes
+`7dca501eeb0e` (R), `759c1a4515c6` (R draft), `fcc0bdeb636b` (P), `eb89102cb7d8` (C), `a87c4318b649` (K).
+
+Corrected here: r314's claim that `K->ne[1]` at the FA op is the layer's KV CACHE SIZE is wrong -- it is the
+PADDED USED LENGTH (measured on the 27B at `-c 8192`: 256 at d0, 5376 -> 5632 while generating, 8192 only
+during a prompt ubatch or in the graph-RESERVATION pass, whose context sets n_kv = kv->get_size()).  That does
+not change r314's measurements -- its d0 row reads 0.0 %, which only a used-length key produces -- and it is
+the right attribute to price the crossover with, since it is the number of KV iterations the kernel executes.
+What it does mean is that a verify batch can straddle a 256-cell padding boundary and take the other kernel
+family for that ONE step: `test-logits-width-probe` at P=9980 (W=1..4 on the tile kernel, W=5..8 on the band)
+FAILs with maxdiff 0.327, while every arm with a constant family passes with maxdiff 0.  Accepted and recorded
+(`GREEDY-PURITY.md` 96/97) -- keying the gate on the cache size instead would band a shallow context on a large
+`-c` and reintroduce exactly these losses.
+
+`TODO` #345 route (b) (adaptive `P = min(nsm, ceil(cells/nbatch_fa))`) is refuted and not implemented: at depth
+there are no idle blocks to remove (32768 cells / 64 = 512 iterations against P = 32 = nsm), and at a short
+cache the idle blocks cost nothing (a block that owns no iteration writes a neutral partial and exits) while a
+smaller P serialises the KV iterations -- 512 cells with P = 8 measures 52.6 us against 31.1 for P = 16.
+P = 16 is the optimum in 30 of the 36 measured rows; the quantized default P = nsm is 10-20 % off it at most
+sizes, which is a separate tuning item (it moves every banded model's numerics).
 ---
  common/common.cpp                             |    6 +
  common/speculative.cpp                        |    4 +
@@ -124,7 +167,7 @@ every ratio) for the band itself, which is also the band's first bf16 oracle for
  ggml/src/ggml-cuda/dequantize.cuh             |   13 +
  ggml/src/ggml-cuda/fattn-common.cuh           |  830 +++++++++++-
  ggml/src/ggml-cuda/fattn-mma-f16.cuh          | 1198 ++++++++++++++---
- ggml/src/ggml-cuda/fattn-rdna.cuh             |  534 ++++++++
+ ggml/src/ggml-cuda/fattn-rdna.cuh             |  614 +++++++++
  ggml/src/ggml-cuda/fattn-tile.cu              |   44 +-
  ggml/src/ggml-cuda/fattn-tile.cuh             |  612 +++++++--
  ggml/src/ggml-cuda/fattn-vec.cuh              |   14 +-
@@ -454,7 +497,7 @@ every ratio) for the band itself, which is also the band's first bf16 oracle for
  src/llama-kv-cache.h                          |   23 +
  src/llama-kv-cells.h                          |   53 +
  tests/test-backend-ops.cpp                    |  220 ++-
- 341 files changed, 6244 insertions(+), 678 deletions(-)
+ 341 files changed, 6324 insertions(+), 678 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-rdna.cuh
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_4-ncols2_8-dkq256-dv256.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_8-ncols2_8-dkq256-dv256.cu
@@ -3756,10 +3799,10 @@ index 33856a38a..f5b09931f 100644
      extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 2,  2); \
 diff --git a/ggml/src/ggml-cuda/fattn-rdna.cuh b/ggml/src/ggml-cuda/fattn-rdna.cuh
 new file mode 100644
-index 000000000..6c6e66d84
+index 000000000..91099ce9c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/fattn-rdna.cuh
-@@ -0,0 +1,534 @@
+@@ -0,0 +1,614 @@
 +// RDNA/ROCm flash-attention predicates: the native-KV staging policy and selectors, and
 +// the RDNA4 decode/verify band (WMMA) helpers.  Split out of fattn-common.cuh (an upstream
 +// hub) so an upstream re-base collides with the predicate call points, not their bodies.
@@ -4211,13 +4254,33 @@ index 000000000..6c6e66d84
 +    return v;
 +}
 +
-+// Does a 128-dim layer with this ratio take the band?  The work test is the layer's CACHE SIZE (K is a permuted
-+// view of the KV cache, so K->ne[1] is the number of cells the cache holds) and never the used length: the
-+// cache size is fixed for the run, while a verify batch moves the used length by up to W-1 rows -- a test on
-+// that would select a different kernel for a decode step and its own verify batch, which is the band's
-+// width-purity contract (GREEDY-PURITY.md 36).  A sliding-window / hybrid model's windowed layers hold
-+// n_swa + n_ubatch cells for the whole run, so they are declined at every depth: measured on ricursive 65B
-+// (64 of 80 layers windowed at 1024) the unconditional band cost 4.5-5.8 % of decode at d0..d32K.
++// Passes over the layer's KV cache that each candidate kernel makes for a GQA ratio: the tile kernel folds the
++// largest power of two dividing the ratio (capped at 8 -- launch_fattn_tile_switch_ncols2, fattn-tile.cuh), the
++// band always folds into its ncols2 = 8 columns.  Both work gates (128- and 256-dim) price their decision from
++// these two numbers, so they cannot disagree about the saving a band takes.
++static inline int ggml_cuda_fattn_band_passes_tile(const int gqa_ratio) {
++    int ncols2_tile = 1;
++    while (ncols2_tile < 8 && gqa_ratio % (2*ncols2_tile) == 0) {
++        ncols2_tile *= 2;
++    }
++    return (gqa_ratio + ncols2_tile - 1) / ncols2_tile;
++}
++
++static inline int ggml_cuda_fattn_band_passes_band(const int gqa_ratio) {
++    return (gqa_ratio + 7) / 8;
++}
++
++// Does a 128-dim layer with this ratio take the band?  The work test reads K->ne[1], which is the number of KV
++// iterations the kernel will execute: K is a permuted view of the KV cache whose extent is the PADDED USED
++// length (r315 corrected r314's "cache size" here -- measured on a 27B, `-c 8192`: 256 cells at d0, 5376 ->
++// 5632 while generating, 8192 only during a prompt ubatch or in the graph-RESERVATION pass, where the
++// reservation context sets n_kv = kv->get_size()).  It is the right attribute for the crossover -- the cost the
++// band adds is per launch and per KV iteration -- and it is never a function of the query width.  A verify
++// batch can straddle a 256-cell padding boundary and then select a different kernel family for that ONE step
++// (GREEDY-PURITY.md 96/97); the alternative, keying on the cache size, would band a shallow context on a large
++// `-c` and reintroduce the losses this gate exists to remove.  A sliding-window / hybrid model's windowed
++// layers hold n_swa + n_ubatch cells for the whole run, so they are declined at every depth: measured on
++// ricursive 65B (64 of 80 layers windowed at 1024) the unconditional band cost 4.5-5.8 % of decode at d0..d32K.
 +static inline bool ggml_cuda_fattn_band_wmma_h128_applies(const ggml_tensor * K, const int gqa_ratio) {
 +    if (!ggml_cuda_fattn_band_wmma_h128_enabled()) {
 +        return false;
@@ -4225,15 +4288,74 @@ index 000000000..6c6e66d84
 +    if (ggml_cuda_fattn_band_wmma_h128_env() > 0) {
 +        return true; // forced on: no work gate (the arm that measures the band itself)
 +    }
-+    // the tile kernel's ncols2 for head 128: the largest power of two dividing the ratio, capped at 8
-+    int ncols2_tile = 1;
-+    while (ncols2_tile < 8 && gqa_ratio % (2*ncols2_tile) == 0) {
-+        ncols2_tile *= 2;
-+    }
-+    const int64_t passes_tile = (gqa_ratio + ncols2_tile - 1) / ncols2_tile;
-+    const int64_t passes_band = (gqa_ratio + 7) / 8;
++    const int64_t passes_tile = ggml_cuda_fattn_band_passes_tile(gqa_ratio);
++    const int64_t passes_band = ggml_cuda_fattn_band_passes_band(gqa_ratio);
 +    const int64_t saving      = passes_tile - passes_band;
 +    return saving > 0 && K != nullptr && K->ne[1]*saving >= ggml_cuda_fattn_band_h128_min_work();
++}
++
++// 256-dim heads (27B / 35B-A3B / qwen4exp, the published default since r6) take the band only where its
++// per-layer cost is paid back -- the same work test as the 128-dim arm, on the same attribute.
++//
++// Per op (gfx1201, one R9700, head 256, 4 KV heads, band / tile time, the best P of 4/8/16/32/64, q8_0 / f16):
++//   GQA 6 decode width: 2.64 / 1.96 at 512 cells, 2.13 / 1.59 at 1024, 1.30 / 1.89 at 2048, 1.26 / 1.48 at
++//                       4096, 0.96 / 1.09 at 8192, 0.66 / 1.10 at 32768
++//   GQA 6 verify width 8: 1.14 / 1.24 at 512, 0.76 / 0.71 at 1024, 0.39 / 0.47 at 2048, 0.31 / 0.40 at 4096
++// Below ~8192 cells the band loses at the decode width at EVERY P and every K/V type: what it costs is its
++// fixed per-launch work (the packed-mask prepass and the P-partial fixup combine), not the idle blocks -- at
++// 512 cells P = 8 (one iteration per block) measures 52.6 us against 31.1 for P = 16, because the blocks that
++// own no iteration write a neutral partial and exit while a smaller P serialises the KV iterations
++// (TODO #345 route (b), refuted).  At verify widths the band wins from 1024 cells, and an adaptive P cannot be
++// keyed on the used length anyway: it moves with the context (see above).
++//
++// End to end, 3 GPUs `-sm tensor`, `ROCBLAS_USE_HIPBLASLT=0`, band against GGML_HIP_FA_BAND_WMMA=0:
++//   27B Q8_0 (GQA 6):      -4.6 % at d0, -1.6/-1.5/-1.6/-1.7 % at d4K/8K/16K/32K, -4.7 % with draft-mtp n3
++//   35B-A3B Q8_0 (GQA 8):  -9.8 % at d0, -2.7 % at d8192, -1.8 % with draft-mtp n3
++//   Flash-Next (GQA 12):   -4.0 % at d0, -2.7 % at d8192
++// and the arm that keeps the band above the gate: 27B, MTP n7 at a 20.5K-token prompt, +6.7 % (79.4 vs 74.4
++// t/s), where the same config's plain decode is -1.6 % -- the band is a verify-width kernel that a weight-bound
++// decode cannot pay for.  A ratio that already folds whole outside the band (GQA 8: the tile kernel's ncols2 is
++// 8 there too, so the band saves no passes) still has to clear the fixed threshold as ONE pass; that is what
++// removes the 35B-A3B loss, and it keeps the band for the deep verify widths where it measures 0.45 at 8192
++// cells instead of disabling it for the whole class.
++//
++// Work: cells x max(passes_tile - passes_band, 1) >= GGML_HIP_FA_BAND_H256_MIN_WORK (default 20000), i.e. band
++// from 10000 cells for GQA 6 (3 -> 1 passes), 20000 for GQA 8 (no saving) and GQA 12 (3 -> 2), 5000 for GQA 5.
++// 20000 is the 128-dim arm's measured crossover and every 256-dim row above crosses below it, so the gate is on
++// the conservative side: it removes the shallow regressions and leaves the depth residual (the 27B's -1.6 % at
++// d16K+) in exchange for the verify-width wins.  GGML_HIP_FA_BAND_WMMA=0 remains the escape hatch, and
++// GGML_HIP_FA_BAND_WMMA_H256 is the class switch: unset = auto (this gate), 0 = off, 1 = on for every 256-dim
++// shape (the measurement arm, and what the band's own test-backend-ops oracle is run with -- with the gate on,
++// a short-cache case takes the tile kernel).
++static inline int ggml_cuda_fattn_band_wmma_h256_env() {
++    static const int v = []() {
++        const char * env = getenv("GGML_HIP_FA_BAND_WMMA_H256");
++        return env != nullptr ? atoi(env) : -1;
++    }();
++    return v; // -1 = auto, 0 = off, >0 = forced on
++}
++
++static inline int64_t ggml_cuda_fattn_band_h256_min_work() {
++    static const int64_t v = []() {
++        const char * env = getenv("GGML_HIP_FA_BAND_H256_MIN_WORK");
++        const long long x = env != nullptr ? atoll(env) : 20000;
++        return x >= 0 ? (int64_t) x : (int64_t) 20000;
++    }();
++    return v;
++}
++
++static inline bool ggml_cuda_fattn_band_wmma_h256_applies(const ggml_tensor * K, const int gqa_ratio) {
++    const int forced = ggml_cuda_fattn_band_wmma_h256_env();
++    if (forced == 0) {
++        return false;
++    }
++    if (forced > 0) {
++        return true; // forced on: no work gate (the measurement arm / the band's own oracle)
++    }
++    const int64_t passes_tile = ggml_cuda_fattn_band_passes_tile(gqa_ratio);
++    const int64_t passes_band = ggml_cuda_fattn_band_passes_band(gqa_ratio);
++    const int64_t saving      = std::max<int64_t>(1, passes_tile - passes_band);
++    return K != nullptr && K->ne[1]*saving >= ggml_cuda_fattn_band_h256_min_work();
 +}
 +
 +// Self-contained band predicate shared by the kernel chooser, the ncols dispatcher and launch_fattn,
@@ -4287,7 +4409,8 @@ index 000000000..6c6e66d84
 +    const bool kv_f16    = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
 +    const bool kv_ok     = kv_quant || kv_f16;
 +
-+    const bool head_ok = (Q->ne[0] == 256 && V->ne[0] == 256) ||
++    const bool head_ok =
++        (Q->ne[0] == 256 && V->ne[0] == 256 && ggml_cuda_fattn_band_wmma_h256_applies(K, gqa_ratio)) ||
 +        (Q->ne[0] == 128 && V->ne[0] == 128 && gqa_ratio % 8 != 0 &&
 +         ggml_cuda_fattn_band_wmma_h128_applies(K, gqa_ratio));
 +

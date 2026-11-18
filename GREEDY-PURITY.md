@@ -2654,7 +2654,20 @@ which is why r270's prewarm-ordering change (`TODO` #318) "fixed" it with no num
 `WORKLOG.md` 261116.006, `INVARIANTS.md` r299, `scripts/gate-host-pool.sh` (its `pinlate` arm + the KLD checks),
 `ENVIRONMENT.md` (`MOE_HOST_POOL_PIN_FAULT`).
 
-## 96. A band arm's selection attribute must be run-constant: the KV CACHE SIZE is pure, the used length is not (r314, block 05, contributor PR #329)
+## 96. A band arm's selection attribute is the number of KV iterations, and keying it costs one crossing per run (r314, block 05, contributor PR #329; corrected r315)
+
+> **Correction (r315).**  This entry's *code* is right and its *justification* is wrong.  `K->ne[1]` at the FA
+> op is **not** the layer's KV cache size — it is the **padded used length**
+> (`min(cells.size(), max(256, GGML_PAD(used, 256)))`, measured: 256 at d0, 5376 → 5632 while generating,
+> 8192 only during a prompt ubatch or in the graph-**reservation** pass, whose context sets
+> `n_kv = kv->get_size()`).  So the gate quoted below *is* keyed on a value that moves with the context, and a
+> verify batch straddling a 256-cell padding boundary selects the other kernel family for that one step:
+> `test-logits-width-probe` at a straddle reads **maxdiff 0.327** where every constant-family arm reads 0
+> (§97).  What r314 got right is the attribute's *meaning* — it is the number of KV iterations the kernel
+> executes, which is what a per-launch cost is amortized over — and r314's measured numbers stand (its d0 row
+> reads 0.0 %, which only a used-length key produces; a cache-size key would have banded those global layers
+> at d0 and read -0.9 %).  A cache-size key is not a usable alternative either: it would band a shallow
+> context on a large `-c` and reintroduce the shallow losses (§97).
 
 **Claim.**  The PR extended the RDNA4 decode/verify band to 128-dim heads whose GQA ratio is not a multiple of
 8 and shipped it unconditional with a kill switch, documenting a "loss below 4-8K cells, -5 % at depth 0".  The
@@ -2673,13 +2686,18 @@ tile on the class measured `--family-switch` **0.001013 / 99.412 %** against a s
    at EVERY depth: ricursive 65B (64 of 80 layers windowed at 1024) lost **5.8 / 5.1 / 4.9 / 4.5 %** of tg64 at
    d0 / 4K / 16K / 32K.  A depth framing hides this -- the diagnostic question is "how many cells can this
    LAYER read", not "how deep is the context".
-2. *The gate must read the cache size, never the used length.*  At the op, `K` is a permuted view of the KV
-   cache, so `K->ne[1]` is the cache's cell count (verified: 8192 vs 16384 for the same 51-token prompt at
-   `-c 8192` vs `-c 16384`; 1536 for a windowed layer, = `GGML_PAD(min(size_base, n_swa + n_ubatch), 256)`) and
-   it is fixed for the run.  The used length moves by up to `W-1` rows between a decode step and its own
-   verify, and the 256-padded form can straddle a boundary (8190 -> 8192 vs 8198 -> 8448), so a length-keyed
-   test would put the two on different kernel families -- invariant 1 -- while the same test on the cache size
-   cannot.  This is the same attribute the existing wide-band gate already reads (`K->ne[1] >= 4096`).
+2. *The gate reads the number of KV iterations -- which is the padded used length, NOT the cache size.*  At the
+   op, `K` is a permuted view whose extent is `min(cells.size(), max(256, GGML_PAD(used, 256)))`
+   (`llama_kv_cache::get_n_kv`), so `K->ne[1]` is the **padded used length** and it *grows with the context*:
+   measured 256 at d0, 5376 -> 5632 while generating, 1536 for a windowed layer, and 8192/16384 only in a
+   prompt ubatch under the prefill pad or in the graph-RESERVATION pass (whose context sets
+   `n_kv = kv->get_size()`) -- which is where r314's "cache size" reading came from (`INVARIANTS.md` r315
+   corrects it).  It is the right attribute for a *work* test, because `iter_k = ceil(ne11/nbatch_fa)` is what
+   the per-launch cost is amortized over, but it is **not** run-constant: a verify batch can straddle a 256-cell
+   padding boundary and take the other kernel family for that one step, exactly the invariant-1 hazard r314
+   attributed to the alternative.  Measure it (§97), record it, and pin the family (`GGML_HIP_FA_BAND_WMMA_H128`
+   / `_H256` = `0`/`1`) where a run must be family-stable.  Never key on `Q->ne[1]`, and note the cache-size key
+   is not a way out: it would band a shallow context on a large `-c` and give back these numbers.
 
 **Numbers.**  With `K->ne[1] * (passes_tile - passes_band) >= 20000` (the measured crossover, one constant,
 `GGML_HIP_FA_BAND_H128_MIN_WORK`), ricursive 65B reads **0.0 / 0.0 / -0.9 / -0.5 %** at d0 / 4K / 16K / 32K
@@ -2688,8 +2706,46 @@ the 128-dim GQA-8 path is unchanged (0.998-1.002 on every op case).  The residua
 layers, whose ratio-10 op win is only 0.77 and does not survive a weight-bandwidth-bound 65B; a non-SWA 128-dim
 model at a real context keeps the band everywhere (op 0.48-0.65 for ratio 5/7 from 8192 cells).
 
-**Record.**  `INVARIANTS.md` r314, `MANIFESTS.md` gate 05, `WORKLOG.md` 261118.009,
-`benchmarks/2026-11-18-fa-band-h128.md`.  The 256-dim arm has the same short-cache profile (3.94x at 512 cells
-for GQA 6) and was deliberately left alone: it is a published default since r6 and re-keying it moves kernel
-selection for every GQA 5..12 256-dim model -- scoped with its measurements in `TODO.md` #345 (three routes;
-the -1.5..-4.7 % end-to-end on a weight-bound 3-GPU 27B is *not* a r314 regression).
+**Record.**  `INVARIANTS.md` r314 (corrected by r315), `MANIFESTS.md` gate 05, `WORKLOG.md` 261118.009,
+`benchmarks/2026-11-18-fa-band-h128.md`.  The 256-dim arm had the same short-cache profile (3.94x at 512 cells
+for GQA 6) and was left alone in r314; r315 gave it the same gate (§97, `TODO` #345 closed, `WORKLOG.md`
+261118.010).
+
+## 97. A family gate on the KV extent is pure *between* crossings and impure AT one — measure the crossing, pin the family if it matters (r315, block 05, `TODO` #345)
+
+**Claim.**  §96's gate came back for the 256-dim arm (`TODO` #345), and the same class of question had to be
+answered for it: **is a work/selection gate on the band safe at all**, given that its attribute moves with the
+context?  Measured answer: safe between crossings, not at one — and the crossing is unavoidable.
+
+**Rule.**  Four parts.
+
+1. *The gate must be a work test, never a width test.*  The 256-dim band loses at the decode width below ~8192
+   cells (2.64x q8_0 / 1.96x f16 at 512, 1.26/1.48 at 4096) and wins at verify widths from 1024-2048 (0.76/0.71,
+   0.39/0.47, 0.31/0.40 … 0.18/0.25 at 32768).  Decode and its own verify cannot be given different *kernels*
+   (invariant 1), so the decode loss decides and the gate is width-blind:
+   `K->ne[1] * max(passes_tile - passes_band, 1) >= 20000`.
+2. *`max(..., 1)` is what handles a ratio that already folds whole.*  GQA 8's tile `ncols2` is 8, so the band
+   saves no passes and a rule that requires a positive saving would disable the band for the class — but the
+   class still measures 2.46x *worse* at the decode width and 0.45 *better* at a deep verify width.  The floor
+   gates it by cells alone (20000) instead of choosing one of those two.
+3. *Any monotone function of the used extent has a crossing, and a W-row verify can straddle it.*  Shifting the
+   threshold or quantizing it only moves the crossing; `min()/max()` with the cache size degenerates to one of
+   the two.  So: measure the crossing (P=9980 on the 27B: 0.327 maxdiff, against 0 for every constant-family
+   arm), record it, and offer `GGML_HIP_FA_BAND_WMMA_H256=0/1` (and `GGML_HIP_FA_BAND_WMMA_H128=0/1`) as the
+   way to pin the family when a run must be family-stable.  Do **not** describe such a gate as pure.
+4. *An adaptive fixup period `P` is not the answer, and it is not keyable either.*  Idle band blocks are free (a
+   block that owns no iteration writes the neutral partial and exits), so shrinking `P` to the iteration count
+   serialises the KV reads for nothing: at 512 cells P = 8 measures 52.6 us against 31.1 for P = 16, where
+   `min(nsm, ceil(cells/nbatch_fa))` picks 8.  `P` = 16 is the optimum in 30 of 36 rows.
+
+**Numbers.**  27B tg64 **+4.4 / +1.8 / +1.8 / 0.0 / 0.0 %** at d0/4K/8K/16K/32K, 35B-A3B **+7.4 / +3.1 %** at
+d0/d8192, Flash-Next **+3.1 / +2.3 %**, 35B-A3B `draft-mtp n3` **+2.0 %**, 27B `draft-mtp n3` at a 5.2K prompt
+**-1.1 %**, and the band kept where it pays (27B `draft-mtp n7` at a 20.5K prompt: band 79.0 vs tile 74.2 t/s,
+**+6.4 %**, while the same config's plain decode is -1.5 %).  Every changed arm is byte-identical to the previous
+build's all-tile arm.  `test-backend-ops -o FLASH_ATTN_EXT` 7381/7381 in four arms; width purity PASS maxdiff 0
+on f16/bf16/q8_0 in 1-, 2- and 3-device `tensor`/`layer` splits and with the gate's own band selection; prefill
+KLD 0.000000 / 100.000 % canonical and 0.004967 / 98.804 % on the family-switch point against a 0.005424 /
+98.804 % same-kernel control.
+
+**Record.**  `INVARIANTS.md` r315, `MANIFESTS.md` gate 05, `ENVIRONMENT.md` §8, `WORKLOG.md` 261118.010,
+`benchmarks/2026-11-18-fa-band-h256.md`.
