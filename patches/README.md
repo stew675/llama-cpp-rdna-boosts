@@ -1372,7 +1372,8 @@ decode path), `mmvq.cu` (the VDR-aware K-split loop and the RDNA3_5 table), `mmq
 > the K-split kernel -- so *while the option is on* the block's byte-identical greedy contract does not hold
 > (`GREEDY-PURITY.md` §91); **off is the default, and with it off nothing of this amendment is reached**,
 > which is why this note does not change the block's own purity statement below (which is about VDR).
-> Knobs: `--wmma-verify off|auto|N` (`auto` = 7) and the deprecated alias `GGML_CUDA_WMMA_MMVQ`, `ENVIRONMENT.md`
+> Knobs: `--wmma-verify off|auto|N` (`auto` = the measured **per-type** floor since r312: 5 for Q4_K/Q5_K, 8
+> for Q6_K/IQ4_XS/Q8_0) and the deprecated alias `GGML_CUDA_WMMA_MMVQ`, `ENVIRONMENT.md`
 > §7.6.  The win is width-shaped and the shipped floor follows it: content-fixed TG t/s by verify width,
 > ON vs OFF, **1 GPU Q4_K_M** `-8.5 / -4.8 / -3.4 / -1.6 / +1.9 / +5.8 / +9.4` % at widths 2..8, **2-GPU
 > `tensor` Q4_K_M** `-5.7 / -4.7 / -5.3 / -4.7 / -4.4 / +7.1 / +10.6` %, **Q8_0 (2-GPU)** `-1.0 / -0.2 /
@@ -1386,6 +1387,20 @@ decode path), `mmvq.cu` (the VDR-aware K-split loop and the RDNA3_5 table), `mmq
 > release (byte-identical: spec `sha ce6f9a37494b`, plain `sha 75baf55d43c0`), `gate-prefill-logits.sh`
 > (0.000697 / 98.784 %), the four-axis and `llama-batched-bench -npl 1,4,8` with it on.  `WORKLOG.md`
 > 261115.002.
+>
+> **r312 amendment: `auto` is PER TYPE, and the low band is refuted rather than optimised.**  The r290 note
+> above shipped a single floor of 7 for every type.  A DRAM-cold sweep (one dense `MUL_MAT`, `m=88064`
+> `k=5120`, one R9700) shows the crossover is type-shaped -- Q4_K/Q5_K win from **5** columns (+6.7 % /
+> +12.9 %), Q6_K/IQ4_XS/Q8_0 only at **8** (+5.4 / +0.3 / +4.3 %) and *lose* 7-8 % (Q6_K) below it -- so
+> `auto` resolves `wmmv_auto_floor(type)` and an explicit `N` stays the uniform floor (`=7` reproduces the
+> r290 behaviour).  The same sweep **refutes `TODO` #329**: at 2..4 columns the K-split kernel is already at
+> **92-98 % of the box's 644 GB/s DRAM roof**, so there is no headroom for a narrower tile or a dot-product
+> form, and the family's fixed 16-column tile (an `iu8` WMMA cannot be narrowed) lands 2-8 % behind it.  The
+> floor cannot go to 2 and the family cannot become default-on -- what keeps it opt-in is the **width split**
+> (1 column is decode), not the low band.  End to end `auto` vs the old floor: +2.9 % at 6 columns on 1 GPU
+> (+1.5 % on a 2-GPU `tensor` split) and neutral elsewhere at TG t/s 147.28 -> **151.62** / 231.33 -> **234.11**.
+> Numerics untouched: an explicit floor 7 reads the same text on the r311 and r312 builds.  Record:
+> `archive/work/rdna4-wmma-verify/LOW-BAND-2026-11-18.md`, `INVARIANTS.md` r312, `WORKLOG.md` 261118.005.
 
 **Dense Q6_K VDR is upstream's now, on every arch (r170).**  The block's own per-arch gate
 (`#if defined(RDNA4) || defined(RDNA3_0)` → VDR=2, upstream's VDR=1 elsewhere) went away with the

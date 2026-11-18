@@ -1,3 +1,59 @@
+## 261118.005 (r312, RELEASE v17-4f9dfa0e3-r312) -- `TODO` #329: the verify band's low columns are at the DRAM roof, so the family's `auto` becomes a measured PER-TYPE floor instead of a narrower tile
+
+**What shipped.**  Block **07** only, inside the opt-in WMMA verify family: `--wmma-verify auto` (and
+`GGML_CUDA_WMMA_MMVQ=auto`) now resolves to a **per-type** floor from a measurement -- **5** columns for
+Q4_K/Q5_K, **8** for Q6_K/IQ4_XS/Q8_0 -- instead of the blanket 7 the family has carried since r290; an
+explicit `N` stays the uniform floor for every type (the calibration/A-B arm, `=7` reproduces r311 exactly), the
+default is still **off**, and `GGML_CUDA_WMMA_MMVQ=auto` is read by its first letter (`atoi("auto")` would
+silently mean `0` = off).  `release.json` at **`v17-4f9dfa0e3-r312`** (canonical tip `8a9e34b57`, tree
+`4f875aea2`; optional re-cut `4c0a69e5b` / `541ad532c`, cumulative `aa250b3da`).  Block count unchanged
+(17 official + `0300`).  Records: `patches/README.md` block 07, `ENVIRONMENT.md` §7.6, `GREEDY-PURITY.md` §91,
+`INVARIANTS.md` r312, `archive/work/rdna4-wmma-verify/LOW-BAND-2026-11-18.md`.
+
+**The item is REFUTED, and that is the finding.**  `#329` proposed that a narrower tile (or a dot-product form)
+would let the floor drop to 2 and make the family default-on.  It cannot: measured on one dense `MUL_MAT` at
+`m=88064 k=5120` (a 253-479 MB matrix, i.e. DRAM-cold -- an `m=11008` matrix is L2-resident and reads 2-3x
+optimistic), the K-split `mmvq` kernel already reads **617 / 617 / 609 / 591 GB/s** at widths 1 / 2 / 3 / 4
+(Q4_K; 92-98 % of this box's 644 GB/s spec), so the whole headroom in the low band is 0-8 % *before* any
+tile-vs-tile comparison, and a 16x16x16 `iu8` WMMA cannot be narrowed -- it computes a full 16-column tile
+whatever the column count, which is worth the **-3.5 / -3.6 / -1.7 %** the family pays at 2 / 3 / 4 (Q6_K pays
+**-7.5 .. -8.5 %** at 2..6 because its own K-split kernel stays at the roof to 6 columns).  The floor stays
+where the measurement puts it; what keeps the family opt-in is the **width split** (1 column is decode), not
+the low band.
+
+**What the measurement did buy (this is the change).**  The crossover is type-shaped, so one floor cannot be
+right: Q4_K **+6.7 %** and Q5_K **+12.9 %** at 5 columns, Q6_K **+5.4 %** / Q8_0 **+4.3 %** only at 8 (and Q6_K
+and IQ4_XS *lose* ~1 % at 7, which the blanket floor still paid for).  End to end (`llama-batched-bench
+-npp 512 -ntg 256`, 27B UD-Q4_K_M, TG t/s at widths 5/6/7/8): 1 GPU **131.70 / 147.28 / 158.74 / 169.68** off
+against **132.46 / 151.62 / 168.79 / 187.26** `auto`, i.e. **+2.9 % at 6 columns** and +6.3 / +10.4 % at 7/8;
+2-GPU `tensor` **204.82 / 231.33 / 250.56 / 271.51** against **204.33 / 234.11 / 260.12 / 289.21** (+1.2 / +3.8
+/ +6.5 %).  Against the old uniform floor of 7 that is +2.9 % (1 GPU) / +1.5 % (2 GPU) at width 6 and
+neutrality elsewhere; `-npl 1,4,8` is 33.24 / 110.92 / **171.70 -> 187.15** (width 1 and 4 unchanged by
+construction -- no type's floor reaches them).
+
+**Two adjacent ideas measured and rejected** (so they are not re-derived -- `INVARIANTS.md` r312 item 3):
+removing the Q4_K/Q5_K min-term ("ones") MMA entirely is only +2.2..+5.0 % (Q4_K) / +0.6..0.8 % (Q5_K) and 0 %
+for the other three types, and does not move the crossover; a wave count that does not divide the super-block
+count (e.g. Gemma 4's `k=3840 -> nsb=15`, which falls through to one 32-thread wave today) is ±1-2 % with
+mixed signs.
+
+**Verified rather than assumed.**
+* **The OFF arm is byte-identical to r311**: 27B Q8_0 + DFlash2 `--spec-draft-n-max 7`, 2 x R9700
+  `-sm tensor`, 96 greedy tokens, seed 42 -> `56612340f420` on both builds.  The family's arithmetic is
+  untouched: an explicit `GGML_CUDA_WMMA_MMVQ=7` reads `b7d28482ca5f` on both builds.
+* `scripts/gate-prefill-logits.sh`: **mean KLD 0.000000 / same-top-p 100.000 %** against the recorded base;
+  GPU kernel journal and every run log clean (`check-gpu-faults.sh`).
+* `scripts/validate-set.sh` GREEN on the regenerated set (18 default patches strict on a fresh `4f9dfa0e3`
+  tarball, applied tree `4f875aea2`, both optional artifacts re-cut and applying strictly, cumulative
+  `aa250b3da`, Windows portability 512 files).
+* `scripts/gate-per-block-build.sh --changed-from 32f6d6a45 --fast`: block 07 and the `0300` tip rebuilt from a
+  wiped build dir, 2/2 OK (every other block's delta is unchanged).
+* Coherence (`Qwen3.5-4B-Q8_0`, `The capital of France is`, seed 42) `1c5d32ac537d` on 1 GPU and on the 3-GPU
+  `tensor` split, OFF and `auto` alike.
+* MTP Protocol A was not run, deliberately: this change cannot alter a dispatch on the default path, and the
+  evidence says it does not (KLD 0.000000, byte-identical text, per-block build).  A user who turns the opt-in
+  on is by definition outside the byte-identical contract (`GREEDY-PURITY.md` §91).
+
 ## 261118.004 (r311, published) -- `v17-4f9dfa0e3-r311` is PUBLISHED: delivery repo `main` + tag, and the fork's `rdna-boosts` is re-cut at `.tip`
 
 **Published.**  Delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main` `d3fb2e42..b0c85ac1`, annotated tag

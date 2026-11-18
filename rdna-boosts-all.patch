@@ -12,7 +12,7 @@ index e38485ca0..688639a72 100644
      fit.h
      file-lock.cpp
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 6bf9355fb..6bdece79f 100644
+index 6bf9355fb..1eee5cf7f 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -341,9 +341,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -108,8 +108,8 @@ index 6bf9355fb..6bdece79f 100644
 +        "run the dense matvecs of a speculative verify batch (N..8 columns) on the RDNA4 WMMA iu8 kernel\n"
 +        "family: each weight is dequantized once for all the verified columns, so the cost is nearly flat in\n"
 +        "the column count where the K-split kernel becomes instruction bound\n"
-+        "default: off (the delivery's own kernels); `auto` = 7, the first width at which it wins\n"
-+        "(2..5 columns are slower, 6 is a tie, 7..8 are 2-10 % faster -- see ENVIRONMENT.md)\n"
++        "default: off (the delivery's own kernels); `auto` = the measured per-type floor (5 columns for Q4_K\n"
++        "and Q5_K, 8 for Q6_K, IQ4_XS and Q8_0), N = that floor for every type (see ENVIRONMENT.md)\n"
 +        "WARNING: opt-in and width-split by design -- 1 column always keeps the K-split kernel, so while this\n"
 +        "is on the byte-identical greedy/verify contract does NOT hold (see GREEDY-PURITY.md)",
 +        [](common_params & params, const std::string & value) {
@@ -118,7 +118,7 @@ index 6bf9355fb..6bdece79f 100644
 +                return;
 +            }
 +            if (common_arg_utils::is_autoy(value)) {
-+                params.wmma_verify = 7;
++                params.wmma_verify = -1;   // auto: the ggml side resolves it PER TYPE (r312)
 +                return;
 +            }
 +            const int n = std::atoi(value.c_str());
@@ -527,7 +527,7 @@ index 6bf9355fb..6bdece79f 100644
          {"--spec-synth-len"}, "L",
          "target mean synthetic acceptance length, including the target token (benchmarking only)",
 diff --git a/common/common.cpp b/common/common.cpp
-index 657dcdbf5..673849c86 100644
+index 657dcdbf5..69454bf31 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -7,6 +7,7 @@
@@ -1002,12 +1002,13 @@ index 657dcdbf5..673849c86 100644
  void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const {
      common_context_seq_add(ctx_tgt, seq_id, p0, p1, delta);
      if (ctx_dft) {
-@@ -1683,9 +2047,37 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
+@@ -1683,9 +2047,38 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
      llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
  }
  
-+// block 07 (r290): `--wmma-verify N` -- the verify band's WMMA iu8 floor (0 = off, the default).  Applied to
-+// every device through the backend registry's own proc-address table: this is a kernel-family selector, so it
++// block 07 (r290): `--wmma-verify off|auto|N` -- the verify band's WMMA iu8 floor (0 = off, the default;
++// -1 = `auto`, which the backend resolves PER TYPE from the measured crossover).  Applied to every device
++// through the backend registry's own proc-address table: this is a kernel-family selector, so it
 +// must be in place before the model's launchers are chosen, and the registry lookup is how `common` reaches
 +// the RDNA4 CUDA backend without a CUDA symbol and without a new cross-backend interface member.  A backend
 +// that does not answer (anything but the RDNA4 CUDA backend) is left alone; with the floor at its default of
@@ -1019,7 +1020,7 @@ index 657dcdbf5..673849c86 100644
 +// registered the backends and BEFORE any model or context exists.  `common_init_from_params()` would not do:
 +// the bench tools load the model themselves and never call it.
 +static void common_apply_backend_options(const common_params & params) {
-+    if (params.wmma_verify <= 0) {
++    if (params.wmma_verify == 0) {
 +        return;
 +    }
 +    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -1040,7 +1041,7 @@ index 657dcdbf5..673849c86 100644
      if (!params.devices.empty()) {
          mparams.devices = params.devices.data();
      }
-@@ -1695,6 +2087,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1695,6 +2088,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.split_mode      = params.split_mode;
      mparams.load_mode       = params.load_mode;
      mparams.lazy_mode = params.lazy_mode;
@@ -1060,7 +1061,7 @@ index 657dcdbf5..673849c86 100644
      mparams.tensor_split    = params.tensor_split;
      mparams.check_tensors   = params.check_tensors;
      mparams.use_extra_bufts = !params.no_extra_bufts;
-@@ -1717,7 +2122,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1717,7 +2123,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.progress_callback           = params.load_progress_callback;
      mparams.progress_callback_user_data = params.load_progress_callback_user_data;
      mparams.no_alloc                    = params.no_alloc;
@@ -1070,7 +1071,7 @@ index 657dcdbf5..673849c86 100644
  
      return mparams;
  }
-@@ -1741,6 +2147,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1741,6 +2148,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.n_ctx             = params.n_ctx;
      cparams.n_seq_max         = params.n_parallel;
      cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
@@ -1080,7 +1081,7 @@ index 657dcdbf5..673849c86 100644
      cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
      cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
      cparams.n_batch           = params.n_batch;
-@@ -1767,6 +2176,17 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1767,6 +2177,17 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.op_offload        = !params.no_op_offload;
      cparams.swa_full          = params.swa_full;
      cparams.kv_unified        = params.kv_unified;
@@ -1099,7 +1100,7 @@ index 657dcdbf5..673849c86 100644
      cparams.type_k = params.cache_type_k;
      cparams.type_v = params.cache_type_v;
 diff --git a/common/common.h b/common/common.h
-index 6043ab342..970abbad5 100644
+index 6043ab342..6736a6d34 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -20,6 +20,7 @@
@@ -1265,7 +1266,7 @@ index 6043ab342..970abbad5 100644
      bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
      bool verbose_prompt    = false; // print prompt tokens before generation
      bool display_prompt    = true;  // print prompt before generation
-@@ -609,9 +687,31 @@ struct common_params {
+@@ -609,9 +687,32 @@ struct common_params {
      ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
      ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
  
@@ -1290,14 +1291,15 @@ index 6043ab342..970abbad5 100644
      float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
  
 +    // block 07 (r290): the verify band's WMMA iu8 floor in columns -- the first verify width that takes the
-+    // tensor-core family instead of the K-split mmvq kernel (0 = off, the default).  `--wmma-verify auto` resolves to 7, the first width at which it beats the K-split
-+    // kernel; below it the family is SLOWER (see ENVIRONMENT.md and GREEDY-PURITY.md).
++    // tensor-core family instead of the K-split mmvq kernel (0 = off, the default; -1 = `auto`, the measured
++    // PER-TYPE crossing resolved in ggml: 5 columns for Q4_K/Q5_K, 8 for Q6_K/IQ4_XS/Q8_0).  Below its own
++    // crossing the family is SLOWER (see ENVIRONMENT.md §7.6 and GREEDY-PURITY.md §91).
 +    int32_t wmma_verify = 0;
 +
      common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
  
      // multimodal models (see tools/mtmd)
-@@ -657,6 +757,16 @@ struct common_params {
+@@ -657,6 +758,16 @@ struct common_params {
      int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
      bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
  
@@ -1314,7 +1316,7 @@ index 6043ab342..970abbad5 100644
      // llama-connect params
      bool        server_connect      = false;
      std::string server_connect_code = "";
-@@ -1007,12 +1117,21 @@ common_gguf_info common_get_gguf_info(const std::string & fname);
+@@ -1007,12 +1118,21 @@ common_gguf_info common_get_gguf_info(const std::string & fname);
  
  // note: defines the model, context, samplers, ets. lifetimes
  struct common_init_result {
@@ -1337,7 +1339,7 @@ index 6043ab342..970abbad5 100644
      common_sampler * sampler(llama_seq_id seq_id);
      void reset_samplers();
  
-@@ -1025,7 +1144,7 @@ private:
+@@ -1025,7 +1145,7 @@ private:
  
  using common_init_result_ptr = std::unique_ptr<common_init_result>;
  
@@ -1346,7 +1348,7 @@ index 6043ab342..970abbad5 100644
  
  struct llama_model_params   common_model_params_to_llama  (      common_params & params);
  struct llama_context_params common_context_params_to_llama(const common_params & params);
-@@ -1091,6 +1210,13 @@ struct common_memory {
+@@ -1091,6 +1211,13 @@ struct common_memory {
      void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
      void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
      void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
@@ -1360,7 +1362,7 @@ index 6043ab342..970abbad5 100644
  };
  
  //
-@@ -1291,6 +1417,8 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
+@@ -1291,6 +1418,8 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
  inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vector<llama_model_tensor_buft_override> & overrides) {
      // keep strings alive and avoid leaking memory by storing them in a static list
      static std::list<std::string> buft_override_strings;
@@ -64844,10 +64846,10 @@ index 000000000..b471e4949
 +}
 diff --git a/ggml/src/ggml-cuda/mmvq-wmma.cu b/ggml/src/ggml-cuda/mmvq-wmma.cu
 new file mode 100644
-index 000000000..857f83130
+index 000000000..c1fb758e4
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmvq-wmma.cu
-@@ -0,0 +1,401 @@
+@@ -0,0 +1,433 @@
 +// Matrix x 2..16 vectors (the speculative VERIFY band) in WMMA iu8 16x16x16, RDNA4.
 +//
 +// WHY (r290, contributor patch burnoutIA, PR #317): a verify batch re-runs the dequantization of every
@@ -64856,9 +64858,9 @@ index 000000000..857f83130
 +// verified tokens).  Here each weight is dequantized ONCE for all the columns and the products go through
 +// the tensor cores, so the cost is nearly flat in the column count.
 +//
-+// SCOPE: this is an OPT-IN kernel family (`--wmma-verify N`, alias GGML_CUDA_WMMA_MMVQ=N, default OFF) and
-+// it is WIDTH-SPLIT BY DESIGN: 1 column keeps the K-split kernel, N..8 columns take this one.  That breaks
-+// GREEDY-PURITY.md invariant 1 (decode and verify of the same state must take the same kernel) and the
++// SCOPE: this is an OPT-IN kernel family (`--wmma-verify off|auto|N`, alias GGML_CUDA_WMMA_MMVQ, default
++// OFF) and it is WIDTH-SPLIT BY DESIGN: 1 column keeps the K-split kernel, N..8 columns take this one. That
++// breaks GREEDY-PURITY.md invariant 1 (decode and verify of the same state must take the same kernel) and the
 +// delivery's byte-identical greedy contract, so it is off by default and NOTHING of the default path
 +// changes while it is off; see GREEDY-PURITY.md and ENVIRONMENT.md for the exception and its numbers.
 +//
@@ -64867,6 +64869,14 @@ index 000000000..857f83130
 +//   w7 +2..+7 %, w8 +4 % (Q8_0) .. +10.6 % (K-quants, 2 GPU tensor split).  End to end the CYCLE time
 +//   drops 8-10 % at every acceptance level and the tokens/s follow acceptance.  Hence the floor defaults to
 +//   7 (`auto`): below it the kernel is SLOWER than the K-split one.
++//
++// r312 (TODO #329): the low band was measured per type and `auto` is now PER TYPE.  Why the floor cannot simply
++// drop to 2: at 2-4 columns the K-split kernel is already at 92-97 % of this box's DRAM roof (590-630 GB/s of
++// 644 on a 253-479 MB matrix), so no kernel can win there -- and this one still computes a full 16x16 tile
++// whatever the column count (a 16x16x16 iu8 WMMA cannot be narrowed), so it lands 3-8 % behind.  What the
++// measurement DID find is that the crossover is type-shaped: Q4_K/Q5_K win from 5 columns where Q6_K, IQ4_XS
++// and Q8_0 only win at 8 and LOSE up to 8 % (Q6_K) below it, which the blanket floor of 7 still paid for.
++// See wmmv_auto_floor().
 +//
 +// DESIGN:
 +// - one workgroup = one tile of 16 rows; its waves split K into interleaved 256-element super-blocks,
@@ -65183,7 +65193,10 @@ index 000000000..857f83130
 +    const auto * y = (const block_q8_1 *) vy;
 +    const int64_t rb = stride_row_x*F::RB;
 +    const int scy = (int) stride_col_y;
-+    // Wave count: it must divide the super-block count (otherwise part of the workgroup idles).
++    // Wave count: it must divide the super-block count (otherwise part of the workgroup idles).  A wave count
++    // that does not divide it was measured instead of one that does (k = 3840, nsb = 15: 10 or 8 waves at
++    // n = 8 is 1.1 % slower for Q4_K and 2.4 % faster for Q8_0 than the single wave this falls through to), so
++    // the exact-divisor rule stays.
 +    if (nsb % 10 == 0) { mmvq_wmma<F, 10><<<grid, 320, 0, stream>>>(x, y, dst, nsb, rb, scy, stride_col_dst, N); }
 +    else if (nsb % 8 == 0) { mmvq_wmma<F, 8><<<grid, 256, 0, stream>>>(x, y, dst, nsb, rb, scy, stride_col_dst, N); }
 +    else if (nsb % 4 == 0) { mmvq_wmma<F, 4><<<grid, 128, 0, stream>>>(x, y, dst, nsb, rb, scy, stride_col_dst, N); }
@@ -65196,15 +65209,35 @@ index 000000000..857f83130
 +} // namespace wmmv
 +
 +// The floor: the FIRST column count at which this family replaces the K-split kernel (0 = off).
-+// `--wmma-verify N` sets it through ggml_backend_dev_wmma_verify_set() before the first graph is built; the
-+// GGML_CUDA_WMMA_MMVQ alias from the contributor's patch keeps working, and when it is set it WINS so a gate
-+// can force the arms (`GGML_CUDA_WMMA_MMVQ=0` disables a run that `--wmma-verify` enabled).
++// `--wmma-verify N` sets it through the backend registry's proc-address table before the first graph is built;
++// the GGML_CUDA_WMMA_MMVQ alias from the contributor's patch keeps working, and when it is set it WINS so a
++// gate can force the arms (`GGML_CUDA_WMMA_MMVQ=0` disables a run that `--wmma-verify` enabled).
 +// Latched once (ENVIRONMENT.md: a behaviour variable is resolved once, not per op).
++static constexpr int WMMV_AUTO = -1;   // `auto`: the per-type floor below (r312)
++
 +static int g_cli_min_cols = 0;
-+static int g_min_cols     = -1;
++static int g_min_cols     = -2;   // -2 = not resolved yet
++
++// r312: `auto` is PER TYPE, from the measured crossover rather than the blanket 7 it used to resolve to.
++// The family's cost is nearly flat in the column count while the K-split kernel's grows, so the crossover is
++// where the K-split kernel leaves the DRAM roof -- and that point is type-shaped: the K-quants are still at
++// 608-620 GB/s at 5 columns (so they win as soon as the K-split one bends) where Q6_K and IQ4_XS, whose own
++// K-split kernels are the fastest per byte, do not win until 8 (and lose 7-8 % at 2..6, which a blanket
++// floor of 7 still paid for).  Measured, ENVIRONMENT.md §7.6 / GREEDY-PURITY.md §91: see the per-type table.
++static constexpr int wmmv_auto_floor(ggml_type type) {
++    switch (type) {
++        case GGML_TYPE_Q4_K:   return 5;
++        case GGML_TYPE_Q5_K:   return 5;
++        case GGML_TYPE_Q6_K:   return 8;
++        case GGML_TYPE_IQ4_XS: return 8;
++        case GGML_TYPE_Q8_0:   return 8;
++        default:               return 0;
++    }
++}
 +
 +static int wmmv_clamp(const int n) {
-+    if (n <= 0) return 0;
++    if (n < 0)  return WMMV_AUTO;   // an explicit `auto`
++    if (n == 0) return 0;
 +    // 1 column is decode, which always keeps the K-split kernel: it is faster there and a decode that took a
 +    // different kernel from the verify would be a purity break at the widest possible band.
 +    if (n < 2)  return 2;
@@ -65212,12 +65245,13 @@ index 000000000..857f83130
 +    return n;
 +}
 +
-+static int wmmv_min_cols() {
-+    if (g_min_cols < 0) {
++static int wmmv_min_cols(const ggml_type type) {
++    if (g_min_cols == -2) {
 +        const char * e = getenv("GGML_CUDA_WMMA_MMVQ");
-+        g_min_cols = e != nullptr ? wmmv_clamp(atoi(e)) : g_cli_min_cols;
++        // `GGML_CUDA_WMMA_MMVQ=auto` is the env spelling of `--wmma-verify auto` (atoi() would read it as 0)
++        g_min_cols = e != nullptr ? ((e[0] == 'a' || e[0] == 'A') ? WMMV_AUTO : wmmv_clamp(atoi(e))) : g_cli_min_cols;
 +    }
-+    return g_min_cols;
++    return g_min_cols == WMMV_AUTO ? wmmv_auto_floor(type) : g_min_cols;
 +}
 +
 +void ggml_cuda_mmvq_wmma_set_min_cols(const int n) {
@@ -65230,7 +65264,7 @@ index 000000000..857f83130
 +bool ggml_cuda_mmvq_wmma(ggml_type type, const void * vx, const void * vy, float * dst,
 +                         int64_t ncols_x, int64_t nrows_x, int64_t stride_row_x, int ncols_dst,
 +                         int64_t stride_col_y, int64_t stride_col_dst, cudaStream_t stream) {
-+    const int min_cols = wmmv_min_cols();
++    const int min_cols = wmmv_min_cols(type);
 +    if (min_cols == 0 || ncols_dst < min_cols || ncols_dst > 16) {
 +        return false;
 +    }

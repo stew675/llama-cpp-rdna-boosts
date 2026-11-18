@@ -1,4 +1,4 @@
-From a3bc1cdc8d28b8dc01cf78783664eff46a09c7a0 Mon Sep 17 00:00:00 2001
+From 45f8d048df830fbaab1cf014c0c43acef13a3790 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 14/17] rdna-boosts: block 14: the streamed KV -- a fixed-VRAM
@@ -171,7 +171,7 @@ is unchanged) and divided by MiB only for display.
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cuh
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 0d2b0debe..628822ad6 100644
+index 129eebd3f..70a7c9f47 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -1698,6 +1698,72 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -284,7 +284,7 @@ index 0d2b0debe..628822ad6 100644
          {"--spec-draft-n-min-adaptive"}, "N",
          string_format("minimum adaptive MTP draft depth; the depth never drops below it (the default cold start is three steps below --spec-draft-n-max, bounded by this floor) (default: %d)", params.speculative.draft.n_min_adaptive),
 diff --git a/common/common.cpp b/common/common.cpp
-index 1ff821c25..673849c86 100644
+index da2740501..69454bf31 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1254,11 +1254,42 @@ static common_draft_reserve common_draft_reserve_derive(const common_params & pa
@@ -333,7 +333,7 @@ index 1ff821c25..673849c86 100644
  }
  
  void common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
-@@ -2146,6 +2177,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -2147,6 +2178,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.swa_full          = params.swa_full;
      cparams.kv_unified        = params.kv_unified;
      cparams.drop_compute_buffers = params.drop_compute_buffers;
@@ -345,7 +345,7 @@ index 1ff821c25..673849c86 100644
      // issue #238: a multimodal projector feeds 2-D (M-RoPE) positions into this context, and the packed KQ
      // mask must be part of the compute reserve for those.  Without a projector the context only ever sees
 diff --git a/common/common.h b/common/common.h
-index 71f251387..83aa5f12f 100644
+index 67e3f9c44..732cce56f 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -377,6 +377,14 @@ struct common_params_speculative_draft {

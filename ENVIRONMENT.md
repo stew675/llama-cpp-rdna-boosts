@@ -882,7 +882,7 @@ one of these as a **new reference**, not as a tuning experiment.
 > byte-identical contract holds; that is the arm every gate runs.
 >
 > **Use it for a fixed deep draft.**  Content-fixed TG t/s by verify width, ON vs OFF
-> (`llama-batched-bench -npp 512 -ntg 64 -npl 1..8`, 27B):
+> (`llama-batched-bench -npp 512 -ntg 64 -npl 1..8`, 27B, floor at its old uniform 7):
 >
 > | width | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
 > |---|---|---|---|---|---|---|---|
@@ -894,16 +894,45 @@ one of these as a **new reference**, not as a tuning experiment.
 > 27B Q4_K_M **205.6 -> 221.5 t/s** (cycle 36.5 -> 33.9 ms), 27B Q8_0 **170.1 -> 177.3 t/s** (43.6 -> 41.8
 > ms); the adaptive-MTP four-axis at `-n 3000` is `+0.7 / +4.5 / +6.7 / +3.7 %` on R/P/C/K.  **Widths above
 > 8 are MMQ**, so an adaptive `n_max 12` arm (deep rounds at 9-13 columns) is neutral -- the feature is for
-> a *fixed* deep draft (`n_max 5..7`), which is where the floor of 7 puts it.
+> a *fixed* deep draft (`n_max 5..7`).
+>
+> **r312 (TODO #329): `auto` is PER TYPE, and the low band cannot be won -- measured, do not re-derive.**  The
+> reported premise was that a narrower tile (or a dot-product form) would let the floor drop to 2 and make the
+> family default-on.  It cannot: **at 2-4 columns the K-split kernel is already at 92-98 % of this box's DRAM
+> roof** (590-630 GB/s of 644 on a 253-479 MB matrix, `m=88064 k=5120`, one R9700), so there is no headroom for
+> any kernel there, and this one still computes a full 16x16 tile whatever the column count (a 16x16x16 `iu8`
+> WMMA cannot be narrowed), which is worth 3-8 % against a kernel that is *at* the roof.  What the measurement
+> did find is that the crossover is **type-shaped**, so `auto` now takes the family where it wins per type:
+>
+> | type | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | `auto` floor |
+> |---|---|---|---|---|---|---|---|---|---|
+> | Q4_K | -- | -0.0 % | -0.1 % | -1.5 % | **+6.7 %** | +18.1 % | +30.7 % | +44.7 % | **5** |
+> | Q5_K | -- | -0.0 % | -0.1 % | -1.5 % | **+13.0 %** | +24.0 % | +36.3 % | +44.2 % | **5** |
+> | Q6_K | -- | -0.0 % | -0.0 % | -0.0 % | -0.0 % | -0.1 % | -0.4 % | **+5.5 %** | **8** |
+> | IQ4_XS | -- | -0.0 % | -0.1 % | -0.0 % | -0.0 % | -0.0 % | -0.0 % | **+0.3 %** | **8** |
+> | Q8_0 | -- | -0.0 % | -0.0 % | -0.0 % | -0.0 % | +0.0 % | -0.0 % | **+4.4 %** | **8** |
+>
+> (one dense `MUL_MAT`, µs/op, K-split vs the family; the K-split column reads 410.8 / 411.1 / 416.1 / 429.7 /
+> 471.6 / 527.2 / 588.8 / 657.8 µs for Q4_K at widths 1-8).  A blanket floor of 7 therefore still paid Q6_K's
+> **-0.4 %** at 7 and never reached Q4_K/Q5_K's 5- and 6-column wins; the per-type table is worth
+> **+0.6 / +2.9 / -0.3 / +0.0 %** at widths 5/6/7/8 against the old uniform floor on 1 GPU (27B UD-Q4_K_M,
+> `-ntg 256`) and **-0.2 / +1.5 / +0.2 / +0.0 %** on a 2-GPU `tensor` split, i.e. a gain at width 6 and
+> neutrality everywhere else.  Two adjacent ideas were measured and REJECTED: removing the Q4_K/Q5_K min-term
+> (ones) MMA entirely is only +2.2..+5.0 % (Q4_K) / +0.6..0.8 % (Q5_K) and 0 % for the other three types, and
+> a wave count that does not divide the super-block count is ±1-2 % with mixed signs.  THE FLOOR CANNOT GO TO 2
+> AND THE FAMILY CANNOT BE DEFAULT-ON while width 1 keeps the K-split kernel -- that is the purity break, not
+> the low band.  Record: `archive/work/rdna4-wmma-verify/LOW-BAND-2026-11-18.md`, `INVARIANTS.md` r312.
 >
 > **RDNA4 only** (gfx1200/gfx1201 device code, `GGML_CUDA_CC_IS_RDNA4` at dispatch); every other type, shape
 > and GPU falls through to the K-split kernel, as does anything fused, `MUL_MAT_ID`, and a non-unit batch
-> dimension.  Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0.
+> dimension.  Q4_K, Q5_K, Q6_K, IQ4_XS and Q8_0.  It is reached by ANY dense matvec in the band, not only by a
+> verify batch: a plain `llama-cli` prefill on a 4B Q8_0 hits it (639 of 2419 matvec dispatches at a floor of
+> 2), which is why the ON arm's greedy text moves even without a drafter.
 
 | variable / option | default | class | notes |
 |---|---|---|---|
-| `--wmma-verify off\|auto\|N` (`common`) | `off` | opt-in | the **floor** in verified columns: the first verify width that takes the family (2..16, clamped; `1` is clamped to 2 because width 1 is decode and must keep the K-split kernel).  `auto` = **7**, the first width it wins on both a single card and a 2-GPU tensor split.  Values above 8 are meaningless in practice (MMQ owns those widths) but are accepted, so a calibration arm can be run without editing the option. |
-| `GGML_CUDA_WMMA_MMVQ` | unset = off | opt-in (**deprecated alias**) | the contributor's original switch (PR #317): the same floor, read from the environment.  It is the A/B and bisection knob and it **wins when set**, so `GGML_CUDA_WMMA_MMVQ=0` disables a run that `--wmma-verify` enabled, and `=7` reproduces `--wmma-verify auto`.  Value-gated (`0` = off), latched once per process.  It is the only way to reach the family from a tool that does not go through `common` (`test-backend-ops`, a bench harness). |
+| `--wmma-verify off\|auto\|N` (`common`) | `off` | opt-in | the **floor** in verified columns: the first verify width that takes the family (2..16, clamped; `1` is clamped to 2 because width 1 is decode and must keep the K-split kernel).  `auto` = the **per-type** floor of the table above (**5** for Q4_K and Q5_K, **8** for Q6_K, IQ4_XS and Q8_0, resolved in ggml since r312), which is what an operator should use.  An explicit `N` is that floor for **every** type -- it is the calibration knob, and `=7` reproduces the pre-r312 behaviour.  Values above 8 are meaningless in practice (MMQ owns those widths) but are accepted, so a calibration arm can be run without editing the option. |
+| `GGML_CUDA_WMMA_MMVQ` | unset = off | opt-in (**deprecated alias**) | the contributor's original switch (PR #317): the same floor, read from the environment.  It is the A/B and bisection knob and it **wins when set**, so `GGML_CUDA_WMMA_MMVQ=0` disables a run that `--wmma-verify` enabled, `=7` is the uniform floor of 7 (the pre-r312 `auto`) and **`=auto`** is `--wmma-verify auto` (r312; the value is read by its first letter, so `atoi()` cannot silently turn it into `0` = off).  Value-gated (`0` = off), latched once per process.  It is the only way to reach the family from a tool that does not go through `common` (`test-backend-ops`, a bench harness). |
 
 ---
 

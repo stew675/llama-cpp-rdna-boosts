@@ -1,4 +1,4 @@
-From e4b670c2cabb1f9270dd8507e2bbcc55db8124fb Mon Sep 17 00:00:00 2001
+From 5acc28761cd6402a367d0c2c16e807b42ebf9779 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/17] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -72,7 +72,7 @@ Subject: [PATCH 12/17] rdna-boosts: block 12: campaign remainder (CPU wins,
  64 files changed, 9895 insertions(+), 1247 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 676a2861a..69b117204 100644
+index 82baad877..bb51905a5 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2683,7 +2683,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -153,7 +153,7 @@ index 676a2861a..69b117204 100644
              params.host_experts_limit_gib = (int64_t) n;
              params.host_experts_mode      = LLAMA_HOST_EXPERTS_MODE_AUTO;
 diff --git a/common/common.cpp b/common/common.cpp
-index 4c99105cf..108fbe536 100644
+index 047f79a5e..54bb82bdc 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1545,6 +1545,8 @@ common_init_result::common_init_result(common_params & params, bool model_only,
@@ -182,10 +182,10 @@ index 4c99105cf..108fbe536 100644
      common_context_seq_add(ctx_tgt, seq_id, p0, p1, delta);
      if (ctx_dft) {
 diff --git a/common/common.h b/common/common.h
-index 4c1016015..4f0a18875 100644
+index 92e046cf8..70b3dec09 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -1172,6 +1172,13 @@ struct common_memory {
+@@ -1173,6 +1173,13 @@ struct common_memory {
      void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
      void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
      void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;

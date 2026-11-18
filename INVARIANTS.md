@@ -677,3 +677,45 @@ fixture ladder.
    `HC_PRE` reads `obs` while the real GSQ-IQ3_XXS/IQ4_NL GGUF reads `query` — the real-model arm is the only
    instrument for that vacuity.  Its graph also legitimately reads `splits = 4..14` (tiny shapes fall back), so the
    splits assertion is a real-model-only check.
+
+## r312 (2026-11-18, `WORKLOG.md` 261118.005) — the verify band's low columns are at the DRAM roof, so a "narrower tile" has nothing to win; the crossover is TYPE-shaped
+
+Established by `TODO` #329 (the family's lowest columns), block 07's `mmvq-wmma.cu`, and a DRAM-cold one-`MUL_MAT`
+sweep plus end-to-end `llama-batched-bench`.  `archive/work/rdna4-wmma-verify/LOW-BAND-2026-11-18.md` carries the
+raw tables.
+
+1. **At 2-4 verified columns the K-split `mmvq` kernel is 92-98 % of the DRAM roof, so NO kernel can beat it there.**
+   One dense `MUL_MAT` (`m=88064`, `k=5120`; 253 MB Q4_K … 479 MB Q8_0, i.e. larger than the 64 MB L2 so it streams),
+   one R9700 at its 644 GB/s spec: Q4_K reads **617.2 / 616.9 / 609.4 / 590.6 GB/s** at widths 1 / 2 / 3 / 4 (96 / 96 /
+   95 / 92 %), Q5_K 624 / 620 / 613 / 595, Q6_K 626 / 623 / 619 / 615, IQ4_XS 621 / 618 / 612 / 605, Q8_0 630 / 627 /
+   624 / 621.  The theoretical headroom in the whole low band is therefore 0-8 %, and the tile family lands 3-8 %
+   behind it.  A "narrower tile or dot-product form for the low band" (the `TODO` #329 premise) cannot change that:
+   the reference is the memory wall, not a kernel.  Ties to the same fact from the whole-model side: at 2 columns the
+   27B UD-Q4_K_M step reads 34.6 ms against 30.2 ms at 1 column, i.e. 476 against 548 GB/s -- the 2nd column is
+   nearly free for the K-split kernel because it is already bandwidth bound.
+2. **The crossover to the WMMA tile family is type-shaped, because each type's K-split kernel leaves the roof at its
+   own width.**  Same sweep, tile vs K-split (µs/op): Q4_K is **-1.5 % at 4 and +6.7 % at 5**, Q5_K -1.5 % at 4 and
+   **+13.0 % at 5**, Q6_K **-7.3 % at 2 … -0.4 % at 7 and +5.5 % at 8**, IQ4_XS **-2.5 % at 2 … +0.3 % at 8**, Q8_0
+   parity until **+4.4 % at 8**.  A single uniform floor is therefore wrong in both directions: a floor of 7 still
+   paid Q6_K's -0.4 % and never reached the K-quants' 5- and 6-column wins.  `auto` is now that measured per-type
+   floor (**5 / 5 / 8 / 8 / 8** for Q4_K / Q5_K / Q6_K / IQ4_XS / Q8_0) and an explicit `N` stays the uniform
+   calibration arm.  End to end (27B UD-Q4_K_M, `-ntg 256`, TG t/s at widths 5 / 6 / 7 / 8): 1 GPU
+   **131.70 / 147.28 / 158.74 / 169.68** off against **132.46 / 151.62 / 168.79 / 187.26** `auto` (+0.6 / **+2.9** /
+   +6.3 / +10.4 %), 2-GPU `tensor` **204.82 / 231.33 / 250.56 / 271.51** against **204.33 / 234.11 / 260.12 /
+   289.21** (-0.2 / +1.2 / +3.8 / +6.5 %); against the old uniform floor of 7 that is +2.9 / +1.5 % at width 6 and
+   neutral (+/-0.3 %) elsewhere.
+3. **Two adjacent ideas are measured and REJECTED; do not re-derive them.**  (a) Dropping the Q4_K/Q5_K min-term
+   ("ones") MMA -- half of those types' tile MMA count -- is worth only **+2.2 % at 2 … +5.0 % at 8** for Q4_K,
+   **+0.6..0.8 %** for Q5_K and **0.0 %** for Q6_K/IQ4_XS/Q8_0 (measured by zeroing the min term, which is wrong
+   output, so timing only), i.e. at most +4-5 % on one type's already-winning widths for a new per-column `Σxq`
+   precompute; it does not move the crossover (Q4_K would still be -1.1 % at 2 and -0.7 % at 3).  (b) Letting the
+   wave count be a non-divisor of the super-block count (`k=3840` -> `nsb=15`, which today falls through to ONE
+   32-thread wave) is **±1-2 % with mixed signs**: 547.3 -> 541.6 GB/s at 8 columns for Q4_K (worse) but 583.4 ->
+   597.7 for Q8_0 (better), so the exact-divisor rule stays.
+4. **The family is reached by ANY dense matvec in the band, not only by a draft's verify batch.**  A plain
+   `llama-cli` prefill on a 4B Q8_0 (`-ub 512`, 12 tokens) dispatches the family **639 times of 2419 matvec ops** at a
+   floor of 2, all before the first decode step, and its 40-token greedy text moves (`ed4ee91ec5b6` off against
+   `1b72606b6cf9` on) -- which is why the option's warning is about the greedy contract, not about drafting, and why
+   the release's purity evidence is the OFF arm and an explicit floor, never "the ON arm only runs at verify".
+   Both are unchanged by r312: the 27B Q8_0 + DFlash2 `n-max 7` spec arm reads `56612340f420` off on the r311 and
+   r312 builds, and an explicit `GGML_CUDA_WMMA_MMVQ=7` reads `b7d28482ca5f` on both.

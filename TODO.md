@@ -45,7 +45,6 @@ left in this file.  The r236 re-base
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
-| **329** | block 07's WMMA verify family loses at 2..5 columns, and a narrower tile (or a dot-product form) would let the floor go to 2 and make it default-on | performance / parked idea (block 07) | **PARKED** — open, not scheduled (r290, PR #317); it stays opt-in with a floor of 7 until the low band is measured — §329 |
 | **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure (per-block gate, clean checkout, hosted CI) dies in `ui-assets.cmake:137` -- the container images are unaffected (their `web` stage supplies `tools/ui/dist`) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround where it bites; re-check before the next per-block ladder — §342 |
 
 ## Handle numbering
@@ -57,6 +56,10 @@ subject after that item has closed and left this file.  The recent ones, so the 
 * **issued and retired the same day** (2026-11-16): `#337` — the attendance pool *does* engage on
   Qwen3.8-Flash-Next under `--kv-unified`, so the "cannot be exercised" premise was wrong; the arm and its
   numbers are in `archive/work/session-scheduling/`.
+* **`#329`** retired at r312 (`WORKLOG.md` 261118.005) — *refuted*, not implemented: at 2..4 verified columns the
+  K-split `mmvq` kernel is already at 92-98 % of the DRAM roof, so no narrower tile or dot-product low-band arm
+  has anything to win; the family stays opt-in and width-split, and what shipped instead is the measured
+  **per-type** `auto` floor (5 / 5 / 8 / 8 / 8).  Record: `archive/work/rdna4-wmma-verify/LOW-BAND-2026-11-18.md`.
 * **`#338`-`#340`** retired at r301, **`#341`** (issued r303) retired at r309 (`WORKLOG.md` 261117.008),
   **`#345`** (issued r308) retired at r311 (`WORKLOG.md` 261118.003).
 * **`#335`/`#336`** retired at r298 — an alias ROLE gap in the expert cache, `WORKLOG.md` 261116.005;
@@ -170,22 +173,6 @@ its size).  Records: `WORKLOG.md` 261108.011, `benchmarks/2026-11-08-host-expert
 arena is now read IN PLACE at any width (`MOE_EXPERT_PREFILL_IN_PLACE`: 1489.6 -> 4033.9 t/s on 3 GPUs
 `-sm tensor`, 3588.8 -> 4072.4 on the pool mirror).  Consolidating the three transports for a **partly resident**
 table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2026-11-10-prefill-in-place.md`.
-
-## 329. Block 07's WMMA verify family loses at 2..5 columns — a narrower tile would let the floor go to 2 (and the feature to default-on)
-
-**PARKED — open, not scheduled** (r290, PR #317).  The family (`--wmma-verify`, `ENVIRONMENT.md` §7.6) amortizes
-dequantization over the verified columns, which is why it wins at 7-8 columns (+5.8..+10.6 %) and *loses*
-below 6 (-1.6..-8.5 %, and -4.4 % at 6 on a 2-GPU split).  The cause is structural, not tuning: the kernel
-computes a full 16x16 tile and streams the whole weight row whatever the column count, so at 2-4 columns it
-does N/8ths of the arithmetic and 8/8ths of the traffic where the K-split kernel does a small fraction of
-both.  A 2..4-column arm would need a narrower tile or a different operand shape (a 16x16x16 `iu8` WMMA
-cannot be narrowed, so this likely means a *dot-product* form rather than a tile form for the low band).
-
-**What it would buy.**  The floor could ship at 2 (or 6), which would make the family a **default-on**
-candidate: the delivery's own adaptive-MTP drafts produce 2..8-column verify batches, and an arm that wins
-across that whole band is a pure win instead of a config-shaped opt-in.  Until then it stays opt-in with a
-floor of 7 and the purity note in `GREEDY-PURITY.md` §91 -- do not lower the floor without measuring the
-low band on both a single card and a 2-GPU `tensor` split (the crossover moves).
 
 ## 342. A broken upstream UI asset bundle breaks every fresh configure
 
