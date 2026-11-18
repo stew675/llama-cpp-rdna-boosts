@@ -51,6 +51,27 @@ and refuses a compare whose model/corpus/settings do not match the base unless `
 is given.  The manual commands below are exactly what the script runs; use them directly only if the
 script's pins do not fit.
 
+**The environment a point was measured under is part of the point (`--pin`, r310).**  Two switches move a
+host-expert shape's *text* on their own — `ROCBLAS_USE_HIPBLASLT` (a per-start kernel choice, `INVARIANTS.md` §44)
+and `MOE_EXPERT_HEATMAP` (the residency prior, `GREEDY-PURITY.md` §89) — so a base recorded with one state and
+compared under another is comparing states, not builds.  `--pin "K=V,..."` applies a `K=V` list to **both**
+arms, folds it into the base file name and records it in the meta as `pins=`, and a compare whose pins differ is
+refused.  Example, the **host-expert point** (`TODO` #344, retired r310; base PPL 2.8553, self-KLD `0.000000` on
+40 x 512 wikitext chunks, ~35 s per pass, peak RSS ~71 GiB — one GPU, nothing else running):
+
+```bash
+MOE_EXPERT_HEATMAP=load ROCBLAS_USE_HIPBLASLT=0 ./scripts/gate-prefill-logits.sh \
+  --model /llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
+  --device 0 --pin "MOE_EXPERT_HEATMAP=load,ROCBLAS_USE_HIPBLASLT=0" \
+  --extra "-ncmoe 47 --load-mode dio --lazy-mode mlockr -ot per_layer_token_embd.*=CPU"
+```
+
+It is the only point that reaches the **streamed host-expert prefill tier** (the 27B reference is dense), so a
+change to the pool fill, the in-place prefill band, the prefill stream or the eager decode-band hook owes it.
+The same two pins are what give that shape a **text** oracle again: 14/14 runs stable (3 x pinned prior, 3 x no
+prior, 4 x with `hipBLASLt` on — the library state reads a different text, which is why it is pinned).
+Record: [`benchmarks/2026-11-18-host-expert-prefill-oracle.md`](2026-11-18-host-expert-prefill-oracle.md).
+
 ## What it catches
 
 Any change that moves the prefill forward pass enough to shift the prompt logits, but not enough to

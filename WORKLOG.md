@@ -1,3 +1,87 @@
+## 261118.001 (r310, RELEASE v17-4f9dfa0e3-r310) -- `TODO` #344: the host-expert shape HAS a text oracle once the heat map AND `ROCBLAS_USE_HIPBLASLT` are pinned, and it is now a recorded KLD point; the r306 admission rule reads identical text there across builds
+
+**What shipped.**  **No patch change** (`release.json` keeps tip `87d3629df` / tree `3e64b1473`, all 18 default
+patch hashes and both optional artifacts byte-identical; the delta is `release.json`'s release id plus doc, gate
+and benchmark text, so nothing to re-cut and nothing to refresh on the fork).  Two functional artifacts:
+`scripts/gate-prefill-logits.sh` gained **`--pin "K=V,..."`** (applied to BOTH arms, folded into the base file
+name, recorded in the meta as `pins=`, and a compare whose pins differ is refused), and the new
+**`scripts/gate-host-expert-text.sh`** is the shape's oracle as a *mechanical* check (N repeats must read ONE
+text, either pin missing from `PIN` refuses the invocation, the flipped-library arm is printed as evidence, and
+`--kld` chains the prefill-logit point).  Records: `MANIFESTS.md` gates 1 and 4, `AGENTS.md` (the gate table),
+`INVARIANTS.md` r310, `GREEDY-PURITY.md` §89 addendum, `benchmarks/prefill-logit-methodology.md`,
+`benchmarks/2026-11-18-host-expert-prefill-oracle.md` (the measurement record + the bisect), `scripts/README.md`,
+`patches/README.md` blocks 16/12, `wip/CAMPAIGNS.md`, `TODO` #344 retired.
+
+**The item.**  r306 left the host-expert shape unverified on both halves: six identical-config runs on Flash-Next
+IQ3_XXS (1 GPU, `-ncmoe 47`) read **four different texts**, and that GGUF **shipped no `.moe-heatmap`** for
+`MOE_EXPERT_HEATMAP=load` to freeze the residency with, so "a step with nothing decoding takes the whole `-b`
+window" was never checked there (`-b/-ub 16384` is inert; `-b/-ub 512` is the altered case).
+
+**Both premises were stale, and neither was assumed.**  (i) The model directory now carries
+`Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS.moe-heatmap` (the r75 unified name), and the census says the host pool
+**covers** the set — 141 tensors, 40 012.5 MiB pinned, `h = 1.0000`, `evictions = 0` — so a frozen prior and no
+prior at all read the **same** text: the r306 spread does not reproduce on r309 (the residency mechanism needs a
+*partial* arena), and the state change in that window is r307's pass scoping (138 whole-table refills removed from
+every 30-34-token prompt).  Not bisected; the coverage does not need it.  (ii) The remaining carrier is the
+**library**: `ROCBLAS_USE_HIPBLASLT=0` reads `296/91ef8940d66e` (3/3) while `hipBLASLt` on reads
+`302/fb8da5c09068` (4/4) — §44's rule reaching a host-expert text arm.
+
+**Measured** (one R9700, gfx1201, ROCm 10.1.0, greedy, `prompts/prose-rdna-boosts.txt`, `-c 8192 -n 64`,
+`--load-mode dio --lazy-mode mlockr -ot per_layer_token_embd.*=CPU`):
+
+| arm | shape | text |
+|---|---|---|
+| heat map `load`, `ROCBLAS_USE_HIPBLASLT=0` | llama-cli | `296/91ef8940d66e` **3/3** |
+| heat map `0` (no prior), `ROCBLAS_USE_HIPBLASLT=0` | llama-cli | `296/91ef8940d66e` **3/3** |
+| heat map `load`, `hipBLASLt` default | llama-cli | `302/fb8da5c09068` **4/4** |
+| **r305** `73295b281`, `-b 2048 -ub 512` (cap every step) | server, `-np 1` | `98/65ba627f8eca` **2/2** (steps `512 x 9, 122, 512, 4`) |
+| **r309** `87d3629df`, default (wide when nothing decodes) | server, `-np 1` | `98/65ba627f8eca` **2/2** (steps `2048, 2048, 634, 512, 4`) |
+
+So the altered case — a 512-token step becoming a 2048-token step — is **byte-identical, across two binaries**,
+with the mechanism provably live on both (12 x 512-wide steps against 2 x 2048-wide).  `-np 1` and a lone prompt
+is the only oracle used; the two-slot rules (§38/§82/§63) are untouched.
+
+**The KLD point** (`gate-prefill-logits.sh`, canonical flags, f16 KV, wikitext `-c 512 --chunks 40`, 1 GPU,
+`--extra "-ncmoe 47 --load-mode dio --lazy-mode mlockr -ot per_layer_token_embd.*=CPU"`,
+`--pin "MOE_EXPERT_HEATMAP=load,ROCBLAS_USE_HIPBLASLT=0"`; base PPL **2.8553**, sha256 `effe46712734…`,
+~35 s per pass, peak RSS **71.1 GiB**):
+
+| arm | mean KLD | same top p |
+|---|---:|---:|
+| r309 build, self-test (record then compare, two processes) | **-0.000000** | **100.000 %** |
+| r305 build `73295b281` against the r309-recorded base | **-0.000000** | **100.000 %** |
+
+The self-test is what makes the tier an *instrument* (the logits are bit-reproducible there), and the second row
+measures the r305..r309 delta — which contains r307's repair on the prefill path — at nothing over 40 chunks.  The
+pins do not move the logits (the unpinned record produced the same base sha256); they belong to the point's
+*identity*, which is what `--pin` now records.  The 27B release point is dense and never builds the pool/in-place
+transport at all, which is why `MANIFESTS.md` gate 4 now requires this point for a change to that tier.
+
+**The spread was BISECTED, and it is not any of the obvious candidates.**  Twelve states, 42 runs, all at
+`-c 16384 -b 2048 -ub 2048` (a genuinely partial arena there: `h = 0.4593`, 6 629 fills) unless stated:
+a **mutating** heat map (default `=1` + a writable `MOE_EXPERT_HEATMAP_DIR`, rewritten each run) 5/5 one text;
+**frozen** (`load`) and **absent** (`=0`) the same; a **forced 8 GiB** arena vs the 23.8 GiB auto size 2+2 the
+same (which also kills the "free VRAM varies, so the library picks another kernel" theory -- that arm IS a 16 GiB
+VRAM delta); and the **r305** build (`73295b281`, a cold worktree build -- pre-r306 admission, pre-r307 repair)
+6/6 identical to the r309 build's 6/6, and to each other.  Only `ROCBLAS_USE_HIPBLASLT` moves the text (both
+states reproducible).  Not reconstructable: that session's prompt and box state; the residual explanation is a
+greedy near-tie flip (`GREEDY-PURITY.md` §46/§61), which is precisely why the coverage is a repeat gate and the
+numerics verdict is the KLD point.
+
+**Gates (all green, on the release tree).**  `validate-set.sh` **GREEN** (18 patches strict on a fresh tarball,
+tree `3e64b1473`, both optional artifacts and the cumulative optional tree re-cut and verified, Windows
+portability 512 files); `gate-prefill-logits.sh` canonical 27B point **0.000000 / 100.000 %** (re-run after the
+script edit, so the `--pin` change is proved inert on the point every release uses); the host-expert point above;
+`gate-host-expert-text.sh` **PASS 3/3** (`319/a455bfe7267a`, library arm `336/e98c06d6427a` -- the pin is live)
+and `--quick --kld` **PASS 2/2 + KLD 0.000000 / 100.000 %**; the pin-refusal arm (`--base` recorded with two pins,
+compare with one) **refuses** as designed; coherence
+`llama-cli` 4B `-sm tensor` (3 GPUs) reads `100 chars sha=1c5d32ac537d` on a binary that is byte-identical to
+r309's (no patch changed); every run's kernel journal clean via `check-gpu-faults.sh --since`.
+
+**One thing recorded rather than fixed.**  The wide-step *multi-prompt* interleaving (`split_equal`) still has no
+text oracle on this shape and stays a KLD-only judgement (`GREEDY-PURITY.md` §63), exactly as before -- a
+two-slot or multi-prompt pair is not an oracle at any pin.
+
 ## 261117.009 (r309, published) -- `v17-4f9dfa0e3-r309` is PUBLISHED: delivery repo `main` + tag, and the fork's `rdna-boosts` already carries `.tip` because no patch changed
 
 **Published, at the maintainer's direction.**  Delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main`

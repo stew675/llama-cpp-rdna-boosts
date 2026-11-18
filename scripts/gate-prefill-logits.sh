@@ -120,6 +120,15 @@
 #                                    e.g. a host-expert arm: --extra "-ncmoe 40 --host-experts pool".
 #                                    Folded into the base file name, because a base recorded on one
 #                                    configuration is not a reference for another.
+#   --pin "K=V,..."   PINS           environment pinned for BOTH arms, comma- or space-separated (default:
+#                                    none).  Some points are only reproducible with an env pin, and the pin
+#                                    is part of the POINT, not a convenience: `ROCBLAS_USE_HIPBLASLT`
+#                                    (INVARIANTS r44) and `MOE_EXPERT_HEATMAP=load` (the residency prior,
+#                                    r284/`GREEDY-PURITY.md` §89) each move a host-expert shape's text on
+#                                    their own.  Folded into the base FILE NAME and recorded in the meta, so
+#                                    a pinned base is never confused with an unpinned one, and a compare whose
+#                                    pins differ is refused.  Example (the Flash-Next host-expert point):
+#                                      --pin "MOE_EXPERT_HEATMAP=load,ROCBLAS_USE_HIPBLASLT=0"
 #   --allow-base-mismatch            skip the base-meta compatibility check
 #   --record, --ab SPEC
 #
@@ -153,6 +162,7 @@ ALLOW_CONTROL_PASS="${ALLOW_CONTROL_PASS:-0}"
 DEVICE="${DEVICE:-0}"
 SM="${SM:-}"
 PPL_EXTRA="${PPL_EXTRA:-}"
+PINS="${PINS:-}"
 TIMEOUT="${TIMEOUT:-1800}"
 KEEP="${KEEP:-0}"
 FAULTS="${FAULTS:-1}"
@@ -194,6 +204,7 @@ while [ $# -gt 0 ]; do
         --no-faults)            FAULTS=0; shift ;;
         --allow-base-mismatch)  ALLOW_BASE_MISMATCH=1; shift ;;
         --extra)                PPL_EXTRA="$2"; shift 2 ;;
+        --pin)                  PINS="$2"; shift 2 ;;
         --record)               RECORD=1; RECORD_ENV=""; shift ;;
         --ab)                   RECORD=1; RECORD_ENV="${2:-}"; shift 2 ;;
         -h|--help)              usage 0 ;;
@@ -280,6 +291,30 @@ resolve_model
          --model /llm/models/Gemma4/26B-A4B-QAT/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"
 [ -f "$MODEL" ] || die "model not found: $MODEL"
 
+# `--pin` accepts a comma- or a space-separated K=V list; it is normalised to a space-separated one here so
+# the run helper and the base name agree, and every entry is validated (a bare value would be passed to `env`
+# as a COMMAND name, which fails in a confusing way).
+if [ -n "$PINS" ]; then
+    pins_norm=""
+    for kv in $(printf '%s' "$PINS" | tr ',' ' '); do
+        case "$kv" in
+            *=*) pins_norm="$pins_norm${pins_norm:+ }$kv" ;;
+            *)   die "--pin: '$kv' is not K=V (pins are environment variable assignments)" ;;
+        esac
+    done
+    PINS="$pins_norm"
+fi
+# A pin the base arm's own env also sets would be silently overridden (later `env` assignments win); that is a
+# contradiction in the invocation, not a preference.
+if [ -n "$PINS" ] && [ -n "$RECORD_ENV" ]; then
+    for kv in $PINS; do
+        pkey="${kv%%=*}"
+        case " $RECORD_ENV " in
+            *" $pkey="*) die "--pin sets $pkey and --ab sets it too; a pin applies to BOTH arms, so give it once" ;;
+        esac
+    done
+fi
+
 MODEL_STEM="$(basename "$MODEL" .gguf)"
 if [ -z "$BASE" ]; then
     mkdir -p "$BASE_DIR" || die "cannot create base dir: $BASE_DIR"
@@ -296,6 +331,12 @@ if [ -z "$BASE" ]; then
     if [ -n "$PPL_EXTRA" ]; then
         xt_tag="-x$(printf '%s' "$PPL_EXTRA" | tr -cs 'A-Za-z0-9.' '-' | sed 's/^-*//;s/-*$//')"
     fi
+    # The env a point was measured under is part of the point (r44/r284), so a pinned run gets its own file
+    # instead of overwriting the unpinned reference -- or, worse, being found AS the unpinned one.
+    pin_tag=""
+    if [ -n "$PINS" ]; then
+        pin_tag="-p$(printf '%s' "$PINS" | tr -cs 'A-Za-z0-9.' '-' | sed 's/^-*//;s/-*$//')"
+    fi
     # The DEVICE SET and the SPLIT MODE are part of the point (the meta pin below, r272; the name from r285,
     # `TODO` #323).  An ALL-REDUCE arm is only reachable on >= 2 devices with `-sm tensor`, so the two points
     # a block-01 change needs are the single-device `layer` reference and the multi-device `tensor` arm --
@@ -308,7 +349,7 @@ if [ -z "$BASE" ]; then
         dev_tag="-dev$(printf '%s' "$DEVICE" | tr ',' '-')"
         sm_tag="-sm${SM:-layer}"
     fi
-    BASE="$BASE_DIR/prefill-logit-${ARCH}-${MODEL_STEM}${fs_tag}${kv_tag}${xt_tag}${dev_tag}${sm_tag}${UB:+-ub${UB}}.kld"
+    BASE="$BASE_DIR/prefill-logit-${ARCH}-${MODEL_STEM}${fs_tag}${kv_tag}${xt_tag}${pin_tag}${dev_tag}${sm_tag}${UB:+-ub${UB}}.kld"
 fi
 META="$BASE.meta"
 CONTROL_BASE="${BASE%.kld}-control-ub${CONTROL_UB}.kld"
@@ -333,7 +374,7 @@ echo "==> prefill-logit KLD gate (issue #113)"
 echo "    ppl=$LLAMA_PPL"
 echo "    model=$MODEL"
 echo "    corpus=$CORPUS  (sha256=${CORPUS_SHA:0:16}...)"
-echo "    arch=$ARCH  device=$DEVICE  ctx=$CTX chunks=$CHUNKS fa=$FA kv=$KV ngl=$NGL threads=$THREADS${PPL_EXTRA:+  extra='$PPL_EXTRA'}"
+echo "    arch=$ARCH  device=$DEVICE  ctx=$CTX chunks=$CHUNKS fa=$FA kv=$KV ngl=$NGL threads=$THREADS${PPL_EXTRA:+  extra='$PPL_EXTRA'}${PINS:+  pin='$PINS'}"
 echo "    base=$BASE$( [ -f "$META" ] && { r="$(sed -n 's/^rocm=//p' "$META" | head -1)"; [ -n "$r" ] && printf '  (recorded with ROCm %s)' "$r"; } )"
 echo "    thresholds: mean KLD <= $MAX_KLD, same-top-p >= ${MIN_TOPP}%"
 [ "$FAMILY_SWITCH" -eq 1 ] && echo "    mode=family-switch (control ubatch=$CONTROL_UB, max point PPL=$FAMILY_MAX_PPL)"
@@ -354,7 +395,8 @@ run_ppl() {
     local xt_args=()
     # shellcheck disable=SC2206  # an intended word-split argument list
     [ -n "$PPL_EXTRA" ] && xt_args=($PPL_EXTRA)
-    timeout "$TIMEOUT" env HIP_VISIBLE_DEVICES="$DEVICE" ${extra:-} \
+    # shellcheck disable=SC2086  # $PINS is an intended word-split K=V list; it applies to BOTH arms
+    timeout "$TIMEOUT" env HIP_VISIBLE_DEVICES="$DEVICE" $PINS ${extra:-} \
         "$LLAMA_PPL" -m "$MODEL" -f "$CORPUS" \
         -c "$CTX" --chunks "$CHUNKS" -ngl "$NGL" -fa "$FA" -ctk "$KV" -ctv "$KV" -t "$THREADS" "${ub_args[@]}" "${sm_args[@]}" \
         "${xt_args[@]}" "$@" >"$out" 2>&1
@@ -415,7 +457,7 @@ check_base_compat() {
     # `tensor` split; the base file NAME carries them since r285 (`TODO` #323), so a mis-named base is not even
     # found -- but this check is what makes a wrongly NAMED file (an explicit `--base`) fail instead of
     # comparing two different points.  A legacy base has neither field and is left alone.
-    for k in model corpus_sha256 ctx chunks kv device sm; do
+    for k in model corpus_sha256 ctx chunks kv device sm pins; do
         v="$(base_meta_field "$k")"
         case "$k" in
             model)         want="$MODEL" ;;
@@ -425,6 +467,7 @@ check_base_compat() {
             kv)            want="$KV" ;;
             device)        want="$DEVICE" ;;
             sm)            want="$SM" ;;
+            pins)          want="$PINS" ;;
         esac
         if [ -n "$v" ] && [ "$v" != "$want" ]; then
             echo "    base meta mismatch: $k='$v' != current '$want'" >&2
@@ -491,6 +534,7 @@ if [ "$RECORD" -eq 1 ]; then
         echo "kv=$KV"
         echo "device=$DEVICE"
         echo "sm=$SM"
+        echo "pins=$PINS"
         echo "arm=${RECORD_ENV:-<default>}"
         echo "base_ppl=$b_ppl"
         echo "base_sha256=$b_sha"
@@ -530,6 +574,7 @@ if [ "$RECORD" -eq 1 ]; then
             echo "kv=$KV"
             echo "device=$DEVICE"
             echo "sm=$SM"
+            echo "pins=$PINS"
             echo "ub=$CONTROL_UB"
             echo "arm=${RECORD_ENV:-<default>}"
             echo "base_ppl=$c_ppl"

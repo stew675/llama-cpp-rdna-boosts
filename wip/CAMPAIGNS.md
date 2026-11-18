@@ -3,7 +3,11 @@
 > **Promoted (r306, 2026-11-17):** `prefill-chunk-adaptive` is folded into **block 16** (the maintainer's decision
 > at r306).  Its record moved to [`archive/work/prefill-chunk-adaptive/`](../archive/work/prefill-chunk-adaptive/README.md),
 > the knob is `-ib` / `--interactive-batch-size` (`ENVIRONMENT.md` §22), the gates are 30/31, and the one open
-> coverage gap is `TODO` #344.  It is not an open campaign and it is not kept here as a stub.
+> coverage gap it left (`TODO` #344, the host-expert shape's text) was **closed at r310**: the shape has an oracle
+> again with `MOE_EXPERT_HEATMAP=load` + `ROCBLAS_USE_HIPBLASLT=0` and its altered `-b 2048 -ub 512` case reads
+> identical text on the r305 and r309 builds (`INVARIANTS.md` r310,
+> `benchmarks/2026-11-18-host-expert-prefill-oracle.md`).  It is not an open campaign and it is not kept here as a
+> stub.
 >
 > **Promoted (r300, 2026-11-16):** `session-scheduling` is folded into **block 12** (the maintainer's decision:
 > a new block was declined "for now"; block 12 is the campaign-remainder block and already owns the server

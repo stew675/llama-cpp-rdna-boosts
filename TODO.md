@@ -42,7 +42,6 @@ left in this file.  The r236 re-base
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure (per-block gate, clean checkout, hosted CI) dies in `ui-assets.cmake:137` -- the container images are unaffected (their `web` stage supplies `tools/ui/dist`) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround where it bites; re-check before the next per-block ladder — §342 |
 | **343** | `Q5_K` / `Q6_K` / `IQ4_XS` `ssm_alpha` projections take block 10's gate/beta epilogue but no GDN GGUF on this box or the contributor's has that type, so the path is untested for them | coverage / accepted limitation (block 10) | **ACCEPTED** — the mechanism check in `scripts/gate-gdn-epi.sh` is what would close it; do not add a KLD arm before the `gdn_epi` line is observed — §343 |
-| **344** | r306's admission change is **unverified on a host-expert shape**: a greedy-text oracle does not exist there without a pinned residency prior (six identical runs on Flash-Next `-ncmoe 47` read four different texts), and this GGUF ships no `.moe-heatmap`, so the default-path numerics of "a step with nothing decoding takes the whole `-b` window" were not checked on that shape | coverage / gate invariant (block 16) | **OPEN** — `scripts/gate-prefill-logits.sh` on that model (a fully resident arena, or repeats with a stated spread) is the arm that would close it — §344 |
 | **345** | the OTHER fused-op probes share r308's vacuity class: `llm_fused_op_top_k_mask_probe`, `..._lid_probe` and the three dsv4-hc probes are all `require_observed = false`, so a probe graph whose arm never contains the op reports "enabled" unverified (safe today only because the qwen4exp builder re-queries `supports_op` for the QSA/indexer ops and a prefill always reaches them) | correctness / probe contract (block 05) | **OPEN** — audit each probe's reachability, then decide per probe between `require_observed` and a direct `ggml_backend_dev_supports_op` query — §345 |
 
 ## Handle numbering
@@ -371,21 +370,3 @@ wrong `qk`/`vdr` in the ksplit body for that type (the arithmetic is the body's,
 per-row dot product is unchanged by construction).  Do not add a KLD arm for it before the mechanism line is
 observed: an arm that never fires passes vacuously.  The same gap is recorded in the r304 release entry and in
 the PR #322 reply, so it is a stated limitation, not a claim.
-
-### #344 -- the r306 admission rule has no text oracle on a host-expert shape, and its logits there are unmeasured
-
-**Coverage gap** (r306).  The contended-only admission cap was verified where a text oracle exists: on the dense
-4B, chunked vs wide prefill reads **byte-identical** text (`332/07a82d55e623` in all four arms), and the contended
-step list is identical to r301's on every shape measured.  On the **host-expert** shape (Flash-Next IQ3_XXS,
-1 GPU, `-ncmoe 47`) six identical-config runs of the same 5-step prefill read **four different texts**
-(`137/d9661c1028ac`, `137/...`, `135/d3339025dbe9`, `133/49f4fa68f134`), across both binaries -- the
-`GREEDY-PURITY.md` §89 mechanism (residency selects the MoE kernel set), not the change, and this GGUF has no
-`.moe-heatmap` for `MOE_EXPERT_HEATMAP=load` to pin it with.  So the shape's *default-path* numerics under r306
-are unmeasured: `-b/-ub 16384` is inert (the r301 default chunk was already one `n_ubatch` there), but
-`-b/-ub 512` is exactly the case the change alters (a 512-token step becomes a 2048-token step), and no text
-comparison is meaningful there without a stable reference.
-
-What would close it: `scripts/gate-prefill-logits.sh` on that model (mean KLD `<= 0.005` / same-top-p `>= 98 %`
-between the r305 and r306 builds), or an arm whose expert residency is fully determined (a resident arena at a
-pinned `-lme`, or a model that ships a heatmap) with the text repeated and reported as a spread rather than a
-hash.  Do not accept a single text hash on that shape as evidence in either direction.

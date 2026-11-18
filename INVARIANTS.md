@@ -580,3 +580,47 @@ Established by the `--kv-unified` kv_rows defect (gfx1151 field report; `WORKLOG
    the gate print it and pick its anchor set from it, so the same script is anchored on `-sm tensor` and
    `-sm layer` without an operator-supplied hint — and a change to the auto rule becomes a FAIL instead of a
    silently different arm set.
+
+## r310 (2026-11-18, `WORKLOG.md` 261118.001)
+
+Established closing `TODO` #344 on the Flash-Next IQ3_XXS host-expert shape (1 GPU, `-ncmoe 47`; record
+`benchmarks/2026-11-18-host-expert-prefill-oracle.md`).
+
+1. **A host-expert shape is a text oracle once TWO states are pinned, and the heat map is not the only one.**
+   With `MOE_EXPERT_HEATMAP=load` **and** `ROCBLAS_USE_HIPBLASLT=0` the shape reads one text 3/3 (and 3/3 with
+   the prior off entirely), but with the library left at its default it reads a *different* one 4/4
+   (`296/91ef8940d66e` off vs `302/fb8da5c09068` on).  So §44's per-start-library rule reaches a host-expert text
+   arm too: pin the library **and** the prior, and report the repeats as a spread.  A text arm that pins only the
+   map is comparing two states and will call it a change.
+2. **The r306 spread does not reproduce in ANY state we can reconstruct, and the eliminations are the finding.**
+   Twelve states, 42 runs: no spread *within* a state, and the only carrier that moves the text *between*
+   states is the BLAS library.  Measured at
+   `-c 16384 -b 2048 -ub 2048` (the r306 arm's 5-step shape; partial arena, `h = 0.4593`, 6 629 fills): a
+   **mutating** heat map (default `=1`, 5/5), the **frozen** prior (`load`) and **no** prior (`=0`) all read the
+   same text (the map is a placement prior and the pool covers the set, so §89 needs a *partial* arena — 5/5 at
+   `h = 0.46` too); a **forced 8 GiB** arena and the 23.8 GiB auto arena read the same text (which also kills the
+   "free VRAM varies, so the library picks another kernel" theory); and the **r305** build (`73295b281`,
+   pre-r307, pre-r306's admission change) reads byte-for-byte what the r309 build reads, 6/6 each.  So the r306
+   six-run spread was **not** the prior, the arena, the residency breadth, or r307's repair.  The GGUF now also
+   ships `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS.moe-heatmap` (the r75 unified name), so the r306 note "this GGUF
+   ships no heat map" no longer holds either.  What was *not* reconstructable is that session's prompt and box
+   state, and a greedy near-tie flip (invisible to a hash, `GREEDY-PURITY.md` §46/§61) stays the residual
+   explanation — which is why the coverage is now **mechanical** (`scripts/gate-host-expert-text.sh`): it repeats
+   the pinned arm N times and fails on any spread, instead of a human noticing four texts in six runs, and the KLD
+   point is the numerics verdict a near-tie cannot fool.
+3. **The r306 admission rule's altered case is text-identical on this shape, measured across builds.**  The cap is
+   unreachable on an r306+ binary (that is the fix), so the A/B is two binaries: r305 `73295b281` admits a
+   5246-token prompt in 12 steps (`512 x 9, 122, 512, 4`) and r309 `87d3629df` in 5 (`2048, 2048, 634, 512, 4`) at
+   `-b 2048 -ub 512`, and both read `98/65ba627f8eca`, 2/2 each.  The wide step really is a *step* change here,
+   not a ubatch change: a lone prompt's ubatch boundaries are the consecutive 512 blocks either way.
+4. **The point's identity includes its env, so the gate records it (`--pin`).**  `gate-prefill-logits.sh` now
+   applies a `K=V,...` list to BOTH arms, folds it into the base file name and writes it to the meta as `pins=`,
+   and refuses a compare whose pins differ.  Without it a base recorded under one library/heat-map state is
+   found and compared under another — on this shape a text *and* kernel-set difference.
+5. **The tier has a usable KLD instrument: self-KLD `0.000000` / `100.000 %` across two processes.**  The point is
+   `--model .../GSQ-IQ3_XXS...gguf --device 0 --pin "MOE_EXPERT_HEATMAP=load,ROCBLAS_USE_HIPBLASLT=0" --extra
+   "-ncmoe 47 --load-mode dio --lazy-mode mlockr -ot per_layer_token_embd.*=CPU"` (base PPL 2.8553, base sha256
+   `effe46712734…`, ~35 s per pass, peak RSS 71.1 GiB — it needs the box to itself).  The r305 build against that
+   base also reads `0.000000 / 100.000 %`, so the r305..r309 delta (including r307's repair on the prefill path)
+   moves nothing on 40 x 512 chunks of host-expert prefill.  The 27B release point is dense and never reaches the
+   pool/in-place transport at all, which is why this point is now the required arm for a change to that tier.

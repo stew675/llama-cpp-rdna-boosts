@@ -356,6 +356,7 @@ tier runs what); this table is the quick answer for a change in flight.
 | you changed | gate |
 |---|---|
 | decode kernels, fusions, the MoE host-expert path, a speculator | same-seed greedy text, then the MTP four-axis protocol (`benchmarks/mtp-adaptive-methodology.md`) and `llama-batched-bench -npl 1,4,8` |
+| anything whose text you want to quote from the Flash-Next host-expert shape (or the admission rule's arm there) | `scripts/gate-host-expert-text.sh` (N repeats must read one text, the two pins are enforced; `--kld` adds the prefill-logit point) |
 | the server's prompt admission: the fair share, the per-step chunk, the skew, or the prefill/decode duty cycle (block 16) | `scripts/gate-prefill-fairness.sh` (including `--self-test`) and `scripts/gate-prefill-duty.sh` on the dense, the `draft-mtp` and a streamed host-expert shape |
 | a prefill kernel, an approximate default-on path, an all-reduce arm | `scripts/gate-prefill-logits.sh` |
 | a mixed K/V cache pair (**optional block `0101`**): the tile `type_V`, `ggml_cuda_fattn_tile_type_V()`, the mixed instance list, the band predicate or the context gate | `scripts/gate-mixed-kv.sh` on the optional-applied build (+ `scripts/gate-prefill-logits.sh` for the default path) |

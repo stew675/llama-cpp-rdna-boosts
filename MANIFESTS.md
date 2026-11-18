@@ -108,7 +108,14 @@ to remove.  The release container images are built **off-host by the worker** an
 in CI.  The model-level gates are manual:
 
 1. **Coherence** — same-seed `llama-cli` output identical to a known-good build (dense and, for a change
-   that touches the MoE path, a host-expert config).  `GGML_CUDA_ALLREDUCE=nccl` is not a bit-identical
+   that touches the MoE path, a host-expert config).  A host-expert **text arm has an oracle** since r310: pin
+   the residency prior and the BLAS library (`MOE_EXPERT_HEATMAP=load`, `ROCBLAS_USE_HIPBLASLT=0` — the heat map
+   now ships next to the model and the two together make the shape deterministic over 42 runs in twelve states,
+   `benchmarks/2026-11-18-host-expert-prefill-oracle.md`), and **report repeats as a spread, not one hash**:
+   `scripts/gate-host-expert-text.sh` IS that arm — N repeats, any spread fails, an unpinned invocation is
+   refused, the flipped-library arm is printed as evidence, and `--kld` chains the prefill-logit point.  If a
+   spread reappears, compare the heat map's mode and `ROCBLAS_USE_HIPBLASLT` before blaming the change
+   (`INVARIANTS.md` r310).  `GGML_CUDA_ALLREDUCE=nccl` is not a bit-identical
    reference under `-sm tensor`; treat it as a smoke comparison.  **A change to the host-expert scheduler hook
    (`ggml_backend_sched_copy_input`'s routing paths, or a `moe_cache_remap`/`_gather`/`_update` iface member)
    owes both kill-switch arms** (`GGML_MOE_DEVREMAP=0`, `MOE_HOST_POOL_COLD=0`, `--host-experts pool`) plus a
@@ -172,6 +179,16 @@ in CI.  The model-level gates are manual:
    question — `GREEDY-PURITY.md` §46, `archive/work/fa-rdna3-head512-purity/RESOLUTION.md`).
    The `FA_DBG_NMSE` op-level accuracy reference (`test-backend-ops` error magnitude vs the CPU backend at
    the model's own prefill shape) is the second, deterministic leg of a family-switch judgement.
+   **A change that reaches the streamed HOST-EXPERT prefill tier owes the host-expert point as well** (r310,
+   `TODO` #344 retired): the 27B reference is dense, so it never builds the pool/in-place/staged prefill
+   transport at all.  The point is
+   `--model /llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
+   --device 0 --pin "MOE_EXPERT_HEATMAP=load,ROCBLAS_USE_HIPBLASLT=0" --extra "-ncmoe 47 --load-mode dio
+   --lazy-mode mlockr -ot per_layer_token_embd.*=CPU"` (base PPL 2.8553, self-KLD `0.000000`; ~35 s per pass,
+   peak RSS ~71 GiB, so run it alone on the box).  `--pin` is new at r310: the env a point was measured under is
+   part of the point — it is folded into the base file name, recorded in the base meta and **refused on
+   mismatch** — because on that shape `ROCBLAS_USE_HIPBLASLT` alone moves the greedy text
+   (`benchmarks/2026-11-18-host-expert-prefill-oracle.md`).
 5. **Per-block build** — `scripts/gate-per-block-build.sh` on a clean `all` build per commit (bisection and
    review walk the blocks individually, so every block must build on its own).  Use `--changed-from` to
    rebuild only the blocks a release changed -- but understand what that buys: it is a **delta** gate, so a block

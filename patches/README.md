@@ -44,7 +44,10 @@
 > `-b/-ub 512` it is free -- the carrier is the **ubatch width**, not the step count.  Gates 30/31 PASS (31 gained
 > two `-lv 5` width passes: an uncontended step must be wider than the chunk, a step carrying decode tokens must
 > not exceed it), prefill-logit KLD **0.000000 / 100.000 %**.  Record: `WORKLOG.md` 261117.005, `INVARIANTS.md`
-> r306, `ENVIRONMENT.md` §22, `TODO` #344 (the host-expert shape's text is not an oracle here).
+> r306, `ENVIRONMENT.md` §22.  The host-expert shape that had no text oracle **has one since r310** (pin
+> `MOE_EXPERT_HEATMAP=load` + `ROCBLAS_USE_HIPBLASLT=0`; its altered case, `-b 2048 -ub 512`, reads identical text
+> on the r305 and r309 builds, and the shape is now a recorded KLD point too -- `INVARIANTS.md` r310,
+> `benchmarks/2026-11-18-host-expert-prefill-oracle.md`, `TODO` #344 retired).
 
 > **r305: a host-expert routed `MUL_MAT_ID` is offloaded at EVERY ubatch width (GitHub issue #323, `briansp2020`), an amendment to block 09.**
 > Block **09** owns `ggml_backend_cuda_device_offload_op()` and the scheduler that consults it, so the fix lives there
@@ -5557,8 +5560,9 @@ per-step cap, **`-1` = one `n_ubatch`**, `0` = off; env `LLAMA_ARG_INTERACTIVE_B
 (**1**, a shortest-remaining weighting) and `LLAMA_SERVER_PREFILL_DUTY` (**16**, up to `K-1` decode-only steps
 before a prefill step, capped in TIME by the last prefill step's own duration).  The `-lv 4` census prints all of
 them at startup.  `ENVIRONMENT.md` §22 is the variable catalogue; `archive/work/session-scheduling/` is the r300
-design record and `archive/work/prefill-duty-cycle/` is the r301 duty-cycle record; `wip/prefill-chunk-adaptive/`
-is the r306 amendment's record (§7 there is the promotion, `TODO` #344 the unverified part).
+design record and `archive/work/prefill-duty-cycle/` is the r301 duty-cycle record; `archive/work/prefill-chunk-adaptive/`
+is the r306 amendment's record (§7 there is the promotion; the host-expert coverage gap it left open,
+`TODO` #344, was closed at r310 -- `INVARIANTS.md` r310).
 
 **r306 amendment — the cap is a CONTENDED bound, and it is an option.**  r300/r301 applied the chunk to **every**
 step, including a step that carries no decode work, where it bounds nothing: on the field shape that cost
