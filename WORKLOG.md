@@ -1,3 +1,22 @@
+## 261118.006 (r312, published) -- `v17-4f9dfa0e3-r312` is PUBLISHED: delivery repo `main` + tag, and the fork's `rdna-boosts` is re-cut at `.tip`
+
+**Published.**  Delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main` `5372fc06..2f48f680`, annotated
+tag **`v17-4f9dfa0e3-r312`** (`5cdee05a`).  The fork `git@github.com:stew675/llama.cpp.git` `rdna-boosts` moved
+`32f6d6a45..8a9e34b57` (force-with-lease, lease read `32f6d6a45`), i.e. exactly `release.json.tip` (tree
+`4f875aea2`).
+
+**Verified rather than assumed.**
+* **Fork refresh**: `scripts/fork-refresh.sh` re-cut from `4f9dfa0e3` with `apply-all.sh`, asserted the applied tree
+  == `release.json.tree` (`4f875aea2`), the commit count == `n_default` (18) and printed tip **`8a9e34b57`** -- the
+  same id the earlier re-cut printed, so the deterministic re-cut holds across two independent runs.
+  `git ls-remote` re-read after the push: `8a9e34b571a484b9db4c87b7245393502bc3dc95`.
+* **Delivery artifacts**: `validate-set.sh` GREEN on the published tree -- 18 default patches strict on a fresh
+  tarball at `4f9dfa0e3`, applied tree `4f875aea2`, both optional artifacts re-cut and applying strictly
+  (`4c0a69e5b` / `541ad532c`, cumulative `aa250b3da`), Windows portability 512 files.
+* **Remote state**: `origin/main` = `2f48f680`, `refs/tags/v17-4f9dfa0e3-r312` = `5cdee05a`, both as pushed.
+* **Container images**: the worker watcher (`scripts/container-watch.sh` on `radiance`) polls for the tag and will
+  rebuild + push both ROCm lines.  Nothing was built on the primary box (policy).
+
 ## 261118.005 (r312, RELEASE v17-4f9dfa0e3-r312) -- `TODO` #329: the verify band's low columns are at the DRAM roof, so the family's `auto` becomes a measured PER-TYPE floor instead of a narrower tile
 
 **What shipped.**  Block **07** only, inside the opt-in WMMA verify family: `--wmma-verify auto` (and
