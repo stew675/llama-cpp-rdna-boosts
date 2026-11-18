@@ -161,10 +161,28 @@ arena is now read IN PLACE at any width (`MOE_EXPERT_PREFILL_IN_PLACE`: 1489.6 -
 `-sm tensor`, 3588.8 -> 4072.4 on the pool mirror).  Consolidating the three transports for a **partly resident**
 table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2026-11-10-prefill-in-place.md`.
 
+## 342. A broken upstream UI asset bundle breaks every fresh configure
 
-These are closed: no work is owed and no row above tracks them.  A handle is kept where one was ever allocated, so
-the dated records that cite it still resolve and a re-entry condition has a name; the ones that never had a handle
-say so in their heading.
+**Waiting on upstream** (r303). The llama-ui bucket's `latest` archive (75 files, 3.3 MB, 2026-11-17) has no
+`workbox[hash].js`, and `scripts/ui-assets.cmake:137` validates that file, so a configure with no
+`tools/ui/dist` aborts with `UI: missing required asset(s): workbox[hash].js`.  Incremental builds never see it
+(`build-rocm`'s stamp caches the resolved bundle), so it appears exactly where a source tree is configured
+fresh: `gate-per-block-build.sh` (wipes its build dir per commit), a clean checkout, the hosted CI tiers.
+
+**The container release path is NOT affected, verified on `radiance` for r303**: `.devops/rdna-rocm.Dockerfile`
+builds the UI in its own `web` stage (`npm ci` + `npm run build`) and copies it in before the cmake step
+(`COPY --from=web /app/tools/ui/dist tools/ui/dist`), which is `ui-assets.cmake`'s Priority 1 -- pre-built
+assets win over both npm and the HF fetch, so that build never downloads or validates the bucket's bundle.
+Do not add a `HF_UI_VERSION` pin to `build-containers.sh` for this.
+
+Where it does bite, `HF_UI_VERSION=b12387` (the bundle this box had stamped) carries `workbox-b3c04f83.js` and
+validates; the per-block gate's header records it.  Drop the pin when `latest` validates again.
+
+## Accepted limitations (deliberately not fixed — do not re-report)
+
+These are closed or accepted: no work is owed, and where a row above still tracks one it says **ACCEPTED**
+(not open work).  A handle is kept where one was ever allocated, so the dated records that cite it still resolve
+and a re-entry condition has a name; the ones that never had a handle say so in their heading.
 
 ### #282 — the mid-run latch's MIXTURE is a ~1e-5 path difference, and it is gated on the LOGITS (retired r299)
 
@@ -310,24 +328,6 @@ candidate: the delivery's own adaptive-MTP drafts produce 2..8-column verify bat
 across that whole band is a pure win instead of a config-shaped opt-in.  Until then it stays opt-in with a
 floor of 7 and the purity note in `GREEDY-PURITY.md` §91 -- do not lower the floor without measuring the
 low band on both a single card and a 2-GPU `tensor` split (the crossover moves).
-
-
-### #342 -- a broken upstream UI asset bundle breaks every fresh configure
-
-**Waiting on upstream** (r303). The llama-ui bucket's `latest` archive (75 files, 3.3 MB, 2026-11-17) has no
-`workbox[hash].js`, and `scripts/ui-assets.cmake:137` validates that file, so a configure with no
-`tools/ui/dist` aborts with `UI: missing required asset(s): workbox[hash].js`.  Incremental builds never see it
-(`build-rocm`'s stamp caches the resolved bundle), so it appears exactly where a source tree is configured
-fresh: `gate-per-block-build.sh` (wipes its build dir per commit), a clean checkout, the hosted CI tiers.
-
-**The container release path is NOT affected, verified on `radiance` for r303**: `.devops/rdna-rocm.Dockerfile`
-builds the UI in its own `web` stage (`npm ci` + `npm run build`) and copies it in before the cmake step
-(`COPY --from=web /app/tools/ui/dist tools/ui/dist`), which is `ui-assets.cmake`'s Priority 1 -- pre-built
-assets win over both npm and the HF fetch, so that build never downloads or validates the bucket's bundle.
-Do not add a `HF_UI_VERSION` pin to `build-containers.sh` for this.
-
-Where it does bite, `HF_UI_VERSION=b12387` (the bundle this box had stamped) carries `workbox-b3c04f83.js` and
-validates; the per-block gate's header records it.  Drop the pin when `latest` validates again.
 
 ### #343 -- Q5_K / Q6_K / IQ4_XS `ssm_alpha` projections are on the r304 path with no local GGUF to test it
 
