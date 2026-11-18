@@ -823,7 +823,7 @@ see `../WORKLOG.md` 261017.008).
 | `GGML_CUDA_HC_POST_RMS_DEBUG` | off | **diagnostic** (r242, block 11) | `1` logs one `hc-post-rms: i=N fused=1 ...` or `hc-post-rms: i=N declined=<reason> ...` line per candidate node at INFO (so `-lv 4`), which is how a gate proves the fusion is live instead of assuming it (`INVARIANTS.md` r225/r238: a silent fusion makes an arm vacuous).  Never changes behaviour. |
 | `GGML_CUDA_BF16_PRODUCER` | **on** (r242, block 11) | kill-switch / diagnostic | lets the qwen4exp prefill producers of the cuBLAS/rocBLAS BF16 GEMM activations write the RNE BF16 copy of their output in the same pass and leave it in `bf16_src1_cache`, so the GEMM skips its own F32 -> BF16 conversion: the fused `hc_post_rms`'s `xn` (feeds `hc_*_down`/`hc_*_inject`) and `dsv4_hc_pre`'s mixed stream (router / indexer / beta-alpha).  The F32 output is always written too (except on the MMB BF16-only mark, where it is not needed).  `0` disables both producers; `2` is a **debug** mode that re-converts every cache hit and compares it element by element (it allocates from the device pool and synchronises the stream per hit, and skips hits inside a graph capture -- never use it for timing).  The gates match the GEMM lookup's (`>= 64` columns, contiguous root, `GGML_CUDA_BF16_SRC1_CACHE` on), so decode is untouched.  Worth **+2.2 %** prefill on top of the fusion (2 R9700, 31.5k prompt); `=2` reported **0 mismatching elements** over 3501+ hits on both producers. |
 | `LLAMA_HC_PIN_BLOCK_OUT` | off | kill-switch (**opt-in**) | `1` restores pinning every qwen4exp layer's `block_out` as a prefill graph output (r24 behaviour; costs ~1.9 GiB of the `-ub 2048` compute buffer). |
-| `LLAMA_HC_MIX_PLANAR` | on | kill-switch | `0` restores the interleaved HC_MIX output (r24) instead of the planar layout (r25; BF16 CUDA path only). |
+| `LLAMA_HC_MIX_PLANAR` | on | kill-switch | `0` restores the interleaved HC_MIX output (r24) instead of the planar layout (r25; both CUDA ops, BF16 and Q8_0 since r313); byte-identical either way. |
 | `LLAMA_CONV_TAIL_CONT` | off | kill-switch (**opt-in**) | `1` restores the `cont` + `cpy` conv-state tail copy instead of the direct strided 2D memcpy (r25). |
 | `LLAMA_SHARE_SLOT_REV` | **on** | kill-switch (r241, block 03) | the conv-state store's rollback index (`arange` + `scale_bias` + `cast`, `K = n_rs_seq + 1 <= 8` int32 values) is built **once per graph per device** and each conv layer takes its `{Kw-1, ..., 0}` tail as a view; `0` restores upstream's per-layer chain, i.e. the 3 nodes and 3 launches per conv layer per graph that issue #291 measured. Built per layer it is 144 nodes of the dense-27B MTP verify graph (1268) and is re-created on every speculative round; sharing it makes that graph **1127** nodes. Bit-identical (same index values, same `set_rows`). Measured 1 R9700, `GGML_CUDA_DISABLE_GRAPHS=1`, `-np 2 --kv-unified`, MTP n3: **58.37 -> 59.01 t/s** decode at 10.5k depth (+1.03 %) and 45.93 -> 47.76 on a decode-dominated short prompt (+4.0 %), text unchanged. The cost it removes is per **launch**, so it is worth most where a launch is expensive (`GGML_CUDA_DISABLE_GRAPHS=1`, Windows). Gate: `scripts/gate-slot-rev-share.sh`. |
 | `GGML_FORCE_NO_INTEGRATED` | off | ignore integrated GPUs when picking devices. |
@@ -933,6 +933,38 @@ one of these as a **new reference**, not as a tuning experiment.
 |---|---|---|---|
 | `--wmma-verify off\|auto\|N` (`common`) | `off` | opt-in | the **floor** in verified columns: the first verify width that takes the family (2..16, clamped; `1` is clamped to 2 because width 1 is decode and must keep the K-split kernel).  `auto` = the **per-type** floor of the table above (**5** for Q4_K and Q5_K, **8** for Q6_K, IQ4_XS and Q8_0, resolved in ggml since r312), which is what an operator should use.  An explicit `N` is that floor for **every** type -- it is the calibration knob, and `=7` reproduces the pre-r312 behaviour.  Values above 8 are meaningless in practice (MMQ owns those widths) but are accepted, so a calibration arm can be run without editing the option. |
 | `GGML_CUDA_WMMA_MMVQ` | unset = off | opt-in (**deprecated alias**) | the contributor's original switch (PR #317): the same floor, read from the environment.  It is the A/B and bisection knob and it **wins when set**, so `GGML_CUDA_WMMA_MMVQ=0` disables a run that `--wmma-verify` enabled, `=7` is the uniform floor of 7 (the pre-r312 `auto`) and **`=auto`** is `--wmma-verify auto` (r312; the value is read by its first letter, so `atoi()` cannot silently turn it into `0` = off).  Value-gated (`0` = off), latched once per process.  It is the only way to reach the family from a tool that does not go through `common` (`test-backend-ops`, a bench harness). |
+
+---
+
+### 7.7 The Q8_0 hyper-connection mixer (block 11, r313) — **on**, one switch per piece
+
+The Q8_0 `HC_MIX` op (a qwen4exp GGUF whose hc weights are Q8_0 -- every unsloth UD quant, and the only hc
+class that takes this op since the BF16 quants take `hc_mix_bf16_*`) now runs the same launch count as the
+BF16 mixer: persistent `down_dots` counters instead of a per-call memset, a planar output so the verify band
+needs no `ggml_cont`, a Q8_1 epilogue in the collapse, a combine+norm+Q8_1 kernel for the fused
+`HC_COMBINE -> HC_MIX` pattern, and an up+collapse launch with the F32 inject rows on the down grid.  All of it
+is **default-on**; each piece keeps its own kill switch (a contributor's PR #326, validated on
+`UD-Q4_K_XL` = Q8_0 hc with an F32 inject, the unsloth-UD layout).  Measured on 2 R9700 `-sm tensor`
+(`--n-cpu-moe 42 -lme auto`, greedy 128 tokens after a short prompt, median of 3): decode **45.1 -> 48.3 t/s
+(+7.1 %)**, and **+4.9 %** after a 5246-token prompt; prompt rates unchanged.  Text is byte-identical in every
+arm (each switch alone, all seven off, `-sm layer`, `-ub 1`, `-ub 4`, and the MTP verify band with identical
+draft acceptance).
+
+| variable / option | default | class | notes |
+|---|---|---|---|
+| `GGML_CUDA_HC_DONE_PERSIST` | **on** (r313) | kill-switch | `0` restores a per-call pool buffer zeroed by `cudaMemsetAsync` for `hc_mix_down_dots`' per-`(token, q8_1 group)` row counters.  The default keeps them in per-stream slots zeroed once at allocation (synchronously, for **every** slice) and has the finishing block reset the counter it completes, so a decode band costs no memset launch. |
+| `GGML_CUDA_HC_Q8_EPI` | **on** (r313) | kill-switch | `0` restores the separate `quantize_q8_1` launch for the matmuls that read `hc_mixed`: the collapse (or the fused up+collapse kernel) also writes the mixed rows' Q8_1 into the quantize cache, with `quantize_q8_1`'s arithmetic including its `d * (integer sum)` term.  Taken only where the consumers key on the `HC_MIX` dst itself (`nt == 1`, planar, or no inject), for a row length that is a multiple of `MATRIX_ROW_PADDING` with `n_embd/32 <= 1024` groups. |
+| `GGML_CUDA_HC_UP_PRELOAD` | **on** (r313) | kill-switch | `0` restores the previous up band kernel (`MAXI` 4, runtime `blocks_per_row`, the weights read inside the dot).  The default loads each thread's weight ints and scales into registers before the prologue barrier and uses the compile-time `BPR`/`MAXI` 3; the dot is the same `vec_dot_q8_0_q8_1_impl` on the same values.  Stands down on its own if `MAXI` ever needs to be 4. |
+| `GGML_CUDA_HC_UP_FUSE` | `1` (r313) | **tuning** | `0` restores the two launches (up band, then collapse+inject); `1`/`2`/`3` fuse them into `hc_mix_up_collapse_q8` with 4/2/1 sub-blocks of 256 threads (2 is a measured tie, 3 is only useful for occupancy experiments).  The fused kernel keeps the per-warp gates in shared memory, sums them in the band kernel's order, and runs the collapse and its Q8_1 epilogue for its 32 columns, so the output is bit-identical.  It needs the band, the pre-quantized `v` (`HC_MIX_PREQ`), `hc == 4`, `blocks_up == 10` (`hc_lr == 320`) and `nt <= 8`. |
+| `GGML_CUDA_HC_INJECT_DOWN` | **on** (r313) | kill-switch | `0` gives the F32 inject rows their own small launch instead of running them as the **first** blocks of the `hc_mix_down_dots` grid (they read a whole `hc_dim` row, ~10x a down row, so at the tail of the grid they stretched it).  Inert unless `GGML_CUDA_HC_UP_FUSE` fused the up+collapse launch; a Q8_0 inject is already on the down grid. |
+
+Two existing switches now cover both hc weight classes: `GGML_CUDA_FUSE_HC_COMBINE_MIX` (the fused
+combine+norm, `hc_mix_combine_rms_gamma` for BF16 and `hc_mix_combine_rms_gamma_q8` for Q8_0) and
+`LLAMA_HC_MIX_PLANAR` (the planar `HC_MIX` output, both ops).  Gates: `scripts/gate-hc-fusions.sh` on a Q8_0-hc
+GGUF (its `both_ops == mix_op` comparison is what proves the fused combine+norm is exact) plus
+`test-backend-ops -o HC_MIX -o HC_COMBINE -o HC_COMBINE_MIX`, whose Q8_0 `HC_COMBINE_MIX` arm is the only
+unit-level oracle for `hc_mix_combine_rms_gamma_q8`.  Record: `WORKLOG.md` 261118.007,
+`archive/work/hc-mix-q8/`, `INVARIANTS.md` r313.
 
 ---
 

@@ -719,3 +719,45 @@ raw tables.
    the release's purity evidence is the OFF arm and an explicit floor, never "the ON arm only runs at verify".
    Both are unchanged by r312: the 27B Q8_0 + DFlash2 `n-max 7` spec arm reads `56612340f420` off on the r311 and
    r312 builds, and an explicit `GGML_CUDA_WMMA_MMVQ=7` reads `b7d28482ca5f` on both.
+
+## r313 (2026-11-18, `WORKLOG.md` 261118.007) — the Q8_0 hc mixer: a launch-count change, and what an "identical output" claim has to be tested against
+
+**Changed.**  Official block 11 only: the fused Q8_0 `GGML_OP_HC_MIX` (every unsloth UD qwen4exp file — a
+BF16-hc model takes `hc_mix_bf16_*` instead) now runs 3-4 launches per hc site instead of ~8, via persistent
+`down_dots` counters, a planar output, a Q8_1 epilogue, `hc_mix_combine_rms_gamma_q8`, a weight-preloading up
+band, an up+collapse fused launch and the F32 inject rows on the down grid (contributor PR #326, five switches,
+`ENVIRONMENT.md` §7.7).  **+7.1 % decode** (45.1 -> 48.3 t/s) on `UD-Q4_K_XL` at 2 devices `-sm tensor`, +4.9 %
+after a 5246-token prompt, prompt rate unchanged; the contributor's +7..10 % on a different UD file holds.
+
+1. **"Byte-identical to stock" is not the invariant; byte-identical to the *chain* is.**  The submission's own
+   arm set is stock-fused vs patched-fused, which is the right test for a *claim of no change* and it does hold
+   (all ten `gate-hc-fusions.sh` arms read the r312 hash in the same arm, on a model neither side had).  But the
+   delivery's contract for this op family is that each fused arm reproduces its own **unfused chain**
+   (`ggml.h`, `gate-hc-fusions.sh`'s HARD arms), and on a fused-mixer class the MIXER half cannot meet it: its
+   inject half is the fused band dot where the chain's is the lora GEMM (r309, `LLAMA_FUSED_HC_MIX` is a numeric
+   arm).  What a change *inside* that family must preserve is the ARMS' own text, which is why this release was
+   gated on the ten-arm table and not on a single greedy hash.  A patch that only ever compares fused-vs-fused
+   would pass while breaking the combine op, and one that only checks a handful of tokens would pass while moving
+   the verify band.
+2. **A default-on Q8_0 fusion needs a Q8_0 unit arm, and the arm has to be proven to reach the kernel.**
+   `test_hc_combine_mix` was BF16-only, so `hc_mix_combine_rms_gamma_q8` had no unit-level oracle at all; the
+   Q8_0 arms added here are only worth anything once they are shown to *bite* — perturbing the kernel
+   (`xn * 1.5`) must fail exactly the Q8_0 arms, and it does (and the same perturbation of the BF16 kernel fails
+   exactly the BF16 arms).  A `1.001` perturbation does NOT bite: the case's `max_nmse_err` is 1e-3, so the
+   falsification has to be larger than the tolerance (`INVARIANTS.md` r225/r238: a silent fusion makes an arm
+   vacuous — this is the same trap one level down).
+3. **A WIP handover can be promoted without a rebase, but not without a re-read.**  `hc-mix.cu` was byte-identical
+   between the PR's base (r304) and r312, so the three patches applied with `git am -3`; the fold into block 11
+   needed exactly one resolution, and it was a *later* block's refactor (`planar_env` became a lambda in block 14),
+   not the PR's own code.  Verify the touched surfaces' ownership first: every file this PR edits was already
+   carried by `0011`, which is what let it be a block amendment instead of a new block.
+4. **Measured and rejected at review — do not re-derive.**  The two redundant `_Q8` sub-switches
+   (`GGML_CUDA_FUSE_HC_COMBINE_MIX_Q8`, `LLAMA_HC_MIX_PLANAR_Q8`) are inert in both directions: the switches
+   they duplicated already covered the Q8_0 class, and folding them changed no text on any arm (so their
+   existence was a knob-count cost, not a mechanism).  Their per-piece A/B value is preserved by the five
+   switches that remain.
+5. **Untested, stated rather than implied.**  A merged-layout (`hc_*_down_inject`) GGUF with Q8_0 hc weights:
+   no such file on this box, and the synthetic merged-HC fixture is F32/`hc_lr 8`, so it never reaches the fused
+   op.  NVIDIA/CUDA, gfx1151 and Windows are likewise untested (the files' kernels are 32-wide with
+   `warp_reduce_*<32>` like the rest of the file).  `TODO.md` carries the limitation; `LLAMA_FUSED_HC_MIX=0` is
+   the reference for anyone holding such a file.

@@ -251,7 +251,14 @@ in CI.  The model-level gates are manual:
    other quant takes the chain (`--types MODEL.gguf` prints the class) — **and once per GGUF layout**, since r303
    a **merged** `hc_*_down_inject` file is a different graph shape (the class line names it; build the fixture
    with `scripts/make-merged-hc-gguf.py`, and pair it with the `test-llama-archs -a qwen4exp` "merged HC" arm,
-   whose negative control is a SIGSEGV on the pre-r303 tree).  The gate pins `ROCBLAS_USE_HIPBLASLT=0`,
+   whose negative control is a SIGSEGV on the pre-r303 tree).  **A Q8_0-hc file is its own arm of this gate since
+   r313**: `blk.0.hc_attn_down` = Q8_0 takes the Q8_0 mixer (a BF16 file takes `hc_mix_bf16_*`), and on a file
+   the built-in `fusedmixer` anchors were not recorded from, pass `SOFT_EXPECT=""` so the numeric arms are
+   *reported* rather than failed -- the HARD arms (`comb_op`, `cuda_fuse_off`, and `both_ops` graded against
+   `mix_op`) and the `defaults`-matches-a-named-state check still apply, and `both_ops == mix_op` is what proves
+   the Q8_0 combine+norm fusion (`hc_mix_combine_rms_gamma_q8`) is exact.  Measured at r313 on `UD-Q4_K_XL`
+   (Q8_0 hc + F32 inject, 2 devices `-sm tensor`, `--n-cpu-moe 42 -lme auto`): PASS, all ten arms reading exactly
+   the r312 build's hash in the same arm (431 `df42686290aa` / 433 `8cd639da2fbf` / 461 `8b39a8568222`).  The gate pins `ROCBLAS_USE_HIPBLASLT=0`,
    `MOE_EXPERT_HEATMAP=load`, `LLAMA_HC_BLK16=0`, `LLAMA_HC_RES16=0` and `GGML_CUDA_MMB_DOWN16=0` itself and its
    default arm must never run through `env -` (GNU `env -i`, which wipes `HIP_VISIBLE_DEVICES` on a pinned
    multi-device run — r303, `INVARIANTS.md`).  The defect class it

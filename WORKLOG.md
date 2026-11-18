@@ -1,3 +1,77 @@
+## 261118.007 (r313, RELEASE v17-4f9dfa0e3-r313) -- contributor PR #326: the Q8_0 hyper-connection mixer runs the BF16 mixer's launch count (UD quants, +7.1 % decode), folded into official block 11
+
+**What shipped.**  Block **11** only: the fused **Q8_0** `HC_MIX` op -- the one every unsloth UD qwen4exp file
+takes, since a BF16-hc model takes `hc_mix_bf16_*` -- went from ~8 launches per hc site to 3-4.  Persistent
+`down_dots` counters (`GGML_CUDA_HC_DONE_PERSIST`), a planar output so the verify band needs no `ggml_cont`
+(`LLAMA_HC_MIX_PLANAR`, now both ops), a Q8_1 epilogue in the collapse (`GGML_CUDA_HC_Q8_EPI`), the
+combine+norm+Q8_1 kernel `hc_mix_combine_rms_gamma_q8` for the `HC_COMBINE -> HC_MIX` pattern
+(`GGML_CUDA_FUSE_HC_COMBINE_MIX`, now both classes), an up band that preloads its weights before the prologue
+barrier (`GGML_CUDA_HC_UP_PRELOAD`), the up+collapse fused into `hc_mix_up_collapse_q8` (`GGML_CUDA_HC_UP_FUSE`,
+default `1`) and the F32 inject rows as the first blocks of the down grid (`GGML_CUDA_HC_INJECT_DOWN`).
+`release.json` at **`v17-4f9dfa0e3-r313`** (canonical tip `6443c787e`, tree `a9b88bab5`; optional re-cut
+`b40c32caa` / `f46c3778a`, cumulative `06013692f`).  Block count unchanged (17 official + `0300`).  Records:
+`ENVIRONMENT.md` §7.7, `patches/README.md` block 11, `MANIFESTS.md` gate 9 (the class row), `INVARIANTS.md` r313,
+`benchmarks/2026-11-18-hc-mix-q8-decode.md`, `archive/work/hc-mix-q8/` (the contributor's README, patches and logs,
+kept verbatim under `pr326/`), `TODO.md` (one accepted limitation).
+
+**The submission was accurate, and every number reproduced.**  The PR is a wip handover (three `git format-patch`
+files against r304), not a delivery patch.  It applies to the r312 tree with `git am -3` and needed **one**
+conflict resolution in the fold (`planar_env`'s pre-lambda form, because block 14 converted it later); every
+surface it touches is already carried by `0011` (`hc-mix.cu`, the `HC_MIX` half of the CPU reference, the hc graph
+code in `qwen4exp.cpp`, `hc_q8_cnt` in `common.cuh`, the `ggml-cuda.cu` destructor), so there is no cross-block
+dependency and no new block.  **`hc-mix.cu` is byte-identical between r304 and r312** -- nothing of the submission
+was already implemented, although the *analogous* BF16 mechanisms (planar, `hc_q8_cnt`, the combine+norm fusion,
+the Q8_1 epilogue) all exist, which is why the request read as possibly-duplicate.
+
+**Verified rather than assumed** (gfx1201, 2 R9700 `-sm tensor`, `UD-Q4_K_XL` = Q8_0 hc + **F32** inject, exactly
+the class the PR targets -- a *different* file from the contributor's UD-IQ3_XXS):
+* **Text byte-identical to r312 in every arm we can build**: greedy 96/128 tokens `461 chars 8b39a8568222`; the
+  MTP verify band (`nt = 4`) `615 chars 7fe3c15a90cd` with draft acceptance **0.68548 (85/124), mean len 3.02**
+  on both builds; a 5246-token prompt + MTP `500 chars b30c608e0c9c` (acceptance 0.41600, 52/125 on both);
+  `-sm layer` `485 chars 876834231fd4`; `-ub 4` and `-ub 1` `294 chars 21e32c653820`; and **each of the seven
+  switches alone**.
+* **Perf, independently reproduced** (interleaved, median of 3): **45.1 -> 48.3 t/s (+7.1 %)** decode, prompt
+  rate unchanged (36.3-36.9) -- against the contributor's +7 to +10 %.  **The all-seven-off arm of the same
+  binary reads 45.1**, i.e. the switch set is complete and the win is the new code.  After a 5246-token prompt
+  **+4.9 %**; the shipping build **44.7/44.8 -> 48.2/48.3 (+7.7 %)**.
+* **Adaptive-MTP four axes on the affected model** (`-n 512`, `draft-mtp n3`, `-f` each prompt file): acceptance
+  **identical to the drafted/generated totals on every axis** -- K 0.86385 (368/426), R 0.67126 (341/508), C
+  0.50993 (308/604), P 0.52872 (313/592) -- with generation **+6.7 / +7.9 / +8.9 / +8.0 %**.  The delivery's
+  canonical Protocol A arm is a *dense* 27B that never builds `GGML_OP_HC_MIX`, so it cannot see this change;
+  this is the same protocol pointed at the class it affects.
+* `scripts/gate-hc-fusions.sh` on the Q8_0-hc class: **PASS**, and **all ten arms read exactly the hash the r312
+  build reads in the same arm** (`chain_chain`/`comb_op`/`cuda_fuse_off` 431 `df42686290aa`, `mix_op`/`both_ops`
+  433 `8cd639da2fbf`, `defaults`/`all_ops` 461 `8b39a8568222`).  Its `both_ops == mix_op` pair is the oracle for
+  the new combine+norm kernel: byte-identical.  (`mix_op` differs from the chain, which is the documented
+  numeric-arm state of the fused mixer since r309, unchanged by this release.)
+* `test-backend-ops`: `HC_MIX` **30/30**, `HC_COMBINE` **20/20**, `HC_COMBINE_MIX` **13/13** -- the last now
+  carries **new Q8_0 arms** (F32 inject, Q8_0 inject, `nt` 1/2/3/5/8 and the head call), because the case was
+  BF16-only and `hc_mix_combine_rms_gamma_q8` otherwise had no unit-level oracle.  Its teeth were checked by
+  perturbing that kernel (`xn * 1.5`) and confirming exactly the Q8_0 arms fail.
+* `scripts/gate-prefill-logits.sh`: **mean KLD 0.000000 / same-top-p 100.000 %** against a base recorded from the
+  r312 build (the recorded base was refreshed in the same session; it had been a 2026-11-16 build).
+* `scripts/gate-per-block-build.sh --changed-from 8a9e34b57 --fast`: **3/3** (block 11, block 14 and the `0300`
+  tip; every other block's delta is unchanged), `HF_UI_VERSION=b12387` as `TODO` #342 requires.
+* `scripts/validate-set.sh` GREEN on the regenerated set (18 default patches strict on a fresh `4f9dfa0e3`
+  tarball, applied tree `a9b88bab5`, both optional artifacts re-cut and applying strictly, cumulative
+  `06013692f`, Windows portability 512 files).
+* GPU kernel journal and every run log clean (`check-gpu-faults.sh` via both gates).
+
+**Four adjustments made in the fold (maintainer's decisions at review).**  (1) The two redundant `_Q8`
+sub-switches were folded into the switches that already cover the class -- `GGML_CUDA_FUSE_HC_COMBINE_MIX` and
+`LLAMA_HC_MIX_PLANAR` -- leaving **five** new variables, one per feature; both were re-tested on the final build
+(text-inert).  (2) The preload/fused `MAXI`-3 instantiations are now guarded by `maxi_up <= 3` (the launcher's
+bound was `<= 4`, which the `MAXI` 4 instantiation would have silently mis-served if a future `VDR` landed there).
+(3) `gate_alloc` is only allocated on the two-launch path.  (4) The `hc_down_done` comment now states the real
+reason its zeroing is synchronous (every stream slice must be zero before any kernel reads it) rather than the
+submitted "so it can never be captured", which was wrong.
+
+**Not claimed.**  A merged-layout (`hc_*_down_inject`, post-#31028) GGUF with Q8_0 hc weights is still untested:
+no such file exists on this box, and the synthetic merged-HC fixture is F32/`hc_lr 8` so it never reaches the
+fused op.  The path is structurally the same (packed rows through `->data`, which a row view keeps) and
+`LLAMA_FUSED_HC_MIX=0` is the reference, but it is recorded as an accepted limitation in `TODO.md` rather than a
+claim.  NVIDIA/CUDA, gfx1151 and Windows are untested by contributor and reviewer alike (`INVARIANTS.md` r313).
+
 ## 261118.006 (r312, published) -- `v17-4f9dfa0e3-r312` is PUBLISHED: delivery repo `main` + tag, and the fork's `rdna-boosts` is re-cut at `.tip`
 
 **Published.**  Delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main` `5372fc06..2f48f680`, annotated

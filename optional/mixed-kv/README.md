@@ -8,8 +8,15 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `7648a7e5772b373da0ce0ad4135634588ff32b7cfc952abda5f67ebd75cb03a6` (the r311 cut -- the re-cut moved the exported commit and
+  `29bbae88e9d026d03b9aee21cab184d3a5904ca485ae885cd15e834a1926dc29` (the r313 cut -- the re-cut moved the exported commit and
   the hunk offsets, see below; every earlier cut is recorded below)
+* **r313 re-cut verification**: applies strictly at the r313 default tree
+  `a9b88bab56ceb20a820044deda4e86504d47fe5b` and produces `f46c3778ae0c9a87692844edea2dc88d61d3b4bb`; cumulative with the other
+  optional artifact, numeric order, is `06013692f6ad9a28fc69ba7da7868b3b55420e80`.  **The patch file moved**
+  (sha256 `29bbae88e9d026d03b9aee21cab184d3a5904ca485ae885cd15e834a1926dc29`): block 11's r313 amendment (the Q8_0 hc mixer) rewrites `ggml/src/ggml-cuda/hc-mix.cu`,
+  `common.cuh`, `ggml-cuda.cu`, `ggml/src/ggml-cpu/ops.cpp` and `src/models/qwen4exp.cpp`, which this artifact
+  edits nothing of, so only the exported commit id and the hunk offsets moved -- the produced diff is otherwise
+  unchanged.  `validate-set.sh` check 8 verifies all three trees on every run.
 * **r311 re-cut verification**: applies strictly at the r311 default tree
   `4a3db2c29d294987b95206fd663bc345114df455` and produces `7ed22548c609149d3e306fbb384a7d5183ecf021`; cumulative with the other
   optional artifact, numeric order, is `5fa077f78da0c50265febcfaf6351484475b3973`.  **The patch file moved**

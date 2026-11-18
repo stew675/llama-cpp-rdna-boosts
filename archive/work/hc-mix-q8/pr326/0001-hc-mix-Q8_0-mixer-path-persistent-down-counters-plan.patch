@@ -1,0 +1,429 @@
+From 8364637f42475dd0604c240bafce17964ddd149d Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 14 Nov 2026 07:02:17 +0000
+Subject: [PATCH 1/3] hc-mix: Q8_0 mixer path - persistent down counters,
+ planar output, Q8_1 epilogue, combine+norm fusion
+
+Fewer launches per hc site for models whose hc weights are Q8_0/F32 (unsloth
+UD quants), bit-identical to the current Q8_0 path, BF16 path unchanged:
+- down_dots counters: per-stream zero-once buffer, the finisher resets its
+  counter; no memset per call (GGML_CUDA_HC_DONE_PERSIST=0: off)
+- planar mixed/inject output, no ggml_cont on the verify band
+  (LLAMA_HC_MIX_PLANAR_Q8=0: off)
+- Q8_1 of the mixed rows written by the collapse kernel into the quantize
+  cache, quantize_q8_1 arithmetic incl. d*int-sum (GGML_CUDA_HC_Q8_EPI=0: off)
+- HC_COMBINE + norm + Q8_1 in one kernel, hc_mix_combine_rms_gamma_q8
+  (GGML_CUDA_FUSE_HC_COMBINE_MIX_Q8=0: off)
+
+---
+ ggml/src/ggml-cpu/ops.cpp       |   2 +-
+ ggml/src/ggml-cuda/common.cuh   |  13 +++
+ ggml/src/ggml-cuda/ggml-cuda.cu |   3 +
+ ggml/src/ggml-cuda/hc-mix.cu    | 194 ++++++++++++++++++++++++++++----
+ src/models/qwen4exp.cpp         |   7 +-
+ 5 files changed, 198 insertions(+), 21 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 2a68f252d3..72e8238475 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12669,7 +12669,7 @@ void ggml_compute_forward_lightning_indexer(
+ static void ggml_compute_forward_hc_mix_f32(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+-    GGML_ASSERT(ggml_get_op_params_i32(dst, 2) == 0);   // planar layout: CUDA BF16 path only
++    GGML_ASSERT(ggml_get_op_params_i32(dst, 2) == 0);   // planar layout: CUDA/HIP only (BF16 and Q8_0 ops)
+ 
+     const ggml_tensor * x         = dst->src[0];
+     const ggml_tensor * w_norm    = dst->src[1];
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index f2808c006f..16336e1b29 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1725,6 +1725,7 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
+ bool ggml_cuda_fusion_disabled();
+ 
+ #define GGML_CUDA_HC_Q8_CNT 1024
++#define GGML_CUDA_HC_DOWN_DONE 1024   // >= n_tokens * (hc_lr/32) of the Q8_0 hc_mix band
+ #define GGML_CUDA_MOE_GLU_Q8_CNT 4096
+ #define GGML_CUDA_MOE_RED_CNT 4096
+ 
+@@ -1816,6 +1817,9 @@ struct ggml_backend_cuda_context {
+     // hc_mix_bf16_up_collapse2 Q8_1 epilogue: per-group row counters, one slice per stream (zeroed once, the
+     // kernel resets every counter it completes)
+     int * hc_q8_cnt = nullptr;
++    // Q8_0 hc_mix_down_dots: per (token, v group) row counters, one slice per stream; zeroed once at allocation
++    // (synchronously, so the zeroing can never be captured into a graph and replayed), the finisher resets each
++    unsigned int * hc_down_done = nullptr;
+     int * moe_glu_q8_cnt = nullptr;
+     int * moe_red_cnt = nullptr;
+     // MoE down + weighted reduction fold (ggml_cuda_mwr_fold_mark): armed at the down MUL_MAT_ID for its mmvq launch, which
+@@ -1858,6 +1862,15 @@ struct ggml_backend_cuda_context {
+         return hc_q8_cnt + curr_stream_no*GGML_CUDA_HC_Q8_CNT;
+     }
+ 
++    unsigned int * hc_down_done_counters() {
++        if (hc_down_done == nullptr) {
++            CUDA_CHECK(ggml_cuda_device_malloc((void **) &hc_down_done, GGML_CUDA_MAX_STREAMS*GGML_CUDA_HC_DOWN_DONE*sizeof(unsigned int), device));
++            CUDA_CHECK(cudaMemset(hc_down_done, 0, GGML_CUDA_MAX_STREAMS*GGML_CUDA_HC_DOWN_DONE*sizeof(unsigned int)));
++            CUDA_CHECK(cudaDeviceSynchronize());
++        }
++        return hc_down_done + curr_stream_no*GGML_CUDA_HC_DOWN_DONE;
++    }
++
+     // GLU -> Q8_1 (verify band): ggml_cuda_try_fuse sets these for the GLU node it is about to leave to the regular
+     // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
+     // matmul's Q8_1 activation into the quantize cache.  Reset on every try_fuse call, so they never outlive the node.
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 14c6bf07b1..fc8852092d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1645,6 +1645,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     if (hc_q8_cnt != nullptr) {
+         CUDA_CHECK(cudaFree(hc_q8_cnt));
+     }
++    if (hc_down_done != nullptr) {
++        CUDA_CHECK(cudaFree(hc_down_done));
++    }
+     if (moe_glu_q8_cnt != nullptr) {
+         CUDA_CHECK(cudaFree(moe_glu_q8_cnt));
+     }
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index 4a615ee7ce..265797f056 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -192,6 +192,77 @@ static __global__ void hc_mix_combine_rms_gamma(
+     }
+ }
+ 
++// The Q8_0 mixer's counterpart (a separate kernel, so the BF16 one above stays untouched): the combine and the
++// grouped RMSNorm + gamma exactly as hc_mix_combine_rms_gamma, then the Q8_1 quantize of xn for the down dots exactly
++// as hc_mix_rms_gamma_quant's in-register branch (same thread -> column -> group mapping), i.e. bit-identical to
++// hc_combine_kernel + hc_mix_rms_gamma_quant.  Needs blockDim 1024, n_embd % 32 == 0 and n_embd <= 8*1024.
++static __global__ void hc_mix_combine_rms_gamma_q8(
++        const float * residual, const float * block_out, const float * inject, float * comb,
++        const float * w_norm, float * xn, block_q8_1 * y, const int n_embd, const int hc, const float eps,
++        const int64_t res_stride_t, const int64_t bo_stride_t, const int64_t inject_stride_t,
++        const int64_t comb_stride_t, const int64_t xn_stride_t, const int64_t y_stride_t) {
++    const int c    = blockIdx.x;
++    const int t    = blockIdx.y;
++    const int tid  = threadIdx.x;
++    const int lane = tid & 31;
++
++    const float s = inject[(int64_t) t*inject_stride_t + c];
++    const float w = (1.0f / (1.0f + expf(-s))) * 2.0f;
++
++    const float * res = residual  + (int64_t) t*res_stride_t + (int64_t) c*n_embd;
++    const float * bo  = block_out + (int64_t) t*bo_stride_t;
++    float       * dt  = comb      + (int64_t) t*comb_stride_t + (int64_t) c*n_embd;
++
++    constexpr int max_k = 8;
++    float xr[max_k];
++    float tmp = 0.0f;
++#pragma unroll
++    for (int k = 0; k < max_k; ++k) {
++        const int col = tid + k*blockDim.x;
++        if (col < n_embd) {
++            {
++#pragma clang fp contract(off)
++                xr[k] = res[col] + bo[col] * w;
++            }
++            dt[col] = xr[k];
++            tmp += xr[k]*xr[k];
++        }
++    }
++    __shared__ float s_sum[32];
++    tmp = block_reduce<block_reduce_method::SUM>(tmp, s_sum);
++
++    const float scale = rsqrtf(tmp / (float) n_embd + eps);
++    float * xo = xn + (int64_t) t*xn_stride_t + (int64_t) c*n_embd;
++#pragma unroll
++    for (int k = 0; k < max_k; ++k) {
++        const int col = tid + k*blockDim.x;
++        if (col < n_embd) {
++            const float r = scale * xr[k];
++            xr[k] = r * w_norm[(int64_t) c*n_embd + col];
++            xo[col] = xr[k];
++        }
++    }
++
++    const int n_groups = n_embd / 32;
++#pragma unroll
++    for (int k = 0; k < max_k; ++k) {
++        const int g = tid/32 + k*(blockDim.x/32);
++        if (g < n_groups) {
++            const float xv = xr[k];
++            float amax = fabsf(xv);
++            float sum  = xv;
++            amax = warp_reduce_max<32>(amax);
++            sum  = warp_reduce_sum<32>(sum);
++            const float  d = amax / 127.0f;
++            const int8_t q = amax == 0.0f ? 0 : (int8_t) roundf(xv / d);
++            y[(int64_t) t*y_stride_t + (int64_t) c*n_groups + g].qs[lane] = q;
++            if (lane == 0) {
++                y[(int64_t) t*y_stride_t + (int64_t) c*n_groups + g].ds = make_half2(d, sum);
++            }
++        }
++    }
++}
++
+ // One Q8_0 matrix-vector product against the pre-quantized Q8_1 input, rpb =
+ // 1 (one row per block, K fills the thread groups). The grid covers the lo
+ // rows (w_down, K = hc_dim) and then the inject rows (w_inject, K = hc_dim);
+@@ -272,6 +343,9 @@ static __global__ void hc_mix_down_dots(
+     y_v[t*blocks_up + kb].qs[lane] = q;
+     if (lane == 0) {
+         y_v[t*blocks_up + kb].ds = make_half2(d, sum);
++        // this block made the group's 32nd and last increment: reset the counter for the next launch, so a
++        // persistent (zero-once) counter buffer needs no memset per call
++        done[t*blocks_up + kb] = 0;
+     }
+ }
+ 
+@@ -531,17 +605,22 @@ static __global__ void hc_mix_up_silu_dot_band(
+ // inject replicates the mmvf float2 accumulation), so the op runs one fewer
+ // kernel per call.  `t` (blockIdx.y) is the token: `xn`/`gate_raw`/`dst` and the dst
+ // inject tail are the packed per-token rows, while w_inject is shared.
++// `inject_stride_t` is the inject tail's per-token stride (dst_stride_t for the packed layout, hc for the planar one).
++// q8 != nullptr: also write the Q8_1 of the mixed row for its mmvq consumers (the quantize cache entry), replacing
++// their quantize_q8_1 launch.  A 256-thread block covers 256 consecutive columns, so each warp holds one whole Q8_1
++// group (32 consecutive columns; n_embd % 32 == 0) and quantizes it from registers exactly as quantize_q8_1 does.
+ static __global__ void hc_mix_collapse_inject(
+         const float * xn, const float * gate_raw, float * dst,
+         const int n_embd, const int hc, const float inv_hc,
+         const float * w_inject, float * inject, const int ncols2,
+         const int n_collapse_blocks,
+-        const int64_t xn_stride_t, const int64_t gate_stride_t, const int64_t dst_stride_t) {
++        const int64_t xn_stride_t, const int64_t gate_stride_t, const int64_t dst_stride_t,
++        const int64_t inject_stride_t, block_q8_1 * q8, const int64_t q8_stride_t) {
+     const int t = blockIdx.y;
+     const float * xn_t = xn + (int64_t) t*xn_stride_t;
+     const float * gate_t = gate_raw + (int64_t) t*gate_stride_t;
+     float * dst_t = dst + (int64_t) t*dst_stride_t;
+-    float * inject_t = inject + (int64_t) t*dst_stride_t;
++    float * inject_t = inject + (int64_t) t*inject_stride_t;
+     if (blockIdx.x >= n_collapse_blocks) {
+         // inject rows: one 256-thread block per inject row (mmvf numerics)
+         const int r   = blockIdx.x - n_collapse_blocks;
+@@ -587,7 +666,24 @@ static __global__ void hc_mix_collapse_inject(
+     for (int c = 1; c < hc; ++c) {
+         sum = sum + pp[c];
+     }
+-    dst_t[j] = sum * inv_hc;
++    const float xi = sum * inv_hc;
++    dst_t[j] = xi;
++    if (q8 == nullptr) {
++        return;
++    }
++    // warp-uniform: the j >= n_embd return above takes whole warps (n_embd % 32 == 0).  Exactly quantize_q8_1's
++    // arithmetic, including its correction term d * (integer sum of the quants) (upstream #31247)
++    const int lane = threadIdx.x % QK8_1;
++    float amax = fabsf(xi);
++    amax = warp_reduce_max<QK8_1>(amax);
++    const float  d = amax / 127.0f;
++    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
++    const int  isum = warp_reduce_sum<QK8_1>((int) q);
++    block_q8_1 * y = q8 + (int64_t) t*q8_stride_t + j/QK8_1;
++    y->qs[lane] = q;
++    if (lane == 0) {
++        y->ds = make_half2(d, d * isum);
++    }
+ }
+ 
+ // ---------------------------------------------------------------------------------------------------------------
+@@ -1066,11 +1162,19 @@ static void ggml_cuda_op_hc_mix_bf16(ggml_backend_cuda_context & ctx, ggml_tenso
+     }
+ }
+ 
++// Q8_0 hc weights.  comb != nullptr: the HC_COMBINE whose result is x (ggml_cuda_hc_combine_mix_fusable), computed
++// here together with the norm (hc_mix_combine_rms_gamma_q8) instead of by its own launch.
++static void ggml_cuda_op_hc_mix_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * comb = nullptr);
++
+ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     if (dst->src[2]->type == GGML_TYPE_BF16) {
+         ggml_cuda_op_hc_mix_bf16(ctx, dst);
+         return;
+     }
++    ggml_cuda_op_hc_mix_q8(ctx, dst);
++}
++
++static void ggml_cuda_op_hc_mix_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * comb) {
+     const ggml_tensor * x         = dst->src[0];
+     const ggml_tensor * w_norm    = dst->src[1];
+     const ggml_tensor * w_down    = dst->src[2];
+@@ -1083,11 +1187,11 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
+     GGML_ASSERT(w_inject == nullptr || w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0);
+     GGML_ASSERT(dst->type      == GGML_TYPE_F32);
+-    GGML_ASSERT(ggml_get_op_params_i32(dst, 2) == 0);   // planar layout: BF16 path only
+ 
+     const int   hc  = ggml_get_op_params_i32(dst, 0);
+     const float eps = ggml_get_op_params_f32(dst, 1);
+     GGML_ASSERT(hc > 0 && hc <= 8);
++    GGML_ASSERT(comb == nullptr || x == comb);
+ 
+     const int64_t n_embd   = x->ne[0];
+     const int64_t hc_dim   = n_embd * hc;
+@@ -1116,13 +1220,19 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const float * x_d   = (const float *) x->data;
+     const float * wn_d  = (const float *) w_norm->data;
+     float * dst_d       = (float *) dst->data;
+-    float * inject      = w_inject ? dst_d + n_embd : nullptr;  // the inject tail
++    // packed (default): a dst row of `out_n` floats per token holds the mixed head then the inject tail.
++    // planar (ggml_hc_mix_set_planar; src/models/qwen4exp.cpp sets it, LLAMA_HC_MIX_PLANAR_Q8=0 off): the mixed rows
++    // [n_embd, T] then the inject rows [hc, T], both contiguous, so the verify band needs no ggml_cont of the head.
++    // Only the addresses differ; every value is computed as before.
++    const bool    planar          = ggml_get_op_params_i32(dst, 2) != 0;
++    float *       inject          = w_inject ? (planar ? dst_d + n_embd*n_tokens : dst_d + n_embd) : nullptr;
++    const int64_t inject_stride_t = planar ? hc     : out_n;
++    const int64_t mixed_stride_t  = planar ? n_embd : out_n;
++    GGML_ASSERT(!planar || w_inject != nullptr);
+ 
+     // per-token element strides: x streams are contiguous within a token (asserted
+-    // above), the packed scratch rows are contiguous within their own arrays, and
+-    // both the mixed head and the inject tail live in a dst row of `out_n` floats
++    // above), the packed scratch rows are contiguous within their own arrays
+     const int64_t x_stride_t   = hc_dim;
+-    const int64_t dst_stride_t = out_n;
+ 
+     cudaStream_t stream = ctx.stream();
+ 
+@@ -1166,8 +1276,21 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int rpb_down = calc_rpb(blocks_down);
+     const int rpb_up   = calc_rpb(blocks_up);
+ 
+-    // xn = rms(x) * w_norm with the xn Q8_1 quantize merged in (grid hc x 1024 x nt)
+-    {
++    // xn = rms(x) * w_norm with the xn Q8_1 quantize merged in (grid hc x 1024 x nt); with comb, the combine that
++    // produces x in the same kernel
++    if (comb != nullptr) {
++        const ggml_tensor * residual  = comb->src[0];
++        const ggml_tensor * block_out = comb->src[1];
++        const ggml_tensor * c_inject  = comb->src[2];
++        const ggml_cuda_kernel_launch_params launch_params = {dim3(hc, n_tokens), dim3(1024), 0, stream};
++        ggml_cuda_kernel_launch(hc_mix_combine_rms_gamma_q8, launch_params,
++                (const float *) residual->data, (const float *) block_out->data, (const float *) c_inject->data,
++                (float *) comb->data, wn_d, xn, y_xn, (int) n_embd, hc, eps,
++                (int64_t) (residual->nb[2] / sizeof(float)),
++                block_out->ne[1] == 1 ? (int64_t) 0 : (int64_t) (block_out->nb[1] / sizeof(float)),
++                c_inject->ne[1]  == 1 ? (int64_t) 0 : (int64_t) (c_inject->nb[1]  / sizeof(float)),
++                (int64_t) (comb->nb[2] / sizeof(float)), hc_dim, (int64_t) blocks_down);
++    } else {
+         const dim3 block_nums(hc, n_tokens);
+         const dim3 block_dims(1024);
+         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+@@ -1193,10 +1316,19 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const bool band       = up_band && n_tokens >= 1 && rpb_up == 16 && maxi_up <= 4 && blocks_up == 10;
+     const bool pre        = preq && (band || rpb_up == 16);
+ 
+-    ggml_cuda_pool_alloc<unsigned int> done_alloc(pool);  // per (token, q8_1 group) row counters
++    // per (token, q8_1 group) row counters.  GGML_CUDA_HC_DONE_PERSIST=0: a pool buffer zeroed by a memset every call
++    // (the original); default: the per-stream zero-once counters, which the finisher block resets (no memset launch)
++    static const bool done_persist = [] { const char * e = getenv("GGML_CUDA_HC_DONE_PERSIST"); return !e || std::atoi(e); }();
++    ggml_cuda_pool_alloc<unsigned int> done_alloc(pool);
++    unsigned int * done = nullptr;
+     if (pre) {
+-        done_alloc.alloc(n_tokens*blocks_up);
+-        CUDA_CHECK(cudaMemsetAsync(done_alloc.get(), 0, n_tokens*blocks_up*sizeof(unsigned int), stream));
++        if (done_persist && n_tokens*blocks_up <= GGML_CUDA_HC_DOWN_DONE) {
++            done = ctx.hc_down_done_counters();
++        } else {
++            done_alloc.alloc(n_tokens*blocks_up);
++            CUDA_CHECK(cudaMemsetAsync(done_alloc.get(), 0, n_tokens*blocks_up*sizeof(unsigned int), stream));
++            done = done_alloc.get();
++        }
+     }
+     {
+         const dim3 block_nums(hc_lr + n_inject_q8, n_tokens);
+@@ -1206,8 +1338,8 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+                 (const block_q8_0 *) w_down->data, lo, hc_lr,
+                 n_inject_q8 ? (const block_q8_0 *) w_inject->data : nullptr, inject, n_inject_q8,
+                 y_xn, blocks_down,
+-                blocks_down, hc_lr, dst_stride_t,
+-                pre ? y_v : nullptr, blocks_up, 1.0f / (float) hc, pre ? done_alloc.get() : nullptr);
++                blocks_down, hc_lr, inject_stride_t,
++                pre ? y_v : nullptr, blocks_up, 1.0f / (float) hc, done);
+     }
+ 
+     // gate_raw = w_up^T v: 10240 rows x 320 dots (short K -> rpb override)
+@@ -1253,7 +1385,22 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ 
+     // mixed at the dst head + the F32 inject at the dst tail in one dispatch:
+     // the collapse blocks (n_embd/256) and the hc inject rows share the grid.
+-    // A Q8_0 inject is already in the tail from the down-dots launch above
++    // A Q8_0 inject is already in the tail from the down-dots launch above.
++    // Q8_1 of the mixed rows straight into the quantize cache for their mmvq consumers (GGML_CUDA_HC_Q8_EPI=0: off,
++    // they run quantize_q8_1).  Registered under dst only where the consumers key on dst: nt == 1 (the head view
++    // needs no copy), planar, or no inject (mixed is dst); the packed nt > 1 band reads a ggml_cont of the head.
++    static const bool q8_epi = [] { const char * e = getenv("GGML_CUDA_HC_Q8_EPI"); return !e || std::atoi(e); }();
++    block_q8_1 * q8 = nullptr;
++    const int64_t q8_stride_t = n_embd / QK8_1;
++    if (q8_epi && (n_tokens == 1 || planar || w_inject == nullptr) &&
++        n_embd % QK8_1 == 0 && GGML_PAD(n_embd, MATRIX_ROW_PADDING) == n_embd) {
++        bool found = false;
++        void * p = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, n_tokens*q8_stride_t*sizeof(block_q8_1),
++                                      n_embd, n_tokens, 1, 1, mixed_stride_t, mixed_stride_t*n_tokens, mixed_stride_t*n_tokens, found);
++        if (!found) {
++            q8 = (block_q8_1 *) p;
++        }
++    }
+     {
+         const int n_collapse_blocks = (int) ((n_embd + 255) / 256);
+         const int n_inject_blocks   = w_inject && inject_f32 ? hc : 0;
+@@ -1264,7 +1411,8 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+                 xn, gate, dst_d, n_embd, hc, 1.0f / (float) hc,
+                 w_inject && inject_f32 ? (const float *) w_inject->data : nullptr, inject,
+                 (int) (hc_dim / 2), n_collapse_blocks,
+-                hc_dim, hc_dim, dst_stride_t);
++                hc_dim, hc_dim, mixed_stride_t,
++                inject_stride_t, q8, q8_stride_t);
+     }
+ }
+ 
+@@ -1331,7 +1479,11 @@ bool ggml_cuda_hc_combine_mix_fusable(const ggml_tensor * comb, const ggml_tenso
+     const int64_t n_embd   = residual->ne[0];
+     const int64_t n_tokens = residual->ne[2];
+     const int     hc       = ggml_get_op_params_i32(comb, 0);
+-    return mix->src[2]->type == GGML_TYPE_BF16 && ggml_get_op_params_i32(mix, 0) == hc && hc == 4 &&
++    // Q8_0 mixer (GGML_CUDA_FUSE_HC_COMBINE_MIX_Q8=0: off): hc_mix_combine_rms_gamma_q8, within the Q8_0 op's band
++    static const bool q8_ok = [] { const char * e = getenv("GGML_CUDA_FUSE_HC_COMBINE_MIX_Q8"); return !e || atoi(e) != 0; }();
++    const bool q8 = q8_ok && mix->src[2]->type == GGML_TYPE_Q8_0 && mix->src[3]->type == GGML_TYPE_Q8_0 &&
++        n_tokens <= HC_FUSED_MAX_TOKENS && n_embd % 32 == 0;
++    return (mix->src[2]->type == GGML_TYPE_BF16 || q8) && ggml_get_op_params_i32(mix, 0) == hc && hc == 4 &&
+         residual->type == GGML_TYPE_F32 && block_out->type == GGML_TYPE_F32 && inject->type == GGML_TYPE_F32 &&
+         comb->type == GGML_TYPE_F32 && residual->ne[1] == hc && n_tokens >= 1 && n_tokens <= HC_BF16_MAX_TOKENS &&
+         block_out->ne[0] == n_embd && inject->ne[0] == hc &&
+@@ -1342,7 +1494,11 @@ bool ggml_cuda_hc_combine_mix_fusable(const ggml_tensor * comb, const ggml_tenso
+ }
+ 
+ void ggml_cuda_op_hc_combine_mix(ggml_backend_cuda_context & ctx, ggml_tensor * comb, ggml_tensor * mix) {
+-    ggml_cuda_op_hc_mix_bf16(ctx, mix, comb);
++    if (mix->src[2]->type == GGML_TYPE_BF16) {
++        ggml_cuda_op_hc_mix_bf16(ctx, mix, comb);
++    } else {
++        ggml_cuda_op_hc_mix_q8(ctx, mix, comb);
++    }
+ }
+ 
+ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index d88a924cc7..4616dd8736 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -924,7 +924,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+         // planar output (BF16 path): mixed [n_embd, nt] then inject [hc, nt], both contiguous, so the verify band
+         // needs no ggml_cont of the mixed head; byte-identical at nt == 1.  LLAMA_HC_MIX_PLANAR=0 disables it.
+         static const bool planar_env = [] { const char * e = getenv("LLAMA_HC_MIX_PLANAR"); return !e || atoi(e) != 0; }();
+-        const bool planar = planar_env && fused_bf16 && w_inject_f != nullptr;
++        // the Q8_0 op writes the same planar layout (LLAMA_HC_MIX_PLANAR_Q8=0: the packed rows + ggml_cont); only the
++        // GPU backend implements it (the CPU op asserts the packed layout), so hc weights in a host buffer keep it.
++        // LLAMA_HC_MIX_PLANAR=0 turns off both the BF16 and the Q8_0 planar layout
++        static const bool planar_q8_env = [] { const char * e = getenv("LLAMA_HC_MIX_PLANAR_Q8"); return !e || atoi(e) != 0; }();
++        const bool planar_q8 = planar_q8_env && !fused_bf16 && w_down_buf->buffer != nullptr && !ggml_backend_buffer_is_host(w_down_buf->buffer);
++        const bool planar = planar_env && (fused_bf16 || planar_q8) && w_inject_f != nullptr;
+         if (planar) {
+             ggml_hc_mix_set_planar(dst_t);
+         }
+-- 
+2.53.0
+

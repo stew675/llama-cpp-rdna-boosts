@@ -1,5 +1,27 @@
 # The delivery patches — what each block is and what it does
 
+> **r313: the Q8_0 hyper-connection mixer runs the BF16 mixer's launch count (contributor PR #326, `briansp2020`), an amendment to block 11.**
+> The fused Q8_0 `GGML_OP_HC_MIX` -- the op **every unsloth UD qwen4exp file** takes, because a BF16-hc model takes
+> `hc_mix_bf16_*` instead -- went from ~8 launches per hc site to 3-4: persistent `down_dots` counters
+> (`GGML_CUDA_HC_DONE_PERSIST`), a planar output so the verify band needs no `ggml_cont` (`LLAMA_HC_MIX_PLANAR`,
+> which now covers **both** ops), a Q8_1 epilogue in the collapse (`GGML_CUDA_HC_Q8_EPI`), the
+> combine+norm+Q8_1 kernel `hc_mix_combine_rms_gamma_q8` for the `HC_COMBINE -> HC_MIX` pattern
+> (`GGML_CUDA_FUSE_HC_COMBINE_MIX`, also both classes now), an up band that preloads its weights before the
+> prologue barrier (`GGML_CUDA_HC_UP_PRELOAD`), the up+collapse fused into `hc_mix_up_collapse_q8`
+> (`GGML_CUDA_HC_UP_FUSE`, default `1`) and the F32 inject rows as the first blocks of the down grid
+> (`GGML_CUDA_HC_INJECT_DOWN`).  **Output is byte-identical**: on `UD-Q4_K_XL` (Q8_0 hc + F32 inject, a file the
+> contributor did not have) every one of `scripts/gate-hc-fusions.sh`'s ten arms reads the hash the r312 build
+> reads in the same arm, the MTP verify band reproduces its draft acceptance exactly (0.68548, 85/124), and each
+> of the seven switches is text-inert alone.  **Decode +7.1 %** (45.1 -> 48.3 t/s, interleaved median of 3; the
+> same binary with all seven switches at `0` reads 45.1) and +4.9 % after a 5246-token prompt; prompt rate
+> unchanged; prefill logits **0.000000 / 100.000 %**.  `test-backend-ops -o HC_COMBINE_MIX` gained **Q8_0 arms**
+> (the case was BF16-only, so the new kernel had no unit oracle); `HC_MIX` 30/30, `HC_COMBINE` 20/20,
+> `HC_COMBINE_MIX` 13/13.  Two accepted limits, both recorded rather than implied: a **merged-layout**
+> (`hc_*_down_inject`) GGUF with Q8_0 hc weights is untested (no such file here, and the synthetic merged fixture
+> is F32/`hc_lr 8`), and NVIDIA/gfx1151/Windows are untested.  Record: `WORKLOG.md` 261118.007,
+> `INVARIANTS.md` r313, `ENVIRONMENT.md` §7.7, `benchmarks/2026-11-18-hc-mix-q8-decode.md`,
+> `archive/work/hc-mix-q8/` (the submission, kept verbatim).
+>
 > **r307: the MoE take-over PROMISE is scoped to its staging pass (GitHub issue #327, `DanoPTT`), an amendment to block 10.**
 > A take-over hook tells the scheduler "do not fill this `input_cpy`, the consumer reads the table out of the arena",
 > and the promise was recorded as a bare **address**.  The scheduler recycles those addresses across graphs and across

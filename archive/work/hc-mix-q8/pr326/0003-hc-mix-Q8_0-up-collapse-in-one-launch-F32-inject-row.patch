@@ -1,0 +1,382 @@
+From 1b9d8a7994366d2f40c14ccfa8eaffa4050490c5 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 14 Nov 2026 21:54:23 +0000
+Subject: [PATCH 3/3] hc-mix: Q8_0 up + collapse in one launch, F32 inject rows
+ first on the down grid (GGML_CUDA_HC_UP_FUSE=0: off)
+
+hc_mix_up_collapse_q8 replays 8 hc_mix_up_silu_dot_band<8,16,NT,3,10,true,true> blocks per
+workgroup (the 4 streams x 2 16-column units of 32 columns), keeps the per-warp results in LDS
+and sums the gate in the band kernel's order, then runs hc_mix_collapse_inject's collapse and
+Q8_1 epilogue for those columns.  The F32 inject rows run as the first blocks of
+hc_mix_down_dots (GGML_CUDA_HC_INJECT_DOWN=0: a separate inject-only launch).  Bit-identical.
+gfx1201, UD-IQ4_XS 4-token sites: 36.1 -> 31.9 us.
+
+---
+ ggml/src/ggml-cuda/hc-mix.cu | 307 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 283 insertions(+), 24 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index dbc0344f6c..8b676ad47e 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -276,9 +276,43 @@ static __global__ void hc_mix_down_dots(
+         const block_q8_0 * w_inject, float * inject, const int nrows_inject,
+         const block_q8_1 * y, const int blocks_per_row,
+         const int64_t y_stride_t, const int64_t lo_stride_t, const int64_t inject_stride_t,
+-        block_q8_1 * y_v, const int blocks_up, const float inv_hc, unsigned int * done) {
+-    const int row = blockIdx.x;
++        block_q8_1 * y_v, const int blocks_up, const float inv_hc, unsigned int * done,
++        const float * xn, const float * w_inject_f32, const int nrows_inject_f32, const int ncols2, const int64_t xn_stride_t) {
++    // the F32 inject rows are the FIRST nrows_inject_f32 blocks: each reads a whole hc_dim row, ~10x a down row, so
++    // at the end of the grid they ran last and stretched its tail
++    const int row = (int) blockIdx.x - nrows_inject_f32;
+     const int t   = blockIdx.y;
++    if (row < 0) {
++        // F32 inject rows (GGML_CUDA_HC_INJECT_DOWN, with the fused up+collapse): hc_mix_collapse_inject's inject
++        // block verbatim (256 threads, tid = 32*y + x is its threadIdx.x), the 1/hc-scaled logit into the inject tail
++        const int r   = (int) blockIdx.x;
++        const int tid = 32*threadIdx.y + threadIdx.x;
++        const float2 * x2 = (const float2 *) (xn + (int64_t) t*xn_stride_t);
++        const float2 * w2 = (const float2 *) (w_inject_f32 + (int64_t) r*2*ncols2);
++        float sumf = 0.0f;
++        for (int col2 = tid; col2 < ncols2; col2 += 256) {
++            const float2 tmpx = x2[col2];
++            const float2 tmpw = w2[col2];
++            sumf += tmpx.x*tmpw.x;
++            sumf += tmpx.y*tmpw.y;
++        }
++        sumf = warp_reduce_sum<32>(sumf);
++        __shared__ float buf[32];
++        if (tid < 32) {
++            buf[tid] = 0.0f;
++        }
++        __syncthreads();
++        buf[tid/32] = sumf;
++        __syncthreads();
++        if (tid < 32) {
++            sumf = buf[tid];
++            sumf = warp_reduce_sum<32>(sumf);
++            if (tid == 0) {
++                inject[(int64_t) t*inject_stride_t + r] = sumf * inv_hc;
++            }
++        }
++        return;
++    }
+     const bool is_inject = row >= nrows_down;
+     const int r = is_inject ? row - nrows_down : row;
+     const block_q8_0 * w = is_inject ? w_inject : w_down;
+@@ -715,6 +749,191 @@ static __global__ void hc_mix_collapse_inject(
+     }
+ }
+ 
++// hc_mix_up_silu_dot_band<8, 16, NT, 3, 10, true, true> (the up rows of 8 reference blocks) and the collapse of
++// their columns in one launch (GGML_CUDA_HC_UP_FUSE 1/2/3 = S 4/2/1 sub-blocks of 256 threads, I = 8/S slots each;
++// 0 = the two launches).  A fused block owns 32 consecutive columns j (2 units of 16) of all hc = 4 streams, i.e. the
++// reference blocks b = c*(n_embd/16) + u, c = 0..3, u = 2*blockIdx.x + {0, 1}: slot k = it*S + s runs reference
++// block (c = k/2, u = 2*blockIdx.x + k%2) with sub-block s, every thread with the reference block's thread index
++// (tid = 32*warp + lane within the sub-block) and the reference block's item math, so each warp's butterfly result
++// for row i is the reference's.  The per-warp results go to tmp[k][warp][t][i] (pre-zeroed like the reference's
++// partials) and the gate of row i is summed in the reference's order (warp 0, then warps 1..7); the gate never
++// leaves the block.  The collapse and its Q8_1 epilogue are hc_mix_collapse_inject's (warp t = token t, lane =
++// column), so the mixed row and its Q8_1 are bit-identical; the F32 inject rows run on the down-dots grid.
++template <int NT, int S>
++static __global__ void __launch_bounds__(S*256, 1) hc_mix_up_collapse_q8(
++        const block_q8_1 * y_pre, const block_q8_0 * w, const float * xn, float * dst,
++        const int n_embd, const int nrows, const int hc, const float inv_hc,
++        const int64_t xn_stride_t, const int64_t dst_stride_t, block_q8_1 * q8, const int64_t q8_stride_t) {
++    constexpr int nwarps = 8;
++    constexpr int RPB    = 16;
++    constexpr int BPR    = 10;
++    constexpr int MAXI   = 3;
++    constexpr int HC     = 4;
++    constexpr int C      = 2;            // 16-column units per fused block (32 columns: one whole Q8_1 group)
++    constexpr int K      = HC*C;         // reference blocks per fused block
++    constexpr int I      = K / S;        // slots per sub-block
++    static_assert(K % S == 0, "S must divide 8");
++    extern __shared__ block_q8_1 y_s[]; // [NT][BPR]
++    __shared__ float tmp[K][nwarps][NT][RPB];
++    const int lane = threadIdx.x;
++    const int s    = threadIdx.y / nwarps;
++    const int wy   = threadIdx.y % nwarps;   // the reference block's threadIdx.y
++    for (int k0 = 32*threadIdx.y + lane; k0 < K*nwarps*NT*RPB; k0 += 32*nwarps*S) {
++        (&tmp[0][0][0][0])[k0] = 0.0f;
++    }
++    constexpr int qi       = QI8_0;
++    constexpr int vdr      = VDR_Q8_0_Q8_1_MMVQ;
++    constexpr int n_groups = nwarps*32 / (qi/vdr);
++    constexpr int n_items  = RPB * BPR;
++    const int tid     = 32*wy + lane;
++    const int kqs     = vdr * (tid % (qi/vdr));
++    const int it0     = tid / (qi/vdr);
++    const int n_units = n_embd / RPB;
++    int  row0[I];
++    int  wq[I][MAXI][vdr];
++    half wdq[I][MAXI];
++#pragma unroll
++    for (int ii = 0; ii < I; ++ii) {
++        const int k = ii*S + s;
++        row0[ii] = RPB*((k / C)*n_units + C*blockIdx.x + k % C);
++#pragma unroll
++        for (int m = 0; m < MAXI; ++m) {
++            const int it = it0 + m*n_groups;
++            if (it < n_items && row0[ii] + it / BPR < nrows) {
++                const block_q8_0 * b = w + (int64_t) (row0[ii] + it / BPR) * BPR + it % BPR;
++#pragma unroll
++                for (int j = 0; j < vdr; ++j) {
++                    wq[ii][m][j] = get_int_b2(b->qs, kqs + j);
++                }
++                wdq[ii][m] = b->d;
++            }
++        }
++    }
++    {
++        const int * src = (const int *) y_pre;
++        int * dstw = (int *) y_s;
++        constexpr int nw = NT*BPR*sizeof(block_q8_1)/sizeof(int);
++        for (int k = 32*threadIdx.y + lane; k < nw; k += 32*nwarps*S) {
++            dstw[k] = src[k];
++        }
++    }
++    __syncthreads();
++
++    // rows touched by this warp (the same for every slot): its items are it = 8*warp + [0, 8) + m*n_groups
++    const int wit0 = (qi/vdr) == 4 ? 8*wy : (32/(qi/vdr))*wy;
++    uint32_t warp_rows = 0;
++#pragma unroll
++    for (int m = 0; m < MAXI; ++m) {
++        const int a = wit0 + m*n_groups;
++        const int b = min(a + 32/(qi/vdr) - 1, n_items - 1);
++        if (a < n_items) {
++            for (int i = a/BPR; i <= b/BPR; ++i) {
++                warp_rows |= 1u << i;
++            }
++        }
++    }
++#pragma unroll
++    for (int ii = 0; ii < I; ++ii) {
++        const int k = ii*S + s;
++        float val[MAXI][NT];
++        int   row_of[MAXI];
++#pragma unroll
++        for (int m = 0; m < MAXI; ++m) {
++            const int it = it0 + m*n_groups;
++            row_of[m] = -1;
++#pragma unroll
++            for (int t = 0; t < NT; ++t) {
++                val[m][t] = 0.0f;
++            }
++            if (it < n_items) {
++                const int i   = it / BPR;
++                const int kbx = it % BPR;
++                if (row0[ii] + i < nrows) {
++                    row_of[m] = i;
++#pragma unroll
++                    for (int t = 0; t < NT; ++t) {
++                        const block_q8_1 * yb = &y_s[t*BPR + kbx];
++                        int u[vdr];
++#pragma unroll
++                        for (int j = 0; j < vdr; ++j) {
++                            u[j] = get_int_b4(yb->qs, kqs + j);
++                        }
++                        val[m][t] = vec_dot_q8_0_q8_1_impl<float, vdr>(wq[ii][m], u, wdq[ii][m], __low2half(yb->ds));
++                    }
++                }
++            }
++        }
++#pragma unroll
++        for (int t = 0; t < NT; ++t) {
++            for (uint32_t mk = warp_rows; mk != 0; mk &= mk - 1) {
++                const int i = __builtin_ctz(mk);
++                float acc = 0.0f;
++#pragma unroll
++                for (int m = 0; m < MAXI; ++m) {
++                    if (row_of[m] == i) {
++                        acc += val[m][t];
++                    }
++                }
++                acc = warp_reduce_sum<32>(acc);
++                if (lane == 0) {
++                    tmp[k][wy][t][i] = acc;
++                }
++            }
++        }
++    }
++    __syncthreads();
++    if (threadIdx.y >= NT) {
++        return;
++    }
++    const int t  = threadIdx.y;
++    const int j  = 32*blockIdx.x + lane;
++    const int kk = lane / RPB;
++    const int i  = lane % RPB;
++    const float * xn_t = xn + (int64_t) t*xn_stride_t;
++    float * dst_t = dst + (int64_t) t*dst_stride_t;
++    float gate[HC];
++#pragma unroll
++    for (int c = 0; c < HC; ++c) {
++        const int k = c*C + kk;
++        float acc = tmp[k][0][t][i];
++#pragma unroll
++        for (int l = 1; l < nwarps; ++l) {
++            acc += tmp[k][l][t][i];
++        }
++        gate[c] = acc;
++    }
++    // hc_mix_collapse_inject's collapse (the reference's separate MUL and ADD roundings; contraction off here only,
++    // the dots above keep the band kernel's flags)
++    float xi;
++    {
++#pragma clang fp contract(off)
++        float pp[8];
++        for (int c = 0; c < hc; ++c) {
++            const float g = 1.0f / (1.0f + expf(-gate[c]));
++            pp[c] = xn_t[c*n_embd + j] * g;
++        }
++        float sum = pp[0];
++        for (int c = 1; c < hc; ++c) {
++            sum = sum + pp[c];
++        }
++        xi = sum * inv_hc;
++    }
++    dst_t[j] = xi;
++    if (q8 == nullptr) {
++        return;
++    }
++    float amax = fabsf(xi);
++    amax = warp_reduce_max<QK8_1>(amax);
++    const float  d = amax / 127.0f;
++    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
++    const int  isum = warp_reduce_sum<QK8_1>((int) q);
++    block_q8_1 * y = q8 + (int64_t) t*q8_stride_t + j/QK8_1;
++    y->qs[lane] = q;
++    if (lane == 0) {
++        y->ds = make_half2(d, d * isum);
++    }
++}
++
+ // ---------------------------------------------------------------------------------------------------------------
+ // BF16 hc weights (Flash-Next GSQ-RCO). The unfused decode chain for BF16 weights is
+ //   rms_norm*gamma -> mul_mat_vec_f<bf16, 256> (down, K = hc_dim) -> scale+silu -> mul_mat_vec_f_vb<bf16, 160, 4>
+@@ -1344,6 +1563,17 @@ static void ggml_cuda_op_hc_mix_q8(ggml_backend_cuda_context & ctx, ggml_tensor
+     const int maxi_up     = (rpb_up*blocks_up + n_groups_up - 1) / n_groups_up;
+     const bool band       = up_band && n_tokens >= 1 && rpb_up == 16 && maxi_up <= 4 && blocks_up == 10;
+     const bool pre        = preq && (band || rpb_up == 16);
++    // up + collapse in one launch (hc_mix_up_collapse_q8; GGML_CUDA_HC_UP_FUSE 1/2/3 = S 4/2/1 sub-blocks, default 1,
++    // 0 = the two launches) and the F32 inject rows on the down-dots grid (GGML_CUDA_HC_INJECT_DOWN=0: their own small
++    // launch instead).  gfx1201, UD-IQ4_XS 4-token sites: up 17.6 + collapse_inject 5.6 + down 12.9 -> 18.5 + 13.4 us
++    // (S 2: 19.9 fused), bit-identical
++    static const int  up_fuse     = [] { const char * e = getenv("GGML_CUDA_HC_UP_FUSE"); return e ? std::atoi(e) : 1; }();
++    static const bool inject_down = [] { const char * e = getenv("GGML_CUDA_HC_INJECT_DOWN"); return !e || std::atoi(e); }();
++    // GGML_CUDA_HC_UP_PRELOAD=0: the previous up band kernel (MAXI 4, runtime blocks_per_row, weights read in the dot)
++    static const bool up_preload = [] { const char * e = getenv("GGML_CUDA_HC_UP_PRELOAD"); return !e || std::atoi(e); }();
++    const bool fuse       = up_fuse >= 1 && up_fuse <= 3 && band && pre && up_preload && hc == 4 && blocks_up == 10 &&
++                            n_embd % 32 == 0 && hc_dim == 4*n_embd && n_tokens <= 8;
++    const bool inj_f32_down = fuse && inject_down && w_inject != nullptr && inject_f32;
+ 
+     // per (token, q8_1 group) row counters.  GGML_CUDA_HC_DONE_PERSIST=0: a pool buffer zeroed by a memset every call
+     // (the original); default: the per-stream zero-once counters, which the finisher block resets (no memset launch)
+@@ -1360,7 +1590,7 @@ static void ggml_cuda_op_hc_mix_q8(ggml_backend_cuda_context & ctx, ggml_tensor
+         }
+     }
+     {
+-        const dim3 block_nums(hc_lr + n_inject_q8, n_tokens);
++        const dim3 block_nums(hc_lr + n_inject_q8 + (inj_f32_down ? hc : 0), n_tokens);
+         const dim3 block_dims(32, 8);
+         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+         ggml_cuda_kernel_launch(hc_mix_down_dots, launch_params,
+@@ -1368,17 +1598,64 @@ static void ggml_cuda_op_hc_mix_q8(ggml_backend_cuda_context & ctx, ggml_tensor
+                 n_inject_q8 ? (const block_q8_0 *) w_inject->data : nullptr, inject, n_inject_q8,
+                 y_xn, blocks_down,
+                 blocks_down, hc_lr, inject_stride_t,
+-                pre ? y_v : nullptr, blocks_up, 1.0f / (float) hc, done);
++                pre ? y_v : nullptr, blocks_up, 1.0f / (float) hc, done,
++                (const float *) xn, inj_f32_down ? (const float *) w_inject->data : nullptr, inj_f32_down ? (int) hc : 0, (int) (hc_dim / 2), hc_dim);
+     }
+ 
++    // mixed at the dst head + the F32 inject at the dst tail in one dispatch:
++    // the collapse blocks (n_embd/256) and the hc inject rows share the grid.
++    // A Q8_0 inject is already in the tail from the down-dots launch above.
++    // Q8_1 of the mixed rows straight into the quantize cache for their mmvq consumers (GGML_CUDA_HC_Q8_EPI=0: off,
++    // they run quantize_q8_1).  Registered under dst only where the consumers key on dst: nt == 1 (the head view
++    // needs no copy), planar, or no inject (mixed is dst); the packed nt > 1 band reads a ggml_cont of the head.
++    static const bool q8_epi = [] { const char * e = getenv("GGML_CUDA_HC_Q8_EPI"); return !e || std::atoi(e); }();
++    block_q8_1 * q8 = nullptr;
++    const int64_t q8_stride_t = n_embd / QK8_1;
++    if (q8_epi && (n_tokens == 1 || planar || w_inject == nullptr) &&
++        n_embd % QK8_1 == 0 && GGML_PAD(n_embd, MATRIX_ROW_PADDING) == n_embd) {
++        bool found = false;
++        void * p = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, n_tokens*q8_stride_t*sizeof(block_q8_1),
++                                      n_embd, n_tokens, 1, 1, mixed_stride_t, mixed_stride_t*n_tokens, mixed_stride_t*n_tokens, found);
++        if (!found) {
++            q8 = (block_q8_1 *) p;
++        }
++    }
+     // gate_raw = w_up^T v: 10240 rows x 320 dots (short K -> rpb override)
++    if (fuse) {
++        const dim3 block_nums(n_embd / 32);
++        const size_t smem = (size_t) n_tokens*blocks_up*sizeof(block_q8_1);
++#define HC_UP_FUSE(NT) do { switch (up_fuse) { \
++            case 1: ggml_cuda_kernel_launch(hc_mix_up_collapse_q8<NT, 4>, ggml_cuda_kernel_launch_params{block_nums, dim3(32, 32), smem, stream}, y_v, (const block_q8_0 *) w_up->data, xn, dst_d, (int) n_embd, (int) hc_dim, hc, 1.0f / (float) hc, hc_dim, mixed_stride_t, q8, q8_stride_t); break; \
++            case 2: ggml_cuda_kernel_launch(hc_mix_up_collapse_q8<NT, 2>, ggml_cuda_kernel_launch_params{block_nums, dim3(32, 16), smem, stream}, y_v, (const block_q8_0 *) w_up->data, xn, dst_d, (int) n_embd, (int) hc_dim, hc, 1.0f / (float) hc, hc_dim, mixed_stride_t, q8, q8_stride_t); break; \
++            default: ggml_cuda_kernel_launch(hc_mix_up_collapse_q8<NT, 1>, ggml_cuda_kernel_launch_params{block_nums, dim3(32, 8), smem, stream}, y_v, (const block_q8_0 *) w_up->data, xn, dst_d, (int) n_embd, (int) hc_dim, hc, 1.0f / (float) hc, hc_dim, mixed_stride_t, q8, q8_stride_t); break; \
++        } } while (0)
++        switch (n_tokens) {
++            case 1: HC_UP_FUSE(1); break;
++            case 2: HC_UP_FUSE(2); break;
++            case 3: HC_UP_FUSE(3); break;
++            case 4: HC_UP_FUSE(4); break;
++            case 5: HC_UP_FUSE(5); break;
++            case 6: HC_UP_FUSE(6); break;
++            case 7: HC_UP_FUSE(7); break;
++            case 8: HC_UP_FUSE(8); break;
++            default: GGML_ABORT("hc_mix: unexpected n_tokens %d\n", (int) n_tokens); break;
++        }
++#undef HC_UP_FUSE
++        if (w_inject && inject_f32 && !inj_f32_down) {
++            // the F32 inject rows alone (hc_mix_collapse_inject with no collapse blocks)
++            const ggml_cuda_kernel_launch_params launch_params = {dim3(hc, n_tokens), dim3(256), 0, stream};
++            ggml_cuda_kernel_launch(hc_mix_collapse_inject, launch_params,
++                    xn, gate, dst_d, n_embd, hc, 1.0f / (float) hc,
++                    (const float *) w_inject->data, inject, (int) (hc_dim / 2), 0,
++                    hc_dim, hc_dim, mixed_stride_t, inject_stride_t, (block_q8_1 *) nullptr, q8_stride_t);
++        }
++        return;
++    }
+     if (band) {
+         const dim3 block_nums((hc_dim + rpb_up - 1) / rpb_up);
+         const dim3 block_dims(32, 8);
+         const size_t smem = (size_t) n_tokens*blocks_up*sizeof(block_q8_1);
+         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, smem, stream};
+-        // GGML_CUDA_HC_UP_PRELOAD=0: the previous kernel (MAXI 4, runtime blocks_per_row, weights read in the dot)
+-        static const bool up_preload = [] { const char * e = getenv("GGML_CUDA_HC_UP_PRELOAD"); return !e || std::atoi(e); }();
+ #define HC_UP_BAND(NT) (pre \
+         ? (up_preload \
+             ? ggml_cuda_kernel_launch(hc_mix_up_silu_dot_band<8, 16, NT, 3, 10, true, true>, launch_params, lo, y_v, (const block_q8_0 *) w_up->data, gate, (int) hc_dim, blocks_up, 1.0f / (float) hc, hc_lr, hc_dim) \
+@@ -1416,24 +1693,6 @@ static void ggml_cuda_op_hc_mix_q8(ggml_backend_cuda_context & ctx, ggml_tensor
+         }
+     }
+ 
+-    // mixed at the dst head + the F32 inject at the dst tail in one dispatch:
+-    // the collapse blocks (n_embd/256) and the hc inject rows share the grid.
+-    // A Q8_0 inject is already in the tail from the down-dots launch above.
+-    // Q8_1 of the mixed rows straight into the quantize cache for their mmvq consumers (GGML_CUDA_HC_Q8_EPI=0: off,
+-    // they run quantize_q8_1).  Registered under dst only where the consumers key on dst: nt == 1 (the head view
+-    // needs no copy), planar, or no inject (mixed is dst); the packed nt > 1 band reads a ggml_cont of the head.
+-    static const bool q8_epi = [] { const char * e = getenv("GGML_CUDA_HC_Q8_EPI"); return !e || std::atoi(e); }();
+-    block_q8_1 * q8 = nullptr;
+-    const int64_t q8_stride_t = n_embd / QK8_1;
+-    if (q8_epi && (n_tokens == 1 || planar || w_inject == nullptr) &&
+-        n_embd % QK8_1 == 0 && GGML_PAD(n_embd, MATRIX_ROW_PADDING) == n_embd) {
+-        bool found = false;
+-        void * p = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, n_tokens*q8_stride_t*sizeof(block_q8_1),
+-                                      n_embd, n_tokens, 1, 1, mixed_stride_t, mixed_stride_t*n_tokens, mixed_stride_t*n_tokens, found);
+-        if (!found) {
+-            q8 = (block_q8_1 *) p;
+-        }
+-    }
+     {
+         const int n_collapse_blocks = (int) ((n_embd + 255) / 256);
+         const int n_inject_blocks   = w_inject && inject_f32 ? hc : 0;
+-- 
+2.53.0
+

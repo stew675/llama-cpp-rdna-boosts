@@ -21,8 +21,15 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `00454bc676c9877792e9d5e951311f5db2906540ed89f518eb00f76b111ba92d` (the r311 cut -- the re-cut moved the exported commit and
+  `60e34a637755275686b8775806027e310d393b80f91c3136e21826bab61556c4` (the r313 cut -- the re-cut moved the exported commit and
   the hunk offsets, see below; every earlier cut is recorded below)
+* **r313 re-cut verification**: applies strictly at the r313 default tree
+  `a9b88bab56ceb20a820044deda4e86504d47fe5b` and produces `b40c32caadee0ab2ed066f153d150bf901a08b33`; cumulative with the other
+  optional artifact, numeric order, is `06013692f6ad9a28fc69ba7da7868b3b55420e80`.  **The patch file moved**
+  (sha256 `60e34a637755275686b8775806027e310d393b80f91c3136e21826bab61556c4`): block 11's r313 amendment (the Q8_0 hc mixer) rewrites `ggml/src/ggml-cuda/hc-mix.cu`,
+  `common.cuh`, `ggml-cuda.cu`, `ggml/src/ggml-cpu/ops.cpp` and `src/models/qwen4exp.cpp`, which this artifact
+  edits nothing of, so only the exported commit id and the hunk offsets moved -- the produced diff is otherwise
+  unchanged.  `validate-set.sh` check 8 verifies all three trees on every run.
 * **r311 re-cut verification**: applies strictly at the r311 default tree
   `4a3db2c29d294987b95206fd663bc345114df455` and produces `48dbb770030653be116fb72f15fc64d58fa9b883`; cumulative with the other
   optional artifact, numeric order, is `5fa077f78da0c50265febcfaf6351484475b3973`.  **The patch file moved**

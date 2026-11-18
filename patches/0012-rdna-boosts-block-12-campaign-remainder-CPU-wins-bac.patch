@@ -1,4 +1,4 @@
-From 5acc28761cd6402a367d0c2c16e807b42ebf9779 Mon Sep 17 00:00:00 2001
+From 7ca4e3d720287c0c4f9109ee4bb16c50196827be Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/17] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -3001,10 +3001,10 @@ index e563bdaf9..b7906b2b9 100644
          if (node->ne[2] > MOE_EXPERT_CACHE_MAX_TOK) {
              // TODO #133 / TODO #327: ABOVE the band an identity (fully resident) table is served IN PLACE -- the
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 663af4f0d..1ac000134 100644
+index 28fb35ec7..52f3234ce 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2761,6 +2761,10 @@ struct ggml_backend_cuda_comm_context {
+@@ -2764,6 +2764,10 @@ struct ggml_backend_cuda_comm_context {
      // re-attempting or re-logging.
      bool                        ce_grow_disabled  = false;
      bool                        ce_fallback_warned = false;
@@ -3015,7 +3015,7 @@ index 663af4f0d..1ac000134 100644
      // `GGML_CUDA_ALLREDUCE=q8ce` (r259): the copy-engine large-tensor arm sends its staged payload as
      // Walsh-Hadamard-rotated q8_0 blocks instead of bf16 (see the ce_q8 kernels).  Fixed for the life of
      // the context by the chain that created it; no env variable other than the algorithm name.
-@@ -3275,42 +3279,29 @@ static bool ggml_cuda_ar_ce_single() {
+@@ -3278,42 +3282,29 @@ static bool ggml_cuda_ar_ce_single() {
      return on;
  }
  
@@ -3078,7 +3078,7 @@ index 663af4f0d..1ac000134 100644
      if (comm_ctx->ce_bytes < need) {
          // Optional scratch budget (`GGML_CUDA_AR_CE_SCRATCH_MIB`; 0 = unlimited, the default): an
          // oversized prefill degrades to the internal pipeline instead of eating the slab reserve.  CE is
-@@ -3323,6 +3314,10 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -3326,6 +3317,10 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
              // Issue #136 (item C): the scratch could not be grown (or exceeds the budget).  Return false
              // BEFORE any collective phase runs, so the dispatcher falls back cleanly to the internal
              // pipeline (`ggml_backend_cuda_comm_allreduce_tensor`).  Never a hard abort.
@@ -3089,7 +3089,7 @@ index 663af4f0d..1ac000134 100644
              if (!comm_ctx->ce_fallback_warned) {
                  comm_ctx->ce_fallback_warned = true;
                  GGML_LOG_WARN("%s: copy-engine all-reduce scratch %.2f MiB unavailable%s; falling back to the "
-@@ -3357,6 +3352,9 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -3360,6 +3355,9 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
                      if (new_tmp [j] != nullptr) comm_ctx->ce_old.push_back({ d, new_tmp [j] });
                      if (new_tmp2[j] != nullptr) comm_ctx->ce_old.push_back({ d, new_tmp2[j] });
                  }
@@ -3099,7 +3099,7 @@ index 663af4f0d..1ac000134 100644
                  if (!comm_ctx->ce_fallback_warned) {
                      comm_ctx->ce_fallback_warned = true;
                      GGML_LOG_WARN("%s: could not allocate the copy-engine all-reduce scratch (%.2f MiB on "
-@@ -3376,8 +3374,57 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -3379,8 +3377,57 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
              comm_ctx->ce_tmp [i] = new_tmp [i];
              comm_ctx->ce_tmp2[i] = new_tmp2[i];
          }
@@ -3157,7 +3157,7 @@ index 663af4f0d..1ac000134 100644
  
      to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
      to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
-@@ -3670,6 +3717,348 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -3673,6 +3720,348 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
      return true;
  }
  
@@ -3506,7 +3506,7 @@ index 663af4f0d..1ac000134 100644
  static bool ggml_backend_cuda_comm_init_ce(ggml_backend_cuda_comm_context * ret) {
      const size_t nb = ret->backends.size();
      if (nb < 2) {
-@@ -4221,6 +4610,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+@@ -4224,6 +4613,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
      return ggml_backend_cuda_host_buffer_type_dev(0);
  }
  
@@ -3584,7 +3584,7 @@ index 663af4f0d..1ac000134 100644
  //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
  //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
  //}
-@@ -5449,6 +5909,21 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -5452,6 +5912,21 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_DUP:
              ggml_cuda_dup(ctx, dst);
              break;
@@ -3606,7 +3606,7 @@ index 663af4f0d..1ac000134 100644
          case GGML_OP_CPY:
              ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
              break;
-@@ -5844,6 +6319,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -5847,6 +6322,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
      }
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
@@ -3631,7 +3631,7 @@ index 663af4f0d..1ac000134 100644
      CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
  }
  
-@@ -6041,7 +6534,8 @@ static void ggml_cuda_peer_copy_staged(
+@@ -6044,7 +6537,8 @@ static void ggml_cuda_peer_copy_staged(
      ggml_cuda_set_device(src_device);
  }
  
@@ -3641,7 +3641,7 @@ index 663af4f0d..1ac000134 100644
      ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
      ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
  
-@@ -6095,16 +6589,25 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+@@ -6098,16 +6592,25 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
  #endif // GGML_CUDA_NO_PEER_COPY
          }
  
@@ -3674,7 +3674,7 @@ index 663af4f0d..1ac000134 100644
      } else {
          // src and dst are on the same backend
          CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
-@@ -6112,6 +6615,15 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+@@ -6115,6 +6618,15 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
      return true;
  }
  
@@ -3690,7 +3690,7 @@ index 663af4f0d..1ac000134 100644
  static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
      ggml_cuda_async_input_drain(cuda_ctx->device);
-@@ -8214,6 +8726,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8217,6 +8729,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
  }
  
  
@@ -3699,7 +3699,7 @@ index 663af4f0d..1ac000134 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -8243,6 +8757,12 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -8246,6 +8760,12 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
      /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
@@ -3712,7 +3712,7 @@ index 663af4f0d..1ac000134 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -8794,6 +9314,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8797,6 +9317,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              }
          case GGML_OP_DUP:
                  return true;
@@ -3723,7 +3723,7 @@ index 663af4f0d..1ac000134 100644
          case GGML_OP_ARGMAX:
          case GGML_OP_COUNT_EQUAL:
              return true;
-@@ -9078,7 +9602,11 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -9081,7 +9605,11 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  // tier, and it is added by block 12, which defines that buffer type -- naming it here would leave blocks 09-11
  // uncompilable (`INVARIANTS.md` r307 fact 5).
  static bool ggml_backend_buft_is_cuda_host_expert(ggml_backend_buffer_type_t buft) {
@@ -3736,7 +3736,7 @@ index 663af4f0d..1ac000134 100644
  }
  
  // Issue #323: the host-expert offload relaxation, default ON.  `GGML_MOE_HOST_OFFLOAD=0` restores the
-@@ -9232,6 +9760,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
+@@ -9235,6 +9763,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
      return moe_cache_enabled() ? moe_cache_max_tok_dev(ctx->device) : 0;
  }
  
@@ -3759,7 +3759,7 @@ index 663af4f0d..1ac000134 100644
  static bool ggml_backend_cuda_device_moe_cache_rearm(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): re-arm the expert-cache arena after a compute-buffer drop returned the VRAM.
      (void) dev;
-@@ -9251,6 +9795,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
+@@ -9254,6 +9798,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
  
  // wip/host-expert-tier: the persisted heat prior, so the loader can fill the pinned host-master tier in
  // descending hotness.  The prior is process-global in the cache, so any CUDA device serves.
@@ -3771,7 +3771,7 @@ index 663af4f0d..1ac000134 100644
  static void ggml_backend_cuda_device_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes) {
      (void) dev;
      moe_cache_set_host_pool_budget(bytes);
-@@ -9274,6 +9823,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -9277,6 +9826,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
      moe_cache_set_host_source(tensor_data, path, offs, n_experts, host_bytes, total_bytes);
  }
  
@@ -3791,7 +3791,7 @@ index 663af4f0d..1ac000134 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -9408,11 +9970,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -9411,11 +9973,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .slab_set_ring_cap         = */ ggml_backend_cuda_device_slab_set_ring_cap,
      /* .slab_enabled              = */ ggml_backend_cuda_device_slab_enabled,
      /* .slab_ring_slots           = */ ggml_backend_cuda_device_slab_ring_slots,
@@ -3806,7 +3806,7 @@ index 663af4f0d..1ac000134 100644
  };
  
  // backend reg
-@@ -9527,6 +10091,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -9530,6 +10094,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
          return (void *)ggml_backend_cuda_comm_allreduce_tensor;
      }
@@ -14036,7 +14036,7 @@ index 69c72eee3..bbaf25b0b 100644
          ggml_tensor * build_norm_gated(
                      ggml_tensor * input,
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index fc74035ca..6cf871607 100644
+index 35ef6e42f..4b28fe00c 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -4,6 +4,10 @@
@@ -14153,7 +14153,7 @@ index fc74035ca..6cf871607 100644
  static bool qwen4exp_want_derived_vis(const llama_model & model, const llama_hparams & hparams, int il, const llama_cparams & cparams, int64_t n_tokens);
  
  // Sparse-draft attention arm.  The draft's dense attention is O(n_q*n_kv) while the sparse cap is
-@@ -1031,6 +1131,31 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -1034,6 +1134,31 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
      // built as a second tail, so the logits tail can stay gathered (see below)
      ggml_tensor * res_hc_export = nullptr;
  
@@ -14185,7 +14185,7 @@ index fc74035ca..6cf871607 100644
      for (int il = 0; il < n_layer; ++il) {
          // Export the layer input only when a drafter taps it (dflash/dspark set these from the head's
          // target_layers): the tap wants the n_embd-wide mean over the hc streams, not the wide residual
-@@ -1042,10 +1167,26 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -1045,10 +1170,26 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
              ggml_build_forward_expand(gf, res->t_layer_inp[il]);
          }
  
@@ -14212,7 +14212,7 @@ index fc74035ca..6cf871607 100644
          ggml_tensor * inject = nullptr;
          ggml_tensor * cur = build_hc_mix(res_hc,
                  model.layers[il].hc_attn_norm,
-@@ -1055,6 +1196,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -1058,6 +1199,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
                  model.layers[il].hc_attn_down_inject,
                  &inject, il);
  
@@ -14224,7 +14224,7 @@ index fc74035ca..6cf871607 100644
          ggml_build_forward_expand(gf, cur);
  
          if (hparams.is_recr(il)) {
-@@ -1063,6 +1209,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -1066,6 +1212,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
              cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
          }
  
@@ -14236,7 +14236,7 @@ index fc74035ca..6cf871607 100644
          // The last layer's tail is always computed on the gathered output rows, so the
          // logits path is bit-identical to `--spec-type none` (a plain decode gathers here
          // too).  An unmasked MTP export additionally needs a hidden row for *every* token,
-@@ -1103,7 +1254,13 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -1106,7 +1257,13 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
                  model.layers[il].hc_ffn_down_inject,
                  &inject, il);
  
@@ -14251,7 +14251,7 @@ index fc74035ca..6cf871607 100644
          cb(cur, "ffn_out", il);
  
          res_hc = build_hc_combine(res_hc, cur, inject, il);
-@@ -1127,6 +1284,15 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+@@ -1130,6 +1287,15 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
          }
      }
  
@@ -14267,7 +14267,7 @@ index fc74035ca..6cf871607 100644
      // The MTP head consumes the wide residual before the head mixer collapses it. Export the
      // combine result itself rather than a reshape of it: a pure view gets no backend
      // assignment from the scheduler, and the readback in llama_context looks one up. It is
-@@ -2783,7 +2949,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+@@ -2786,7 +2952,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
      return cur;
  }
  
@@ -14277,7 +14277,7 @@ index fc74035ca..6cf871607 100644
      GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
  
      // The shared expert is mirrored under -sm tensor while the MoE output is a partial sum: expanding the shared
-@@ -2807,7 +2974,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -2810,7 +2977,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
      }
  
      ggml_tensor * moe_out =
@@ -14286,7 +14286,7 @@ index fc74035ca..6cf871607 100644
              model.layers[il].ffn_gate_inp,
              model.layers[il].ffn_up_exps,
              model.layers[il].ffn_gate_exps,
-@@ -2823,6 +2990,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -2826,6 +2993,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
              model.layers[il].ffn_down_exps_s);
      cb(moe_out, "ffn_moe_out", il);
  
