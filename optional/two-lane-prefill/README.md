@@ -21,8 +21,14 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `00abb040e7debc4b6499f5262936c392019c93b2414d360cdb66fda7526eacb0` (the r307 cut -- byte-identical to the r306
-  one; the earlier cuts are recorded below)
+  `00454bc676c9877792e9d5e951311f5db2906540ed89f518eb00f76b111ba92d` (the r311 cut -- the re-cut moved the exported commit and
+  the hunk offsets, see below; every earlier cut is recorded below)
+* **r311 re-cut verification**: applies strictly at the r311 default tree
+  `4a3db2c29d294987b95206fd663bc345114df455` and produces `48dbb770030653be116fb72f15fc64d58fa9b883`; cumulative with the other
+  optional artifact, numeric order, is `5fa077f78da0c50265febcfaf6351484475b3973`.  **The patch file moved**
+  (sha256 `00454bc676c9877792e9d5e951311f5db2906540ed89f518eb00f76b111ba92d`): block 05's r311 amendment rewrites `src/llama-context.cpp`, which this artifact edits
+  nothing of, so only the exported commit id and the hunk offsets moved -- the produced diff is otherwise
+  unchanged.  `validate-set.sh` check 8 verifies all three trees on every run.
 * **r307 re-cut verification**: applies strictly at the r307 default tree
   `f91aa81202fd32d060f9afb0f9c54824116758b9` and produces `7cafcacf5dea9677c318aba7713ba80802d144f9`; cumulative with the other
   optional artifact, numeric order, is `db5d26d45d5c8258b686151e3e42b63e139c301d`.  The patch file is

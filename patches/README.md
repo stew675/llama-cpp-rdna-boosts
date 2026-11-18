@@ -961,6 +961,22 @@ almost all of them `template-instances/*.cu`.
   `scripts/gate-fused-probe-splits.sh` (6 arms incl. the MTP pair; `splits == 1`, the two decline mechanisms
   graded separately).  Knob: `LLAMA_KV_ROWS_DISABLE=1` is the A/B arm (upstream's).  `WORKLOG.md` 261117.007,
   `INVARIANTS.md` r308.
+* **The other fused-op probes say HOW they verified (r311, `TODO` #345).**  r308's fix was one flag on one
+  probe; the class is wider.  `llm_fused_op_probe` gained `query_supports_op`: when the probe graph does not
+  CONTAIN the audited node, `resolve_fused_ops()` asks the acting DEVICE instead
+  (`ggml_backend_dev_supports_op`, one query per distinct `model.dev_layer(il)`, so a Meta device's `all_of()`
+  is the `-sm tensor` safety condition), and every `enabled` line for the three `DSV4 HC` probes and the top-k
+  mask now carries its verdict -- either `(the probe graph contained the node and its placement was checked)` or
+  `(the probe graph built no such node; ... verified by ggml_backend_dev_supports_op)`.  A bare `enabled` is the
+  r308 defect and the gate rejects it.  Measured reachability (fixture ladder + the real Flash-Next GGUF, gfx1201):
+  on `qwen4exp` the HC pre/comb/post ops are **prefill-only** (`HC_FUSED_MAX_TOKENS`), so the 1-token probe graph
+  builds none of them, and `top-k mask` is not built by the model at all (it still arms the probe, because its
+  GGUF carries `indexer_top_k = 2048`); `deepseek41`'s top-k mask is absent from ITS 1-token graph too although the
+  compressed-attention path builds it at runtime -- so `require_observed` would have DISABLED working features
+  (a numeric regression for `DSV4_HC_POST` under a Meta split, r309).  The Lightning Indexer probe stays INERT
+  (`auto_flid = false`) because its predicate is SHAPE-dependent and every backend has a generic fallback; the
+  models that read `fused_lid` gate on their own geometry.  Gate: `scripts/gate-fused-probe-splits.sh` (its fixture
+  ladder is the class-wide instrument).  `WORKLOG.md` 261118.003, `INVARIANTS.md` r311.
 * **The band kernels** (`fattn-rdna.cuh`): the RDNA4 head-256 GQA-6 band (the GQA group folded into
   `ncols2 = 8`, a round-robin KV split over a fixed `P`), extended to the 2-byte (f16/bf16) arm and capped
   by `GGML_HIP_FA_BAND_WMMA_GQA_MAX` (default 12) for GQA-12 models.  Since r92 the 2-byte arm uses the

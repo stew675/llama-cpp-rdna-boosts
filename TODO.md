@@ -42,13 +42,12 @@ left in this file.  The r236 re-base
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure (per-block gate, clean checkout, hosted CI) dies in `ui-assets.cmake:137` -- the container images are unaffected (their `web` stage supplies `tools/ui/dist`) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround where it bites; re-check before the next per-block ladder — §342 |
 | **343** | `Q5_K` / `Q6_K` / `IQ4_XS` `ssm_alpha` projections take block 10's gate/beta epilogue but no GDN GGUF on this box or the contributor's has that type, so the path is untested for them | coverage / accepted limitation (block 10) | **ACCEPTED** — the mechanism check in `scripts/gate-gdn-epi.sh` is what would close it; do not add a KLD arm before the `gdn_epi` line is observed — §343 |
-| **345** | the OTHER fused-op probes share r308's vacuity class: `llm_fused_op_top_k_mask_probe`, `..._lid_probe` and the three dsv4-hc probes are all `require_observed = false`, so a probe graph whose arm never contains the op reports "enabled" unverified (safe today only because the qwen4exp builder re-queries `supports_op` for the QSA/indexer ops and a prefill always reaches them) | correctness / probe contract (block 05) | **OPEN** — audit each probe's reachability, then decide per probe between `require_observed` and a direct `ggml_backend_dev_supports_op` query — §345 |
 
 ## Handle numbering
 
 **New handles append after `#345` (the highest issued so far; #338-#340 were all retired at r301, #341/#342 were
-issued at r303 -- #341 was retired at r309 (`WORKLOG.md` 261117.008) -- #343 at r304 and #345 at r308), and a
-number is never reused.**  (`#337` was opened and retired the
+issued at r303 -- #341 was retired at r309 (`WORKLOG.md` 261117.008) -- #343 at r304 and #345 at r308 and
+**retired at r311**, `WORKLOG.md` 261118.003), and a number is never reused.**  (`#337` was opened and retired the
 same day, 2026-11-16: the attendance pool *does* engage on Qwen3.8-Flash-Next under `--kv-unified`, so the
 "cannot be exercised" premise was wrong; the arm and its numbers are in `archive/work/session-scheduling/`.)  (`#335`/`#336` were retired at r298 -- an alias
 ROLE gap in the expert cache, `WORKLOG.md` 261116.005 -- and `#282` at r299 -- the mid-run latch's mixture is gated on
@@ -162,32 +161,6 @@ arena is now read IN PLACE at any width (`MOE_EXPERT_PREFILL_IN_PLACE`: 1489.6 -
 `-sm tensor`, 3588.8 -> 4072.4 on the pool mirror).  Consolidating the three transports for a **partly resident**
 table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2026-11-10-prefill-in-place.md`.
 
-## 345. The other fused-op probes share r308's vacuity class — audit each one's reachability
-
-`llama_context::resolve_fused_ops()` decides a fused feature from where the probe graph's node *landed*, which only
-verifies anything when the probe graph actually contains the node (`require_observed`).  r308 fixed the one probe
-where that was live (`llm_fused_op_flash_attn_kv_rows_probe`, field report on gfx1151: `--kv-unified` put every
-joint attention layer on the CPU, `INVARIANTS.md` r308, `scripts/gate-fused-probe-splits.sh`).  The others are
-still `require_observed = false`:
-
-* `llm_fused_op_top_k_mask_probe` and `llm_fused_op_lid_probe` (qwen4exp QSA/indexer): the probe is decode-shaped,
-  and at `n_kv < width` / on the dense decode arm those ops are NOT built, so `enabled` is reported unverified.
-* `llm_fused_op_dsv4_hc_pre_probe` / `..._comb_probe` / `..._post_probe`: same shape, same question.
-
-**Why they are not bugs today** (and why this is a TODO rather than a fix): each of those features has a SECOND,
-independent gate that does not depend on the probe — the qwen4exp builder calls `qsa_op_supported()` /
-`lightning_indexer_op_supported()`, which ask `ggml_backend_dev_supports_op()` for the real op on the real device
-— and the qwen4exp prefill always takes the sparse arm, so the indexer/top-k nodes are built where they matter.
-The kv_rows form had no second gate, which is what made it exploitable.
-
-**What to do:** for each probe, decide between (a) `require_observed = true` (correct when the op is built on a
-shape every context reaches), (b) a direct `ggml_backend_dev_supports_op()` query like `qsa_op_supported()`
-(correct when the probe's shape can legitimately differ from runtime), and (c) leaving it, with the reason
-recorded next to the descriptor.  Extend `scripts/gate-fused-probe-splits.sh` with a `--log` assertion for each
-probe it can grade, so the class has one instrument.  A DESCRIPTOR-ONLY change here is block 05's territory (no
-new block), but re-read `INVARIANTS.md` r308 item 5 first: the initializers are positional.
-
-## Accepted limitations (deliberately not fixed — do not re-report)
 
 These are closed: no work is owed and no row above tracks them.  A handle is kept where one was ever allocated, so
 the dated records that cite it still resolve and a re-entry condition has a name; the ones that never had a handle

@@ -1,4 +1,4 @@
-From 693151f52b361b34bd55e48291649a0df70745a8 Mon Sep 17 00:00:00 2001
+From d6950097521d9183bd0f8d7a220d200669bc76f1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/17] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -234,10 +234,10 @@ index 8f8fcb531..6311f1356 100644
          enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
          enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 72c1aa469..7a15047f0 100644
+index d5e585e64..83a048267 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -988,6 +988,22 @@ llama_context::llama_context(
+@@ -1139,6 +1139,22 @@ llama_context::llama_context(
              }
          }
  
@@ -260,7 +260,7 @@ index 72c1aa469..7a15047f0 100644
          sched_reserve();
  
          // wip/first-prefill-latency: reserve the wide prefill work region in the slab BEFORE the MoE
-@@ -4416,6 +4432,7 @@ llm_graph_params llama_context::graph_params(
+@@ -4604,6 +4620,7 @@ llm_graph_params llama_context::graph_params(
          /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
          /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
          /*.samplers    =*/ sampling.samplers,
@@ -268,7 +268,7 @@ index 72c1aa469..7a15047f0 100644
          /*.n_outputs   =*/ n_outputs,
          /*.cb          =*/ graph_get_cb(),
          /*.res         =*/ res,
-@@ -6284,6 +6301,7 @@ llama_context_params llama_context_default_params() {
+@@ -6472,6 +6489,7 @@ llama_context_params llama_context_default_params() {
          /*.n_outputs_max_per_seq       =*/ 1,
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
          /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
@@ -665,7 +665,7 @@ index c0ee6fa03..595f0c1bd 100644
  
      res->t_logits = cur;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index fdd60dd0e..d3c2f38ec 100644
+index 6cf871607..837cb1617 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -1563,7 +1563,22 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :

@@ -378,7 +378,7 @@ tier runs what); this table is the quick answer for a change in flight.
 | the narrow-row norm fusion (`norm-gated.cu`), its alloc-dep registration, or a new fusion that pre-dispatches a node | `scripts/gate-norm-rows-alias.sh` |
 | the hc base copy, `bf16_src1_cache_put()`, or the device `pool_stack` | `scripts/gate-hc-base-copy.sh` |
 | the fusion-window range check (`ggml_cuda_check_fusion_memory_ranges()`), a fusion's out-node set, or a host-expert scheduler copy | `scripts/gate-fusion-alias-copy.sh` |
-| a fused-op PROBE (`resolve_fused_ops()`), a `cparams.auto_*` / `fused_*` enable decision, or a probe descriptor | `scripts/gate-fused-probe-splits.sh` (a probe that cannot verify an op must disable it; `splits == 1` is the oracle, never text) |
+| a fused-op PROBE (`resolve_fused_ops()`), a `cparams.auto_*` / `fused_*` enable decision, or a probe descriptor | `scripts/gate-fused-probe-splits.sh` (a probe that cannot verify an op must disable it and must SAY how it verified, so a bare `enabled` fails; `splits` bounded by the LAYOUT, never text -- `--fixture-only` is the cheap class-wide arm) |
 | a grid-stall pad call site, or `ggml_cuda_grid_stall_pad()` itself | `scripts/gate-grid-stall-pad.sh` |
 | the MTP draft KV window (block 14 Goal C) | `scripts/gate-spec-draft-window.sh` |
 | a drafter's own KV cache: the DFlash/MTP prompt-ingest tail, a restored draft checkpoint, or anything that decides which rows a draft ingests | `scripts/gate-spec-reuse-window.sh` |

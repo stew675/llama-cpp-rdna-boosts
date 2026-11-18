@@ -1,4 +1,4 @@
-From fe5993677858c6b507e8b2dc25f1ee048c4f828b Mon Sep 17 00:00:00 2001
+From ead94cc613708f9c390f9412847b64f46a961575 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/17] rdna-boosts: block 11: qwen4exp (model,
@@ -161,12 +161,12 @@ r243 (contributor PR #289, bsp2020): the host PLE gather fans out over --threads
  src/llama-model.h                        |    1 +
  src/llama.cpp                            |   18 +-
  src/models/models.h                      |   74 +-
- src/models/qwen4exp.cpp                  | 2526 ++++++++++++++++++----
+ src/models/qwen4exp.cpp                  | 2527 ++++++++++++++++++----
  tests/CMakeLists.txt                     |    3 +
  tests/test-backend-ops.cpp               |  491 +++++
  tests/test-lazy-reader.cpp               |  264 +++
  tests/test-llama-archs.cpp               |  146 +-
- 52 files changed, 13062 insertions(+), 508 deletions(-)
+ 52 files changed, 13063 insertions(+), 508 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
@@ -9295,10 +9295,10 @@ index 6dcf34e77..ab8a48288 100644
              return true;
      }
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ef6ffad40..e36fd0433 100644
+index 83221808a..d18b589d9 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -822,6 +822,10 @@ llama_context::llama_context(
+@@ -973,6 +973,10 @@ llama_context::llama_context(
              /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
              /*.no_alloc  =*/ model.no_alloc(),
          };
@@ -11470,7 +11470,7 @@ index cfef363b6..69c72eee3 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 181e4dca4..cae6a7d9f 100644
+index 181e4dca4..fc74035ca 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -5,6 +5,333 @@
@@ -12773,7 +12773,7 @@ index 181e4dca4..cae6a7d9f 100644
      }
  
      bool can_reuse(const llm_graph_params & params) override {
-@@ -730,238 +1467,844 @@ public:
+@@ -730,238 +1467,845 @@ public:
              return false;
          }
  
@@ -13442,8 +13442,9 @@ index 181e4dca4..cae6a7d9f 100644
 +                freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow,
 +                score_pool, score_pool != nullptr ? inp->rng : nullptr);
 +        // register the fused indexer score so resolve_fused_ops()'s Lightning Indexer probe can
-+        // report a layer/device mismatch.  cparams.auto_flid is false in this tree, so the probe
-+        // is inert for now, but the registration keeps us aligned with upstream 889edf43d.
++        // report a layer/device mismatch.  cparams.auto_flid is false in this tree (TODO #345: a
++        // shape-dependent predicate cannot be probed at one shape), so the registration is inert
++        // for now, but it keeps us aligned with upstream 889edf43d.
 +        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
 +    } else {
 +        // gathers per stream: blk_cells row s indexes stream s's own cells
@@ -13798,7 +13799,7 @@ index 181e4dca4..cae6a7d9f 100644
      }
  
      // these nodes are added to the graph together so that they are not reordered
-@@ -982,41 +2325,259 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -982,41 +2326,259 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
      }
  
@@ -14071,7 +14072,7 @@ index 181e4dca4..cae6a7d9f 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -1050,8 +2611,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1050,8 +2612,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
  
      // Apply IMRoPE
@@ -14091,7 +14092,7 @@ index 181e4dca4..cae6a7d9f 100644
  
      cb(Qcur, "Qcur", il);
      cb(Kcur, "Kcur", il);
-@@ -1059,8 +2629,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1059,8 +2630,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
  
      const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
  
@@ -14102,7 +14103,7 @@ index 181e4dca4..cae6a7d9f 100644
      } else {
          cur = build_attn(inp,
                      nullptr, nullptr, nullptr,
-@@ -1215,6 +2785,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
+@@ -1215,6 +2786,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
  ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
      GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
  
@@ -14129,7 +14130,7 @@ index 181e4dca4..cae6a7d9f 100644
      ggml_tensor * moe_out =
          build_moe_ffn(cur,
              model.layers[il].ffn_gate_inp,
-@@ -1233,16 +2823,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -1233,16 +2824,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
      cb(moe_out, "ffn_moe_out", il);
  
      // shared experts, as in the Qwen3Next reference
@@ -14147,7 +14148,7 @@ index 181e4dca4..cae6a7d9f 100644
          // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
          ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
          cb(shared_gate, "shared_expert_gate", il);
-@@ -1266,49 +2847,59 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+@@ -1266,49 +2848,59 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
  //   mixed_n = (t[p]*m[0]) ^ ... ^ (t[p-n+1]*m[n-1]);  row = mixed_n % vocab[h] + offset[h]
  // The hash runs host-side because ggml has no int64 and no xor. EOS resets the window.
  
@@ -14223,7 +14224,7 @@ index 181e4dca4..cae6a7d9f 100644
      const int64_t n_prev   = n_gram - 1;
  
      std::vector<int32_t> idx(n_heads * n_tokens);
-@@ -1338,29 +2929,136 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
+@@ -1338,29 +2930,136 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
          }
  
          for (int64_t n = 2; n <= n_gram; ++n) {
@@ -14371,7 +14372,7 @@ index 181e4dca4..cae6a7d9f 100644
  }
  
  // Read a conv history out of its own recurrent row and write the new tail back.
-@@ -1372,6 +3070,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+@@ -1372,6 +3071,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
          int64_t              state_cols,
          int64_t              channels,
          int                  il) {
@@ -14382,7 +14383,7 @@ index 181e4dca4..cae6a7d9f 100644
      const int64_t n_seqs    = ubatch.n_seqs;
      const int64_t row_total = conv_states_all->ne[0];
  
-@@ -1389,7 +3091,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+@@ -1389,7 +3092,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
  
      ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
  
@@ -14415,7 +14416,7 @@ index 181e4dca4..cae6a7d9f 100644
  
      return conv_input;
  }
-@@ -1399,7 +3125,45 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+@@ -1399,7 +3126,45 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
      const int64_t n_heads = hparams.ple_n_heads;
  
      // the attention cells see every ubatch regardless of the layer types

@@ -1,4 +1,4 @@
-From 6405594db1f173f1ef7970b40ebddf3a814818d4 Mon Sep 17 00:00:00 2001
+From c2ddf0488367d2171dfe2feae10d73d4c29bae3b Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 12 Nov 2026 08:22:10 -0600
 Subject: [PATCH 05/17] rdna-boosts: block 05: flash-attention band, native
@@ -415,7 +415,7 @@ order and carries that warning next to it.
  ggml/src/ggml-hip/CMakeLists.txt              |   11 +
  ggml/src/ggml.c                               |   41 +
  include/llama.h                               |    6 +
- src/llama-context.cpp                         |  394 +++++-
+ src/llama-context.cpp                         |  584 +++++++-
  src/llama-context.h                           |   28 +-
  src/llama-cparams.h                           |    4 +
  src/llama-graph.cpp                           |  200 ++-
@@ -424,7 +424,7 @@ order and carries that warning next to it.
  src/llama-kv-cache.h                          |   23 +
  src/llama-kv-cells.h                          |   53 +
  tests/test-backend-ops.cpp                    |  181 ++-
- 341 files changed, 5930 insertions(+), 677 deletions(-)
+ 341 files changed, 6119 insertions(+), 678 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-rdna.cuh
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_4-ncols2_8-dkq256-dv256.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_8-ncols2_8-dkq256-dv256.cu
@@ -9547,7 +9547,7 @@ index 4c171aa3d..49bf5558a 100644
          // [EXPERIMENTAL]
          // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0f389ad8c..703ce53c3 100644
+index 0f389ad8c..edcdc6ecb 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -7,6 +7,9 @@
@@ -9624,7 +9624,7 @@ index 0f389ad8c..703ce53c3 100644
  // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
  // without this check, an arch that skips the transform helpers loads and computes wrong results
  static void llama_verify_hadamard_graph(
-@@ -122,6 +182,18 @@ struct llm_fused_op_probe {
+@@ -122,6 +182,28 @@ struct llm_fused_op_probe {
      llm_fused_op op;
      const char * name;
      uint32_t n_tokens_per_seq;
@@ -9640,10 +9640,20 @@ index 0f389ad8c..703ce53c3 100644
 +
 +    // the probe graph has to actually contain the fused op - otherwise nothing was verified
 +    bool require_observed = false;
++
++    // ... and when the node is legitimately absent from the probe graph, ask the acting DEVICE
++    // whether it implements the op (ggml_backend_dev_supports_op) instead of reporting "enabled"
++    // from a graph that never built it.  That is r308's vacuity class (TODO #345): an op can be
++    // PREFILL-only (qwen4exp's DSV4 HC ops: its 1-token arm runs the fused HC_MIX/HC_COMBINE band),
++    // or belong to another arch entirely (TOP_K_MASK is built only by the DSA arches, while
++    // qwen4exp's indexer_top_k still arms this probe).  Only for ops whose backend predicate reads
++    // the SOURCE TYPES rather than the runtime geometry -- a shape-dependent predicate (the
++    // lightning indexer's) cannot be answered by any single probe shape, so that one stays inert.
++    bool query_supports_op = false;
  };
  
  static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
-@@ -130,10 +202,35 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
+@@ -130,42 +212,276 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
      /*.n_tokens_per_seq =*/ 1,
  };
  
@@ -9678,9 +9688,80 @@ index 0f389ad8c..703ce53c3 100644
 +    /*.require_observed =*/ true,
  };
  
++// TODO #345 (a): this probe is INERT and stays inert (option (c) of the r308 follow-up).  Its backend
++// predicate is SHAPE-dependent -- ggml_cuda_lightning_indexer_generic_supported() rejects anything whose
++// q->ne[0] != 128 or whose head width is not 64/32/4 -- so no single probe shape answers the question
++// for a model whose indexer geometry differs (dsv4's is 64 heads, qwen4exp's is 4), and every backend has
++// a generic fallback for the op, so a device that cannot run the fused form is SLOW rather than wrong.
++// The models that read cparams.fused_lid gate on their own capability at their OWN geometry
++// (qwen4exp.cpp's lightning_indexer_op_supported() queries the real per-layer shape), which is the only
++// faithful instrument here.  `cparams.auto_flid` is therefore false, and the resolve block below never
++// runs -- keep the descriptor for that hook, not as a live probe.
  static const llm_fused_op_probe llm_fused_op_lid_probe = {
-@@ -166,6 +263,81 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
+     /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
+     /*.name             =*/ "Lightning Indexer",
      /*.n_tokens_per_seq =*/ 1,
++    /*.n_seqs           =*/ 0,
++    /*.require_gpu      =*/ false,
++    /*.require_kq_derived =*/ false,
++    /*.require_observed =*/ false,
++    /*.query_supports_op =*/ false,
+ };
+ 
++// The three DSV4 hyper-connection ops are built on EVERY shape by deepseek4/glm5-next/xing4-0, so the
++// placement verdict is available there -- but on qwen4exp they are PREFILL-only (build_hc_mix and
++// build_hc_combine collapse to HC_MIX/HC_COMBINE up to HC_FUSED_MAX_TOKENS/HC_BF16_MAX_TOKENS, i.e. at
++// the probe's 1 token), so the probe graph can never contain them for the model family this box actually
++// runs.  `query_supports_op` is the fallback for exactly that case: when the probe graph DID contain the
++// node the placement verdict below is the stronger answer and is used unchanged.
+ static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
+     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
+     /*.name             =*/ "fused DeepSeek V4 HC pre",
+     /*.n_tokens_per_seq =*/ 1,
++    /*.n_seqs           =*/ 0,
++    /*.require_gpu      =*/ false,
++    /*.require_kq_derived =*/ false,
++    /*.require_observed =*/ false,
++    /*.query_supports_op =*/ true,
+ };
+ 
+ static const llm_fused_op_probe llm_fused_op_dsv4_hc_comb_probe = {
+     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_COMB,
+     /*.name             =*/ "fused DeepSeek V4 HC comb",
+     /*.n_tokens_per_seq =*/ 1,
++    /*.n_seqs           =*/ 0,
++    /*.require_gpu      =*/ false,
++    /*.require_kq_derived =*/ false,
++    /*.require_observed =*/ false,
++    /*.query_supports_op =*/ true,
+ };
+ 
+ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_POST,
+     /*.name             =*/ "fused DeepSeek V4 HC post",
+     /*.n_tokens_per_seq =*/ 1,
++    /*.n_seqs           =*/ 0,
++    /*.require_gpu      =*/ false,
++    /*.require_kq_derived =*/ false,
++    /*.require_observed =*/ false,
++    /*.query_supports_op =*/ true,
+ };
+ 
++// TOP_K_MASK is built by the DSA arches (deepseek4/deepseek41/kimi-k31/glm5-next/dots3note/glm-dsa/
++// hy-v4/mistral-large4/deepseek32), never by qwen4exp -- whose GGUF still carries indexer_top_k (2048)
++// and therefore still ARMS this probe (cparams.auto_ftkm = hparams.indexer_top_k > 0).  On qwen4exp the
++// probe graph has no such node and there is no second gate, so before r311 this line reported "enabled"
++// having verified nothing.  Its backend predicate is a pure mask-type check (F16/F32), so the device
++// query is faithful.
+ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
+     /*.op               =*/ LLM_FUSED_OP_TOP_K_MASK,
+     /*.name             =*/ "fused top-k mask",
+     /*.n_tokens_per_seq =*/ 1,
++    /*.n_seqs           =*/ 0,
++    /*.require_gpu      =*/ false,
++    /*.require_kq_derived =*/ false,
++    /*.require_observed =*/ false,
++    /*.query_supports_op =*/ true,
  };
  
 +// V3: the derived kq mask only changes the flash attention prefill path (the packed mask stays for
@@ -9738,6 +9819,94 @@ index 0f389ad8c..703ce53c3 100644
 +    return false;
 +}
 +
++// A minimal op tensor for `probe.query_supports_op`: the direct device query needs a tensor whose
++// SOURCE TYPES are the ones the graph will build, because that is all the backends' predicates for
++// these ops read (see ggml-cuda.cu's DSV4_HC_PRE/COMB/POST and TOP_K_MASK cases -- a type check, no
++// geometry).  Returns nullptr for an op with no faithful minimal form (a shape-dependent predicate),
++// which turns into "cannot verify" at the call site rather than a silent pass.
++static ggml_tensor * llm_fused_op_query_tensor(ggml_context * ctx, llm_fused_op op) {
++    switch (op) {
++        // the GATED form: qwen4exp -- the family whose probe graph never contains this op -- builds
++        // ggml_dsv4_hc_pre_gated(), and both forms share src types and the same op
++        case LLM_FUSED_OP_DSV4_HC_PRE: {
++            ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 4, 1);
++            ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 4, 1);
++            return ggml_dsv4_hc_pre_gated(ctx, x, gate, 1.0f/4.0f);
++        }
++        // hc_comb asserts hc == 4, so mixes is exactly (2 + hc)*hc = 24 wide
++        case LLM_FUSED_OP_DSV4_HC_COMB: {
++            ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 24, 1);
++            ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
++            ggml_tensor * base  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 24);
++            return ggml_dsv4_hc_comb(ctx, mixes, scale, base, 0.0f, 1);
++        }
++        // the comb-present form (deepseek4); qwen4exp passes nullptr, and the predicate accepts both
++        case LLM_FUSED_OP_DSV4_HC_POST: {
++            ggml_tensor * x        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 1);
++            ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 4, 1);
++            ggml_tensor * post     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 1);
++            ggml_tensor * comb     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, 1);
++            return ggml_dsv4_hc_post(ctx, x, residual, post, comb);
++        }
++        case LLM_FUSED_OP_TOP_K_MASK: {
++            ggml_tensor * mask  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 8, 1, 1, 1);
++            ggml_tensor * top_k = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, 1, 1, 1);
++            return ggml_top_k_mask(ctx, mask, top_k, nullptr, nullptr, nullptr);
++        }
++        default:
++            return nullptr;
++    }
++}
++
++// Ask every acting DEVICE whether it implements the op -- the fallback for a probe whose node the probe
++// graph legitimately does not contain.  `model.dev_layer(il)` is the device that executes layer il; under
++// `-sm tensor` it is the Meta device, whose supports_op() requires EVERY tensor-parallel child to accept
++// the op, so this query is also the split-safety condition (the same reason qsa_op_supported() asks it).
++// Returns true when all of them accept it; on a refusal `*refused_dev`/`*refused_il` name the culprit.
++// Returns false with `*refused_dev == nullptr` when the op could not even be constructed (nothing verified).
++static bool llm_fused_op_query_devices(
++        const llama_model & model, llm_fused_op op,
++        ggml_backend_dev_t * refused_dev, uint32_t * refused_il) {
++    *refused_dev = nullptr;
++    *refused_il  = 0;
++
++    const ggml_init_params params = {
++        /*.mem_size   =*/ 16*ggml_tensor_overhead(),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++    ggml_context * ctx = ggml_init(params);
++    if (ctx == nullptr) {
++        return false;
++    }
++
++    ggml_tensor * qop = llm_fused_op_query_tensor(ctx, op);
++    bool ok = qop != nullptr;
++
++    std::vector<ggml_backend_dev_t> seen;
++    for (uint32_t il = 0; ok && il < model.hparams.n_layer_all; ++il) {
++        ggml_backend_dev_t dev = model.dev_layer((int) il);
++        if (dev == nullptr) {
++            continue;
++        }
++        // one query per distinct device: a layer split repeats the same answer per layer
++        if (std::find(seen.begin(), seen.end(), dev) != seen.end()) {
++            continue;
++        }
++        seen.push_back(dev);
++
++        if (!ggml_backend_dev_supports_op(dev, qop)) {
++            *refused_dev = dev;
++            *refused_il  = il;
++            ok = false;
++        }
++    }
++
++    ggml_free(ctx);
++
++    return ok;
++}
++
 +// the derived kq mask is only implemented by the CUDA/HIP backend.  A "meta" device (the
 +// tensor-parallel wrapper used for multi-GPU tensor split) does not expose its sub-devices here, but
 +// its supports_op forwards to all of them - which is exactly how the probed node ended up on it - so
@@ -9761,7 +9930,7 @@ index 0f389ad8c..703ce53c3 100644
  llama_context::llama_context(
          const llama_model & model,
                llama_context_params params) :
-@@ -184,6 +356,8 @@ llama_context::llama_context(
+@@ -184,6 +500,8 @@ llama_context::llama_context(
  
      const auto & hparams = model.hparams;
  
@@ -9770,7 +9939,7 @@ index 0f389ad8c..703ce53c3 100644
      cparams.n_seq_max = std::max(1u, params.n_seq_max);
      if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
          throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
-@@ -338,6 +512,45 @@ llama_context::llama_context(
+@@ -338,6 +656,52 @@ llama_context::llama_context(
          cparams.auto_fa    = false;
      }
  
@@ -9813,10 +9982,17 @@ index 0f389ad8c..703ce53c3 100644
 +    }
 +
 +
++    // TODO #345 (c): the Lightning Indexer probe is inert ON PURPOSE.  Its backend predicate is
++    // shape-dependent (q->ne[0] == 128 and a 64/32/4 head width in
++    // ggml_cuda_lightning_indexer_generic_supported), so no single probe shape answers it for a model
++    // whose indexer geometry differs -- dsv4 is 64 heads, qwen4exp is 4 -- and every backend has a
++    // generic fallback for the op, so an unsupported device is SLOW rather than wrong.  The models that
++    // read fused_lid gate on their own capability at their OWN geometry (qwen4exp.cpp's
++    // lightning_indexer_op_supported(), which asks the real per-layer shape).
      cparams.fused_lid = true;
      cparams.auto_flid = false;
  
-@@ -666,19 +879,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -666,19 +1030,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
              return;
          }
  
@@ -9842,7 +10018,7 @@ index 0f389ad8c..703ce53c3 100644
              GGML_ASSERT(node.il >= 0);
  
              ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
-@@ -698,11 +915,46 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -698,14 +1066,86 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                  device_mismatch = true;
                  break;
              }
@@ -9869,6 +10045,29 @@ index 0f389ad8c..703ce53c3 100644
 +        if (!observed && probe.require_observed) {
 +            LLAMA_LOG_WARN("%s: %s was not used in the probe graph, set to disabled\n", func, probe.name);
 +            device_mismatch = true;
++        }
++
++        // The node can be legitimately absent (a PREFILL-only op, or a model that does not build it at
++        // all): a probe graph that never contained it has verified nothing, so ask the acting DEVICE
++        // instead of reporting "enabled" from the graph's shape (r308's class, TODO #345).
++        bool verified_by_query = false;
++        if (!observed && !probe.require_observed && probe.query_supports_op) {
++            ggml_backend_dev_t refused_dev = nullptr;
++            uint32_t           refused_il  = 0;
++
++            if (!llm_fused_op_query_devices(model, probe.op, &refused_dev, &refused_il)) {
++                if (refused_dev != nullptr) {
++                    LLAMA_LOG_WARN("%s: %s: layer %u is assigned to device %s, which does not implement the op "
++                            "(the probe graph built no such node, so this was asked of the device directly)\n",
++                            func, probe.name, refused_il, ggml_backend_dev_name(refused_dev));
++                } else {
++                    LLAMA_LOG_WARN("%s: %s: no minimal op tensor could be built for the device query\n",
++                            func, probe.name);
++                }
++                device_mismatch = true;
++            } else {
++                verified_by_query = true;
++            }
          }
  
          if (device_mismatch) {
@@ -9888,8 +10087,26 @@ index 0f389ad8c..703ce53c3 100644
 +            }
          } else {
              enabled = true;
-             LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
-@@ -721,6 +973,31 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+-            LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
++            if (verified_by_query) {
++                // the marker is what the gate greps for: "enabled" is only claimed here after the
++                // acting device was asked about the op itself (ggml_backend_dev_supports_op), never
++                // from a probe graph that happened not to build the node
++                LLAMA_LOG_INFO("%s: %s enabled (the probe graph built no such node; the acting device accepts "
++                        "the op, verified by ggml_backend_dev_supports_op)\n", func, probe.name);
++            } else if (probe.query_supports_op) {
++                // the node WAS in the probe graph, so the placement check above is the verdict.  Say so
++                // explicitly: for these probes a bare "enabled" must never appear, or a regression to
++                // the vacuous form (r308) would be indistinguishable from a verified pass.
++                LLAMA_LOG_INFO("%s: %s enabled (the probe graph contained the node and its placement was "
++                        "checked)\n", func, probe.name);
++            } else {
++                LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
++            }
+         }
+     };
+ 
+@@ -721,6 +1161,31 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
          cparams.auto_fkvr = false;
      }
  
@@ -9921,7 +10138,7 @@ index 0f389ad8c..703ce53c3 100644
      if (cparams.auto_flid) {
          LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
          resolve(llm_fused_op_lid_probe, cparams.fused_lid);
-@@ -790,6 +1067,61 @@ void llama_context::sched_new(const sched_params & params) {
+@@ -790,6 +1255,61 @@ void llama_context::sched_new(const sched_params & params) {
      sched_params_cur = params;
  }
  
@@ -9983,7 +10200,7 @@ index 0f389ad8c..703ce53c3 100644
  void llama_context::sched_reserve() {
      if (!sched_need_reserve) {
          return;
-@@ -806,6 +1138,10 @@ void llama_context::sched_reserve() {
+@@ -806,6 +1326,10 @@ void llama_context::sched_reserve() {
      const uint32_t n_seqs = cparams.n_seq_max;
      const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
  
@@ -9994,7 +10211,7 @@ index 0f389ad8c..703ce53c3 100644
      const size_t max_nodes = this->graph_max_nodes();
  
      LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
-@@ -857,7 +1193,8 @@ void llama_context::sched_reserve() {
+@@ -857,7 +1381,8 @@ void llama_context::sched_reserve() {
      // reserve pp (prompt processing) graph first so that buffers are only allocated once
      {
          auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
@@ -10004,7 +10221,7 @@ index 0f389ad8c..703ce53c3 100644
          if (!gf) {
              if (cparams.pipeline_parallel) {
                  LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
-@@ -867,7 +1204,7 @@ void llama_context::sched_reserve() {
+@@ -867,7 +1392,7 @@ void llama_context::sched_reserve() {
                      /*.parallel   =*/ false,
                      /*.op_offload =*/ cparams.op_offload,
                  });
@@ -10013,7 +10230,7 @@ index 0f389ad8c..703ce53c3 100644
              }
              if (!gf) {
                  throw std::runtime_error("failed to allocate compute pp buffers");
-@@ -888,7 +1225,7 @@ void llama_context::sched_reserve() {
+@@ -888,7 +1413,7 @@ void llama_context::sched_reserve() {
          n_splits_tg = n_splits_pp;
          n_nodes_tg  = n_nodes_pp;
      } else {
@@ -10022,7 +10239,7 @@ index 0f389ad8c..703ce53c3 100644
          if (!gf) {
              throw std::runtime_error("failed to allocate compute tg buffers");
          }
-@@ -910,10 +1247,10 @@ void llama_context::sched_reserve() {
+@@ -910,10 +1435,10 @@ void llama_context::sched_reserve() {
                  // [TAG_RESERVE_DIAG_DECAY]
                  // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                  // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
@@ -10035,7 +10252,7 @@ index 0f389ad8c..703ce53c3 100644
          };
  
          if (!gf) {
-@@ -1084,7 +1421,7 @@ bool llama_context::memory_update(bool optimize) {
+@@ -1084,7 +1609,7 @@ bool llama_context::memory_update(bool optimize) {
  
          const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
  
@@ -10044,7 +10261,7 @@ index 0f389ad8c..703ce53c3 100644
          if (!gf) {
              LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
          }
-@@ -2254,6 +2591,26 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2254,6 +2779,26 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      output_swaps.clear();
      embd_batch_idxs.clear();
  
@@ -10071,7 +10288,7 @@ index 0f389ad8c..703ce53c3 100644
      sched_reserve();
  
      bool did_optimize = false;
-@@ -3105,7 +3462,8 @@ static void ubatch_prepare_reserve(
+@@ -3105,7 +3650,8 @@ static void ubatch_prepare_reserve(
  }
  
  ggml_cgraph * llama_context::graph_reserve(
@@ -10081,7 +10298,7 @@ index 0f389ad8c..703ce53c3 100644
      LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs_l);
      GGML_ASSERT(n_outputs_l >= 1);
  
-@@ -3135,7 +3493,22 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -3135,7 +3681,22 @@ ggml_cgraph * llama_context::graph_reserve(
  
      auto * res = gf_res_reserve.get();
  
@@ -10105,7 +10322,7 @@ index 0f389ad8c..703ce53c3 100644
  
      res->reset();
  
-@@ -4546,6 +4919,7 @@ llama_context_params llama_context_default_params() {
+@@ -4546,6 +5107,7 @@ llama_context_params llama_context_default_params() {
          /*.op_offload                  =*/ true,
          /*.swa_full                    =*/ true,
          /*.kv_unified                  =*/ false,

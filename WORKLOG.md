@@ -1,3 +1,70 @@
+## 261118.003 (r311, RELEASE v17-4f9dfa0e3-r311) -- `TODO` #345: the other fused-op probes reported `enabled` having verified nothing, and `require_observed` would have been a REGRESSION on three of them
+
+**What shipped.**  Block **05** (`src/llama-context.cpp`: a `query_supports_op` descriptor field, a minimal-op factory and a
+direct `ggml_backend_dev_supports_op` query per distinct acting device, a verdict marker on every audited `enabled`
+line, and the recorded reason the Lightning Indexer probe stays inert) and, in block **11**, one comment in
+`src/models/qwen4exp.cpp` that referenced the retired item.  `release.json` at **`v17-4f9dfa0e3-r311`** (canonical tip
+`32f6d6a45`, tree `4a3db2c29`; optional re-cut `48dbb7700` / `7ed22548c`, cumulative `5fa077f78`), and
+`scripts/gate-fused-probe-splits.sh` extended from "the r308 arms" to the whole class.  Block count unchanged (17
+official + `0300`).  Records: `patches/README.md` block 05, `MANIFESTS.md` block 05 + gate 35, `INVARIANTS.md` r311,
+`scripts/README.md`, `AGENTS.md`'s gate table.
+
+**The audit (this is the item).**  `resolve_fused_ops()` decides a fused feature from where the probe graph's node
+LANDED, which only verifies anything when the graph contains it.  r308 fixed the one live case (kv_rows); the other
+five descriptors were `require_observed = false`.  Measured on this box with `test-llama-archs -a <arch>` (a synthetic
+fixture per arch: a real context, so the probe runs, + a 64-token prefill and decode, ~2.4 s, no model load) and with
+the real Flash-Next GGUF:
+
+| arch | HC pre | HC comb | HC post | top-k mask |
+|---|---|---|---|---|
+| `qwen4exp` | obs (fixture) / **query** (real GGUF) | **query** | **query** | **query** |
+| `deepseek4` | obs | obs | obs | obs |
+| `deepseek41` | obs | obs | obs | **query** |
+| `glm5-next` | obs | obs | obs | obs |
+| `kimi-k31`, `deepseek32`, `dots3note`, `glm-dsa`, `mistral-large4` | **query** | **query** | -- (no tensor arm) | obs |
+
+Two rows decide the fix.  `qwen4exp` builds `DSV4_HC_PRE/POST` only above `HC_FUSED_MAX_TOKENS` (its 1-token arm runs
+the fused `HC_MIX`/`HC_COMBINE` band) and never builds `TOP_K_MASK` at all -- yet its GGUF carries `indexer_top_k =
+2048`, so the probe still ran and printed `fused top-k mask enabled` having verified nothing.  `deepseek41` builds
+`TOP_K_MASK` at runtime (its compressed-attention path) but not in its 1-token probe graph, so `require_observed = true`
+there would have DISABLED a working feature; on `DSV4_HC_POST` that class of mistake is worse than perf -- the unfused
+chain reads NMSE 1.74e-01 under a Meta split (r309).
+
+**The fix.**  A descriptor may now say `query_supports_op`, and when the probe graph did not contain the node the
+resolution asks the acting DEVICE (`ggml_backend_dev_supports_op` with a minimal op tensor, one query per distinct
+`model.dev_layer(il)`; under `-sm tensor` that is the Meta device, whose `all_of()` makes the query the split-safety
+condition).  That is faithful exactly where the backend predicate reads the SOURCE TYPES -- `ggml-cuda.cu`'s
+`DSV4_HC_PRE/COMB/POST` cases are F32 type checks and `TOP_K_MASK`'s is an F16/F32 mask check.  The Lightning Indexer
+probe is **not** converted: `ggml_cuda_lightning_indexer_generic_supported()` is shape-dependent (`q->ne[0] == 128`,
+a 64/32/4 head width), so no single probe shape answers it for dsv4 (64 heads) and qwen4exp (4 heads); every backend
+has a generic fallback for that op, and the models that read `cparams.fused_lid` query their own per-layer geometry
+(`qwen4exp.cpp`'s `lightning_indexer_op_supported()`).  Its descriptor and its `auto_flid = false` now carry that reason
+(option (c) of the item).  Every audited `enabled` line carries its verdict -- `(the probe graph contained the node and
+its placement was checked)` or `(the probe graph built no such node; ... verified by ggml_backend_dev_supports_op)` --
+because a bare `enabled` is indistinguishable from r308's vacuous pass.
+
+**Verification.**  `scripts/gate-fused-probe-splits.sh` PASS, both sections.  The **fixture ladder** (its new arm
+class, on 1 and 2 GPUs, the latter for the Meta arm that `fused_dsv4_hc_post` needs) asserts the audit table above
+per (arch, probe) and passes; `xing4-0` and `hy-v4` are the two arches it cannot cover (no fixture, no GGUF).  The
+**real-model arms** (Flash-Next GSQ-IQ3_XXS 72 GB, `-sm layer`, 3 GPUs, `--kv-unified -c 32768 --parallel 2`, six
+arms): every arm reads `HC pre`/`comb`/`top-k mask` = **query** -- the vacuity, now verified -- `splits = 4` (= the
+layout bound, not a CPU fallback), `check-gpu-faults.sh` clean, and the same-regime texts identical
+(`plain == rows-off == dense-always`, `mtp == mtp-rdna34`, sha `f6f0a8fd998b`).  **Negative tests, four of them:** the
+pre-fix r310 binary FAILS three arms (`UNVERIFIED 'enabled'` for exactly those three probes), a log with the verdicts
+stripped FAILS, `Flash Attention over K/V rows enabled` FAILS, `splits = 25` FAILS.  Inertness: coherence byte-identical
+against an r310 build of the same tree -- 4B Q8_0 `1c5d32ac537d` (1 and 3 GPU `-sm tensor`), 27B Q8_0 3 GPU
+`da2e2d192e21`, 35B-A3B Q8_0 `-ncmoe 40` `461ca8cd0e88` -- and the 27B prefill-logit point **mean KLD 0.000000 /
+same-top-p 100.000 %**.  Per-block ladder **18/18** (142 s, `HF_UI_VERSION=b12387` for `TODO` #342) after amending
+block 05 (the full ladder, not `--changed-from`: an early-block amendment moves every later tree).  `validate-set.sh`
+strict with both optional artifacts re-cut against the new tree (`48dbb7700` / `7ed22548c`, cumulative `5fa077f78`).
+Fork refresh re-cut `rdna-boosts` at **`32f6d6a45`** (tree `4a3db2c29`, reproducible), `--build --gates` green.
+
+**Two gate defects found and fixed on the way** (both were box-shaped assertions, which is how a gate becomes a
+one-box ritual): the `splits = N > 1` check assumed one device -- it now bounds by the LAYOUT (1 single-device/tensor,
+NGPU+1 on a layer split, because the output layer is placed back on the first device), and `plain`/`mtp` asserted the
+gfx1151 QSA policy -- the expectation is now derived from the arm or pinned with `KVROWS_EXPECT`.  Without those,
+`gate-fused-probe-splits.sh` could not PASS anywhere but `halo`.
+
 ## 261118.002 (r310, published) -- `v17-4f9dfa0e3-r310` is PUBLISHED: delivery repo `main` + tag, and the fork's `rdna-boosts` already carries `.tip` because no patch changed
 
 **Published, at the maintainer's direction.**  Delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main`

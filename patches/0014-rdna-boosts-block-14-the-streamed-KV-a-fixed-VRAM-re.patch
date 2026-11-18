@@ -1,4 +1,4 @@
-From d3cfcfcab75b242253bbd44e8697177f9900206a Mon Sep 17 00:00:00 2001
+From a3bc1cdc8d28b8dc01cf78783664eff46a09c7a0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 14/17] rdna-boosts: block 14: the streamed KV -- a fixed-VRAM
@@ -6453,10 +6453,10 @@ index 6311f1356..0c28048df 100644
  
      struct llama_model_tensor_override {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 7a15047f0..c0c57dc22 100644
+index 83a048267..4d3932459 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -675,6 +675,14 @@ llama_context::llama_context(
+@@ -826,6 +826,14 @@ llama_context::llama_context(
      cparams.moe_cache_size      = params.moe_cache_size; // upstream MoE cache (dormant unless --moe-cache-mib)
      cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
      cparams.drop_compute_buffers = params.drop_compute_buffers;
@@ -6471,7 +6471,7 @@ index 7a15047f0..c0c57dc22 100644
  
      // resolved after flash attention, see resolve_fused_ops()
      {
-@@ -835,6 +843,8 @@ llama_context::llama_context(
+@@ -986,6 +994,8 @@ llama_context::llama_context(
              /*.ctx_type  =*/ cparams.ctx_type,
              /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
              /*.no_alloc  =*/ model.no_alloc(),
@@ -6480,7 +6480,7 @@ index 7a15047f0..c0c57dc22 100644
          };
          // the graph builders that choose between quantized-aware attention arms need the same
          // types the memory module was given (see qwen4exp_qsa_sparse)
-@@ -6333,6 +6343,9 @@ llama_context_params llama_context_default_params() {
+@@ -6521,6 +6531,9 @@ llama_context_params llama_context_default_params() {
          /*.sampler                     =*/ nullptr,
          /*.n_sampler                   =*/ 0,
          /*.ctx_other                   =*/ nullptr,
@@ -6490,7 +6490,7 @@ index 7a15047f0..c0c57dc22 100644
      };
  
      return result;
-@@ -7133,6 +7146,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+@@ -7321,6 +7334,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
      return ctx->memory_breakdown();
  }
  
@@ -10793,7 +10793,7 @@ index a4065bea4..dc6b8b4b9 100644
      uint64_t n_elements() const;
  
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index d3c2f38ec..d88a924cc 100644
+index 837cb1617..85dc1384f 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -269,6 +269,34 @@ static bool qwen4exp_mtp_sparse_arm(int64_t n_tokens, int64_t n_kv,
@@ -10858,7 +10858,7 @@ index d3c2f38ec..d88a924cc 100644
      if (pin_block_out) {
          ggml_set_output(block_out);
      }
-@@ -2557,9 +2585,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -2558,9 +2586,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
      }
  
@@ -10887,7 +10887,7 @@ index d3c2f38ec..d88a924cc 100644
      // the natural cache views, kept for the qsa3 packs (which must cast before permuting)
      ggml_tensor * k_raw = k;
      ggml_tensor * v_raw = v;
-@@ -2578,6 +2623,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -2579,6 +2624,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          // derives each cell's visibility from cell_vis/q_vis instead - see findings 2c
          cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f,
                  qsa_cell_vis, qsa_q_vis);
@@ -10898,7 +10898,7 @@ index d3c2f38ec..d88a924cc 100644
          // qsa3 (packed-block WMMA) needs the packed F16 layouts; it is prefill-only, so the whole
          // W=1..8 decode/verify band keeps the VEC kernel and width purity holds by construction.
          // Compile-time gate (see LLAMA_QSA3_ENABLE at the top of this file, default 1) plus the
-@@ -2738,10 +2787,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -2739,10 +2788,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
          const int64_t qsa_decode_band = std::max<int64_t>(QSA_DECODE_BAND, (int64_t) cparams.n_rs_batch);
          if (shortcut && n_kv <= width) {
              build_qsa_store_k(mctx_hyb, cur, il);
@@ -10913,7 +10913,7 @@ index d3c2f38ec..d88a924cc 100644
              build_qsa_store_k(mctx_hyb, cur, il);
          } else if (qsa_dense_prefill_until > 0 && n_tokens > qsa_decode_band &&
                     n_kv < qsa_dense_prefill_until) {
-@@ -3302,7 +3354,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+@@ -3303,7 +3355,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
  
          // copy the strided tail straight into the slot (one copy, a 2D memcpy on CUDA) instead of cont + cpy;
          // LLAMA_CONV_TAIL_CONT=1 restores the intermediate contiguous copy for A/B

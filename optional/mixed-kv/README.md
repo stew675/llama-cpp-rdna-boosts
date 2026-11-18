@@ -8,8 +8,14 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `b5b223baa8d8b8ed5f45aebd885702c783c0193f547d3db1ccfe31e256d32e34` (the r307 cut -- byte-identical to the r306
-  one; the earlier cuts are recorded below)
+  `7648a7e5772b373da0ce0ad4135634588ff32b7cfc952abda5f67ebd75cb03a6` (the r311 cut -- the re-cut moved the exported commit and
+  the hunk offsets, see below; every earlier cut is recorded below)
+* **r311 re-cut verification**: applies strictly at the r311 default tree
+  `4a3db2c29d294987b95206fd663bc345114df455` and produces `7ed22548c609149d3e306fbb384a7d5183ecf021`; cumulative with the other
+  optional artifact, numeric order, is `5fa077f78da0c50265febcfaf6351484475b3973`.  **The patch file moved**
+  (sha256 `7648a7e5772b373da0ce0ad4135634588ff32b7cfc952abda5f67ebd75cb03a6`): block 05's r311 amendment rewrites `src/llama-context.cpp`, which this artifact edits
+  nothing of, so only the exported commit id and the hunk offsets moved -- the produced diff is otherwise
+  unchanged.  `validate-set.sh` check 8 verifies all three trees on every run.
 * **r307 re-cut verification**: applies strictly at the r307 default tree
   `f91aa81202fd32d060f9afb0f9c54824116758b9` and produces `38edbd0eba73bd96303c5ce8824f4b0096658e01`; cumulative with the other
   optional artifact, numeric order, is `db5d26d45d5c8258b686151e3e42b63e139c301d`.  The patch file is

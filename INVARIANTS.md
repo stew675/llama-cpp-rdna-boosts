@@ -624,3 +624,56 @@ Established closing `TODO` #344 on the Flash-Next IQ3_XXS host-expert shape (1 G
    base also reads `0.000000 / 100.000 %`, so the r305..r309 delta (including r307's repair on the prefill path)
    moves nothing on 40 x 512 chunks of host-expert prefill.  The 27B release point is dense and never reaches the
    pool/in-place transport at all, which is why this point is now the required arm for a change to that tier.
+
+## r311 (2026-11-18, `WORKLOG.md` 261118.003) — the fused-op probes: a verdict that is not in the log is not a verdict
+
+Established by `TODO` #345 (the r308 vacuity CLASS), block 05's descriptor set and `scripts/gate-fused-probe-splits.sh`'s
+fixture ladder.
+
+1. **`require_observed` is the wrong instrument for the probes that remain, and a bare `enabled` line is the defect.**
+   Four descriptors carry `query_supports_op` and now say HOW they decided: `...(the probe graph contained the node
+   and its placement was checked)` or `...(the probe graph built no such node; the acting device accepts the op,
+   verified by ggml_backend_dev_supports_op)`.  The measured reachability audit (fixture ladder, `test-llama-archs -a
+   <arch>`, gfx1201):
+
+   | arch | HC pre | HC comb | HC post | top-k mask |
+   |---|---|---|---|---|
+   | `qwen4exp` | obs (fixture) / **query** (real GGUF) | **query** | **query** | **query** |
+   | `deepseek4` | obs | obs | obs | obs |
+   | `deepseek41` | obs | obs | obs | **query** |
+   | `glm5-next` | obs | obs | obs | obs |
+   | `kimi-k31`, `deepseek32`, `dots3note`, `glm-dsa`, `mistral-large4` | **query** | **query** | — (no tensor arm) | obs |
+
+   `require_observed = true` on any of them would have DISABLED a working feature: `deepseek41` builds `TOP_K_MASK`
+   at runtime (`deepseek41.cpp`'s compressed-attention path) but not in its 1-token probe graph, and qwen4exp builds
+   `DSV4_HC_PRE/POST` only above `HC_FUSED_MAX_TOKENS`/`HC_BF16_MAX_TOKENS` (its single-token arm runs the fused
+   `HC_MIX`/`HC_COMBINE` band).  For `DSV4_HC_POST` that would be a NUMERIC regression, not a perf one: the unfused
+   chain reads NMSE 1.74e-01 under the Meta device (r309).
+2. **The direct query is faithful exactly when the backend predicate reads the SOURCE TYPES, and no other probe can be
+   built at all.**  `ggml-cuda.cu`'s `DSV4_HC_PRE/COMB/POST` cases are type checks on F32, and `TOP_K_MASK`'s is a
+   mask-type check (F16/F32), so a minimal all-F32 (resp. F16-mask) op answers the real question.
+   `ggml_cuda_lightning_indexer_generic_supported()` is **shape**-dependent (`q->ne[0] == 128`, a 64/32/4 head width),
+   so no single probe shape answers it for both dsv4 (64 heads) and qwen4exp (4): that descriptor stays inert
+   (`auto_flid = false`) and the models gate on their own geometry (`qwen4exp.cpp`'s
+   `lightning_indexer_op_supported()` queries the real per-layer shape).  Every backend also has a generic fallback
+   for the indexer op, so an unsupported device there is SLOW, not wrong.
+3. **Under `-sm tensor` the query IS the split-safety condition.**  `model.dev_layer(il)` is the Meta device, whose
+   `supports_op` is `all_of()` over the tensor-parallel children, so one query per distinct acting device answers for
+   every layer and every device at once (the same argument as `qsa_op_supported()`).  Query each distinct device
+   once, not once per layer.
+4. **The gate's `splits` bound is a property of the LAYOUT, not of the probe.**  `ggml_backend_sched` counts one
+   segment per backend boundary: 1 on a single device and on a tensor split (the Meta backend is ONE backend), and
+   **N+1** on an N-device layer split — measured 4 at NGPU=3, because the output layer is placed back on the first
+   device.  The r308 form (`splits > 1` fails) can only pass on a 1-GPU or tensor-split arm, and the r308 gate's
+   `plain`/`mtp` arms are also box-dependent by construction: they leave `LLAMA_QSA_DENSE_DECODE_UNTIL` at the box
+   default, which is the SPARSE policy on gfx1151 (`32768`) and the DENSE policy on gfx1201 (unbounded), so `plain`
+   declines by OBSERVATION on halo and by PLACEMENT on the R9700 box.  Pin the expectation (`KVROWS_EXPECT`) or
+   derive it; never encode one box's kernel policy in an assertion.
+5. **`test-llama-archs -a <arch>` is the cheap per-probe oracle, and it has two known gaps.**  It builds each arch's
+   graph from GGUF metadata (no model load, ~2.4 s/arch, real context → `resolve_fused_ops()` runs, plus a 64-token
+   prefill and decode), which is how the whole reachability table above was measured on one box.  Gaps: **no fixture
+   for `xing4-0` / `hy-v4`** (both build DSV4-HC / LIGHTNING_INDEXER nodes; no GGUF of either on this fleet), and a
+   fixture's tensor **types are F32/F16**, so qwen4exp's `hc_mix`/`hc_combine` fused band does NOT fire there and its
+   `HC_PRE` reads `obs` while the real GSQ-IQ3_XXS/IQ4_NL GGUF reads `query` — the real-model arm is the only
+   instrument for that vacuity.  Its graph also legitimately reads `splits = 4..14` (tiny shapes fall back), so the
+   splits assertion is a real-model-only check.
