@@ -804,7 +804,8 @@ is guarded on the compiled instance.
 5. **The 256-dim arm has the same short-cache property and was left alone.**  q8_0, decode width, band/tile:
    3.94 at 512 cells, 2.05 at 1024, 1.70 at 2048, 1.51 at 4096 for GQA 6; 2.94/2.18/1.94/1.97 for GQA 8.  It
    is a published default since r6 and moving it changes kernel selection for every GQA 5..12 256-dim model,
-   so it keeps its behaviour: only the 128-dim arm is gated (recorded in `TODO.md`).
+   so it keeps its behaviour: only the 128-dim arm is gated, and the follow-up is scoped in `TODO.md` #345
+   (measured: -4.6 % at d0 and -1.5..-1.7 % at d4K..d32K on a weight-bound 3-GPU 27B decode, `benchmarks/2026-11-18-fa-band-h128.md` 5).
 6. **The submission's own numbers reproduce, and its oracle has a hole this release closes.**  Apply on the
    r313 tree: clean `git am`, zero conflicts.  `test-backend-ops -o FLASH_ATTN_EXT` 7333/7333 in three arms
    (band, `H128=0` -> tile, `GGML_HIP_FA_BAND_WMMA=2`); width purity PASS, worst maxdiff 0, with f16, bf16 and

@@ -2691,4 +2691,5 @@ model at a real context keeps the band everywhere (op 0.48-0.65 for ratio 5/7 fr
 **Record.**  `INVARIANTS.md` r314, `MANIFESTS.md` gate 05, `WORKLOG.md` 261118.009,
 `benchmarks/2026-11-18-fa-band-h128.md`.  The 256-dim arm has the same short-cache profile (3.94x at 512 cells
 for GQA 6) and was deliberately left alone: it is a published default since r6 and re-keying it moves kernel
-selection for every GQA 5..12 256-dim model (`TODO.md`).
+selection for every GQA 5..12 256-dim model -- scoped with its measurements in `TODO.md` #345 (three routes;
+the -1.5..-4.7 % end-to-end on a weight-bound 3-GPU 27B is *not* a r314 regression).
