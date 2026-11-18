@@ -1,3 +1,23 @@
+## 261118.002 (r310, published) -- `v17-4f9dfa0e3-r310` is PUBLISHED: delivery repo `main` + tag, and the fork's `rdna-boosts` already carries `.tip` because no patch changed
+
+**Published, at the maintainer's direction.**  Delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main`
+`0382db6f..1e6afe25`, annotated tag **`v17-4f9dfa0e3-r310`** (`813425cf`, `^{}` = `1e6afe25`) -- the record is
+`WORKLOG.md` 261118.001 above, and the two new artifacts it shipped are `scripts/gate-host-expert-text.sh` (the
+host-expert text oracle as a repeat check) and `scripts/gate-prefill-logits.sh`'s `--pin`.
+
+**Verified rather than assumed:**
+* **Fork refresh**: `git ls-remote git@github.com:stew675/llama.cpp.git refs/heads/rdna-boosts` reads
+  **`87d3629dfef4ebe222272e2082f918f8cf591bc2`**, i.e. exactly `release.json.tip` (tree `3e64b1473`) -- the
+  `.tip` contract holds because r310 changed no patch, so a re-cut would produce the same commits and there was
+  nothing to refresh (the branch is not stale).
+* **Delivery artifacts**: `validate-set.sh` GREEN on the published tree (18 patches strict on a fresh tarball,
+  tree `3e64b1473`, both optional artifacts and the cumulative optional tree re-cut and verified, Windows
+  portability 512 files).
+* **Remote state**: `origin/main` = `1e6afe25` and `refs/tags/v17-4f9dfa0e3-r310` = `813425cf`, both as pushed.
+* **Container images**: the worker watcher (`scripts/container-watch.sh` on `radiance`) polls for the tag and
+  will rebuild + push both ROCm lines.  Nothing was built on the primary box (policy), and the source tree is
+  identical to r309's, so the images are a rebuild of the same tree -- expected, not a new artifact.
+
 ## 261118.001 (r310, RELEASE v17-4f9dfa0e3-r310) -- `TODO` #344: the host-expert shape HAS a text oracle once the heat map AND `ROCBLAS_USE_HIPBLASLT` are pinned, and it is now a recorded KLD point; the r306 admission rule reads identical text there across builds
 
 **What shipped.**  **No patch change** (`release.json` keeps tip `87d3629df` / tree `3e64b1473`, all 18 default
