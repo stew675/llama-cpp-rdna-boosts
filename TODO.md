@@ -8,12 +8,17 @@ and parked ideas.  **A closed or resolved item is not kept here** — it is one 
 Details never live here: they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `ENVIRONMENT.md`, `wip/*` and `benchmarks/`.
 
-**How this file is organised.**  The **index table** is the only list: every open, parked or in-flight
-handle appears there exactly once, in handle order, and nothing else does.  The `## NNN.` sections that
-follow carry the detail, in the same order; a row never states a status its section disagrees with, and a
-closed item leaves both (the record is a `WORKLOG.md` entry plus the campaign it points at).  Unnumbered
-**accepted limitations** — deliberately not fixed, do not re-report — come last, with the pointers to the
-campaign records.
+**How this file is organised.**  The **index table** is the only list: every **OPEN**, **PARKED** or
+**WAITING** handle appears there exactly once, in handle order, and nothing else does.  The `## NNN.` detail
+sections follow in the same order, one per row; a row never states a status its section disagrees with, and a
+closed item leaves both (the record is a `WORKLOG.md` entry plus the campaign it points at).
+
+**Accepted limitations** — deliberately not fixed, do not re-report — come last, as `### #NNN — subject`
+entries, and they are **not** rows: an accepted limitation is not open work, so listing it in the table would
+be the one place a "status" could read as a task.  The handle stays in the heading where one was ever
+allocated (a dated record that cites it still resolves, and a re-entry condition needs a name); an entry that
+never had one says `### No handle — …`.  Each entry names its re-entry condition, where it has one, and the
+records it points at (`WORKLOG.md`, the campaign, the `benchmarks/` or `archive/work/` file).
 
 **Numbers are never reused.**  `#NN` is a permanent handle: an old `WORKLOG.md` entry that cites `TODO #74`
 still means the same subject after that item is closed and removed from this file.  New items append.
@@ -40,19 +45,24 @@ left in this file.  The r236 re-base
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
+| **329** | block 07's WMMA verify family loses at 2..5 columns, and a narrower tile (or a dot-product form) would let the floor go to 2 and make it default-on | performance / parked idea (block 07) | **PARKED** — open, not scheduled (r290, PR #317); it stays opt-in with a floor of 7 until the low band is measured — §329 |
 | **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure (per-block gate, clean checkout, hosted CI) dies in `ui-assets.cmake:137` -- the container images are unaffected (their `web` stage supplies `tools/ui/dist`) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround where it bites; re-check before the next per-block ladder — §342 |
-| **343** | `Q5_K` / `Q6_K` / `IQ4_XS` `ssm_alpha` projections take block 10's gate/beta epilogue but no GDN GGUF on this box or the contributor's has that type, so the path is untested for them | coverage / accepted limitation (block 10) | **ACCEPTED** — the mechanism check in `scripts/gate-gdn-epi.sh` is what would close it; do not add a KLD arm before the `gdn_epi` line is observed — §343 |
 
 ## Handle numbering
 
-**New handles append after `#345` (the highest issued so far; #338-#340 were all retired at r301, #341/#342 were
-issued at r303 -- #341 was retired at r309 (`WORKLOG.md` 261117.008) -- #343 at r304 and #345 at r308 and
-**retired at r311**, `WORKLOG.md` 261118.003), and a number is never reused.**  (`#337` was opened and retired the
-same day, 2026-11-16: the attendance pool *does* engage on Qwen3.8-Flash-Next under `--kv-unified`, so the
-"cannot be exercised" premise was wrong; the arm and its numbers are in `archive/work/session-scheduling/`.)  (`#335`/`#336` were retired at r298 -- an alias
-ROLE gap in the expert cache, `WORKLOG.md` 261116.005 -- and `#282` at r299 -- the mid-run latch's mixture is gated on
-the logits, `WORKLOG.md` 261116.006 -- so the next free handle is `#346`.)  `#NN` is a permanent handle: a `WORKLOG.md` entry
-that cites `TODO #74` still means the same subject after that item has closed and left this file.
+**New handles append after `#345`, the highest issued so far, so the next free handle is `#346`; a number is
+never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
+subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
+
+* **issued and retired the same day** (2026-11-16): `#337` — the attendance pool *does* engage on
+  Qwen3.8-Flash-Next under `--kv-unified`, so the "cannot be exercised" premise was wrong; the arm and its
+  numbers are in `archive/work/session-scheduling/`.
+* **`#338`-`#340`** retired at r301, **`#341`** (issued r303) retired at r309 (`WORKLOG.md` 261117.008),
+  **`#345`** (issued r308) retired at r311 (`WORKLOG.md` 261118.003).
+* **`#335`/`#336`** retired at r298 — an alias ROLE gap in the expert cache, `WORKLOG.md` 261116.005;
+  **`#282`** at r299 — the mid-run latch's mixture is gated on the logits, `WORKLOG.md` 261116.006.
+* **`#342`** (r303) and **`#343`** (r304) are the newest still tracked; `#342` is WAITING on upstream, `#343`
+  is an accepted limitation.
 
 **Two allocation mistakes are on the record, and both are left in place because renumbering would break the dated
 records** (the commit messages that cite them are immutable).  The r187-r189 sessions allocated `#190`-`#196` (and
@@ -161,6 +171,22 @@ arena is now read IN PLACE at any width (`MOE_EXPERT_PREFILL_IN_PLACE`: 1489.6 -
 `-sm tensor`, 3588.8 -> 4072.4 on the pool mirror).  Consolidating the three transports for a **partly resident**
 table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2026-11-10-prefill-in-place.md`.
 
+## 329. Block 07's WMMA verify family loses at 2..5 columns — a narrower tile would let the floor go to 2 (and the feature to default-on)
+
+**PARKED — open, not scheduled** (r290, PR #317).  The family (`--wmma-verify`, `ENVIRONMENT.md` §7.6) amortizes
+dequantization over the verified columns, which is why it wins at 7-8 columns (+5.8..+10.6 %) and *loses*
+below 6 (-1.6..-8.5 %, and -4.4 % at 6 on a 2-GPU split).  The cause is structural, not tuning: the kernel
+computes a full 16x16 tile and streams the whole weight row whatever the column count, so at 2-4 columns it
+does N/8ths of the arithmetic and 8/8ths of the traffic where the K-split kernel does a small fraction of
+both.  A 2..4-column arm would need a narrower tile or a different operand shape (a 16x16x16 `iu8` WMMA
+cannot be narrowed, so this likely means a *dot-product* form rather than a tile form for the low band).
+
+**What it would buy.**  The floor could ship at 2 (or 6), which would make the family a **default-on**
+candidate: the delivery's own adaptive-MTP drafts produce 2..8-column verify batches, and an arm that wins
+across that whole band is a pure win instead of a config-shaped opt-in.  Until then it stays opt-in with a
+floor of 7 and the purity note in `GREEDY-PURITY.md` §91 -- do not lower the floor without measuring the
+low band on both a single card and a 2-GPU `tensor` split (the crossover moves).
+
 ## 342. A broken upstream UI asset bundle breaks every fresh configure
 
 **Waiting on upstream** (r303). The llama-ui bucket's `latest` archive (75 files, 3.3 MB, 2026-11-17) has no
@@ -180,9 +206,9 @@ validates; the per-block gate's header records it.  Drop the pin when `latest` v
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 
-These are closed or accepted: no work is owed, and where a row above still tracks one it says **ACCEPTED**
-(not open work).  A handle is kept where one was ever allocated, so the dated records that cite it still resolve
-and a re-entry condition has a name; the ones that never had a handle say so in their heading.
+These are closed or accepted: no work is owed, and no row above tracks them (see *How this file is
+organised*).  A handle is kept in the heading where one was ever allocated, so the dated records that cite
+it still resolve and a re-entry condition has a name; the ones that never had a handle say `No handle`.
 
 ### #282 — the mid-run latch's MIXTURE is a ~1e-5 path difference, and it is gated on the LOGITS (retired r299)
 
@@ -313,23 +339,7 @@ Three limits of the same tier, recorded together because they are one hardware s
   arm's own subject is decode width (blocks 12/14) and it lives in the MTP protocol, not here.  Record:
   `archive/work/apu-expert-gtt/MEASUREMENTS.md` §27.1 and §28.
 
-### #329 -- block 07's WMMA verify family loses at 2..5 columns; a narrower tile would let the floor go to 2 (and the feature to default-on)
-
-**Open, not scheduled** (r290, PR #317).  The family (`--wmma-verify`, `ENVIRONMENT.md` §7.6) amortizes
-dequantization over the verified columns, which is why it wins at 7-8 columns (+5.8..+10.6 %) and *loses*
-below 6 (-1.6..-8.5 %, and -4.4 % at 6 on a 2-GPU split).  The cause is structural, not tuning: the kernel
-computes a full 16x16 tile and streams the whole weight row whatever the column count, so at 2-4 columns it
-does N/8ths of the arithmetic and 8/8ths of the traffic where the K-split kernel does a small fraction of
-both.  A 2..4-column arm would need a narrower tile or a different operand shape (a 16x16x16 `iu8` WMMA
-cannot be narrowed, so this likely means a *dot-product* form rather than a tile form for the low band).
-
-**What it would buy.**  The floor could ship at 2 (or 6), which would make the family a **default-on**
-candidate: the delivery's own adaptive-MTP drafts produce 2..8-column verify batches, and an arm that wins
-across that whole band is a pure win instead of a config-shaped opt-in.  Until then it stays opt-in with a
-floor of 7 and the purity note in `GREEDY-PURITY.md` §91 -- do not lower the floor without measuring the
-low band on both a single card and a 2-GPU `tensor` split (the crossover moves).
-
-### #343 -- Q5_K / Q6_K / IQ4_XS `ssm_alpha` projections are on the r304 path with no local GGUF to test it
+### #343 — Q5_K / Q6_K / IQ4_XS `ssm_alpha` projections are on the r304 path with no local GGUF to test it
 
 **Accepted limitation** (r304).  Block 10's GDN gate/beta epilogue takes `Q4_K`, `Q5_K`, `Q6_K`, `IQ4_XS` and
 `MXFP4` (`mmvq_gdn_epi_type`), but neither this box nor the contributor's has a GDN GGUF whose
