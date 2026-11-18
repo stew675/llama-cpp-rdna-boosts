@@ -1,3 +1,81 @@
+## 261118.009 (r314, RELEASE v17-4f9dfa0e3-r314) -- contributor PR #329: the FA band takes 128-dim heads with an odd GQA ratio, but only where the layer's KV cache is long enough to pay for it (official block 05)
+
+**What shipped.**  Block **05** only: the RDNA4 decode/verify band now also takes **128-dim heads whose GQA
+ratio is not a multiple of 8** (5, 6, 7, 9..12) -- outside the band an odd ratio folds *nothing* (the generic
+dispatch folds the largest power of two dividing the ratio, and the tile kernel needs every column of a block on
+one K/V head), so a GQA 7 decode read each K/V head once per query head; the band folds the group into
+`ncols2 = 8` and masks the unused columns.  It lands in the band's **existing** 128-dim `ncols1 <= 4`
+instances and its 32-column block for every query width -- no new config rows, no new instances, and no
+64-column row or q8_0 fetch-ahead for this head size.  Two knobs: `GGML_HIP_FA_BAND_WMMA_H128`
+(`auto` default / `0` kill switch / `1` forced) and `GGML_HIP_FA_BAND_H128_MIN_WORK` (20000).
+`release.json` at **`v17-4f9dfa0e3-r314`** (canonical tip `fe5fb46d2`, tree `623e5a13f`; optional re-cut
+`7704a44e6` / `b3cd09f79`, cumulative `4ea663b57`).  Block count unchanged (17 official + `0300`).  Records:
+`ENVIRONMENT.md` §8, `patches/README.md` block 05, `MANIFESTS.md` gate 05, `INVARIANTS.md` r314,
+`GREEDY-PURITY.md` §96, `benchmarks/2026-11-18-fa-band-h128.md`, `TODO.md` (one parked follow-up).
+
+**The submission's kernel work is right, and its numbers reproduced.**  Apply on the r313 tree: clean
+`git am`, zero conflicts (it was cut against r305; `fattn-rdna.cuh` is byte-identical between r305 and r313).
+`test-backend-ops -o FLASH_ATTN_EXT` **7381/7381** at `auto` and at `=1`, 7333/7333 at `=0` and at
+`GGML_HIP_FA_BAND_WMMA=2`.  Width purity **PASS, worst maxdiff 0** with f16, bf16 and q8_0 on ricursive 65B
+(bf16 is *not* in the submission's cases and is the band's third native K/V type), and PASS again in the mixed
+per-layer configuration the gate creates.  Op-level claims matched (ratio 7 kv 4096 nb 1: 69.9 -> 50.4 us
+against its 68.1 -> 49.6; ratio 5 kv 45056 nb 8: 1794 -> 378 against 1789.5 -> 356.9), and so did its KLD
+claim: `--family-switch`, band vs tile on the class, **0.001013 / 99.412 %** against a same-kernel `-ub 256`
+control of 0.002222 / 98.676 % -- the band's own rounding is *smaller* than a plain ubatch change.
+
+**What changed, and why (maintainer's decisions at review).**  (1) **The arm is on where it pays, not
+unconditionally.**  The submission shipped it default-on and documented the cost as "a loss below 4-8 K cells,
+-5 % at depth 0".  The cost is per *layer*, not per depth: the band adds a fixed per-launch cost (the packed
+mask prepass and the `P = nsm` fixup combine) plus a round-robin split that leaves most blocks idle on a short
+cache, so the crossover is `cells x passes_saved ~ 16-25k` -- and a sliding-window/hybrid model holds
+`n_swa + n_ubatch` cells for its windowed layers for the **whole run**.  On the one 128-dim odd-ratio model in
+the fleet (ricursive 65B, GQA 10, **64 of 80 layers windowed at 1024**) the unconditional band was **-5.8 /
+-5.1 / -4.9 / -4.5 %** of tg64 at d0 / 4K / 16K / 32K.  `ggml_cuda_fattn_band_wmma_h128_applies()` now tests
+`K->ne[1] * (ceil(ratio/ncols2_tile) - ceil(ratio/8)) >= 20000`, and **the attribute is the layer's KV CACHE
+SIZE, never the used length** -- `K->ne[1]` at the op is the cache's cell count (measured: 8192 / 16384 for the
+same 51-token prompt at `-c 8192` / `-c 16384`; 1536 for a windowed layer) and is fixed for the run, while a
+verify batch moves the used length by up to `W-1` rows and a length-keyed test would put a decode step and its
+own verify on different kernel families (invariant 1).  Result on that model: **0.0 / 0.0 / -0.9 / -0.5 %**,
+and `-c 2048` (gate declines every layer) reproduces the r313 text byte for byte (`c1e00039b55c`).  A non-SWA
+128-dim model at a real context keeps the band everywhere.  (2) **The 2-D launch is guarded on the compiled
+instance** (`Q->ne[0] == 256 || ncols1 <= 4`) in `launch_fattn`: the kernel's band fast path is compiled only
+for the 128-dim `ncols1 <= 4` instances, and a 2-D launch with `ncols1 = 8` would have fallen through to the
+ordinary stream-K path while `gridDim.y` was still `P > 1`.  The dispatch can only pick 2 or 4 today; this makes
+it structural.  (3) **The oracle is closed**: under `auto` the submission's short-cache cases take the tile
+kernel, so the band's oracle is the same suite with `GGML_HIP_FA_BAND_WMMA_H128=1`, and 48 new cases (ratios
+5/6/7/12 x q8_0/f16/**bf16** at kv 32768) reach the band in a default run.  (4) The README's "kv 512/1024/4096
+with a fully masked 256-cell group" is really *only* at 4096 (the code was right; its prose was not), and the
+band's per-op table is now in a dated record rather than a PR description.
+
+**Verified rather than assumed** (gfx1201, 3×R9700, ROCm 10.1.0, `ROCBLAS_USE_HIPBLASLT=0`): interleaved
+`llama-bench` tg64 on the model above (`auto` vs tile vs the submission's default, two runs per arm);
+`test-logits-width-probe` at P=4096 (`=1`) and P=8192 (`auto`, the mixed per-layer split) with f16/bf16/q8_0;
+`test-backend-ops perf -o FLASH_ATTN_EXT` at `=1` vs `=0` (the gate's decision boundary measured by timing is
+band-from 8192 / 4096 / 8192 / 32768 for ratios 5 / 7 / 10 / 12, and every TILE decision is a measured loss case
+of 1.05-2.48x); 128-dim GQA 8 unchanged (0.998-1.002); `gate-prefill-logits.sh` canonical point
+**0.000000 / 100.000 %** against a base recorded from the r312 build, plus the family-switch point above;
+coherence 4B `8d89080db673`, 27B `da2e2d192e21`, 35B-A3B `ae39ec41bc1e` == r313; four MTP axes
+acceptance-identical to r313 on the dense 27B (352/474, 349/485, 370/422, 321/564);
+`gate-per-block-build.sh --changed-from 6443c787e --fast` **2/2**; `validate-set.sh` GREEN (18 default patches
+strict on a fresh `4f9dfa0e3` tarball, applied tree `623e5a13f`, both optional artifacts re-cut and applying
+strictly, cumulative `4ea663b57`, Windows portability 512 files); GPU kernel journal and every run log clean.
+
+**Not claimed.**  A **non-SWA** 128-dim odd-ratio model at a real context -- no such file on this box, so the
+contributor's +16 % at 16K / +36 % at 32K is their measurement, corroborated here only at the op level.  The
+residual -0.5..-0.9 % at d16K/d32K on ricursive 65B is the 16 *global* layers, whose ratio-10 op win (0.77) does
+not survive a weight-bandwidth-bound 65B; `GGML_HIP_FA_BAND_WMMA_H128=0` is the documented answer for that model.
+`--swa-full` (a windowed layer's cache raised to the full context) would enable the band on layers that read
+mostly-masked rows: untested, and it needs the same care a length gate would.  gfx1100 / gfx1151 and Windows are
+untested for this arm.  The **256-dim** arm has the same short-cache profile (3.94x at 512 cells, GQA 6) and was
+deliberately left alone -- it is a published default since r6 and re-keying it moves kernel selection for every
+GQA 5..12 256-dim model (`TODO.md` #345).
+
+**Publishing.**  Delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main` + annotated tag
+**`v17-4f9dfa0e3-r314`**.  The fork `git@github.com:stew675/llama.cpp.git` `rdna-boosts` is re-cut at
+`release.json.tip` **`fe5fb46d2`** (tree `623e5a13f`) by `scripts/fork-refresh.sh --build --gates --push`.  The
+container images are rebuilt and pushed off-host by the worker watcher (`scripts/container-watch.sh` on
+`radiance`); nothing is built on the primary box.
+
 ## 261118.008 (r313, published) -- `v17-4f9dfa0e3-r313` is PUBLISHED: delivery repo `main` + tag, and the fork's `rdna-boosts` is re-cut at `.tip`
 
 **Published.**  Delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main` `d09454d0..c074f170`, annotated

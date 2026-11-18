@@ -45,6 +45,7 @@ left in this file.  The r236 re-base
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
+| **345** | the 256-dim band has the same short-cache profile the r314 work gate fixed for 128-dim heads (3.94x at 512 cells, GQA 6) | performance / kernel selection (block 05) | **PARKED** (2026-11-18, r314) — see the section |
 | **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure (per-block gate, clean checkout, hosted CI) dies in `ui-assets.cmake:137` -- the container images are unaffected (their `web` stage supplies `tools/ui/dist`) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround where it bites; re-check before the next per-block ladder — §342 |
 
 ## Handle numbering
@@ -190,6 +191,30 @@ Do not add a `HF_UI_VERSION` pin to `build-containers.sh` for this.
 
 Where it does bite, `HF_UI_VERSION=b12387` (the bundle this box had stamped) carries `workbox-b3c04f83.js` and
 validates; the per-block gate's header records it.  Drop the pin when `latest` validates again.
+
+## 345. The 256-dim band still takes a short KV cache: the r314 work gate is the measured rule, but re-keying it moves a published default
+
+**Subject**: `ggml_cuda_fattn_band_wmma_applies()` gates the **128-dim** arm on the layer's KV cache size
+(`K->ne[1] * passes_saved >= 20000`, `INVARIANTS.md` r314).  The **256-dim** arm has the identical per-layer
+profile and keeps its unconditional behaviour: measured on gfx1201 with q8_0 at the decode width
+(band / tile-kernel time per op), GQA 6 gives **3.94 at 512 cells, 2.05 at 1024, 1.70 at 2048, 1.51 at 4096**
+and GQA 8 gives 2.94 / 2.18 / 1.94 / 1.97; verify widths tilt the other way (GQA 6 at 1024: 1.26 at `nb` 4,
+0.92 at `nb` 8).  So a 256-dim GQA 5..12 model running a shallow context, or any **windowed** 256-dim model,
+pays a per-op cost on every decode step -- exactly the mechanism `benchmarks/2026-11-18-fa-band-h128.md`
+documents, at a larger magnitude because the 256-dim band row is the 8-warp / 64-half2 geometry.
+
+**Why it is parked rather than fixed with r314**: the 256-dim band is a published default since r6 and the arm
+every documented band win is quoted from (27B GQA 6, qwen4exp GQA 12).  Re-keying it changes **kernel selection
+for every GQA 5..12 256-dim model**, i.e. it moves text on those models and needs the whole band ladder again
+(width purity at `P` 3584/4096, the four MTP axes, `gate-prefill-logits`, `-sm tensor`/`-sm layer` arms, the
+packed-hole skip at r133's widths, plus the `GGML_HIP_FA_BAND_WIDE` interaction at `K->ne[1] >= 4096`).
+There is also a better fix than a gate for this one: `P = nsm` is what leaves the blocks idle, and **`P` may
+depend on the cache size** (a run constant) even though it may not depend on the used length or `n_q` -- an
+adaptive `P = min(nsm, ceil(cells / nbatch_fa))` would keep the band's fold at short depth instead of falling
+back to the tile kernel.  Either route needs its own settlement; nothing here is a regression r314 introduced.
+
+**Re-entry condition**: a 256-dim windowed/hybrid model (or a shallow-context arm) is measured end to end on
+this box, or the adaptive-`P` arm is built and passes the band ladder.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

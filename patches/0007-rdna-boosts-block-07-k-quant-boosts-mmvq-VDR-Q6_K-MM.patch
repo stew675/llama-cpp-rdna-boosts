@@ -1,4 +1,4 @@
-From 9f9fd2133277c2580cb33eb8711a4359054ddd97 Mon Sep 17 00:00:00 2001
+From 5a8217a3c925c9adf05d95750cb3e8d76c54a913 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 07/17] rdna-boosts: block 07: k-quant boosts (mmvq VDR, Q6_K
@@ -2299,10 +2299,10 @@ index d5ff93b91..b7d3fa221 100644
      const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
      return d * sumi;
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 3d56b48b0..f061ede79 100644
+index 67e61ccd3..9e96dad43 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -12014,6 +12014,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12042,6 +12042,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
@@ -2315,7 +2315,7 @@ index 3d56b48b0..f061ede79 100644
  #endif
  
      for (ggml_type type_a : all_types) {
-@@ -14042,9 +14048,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -14070,9 +14076,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -2351,7 +2351,7 @@ index 3d56b48b0..f061ede79 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -14052,8 +14082,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -14080,8 +14110,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  

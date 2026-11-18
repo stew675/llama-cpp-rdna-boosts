@@ -1,4 +1,4 @@
-From c7c9f4f53738a4987b15817f118e5ee2c55fae24 Mon Sep 17 00:00:00 2001
+From 5dd9ade221604b704f97b5aea3b6f62c67327010 Mon Sep 17 00:00:00 2001
 From: Marvin Johanning <email@marvinjohanning.de>
 Date: Sat, 14 Nov 2026 16:30:09 +0100
 Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types -- a q8_0 K
@@ -68,7 +68,7 @@ optional-applied build.
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_1.cu
 
 diff --git a/ggml/src/ggml-cuda/fattn-rdna.cuh b/ggml/src/ggml-cuda/fattn-rdna.cuh
-index 1c2626477..4c86ee4b4 100644
+index 6c6e66d84..8a67abf96 100644
 --- a/ggml/src/ggml-cuda/fattn-rdna.cuh
 +++ b/ggml/src/ggml-cuda/fattn-rdna.cuh
 @@ -265,6 +265,29 @@ static inline int ggml_cuda_fattn_tile_kv_native_type(const ggml_tensor * K, con
@@ -121,7 +121,7 @@ index 1c2626477..4c86ee4b4 100644
  // Decode/verify band (n_q <= 8) on RDNA4: the whole GQA group is folded into one block
  // (ncols2 = 8) via the WMMA kernel instead of the tile kernel's ncols2 = 2, which fetches and
  // dequantizes every K/V element once per head pair (3x for GQA 6).  This is the default; the env var
-@@ -456,7 +487,8 @@ static inline bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_te
+@@ -521,7 +552,8 @@ static inline bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_te
      // is the default since the r6 flip; it is deliberately NOT banded while it is staged, where the
      // whole-cache conversion dominates (that staged case only appears under GGML_CUDA_FA_KV_NATIVE=0).
      const int  kv_native = ggml_cuda_fattn_kv_native_type(K);
@@ -455,10 +455,10 @@ index 3072e9b61..69119f1e1 100644
  EXTERN_DECL_FATTN_TILE_CASES( 64,  64);
  EXTERN_DECL_FATTN_TILE_CASES( 72,  72);
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 35ae5603b..b44f93c55 100644
+index c87ecd030..65d9dba37 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -925,7 +925,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -937,7 +937,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
              // into the neighbouring buffer).
              const ggml_type tile_type = ggml_cuda_fattn_tile_type(K, V, ggml_cuda_info().devices[device].cc);
              need_f16_K = K->type != tile_type;
@@ -566,10 +566,10 @@ index 9a98670fd..551b03ff1 100644
          return nullptr;
      }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 6ccabdc62..acac7e1c5 100644
+index 63bb2de9e..560a5aff8 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -13576,6 +13576,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13604,6 +13604,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  

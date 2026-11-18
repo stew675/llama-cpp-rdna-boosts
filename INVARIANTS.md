@@ -761,3 +761,63 @@ after a 5246-token prompt, prompt rate unchanged; the contributor's +7..10 % on 
    op.  NVIDIA/CUDA, gfx1151 and Windows are likewise untested (the files' kernels are 32-wide with
    `warp_reduce_*<32>` like the rest of the file).  `TODO.md` carries the limitation; `LLAMA_FUSED_HC_MIX=0` is
    the reference for anyone holding such a file.
+
+## r314 (2026-11-18, `WORKLOG.md` 261118.009) — the band for 128-dim odd-GQA heads, and why a test on the KV *cache size* is pure while a test on the used length is not
+
+**Changed.**  Official block 05 only (contributor PR #329, @overdoingism): the RDNA4 decode/verify band also
+takes 128-dim heads whose GQA ratio is not a multiple of 8 (5, 6, 7, 9..12), in its existing 128-dim
+`ncols1 <= 4` instances and its 32-column block for every query width -- no new config rows, no new
+instances.  Outside the band an odd ratio folds *nothing* (`ncols2` = the largest power of two dividing the
+ratio, capped at 8), so a GQA 7 decode read each K/V head once per query head.  Two things changed from the
+submission: the arm is **on where it pays** (`ggml_cuda_fattn_band_wmma_h128_applies()`), and the 2-D launch
+is guarded on the compiled instance.
+
+1. **`K->ne[1]` at the FA op is the layer's KV CACHE SIZE, not the used length.**  Measured on the fork's
+   graph (a one-shot print in the band predicate, ricursive 65B): with a 51-token prompt the global layers
+   read `K->ne[1]` = 8192 at `-c 8192` and 16384 at `-c 16384`, and the windowed layers read **1536** =
+   `GGML_PAD(min(size_base, n_swa + n_ubatch), 256)` = `1024 + 512` (`llama-kv-cache-iswa.cpp`).  The value
+   is fixed for the run.  This is the *same* attribute the existing wide-band gate already reads
+   (`GGML_HIP_FA_BAND_WIDE` -> `K->ne[1] >= 4096`), so it is not a new kind of decision.
+2. **... which is exactly what makes a kernel-family test on it width-pure, and a test on the used length a
+   purity break.**  A verify batch moves the used length by up to `W-1` rows, and the padded form
+   (`K->ne[1] % 256 == 0`) can then differ between a decode step and its own verify (used 8170 -> pad 8192
+   vs used 8178 -> pad 8192 is stable, but 8190 -> 8192 vs 8198 -> 8448 is not), so a "decline below N cells"
+   gate keyed on the used length would put a decode and its verify on different kernel families --
+   `GREEDY-PURITY.md` invariant 1 and §36.  Anyone adding a "depth" gate to a band arm must use the cache
+   size; there is no way to key on the used length without breaking the band.
+3. **The band's per-layer cost does not amortize on a short cache, and the crossover is `cells x passes_saved
+   ~ 20k`.**  Measured on gfx1201 (q8_0 K/V, decode width, band / tile-kernel time per op): ratio 5 (5 -> 1
+   passes) 1.26 at 2048 cells / 0.94 at 4096 / 0.65 at 8192 / 0.51 at 16384; ratio 7 (7 -> 1) 1.05 / 0.72 /
+   0.48 / 0.37; ratio 10 (5 -> 2) 1.70 at 2048 / 1.24 at 4096 / 0.96 at 8192 / 0.81 at 16384; ratio 12
+   (3 -> 2) 1.83 / 1.45 / 1.14 / 0.95 at the same points.  Every row crosses at 16-25k, hence
+   `K->ne[1] * ceil(ratio/ncols2_tile) - ceil(ratio/8) >= 20000` (`GGML_HIP_FA_BAND_H128_MIN_WORK`).
+   Verify widths tilt the other way (band already wins at 1024-2048 cells), which is why the rule cannot be a
+   flat cell count: it would enable ratio 12 at 8192 (a 1.14 loss) or deny ratio 7 at 4096 (0.72).
+4. **A windowed/hybrid model is the case that matters, and it is a loss at EVERY depth, not at depth 0.**
+   ricursive 65B (64 of 80 layers windowed at 1024), 3-GPU `-sm tensor`, interleaved `A B B A`,
+   `ROCBLAS_USE_HIPBLASLT=0`, tg64: unconditional band **-5.8 % d0, -5.1 % d4096, -4.9 % d16384, -4.5 %
+   d32768**; with the work gate **0.0 % / 0.0 % / -0.9 % / -0.5 %** (the residual is the 16 global layers,
+   whose op-level win is only 0.77 at ratio 10 and does not survive a weight-bandwidth-bound 65B).  The
+   submission documented this as "a loss below 4-8K cells, -5 % at depth 0"; the depth framing is wrong --
+   the *layer's* cache is what decides, so a hybrid model pays it at any depth.  `-c 2048` (auto declines
+   every layer) reads the r313 text byte-for-byte (`c1e00039b55c`).
+5. **The 256-dim arm has the same short-cache property and was left alone.**  q8_0, decode width, band/tile:
+   3.94 at 512 cells, 2.05 at 1024, 1.70 at 2048, 1.51 at 4096 for GQA 6; 2.94/2.18/1.94/1.97 for GQA 8.  It
+   is a published default since r6 and moving it changes kernel selection for every GQA 5..12 256-dim model,
+   so it keeps its behaviour: only the 128-dim arm is gated (recorded in `TODO.md`).
+6. **The submission's own numbers reproduce, and its oracle has a hole this release closes.**  Apply on the
+   r313 tree: clean `git am`, zero conflicts.  `test-backend-ops -o FLASH_ATTN_EXT` 7333/7333 in three arms
+   (band, `H128=0` -> tile, `GGML_HIP_FA_BAND_WMMA=2`); width purity PASS, worst maxdiff 0, with f16, bf16 and
+   q8_0 on ricursive 65B (bf16 is **not** in the PR's cases, and it is the band's third native K/V type), and
+   PASS again in the mixed per-layer configuration the gate creates (windowed layers on tile, global layers on
+   band, P=8192).  Op-level claims matched (ratio 7 kv 4096 nb 1: 69.9 -> 50.4 us against their 68.1 -> 49.6;
+   ratio 5 kv 45056 nb 8: 1794 -> 378 against 1789.5 -> 356.9).  KLD `--family-switch` on ricursive 65B
+   (`--ub 4`, band vs tile) **0.001013 / 99.412 %** against a same-kernel control of 0.002222 / 98.676 %,
+   i.e. the band's own rounding is smaller than a plain ubatch change.  Coherence unchanged on 4B / 27B /
+   35B-A3B (`8d89080db673` / `da2e2d192e21` / `ae39ec41bc1e`), four MTP axes acceptance-identical to r313 on
+   the dense 27B (352/474, 349/485, 370/422, 321/564).  **The hole**: with the gate, the PR's short-cache
+   cases take the tile kernel, so the band's oracle is the same suite run with `GGML_HIP_FA_BAND_WMMA_H128=1`
+   (`MANIFESTS.md` gate 05); the new kv-32768 loop is what reaches the band in a default run.
+7. **Not validated.**  a 128-dim *non-SWA* odd-ratio model with a real context (the submission's Nanbeige /
+   Qwen2.5 case): no such file on this box, so the win is quoted from the contributor and corroborated only at
+   the op level.  gfx1100/gfx1151 and Windows are untested for this arm.

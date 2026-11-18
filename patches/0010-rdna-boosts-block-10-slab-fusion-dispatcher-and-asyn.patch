@@ -1,4 +1,4 @@
-From 9133b55f1034c8f6ab31b76d5675096be7caa8b5 Mon Sep 17 00:00:00 2001
+From 08f2c5fab9d44e1612285eb337be584ccc9170c3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/17] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -2423,7 +2423,7 @@ index 2d0b3cfea..ecb0a13f6 100644
  
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 7fc1436d6..c3e32eeb6 100644
+index 4afdbb6d8..bd2265f05 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -3,6 +3,8 @@
@@ -2910,7 +2910,7 @@ index 7fc1436d6..c3e32eeb6 100644
              if (ggml_is_contiguously_allocated(V)) {
                  to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                  to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
-@@ -1916,6 +2220,14 @@ void launch_fattn(
+@@ -1921,6 +2225,14 @@ void launch_fattn(
          kq_blocks_arg = kq_blocks.ptr;
      }
  
@@ -2925,7 +2925,7 @@ index 7fc1436d6..c3e32eeb6 100644
      const int * kv_max_arg = KV_max.ptr;
  
      const dim3 block_dim(warp_size, nwarps, 1);
-@@ -1953,7 +2265,10 @@ void launch_fattn(
+@@ -1958,7 +2270,10 @@ void launch_fattn(
      const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
  
      dim3 blocks_num;
@@ -2937,7 +2937,7 @@ index 7fc1436d6..c3e32eeb6 100644
          // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
          const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
  
-@@ -2098,6 +2413,180 @@ void launch_fattn(
+@@ -2103,6 +2418,180 @@ void launch_fattn(
          CUDA_CHECK(cudaGetLastError());
      }
  
@@ -3118,7 +3118,7 @@ index 7fc1436d6..c3e32eeb6 100644
      ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
      ggml_cuda_kernel_launch(fattn_kernel, launch_params,
          (const char *) Q->data,
-@@ -2120,55 +2609,65 @@ void launch_fattn(
+@@ -2125,55 +2614,65 @@ void launch_fattn(
          cell_pos ? (const int *) cell_pos->data : nullptr,
          tok_lo   ? (const int *) tok_lo  ->data : nullptr,
          tok_hi   ? (const int *) tok_hi  ->data : nullptr,
@@ -3223,7 +3223,7 @@ index 7fc1436d6..c3e32eeb6 100644
      CUDA_CHECK(cudaGetLastError());
  }
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index 99f027134..8dec6f09e 100644
+index f5b09931f..e264b6d10 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 @@ -1880,6 +1880,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
@@ -3482,10 +3482,10 @@ index 2fd54945e..07bd112eb 100644
  #ifdef FLASH_ATTN_AVAILABLE
      const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 10938aac3..35ae5603b 100644
+index 099f48448..c87ecd030 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -256,7 +256,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
+@@ -268,7 +268,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
              // instead of two (q8_0, gfx1201: -10..-15 % from 4k KV rows, but +2..8 % below 2k, where the
              // 16-warp block is mostly idle), so the KV-length gate cannot change any output either.
              // GGML_HIP_FA_BAND_WIDE=0 restores the two-tile launch.
@@ -3494,7 +3494,7 @@ index 10938aac3..35ae5603b 100644
              if (band_wide_on && ggml_cuda_fattn_band_wmma_ncols1(dst) == 4 && Q->ne[1] > 4 && K->ne[1] >= 4096) {
                  ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 8, true>(ctx, dst);
              } else if (ggml_cuda_fattn_band_wmma_ncols1(dst) == 4) {
-@@ -957,6 +957,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -969,6 +969,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
      return f16_extra.end - (uintptr_t) dst->data;
  }
  
@@ -27044,7 +27044,7 @@ index b4af27eb7..137de5f2e 100644
      // TODO #135: a load-time guard against a degenerate `-sm tensor` device count.  It refuses (throws) a
      // split whose granularity-rounded per-device share of a HOST-RESIDENT expert table leaves a device with
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 148781f9b..b2d2f5ad8 100644
+index 2fd5a9f91..00a02328f 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -87,7 +87,13 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
@@ -27126,7 +27126,7 @@ index 148781f9b..b2d2f5ad8 100644
  
          for (size_t i = 0; i < sources.size() && i < GGML_MAX_SRC; i++) {
              ggml_tensor * t = out->src[i];
-@@ -11750,7 +11771,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11778,7 +11799,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -27135,7 +27135,7 @@ index 148781f9b..b2d2f5ad8 100644
          test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
          test_cases.emplace_back(new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
          for (int mode : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX}) {
-@@ -11804,7 +11825,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11832,7 +11853,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      for (auto multi_add : {false, true}) {
          for (auto set_rows : {false, true}) {
              for (auto broadcast : {false, true}) {
@@ -27144,7 +27144,7 @@ index 148781f9b..b2d2f5ad8 100644
                      test_cases.emplace_back(new test_rms_norm_mul_rope({768, 1, 1, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                      test_cases.emplace_back(new test_rms_norm_mul_rope({768, 3, 1, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                      test_cases.emplace_back(new test_rms_norm_mul_rope({768, 3, 5, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
-@@ -12025,6 +12046,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12053,6 +12074,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1})); // q8_0 at ffn shape
@@ -27152,7 +27152,7 @@ index 148781f9b..b2d2f5ad8 100644
  
      // Qwen3.6-27B Q6_K prefill shapes (perf tuning targets):
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1})); // ffn_up/ffn_gate
-@@ -12843,6 +12865,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12871,6 +12893,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2049, 2, 1, 3}, order));
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2, 8, 8192, 1}, order)); // bailingmoe2 (group selection)
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 512, 1, 1}, order)); // test CUDA dispatching to radix sort for nrows > = 1 in graph mode
@@ -27163,7 +27163,7 @@ index 148781f9b..b2d2f5ad8 100644
      }
  
      for (int n = 1; n < 5; ++n) {
-@@ -13306,6 +13332,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13334,6 +13360,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      // sparse mask with large batch size
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
@@ -27175,7 +27175,7 @@ index 148781f9b..b2d2f5ad8 100644
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,  2048));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
-@@ -13598,6 +13629,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13626,6 +13657,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      test_cases.emplace_back(new test_topk_moe({384,  1, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4.1
                      test_cases.emplace_back(new test_topk_moe({384,  8, 1, 1}, 6, with_norm, bias_probs, gate, scale_w));
                      test_cases.emplace_back(new test_topk_moe({384, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w));
@@ -27183,7 +27183,7 @@ index 148781f9b..b2d2f5ad8 100644
                      // rows at and just past the limit where one block still covers all rows
                      test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 4, with_norm, bias_probs, gate, scale_w));
                      test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
-@@ -13849,6 +13881,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -13877,6 +13909,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 17408, n_tokens, 1, 1 }, 0.1f));
      }
  
