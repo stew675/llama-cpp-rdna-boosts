@@ -8,8 +8,16 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `3e0006670f55d625acc7539d690ba80543d8114ffdc440e29904fde5690f0079` (the r319 cut -- every re-cut moves the exported commit
+  `0b60c08e256bef1c81bb9e37e1e63c328f2f67c466f3009cf0837f6f06db8694` (the r320 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
+* **r320 re-cut verification**: applies strictly at the r320 default tree
+  `3334a4eb31124213805ae5a0a019f6aaf86d5d7b` (sha256
+  `0b60c08e256bef1c81bb9e37e1e63c328f2f67c466f3009cf0837f6f06db8694`), producing tree
+  `595d4bbf37c131f5a72a8f3d583abcff66ff1393`; with the other optional artifact on top, the cumulative tree is
+  `b61726912339d2f2e0a9abb646190f38690aec52`.  r320 amends **block 10** (`ggml/src/ggml-cuda/gdn-conv.cu`: the
+  conv + q/k norm fold's overlap test follows a deferred conv-state gather, PR #316), a file this artifact owns
+  no hunk of, so the re-cut moved only the exported commit id and the context offsets.
+  `validate-set.sh` check 8 verifies all three trees on every run.
 * **r319 re-cut verification**: applies strictly at the r319 default tree
   `9f53a85322eb8c0327c350fca89fe5af76a30806` (sha256
   `3e0006670f55d625acc7539d690ba80543d8114ffdc440e29904fde5690f0079`), producing tree `9cb63478129bb63aa3c1529ee890610bceecb63d`; with the other

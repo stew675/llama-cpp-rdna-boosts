@@ -1,3 +1,108 @@
+## 261119.004 (r320, RELEASE v17-4f9dfa0e3-r320) -- contributor PR #316 taken as a matcher correctness fix: the conv + q/k norm fold's overlap test now tests the buffer the kernel reads, and the PR's own claim (a refused fold on every DFlash2 verify call) is refuted on r244 and later
+
+**Release:** `v17-4f9dfa0e3-r320`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `b7e5da6c1`
+(the `apply-all.sh` re-cut, tree `3334a4eb31`), 17 official + 1 temporary = 18 default blocks, optional
+`0100` -> `9d8474c19` / `0101` -> `595d4bbf3` (cumulative `b61726912`).  **No block created, split or
+renumbered**: one same-block amendment, **block 10** (`ggml/src/ggml-cuda/gdn-conv.cu` -- the norm matcher
+and the deferred-gather machinery are block 10's, although block 08 creates the file).  No kernel arithmetic
+changed, no default moved, no environment variable added, and the measured decode effect is **0.02 %**.
+
+This was the last open PR on the repo after its submitter stopped responding.  It was assessed a second time
+on the submitter's exact scenario, which is what this box holds (1 x R9700, 27B UD-Q4_K_M + DFlash2-Q4_K_M).
+
+### What the PR claims, and what r318/r320 actually do
+
+@burnoutIA's report: on `DFlash2 --spec-draft-n-max 7`, **every** `T = 8` verify call was refused on "q
+overlaps state", because the conv-state `GET_ROWS` is a deferred gather and the allocator places the q `SCALE`
+output over that dead buffer; -0.7 ms/cycle (43.49 -> 42.8 ms), acceptance unchanged.  It was measured on the
+delivery of `81e969e` (2026-11-03) and cut against r289 (2026-11-15).
+
+The diagnosis of the matcher is right and the numbers are stale, exactly as the r289 review found -- and both
+reproduce here, with a census added to `gdn_conv_norm_match()`:
+
+| arm (27B Q4_K_M, 1 GPU) | verify band owner on r320 | matcher entered? |
+|---|---|---|
+| `draft-dflash --spec-draft-n-max 7` | `GDN_CONV_STORE ... T=2/4/8/5/6/3/9 S=1` | **never** |
+| `draft-dflash,ngram-mod` (the field config) | store | **never** |
+| `draft-mtp-adaptive --spec-draft-n-max 9` (35B-A3B) | store `T=2/4/7/6/5` | **never** |
+
+`ggml_cuda_gdn_store_try_fuse()` has been dispatched ahead of `ggml_cuda_gdn_conv_try_fuse()` since **r244**
+(2026-11-09, contributor PR #292 / upstream #31660), and that one kernel already writes `q_out`/`k_out`: there
+is no norm pair left to fold on the store's path.  So the premise holds only for trees before r244, which is
+six days after the submitter's measurement tree and six days before the cut they submitted.
+
+**Nothing changed the reach between the PR and this release.**  `gdn-conv.cu`, `gdn-conv.cuh`,
+`gdn-conv-store.cu` and `gdn-conv-store.cuh` are byte-identical between the r289 and r318 trees (materialised
+both and diffed), and the only GDN-related delta in the dispatcher is the unrelated gate/beta epilogue fusion.
+
+### What the earlier review missed: the mechanism IS reachable, just not where the PR said
+
+The r289 review widened `ngram-mod` with `--spec-draft-n-max`, but the n-gram family's width knob is
+`--spec-ngram-mod-n-max`, and a dense model with no arena is never band-clamped.  With the right knob, and in
+the other speculators that do not take the rollback store, the matcher is entered with a deferred gather and
+refuses from verify width 6 (the q output is `128*nk*T` floats against the state's `3*C`, so the spans collide
+from `T = 6`):
+
+| arm | refused widths (base) | after the change |
+|---|---|---|
+| `ngram-mod --spec-ngram-mod-n-max 7` | `T=8` | folded |
+| `ngram-mod --spec-ngram-mod-n-max 15` | `T=11, 16` | folded |
+| `ngram-cache --spec-draft-n-max 7` | `T=6, 9` | folded |
+| `ngram-map-k --spec-draft-n-max 7` | `T=16` | folded |
+| `draft-simple --spec-draft-n-max 7` | `T=6, 7, 8` | folded |
+| `test-logits-width-probe KV=q8_0` | `W=6,7,8` | folded |
+
+### The fix
+
+`gdn_conv_norm_match()` takes the backend context and computes what the conv **really reads** as its state: if
+the state's root is in `ctx.gdn_deferred_gathers`, `ggml_cuda_gdn_conv_direct` reads the cache row through the
+gather's row id and never dereferences `m.state->data`, so the cache tensor (`root->src[0]`) replaces `m.state`
+in the overlap test.  That is stricter than the contributor's form, which simply skipped the state test: the
+buffer the kernel does read is now checked.  `x`, `w`, the conv output and the single-token decide are
+unchanged (`gdn_conv_decode_ok()` still calls the matcher without a context), and the rollback `SET_ROWS`
+store never reaches this matcher.
+
+### The win is real and immaterial, which is the decision
+
+`ngram-mod --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-match 45`, 27B Q4_K_M, `-n 2048`, greedy, 5
+interleaved pairs, wall clock (the footer's 0.1 t/s resolution is too coarse here): r319 **38 692.4 ms** ->
+r320 **38 685.6 ms** (-0.018 %, inside the +-0.03 % resolution), against **39 262.4 ms** with
+`GGML_CUDA_FUSE_GDN_CONV_NORM=0` (an upper bound: that arm also moves the `T=1` decide).  `ngram-map-k`:
+67.1 vs 67.1 t/s against 66.0.  The refusal is rare because the ngram draft is 10-15 tokens deep only
+occasionally.  Outside the delivery's own arms (`draft-simple` 17.8 t/s, `ngram-cache` 140.7) it is likewise
+not a knob anyone turns for speed.
+
+Taken anyway, as a **matcher correctness fix**: a fold may refuse a layout on a hazard that is not there, and
+the delivery's own comments claimed the state is always dead after the CONCAT, which is true only without a
+deferred gather.  The contributor's patch is the reason the class was found (the census above is theirs in
+substance: `gdn_deferred_gathers` is exactly the test they proposed), so the fix ships with
+`Co-authored-by` credit in the block and their authorship recorded here.
+
+### Correctness and gates (all green)
+
+* Greedy text identical r319 vs r320 on `ngram-mod n15` / `ngram-cache` / `draft-simple` / `draft-dflash`
+  (27B, `ba147eef7e7c`) and `draft-mtp-adaptive` (35B-A3B, `a1783d90d107`).
+* `test-logits-width-probe KV=q8_0`, `P=3584` and `P=4096`, **dense 27B and MoE 35B-A3B**: `width_purity=PASS`,
+  worst maxdiff 0, every `W=1..8` and row0/row1 hash byte-identical r319 vs r320; also identical to
+  `GGML_CUDA_DISABLE_CONV_FUSION=1` and to each fold kill switch.  The arm's non-vacuity is the census
+  (`T=6..8 deferred=1 base=overlap_state` -> `folded`), because a matcher-decision change moves no hash at all.
+* Four-axis MTP Protocol A, 1 GPU, 27B Q4_K_XL, bf16, `-n 3000`: plain == draft on R/P/C/K, acceptance
+  **0.60747 / 0.87198 / 0.90924 / 0.99200** identical r319 vs r320, t/s identical.
+* `test-backend-ops -o SSM_CONV,GATED_DELTA_NET,RMS_NORM`: **236/236**.
+* `gate-prefill-logits.sh`: **0.000000 / 100.000 %** (prefill is unreachable by construction: the deferral
+  needs `T <= 16` and the fold's decision there is unchanged -- verified by the census, `deferred=0` at
+  `T=42/44/512`).
+* `llama-batched-bench -npl 1,4,8`: TG 154.48 / 424.06 / 576.00 -> 154.44 / 423.97 / 575.80 (noise).
+* `validate-set.sh` GREEN (tree `3334a4eb31`, optional alone `9d8474c19` / `595d4bbf3`, cumulative
+  `b61726912`, 512-file Windows portability scan); `gate-per-block-build.sh --changed-from f6ffa8042 --fast`
+  **2/2** (rung 1/2 block 10 601s, rung 2/2 the tip 122s); `check-gpu-faults.sh` clean.
+
+### PR #316 is CLOSED on this release
+
+Its premise does not transfer (r244's store owns the band it measured), its measurement predates that kernel,
+and the code it changes is now in the delivery in a stricter form.  The closing comment states all three and
+credits the diagnosis.
+
 ## 261119.003 (r319, RELEASE v17-4f9dfa0e3-r319) -- GitHub issue #330 CLOSED: the tile FA launcher's KV split was keyed on the padded used KV extent, so a verify batch and its own decode took different splits
 
 **Release:** `v17-4f9dfa0e3-r319`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `f6ffa8042`

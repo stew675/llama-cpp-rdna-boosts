@@ -1101,3 +1101,44 @@ kill-switch, default on).
 Record: `WORKLOG.md` 261119.003, `benchmarks/2026-11-19-fa-split-boundary-purity.md`, `GREEDY-PURITY.md` §99,
 `ENVIRONMENT.md` `GGML_CUDA_FA_SPLIT_CONST`, `MANIFESTS.md` gate 36, `patches/README.md` blocks 05/10 (the probe),
 issue #330.
+
+## r320 (2026-11-19, `WORKLOG.md` 261119.004) — a fusion's overlap test must test the buffers the kernel READS, and a deferred gather makes the state node dead (PR #316)
+
+1. **`m.state` is not always the state the conv reads.**  `gdn_conv_norm_match()` folds the GDN q/k l2 norm pair
+   into the direct conv kernel, and it refuses a layout where a SCALE output overlaps `x`, `w`, the conv output
+   or the conv state, because the kernel writes the normalized outputs while it still streams those buffers.
+   With a **deferred conv-state gather** (`ggml_cuda_gdn_conv_gather_deferrable`) that last test is wrong:
+   `ggml_cuda_gdn_conv_direct` reassigns `state` to `root->src[0]->data`, indexes it with the gather's row id
+   (`state_ids`), and never dereferences `m.state->data`.  The matcher now takes the context and, exactly then,
+   tests the **cache tensor** (`root->src[0]`) instead of the dead `GET_ROWS` node.
+2. **The allocator does place the q output there, so the refusal was real and reachable.**  The q SCALE output is
+   `128*nk*T` floats against the state's `3*C`, so the spans collide from `T = 6` (27B: 20 480 B per row against
+   122 880 B).  A census in the matcher on r318 read `T=6,7,8 deferred=1 base=overlap_state` on
+   `test-logits-width-probe` (`KV=q8_0`), `T=6,7,8` on `--spec-type draft-simple`, `T=6,9` on `ngram-cache`,
+   `T=16` on `ngram-map-k` and `T=8/11/16` on `ngram-mod --spec-ngram-mod-n-max {7,15}` -- i.e. every
+   non-store speculator verify arm at a width of 6 or more loses the norm fold in every GDN layer.
+3. **It is inert in every arm that takes the rollback store.**  `--spec-type draft-dflash` (the submitter's own
+   scenario), `draft-dflash,ngram-mod` and `draft-mtp-adaptive` n9 on 35B-A3B run `GDN_CONV_STORE ...` and never
+   enter the matcher at all: that kernel already writes `q_out`/`k_out`.  So the PR's motivating observation
+   ("every T=8 DFlash2 verify call refused") was true of its 2026-11-03 measurement tree and has been false since
+   **r244** (2026-11-09, PR #292 / upstream #31660), six days before the r289 cut the PR was made against.
+4. **Nothing changed the reach between r289 and r318.**  `gdn-conv.cu`, `gdn-conv.cuh`, `gdn-conv-store.cu` and
+   `gdn-conv-store.cuh` are byte-identical between the two trees (materialised and diffed), and the only
+   GDN-related delta in the dispatcher is the unrelated gate/beta epilogue fusion.  The r289 review's "no
+   production arm reaches it" was too strong for a different reason: it widened `ngram-mod` with
+   `--spec-draft-n-max`, but the ngram family's width knob is `--spec-ngram-mod-n-max`, and a dense model with no
+   arena is never band-clamped, so `ngram-mod` does reach `T=8..16`.
+5. **The win is real but tiny, and that is the decision.**  5 interleaved pairs, 1 GPU, 27B UD-Q4_K_M,
+   `ngram-mod --spec-ngram-mod-n-max 15 --spec-ngram-mod-n-match 45`, `-n 2048`, greedy: 38 692.4 ->
+   38 685.6 ms (**-0.018 %**, inside the ±0.03 % wall-clock resolution), against 39 262.4 ms with the fold
+   forced off (+1.47 %, an upper bound that also moves the `T=1` decide).  The refusal is rare because the
+   ngram draft is 10-15 tokens deep only occasionally; `ngram-map-k` agrees (67.1 vs 67.1 t/s against 66.0
+   fold-off).  So it ships as a matcher correctness fix with a measured ~0, not as a decode win.
+6. **A matcher-decision change moves no hash, so the probe arm needs a census to be non-vacuous.**  The width
+   probe reads `width_purity=PASS` and byte-identical `W=1..8` hashes **both** before and after (dense 27B and
+   MoE 35B-A3B, `P=3584` and `P=4096`, and against `GGML_CUDA_DISABLE_CONV_FUSION=1` and each fold kill
+   switch).  The evidence that the arm is not vacuous is the matcher census above (`base=overlap_state` ->
+   `folded`), which is the same instrument the r289 review needed.
+
+Record: `WORKLOG.md` 261119.004, `GREEDY-PURITY.md` §100, `patches/README.md` block 10, `ENVIRONMENT.md`
+`GGML_CUDA_FUSE_GDN_CONV_NORM`, PR #316.

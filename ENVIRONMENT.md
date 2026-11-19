@@ -667,8 +667,11 @@ These use `getenv(...) == nullptr || atoi(...) != 0`, so unset = **on** and `0` 
 Four more from r102 (PR #200, block 10), all bit-identical with their own switch: `GGML_CUDA_FUSE_GATE_BETA_BF16`
 (qwen4exp's alpha/beta BF16 projections plus `softplus(alpha + dt) * a` in one `mul_mat_vec_f` launch),
 `GGML_CUDA_FUSE_GDN_CONV_NORM` (the q/k l2 norm pair folded into the direct conv kernel; falls back when a
-SCALE output would overlap the conv's `x`/state/weight/output, which the allocator may do since all of them
-are dead after the CONCAT), `GGML_CUDA_FUSE_CONT_GATE_Q8_1` (the attention gate's row-strided view read in
+SCALE output would overlap a buffer the conv actually reads, which the allocator may do since they are dead
+after the CONCAT: `x`, `w` and the output always, and the conv state only when it is **not** a deferred
+gather -- with a deferred gather the kernel reads the cache row through the gather's row id, so the dead
+`GET_ROWS` output may hold the SCALE outputs and the buffer that must not be aliased is the cache tensor,
+r320), `GGML_CUDA_FUSE_CONT_GATE_Q8_1` (the attention gate's row-strided view read in
 place by the gate -> Q8_1 kernel, so its CONT copies nothing) and `GGML_CUDA_FUSE_GDN_NORM_GATE` (qwen4exp's
 GDN output `RMS_NORM * w` computed inside the gate kernel).  Worth +0.2-0.3 % on 27B MTP and +0.7 % on
 Flash-Next 2 GPU `-sm tensor` + MTP, flat on 35B-A3B 1 GPU.  The GDN-norm pair is the only fusion in the set

@@ -1,4 +1,4 @@
-From 8b9431e57fd4f1f39ea83634f1761f6ce58fc3b1 Mon Sep 17 00:00:00 2001
+From 9f924e6b9f68a5f6aeee8c711c60663150c18066 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/17] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -113,6 +113,8 @@ projection type ran each step as its own launch.  Extended, one switch per piece
   -ub 1, 4 and 8 against a base recorded from the previous build's binary, same-seed greedy text identical on
   both arms plus the reorder-only Flash-Next IQ4_NL case, `none == draft-mtp` text purity on both builds, no GPU
   faults; `test-fusion-gate-beta-multiseq` 77/77 shapes (the F32 and Q4_K arms added here).
+
+Co-authored-by: burnoutIA <72673971+burnoutIA@users.noreply.github.com>
 ---
  ggml/include/ggml-alloc.h                     |   13 +
  ggml/include/ggml.h                           |    1 -
@@ -143,7 +145,7 @@ projection type ran each step as its own launch.  Extended, one switch per piece
  .../gated_delta_net_chunked_bf16_gfx11.cu     |    5 +-
  ggml/src/ggml-cuda/gdn-conv-store.cu          |  409 ++
  ggml/src/ggml-cuda/gdn-conv-store.cuh         |   36 +
- ggml/src/ggml-cuda/gdn-conv.cu                |  393 +-
+ ggml/src/ggml-cuda/gdn-conv.cu                |  408 +-
  ggml/src/ggml-cuda/gdn-conv.cuh               |   13 +-
  ggml/src/ggml-cuda/ggml-cuda-arena.cu         |   70 +
  ggml/src/ggml-cuda/ggml-cuda-arena.cuh        |   15 +
@@ -201,7 +203,7 @@ projection type ran each step as its own launch.  Extended, one switch per piece
  tests/test-fusion-gate-beta-multiseq.cpp      |  321 +
  tests/test-logits-width-probe.cpp             |  233 +-
  tools/server/server-context.cpp               |   30 +-
- 87 files changed, 17452 insertions(+), 5644 deletions(-)
+ 87 files changed, 17467 insertions(+), 5644 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -4781,7 +4783,7 @@ index 000000000..d5721bf6f
 +// the conv-state GET_ROWS at node_idx feeds a store match that reads the cache row itself
 +bool ggml_cuda_gdn_store_gather_deferrable(const ggml_cgraph * cgraph, int node_idx, const ggml_cuda_gdn_gather_index & idx);
 diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
-index 07380a061..d24e4344d 100644
+index 07380a061..d1a171e2f 100644
 --- a/ggml/src/ggml-cuda/gdn-conv.cu
 +++ b/ggml/src/ggml-cuda/gdn-conv.cu
 @@ -1,19 +1,31 @@
@@ -4887,7 +4889,7 @@ index 07380a061..d24e4344d 100644
      const float b = 0.0f;
      const int tend = min(T, t0 + TT);
      for (int t = t0; t < tend; ++t) {
-@@ -45,12 +95,93 @@ static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float
+@@ -45,10 +95,91 @@ static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float
  #pragma unroll
          for (int j = 0; j < 4; ++j) sumf += xw[j] * wr[j];
          sumf += b;
@@ -4930,9 +4932,9 @@ index 07380a061..d24e4344d 100644
          xw[0] = xw[1]; xw[1] = xw[2]; xw[2] = xw[3];
 -        const int jp = t + 4; xw[3] = (jp < 3) ? state[c * 3 + jp] : ((jp - 3) < T ? x[(size_t) (jp - 3) * C + c] : 0.0f);
 +        const int jp = t + 4; xw[3] = (jp < 3) ? st(jp) : ((jp - 3) < T ? x[(size_t) (jp - 3) * C + c] : 0.0f);
-     }
- }
- 
++    }
++}
++
 +// byte span of a (possibly strided) tensor
 +static void gdn_conv_span(const ggml_tensor * t, uintptr_t & lo, uintptr_t & hi) {
 +    lo = (uintptr_t) t->data;
@@ -4976,13 +4978,11 @@ index 07380a061..d24e4344d 100644
 +            if (gdn_conv_overlap(t, m.snap_dst[a])) return false;
 +            for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (gdn_conv_overlap(t->src[s], m.snap_dst[a])) return false;
 +        }
-+    }
+     }
 +    return true;
-+}
-+
+ }
+ 
  static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m) {
-     if (!gdn_conv_enabled() || i < 0 || i + 2 >= cgraph->n_nodes) return false;
-     const ggml_tensor * cc = cgraph->nodes[i];
 @@ -64,7 +195,14 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
      if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 || !ggml_is_contiguous(st)) return false;
      if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) return false;
@@ -5080,7 +5080,7 @@ index 07380a061..d24e4344d 100644
      const int ncols = (int) (m.T + 3 - m.tail_from);
      if (ncols <= 0) return;
      const int64_t n = m.C * ncols;
-@@ -124,12 +301,180 @@ void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_c
+@@ -124,12 +301,195 @@ void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_c
      CUDA_CHECK(cudaGetLastError());
  }
  
@@ -5152,7 +5152,8 @@ index 07380a061..d24e4344d 100644
 +
 +// The q / k l2 norm pair right after the conv (only no-op nodes between): the direct kernel also writes both normalized
 +// outputs.  Returns the index of the second SCALE, -1 when the pattern is not there.  GGML_CUDA_FUSE_GDN_CONV_NORM=0: off.
-+static int gdn_conv_norm_match(const ggml_cgraph * cgraph, const ggml_cuda_gdn_conv_match & m, gdn_conv_norm_args & na) {
++static int gdn_conv_norm_match(const ggml_cgraph * cgraph, const ggml_cuda_gdn_conv_match & m, gdn_conv_norm_args & na,
++                               const ggml_backend_cuda_context * ctx = nullptr) {
 +    static const bool fuse = [] { const char * e = getenv("GGML_CUDA_FUSE_GDN_CONV_NORM"); return e == nullptr || atoi(e) != 0; }();
 +    if (!fuse || !m.silu || m.C % 256 != 0) return -1;
 +    int j = m.conv_idx + 2;
@@ -5181,9 +5182,23 @@ index 07380a061..d24e4344d 100644
 +        const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a), b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
 +        return a0 < b1 && b0 < a1;
 +    };
++    // What the conv genuinely reads as the state.  A deferred conv-state gather (ggml_cuda_gdn_conv_gather_deferrable) is
++    // the one case where it is NOT m.state: the direct kernel reads the cache row itself through the gather's row id
++    // (state_ids), so the dead GET_ROWS output may legitimately hold the SCALE outputs, and the cache tensor is then the
++    // buffer that must not be aliased.  This is the CPY-snapshot verify shape (2..16 tokens, one sequence); the rollback
++    // SET_ROWS store takes its own path (gdn-conv-store.cu) and never reaches this matcher.
++    const ggml_tensor * state_read = m.state;
++    if (ctx != nullptr) {
++        const ggml_tensor * root = m.state;
++        while (root->view_src != nullptr) root = root->view_src;
++        if (std::find(ctx->gdn_deferred_gathers.begin(), ctx->gdn_deferred_gathers.end(), root) != ctx->gdn_deferred_gathers.end()) {
++            GGML_ASSERT(root->src[0] != nullptr);
++            state_read = root->src[0];
++        }
++    }
 +    for (const ggml_tensor * d : { cgraph->nodes[j + 1], cgraph->nodes[j2 + 1] }) {
 +        for (const ggml_tensor * src : { m.x, m.state, m.w, (const ggml_tensor *) m.conv_out }) {
-+            if (overlap(d, src)) return -1;
++            if (overlap(d, src == m.state ? state_read : src)) return -1;
 +        }
 +    }
 +    na.dst0 = (float *) cgraph->nodes[j + 1]->data;
@@ -5237,7 +5252,7 @@ index 07380a061..d24e4344d 100644
 +    }
 +    if (node->op == GGML_OP_SSM_CONV && ggml_cuda_gdn_conv_match_at_conv(cgraph, i, gm)) {
 +        gdn_conv_norm_args na;
-+        const int last = gdn_conv_norm_match(cgraph, gm, na);
++        const int last = gdn_conv_norm_match(cgraph, gm, na, &ctx);
 +        if (last > 0) {
 +            ggml_cuda_gdn_conv_direct(ctx, gm, &na);
 +            return last - i;

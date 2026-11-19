@@ -1,5 +1,25 @@
 # The delivery patches — what each block is and what it does
 
+> **r320: the conv + q/k norm fold's overlap test follows the buffer the kernel READS, so a deferred conv-state gather no longer refuses it (contributor PR #316, `burnoutIA`), an amendment to block 10.**
+> `gdn_conv_norm_match()` writes the GDN q/k norm outputs while the direct conv still streams `x`, the state and
+> `w`, so it refuses a layout where a SCALE output overlaps them -- including `m.state`.  With a **deferred**
+> conv-state gather (`ctx.gdn_deferred_gathers`) that test names the wrong buffer: `ggml_cuda_gdn_conv_direct`
+> reads the cache row through the gather's row id and never dereferences `m.state->data`, so the allocator
+> legitimately places the q output over that dead `GET_ROWS` output, and the two spans are `128*nk*T` against
+> `3*C` floats (they collide from `T = 6`).  The matcher now takes the context and, exactly then, tests the
+> **cache tensor** (`root->src[0]`) instead of the dead node -- stricter than the contributor's form, which
+> simply dropped the check.  Reach: the CPY-snapshot verify shape only (`T <= 16`, one sequence), i.e.
+> `--spec-type ngram-mod` at `--spec-ngram-mod-n-max 7/15`, `ngram-cache`, `ngram-map-k` and `draft-simple`; the
+> rollback `SET_ROWS` store owns the DFlash2/MTP verify band and never enters this matcher, so the PR's own
+> arm (`draft-dflash --spec-draft-n-max 7`, "every T=8 verify refused") is **inert** on r244 and later.  Worth
+> **0.02 %** of decode on the one delivery arm that reaches it (38 692.4 -> 38 685.6 ms over 2048 tokens, 5
+> interleaved pairs, against 39 262.4 ms fold-off), so it ships as a matcher correctness fix, not a decode win.
+> Gates: byte-identical greedy text (five arms), the width probe's `W=1..8` hashes identical r319 vs r320 on the
+> dense 27B and MoE 35B-A3B at `P=3584`/`P=4096` and against every fold kill switch, the matcher census as the
+> non-vacuity proof (`deferred=1 base=overlap_state` -> `folded`), `test-backend-ops -o
+> SSM_CONV,GATED_DELTA_NET,RMS_NORM` 236/236, prefill KLD 0.000000 / 100.000 %.  Record: `WORKLOG.md`
+> 261119.004, `INVARIANTS.md` r320, `GREEDY-PURITY.md` §100, `benchmarks/2026-11-19-gdn-norm-deferred-gather.md`.
+>
 > **r319: a speculator must not change the greedy text, and the tile FA KV split was keyed on the padded KV extent (GitHub issue #330), an amendment to block 05 (+ the block-10 probe).**
 > `--spec-type none` and `--spec-type draft-mtp` emitted different greedy text on a 3-device `-sm tensor` split (q8_0
 > prose `120c74935967` / `c1f9d0b3f5b6`; bf16 reasoning `7dca501eeb0e` / `759c1a4515c6`).  Not the speculator: at the FA
@@ -2472,6 +2492,23 @@ next item) and the census to expect is `direct` ~= 0 with `properties_changed` i
 
 ## Block 10 — the slab, the fusion dispatcher, the async input ring (infrastructure)
 
+> **r320 amendment (contributor PR #316): the conv + q/k norm fold's overlap test follows what the kernel
+> READS.**  Block 10 owns the norm matcher and the deferred-gather machinery (`gdn_conv_norm_match()`,
+> `ctx.gdn_deferred_gathers`, `ggml_cuda_gdn_conv_gather_deferrable`), so the fix lands here even though the
+> file (`gdn-conv.cu`) is created by block 08.  The fold writes both normalized outputs while the conv streams
+> `x`/state/`w`, so the matcher refuses a layout where a SCALE output overlaps them -- including `m.state`.
+> For a **deferred** gather that test is wrong: `ggml_cuda_gdn_conv_direct` reads the cache row through the
+> gather's row id and never dereferences `m.state->data`, and the allocator puts the q output over that dead
+> `GET_ROWS` output for a 6..16-token verify batch (the two spans are `128*nk*T` and `3*C` floats, so they
+> collide from `T=6`).  The matcher now takes the context and, exactly in that case, tests the **cache tensor**
+> (`root->src[0]`) instead of the dead node -- stricter than the contributor's form, which simply dropped the
+> check.  It reaches the CPY-snapshot verify shape only; the rollback `SET_ROWS` store owns the
+> DFlash2/MTP verify band and never enters this matcher.  Measured on 1 GPU gfx1201: the fold now fires at
+> `T=8/11/16` under `--spec-type ngram-mod` (and `T=6,7,8` under `draft-simple`) and is worth **0.02 %** of
+> decode on the one delivery arm that reaches it; text is byte-identical everywhere and the width probe's
+> `W=1..8` hashes are unchanged.  No kernel arithmetic, no default, no environment variable.
+> `INVARIANTS.md` r320, `GREEDY-PURITY.md` §100, `WORKLOG.md` 261119.004, PR #316.
+
 > **r319 amendment (GitHub issue #330): the width probe gained a 256-cell KV-padding-boundary arm.**  This block
 > owns the last change to `tests/test-logits-width-probe.cpp` (it added the `SPLIT` / `NCMOE` / `CACHE` arms), so
 > the probe's new arm lands here.  The probe compared widths 1..8 at ONE prefix length, and a prefix on a
@@ -3297,6 +3334,18 @@ fix found while setting up its Flash-Next arm.
   lives in the compute-time matchers (`match_at_concat` / `match_at_conv`, which every compute-time site calls);
   `graph_optimize` uses the structural `ggml_cuda_gdn_conv_pattern_at_concat`, a superset, so its alloc deps
   cover every case the compute-time matchers take.
+* **The norm pair's overlap test follows what the kernel READS (r320).**  The fold writes both normalized
+  outputs while the conv still streams from memory, so `gdn_conv_norm_match()` refuses a layout where a SCALE
+  output overlaps `x`, `w` or the conv output -- and the conv state, **unless that state's `GET_ROWS` is a
+  deferred gather** (`ctx.gdn_deferred_gathers`): then the direct kernel reads the cache row through the
+  gather's row id (`state_ids`) and never dereferences `m.state->data`, so the dead `GET_ROWS` output may
+  carry the q output.  The cache tensor (`root->src[0]`, the row the kernel really reads) takes its place in
+  the test.  This is the CPY-snapshot verify shape only (one sequence, `T <= 16`); the rollback `SET_ROWS`
+  store has its own kernel (`gdn-conv-store.cu`, block 10's store) and never enters this matcher, which is
+  why the `draft-dflash` and `draft-mtp-adaptive` verify bands are untouched.  What it fixes: a verify batch
+  whose q output spans the state buffer (`128*nk*T` floats against `3*C`, i.e. `T >= 6`) used to run the two
+  norms as a separate kernel per GDN layer; measured **0.02 %** of decode on the one delivery arm that reaches
+  it (`--spec-type ngram-mod --spec-ngram-mod-n-max 15`), and inert on the DFlash2/MTP/ngram-mod-at-7 arms.
 * **The shared-expert gate fold** (`GGML_CUDA_FUSE_SHEXP_GATE_SIGMOID=0` off): `MUL_MAT`(one gate row) ->
   `SIGMOID` -> `MUL` -> `ADD` runs in the `mul_mat_vec_f` launch the gate would take anyway; every block
   recomputes the one gate row and applies `sigmoid_mul_add_f32`'s own `op_sigmoid` and its
@@ -3327,6 +3376,10 @@ against r182 they measure +5.9 % / +3.3 % here.
   that said otherwise is historical.
 * **`0003` must keep the `gdn_conv_norm_match() > 0` gate.**  Relaxing it re-opens the #249 loss: where the
   norm fold is refused the `ssm_conv_in` epilogue's free CONCAT write is replaced by a separate launch.
+* **The overlap test tests the buffers the kernel reads, not the nodes it was handed** (r320).  `m.state` is
+  dead only when the gather feeding it is deferred; a future fold here must make the same distinction rather
+  than drop the state test (the contributor form of this patch simply skipped it) or keep refusing a layout
+  the kernel never reads.
 * **The compute-time matchers and `graph_optimize` must keep deciding the same way** — the decode gate reads
   data pointers, so a new compute-time caller goes through `ggml_cuda_gdn_conv_match_at_concat` /
   `_at_conv`; only `graph_optimize` may use the structural `_pattern_at_concat` (a superset).
@@ -3342,6 +3395,13 @@ canonical 27B Q8_0 gate **0.000000 / 100.000 %** against the r182 base; MTP on 3
 the `GGML_CUDA_SLAB=0` arm's text); per-block build 3/3 `--fast`; `validate-set.sh` green; no GPU faults.
 Numbers: `benchmarks/2026-10-30-gdn-decode-folds.md`; records `archive/work/gdn-decode-folds/PROMOTED.md`
 and `archive/work/cpy-2d-memcpy-guard/README.md`.
+
+**r320's arm for the norm-pair overlap test** adds one instrument to that list: `test-logits-width-probe`
+with `KV=q8_0` reads `W=6,7,8` as **deferred-gather refusals** on the pre-r320 build (a census in the matcher
+shows `deferred=1 base=overlap_state`) and folds them afterwards, with the probe's `W=1..8` and
+row0/row1 hashes byte-identical across r319 and r320 on the dense 27B and the MoE 35B-A3B at `P=3584` and
+`P=4096` (and against `GGML_CUDA_DISABLE_CONV_FUSION=1` and each fold kill switch).  Without that census the
+probe arm is vacuous for this class: the fusion-decision change moves no hash.
 
 #### r186 — the conv fusion (and all four r183 folds) run on every device count
 
