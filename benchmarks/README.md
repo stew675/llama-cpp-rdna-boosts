@@ -24,6 +24,21 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
 > benchy depth-16384 protocol in `wip/HANDOFF.md`.
 
+## 2026-11-19 — a fusion's overlap test must test the buffers the kernel reads: the GDN conv + q/k norm fold on a deferred conv-state gather (r320, PR #316)
+
+**`WORKLOG.md` 261119.004** + [`2026-11-19-gdn-norm-deferred-gather.md`](2026-11-19-gdn-norm-deferred-gather.md) —
+the contributor's premise (every DFlash2 verify call refused, -0.7 ms/cycle) belongs to a tree from before r244:
+since then the one-kernel `gdn_conv_store` owns that band and already writes `q_out`/`k_out`, so the matcher is never
+entered (census: `GDN_CONV_STORE T=2/4/8/5/6/3/9`, no matcher entry; same for `draft-dflash,ngram-mod` and
+`draft-mtp-adaptive`).  The mechanism is real in the arms that do **not** take the rollback store: with a deferred
+conv-state gather the direct conv reads the cache row and never `m.state->data`, the allocator puts the q `SCALE`
+output over that dead node (the spans are `128*nk*T` against `3*C`, colliding from `T=6`), and the matcher refused.
+Measured refusals: `ngram-mod` `T=8/11/16`, `ngram-cache` `T=6,9`, `ngram-map-k` `T=16`, `draft-simple` `T=6,7,8`,
+width probe `W=6,7,8`.  The matcher now tests the **cache tensor** in exactly that case (stricter than the
+contributor's skip).  Worth **0.02 %** of decode on the one delivery arm that reaches it (38 692.4 -> 38 685.6 ms
+over 2048 tokens, 5 interleaved pairs, against 39 262.4 ms fold-off), i.e. a correctness fix; the width probe's
+`W=1..8` hashes are unchanged, so the non-vacuity instrument is the matcher census.
+
 ## 2026-11-19 — the FA tile kernel's KV split must be a run constant, not a function of the padded KV extent (r319, issue #330)
 
 **`WORKLOG.md` 261119.003** + [`2026-11-19-fa-split-boundary-purity.md`](2026-11-19-fa-split-boundary-purity.md) —
