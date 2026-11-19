@@ -1,0 +1,107 @@
+From e10a6f1e77a2dc04d2325360c6db1d0150c50aab Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 15 Nov 2026 18:14:58 +0000
+Subject: [PATCH 1/2] MoE decode: down + weighted-reduction fold takes
+ precedence over the MUL-only down fold; fold sum without fma contraction
+
+- ggml_cuda_moe_down_fold_try_fuse steps aside when ggml_cuda_mwr_fold_mark armed the down + reduction fold for
+  this MUL_MAT_ID: folding only the MUL (x_scale) disqualified that fold and left the reduction's ADD chain as its
+  own launch (Qwen3.5/3.6 MoE decode, one per MoE layer). GGML_CUDA_MWR_FOLD_FIRST=0: the old precedence.
+  Default on for HIP only: nvcc ignores the clang pragma below, so there the fold would be less exact than the
+  MUL fold + ADD chain it replaces (GGML_CUDA_MWR_FOLD_FIRST=1 turns it on).
+- The fold's weighted sum runs under `#pragma clang fp contract(off)`: HIP clang contracted
+  `sum += (x * scale) * w` into an fma, so the fold differed from the unfused MUL + ADD chain at rounding level.
+  GGML_CUDA_MWR_FOLD_CONTRACT=1: the old contracted sum.
+
+1 x R9700 (gfx1201), r321, KLD against the fully unfused graph at -ub 1: Qwen3-30B-A3B Q4_K_M 0.002054 -> 0.000000,
+Qwen3.6-35B-A3B Q4_K_M 0.000000 -> 0.000000 (now via the fold). tg128: Qwen3.6-35B-A3B 155.78 / 155.84 ->
+159.39 / 159.34 t/s (+2.3 %), Qwen3-30B-A3B and gemma-4-26B-A4B unchanged.
+---
+ ggml/src/ggml-cuda/common.cuh  |  1 +
+ ggml/src/ggml-cuda/mmvq-moe.cu | 23 ++++++++++++++++++-----
+ ggml/src/ggml-cuda/mmvq.cu     | 15 +++++++++++++++
+ 3 files changed, 34 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 1880d449f7..4614585ade 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -2903,6 +2903,7 @@ struct ggml_cuda_mm_fusion_args_device {
+     const float * red_w = nullptr;
+     const float * red_scale = nullptr;
+     int * red_cnt = nullptr;
++    bool red_contract = false;   // GGML_CUDA_MWR_FOLD_CONTRACT=1: the fold's old (fma-contracted) sum
+     // GDN alpha/beta pair in one mmvf launch (ggml_cuda_gate_beta_bf16_try_fuse): rows >= gb_nrows read gb_x2 and
+     // write gb_dst2; rows below write softplus(v + gb_dt[row]) * gb_a[row].
+     const void * gb_x2 = nullptr;
+diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
+index cbde504132..a1a15d2eb6 100644
+--- a/ggml/src/ggml-cuda/mmvq-moe.cu
++++ b/ggml/src/ggml-cuda/mmvq-moe.cu
+@@ -229,12 +229,25 @@ static __global__ void mul_mat_vec_q_moe(
+                 if ((int) threadIdx.x < rows_valid) {
+                     const int   r  = row0 + threadIdx.x;
+                     const float s0 = fusion.red_scale != nullptr ? fusion.red_scale[0] : 1.0f;
+-                    float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
+-                    for (int e = 1; e < (int) nchannels_dst; ++e) {
+-                        const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
+-                        sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
++                    // no fma: the graph's MUL (expert x weight) and each ADD of the reduction round on their own; contracted,
++                    // the fold read KLD 0.0018 (Qwen3.6-35B-A3B) / 0.0021 (Qwen3-30B-A3B) against the unfused graph.
++                    // GGML_CUDA_MWR_FOLD_CONTRACT=1 (fusion.red_contract): the old contracted sum.
++                    if (!fusion.red_contract) {
++#pragma clang fp contract(off)
++                        float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
++                        for (int e = 1; e < (int) nchannels_dst; ++e) {
++                            const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
++                            sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
++                        }
++                        fusion.red_dst[r] = sum;
++                    } else {
++                        float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
++                        for (int e = 1; e < (int) nchannels_dst; ++e) {
++                            const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
++                            sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
++                        }
++                        fusion.red_dst[r] = sum;
+                     }
+-                    fusion.red_dst[r] = sum;
+                 }
+                 if (threadIdx.x == 0) {
+                     *cnt = 0;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 535ea76cc0..2d9925df07 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1955,6 +1955,8 @@ void ggml_cuda_mul_mat_vec_q(
+         fusion_local.red_w     = (const float *) ctx.mwr_fold_weights->data;
+         fusion_local.red_scale = ctx.mwr_fold_scale ? (const float *) ctx.mwr_fold_scale->data : nullptr;
+         fusion_local.red_cnt   = ctx.moe_red_counters();
++        static const bool red_contract = [] { const char * e = getenv("GGML_CUDA_MWR_FOLD_CONTRACT"); return e != nullptr && atoi(e) != 0; }();
++        fusion_local.red_contract = red_contract;
+         ctx.mwr_done_graph = ctx.mwr_fold_graph;
+         ctx.mwr_done_idx   = ctx.mwr_fold_idx;
+     }
+@@ -3490,6 +3492,19 @@ int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml
+     ggml_tensor * mm_node  = cgraph->nodes[i];
+     ggml_tensor * mul_node = cgraph->nodes[i + 1];
+ 
++    // The down + weighted-reduction fold (ggml_cuda_mwr_fold_mark armed it for this node) covers this MUL and the ADDs of the
++    // reduction in one launch; folding only the MUL here sets x_scale, which disqualifies that fold and leaves the reduction's
++    // ADD chain as its own launch (Qwen3.5/3.6 MoE decode: one per MoE layer).  GGML_CUDA_MWR_FOLD_FIRST=0: the old precedence.
++    // Default on for HIP only: nvcc ignores the fold sum's `#pragma clang fp contract(off)`, so there the fold would be less
++    // exact than the MUL fold + ADD chain it replaces (GGML_CUDA_MWR_FOLD_FIRST=1 still turns it on).
++#if defined(GGML_USE_HIP)
++    static const bool mwr_fold_first = [] { const char * e = getenv("GGML_CUDA_MWR_FOLD_FIRST"); return e == nullptr || atoi(e) != 0; }();
++#else
++    static const bool mwr_fold_first = [] { const char * e = getenv("GGML_CUDA_MWR_FOLD_FIRST"); return e != nullptr && atoi(e) != 0; }();
++#endif
++    if (mwr_fold_first && ctx.mwr_fold_experts == mm_node) {
++        return 0;
++    }
+     const int out_nodes[] = { i + 1 };
+     if (mul_node->op == GGML_OP_MUL &&
+             mul_node->src[0] == mm_node &&
+-- 
+2.53.0
+
