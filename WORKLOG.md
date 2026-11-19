@@ -1,3 +1,104 @@
+## 261119.006 (r322, RELEASE v17-4f9dfa0e3-r322) -- GitHub issue #333 CLOSED: the band's fixup period `P` is "enough blocks to fill the machine", not a flat `nsm/2`, so a tensor split that leaves a device 1 or 2 output tiles no longer idles half of it
+
+**Release:** `v17-4f9dfa0e3-r322`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `20aaa0fb6`
+(the `apply-all.sh` re-cut, tree `de717e7a5f`), 17 official + 1 temporary = 18 default blocks, optional
+`0100` -> `f5f16105f` / `0101` -> `e491fa1bb` (cumulative `54fcae875`).  **No block created, split or
+renumbered**: one same-block amendment, **block 05**
+(`ggml_cuda_fattn_band_wmma_split()` in `ggml/src/ggml-cuda/fattn-rdna.cuh` and its one call site in
+`fattn-common.cuh`).  One default moved (`P` for a device whose slice gets fewer than 4 output tiles), no
+environment variable added or removed, and no kernel arithmetic touched -- but `P` is numeric order, so the
+greedy text of every *banded* multi-device arm moves, and the record says which and by how much.
+
+### The report, and what it is
+
+@briansp2020 (their own series, FA unchanged): after rebasing onto r317 their long-context decode dropped, and
+bisecting traced it to r316's `P` change for quantized K/V (`nsm` -> `nsm/2`).  Their arm is qwen4exp
+(Qwen3.8-Flash-Next UD-IQ4_XS, head 256, GQA 12) on **2x R9700 `-sm tensor`**, q8_0 K/V, MTP `n_max 3`,
+`-c 262144`: `P` 32 beat `P` 16 by 4-9 % at ~16k-260k, with one noisy row (their ~65k) the other way, and they
+run `GGML_HIP_FA_BAND_WMMA_SPLIT=32` meanwhile.
+
+It reproduces here on the same shape (GSQ-IQ3_XXS + the shared MTP head, 2x R9700, q8_0 K/V, this box's
+`--load-mode dio --lazy-mode mlockr` in place of their `--host-experts mmap`): the new default **is** their
+`SPLIT=32` arm, cell for cell.  And the cause is not `P`'s value but what `P` multiplies.
+
+### The mechanism: the grid is `tiles x P`, and a tensor split cuts `tiles`
+
+`P` is the interleave period of the band's fixup layout and the launch is `gridDim = (tiles, P)`, where
+`tiles = ntiles_z_gqa * K->ne[2] * Q->ne[3]`.  A `-sm tensor` split cuts `K->ne[2]` (each device owns a range of
+K/V heads), so **adding devices lowers `tiles`**: qwen4exp (2 K/V heads, GQA 12) is 4 tiles per device on one
+GPU and **2 on two**; 27B (4 K/V heads) is 2/1/1 on three.  The band's 32-column block is 8 warps with a runtime
+`max_blocks_per_sm` of 3, and its measured saturation point is **2 blocks per SM** (64 blocks on gfx1201).  So
+r316's flat `P = nsm/2 = 16` is right for the 4-tile shape it was measured on (4 x 16 = 64) and wrong
+everywhere else: at 2 tiles it launches 32 blocks on 32 SMs (one per SM, a third of the machine's block slots)
+and at 1 tile 16 blocks (half the SMs idle).
+
+Re-measured per op (`test-backend-ops perf -o FLASH_ATTN_EXT`, band forced, q8_0, `us/run`, one R9700), step
+`P` 16 -> the optimum: **tiles 1** (256-dim GQA 6, 1 K/V head) 278.2 -> **138.0** (P 64) at kv 102400, 69.2 ->
+58.4 (P 32) at 16384; **tiles 2** (GQA 12, 1 head) 291.7 -> **215.0** (P 32) at 102400, 69.0 -> 65.8 at 16384;
+**tiles 4** (r316's shape) 401.4 at P 16 unchanged; **tiles 8** -> P 8 (150.0 vs 161.1 at 16384); **tiles 16** ->
+P 4 (280.3 vs 312.5).  The 128-dim class follows the same law with 4-warp blocks (tiles 2 -> P 64: 293.2 ->
+144.9 at 102400; tiles 16 -> P 16, where it already was).  Read as a rule: **`tiles x P = 2 blocks per SM`**, or
+equivalently ~16 warps in flight per SM, which for the 4-warp 128-dim row is 4 blocks per SM.
+
+In situ, 2 devices (a `rocprofv3` kernel trace at a 39485-token prompt): the band kernel itself is **103.2 ->
+82.1 us per launch per device (-20 %)**.
+
+### The fix
+
+`ggml_cuda_fattn_band_wmma_split(dst, tiles, nwarps)`:
+
+```
+P = max(nsm/2, ceil(nsm * blocks_per_sm / tiles)),   blocks_per_sm = max(1, 16 / nwarps)
+```
+
+`nsm/2` is the floor, so a device with 4 or more tiles keeps r316's value exactly and the change can only *raise*
+`P`; 2 blocks/SM for the 8-warp 256-dim row, 4 for the 4-warp 128-dim one, and 1 for the unmeasured 16-warp
+band_wide row (which therefore only moves when a device is left with a single tile).  `tiles` is a function of the
+K/V head count, the GQA ratio and `Q->ne[3]` -- never of `n_q` (`ntiles_x` is 1 for every width 1..8, in both the
+32-column and the 64-column band row) -- so this is still **one value per shape** and `GREEDY-PURITY.md` §98's
+invariant is intact: decode and its own verify reduce identically, and a per-device `P` (32/64/64 on a 3-device
+27B split) is legal because a device's attention output never crosses the split.
+
+### Correctness and gates (all green)
+
+* `test-backend-ops -o FLASH_ATTN_EXT`: **7381/7381** on ROCm0/1/2 and CPU, as r321.
+* `scripts/gate-spec-purity.sh`: **PASS** -- `plain == draft-mtp` on both caches on the 3-device `-sm tensor`
+  split where `P` is now 32/64/64 (q8_0 `c1f9d0b3f5b6`, bf16 `2fbc183348a8`), all four R/P/C/K axes pass on both
+  caches, and the width probe's flat **and** 256-cell-boundary arms are `PASS`, worst maxdiff **0**, at q8_0 and
+  bf16.  A constant-per-shape `P` is width-pure by construction, and this is the arm that shows it.
+* Deep-context purity where `P` differs from r321: 27B Q8_0 3 devices, q8_0 K/V, a 39185-token prompt, `-n 32`:
+  plain == `draft-mtp n3`, **`58439631ccc9`**.  qwen4exp 2 devices, a 39485-token prompt, `-n 32`:
+  `--spec-type none` 74.9 t/s against `draft-mtp n3` 100.3 t/s (1.34x, non-vacuous) with byte-identical text
+  **`35699210a30e`**.
+* Coherence, f16 K/V, below the band's work gate (so the change is inert there): 4B `8d89080db673`, 27B
+  `da2e2d192e21`, 35B-A3B `265c381dbc11`, 4B at `-ctk/-ctv q8_0` `8d89080db673` -- **all identical to r316/r321**.
+* `gate-prefill-logits.sh`: **mean KLD 0.000000 / same-top-p 100.000 %** (the band is decode/verify only).
+* `gate-per-block-build.sh --fast --changed-from 4262662b8`: **2/2**.  `validate-set.sh` GREEN, tree
+  `de717e7a5`.  GPU kernel journal and every run log clean.
+
+### Throughput
+
+2 devices, qwen4exp (the reporter's shape), plain decode (no speculator, so no step-mix confound): **70.3 -> 72.3
+t/s at 65k (+2.8 %)** and **66.9 -> 70.5 at 105k (+5.4 %)**.  With `draft-mtp n3` at a 128-token sample:
+**+7.5 %** at 65.7k and **+10.2 %** at 104.9k, -4.1 % at 39.5k and -2.3 % at 196.9k where the acceptance re-roll
+runs the other way (the reporter's own write-up calls their equivalent row the noisy one; a greedy speculative
+arm's token rate is `mean_len x steps/s`, and `P` moves the acceptance).
+
+3 devices, 27B Q8_0 (the delivery's own gate shape, now 2/1/1 tiles): plain decode 32k **42.4 -> 42.6 t/s
+(+0.4 %)**, 3 interleaved repeats each; `draft-mtp n3` at `-n 512` **31.5 ms/step both** (86.5 against 85.2 t/s,
+the token rate differing only by the re-roll: 188 against 191 steps for 512 tokens).  An `-n 128` reading of the
+same pair looked like -3.4 %/step; at ~45 steps one step of arithmetic resolution is 2 %, so that arm cannot
+resolve a step rate and the rule is now in `INVARIANTS.md` r322 item 5.
+
+### Issue #333 is CLOSED on this release
+
+The report's bisection was right and its `SPLIT=32` workaround becomes the default for their shape without them
+having to set anything: the reply records the reproduction, the mechanism (the grid is `tiles x P` and their two
+cards leave 2 tiles), the per-op table, the purity, and the two end-to-end arms, and notes that the arm they
+called noisy is the acceptance re-roll rather than the kernel.  The record is
+`benchmarks/2026-11-19-band-split-blocks-per-sm.md`; `TODO` #346's r316 conclusion is amended in place rather
+than replaced (its width compromise stands; its "one constant" did not).
+
 ## 261119.005 (r321, RELEASE v17-4f9dfa0e3-r321) -- GitHub issue #332 CLOSED: a gate-less MoE fusion was judged "one lane served" when its only lane was STAGED, so every single-lane fused launch stood itself down for as long as its table was staged (and the STAGED answer now owns the broken-promise repair, so no fused site has to remember it)
 
 **Release:** `v17-4f9dfa0e3-r321`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `4262662b8`

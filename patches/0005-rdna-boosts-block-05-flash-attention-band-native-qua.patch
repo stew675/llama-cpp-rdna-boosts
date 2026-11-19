@@ -1,4 +1,4 @@
-From 418fc2d99c6808c7774fd3c270b11cabd94dc8ad Mon Sep 17 00:00:00 2001
+From 0f086165675cd7b4e5d370f02b3c0309b8209da3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 12 Nov 2026 08:22:10 -0600
 Subject: [PATCH 05/17] rdna-boosts: block 05: flash-attention band, native
@@ -201,9 +201,9 @@ Records: `INVARIANTS.md` r316, `GREEDY-PURITY.md` 98, `benchmarks/2026-11-18-ban
  ggml/src/ggml-cpu/ops.cpp                     |   34 +-
  ggml/src/ggml-cuda/convert.cu                 |    6 +
  ggml/src/ggml-cuda/dequantize.cuh             |   13 +
- ggml/src/ggml-cuda/fattn-common.cuh           |  897 +++++++++++-
+ ggml/src/ggml-cuda/fattn-common.cuh           |  896 +++++++++++-
  ggml/src/ggml-cuda/fattn-mma-f16.cuh          | 1198 ++++++++++++++---
- ggml/src/ggml-cuda/fattn-rdna.cuh             |  607 +++++++++
+ ggml/src/ggml-cuda/fattn-rdna.cuh             |  620 +++++++++
  ggml/src/ggml-cuda/fattn-tile.cu              |   44 +-
  ggml/src/ggml-cuda/fattn-tile.cuh             |  612 +++++++--
  ggml/src/ggml-cuda/fattn-vec.cuh              |   14 +-
@@ -533,7 +533,7 @@ Records: `INVARIANTS.md` r316, `GREEDY-PURITY.md` 98, `benchmarks/2026-11-18-ban
  src/llama-kv-cache.h                          |   23 +
  src/llama-kv-cells.h                          |   53 +
  tests/test-backend-ops.cpp                    |  220 ++-
- 341 files changed, 6367 insertions(+), 695 deletions(-)
+ 341 files changed, 6379 insertions(+), 695 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-rdna.cuh
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_4-ncols2_8-dkq256-dv256.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_8-ncols2_8-dkq256-dv256.cu
@@ -1078,7 +1078,7 @@ index 651524be7..a8cf54eb5 100644
      const block_q4_1 * x = (const block_q4_1 *) vx;
  
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 83a0e2254..548c3665e 100644
+index 83a0e2254..a50937f82 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -8,6 +8,51 @@
@@ -1986,7 +1986,7 @@ index 83a0e2254..548c3665e 100644
      GGML_ASSERT(max_blocks_per_sm > 0);
      int parallel_blocks = max_blocks_per_sm;
  
-@@ -1231,7 +1985,31 @@ void launch_fattn(
+@@ -1231,7 +1985,29 @@ void launch_fattn(
          blocks_num.y = 1;
          blocks_num.z = 1;
  
@@ -2005,21 +2005,19 @@ index 83a0e2254..548c3665e 100644
 +        // band_wmma is the evaluation the group-skip gate above reads, so the two cannot disagree.
 +
 +        if (band_wmma) {
-+            // P = nsm/2 for every K/V type (r316): measured on gfx1201 (head 256, GQA 6, 4 KV heads,
-+            // nsm 32) the decode width's optimum is 16 on both type families, and the verify widths'
-+            // is 8 -- one constant cannot serve both, and the smaller one costs the decode width more
-+            // than it buys the verify.  The r133-era note that the verify cost was "flat for P 48..96
-+            // at kv 20K..200K" does not reproduce on this kernel (verify widths are monotone in P:
-+            // at kv 32768, n_q 8, q8_0, P 8/16/32/48/64/96 = 269/280/318/345/369/401 us); what is
-+            // flat is the *decode* width above P 24.  benchmarks/2026-11-18-band-fixup-period.md.
-+            const int P = ggml_cuda_fattn_band_wmma_split(dst);
++            // P (the fixup period / blocks per output tile) is a device and SHAPE constant: it targets
++            // ~16 warps in flight per SM, so it scales with how many output tiles this device's slice
++            // of the split actually gets.  See ggml_cuda_fattn_band_wmma_split; r316's flat nsm/2 is
++            // its floor (and is what the 4-tile shape it was measured on still gets).
++            // benchmarks/2026-11-18-band-fixup-period.md, benchmarks/2026-11-19-band-split-blocks-per-sm.md.
++            const int P = ggml_cuda_fattn_band_wmma_split(dst, ntiles_z_gqa * K->ne[2] * Q->ne[3], nwarps);
 +            blocks_num.x = ntiles_dst;
 +            blocks_num.y = P;
 +        } else if(use_stream_k) {
              const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
              // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
              // Only do this if the occupancy loss from rounding is acceptable.
-@@ -1247,8 +2025,9 @@ void launch_fattn(
+@@ -1247,8 +2023,9 @@ void launch_fattn(
              blocks_num.x = nblocks_stream_k;
          }
  
@@ -2031,7 +2029,7 @@ index 83a0e2254..548c3665e 100644
          }
      } else {
          // parallel_blocks must not be larger than what the tensor size allows:
-@@ -1260,28 +2039,59 @@ void launch_fattn(
+@@ -1260,28 +2037,60 @@ void launch_fattn(
          // feed different partial sums into the online-softmax/PV combine, drift the
          // logits in the last bits and flip greedy near-ties (issue #25).  Evaluate
          // the heuristic as if n_q == 1 so every small batch agrees.
@@ -2049,7 +2047,8 @@ index 83a0e2254..548c3665e 100644
 +        // the search reaches at saturation (one full wave, a device/width constant) and let a shorter
 +        // cache only take FEWER parallel blocks: then every block owns at most one KV iteration (the
 +        // order is ascending KV) and the extra trailing partials are neutral, which the combine adds as
-+        // exactly 0.  The band's own kernel already pins its P (`nsm/2`, r316) for the same reason.
++        // exactly 0.  The band's own kernel already pins its P for the same reason (a device/shape
++        // constant, `ggml_cuda_fattn_band_wmma_split`, r316/r322).
 +        const bool decode_verify_band = Q->ne[1] <= 8;
 +        const int ntiles_dst_eff = decode_verify_band ? (ntiles_z_gqa * K->ne[2] * Q->ne[3]) : ntiles_dst;
  
@@ -2108,7 +2107,7 @@ index 83a0e2254..548c3665e 100644
          }
  
          blocks_num.x = ntiles_x;
-@@ -1317,29 +2127,46 @@ void launch_fattn(
+@@ -1317,29 +2126,46 @@ void launch_fattn(
  
      GGML_ASSERT(block_dim.x % warp_size == 0);
  
@@ -2159,7 +2158,7 @@ index 83a0e2254..548c3665e 100644
              const int bpt         = nblocks_sk / ntiles_dst;
  
              const uint3 fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * K->ne[2]);
-@@ -1354,7 +2181,7 @@ void launch_fattn(
+@@ -1354,7 +2180,7 @@ void launch_fattn(
                  (float *) KQV->data, dst_tmp_meta.ptr,
                   Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                   gqa_ratio, bpt, fd0, fd1, fd2);
@@ -3914,10 +3913,10 @@ index 33856a38a..f5b09931f 100644
      extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 2,  2); \
 diff --git a/ggml/src/ggml-cuda/fattn-rdna.cuh b/ggml/src/ggml-cuda/fattn-rdna.cuh
 new file mode 100644
-index 000000000..529e05f6c
+index 000000000..380f22ec8
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/fattn-rdna.cuh
-@@ -0,0 +1,607 @@
+@@ -0,0 +1,620 @@
 +// RDNA/ROCm flash-attention predicates: the native-KV staging policy and selectors, and
 +// the RDNA4 decode/verify band (WMMA) helpers.  Split out of fattn-common.cuh (an upstream
 +// hub) so an upstream re-base collides with the predicate call points, not their bodies.
@@ -4288,16 +4287,23 @@ index 000000000..529e05f6c
 +    return 4;
 +}
 +
-+// Blocks per output tile in the band (the interleave period P, see launch_fattn).  P = nsm/2 on
-+// gfx1201 (nsm 32 -> 16), for every K/V type; GGML_HIP_FA_BAND_WMMA_SPLIT overrides it for tuning.
-+// Whatever the source, it must not depend on n_q or on the KV length, or decode and verify would
-+// split differently.  The value is a compromise the widths force: the decode width's optimum is the
-+// larger one (P 16 beats 24/32/48/64/96 at kv 8192-102400 and is 5-8 % off at 20480-32768), while
-+// the verify widths prefer half of that (P 8), and one constant has to serve both.  At a short cache
-+// the band is below every gate anyway (and a small P is *worse* there: 1024 cells, q8_0, n_q = 1,
-+// P 16 55.0 us against P 32 42.6).  Expressed as a fraction of nsm so a smaller RDNA4 part scales
-+// down with it.  Record: benchmarks/2026-11-18-band-fixup-period.md (`r316`).
-+static inline int ggml_cuda_fattn_band_wmma_split(const ggml_tensor * dst) {
++// Blocks per output tile in the band (the interleave period P, see launch_fattn).
++// GGML_HIP_FA_BAND_WMMA_SPLIT overrides it for tuning.  Whatever the source, it must not depend on n_q
++// or on the KV length, or decode and verify would split differently (GREEDY-PURITY.md §98).
++//
++// The default keeps ~16 warps in flight per SM, which is where the launch saturates: a 256-dim band
++// block is 8 warps (2 blocks/SM) and the 128-dim row's is 4 (4 blocks/SM).  `tiles` is the number of
++// OUTPUT TILES the device's own slice gets (ntiles_z_gqa x K/V heads x Q streams: a tensor split cuts
++// the K/V head count, so this is per device), and the grid is tiles x P -- so the tile count decides
++// how many blocks per tile are needed to fill the machine.  nsm/2 (16 on gfx1201) is the floor, which
++// is what a device with 4 tiles gets (4 x 16 = 64 blocks = the saturation point) and therefore keeps
++// r316's measured value for the shape it was measured on; a device that only gets 1 or 2 tiles needs
++// 64 or 32 blocks per tile instead, or most of the SMs idle (issue #333: a 2-device tensor split of
++// qwen4exp gives 2 tiles/device and P 16 cost 4-9 % against P 32).  The tile count is constant inside
++// the band (ntiles_x is 1 for n_q = 1..8), so P is still width- and extent-independent.
++// Records: benchmarks/2026-11-18-band-fixup-period.md (`r316`),
++// benchmarks/2026-11-19-band-split-blocks-per-sm.md (`r322`).
++static inline int ggml_cuda_fattn_band_wmma_split(const ggml_tensor * dst, const int tiles, const int nwarps) {
 +    GGML_UNUSED(dst);
 +    static const int env_split = []() {
 +        const char * env = getenv("GGML_HIP_FA_BAND_WMMA_SPLIT");
@@ -4308,7 +4314,13 @@ index 000000000..529e05f6c
 +        return env_split;
 +    }
 +    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
-+    return std::max(2, nsm/2);
++    // blocks per SM that keep ~16 warps resident: 2 for the 8-warp 256-dim row, 4 for the 4-warp
++    // 128-dim one, 1 for the 16-warp wide row (which therefore keeps nsm/2 unless a device gets < 2
++    // tiles) -- only two of those are measured, so the unmeasured one stays at r316's value.
++    const int bps     = std::max(1, 16 / std::max(1, nwarps));
++    const int ntiles  = std::max(1, tiles);
++    const int need    = (nsm*bps + ntiles - 1) / ntiles;
++    return std::max(std::max(2, nsm/2), need);
 +}
 +
 +// With q8_0 K and V the band launches a kernel variant that fetches the raw K/V bytes ahead into registers

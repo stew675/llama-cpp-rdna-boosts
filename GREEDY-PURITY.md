@@ -2755,7 +2755,7 @@ KLD 0.000000 / 100.000 % canonical and 0.004967 / 98.804 % on the family-switch 
 **Record.**  `INVARIANTS.md` r315, `MANIFESTS.md` gate 05, `ENVIRONMENT.md` §8, `WORKLOG.md` 261118.010,
 `benchmarks/2026-11-18-fa-band-h256.md`.
 
-## 98. A fixup period is a numeric-order constant: one value, chosen end to end, never keyed on the width (r316, block 05, `TODO` #346)
+## 98. A fixup period is a numeric-order constant: one value per SHAPE, chosen end to end, never keyed on the width (r316, block 05, `TODO` #346; amended r322, issue #333)
 
 **Claim.**  The RDNA4 band splits each output tile's KV over a fixed number `P` of blocks (`b = tile*P + i`, the
 uniform fixup combines the `P` partials in a fixed order), so `P` is **numeric order** — a change to it moves the
@@ -2796,8 +2796,31 @@ on a *banded* `-ub 4` family-switch point against same-kernel controls of 0.0041
 97.772 %; f16 K/V text byte-identical to r315 on five models, and the one moved q8_0 arm reproduces the r315
 build's `GGML_HIP_FA_BAND_WMMA_SPLIT=16` arm byte for byte.
 
-**Record.**  `INVARIANTS.md` r316, `MANIFESTS.md` gate 05, `ENVIRONMENT.md` §8, `WORKLOG.md` 261118.011,
-`benchmarks/2026-11-18-band-fixup-period.md`.
+**Amendment (r322, issue #333): "one constant" means one value per SHAPE -- the period also has to FILL the
+machine.**  The r316 text above is right that `P` may not depend on the width or the KV extent, and wrong in one
+respect: it read the measured 16 as a device constant, when 16 is only the optimum for the shape it was measured
+on.  The launch is `gridDim = (tiles, P)`, where `tiles` is the number of output tiles **this device's slice**
+gets and a tensor split cuts it (`K->ne[2]`, the K/V head count, is per device), so the block count is
+`tiles x P`: 4 tiles x 16 = 64 blocks is the saturation point (2 blocks/SM for the band's 8-warp block on nsm 32),
+and 2 tiles x 16 = 32 blocks is **one** block per SM while 1 tile x 16 idles half the SMs.  A `P` that ignores
+`tiles` therefore underfills on every multi-device split with few K/V heads per device -- qwen4exp (2 K/V heads,
+GQA 12) is 4 tiles on one GPU and 2 on two, and its 2-device decode lost 4-9 % (issue #333).  So the fifth part
+of the rule:
+
+5. *Scale `P` with the tile count the device gets, and target the machine, not a number.*  `P = max(nsm/2,
+   ceil(nsm * blocks_per_sm / tiles))` with `blocks_per_sm = max(1, 16 / nwarps)`: the measured per-tile-count
+   optima are 1 -> 64, 2 -> 32, 4 -> 16, 8 -> 8, 16 -> 4 on the 256-dim class (q8_0, n_q 1 and 4, kv
+   16384-102400; the op is 5-26 % slower off that point) and 2 -> 64 on the 128-dim one, i.e. **~16 warps in
+   flight per SM in every row**.  `tiles` is a function of the K/V head count, the GQA ratio and `Q->ne[3]` --
+   never of `n_q` (`ntiles_x` is 1 for widths 1..8 in both the 32- and 64-column band rows), so decode and its
+   own verify still reduce identically: the width probe is PASS maxdiff 0 on q8_0 and bf16, and `plain ==
+   draft-mtp` on both a 3-device 27B split (per-device `P` 32/64/64) and the reporter's 2-device qwen4exp one.
+   End to end: 2-device qwen4exp plain decode **+2.8 % / +5.4 %** at 65k / 105k (kernel 103.2 -> 82.1 µs/launch)
+   and the 3-device 27B arm flat (plain +0.4 %, 31.5 ms/step both with a draft); prefill KLD 0.000000.
+
+**Record.**  `INVARIANTS.md` r316 / r322, `MANIFESTS.md` gate 05 / 36, `ENVIRONMENT.md` §8, `WORKLOG.md`
+261118.011 / 261119.006, `benchmarks/2026-11-18-band-fixup-period.md`,
+`benchmarks/2026-11-19-band-split-blocks-per-sm.md`.
 
 ## 99. A decode/verify KV split is the summation order, so it must be a run constant, never a function of the padded KV extent (r319, block 05, issue #330)
 

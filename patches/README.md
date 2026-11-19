@@ -1052,6 +1052,26 @@ almost all of them `template-instances/*.cu`.
   the old search (A/B and the gate's negative control).  Gate: `MANIFESTS.md` gate 36
   (`scripts/gate-spec-purity.sh`) — `benchmarks/2026-11-19-fa-split-boundary-purity.md`, `INVARIANTS.md` r319,
   `GREEDY-PURITY.md` 99, `ENVIRONMENT.md` 8.
+* **The band's fixup period `P` is "enough blocks to fill the machine", not one constant (r322, issue #333).**
+  `ggml_cuda_fattn_band_wmma_split()` takes the number of **output tiles this device's slice gets**
+  (`ntiles_z_gqa x K/V heads x Q streams`) and the launcher's block width, and returns
+  `max(nsm/2, ceil(nsm * blocks_per_sm / tiles))` with `blocks_per_sm = max(1, 16 / nwarps)`: ~16 warps in
+  flight per SM, i.e. 2 blocks/SM for the 256-dim row (8 warps) and 4 for the 128-dim one (4 warps).  `nsm/2`
+  stays the floor, so a device with 4 or more tiles keeps r316's value exactly and the change can only *raise*
+  `P`.  The reason is structural: the band's grid is `tiles x P`, and a **tensor split cuts `K->ne[2]`**, so
+  adding devices lowers `tiles` — 2 K/V heads (qwen4exp, GQA 12) are 4 tiles on one GPU but **2 on two**, and
+  4 K/V heads (27B, GQA 6) are 2/1/1 on three.  At 2 tiles r316's `P` 16 launches 32 blocks on 32 SMs (one block
+  per SM out of a 3-block limit) and at 1 tile it idles half the SMs, so the op measures **5-26 % slower** there
+  and the reporter's 2-device qwen4exp decode lost 4-9 %.  `P` is still numeric order and still width- and
+  extent-independent (the tile count is constant for `n_q` 1..8, so a decode and its own verify reduce
+  identically): the width probe is `PASS` worst maxdiff 0 on q8_0 and bf16 and `plain == draft-mtp` holds on
+  both the 3-device 27B split (`P` 32/64/64) and the 2-device qwen4exp one.  Measured: the default now lands on
+  the per-tile-count optimum at 1/2/4/8/16 tiles, 2-device qwen4exp plain decode **+2.8 % / +5.4 %** at 65k /
+  105k (server `draft-mtp n3` +7.5 % / +10.2 %), and the 3-device 27B arm flat (plain +0.4 %, 31.5 ms/step both
+  with a draft).  Gate: `MANIFESTS.md` gate 36 (`scripts/gate-spec-purity.sh`, the band's own P is its
+  summation order) plus `test-backend-ops -o FLASH_ATTN_EXT` with the band forced on.  Record:
+  `benchmarks/2026-11-19-band-split-blocks-per-sm.md`, `INVARIANTS.md` r322, `GREEDY-PURITY.md` 98,
+  `ENVIRONMENT.md` 8.
 * **The band's fixup period `P` is one constant, `nsm/2`, for every K/V type (r316, `TODO` #346).**
   `ggml_cuda_fattn_band_wmma_split()` returns `max(2, nsm/2)` (`P` 16 on gfx1201, `nsm` 32) instead of `nsm` for
   the native-quantized types and `nsm/2` for f16/bf16; `ggml_cuda_fattn_band_wmma_two_byte()` and the launcher's

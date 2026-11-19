@@ -860,10 +860,14 @@ in CI.  The model-level gates are manual:
     asked the four-axis gate to gain.  And it runs `test-logits-width-probe` at `P=4096` for q8_0 and bf16; the probe's new `boundary` arm
     prefixes at `256*(P/256 + 1) - NW/2`, the prefix where W=1 and W=8 land on different
     `GGML_PAD(used, 256)` extents (a flat prefix on a 256-multiple puts every width in one padding block and
-    cannot see this class).  Required for any change to the tile FA launcher's KV split (`parallel_blocks`,
-    `gridDim.y`, the efficiency search), to `ggml_cuda_fattn_band_*`, to the KV extent/padding (`get_n_kv`,
-    `LLAMA_KV_N_PAD_*`), or to a speculator's verify batch composition -- and every release that touches
-    block 05.
+    cannot see this class).  **Since r322 it is also the gate for the band's own fixup period** (`P`,
+    `ggml_cuda_fattn_band_wmma_split`, issue #333): `P` is the band's summation order, so a tiles-dependent `P`
+    is exactly the "decode and its own verify must reduce identically" class -- the probe's flat and boundary
+    arms are the purity proof and per-device `P` differences (32/64/64 on a 3-device 27B split) are legal
+    because a device's attention never crosses the split.  Required for any change to the tile FA launcher's KV
+    split (`parallel_blocks`, `gridDim.y`, the efficiency search), to `ggml_cuda_fattn_band_*` (including
+    `ggml_cuda_fattn_band_wmma_split`), to the KV extent/padding (`get_n_kv`, `LLAMA_KV_N_PAD_*`), or to a
+    speculator's verify batch composition -- and every release that touches block 05.
 
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 

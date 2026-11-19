@@ -1,4 +1,4 @@
-From d1a418bf5e11a77adf8bff4c7d5a1fdbcbeff0b6 Mon Sep 17 00:00:00 2001
+From 505603f488860d167afbace02f16147014fd08d5 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 19 Nov 2026 09:05:55 -0600
 Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types (optional): K
@@ -22,7 +22,7 @@ Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types (optional): K
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_1.cu
 
 diff --git a/ggml/src/ggml-cuda/fattn-rdna.cuh b/ggml/src/ggml-cuda/fattn-rdna.cuh
-index 529e05f6c..9c4d13e13 100644
+index 380f22ec8..bb43d0435 100644
 --- a/ggml/src/ggml-cuda/fattn-rdna.cuh
 +++ b/ggml/src/ggml-cuda/fattn-rdna.cuh
 @@ -265,6 +265,29 @@ static inline int ggml_cuda_fattn_tile_kv_native_type(const ggml_tensor * K, con
@@ -75,7 +75,7 @@ index 529e05f6c..9c4d13e13 100644
  // Decode/verify band (n_q <= 8) on RDNA4: the whole GQA group is folded into one block
  // (ncols2 = 8) via the WMMA kernel instead of the tile kernel's ncols2 = 2, which fetches and
  // dequantizes every K/V element once per head pair (3x for GQA 6).  This is the default; the env var
-@@ -593,7 +624,8 @@ static inline bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_te
+@@ -606,7 +637,8 @@ static inline bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_te
      // is the default since the r6 flip; it is deliberately NOT banded while it is staged, where the
      // whole-cache conversion dominates (that staged case only appears under GGML_CUDA_FA_KV_NATIVE=0).
      const int  kv_native = ggml_cuda_fattn_kv_native_type(K);

@@ -1183,3 +1183,38 @@ Record: `WORKLOG.md` 261119.004, `GREEDY-PURITY.md` §100, `patches/README.md` b
 
 Record: `WORKLOG.md` 261119.005, `GREEDY-PURITY.md` §101, `patches/README.md` block 10, `MANIFESTS.md` gate 28,
 issue #332, `scripts/gate-moe-promise.sh`.
+
+## r322 (2026-11-19, `WORKLOG.md` 261119.006) — the band's fixup period must FILL the machine, and a tensor split's per-device tile count decides how (issue #333)
+
+1. **`gridDim = (tiles, P)`, so `P` alone does not set the block count.**  The RDNA4 band launches one block per
+   (output tile, interleave phase); `tiles = ntiles_z_gqa * K->ne[2] * Q->ne[3]` and a **`-sm tensor` split cuts
+   `K->ne[2]`** (each device owns a range of K/V heads), so adding devices *lowers* `tiles`: qwen4exp (2 K/V heads,
+   GQA 12) is 4 tiles per device on one GPU but **2 on two**, and 27B (4 K/V heads) is 2/1/1 on three.  The
+   32-column band row is an 8-warp block whose runtime `max_blocks_per_sm` is 3, and the measured saturation point
+   is **2 blocks per SM**: at r316's flat `P` 16 a 2-tile device launched 32 blocks on 32 SMs (one per SM) and a
+   1-tile device only 16 (half the SMs idle).  Symptom, per op (q8_0, `n_q` 1/4): 291.7 -> 215.0 us at 2 tiles
+   and 278.2 -> 138.0 at 1 tile (kv 102400), 69.0 -> 65.8 at 2 tiles (kv 16384), and 5-26 % in every other row.
+2. **The rule is a warps-in-flight target, and the tile count is a legal input.**  `P = max(nsm/2, ceil(nsm *
+   blocks_per_sm / tiles))`, `blocks_per_sm = max(1, 16 / nwarps)`: 2 blocks/SM for the 8-warp 256-dim row and 4
+   for the 4-warp 128-dim one, i.e. ~16 warps resident per SM.  The measured per-tile-count optima (1/2/4/8/16 ->
+   `P` 64/32/16/8/4 on the 256-dim class, 2 -> 64 on the 128-dim one) are exactly that, and `nsm/2` is the floor,
+   so a device with 4 or more tiles keeps r316's value and nothing can be lowered.  `tiles` depends on the K/V head
+   count, the GQA ratio and `Q->ne[3]` only -- `ntiles_x` is 1 for every width 1..8 -- so this is still one value
+   per shape and never keyed on `n_q` or the KV extent (`GREEDY-PURITY.md` §98.5).
+3. **A per-device `P` is fine; a per-width one is not.**  The three devices of a 27B `-sm tensor` run now take
+   `P` 32/64/64, i.e. three different summation orders inside one layer, and that is *not* an impurity: each
+   device's attention output is its own heads and never crosses a device.  What would be an impurity is decode and
+   its own verify choosing differently, and the width probe (`PASS`, worst maxdiff 0, q8_0 and bf16) plus
+   `plain == draft-mtp` on both the 3-device 27B (`58439631ccc9`) and the 2-device qwen4exp (`35699210a30e`) arms
+   are the proof that they do not.
+4. **The fixup combine is proportional to `P`, which is why "more blocks" is not free.**  Per launch on a 27B
+   trace: 8.8 us at `P` 16 -> 31.3 us at `P` 64, against an FA kernel that fell 150.4 -> 75.2 us.  The op table
+   already prices it (it times the whole op), and the 1-tile rows' optimum drifts from `P` 32 (16-32k) to `P` 64
+   (102k) as its share falls; one constant cannot follow that, and the saturation point is the compromise.
+5. **A short greedy speculative arm cannot resolve a step rate.**  `-n 128` at a mean accepted length of ~2.8 is
+   ~45 steps, so one step of arithmetic resolution is 2 %: the same 27B pair read -3.4 %/step at `-n 128` and
+   **0.0 %** at `-n 512` (31.5 ms/step both, 188 against 191 steps for 512 tokens -- the token rate differs only
+   by the acceptance re-roll).  Quote the long arm, and derive steps as `tokens - accepted` before comparing.
+
+Record: `WORKLOG.md` 261119.006, `GREEDY-PURITY.md` §98, `patches/README.md` block 05, `MANIFESTS.md` gate 05/36,
+`ENVIRONMENT.md` §8, issue #333, `benchmarks/2026-11-19-band-split-blocks-per-sm.md`.

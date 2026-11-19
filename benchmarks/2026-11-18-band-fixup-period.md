@@ -1,5 +1,11 @@
 # The RDNA4 band's fixup period `P`: one constant, `nsm/2`, for every K/V type (r316, block 05, `TODO` #346)
 
+> **Amended by r322 (issue #333):** the width compromise measured below stands, but "one constant" was one
+> constant *per shape* and this record's shape was a 1-GPU run (4 output tiles per device, where `nsm/2` gives
+> 64 blocks = the saturation point).  A tensor split cuts the per-device tile count, so the constant has to
+> scale with it; see `benchmarks/2026-11-19-band-split-blocks-per-sm.md`.  Every `P` table below was read on
+> 4 tiles, which is why 16 measured best here.
+
 Everything here was measured on the primary box: 3× RX 9070 XT / R9700 (gfx1201), ROCm 10.1.0,
 `~/llama-scratch` (one long-lived source path, `build-rocm`), the r315 block-05 chain plus this change.
 `ROCBLAS_USE_HIPBLASLT=0` on every fresh-process comparison (INVARIANTS r44).  `nsm` as ggml counts it on this
