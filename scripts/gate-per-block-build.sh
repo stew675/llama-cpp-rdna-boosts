@@ -89,6 +89,14 @@
 #   --targets "T1 T2 ..."        an explicit target list (default: `all`)
 #   --list-only                  print the commits that would be built, then exit
 #
+#   PROGRESS_SECS=N              heartbeat period, in seconds, while a rung is COMPILING (default 30,
+#                                0 disables).  The per-rung line is printed before configure, but a
+#                                rung that is a 6-7 minute cold build used to run in total silence
+#                                (its output goes to the rung log), which made it impossible to tell
+#                                a long build from a hung one.  The heartbeat prints elapsed seconds
+#                                on that rung and the cumulative gate time; a finish line after each
+#                                rung adds the rungs still to go, so the end of the ladder is visible.
+#
 #   HF_UI_VERSION=<tag>          upstream's own knob (tools/ui/CMakeLists.txt) for the llama-ui
 #                                asset bundle a fresh configure downloads.  Unset (the default) it
 #                                resolves `latest`.  Set it when upstream publishes a bundle that
@@ -115,6 +123,7 @@ GPU_TARGETS="${GPU_TARGETS:-gfx1201}"
 KEEP_GOING=0
 LIST_ONLY=0
 CHANGED_FROM=""
+PROGRESS_SECS="${PROGRESS_SECS:-30}"
 # The release profile: the libraries plus the binaries the delivery actually ships/uses.  It drops the
 # test and example/tool binaries, whose coverage is the tip's own gates (the release flow builds the
 # tip with `all` once, and `test-backend-ops -o ...` runs there).
@@ -204,6 +213,7 @@ LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rboosts-per-block.XXXXXX")"
 ORIG_REF="$(git -C "$REPO" symbolic-ref -q --short HEAD || git -C "$REPO" rev-parse HEAD)"
 echo "==> per-block build gate: $BASE..$TIP in $REPO (targets: $TARGETS)"
 echo "    logs: $LOG_DIR   build dir: $REPO/$BUILD_DIR   jobs: $JOBS"
+echo "    progress: a heartbeat every ${PROGRESS_SECS}s while a rung compiles (PROGRESS_SECS=0 disables)"
 [ -n "$CHANGED_FROM" ] && echo "    changed-from: $CHANGED_FROM (blocks whose own delta is unchanged are skipped; the tip is always built)"
 
 # --changed-from: map subject -> patch-id for the reference chain.  Block subjects are
@@ -245,14 +255,16 @@ if [ "$LIST_ONLY" = 1 ]; then
     exit 0
 fi
 
+n_sel=${#selected[@]}
 total=0; ok=0; failed=0; t_gate0="$(date +%s)"; declare -a fail_list=()
 for c in "${selected[@]}"; do
     total=$((total+1)); t_blk0="$(date +%s)"
     subj="$(git -C "$REPO" log -1 --format=%s "$c")"
-    printf '==> [%2d] %s %s\n' "$total" "${c:0:9}" "$subj"
+    printf '==> [%2d/%d] %s %s\n' "$total" "$n_sel" "${c:0:9}" "$subj"
     git -C "$REPO" checkout -q "$c" || { echo "    CHECKOUT FAILED"; failed=$((failed+1)); fail_list+=("$c checkout"); [ "$KEEP_GOING" = 0 ] && break; continue; }
 
     rm -rf "$REPO/$BUILD_DIR"
+    echo "    configuring (fresh build dir) ..."
     if ! HIPCXX="$ROCM_DIR/lib/llvm/bin/clang" HIP_PATH="$ROCM_DIR" \
         cmake -S "$REPO" -B "$REPO/$BUILD_DIR" \
             -DGGML_RPC=1 -DGGML_HIP=ON -DGGML_NATIVE=1 -DGGML_HIP_RCCL=1 \
@@ -278,10 +290,25 @@ for c in "${selected[@]}"; do
         [ "$KEEP_GOING" = 0 ] && break
         continue
     fi
-    if cmake --build "$REPO/$BUILD_DIR" --target $TARGETS -j "$JOBS" -- -k \
-            > "$LOG_DIR/${total}.build.log" 2>&1; then
-        echo "    BUILD OK ($(( $(date +%s) - t_blk0 ))s)"
+    # Compile in the background so the heartbeat can say the rung is still alive.  A 6-7 minute cold
+    # rung with no output is indistinguishable from a hang (and the fans spin down between rungs), so
+    # every rung reports its elapsed time and how many rungs are left.
+    echo "    building $TARGETS ..."
+    t_build0="$(date +%s)"
+    cmake --build "$REPO/$BUILD_DIR" --target $TARGETS -j "$JOBS" -- -k \
+        > "$LOG_DIR/${total}.build.log" 2>&1 &
+    bp=$!
+    if [ "$PROGRESS_SECS" -gt 0 ] 2>/dev/null; then
+        while kill -0 "$bp" 2>/dev/null; do
+            sleep "$PROGRESS_SECS"
+            kill -0 "$bp" 2>/dev/null || break
+            echo "    ... still building rung $total/$n_sel: $(( $(date +%s) - t_build0 ))s on this rung, $(( $(date +%s) - t_gate0 ))s total"
+        done
+    fi
+    wait "$bp"; brc=$?
+    if [ "$brc" -eq 0 ]; then
         ok=$((ok+1))
+        echo "    BUILD OK ($(( $(date +%s) - t_blk0 ))s)  -- rung $total/$n_sel done, $(( n_sel - total )) rung(s) left, $(( $(date +%s) - t_gate0 ))s of gate time so far"
     else
         echo "    BUILD FAILED (log: $LOG_DIR/${total}.build.log)"
         grep -E "error:" "$LOG_DIR/${total}.build.log" \
