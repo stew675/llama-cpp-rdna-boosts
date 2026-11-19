@@ -1077,11 +1077,13 @@ kill-switch, default on).
    (`M = -inf` -> `expf(-inf) = 0`, added as exactly 0).  The `ntiles_KV = P_const` crossing is exact because the
    round-robin split is one iteration per block there too.  The RDNA4 band kernel already pins its own P
    (`nsm/2`, r316) for the same reason; this is the tile path the band declines below its work gate.
-4. **Only the 3-device `-sm tensor` plain arm moved, and it moved onto the verify arm's numerics.**  Post-fix
+4. **Only the 3-device `-sm tensor` LAYOUT's text moved, and it moved onto the ascending order.**  Post-fix
    manifest A plain == draft `c1f9d0b3f5b6` and B `2fbc183348a8` (3 GPU tensor, 27B Q8_0, `-n 512`); the old
    plain pair (`120c74935967` / `7dca501eeb0e`) is reproduced exactly by `GGML_CUDA_FA_SPLIT_CONST=0` on the same
-   binary.  4B 1 GPU `-sm layer` `be6407e421c8`, 27B 2 GPU tensor `b1c84ba23a2c` and 27B 3 GPU `-sm layer`
-   `f59aa0be6536` are unchanged (the last two are issue #330's own published hashes).
+   binary.  In A the plain arm moved onto the draft's text; in B both arms moved (the draft `759c1a4515c6` ->
+   `2fbc183348a8`) because the old search keyed *every* band batch on its own padded extent.  4B 1 GPU
+   `-sm layer` `be6407e421c8`, 27B 2 GPU tensor `b1c84ba23a2c` and 27B 3 GPU `-sm layer` `f59aa0be6536` are
+   unchanged (the last two are issue #330's own published hashes).
 5. **The class is not device-count specific; the LAYOUT is what exposes it.**  The width probe's boundary arm
    fails pre-fix on the 3-device tensor layout (`ndst_eff = 3`, `bpw = 576`) and passes pre-fix on the layer
    layout (its `ndst_eff` makes the old search pick `ntiles_KV`).  A gate for this class must therefore run a

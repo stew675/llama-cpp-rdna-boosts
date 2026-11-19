@@ -846,7 +846,9 @@ in CI.  The model-level gates are manual:
     arm's Generation t/s must be >= 1.2x the plain arm's (NON-VACUITY -- a speculator that drafted nothing
     would satisfy the equality trivially).  `--control` runs manifest A with `GGML_CUDA_FA_SPLIT_CONST=0`
     (the pre-fix `ntiles_KV`-driven split) and requires it to **diverge**, so the gate is shown to have teeth.
-    It also runs `test-logits-width-probe` at `P=4096` for q8_0 and bf16; the probe's new `boundary` arm
+    It also runs the four-axis protocol's R/P/C/K prompts on the same 3-device tensor split on both caches
+    (`--n-axis`, default 512; `--no-four-axis` to skip), requiring plain == draft per axis -- the arm issue #330
+    asked the four-axis gate to gain.  And it runs `test-logits-width-probe` at `P=4096` for q8_0 and bf16; the probe's new `boundary` arm
     prefixes at `256*(P/256 + 1) - NW/2`, the prefix where W=1 and W=8 land on different
     `GGML_PAD(used, 256)` extents (a flat prefix on a 256-multiple puts every width in one padding block and
     cannot see this class).  Required for any change to the tile FA launcher's KV split (`parallel_blocks`,

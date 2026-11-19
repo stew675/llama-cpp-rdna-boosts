@@ -21,6 +21,10 @@
 #   require:      generated text byte-identical (the claim)
 #                 the draft arm's Generation t/s >= 1.2x the plain arm's (NON-VACUITY: a speculator
 #                 that drafted nothing would pass the equality trivially)
+#   then the FOUR AXES (the MTP protocol's R/P/C/K prompts, reasoning on only for R) on the same
+#   3-device tensor split on BOTH cache types: plain == draft per axis at --n-axis (default 512).
+#   This is the arm the issue asked the four-axis protocol to gain; the throughput verdict stays
+#   the 1-GPU -n 3000 protocol, this is a purity arm.
 #
 # OPTIONAL ARMS:
 #   --control        also run manifest A with GGML_CUDA_FA_SPLIT_CONST=0 (the pre-fix split search) and
@@ -46,6 +50,8 @@ DEVICES="0,1,2"
 N=512
 CONTROL=0
 PROBE_ARM=1
+FOUR_AXIS=1
+N_AXIS=512
 PROBE_BIN=""
 BUILD=""
 
@@ -57,6 +63,8 @@ while [ $# -gt 0 ]; do
         --control)  CONTROL=1; shift ;;
         --probe)    PROBE_ARM=1; PROBE_BIN="$2"; shift 2 ;;
         --no-probe) PROBE_ARM=0; shift ;;
+        --no-four-axis) FOUR_AXIS=0; shift ;;
+        --n-axis)   N_AXIS="$2"; shift 2 ;;
         --build)    BUILD="$2"; shift 2 ;;
         -h|--help)  sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "ERROR: unknown argument: $1" >&2; exit 2 ;;
@@ -88,7 +96,7 @@ run_arm() {
     local log="$WORK/$tag.log"
     # shellcheck disable=SC2086
     env HIP_VISIBLE_DEVICES="$DEVICES" ROCBLAS_USE_HIPBLASLT=0 $envs "$CLI" \
-        -m "$MODEL" -ngl 99 -t 16 -c 102400 -n "$N" --seed 42 --temp 0 -fa 1 -sm tensor \
+        -m "$MODEL" -ngl 99 -t 16 -c 102400 -n "${ARM_N:-$N}" --seed 42 --temp 0 -fa 1 -sm tensor \
         --no-display-prompt --single-turn -ctk "$ct" -ctv "$ct" \
         -f "$REPO_DIR/prompts/$prompt" --reasoning "$reason" \
         $spec > "$log" 2>&1 || { echo "ERROR: arm $tag failed (see $log)" >&2; return 1; }
@@ -147,6 +155,31 @@ if [ "$CONTROL" = 1 ]; then
     else
         say "  PASS control: the pre-fix arm diverges, so the equality above is not vacuous"
     fi
+fi
+
+if [ "$FOUR_AXIS" = 1 ]; then
+    export ARM_N="$N_AXIS"
+    for ct in q8_0 bf16; do
+        for axis in reasoning prose code recall; do
+            case "$axis" in
+                reasoning) reason=on;  prompt=reasoning.txt ;;
+                prose)     reason=off; prompt=prose-rdna-boosts.txt ;;
+                code)      reason=off; prompt=code-python.txt ;;
+                recall)    reason=off; prompt=recall.txt ;;
+            esac
+            a_p=$(run_arm "ax_${ct}_${axis}_plain" "--spec-type none" "$ct" "$prompt" "$reason") || { fail=1; continue; }
+            a_d=$(run_arm "ax_${ct}_${axis}_draft" "--spec-type draft-mtp --spec-draft-n-max 3" "$ct" "$prompt" "$reason") || { fail=1; continue; }
+            read -r ax_p_chars ax_p_sha ax_p_gen <<<"$a_p"
+            read -r ax_d_chars ax_d_sha ax_d_gen <<<"$a_d"
+            if [ "$ax_p_chars" -lt 100 ] || [ "$ax_p_sha" != "$ax_d_sha" ]; then
+                say "  FAIL axis $ct/$axis: plain ${ax_p_chars} chars $ax_p_sha against draft ${ax_d_chars} chars $ax_d_sha"
+                fail=1
+            else
+                say "  PASS axis $ct/$axis: ${ax_p_chars} chars $ax_p_sha (plain ${ax_p_gen} t/s, draft ${ax_d_gen} t/s)"
+            fi
+        done
+    done
+    unset ARM_N
 fi
 
 if [ "$PROBE_ARM" = 1 ]; then

@@ -2831,7 +2831,8 @@ plain `120c74935967` against `draft-mtp n3` `c1f9d0b3f5b6`; bf16 reasoning plain
 extent 5888 against the plain's 5632; bit-identical top-2 logits over the preceding 373 positions), and the probe's
 boundary arm reads **maxdiff 0.232868** (q8_0) / **0.196008** (bf16) pre-fix, **0** post-fix.  Post-fix both manifests
 read one text (`c1f9d0b3f5b6` / `2fbc183348a8`), and `GGML_CUDA_FA_SPLIT_CONST=0` reproduces the pre-fix pair exactly.
-Only the 3-device tensor plain arm moved (it moved onto the verify's ascending order); 4B 1 GPU `-sm layer`
+Only the 3-device tensor layout moved (in A the plain arm onto the draft's text, in B both arms onto a new
+common text, because the old search keyed every band batch on its own padded extent); 4B 1 GPU `-sm layer`
 `be6407e421c8`, 27B 2 GPU tensor `b1c84ba23a2c` and 27B 3 GPU `-sm layer` `f59aa0be6536` are unchanged.  Decode is flat
 at every depth to 131k (tg128 46.6 / 45.6 / 42.3 / 34.6 t/s at d0/8k/32k/131k, both arms) and prefill is untouched.
 

@@ -52,9 +52,14 @@ arm and the gate's negative control).
 | B: bf16, reasoning | 2689 `2fbc183348a8` | 2689 `2fbc183348a8` | 2746 `7dca501eeb0e` |
 
 The pre-fix pair is reproduced **on the same binary** by the control arm, so the whole difference is the
-split choice.  Only the plain 3-device tensor arm moved, and it moved onto the verify arm's numerics (the
-ascending order): 4B 1 GPU `-sm layer` `be6407e421c8`, 27B 2 GPU (0,2) tensor `b1c84ba23a2c` and 27B 3 GPU
-`-sm layer` `f59aa0be6536` are unchanged (the last two are issue #330's own published hashes).
+split choice.  **The 3-device `-sm tensor` layout's text moved**: in manifest A the plain arm moved onto the
+text the draft arm already read (`c1f9d0b3f5b6`), and in manifest B both arms moved to a new common text
+(the draft's own padded extent also tripped the off-by-one at another boundary, `759c1a4515c6` ->
+`2fbc183348a8`).  Every other layout is unchanged: 4B 1 GPU `-sm layer` `be6407e421c8`, 27B 2 GPU (0,2)
+tensor `b1c84ba23a2c` and 27B 3 GPU `-sm layer` `f59aa0be6536` (the last two are issue #330's own
+published hashes).  *Correction after first publication: this paragraph first said "only the plain arm
+moved"; the draft arm moved too in manifest B, because the old search keyed every decode/verify band batch
+on its own padded extent, not only the plain ones.*
 
 ### The instrument the class was missing
 
@@ -76,7 +81,11 @@ already returned whenever it did not trip the off-by-one.
 
 * `scripts/gate-spec-purity.sh` **NEW**: manifest A and B plain == draft, byte for byte, with a non-vacuity
   check (draft Generation t/s >= 1.2x plain) and a `--control` arm that must DIVERGE.  PASS (A
-  `c1f9d0b3f5b6`, B `2fbc183348a8`), control diverges, probe flat + boundary maxdiff 0 for q8_0 and bf16.
+  `c1f9d0b3f5b6`, B `2fbc183348a8`), control diverges, probe flat + boundary maxdiff 0 for q8_0 and bf16.  It
+  also runs the four-axis protocol's R/P/C/K prompts on the same 3-device tensor split on **both** caches
+  (`--n-axis`, default 512): plain == draft on all eight, and the q8_0 axis hashes reproduce the issue's own
+  published `000b437b135b` (reasoning) / `eb89102cb7d8` (code) / `a87c4318b649` (recall), with prose equal to
+  manifest A.
 * Four-axis MTP Protocol A, 1 GPU, 27B Q4_K_XL, bf16, `-n 3000`: plain == draft on R/P/C/K, acceptance
   **0.53656 / 0.80437 / 0.86819 / 0.99200**.  The same four axes on **3 GPU `-sm tensor`, `-n 1000`, on BOTH
   q8_0 and bf16** (the arm the issue asked the gate to gain): plain == draft on all eight, acceptance

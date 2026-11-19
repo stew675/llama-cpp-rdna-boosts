@@ -81,8 +81,10 @@ the tile path, which the band declines below its work gate (10 000 cells for GQA
 | B: bf16, reasoning | 2689 `2fbc183348a8` | 2689 `2fbc183348a8` | 2746 `7dca501eeb0e` |
 
 The control arm (same binary, `GGML_CUDA_FA_SPLIT_CONST=0`) reproduces the pre-fix text exactly, so the
-whole difference is the split choice.  Only the plain 3-device `-sm tensor` arm moves; it moves onto the
-verify arm's numerics, i.e. onto the ascending order.  The other layouts are untouched:
+whole difference is the split choice.  The **3-device `-sm tensor` layout** is what moves: in A the plain
+arm moves onto the text the draft already read (`c1f9d0b3f5b6`, the old draft), and in B both arms move (the
+old draft `759c1a4515c6` -> `2fbc183348a8`) because the old search keyed *every* band batch on its own padded
+extent.  The other layouts are untouched:
 
 | arm | post-fix | pre-fix |
 |---|---|---|

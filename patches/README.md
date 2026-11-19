@@ -10,7 +10,7 @@
 > verify took a different split than the decode of the same row (176 against 175 at `nkv` 5632) and the logits moved by
 > up to **0.232868** -- enough to flip a greedy near-tie.  For `Q->ne[1] <= 8` the split is now a run constant
 > (`min(P_const, ntiles_KV)`, `P_const` = the search's one-full-wave value), which is exact by construction; only the
-> plain 3-device tensor arm moves (onto the verify's numerics), 4B 1 GPU / 27B 2 GPU tensor / 27B 3 GPU `-sm layer` are
+> 3-device tensor layout's text moves, 4B 1 GPU / 27B 2 GPU tensor / 27B 3 GPU `-sm layer` are
 > unchanged, and decode is flat to 131k.  `GGML_CUDA_FA_SPLIT_CONST=0` restores the old search.  The width probe gained
 > a 256-cell-boundary prefix arm (that is why it read PASS through r318), and the new gate is
 > `scripts/gate-spec-purity.sh`.  Record: `WORKLOG.md` 261119.003, `INVARIANTS.md` r319, `GREEDY-PURITY.md` 99,
@@ -1005,8 +1005,9 @@ almost all of them `template-instances/*.cu`.
   `Q->ne[1] <= 8` the split is now `min(P_const, ntiles_KV)` with `P_const` = the search's one-full-wave value
   (`nsm * max_blocks_per_sm`): deep KV appends only fully-masked no-ops and combines in one fixed order, shallow KV
   is one iteration per block (ascending), and the `ntiles_KV = P_const` crossing is exact.  Only the 3-device tensor
-  plain arm moves (4B 1 GPU `be6407e421c8`, 27B 2 GPU tensor `b1c84ba23a2c` and 27B 3 GPU `-sm layer`
-  `f59aa0be6536` are unchanged) and decode is flat at every depth to 131k.  `GGML_CUDA_FA_SPLIT_CONST=0` restores
+  layout's text moves (in A the plain arm onto the draft's text, in B both arms; 4B 1 GPU `be6407e421c8`, 27B
+  2 GPU tensor `b1c84ba23a2c` and 27B 3 GPU `-sm layer` `f59aa0be6536` are unchanged) and decode is flat at
+  every depth to 131k.  `GGML_CUDA_FA_SPLIT_CONST=0` restores
   the old search (A/B and the gate's negative control).  Gate: `MANIFESTS.md` gate 36
   (`scripts/gate-spec-purity.sh`) — `benchmarks/2026-11-19-fa-split-boundary-purity.md`, `INVARIANTS.md` r319,
   `GREEDY-PURITY.md` 99, `ENVIRONMENT.md` 8.
