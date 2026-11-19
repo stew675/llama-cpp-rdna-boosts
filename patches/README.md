@@ -1,5 +1,21 @@
 # The delivery patches — what each block is and what it does
 
+> **r319: a speculator must not change the greedy text, and the tile FA KV split was keyed on the padded KV extent (GitHub issue #330), an amendment to block 05 (+ the block-10 probe).**
+> `--spec-type none` and `--spec-type draft-mtp` emitted different greedy text on a 3-device `-sm tensor` split (q8_0
+> prose `120c74935967` / `c1f9d0b3f5b6`; bf16 reasoning `7dca501eeb0e` / `759c1a4515c6`).  Not the speculator: at the FA
+> op `K->ne[1]` is the KV cache's **padded used extent** (`GGML_PAD(used, 256)`), computed *after* the batch is
+> applied, so a W-row verify batch sees `pad(p+W)` against the plain decode's `pad(p+1)`; the tile launcher's KV split
+> `parallel_blocks` (which **is** the reduction's association: block b owns iterations b, b+P, ... and the combine sums
+> the P partials in block order) was picked by an efficiency search over `ntiles_KV`, so at a 256-cell multiple the
+> verify took a different split than the decode of the same row (176 against 175 at `nkv` 5632) and the logits moved by
+> up to **0.232868** -- enough to flip a greedy near-tie.  For `Q->ne[1] <= 8` the split is now a run constant
+> (`min(P_const, ntiles_KV)`, `P_const` = the search's one-full-wave value), which is exact by construction; only the
+> plain 3-device tensor arm moves (onto the verify's numerics), 4B 1 GPU / 27B 2 GPU tensor / 27B 3 GPU `-sm layer` are
+> unchanged, and decode is flat to 131k.  `GGML_CUDA_FA_SPLIT_CONST=0` restores the old search.  The width probe gained
+> a 256-cell-boundary prefix arm (that is why it read PASS through r318), and the new gate is
+> `scripts/gate-spec-purity.sh`.  Record: `WORKLOG.md` 261119.003, `INVARIANTS.md` r319, `GREEDY-PURITY.md` 99,
+> `benchmarks/2026-11-19-fa-split-boundary-purity.md`.
+>
 > **r318: the Q8_1 MUL fusion counts readers THROUGH VIEWS, so a LoRA's delta is not dropped (GitHub issue #331, `Nyshone`), an amendment to block 10.**
 > `ggml_cuda_find_mul_q8_1_matmul()` guards the `UNARY(silu/sigmoid/softplus) -> MUL -> MUL_MAT` decode fusion by
 > requiring the MUL to have exactly one consumer, because the fused kernel writes only the matmul's Q8_1 activation
@@ -976,6 +992,24 @@ almost all of them `template-instances/*.cu`.
 
 **Contents.**
 
+* **The decode/verify KV split is a RUN CONSTANT, not a function of the padded KV extent (r319, GitHub issue
+  #330).**  The **tile** launcher's `parallel_blocks` (`gridDim.y`) is the reduction's association: block b owns
+  KV iterations b, b+P, b+2P, … and `flash_attn_combine_results` adds the P partials in block order.  It was chosen
+  by an efficiency search over `ntiles_KV = ceil(K->ne[1] / nbatch_fa)`, and `K->ne[1]` is the KV cache's
+  **padded used extent** (`GGML_PAD(used, 256)`, computed *after* the batch is applied), so a W-row verify batch at
+  position p sees `pad(p+W)` against the plain decode's `pad(p+1)`.  At a 256-cell multiple the two took different
+  splits (measured 3 GPU `-sm tensor`, 27B Q8_0: `nkv` 5632 → `ntiles_KV` 176, old P 175, new 176), which put
+  iteration 175 into block 0 and moved the logits by up to **0.232868** — a greedy near-tie flipped, so
+  `--spec-type none` and `--spec-type draft-mtp` emitted different text (the q8_0 prose pair
+  `120c74935967` / `c1f9d0b3f5b6` and the bf16 reasoning pair `7dca501eeb0e` / `759c1a4515c6`).  For
+  `Q->ne[1] <= 8` the split is now `min(P_const, ntiles_KV)` with `P_const` = the search's one-full-wave value
+  (`nsm * max_blocks_per_sm`): deep KV appends only fully-masked no-ops and combines in one fixed order, shallow KV
+  is one iteration per block (ascending), and the `ntiles_KV = P_const` crossing is exact.  Only the 3-device tensor
+  plain arm moves (4B 1 GPU `be6407e421c8`, 27B 2 GPU tensor `b1c84ba23a2c` and 27B 3 GPU `-sm layer`
+  `f59aa0be6536` are unchanged) and decode is flat at every depth to 131k.  `GGML_CUDA_FA_SPLIT_CONST=0` restores
+  the old search (A/B and the gate's negative control).  Gate: `MANIFESTS.md` gate 36
+  (`scripts/gate-spec-purity.sh`) — `benchmarks/2026-11-19-fa-split-boundary-purity.md`, `INVARIANTS.md` r319,
+  `GREEDY-PURITY.md` 99, `ENVIRONMENT.md` 8.
 * **The band's fixup period `P` is one constant, `nsm/2`, for every K/V type (r316, `TODO` #346).**
   `ggml_cuda_fattn_band_wmma_split()` returns `max(2, nsm/2)` (`P` 16 on gfx1201, `nsm` 32) instead of `nsm` for
   the native-quantized types and `nsm/2` for f16/bf16; `ggml_cuda_fattn_band_wmma_two_byte()` and the launcher's
@@ -2436,6 +2470,17 @@ next item) and the census to expect is `direct` ~= 0 with `properties_changed` i
 ---
 
 ## Block 10 — the slab, the fusion dispatcher, the async input ring (infrastructure)
+
+> **r319 amendment (GitHub issue #330): the width probe gained a 256-cell KV-padding-boundary arm.**  This block
+> owns the last change to `tests/test-logits-width-probe.cpp` (it added the `SPLIT` / `NCMOE` / `CACHE` arms), so
+> the probe's new arm lands here.  The probe compared widths 1..8 at ONE prefix length, and a prefix on a
+> 256-cell multiple puts every width in the same `GGML_PAD(used, 256)` KV extent — which is why it read PASS on the
+> FA split defect that block 05 fixes at r319.  It now runs `P` and a second arm at
+> `P_b = 256*(P/256 + 1) - NW/2`, the prefix where W=1 lands below the multiple and W=8 above it, and requires
+> both to pass (`arm=flat` / `arm=boundary`, then one `width_purity=` verdict and exit 2 on a failure).  No
+> delivery code, kernel, default or environment variable changed; `GGML_CUDA_FA_SPLIT_CONST=0` is the pre-fix
+> control and reads **0.232868** (q8_0) / **0.196008** (bf16) on the boundary arm where the shipped arm reads
+> **0**.  Record: `benchmarks/2026-11-19-fa-split-boundary-purity.md`, `MANIFESTS.md` gate 36 + the block-10 row.
 
 > **r317 amendment (GitHub issue #294 closed): every routed fused launch resolves the expert cache first.**
 > A cache take-over makes the scheduler skip the split input's `input_cpy` copy, so a fused MoE that does not

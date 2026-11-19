@@ -839,6 +839,21 @@ in CI.  The model-level gates are manual:
     `ggml_backend_cuda_device_offload_op()`, to `GGML_MOE_HOST_OFFLOAD`, to the delivery's host-expert master
     buffer types, or to the split that decides whether such a weight is GPU-owned.
 
+36. **A speculator must not change the greedy text on a multi-device tensor split** (r319, block 05, GitHub
+    issue #330) -- `scripts/gate-spec-purity.sh`.  Manifest A (q8_0 K/V, prose prompt, reasoning off) and B
+    (bf16 K/V, reasoning prompt, reasoning on), 27B Q8_0, `-n 512`, seed 42, temp 0, 3 devices `-sm tensor`:
+    `--spec-type none` and `--spec-type draft-mtp --spec-draft-n-max 3` must read **one text**, and the draft
+    arm's Generation t/s must be >= 1.2x the plain arm's (NON-VACUITY -- a speculator that drafted nothing
+    would satisfy the equality trivially).  `--control` runs manifest A with `GGML_CUDA_FA_SPLIT_CONST=0`
+    (the pre-fix `ntiles_KV`-driven split) and requires it to **diverge**, so the gate is shown to have teeth.
+    It also runs `test-logits-width-probe` at `P=4096` for q8_0 and bf16; the probe's new `boundary` arm
+    prefixes at `256*(P/256 + 1) - NW/2`, the prefix where W=1 and W=8 land on different
+    `GGML_PAD(used, 256)` extents (a flat prefix on a 256-multiple puts every width in one padding block and
+    cannot see this class).  Required for any change to the tile FA launcher's KV split (`parallel_blocks`,
+    `gridDim.y`, the efficiency search), to `ggml_cuda_fattn_band_*`, to the KV extent/padding (`get_n_kv`,
+    `LLAMA_KV_N_PAD_*`), or to a speculator's verify batch composition -- and every release that touches
+    block 05.
+
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 
 ## Verification per block
@@ -848,6 +863,8 @@ on the tip.
 
 | block | verify | expected |
 |---|---|---|
+| 05 | **(r319, issue #330) the decode/verify KV split is a run constant**: `scripts/gate-spec-purity.sh` (`plain == draft-mtp` on q8_0 and bf16 at 3-device `-sm tensor`, the non-vacuity draft-rate check, `--control` on `GGML_CUDA_FA_SPLIT_CONST=0` must diverge, and the width probe's flat + 256-cell-boundary arms for both KV types); the four-axis MTP protocol on 1 GPU and on 3 GPU `-sm tensor` on BOTH cache types; the same-seed text of the arms the change cannot reach (4B 1 GPU, 27B 2 GPU tensor, 27B 3 GPU `-sm layer`) against the previous build; `llama-bench tg128` at d0..131k and `pp512` (flat); `test-backend-ops -o FLASH_ATTN_EXT`; `gate-prefill-logits.sh` | gate **PASS** (A `c1f9d0b3f5b6`, B `2fbc183348a8`, plain == draft; control diverges; probe flat + boundary maxdiff **0** for q8_0 AND bf16 where the pre-fix boundary arm reads 0.232868 / 0.196008); four-axis plain == draft on all four at `-n 3000` 1 GPU (acceptance 0.53656 / 0.80437 / 0.86819 / 0.99200) and all four at `-n 1000` on both caches 3 GPU tensor (0.57755 / 0.81776 / 0.86555 / 0.99200); unchanged `be6407e421c8` / `b1c84ba23a2c` / `f59aa0be6536`; tg128 46.6 / 45.6 / 42.3 / 39.3 / 36.8 / 34.6 at d0/8k/32k/65k/98k/131k both arms; 7381/7381; KLD 0.000000 / 100.000 % canonical and 0.000000 / 99.990 % 3-device tensor -- `WORKLOG.md` 261119.003 |
+| 10 | **(r319, issue #330) the width probe must straddle a 256-cell padding boundary**: `test-logits-width-probe MODEL prompts/prose-rdna-boosts.txt 4096 512` on `KV=q8_0` and `KV=bf16` at `SPLIT=tensor` (the flat arm plus the new boundary arm at `P=4348`), with the pre-fix arm as the control (`GGML_CUDA_FA_SPLIT_CONST=0` must FAIL the boundary arm) | flat PASS in both arms (maxdiff 0); boundary **PASS maxdiff 0** post-fix and **FAIL 0.232868 (q8_0) / 0.196008 (bf16)** pre-fix -- `benchmarks/2026-11-19-fa-split-boundary-purity.md` |
 | 00 | `test-backend-ops -o FLASH_ATTN_EXT`; `test-logits-width-probe` W=1..8 | pass; one hash across the band |
 | 00 | **(r230) the lazy-table residency arms**: on a model that has a `TENSOR_READ_LAZY` table (Flash-Next here), `--lazy-mode mlock` must pin the **whole** table -- `VmLck` in `/proc/<pid>/status` equal to the table's bytes with `RssAnon` far below it -- and `auto`/`off`/`mlock` must emit the same same-seed greedy text; process exit must return `Mlocked`/`Unevictable` in `/proc/meminfo` to their pre-start values; a small `RLIMIT_MEMLOCK` (`ulimit -l 2048`) must warn and fall back to the evictable page-cache path without changing the text | `VmLck` **28125136 kB** = 26.82 GiB = the whole 27,465 MiB table, `RssAnon` 1.3 GB (`off` arm: 32.2 GB); `125 chars sha=7d898d3d3e58` in all three arms (and under `--load-mode none`); `Mlocked` 28125136 -> 0 kB at exit, `Cached` retained; refused pin warns, text unchanged -- `benchmarks/2026-11-07-lazy-mode-mlock.md` |
 | 01 | same-seed coherence on 2 and 3 GPUs (`-sm tensor`), MTP `none == draft-mtp` | identical |

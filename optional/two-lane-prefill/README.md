@@ -1,8 +1,9 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r318`** (against the r318
-default delivery tree `d586e2a5fdfda303ea8363dfac20ca72784bf90a` = official blocks `0000`-`0016` plus the
-temporary `0300`; the r307 cut is at the bottom of the list, against the r307 default delivery tree
+**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r319`** (against the r319
+default delivery tree `9f53a85322eb8c0327c350fca89fe5af76a30806` = official blocks `0000`-`0016` plus the
+temporary `0300`; the r318 cut is at the bottom of the list, against the r318 default delivery tree
+`d586e2a5fdfda303ea8363dfac20ca72784bf90a`; the r307 cut is at the bottom of the list, against the r307 default delivery tree
 `f91aa81202fd32d060f9afb0f9c54824116758b9`; the r288 re-cut is at the bottom of the list, against the r288 default delivery tree
 `79d18f41b9ab9b235d35fd3a5034858eddd94844` = official blocks `0000`-`0015` plus the
 temporary `0300`; the r259, r254, r247, r246, r243, r241 and r229 cuts and their measurements are kept below
@@ -22,8 +23,13 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `eb19211a0f3cbdf3bf6bb332d1d3fa389b64c17c8ff7ae1684e5cad6ad0cc911` (the r318 cut -- every re-cut moves the exported commit
+  `0eaff51b987b789bbef9960229505de6beefec82d6b95c8c379eb5868e25287a` (the r319 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
+* **r319 re-cut verification**: applies strictly at the r319 default tree
+  `9f53a85322eb8c0327c350fca89fe5af76a30806` (sha256
+  `0eaff51b987b789bbef9960229505de6beefec82d6b95c8c379eb5868e25287a`), producing tree
+  `cb07e2f41578163dbe5db56cc94da538f9a99110`.  r319 amends blocks 05 (the FA KV split) and 10 (the width probe),
+  neither of which this artifact edits, so the re-cut moved only the exported commit id and the context offsets.
 * **r318 re-cut verification**: applies strictly at the r318 default tree
   `d586e2a5fdfda303ea8363dfac20ca72784bf90a` (sha256
   `eb19211a0f3cbdf3bf6bb332d1d3fa389b64c17c8ff7ae1684e5cad6ad0cc911`), producing tree `ffb6c3239df6098f1f9315fc472273a062d3aa94`; with the other

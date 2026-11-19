@@ -1048,3 +1048,54 @@ want=…`.  No kernel changed, no default moved, no new environment variable.
 
 Record: `WORKLOG.md` 261119.002, `MANIFESTS.md` gate 1b + the block-10 row, `patches/README.md` block 10,
 `ENVIRONMENT.md` `GGML_CUDA_FUSE_TRACE`, `scripts/gate-lora-fusion.sh`, `scripts/make-test-lora.py`, issue #331.
+
+## r319 (2026-11-19, `WORKLOG.md` 261119.003) — a decode/verify KV split must be a run constant, not a function of the padded KV extent
+
+**Changed.**  Official block 05 only (`ggml/src/ggml-cuda/fattn-common.cuh`) plus the width probe's new boundary
+arm (block 10, `tests/test-logits-width-probe.cpp`, the block that last touched that file).  GitHub issue #330:
+`--spec-type none` and `--spec-type draft-mtp` emitted different greedy text on a 3-device `-sm tensor` split.
+No kernel arithmetic changed, no default moved; one environment variable added (`GGML_CUDA_FA_SPLIT_CONST`,
+kill-switch, default on).
+
+1. **`K->ne[1]` at the FA op is the PADDED USED extent, and a verify batch is `W-1` cells ahead of the decode of
+   the same row.**  `llama_kv_cache::get_n_kv()` returns `min(cache, max(256, GGML_PAD(used, 256)))` and is called
+   *after* `apply_ubatch()`, so a W-row batch at position `p` makes the extent `pad(p + W)` while the plain decode
+   of that row makes it `pad(p + 1)`.  The two differ only in the W-1 cell window at each 256-cell multiple — which
+   is exactly where issue #330 diverged (generated position 5630: the verify's extent 5888 against the plain's
+   5632; the top-2 logits were bit-identical over the preceding 373 positions).
+2. **The tile FA launcher's KV split `parallel_blocks` IS the summation order, so keying it on the extent breaks
+   width purity.**  `gridDim.y = parallel_blocks`; block b owns KV iterations b, b+P, b+2P, … and
+   `flash_attn_combine_results` sums the P partials in block order.  The efficiency search stops one below
+   `ntiles_KV` whenever two candidate counts print the same integer efficiency (measured: `ntiles_KV` 176, P 175
+   against 176; 525/576 and 528/576 both read 91 %), so P = 175 put iteration 175 in block 0 and added it before
+   iterations 1..174.  Measured logit move: up to **0.232868** (q8_0) / **0.196008** (bf16) in the width probe's
+   boundary arm, and a 0.04 near-tie flipped in the generated text.
+3. **The fix is `min(P_const, ntiles_KV)` for `Q->ne[1] <= 8`, where `P_const` is the search's one-full-wave value
+   (`nsm * max_blocks_per_sm`), and it is exact by construction.**  Deep KV: P fixed, so a longer extent only
+   appends iterations that are fully masked for earlier rows (exact no-ops) and the combine order is fixed.
+   Shallow KV: P = `ntiles_KV`, one iteration per block (ascending order), with the trailing blocks neutral
+   (`M = -inf` -> `expf(-inf) = 0`, added as exactly 0).  The `ntiles_KV = P_const` crossing is exact because the
+   round-robin split is one iteration per block there too.  The RDNA4 band kernel already pins its own P
+   (`nsm/2`, r316) for the same reason; this is the tile path the band declines below its work gate.
+4. **Only the 3-device `-sm tensor` plain arm moved, and it moved onto the verify arm's numerics.**  Post-fix
+   manifest A plain == draft `c1f9d0b3f5b6` and B `2fbc183348a8` (3 GPU tensor, 27B Q8_0, `-n 512`); the old
+   plain pair (`120c74935967` / `7dca501eeb0e`) is reproduced exactly by `GGML_CUDA_FA_SPLIT_CONST=0` on the same
+   binary.  4B 1 GPU `-sm layer` `be6407e421c8`, 27B 2 GPU tensor `b1c84ba23a2c` and 27B 3 GPU `-sm layer`
+   `f59aa0be6536` are unchanged (the last two are issue #330's own published hashes).
+5. **The class is not device-count specific; the LAYOUT is what exposes it.**  The width probe's boundary arm
+   fails pre-fix on the 3-device tensor layout (`ndst_eff = 3`, `bpw = 576`) and passes pre-fix on the layer
+   layout (its `ndst_eff` makes the old search pick `ntiles_KV`).  A gate for this class must therefore run a
+   tensor split *and* a prefix that straddles a 256-cell multiple: the probe's flat arm at a 256-multiple prefix
+   (256/4096/10240) puts every width in one padding block and cannot see it.
+6. **The split was never the parallelism.**  tg128 on 3 GPU tensor is flat at every depth to 131k
+   (d0 46.6, d8k 45.6, d32k 42.3, d65k 39.3, d98k 36.8, d131k 34.6 both arms) and `pp512` is identical: at deep KV
+   the pinned value is the split the old search already returned whenever it did not trip the off-by-one.
+7. **The gate is `scripts/gate-spec-purity.sh`.**  Manifest A (q8_0/prose) and B (bf16/reasoning) must read one
+   text, with a non-vacuity check (draft Generation t/s >= 1.2x plain) and a `--control` arm that runs the pre-fix
+   split and requires it to DIVERGE.  It also runs the probe's flat + boundary arms.  The four-axis MTP protocol
+   was run on 1 GPU at `-n 3000` and on 3 GPU `-sm tensor` at `-n 1000` on BOTH cache types; plain == draft on
+   every axis with healthy acceptance (0.53656/0.80437/0.86819/0.99200 and 0.57755/0.81776/0.86555/0.99200).
+
+Record: `WORKLOG.md` 261119.003, `benchmarks/2026-11-19-fa-split-boundary-purity.md`, `GREEDY-PURITY.md` §99,
+`ENVIRONMENT.md` `GGML_CUDA_FA_SPLIT_CONST`, `MANIFESTS.md` gate 36, `patches/README.md` blocks 05/10 (the probe),
+issue #330.

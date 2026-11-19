@@ -1,4 +1,4 @@
-From 673cea36361ffc0861a14593b504d0b55ec9e3d1 Mon Sep 17 00:00:00 2001
+From d28df81ec956e55cd7741a61c6913c4b0bb0cddf Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 12 Nov 2026 08:22:10 -0600
 Subject: [PATCH 05/17] rdna-boosts: block 05: flash-attention band, native
@@ -201,7 +201,7 @@ Records: `INVARIANTS.md` r316, `GREEDY-PURITY.md` 98, `benchmarks/2026-11-18-ban
  ggml/src/ggml-cpu/ops.cpp                     |   34 +-
  ggml/src/ggml-cuda/convert.cu                 |    6 +
  ggml/src/ggml-cuda/dequantize.cuh             |   13 +
- ggml/src/ggml-cuda/fattn-common.cuh           |  832 +++++++++++-
+ ggml/src/ggml-cuda/fattn-common.cuh           |  897 +++++++++++-
  ggml/src/ggml-cuda/fattn-mma-f16.cuh          | 1198 ++++++++++++++---
  ggml/src/ggml-cuda/fattn-rdna.cuh             |  607 +++++++++
  ggml/src/ggml-cuda/fattn-tile.cu              |   44 +-
@@ -533,7 +533,7 @@ Records: `INVARIANTS.md` r316, `GREEDY-PURITY.md` 98, `benchmarks/2026-11-18-ban
  src/llama-kv-cache.h                          |   23 +
  src/llama-kv-cells.h                          |   53 +
  tests/test-backend-ops.cpp                    |  220 ++-
- 341 files changed, 6319 insertions(+), 678 deletions(-)
+ 341 files changed, 6367 insertions(+), 695 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-rdna.cuh
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_4-ncols2_8-dkq256-dv256.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_8-ncols2_8-dkq256-dv256.cu
@@ -1078,7 +1078,7 @@ index 651524be7..a8cf54eb5 100644
      const block_q4_1 * x = (const block_q4_1 *) vx;
  
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 83a0e2254..8365cde4d 100644
+index 83a0e2254..548c3665e 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -8,6 +8,51 @@
@@ -2031,7 +2031,84 @@ index 83a0e2254..8365cde4d 100644
          }
      } else {
          // parallel_blocks must not be larger than what the tensor size allows:
-@@ -1317,29 +2096,46 @@ void launch_fattn(
+@@ -1260,28 +2039,59 @@ void launch_fattn(
+         // feed different partial sums into the online-softmax/PV combine, drift the
+         // logits in the last bits and flip greedy near-ties (issue #25).  Evaluate
+         // the heuristic as if n_q == 1 so every small batch agrees.
+-        const int ntiles_dst_eff = Q->ne[1] <= 8 ? (ntiles_z_gqa * K->ne[2] * Q->ne[3]) : ntiles_dst;
++        //
++        // The band must also use a KV-LENGTH-independent split (issue #330).  Block b owns the KV
++        // iterations b, b+P, b+2P, ..., and flash_attn_combine_results adds the P partials in block
++        // order, so P IS the summation order: changing P re-groups real iterations and moves the last
++        // bits.  `ntiles_KV` is built from `K->ne[1]`, the KV cache's PADDED USED extent
++        // (llama_kv_cache::get_n_kv: GGML_PAD(used, 256)), and a verify batch carries W-1 more rows than
++        // the decode that produced the same state, so its padded extent steps over a 256-cell boundary
++        // one step earlier -- at that one step the efficiency search below picked a different P for the
++        // verify than for the plain decode of the same row, and a greedy near-tie flipped (measured on
++        // 3 devices `-sm tensor`: 5630, padded 5632 against 5888).  So pin P for the band to the value
++        // the search reaches at saturation (one full wave, a device/width constant) and let a shorter
++        // cache only take FEWER parallel blocks: then every block owns at most one KV iteration (the
++        // order is ascending KV) and the extra trailing partials are neutral, which the combine adds as
++        // exactly 0.  The band's own kernel already pins its P (`nsm/2`, r316) for the same reason.
++        const bool decode_verify_band = Q->ne[1] <= 8;
++        const int ntiles_dst_eff = decode_verify_band ? (ntiles_z_gqa * K->ne[2] * Q->ne[3]) : ntiles_dst;
+ 
+         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
+         // Test whether parallel_blocks can be set to a higher value for better efficiency.
+         const int blocks_per_wave = nsm * max_blocks_per_sm;
+-        int nwaves_best = 0;
+-        int efficiency_percent_best = 0;
+-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+-            const int nblocks_total = ntiles_dst_eff * parallel_blocks_test;
+-            const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+-            const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+-
+-            // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
+-            if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+-                break;
+-            }
+-
+-            if (efficiency_percent > efficiency_percent_best) {
+-                nwaves_best = nwaves;
+-                efficiency_percent_best = efficiency_percent;
+-                parallel_blocks = parallel_blocks_test;
++        const auto pick_parallel_blocks = [&](const int limit) {
++            int pb = std::min(max_blocks_per_sm, limit);
++            int nwaves_best = 0;
++            int efficiency_percent_best = 0;
++            for (int parallel_blocks_test = pb; parallel_blocks_test <= limit; ++parallel_blocks_test) {
++                const int nblocks_total = ntiles_dst_eff * parallel_blocks_test;
++                const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
++                const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
++
++                // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
++                if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
++                    break;
++                }
++
++                if (efficiency_percent > efficiency_percent_best) {
++                    nwaves_best = nwaves;
++                    efficiency_percent_best = efficiency_percent;
++                    pb = parallel_blocks_test;
++                }
+             }
++            return pb;
++        };
++        // GGML_CUDA_FA_SPLIT_CONST=0 restores the old ntiles_KV-driven search (the A/B arm for issue #330;
++        // it is the path that lets a verify batch and the same row's decode choose different splits).
++        static const bool split_const = [] {
++            const char * e = getenv("GGML_CUDA_FA_SPLIT_CONST");
++            return e == nullptr || atoi(e) != 0;
++        }();
++        if (decode_verify_band && split_const) {
++            // one full wave is the saturation point the search would reach at any depth past it
++            parallel_blocks = std::min(pick_parallel_blocks(blocks_per_wave), ntiles_KV);
++        } else {
++            parallel_blocks = std::min(pick_parallel_blocks(ntiles_KV), ntiles_KV);
+         }
+ 
+         blocks_num.x = ntiles_x;
+@@ -1317,29 +2127,46 @@ void launch_fattn(
  
      GGML_ASSERT(block_dim.x % warp_size == 0);
  
@@ -2082,7 +2159,7 @@ index 83a0e2254..8365cde4d 100644
              const int bpt         = nblocks_sk / ntiles_dst;
  
              const uint3 fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * K->ne[2]);
-@@ -1354,7 +2150,7 @@ void launch_fattn(
+@@ -1354,7 +2181,7 @@ void launch_fattn(
                  (float *) KQV->data, dst_tmp_meta.ptr,
                   Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                   gqa_ratio, bpt, fd0, fd1, fd2);

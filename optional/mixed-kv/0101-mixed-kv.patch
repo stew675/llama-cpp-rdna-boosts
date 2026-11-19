@@ -1,55 +1,9 @@
-From 66f84a2c78834ab9d68f4115bef939d342d4f1f4 Mon Sep 17 00:00:00 2001
-From: Marvin Johanning <email@marvinjohanning.de>
-Date: Sat, 14 Nov 2026 16:30:09 +0100
-Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types -- a q8_0 K
- cache with a q4_0/q5_0/q5_1 V cache, read natively
+From 22adfbbcb4bf097d3869756123a4ad2b32bcc6aa Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Thu, 19 Nov 2026 09:05:55 -0600
+Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types (optional): K
+ q8_0 with V q4_0/q5_0/q5_1
 
-The delivery's context gate has refused every mixed K/V cache type since 2026-09-11
-(`type_k != type_v`), because a mixed pair missed the native decode band and was staged
-through the whole-cache F16 scratch on every decode step: 1.7-3.6x slower and never
-smaller at the time.  PR #312 (@mjohanning99) found the cause and the pair it is worth
-lifting for: the tile kernel had ONE K/V type parameter, so a mixed pair could not take
-either the native tile read or the RDNA4 decode/verify band, while prefill (the MMA
-kernel) already read K and V with their own types.
-
-This block gives the tile kernel a second type parameter for V (`type_V`, defaulting to
-`type_KV`) and instantiates it for head 256 only -- K q8_0 with V q4_0, q5_0 or q5_1.
-The tile dispatch takes its V type from `ggml_cuda_fattn_tile_type_V`, the same function
-the allocator sizes the F16 scratch with, so the instantiation, the launcher and the
-allocator cannot disagree (the contract the three earlier drifts broke).  The RDNA4 band
-accepts those pairs, and `llama_init_from_model` accepts them on a model whose attention
-layers are all 256-wide, except qwen4exp (its QSA op asserts K->type == V->type).  Every
-other head size and pair keeps the same-type rule and the old error text names the one
-mixed form.  Same-type caches do not reach the new code (mean KLD 0.000000 against the
-previous release; same-seed greedy text identical).
-
-`GGML_CUDA_FA_KV_MIXED=0` is the kill switch: the staged path (the pre-block behaviour of
-a mixed pair).  The three mixed instances are always compiled, so a build cannot accept a
-pair it did not compile (a build-time query would be needed to make it conditional; the
-context gate cannot see the backend's build flags).
-
-Measured on gfx1201 (RX 9070 / R9700), gfx1100 (RX 7900 GRE) and gfx1151 (Strix Halo):
-`test-backend-ops -o FLASH_ATTN_EXT` 7021/7021 on each, default / `GGML_CUDA_FA_KV_MIXED=0`
-/ `GGML_CUDA_FA_KV_NATIVE=0`; W=1..8 width purity PASS (maxdiff 0) on 1 GPU, `-sm layer`
-and `-sm tensor` for q8_0/q8_0 and the three pairs; plain == draft-mtp at n_max 1/3/7 on
-gfx1201, gfx1100 and gfx1151.  At `-c 131072`, 27B Q4_K_M, 3-GPU `-sm tensor`: KV 4352 MiB
-(q8_0/q8_0) -> 3712 / 3584 / 3328 (q5_1 / q5_0 / q4_0), the same compute buffers and
-`graph splits = 2`; decode at 32768 cells is 0.3-3.2 % below q8_0/q8_0 and mixed sits
-between the same-type neighbours (47.0 vs 51.6 / 46.0 t/s at 3 GPUs, q8_0/q5_1).  The
-staged kill-switch arm is 12 % behind the native read at 32768 cells and 25 % at 100000.
-
-Not covered: head sizes other than 256 (still refused), other mixed pairs (still refused),
-and quality at depth (KLD was measured at 4096-token chunks).  The submission, the review and
-the measurements are in PR #312 and `archive/work/mixed-kv/`; the artifact itself lives in
-`optional/mixed-kv/`.
-
-Block history: this was promoted into the delivery as block 17 in r287.  The r288 block-number
-re-org moved it OUT of the default set as optional block 0101 (the default set is now the 16
-official blocks 0000-0015 plus the temporary 0300); its measured trade -- a smaller KV cache for
-0.3-3.2 % decode at depth -- makes it a fittability opt-in in the same class as block 0014's KV
-window.  It is applied with `scripts/apply-all.sh --include-optional` and is not covered by the
-delivery's release gates; its own gate is `scripts/gate-mixed-kv.sh`, run on the
-optional-applied build.
 ---
  ggml/src/ggml-cuda/fattn-rdna.cuh             | 34 +++++++-
  ggml/src/ggml-cuda/fattn-tile.cu              | 24 ++++++
@@ -586,7 +540,7 @@ index 63bb2de9e..560a5aff8 100644
      for (int hs : { 128, 256, 512, }) {
          for (int nh : { 1, 2, 6, }) {
 diff --git a/tests/test-logits-width-probe.cpp b/tests/test-logits-width-probe.cpp
-index 120e9f8ff..411d0872f 100644
+index 7cd503dea..362faa3a3 100644
 --- a/tests/test-logits-width-probe.cpp
 +++ b/tests/test-logits-width-probe.cpp
 @@ -21,6 +21,7 @@
@@ -619,14 +573,14 @@ index 120e9f8ff..411d0872f 100644
      exit(1);
  }
  
-@@ -168,7 +169,7 @@ int main(int argc, char ** argv) {
-                                 : (fa && (!strcmp(fa, "1") || !strcmp(fa, "on")))  ? LLAMA_FLASH_ATTN_TYPE_ENABLED
-                                 : LLAMA_FLASH_ATTN_TYPE_AUTO;
-         }
--        cp.type_k = kv_type; cp.type_v = kv_type;
-+        cp.type_k = kv_type; cp.type_v = kv_from_env("KVV", kv_type);
-         llama_context * ctx = llama_init_from_model(model, cp);
-         if (!ctx) { fprintf(stderr, "ctx init failed (W=%d)\n", W); return 1; }
+@@ -178,7 +179,7 @@ int main(int argc, char ** argv) {
+                                     : (fa && (!strcmp(fa, "1") || !strcmp(fa, "on")))  ? LLAMA_FLASH_ATTN_TYPE_ENABLED
+                                     : LLAMA_FLASH_ATTN_TYPE_AUTO;
+             }
+-            cp.type_k = kv_type; cp.type_v = kv_type;
++            cp.type_k = kv_type; cp.type_v = kv_from_env("KVV", kv_type);
+             llama_context * ctx = llama_init_from_model(model, cp);
+             if (!ctx) { fprintf(stderr, "ctx init failed (arm=%s W=%d)\n", label, W); return 1; }
  
 -- 
 2.56.1

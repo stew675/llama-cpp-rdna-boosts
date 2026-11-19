@@ -17822,7 +17822,7 @@ index 2d0b3cfea..9c99c71dd 100644
  
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 6667ca400..9e5d08178 100644
+index 6667ca400..f35ad131c 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -3,11 +3,62 @@
@@ -19163,7 +19163,7 @@ index 6667ca400..9e5d08178 100644
              const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
              // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
              // Only do this if the occupancy loss from rounding is acceptable.
-@@ -1247,20 +2340,29 @@ void launch_fattn(
+@@ -1247,33 +2340,73 @@ void launch_fattn(
              blocks_num.x = nblocks_stream_k;
          }
  
@@ -19183,20 +19183,79 @@ index 6667ca400..9e5d08178 100644
 +        // feed different partial sums into the online-softmax/PV combine, drift the
 +        // logits in the last bits and flip greedy near-ties (issue #25).  Evaluate
 +        // the heuristic as if n_q == 1 so every small batch agrees.
-+        const int ntiles_dst_eff = Q->ne[1] <= 8 ? (ntiles_z_gqa * K->ne[2] * Q->ne[3]) : ntiles_dst;
++        //
++        // The band must also use a KV-LENGTH-independent split (issue #330).  Block b owns the KV
++        // iterations b, b+P, b+2P, ..., and flash_attn_combine_results adds the P partials in block
++        // order, so P IS the summation order: changing P re-groups real iterations and moves the last
++        // bits.  `ntiles_KV` is built from `K->ne[1]`, the KV cache's PADDED USED extent
++        // (llama_kv_cache::get_n_kv: GGML_PAD(used, 256)), and a verify batch carries W-1 more rows than
++        // the decode that produced the same state, so its padded extent steps over a 256-cell boundary
++        // one step earlier -- at that one step the efficiency search below picked a different P for the
++        // verify than for the plain decode of the same row, and a greedy near-tie flipped (measured on
++        // 3 devices `-sm tensor`: 5630, padded 5632 against 5888).  So pin P for the band to the value
++        // the search reaches at saturation (one full wave, a device/width constant) and let a shorter
++        // cache only take FEWER parallel blocks: then every block owns at most one KV iteration (the
++        // order is ascending KV) and the extra trailing partials are neutral, which the combine adds as
++        // exactly 0.  The band's own kernel already pins its P (`nsm/2`, r316) for the same reason.
++        const bool decode_verify_band = Q->ne[1] <= 8;
++        const int ntiles_dst_eff = decode_verify_band ? (ntiles_z_gqa * K->ne[2] * Q->ne[3]) : ntiles_dst;
 +
          // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
          // Test whether parallel_blocks can be set to a higher value for better efficiency.
          const int blocks_per_wave = nsm * max_blocks_per_sm;
-         int nwaves_best = 0;
-         int efficiency_percent_best = 0;
-         for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+-        int nwaves_best = 0;
+-        int efficiency_percent_best = 0;
+-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
 -            const int nblocks_total = ntiles_dst * parallel_blocks_test;
-+            const int nblocks_total = ntiles_dst_eff * parallel_blocks_test;
-             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
-             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+-            const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+-            const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+-
+-            // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
+-            if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+-                break;
+-            }
+-
+-            if (efficiency_percent > efficiency_percent_best) {
+-                nwaves_best = nwaves;
+-                efficiency_percent_best = efficiency_percent;
+-                parallel_blocks = parallel_blocks_test;
++        const auto pick_parallel_blocks = [&](const int limit) {
++            int pb = std::min(max_blocks_per_sm, limit);
++            int nwaves_best = 0;
++            int efficiency_percent_best = 0;
++            for (int parallel_blocks_test = pb; parallel_blocks_test <= limit; ++parallel_blocks_test) {
++                const int nblocks_total = ntiles_dst_eff * parallel_blocks_test;
++                const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
++                const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
++
++                // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
++                if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
++                    break;
++                }
++
++                if (efficiency_percent > efficiency_percent_best) {
++                    nwaves_best = nwaves;
++                    efficiency_percent_best = efficiency_percent;
++                    pb = parallel_blocks_test;
++                }
+             }
++            return pb;
++        };
++        // GGML_CUDA_FA_SPLIT_CONST=0 restores the old ntiles_KV-driven search (the A/B arm for issue #330;
++        // it is the path that lets a verify batch and the same row's decode choose different splits).
++        static const bool split_const = [] {
++            const char * e = getenv("GGML_CUDA_FA_SPLIT_CONST");
++            return e == nullptr || atoi(e) != 0;
++        }();
++        if (decode_verify_band && split_const) {
++            // one full wave is the saturation point the search would reach at any depth past it
++            parallel_blocks = std::min(pick_parallel_blocks(blocks_per_wave), ntiles_KV);
++        } else {
++            parallel_blocks = std::min(pick_parallel_blocks(ntiles_KV), ntiles_KV);
+         }
  
-@@ -1309,69 +2411,270 @@ void launch_fattn(
+         blocks_num.x = ntiles_x;
+@@ -1309,69 +2442,270 @@ void launch_fattn(
  
      GGML_ASSERT(block_dim.x % warp_size == 0);
  
@@ -115755,10 +115814,10 @@ index 1f4c8a46b..780060681 100644
      } else if (n_failed == 0) {
 diff --git a/tests/test-logits-width-probe.cpp b/tests/test-logits-width-probe.cpp
 new file mode 100644
-index 000000000..120e9f8ff
+index 000000000..7cd503dea
 --- /dev/null
 +++ b/tests/test-logits-width-probe.cpp
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,263 @@
 +// W = 1..8 logits purity probe -- the delivery's §11 promotion gate item 1
 +// ("`W = 1..8` logits matrix with GGML_CUDA_MMB=1 == off").
 +//
@@ -115901,97 +115960,126 @@ index 000000000..120e9f8ff
 +           mp.split_mode == LLAMA_SPLIT_MODE_TENSOR ? "tensor" : mp.split_mode == LLAMA_SPLIT_MODE_ROW ? "row" : "layer",
 +           getenv("NCMOE") ? getenv("NCMOE") : "-");
 +
-+    // rows[w-1] = the logits of every row of the W-token batch, in row order
-+    std::vector<std::vector<float>> rows[NW];
++    // One width-purity arm at prefix length P_arm: prefill P_arm tokens as ONE batch, then decode a
++    // W-token batch, and require every row shared with the widest batch (W=8) to match it bit for bit.
++    //
++    // TWO prefix lengths are run.  A flat P is not enough: at the FA op `K->ne[1]` is the KV cache's
++    // PADDED USED extent (`GGML_PAD(used, 256)`), the decode batch is applied BEFORE that extent is
++    // computed, so a W-row batch sees `pad(P_arm + W)`.  If P_arm sits just below a 256-cell multiple,
++    // W=1 lands on the lower extent and W=8 on the upper one -- the pass that used to be missed.  The
++    // launcher's KV split for the decode/verify band must be run-constant, not a function of that
++    // extent (issue #330: the efficiency search picked a different parallel_blocks at the boundary,
++    // which re-grouped real KV iterations and moved the last bits, up to maxdiff 0.23).
++    const auto run_arm = [&](const int P_arm, const char * label) -> int {
++        std::vector<std::vector<float>> rows[NW];
 +
-+    for (int W = 1; W <= NW; ++W) {
-+        llama_context_params cp = llama_context_default_params();
-+        // n_batch is the max tokens per llama_decode call (the whole prefill batch),
-+        // n_ubatch the max per micro-batch -- they are NOT the same knob.
-+        // n_ctx must hold the P-token prefill plus the W-row decode.  It also decides whether the RDNA4
-+        // band's 64-column block (query widths 5..8) is reachable at all: the launcher's gate is
-+        // K->ne[1] >= 4096 and K->ne[1] is the context's USED length, so a width-purity run must pass
-+        // P >= 4096 (issue #224: the P=256 run never reached that block, so the gate could not see the
-+        // 8-warp row that broke width purity; a P=4096 run fails on it).
-+        cp.n_ctx = P + NW + 8; cp.n_batch = P > ubatch ? P : ubatch; cp.n_ubatch = ubatch; cp.n_seq_max = 1;
-+        if (const char * q = getenv("NSEQ")) cp.n_seq_max = (uint32_t) atoi(q);
-+        // Replicate the MTP verify-batch recurrent-state snapshot count: common sets
-+        // n_rs_seq = draft.n_max, so a W-token batch with n_max = W-1 uses n_rs_seq = W-1.
-+        {
-+            const char * rs = getenv("RS");
-+            cp.n_rs_seq = (rs == nullptr) ? 0u
-+                        : (strcmp(rs, "from_w") == 0) ? (uint32_t) (W - 1)
-+                        : (uint32_t) atoi(rs);
-+        }
-+        {
-+            const char * fa = getenv("FA");
-+            cp.flash_attn_type = (fa && (!strcmp(fa, "0") || !strcmp(fa, "off"))) ? LLAMA_FLASH_ATTN_TYPE_DISABLED
-+                                : (fa && (!strcmp(fa, "1") || !strcmp(fa, "on")))  ? LLAMA_FLASH_ATTN_TYPE_ENABLED
-+                                : LLAMA_FLASH_ATTN_TYPE_AUTO;
-+        }
-+        cp.type_k = kv_type; cp.type_v = kv_type;
-+        llama_context * ctx = llama_init_from_model(model, cp);
-+        if (!ctx) { fprintf(stderr, "ctx init failed (W=%d)\n", W); return 1; }
-+
-+        // the prefill batch holds P tokens, so size the batch for P (not just n_ubatch)
-+        llama_batch b = llama_batch_init(cp.n_batch, 0, 1);
-+        b.n_tokens = 0;
-+        for (int i = 0; i < P; ++i) {
-+            b.token[b.n_tokens] = toks[i]; b.pos[b.n_tokens] = i;
-+            b.n_seq_id[b.n_tokens] = 1; b.seq_id[b.n_tokens][0] = 0; b.logits[b.n_tokens] = 0;
-+            b.n_tokens++;
-+        }
-+        if (llama_decode(ctx, b) != 0) { fprintf(stderr, "prefill decode failed (W=%d)\n", W); return 1; }
-+
-+        b.n_tokens = 0;
-+        for (int j = 0; j < W; ++j) {
-+            b.token[b.n_tokens] = toks[P + j]; b.pos[b.n_tokens] = P + j;
-+            b.n_seq_id[b.n_tokens] = 1; b.seq_id[b.n_tokens][0] = 0; b.logits[b.n_tokens] = 1;
-+            b.n_tokens++;
-+        }
-+        if (llama_decode(ctx, b) != 0) { fprintf(stderr, "batch decode failed (W=%d)\n", W); return 1; }
-+
-+        for (int j = 0; j < W; ++j) {
-+            const float * l = llama_get_logits_ith(ctx, j);
-+            if (!l) { fprintf(stderr, "no logits for row %d (W=%d)\n", j, W); return 1; }
-+            rows[W - 1].push_back(std::vector<float>(l, l + n_vocab));
-+        }
-+        llama_batch_free(b);
-+        llama_free(ctx);
-+    }
-+
-+    // width purity: every row shared with the widest batch (W=8) must match it
-+    int bad = 0;
-+    float worst = 0.0f;
-+    for (int W = 1; W <= NW; ++W) {
-+        float wmax = 0.0f;
-+        for (int j = 0; j < W; ++j) {
-+            const std::vector<float> & a = rows[W - 1][j];
-+            const std::vector<float> & b = rows[NW - 1][j];
-+            for (size_t k = 0; k < a.size(); ++k) {
-+                const float d = std::fabs(a[k] - b[k]);
-+                if (d > wmax) { wmax = d; }
++        for (int W = 1; W <= NW; ++W) {
++            llama_context_params cp = llama_context_default_params();
++            // n_batch is the max tokens per llama_decode call (the whole prefill batch),
++            // n_ubatch the max per micro-batch -- they are NOT the same knob.
++            // n_ctx must hold the P-token prefill plus the W-row decode.  It also decides whether the RDNA4
++            // band's 64-column block (query widths 5..8) is reachable at all: the launcher's gate is
++            // K->ne[1] >= 4096 and K->ne[1] is the context's USED length, so a width-purity run must pass
++            // P >= 4096 (issue #224: the P=256 run never reached that block, so the gate could not see the
++            // 8-warp row that broke width purity; a P=4096 run fails on it).
++            cp.n_ctx = P_arm + NW + 8; cp.n_batch = P_arm > ubatch ? P_arm : ubatch; cp.n_ubatch = ubatch; cp.n_seq_max = 1;
++            if (const char * q = getenv("NSEQ")) cp.n_seq_max = (uint32_t) atoi(q);
++            // Replicate the MTP verify-batch recurrent-state snapshot count: common sets
++            // n_rs_seq = draft.n_max, so a W-token batch with n_max = W-1 uses n_rs_seq = W-1.
++            {
++                const char * rs = getenv("RS");
++                cp.n_rs_seq = (rs == nullptr) ? 0u
++                            : (strcmp(rs, "from_w") == 0) ? (uint32_t) (W - 1)
++                            : (uint32_t) atoi(rs);
 +            }
++            {
++                const char * fa = getenv("FA");
++                cp.flash_attn_type = (fa && (!strcmp(fa, "0") || !strcmp(fa, "off"))) ? LLAMA_FLASH_ATTN_TYPE_DISABLED
++                                    : (fa && (!strcmp(fa, "1") || !strcmp(fa, "on")))  ? LLAMA_FLASH_ATTN_TYPE_ENABLED
++                                    : LLAMA_FLASH_ATTN_TYPE_AUTO;
++            }
++            cp.type_k = kv_type; cp.type_v = kv_type;
++            llama_context * ctx = llama_init_from_model(model, cp);
++            if (!ctx) { fprintf(stderr, "ctx init failed (arm=%s W=%d)\n", label, W); return 1; }
++
++            // the prefill batch holds P_arm tokens, so size the batch for it (not just n_ubatch)
++            llama_batch b = llama_batch_init(cp.n_batch, 0, 1);
++            b.n_tokens = 0;
++            for (int i = 0; i < P_arm; ++i) {
++                b.token[b.n_tokens] = toks[i]; b.pos[b.n_tokens] = i;
++                b.n_seq_id[b.n_tokens] = 1; b.seq_id[b.n_tokens][0] = 0; b.logits[b.n_tokens] = 0;
++                b.n_tokens++;
++            }
++            if (llama_decode(ctx, b) != 0) { fprintf(stderr, "prefill decode failed (arm=%s W=%d)\n", label, W); return 1; }
++
++            b.n_tokens = 0;
++            for (int j = 0; j < W; ++j) {
++                b.token[b.n_tokens] = toks[P_arm + j]; b.pos[b.n_tokens] = P_arm + j;
++                b.n_seq_id[b.n_tokens] = 1; b.seq_id[b.n_tokens][0] = 0; b.logits[b.n_tokens] = 1;
++                b.n_tokens++;
++            }
++            if (llama_decode(ctx, b) != 0) { fprintf(stderr, "batch decode failed (arm=%s W=%d)\n", label, W); return 1; }
++
++            for (int j = 0; j < W; ++j) {
++                const float * l = llama_get_logits_ith(ctx, j);
++                if (!l) { fprintf(stderr, "no logits for row %d (arm=%s W=%d)\n", j, label, W); return 1; }
++                rows[W - 1].push_back(std::vector<float>(l, l + n_vocab));
++            }
++            llama_batch_free(b);
++            llama_free(ctx);
 +        }
-+        if (wmax != 0.0f) bad++;
-+        if (wmax > worst) worst = wmax;
-+        // hash the float bytes of every row, not the std::vector objects
-+        uint64_t h = 1469598103934665603ULL;
-+        for (int j = 0; j < W; ++j) h ^= fnv1a(rows[W - 1][j].data(), (size_t) n_vocab * sizeof(float));
-+        printf("W=%d rows=%d hash=%016llx maxdiff_vs_W8=%.6g%s\n",
-+               W, W, (unsigned long long) h, wmax, wmax == 0.0f ? "" : "   <-- DIFFERS");
++
++        // width purity: every row shared with the widest batch (W=8) must match it
++        int bad = 0;
++        float worst = 0.0f;
++        for (int W = 1; W <= NW; ++W) {
++            float wmax = 0.0f;
++            for (int j = 0; j < W; ++j) {
++                const std::vector<float> & a = rows[W - 1][j];
++                const std::vector<float> & b = rows[NW - 1][j];
++                for (size_t k = 0; k < a.size(); ++k) {
++                    const float d = std::fabs(a[k] - b[k]);
++                    if (d > wmax) { wmax = d; }
++                }
++            }
++            if (wmax != 0.0f) bad++;
++            if (wmax > worst) worst = wmax;
++            // hash the float bytes of every row, not the std::vector objects
++            uint64_t h = 1469598103934665603ULL;
++            for (int j = 0; j < W; ++j) h ^= fnv1a(rows[W - 1][j].data(), (size_t) n_vocab * sizeof(float));
++            printf("arm=%s P=%d W=%d rows=%d hash=%016llx maxdiff_vs_W8=%.6g%s\n",
++                   label, P_arm, W, W, (unsigned long long) h, wmax, wmax == 0.0f ? "" : "   <-- DIFFERS");
++        }
++        printf("arm=%s P=%d row0_row1_hashes: ", label, P_arm);
++        for (int W = 1; W <= NW; ++W) {
++            uint64_t h0 = fnv1a(rows[W - 1][0].data(), (size_t) n_vocab * sizeof(float));
++            uint64_t h1 = W >= 2 ? fnv1a(rows[W - 1][1].data(), (size_t) n_vocab * sizeof(float)) : 0;
++            printf("%d:%016llx/%016llx ", W, (unsigned long long) h0, (unsigned long long) h1);
++        }
++        printf("\narm=%s width_purity=%s (worst maxdiff %.6g)\n", label, bad ? "FAIL" : "PASS", worst);
++        return bad;
++    };
++
++    int n_bad_arms = 0;
++
++    // arm 1: the requested prefix
++    n_bad_arms += run_arm(P, "flat") != 0;
++
++    // arm 2: the first prefix just below the next 256-cell multiple, so the W=1 decode batch lands on
++    // the lower padded KV extent and W=8 on the upper one (P_b + 1 <= 256k < P_b + NW).
++    const int P_b = 256*(P/256 + 1) - NW/2;
++    if (P_b != P && P_b + NW <= n) {
++        n_bad_arms += run_arm(P_b, "boundary") != 0;
++    } else {
++        printf("arm=boundary skipped: P_b=%d (P=%d, tokens=%d; need P_b != P and P_b + %d <= tokens)\n",
++               P_b, P, n, NW);
 +    }
-+    printf("row0_row1_hashes: ");
-+    for (int W = 1; W <= NW; ++W) {
-+        uint64_t h0 = fnv1a(rows[W - 1][0].data(), (size_t) n_vocab * sizeof(float));
-+        uint64_t h1 = W >= 2 ? fnv1a(rows[W - 1][1].data(), (size_t) n_vocab * sizeof(float)) : 0;
-+        printf("%d:%016llx/%016llx ", W, (unsigned long long) h0, (unsigned long long) h1);
-+    }
-+    printf("\nwidth_purity=%s (worst maxdiff %.6g)\n", bad ? "FAIL" : "PASS", worst);
++
++    printf("\nwidth_purity=%s\n", n_bad_arms ? "FAIL" : "PASS");
 +
 +    llama_model_free(model);
 +    llama_backend_free();
-+    return bad ? 2 : 0;
++    return n_bad_arms ? 2 : 0;
 +}
 diff --git a/tests/test-mtp-draft-vocab.cpp b/tests/test-mtp-draft-vocab.cpp
 new file mode 100644

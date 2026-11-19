@@ -8,8 +8,17 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `d347cb7248e62998d77be649eca6fc6b05c2a45f69b57b22a8c1529093606807` (the r318 cut -- every re-cut moves the exported commit
+  `3e0006670f55d625acc7539d690ba80543d8114ffdc440e29904fde5690f0079` (the r319 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
+* **r319 re-cut verification**: applies strictly at the r319 default tree
+  `9f53a85322eb8c0327c350fca89fe5af76a30806` (sha256
+  `3e0006670f55d625acc7539d690ba80543d8114ffdc440e29904fde5690f0079`), producing tree `9cb63478129bb63aa3c1529ee890610bceecb63d`; with the other
+  optional artifact on top, the cumulative tree is `bccfacc44cf28ea3a86917c1f5bc6572eba70722`.  r319 amends **block 05**
+  (`fattn-common.cuh`: the decode/verify KV split is a run constant, issue #330) and **block 10**
+  (`tests/test-logits-width-probe.cpp`: its 256-cell-boundary arm), and this artifact's hunk of that probe file
+  (`KVV=` / `kv_from_env("KVV", …)`) had to be reconciled onto the refactored probe: the resolved hunk is still the
+  three-line `KVV` change and the artifact's own mechanisms are untouched.  `validate-set.sh` check 8 verifies all
+  three trees on every run.
 * **r318 re-cut verification**: applies strictly at the r318 default tree
   `d586e2a5fdfda303ea8363dfac20ca72784bf90a` (sha256
   `d347cb7248e62998d77be649eca6fc6b05c2a45f69b57b22a8c1529093606807`), producing tree `9a884993b61dbacebac025fa772ff1c1764088b7`; with the other

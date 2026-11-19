@@ -24,6 +24,22 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
 > benchy depth-16384 protocol in `wip/HANDOFF.md`.
 
+## 2026-11-19 — the FA tile kernel's KV split must be a run constant, not a function of the padded KV extent (r319, issue #330)
+
+**`WORKLOG.md` 261119.003** + [`2026-11-19-fa-split-boundary-purity.md`](2026-11-19-fa-split-boundary-purity.md) —
+on a 3-device `-sm tensor` split `--spec-type none` and `--spec-type draft-mtp` emitted different greedy text
+(q8_0 prose `120c74935967` against `c1f9d0b3f5b6`, bf16 reasoning `7dca501eeb0e` against `759c1a4515c6`).  At the FA
+op `K->ne[1]` is `GGML_PAD(used, 256)` computed after the batch is applied, so a W-row verify sees `pad(p+W)` against
+the decode's `pad(p+1)`; the tile launcher's KV split `parallel_blocks` **is** the reduction order and was chosen
+from `ntiles_KV`, so at a 256-cell multiple the verify took a different split (176 against 175) and the logits moved
+by up to **0.232868** -- a greedy near-tie flipped.  The split is now `min(P_const, ntiles_KV)` for `Q->ne[1] <= 8`
+(`P_const` = the search's one-full-wave value), exact by construction; `GGML_CUDA_FA_SPLIT_CONST=0` is the pre-fix
+control and reproduces the old pair byte for byte.  Only the plain 3-device tensor arm moves, and decode is flat at
+every depth to 131k (tg128 46.6 / 45.6 / 42.3 / 39.3 / 36.8 / 34.6 at d0/8k/32k/65k/98k/131k).  The width probe gained
+a **256-cell-boundary** prefix arm (the flat arm on a 256-multiple prefix cannot see this class: it read PASS through
+r318); pre-fix the boundary arm reads **0.232868** (q8_0) / **0.196008** (bf16), post-fix **0**.  Gate:
+`scripts/gate-spec-purity.sh`.
+
 ## 2026-10-29 — the derived kq mask for batches of several sequences (r172, PR #247)
 
 **`WORKLOG.md` 261029.003** + [`2026-10-29-derived-kq-multiseq.md`](2026-10-29-derived-kq-multiseq.md) —

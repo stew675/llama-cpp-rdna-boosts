@@ -1,3 +1,109 @@
+## 261119.003 (r319, RELEASE v17-4f9dfa0e3-r319) -- GitHub issue #330 CLOSED: the tile FA launcher's KV split was keyed on the padded used KV extent, so a verify batch and its own decode took different splits
+
+**Release:** `v17-4f9dfa0e3-r319`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `f6ffa8042`
+(the `apply-all.sh` re-cut, tree `9f53a85322`), 17 official + 1 temporary = 18 default blocks, optional
+`0100` -> `cb07e2f41` / `0101` -> `9cb634781` (cumulative `bccfacc44`).  **No block created, split or
+renumbered**: one same-block amendment, **block 05** (`ggml/src/ggml-cuda/fattn-common.cuh`), plus a
+**block 10** amendment to the file it last touched (`tests/test-logits-width-probe.cpp`, the boundary arm).
+No kernel arithmetic changed, no default moved; one environment variable added (`GGML_CUDA_FA_SPLIT_CONST`,
+kill-switch, default on).
+
+### The report, reproduced, and where it actually lives
+
+Issue #330: on a 3-device `-sm tensor` split `--spec-type none` and `--spec-type draft-mtp` emit different
+greedy text.  Both manifests reproduce on r318 to the character: q8_0 prose plain `120c74935967` against
+draft `c1f9d0b3f5b6`, bf16 reasoning plain `7dca501eeb0e` against draft `759c1a4515c6` (27B Q8_0, `-n 512`,
+seed 42, temp 0).
+
+The issue's candidate loci (the 3-rank all-reduce, block 09's split state, the verify-band fusions, the
+derived kq mask) were each exercised or A/B'd where a switch exists, and none is it.  What pinned it was a temporary sampler dump comparing
+the target's top-2 logits at the same position in both arms: positions 5258..5629 are **bit-identical**
+(373 positions), and the first difference is at 5630 (plain 27.7634354 against draft 27.7384148), with a
+0.04 near-tie flipping at 5636.  A peak at the KV extents gives the answer: the verify at that step sees
+`K->ne[1]` 5888 while the plain decode of the same row sees 5632.
+
+`llama_kv_cache::get_n_kv()` pads the graph's KV extent to `GGML_PAD(used, 256)` and is called **after**
+`apply_ubatch()`, so a W-row batch at position p makes the extent `pad(p+W)` while the plain decode of the
+same row makes it `pad(p+1)`; the two differ only in the W-1 cell window at each 256-cell multiple.  The
+tile FA launcher picked its KV split `parallel_blocks` (`gridDim.y`) with an efficiency search over
+`ntiles_KV = ceil(K->ne[1]/nbatch_fa)`.  Block b owns KV iterations b, b+P, b+2P, ... and
+`flash_attn_combine_results` sums the P partials in block order, so **P is the summation order**.  A
+temporary `FA_SPLIT_TRACE` read the arm: `nkv` 5632 -> `ntiles_KV` 176 but the old search chose **175**
+(525/576 and 528/576 both print 91 % efficiency, so it keeps the first), which puts iteration 175 into block
+0 and adds it before iterations 1..174.  Same at 5888: 184 against 183.
+
+### The fix
+
+For the decode/verify band (`Q->ne[1] <= 8`) the split is a **run constant**:
+`parallel_blocks = min(P_const, ntiles_KV)`, `P_const` = the value the same search returns at one full wave
+(`nsm * max_blocks_per_sm`).  Deep KV: P fixed, so a longer extent only appends iterations that are fully
+masked for earlier rows (exact no-ops) and the P partials combine in one fixed order.  Shallow KV: P =
+`ntiles_KV`, one iteration per block (ascending order), and the trailing blocks above the row's own tile
+count are neutral (`M = -inf` -> `expf(-inf) = 0`, added as exactly 0); the `ntiles_KV = P_const` crossing is
+exact for the same reason.  The RDNA4 band kernel already pins its own P (`nsm/2`, r316); this is the tile
+path the band declines below its work gate.  `GGML_CUDA_FA_SPLIT_CONST=0` restores the old search (the A/B
+arm and the gate's negative control).
+
+### Correctness: plain == draft, and only the affected arm moves
+
+| arm (27B Q8_0, 3 GPU `-sm tensor`, `-n 512`) | post-fix plain | post-fix draft | pre-fix (`SPLIT_CONST=0`) |
+|---|---|---|---|
+| A: q8_0, prose | 1559 `c1f9d0b3f5b6` | 1559 `c1f9d0b3f5b6` | 1570 `120c74935967` |
+| B: bf16, reasoning | 2689 `2fbc183348a8` | 2689 `2fbc183348a8` | 2746 `7dca501eeb0e` |
+
+The pre-fix pair is reproduced **on the same binary** by the control arm, so the whole difference is the
+split choice.  Only the plain 3-device tensor arm moved, and it moved onto the verify arm's numerics (the
+ascending order): 4B 1 GPU `-sm layer` `be6407e421c8`, 27B 2 GPU (0,2) tensor `b1c84ba23a2c` and 27B 3 GPU
+`-sm layer` `f59aa0be6536` are unchanged (the last two are issue #330's own published hashes).
+
+### The instrument the class was missing
+
+`test-logits-width-probe` compared widths 1..8 at ONE prefix, and a prefix on a 256-cell multiple (256 /
+4096 / 10240) puts every width in the same padding block -- which is why it read PASS through r318.  It now
+runs a second arm at `P_b = 256*(P/256 + 1) - NW/2` (P=4348 for the default 4096), the prefix where W=1 lands
+below the multiple and W=8 above it: pre-fix **FAIL maxdiff 0.232868** (q8_0) / **0.196008** (bf16), post-fix
+**PASS maxdiff 0**.  The layer layout passes pre-fix (its `ndst_eff` makes the old search choose
+`ntiles_KV`), so the class is a padding straddle plus a split count, not a device count.
+
+### Performance is flat, at every depth
+
+`llama-bench -p 512 -n 128`, 3 GPU tensor, interleaved `1,0,0,1`: tg128 d0 46.59/46.62, d8192 45.59/45.55,
+d32768 42.27/42.27, d65536 39.33/39.29, d98304 36.81/36.78, d131072 34.59/34.57 -- and `pp512` identical at
+every depth (the change is decode/verify-only).  At deep KV the pinned value is the split the old search
+already returned whenever it did not trip the off-by-one.
+
+### Gates
+
+* `scripts/gate-spec-purity.sh` **NEW**: manifest A and B plain == draft, byte for byte, with a non-vacuity
+  check (draft Generation t/s >= 1.2x plain) and a `--control` arm that must DIVERGE.  PASS (A
+  `c1f9d0b3f5b6`, B `2fbc183348a8`), control diverges, probe flat + boundary maxdiff 0 for q8_0 and bf16.
+* Four-axis MTP Protocol A, 1 GPU, 27B Q4_K_XL, bf16, `-n 3000`: plain == draft on R/P/C/K, acceptance
+  **0.53656 / 0.80437 / 0.86819 / 0.99200**.  The same four axes on **3 GPU `-sm tensor`, `-n 1000`, on BOTH
+  q8_0 and bf16** (the arm the issue asked the gate to gain): plain == draft on all eight, acceptance
+  **0.57755 / 0.81776 / 0.86555 / 0.99200**.
+* `llama-batched-bench -npl 1,4,8 -npp 512 -ntg 128` (35B-A3B Q8_0, 3 GPU tensor): TG
+  **138.04 / 395.29 / 596.86** against r317's 137.50 / 395.24 / 597.08 (noise).
+* `test-backend-ops -o FLASH_ATTN_EXT`: **7381/7381**.
+* `gate-prefill-logits.sh`: **0.000000 / 100.000 %** canonical and **0.000000 / 99.990 %** at
+  `--device 0,1,2 --sm tensor` (decode-only change, as expected).
+* `validate-set.sh` GREEN (tree `9f53a85322`, optional alone `cb07e2f41` / `9cb634781`, cumulative
+  `bccfacc44`, Windows portability 512 files); `gate-per-block-build.sh --fast` ladder **18/18**;
+  `check-gpu-faults.sh` clean on every run's window.
+
+### Findings for the maintainer (recorded, no new handle)
+
+1. The band's own family gate (`ggml_cuda_fattn_band_wmma_h256_applies`) still keys on the padded used
+   extent, so a verify batch that straddles the 256-cell boundary *where the gate flips* takes the other
+   family for that one step.  That is the r315 trade, documented in `ENVIRONMENT.md` §8 and §97; it was not
+   changed here, and the tile split above is a separate (and now fixed) crossing.
+2. `ntiles_dst_eff` is already width-normalised for issue #25 but the *other* half of the heuristic (the
+   split count) was not: the two belong together, which is what made this a two-and-a-half-year-old class
+   hiding behind one correct line.
+3. The per-block gate configures a FRESH build dir per rung and therefore re-downloads the llama-ui bundle from
+   HF every rung; with `latest` publishing a bundle the validator rejects (`TODO` #342) and with a flaky
+   network it can fail a rung for reasons unrelated to the change.  `HF_UI_VERSION=b12387` was required for
+   this release's ladder.
+
 ## 261119.002 (r318, RELEASE v17-4f9dfa0e3-r318) -- GitHub issue #331 CLOSED: the Q8_1 MUL fusion counted only direct readers, so a LoRA's delta was dropped (block 10)
 
 **Release:** `v17-4f9dfa0e3-r318`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `51a0d4256`

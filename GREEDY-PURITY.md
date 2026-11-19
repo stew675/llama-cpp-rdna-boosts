@@ -169,6 +169,7 @@ is worth keeping moves it to that archive under its own number rather than growi
 | **§94** | **a table resolved from a recycled scheduler buffer must be identified by its SEMANTIC ROLE, not by device + layer — and a take-over's "do not fill the copy" promise must be repairable:** a layer's `ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps` share a device and a layer number, and a layer's routed ops are issued back to back, so the graph allocator's recycled `input_cpy` address is routinely a *sibling role's*; the hooks resolve the host master (right role) while the consumer's redirect resolved the copy pointer, so a stale alias made the redirect serve the neighbour's arena in place — `blk.43.ffn_up_exps` computed from `blk.43.ffn_down_exps` (`nan`, then `-2.1e7`, Flash-Next + MTP, 2 devices `-sm layer`, `-c 32768`), one near-tie flip, and a degenerate continuation where a capture bakes the wrong pointer in.  The role check is one in-place string compare per routed op and rejects once in a 24 K-token prompt; the fallback is the existing `(layer, sem_role, device)` key.  A byte validator cannot see it (`MOE_EXPERT_CACHE_VALIDATE=3` read 0 `MISMATCH` on the NaN arm: the arena held the model's bytes).  Separately, a hook's promise that the scheduler may skip `input_cpy` can be broken by an arena eviction landing between the hook and the consumer's launch, so the consumer re-fills the skipped buffer from the host master when the promise is still outstanding for that buffer (`MOE_EXPERT_TAKEOVER_FAULT=1` proves the path byte-identical to the staged arm; ordinary runs read `broken=0 repaired=0`) | doctrine + fix (r298, blocks 09/10/15, `TODO` #335 + #336 retired; `benchmarks/2026-11-16-in-place-read-alias-role.md`, `INVARIANTS.md` r298) |
 | **§96** | **a kernel-family test for a decode/verify kernel must read a RUN-CONSTANT per-layer attribute, never the used KV length**: at the FA op `K->ne[1]` is the layer's KV **cache size** (measured: 8192/16384 at `-c 8192`/`-c 16384`, and `n_swa + n_ubatch` = 1536 for a windowed layer) and is fixed for the run, so keying the RDNA4 band's 128-dim arm on `K->ne[1] * passes_saved >= 20000` keeps a decode step and its own verify on one kernel, while a test on the used length would move by `W-1` rows between them (the padded form can straddle a 256 boundary: 8190 -> 8192 decode against 8198 -> 8448 verify) and break invariant 1. The band's per-launch cost (the packed-mask prepass, the `P = nsm` fixup combine) is not amortized on a short cache, so the arm is a loss of 1.05-2.5x at the decode width below the crossover and a win of 2-7x above it; on a sliding-window/hybrid model the windowed layers hold a short cache for the WHOLE run, which is why the band was -4.5..-5.8 % at every depth until it was gated (r314, block 05, contributor PR #329) | doctrine + fix (r314; `INVARIANTS.md` r314; `benchmarks/2026-11-18-fa-band-h128.md`) |
 | **§98** | **a decode/verify kernel's fixup period is a NUMERIC-ORDER constant, so it must not depend on the query width or the KV extent — and the shipping value is the one the end-to-end arm ranks, not the op table**: the RDNA4 band's `P` (blocks per output tile) has a *width-dependent* optimum — the decode width wants 16 and the verify widths want 8 on gfx1201 (q8_0, medians of 3: 92.9 against 104.0 µs at kv 16384/n_q 1, 150.1 against 170.2 at kv 16384/n_q 8), so one constant is necessarily suboptimal somewhere and keying it on `n_q` would split a decode step from its own verify (invariant 1).  The quantized types' old default `nsm` (32) was 5-14 % off at every banded shape and shipped as `nsm/2` (r316); `P` 8 wins the verify rows and loses every end-to-end arm (40.86 against 42.45 t/s at d32768; 75.68 against 88.91 on a 20.5K MTP arm), and the attention-bound arm's +17.1 % token rate is only ~4.5 %/step of kernel — the rest is the acceptance re-roll a numeric-order change carries, so never quote a greedy speculative arm's t/s delta as the kernel's win.  A constant `P` is width-pure BY CONSTRUCTION (37 probe arms, maxdiff 0), which is what makes it cheap to gate: a *keyed* `P` would owe §97's crossing measurement | doctrine + fix (r316, block 05, `TODO` #346 closed; `INVARIANTS.md` r316; `benchmarks/2026-11-18-band-fixup-period.md`) |
+| **§99** | **a decode/verify KV split is the summation order, so it must be a RUN CONSTANT — never a function of the padded used KV extent**: the tile FA launcher's `parallel_blocks` (`gridDim.y`) decides which block owns KV iterations b, b+P, b+2P, …, and the combine sums the P partials in block order, so P re-groups real iterations.  `K->ne[1]` is `GGML_PAD(used, 256)` computed AFTER the batch is applied, so a W-row verify at position p sees `pad(p+W)` against the plain decode's `pad(p+1)`; at a 256-cell multiple the old efficiency search picked a different P for the same row (176 against 175 at 27B 3-device tensor `nkv` 5632) and moved the logits by up to 0.232868 — a greedy near-tie flipped, so `plain != draft-mtp` (issue #330).  Pin P to the search's one-full-wave value for `Q->ne[1] <= 8`: deep KV then appends only masked no-ops, shallow KV is one iteration per block (ascending), and the `ntiles_KV = P_const` crossing is exact | fix (r319, block 05, issue #330; `INVARIANTS.md` r319; `benchmarks/2026-11-19-fa-split-boundary-purity.md`) |
 
 ---
 
@@ -2794,3 +2795,46 @@ build's `GGML_HIP_FA_BAND_WMMA_SPLIT=16` arm byte for byte.
 
 **Record.**  `INVARIANTS.md` r316, `MANIFESTS.md` gate 05, `ENVIRONMENT.md` §8, `WORKLOG.md` 261118.011,
 `benchmarks/2026-11-18-band-fixup-period.md`.
+
+## 99. A decode/verify KV split is the summation order, so it must be a run constant, never a function of the padded KV extent (r319, block 05, issue #330)
+
+**Claim.**  The tile FA launcher splits each output tile's KV over `parallel_blocks` blocks (`gridDim.y`): block b owns
+the KV iterations `b, b+P, b+2P, …` and `flash_attn_combine_results` sums the P partials **in block order**.  `P` is
+therefore the reduction's association, and it is not allowed to move between a decode step and the verify of the same
+state (invariant 1).  At the FA op `K->ne[1]` is the KV cache's **padded used extent**
+(`min(cache, max(256, GGML_PAD(used, 256)))`), and the decode batch is applied *before* it is computed, so a W-row
+verify batch at position `p` makes the extent `pad(p+W)` while the plain decode of the same row makes it `pad(p+1)`.
+The two agree except in the W-1 cell window at each 256-cell multiple, where the verify steps one padding block ahead
+— and the old efficiency search keyed `P` on `ntiles_KV = ceil(K->ne[1] / nbatch_fa)`, so at that one step it could
+pick a different split and move the last bits.
+
+**Rule.**  Three parts.
+
+1. *A decode/verify KV split is a run constant.*  In the `Q->ne[1] <= 8` band, take `P` from the device and the
+   width-independent tile count (as the launcher already evaluates `ntiles_dst` "as if n_q == 1" for issue #25), never
+   from `ntiles_KV`.  The shipping form is `min(P_const, ntiles_KV)` with `P_const` the search's one-full-wave value
+   (`nsm * max_blocks_per_sm`), which is exactly the split the old search returned whenever it did not trip the
+   off-by-one, so the fix is free.
+2. *The `min(ntiles_KV, …)` clamp is safe only because a short cache is one iteration per block.*  With `P >=`
+   the row's own tile count the combine's order is ascending KV; the trailing blocks above it are neutral
+   (`M = -inf` -> `expf(-inf - kqmax) = 0`) and are added as exactly 0, so a verify whose extent is one padding
+   block ahead of the decode's produces the same bits.  The `ntiles_KV = P_const` crossing is exact for the same
+   reason (the round-robin split is one iteration per block there).
+3. *A width probe must straddle a padding boundary, or it cannot see this class.*  A flat prefix on a 256-cell
+   multiple (256 / 4096 / 10240) puts every width in the same padding block, which is why
+   `test-logits-width-probe` read PASS through r318 while a 3-device speculator diverged.  The probe now runs a
+   second arm at `256*(P/256 + 1) - NW/2`, the prefix where W=1 lands below the multiple and W=8 above it.
+
+**Numbers.**  Pre-fix (r318) the two manifests on 3 GPU `-sm tensor`, 27B Q8_0, `-n 512`, seed 42, temp 0: q8_0 prose
+plain `120c74935967` against `draft-mtp n3` `c1f9d0b3f5b6`; bf16 reasoning plain `7dca501eeb0e` against
+`759c1a4515c6`.  A sampler-level diff shows the first divergence at generated position 5630 (the verify's padded
+extent 5888 against the plain's 5632; bit-identical top-2 logits over the preceding 373 positions), and the probe's
+boundary arm reads **maxdiff 0.232868** (q8_0) / **0.196008** (bf16) pre-fix, **0** post-fix.  Post-fix both manifests
+read one text (`c1f9d0b3f5b6` / `2fbc183348a8`), and `GGML_CUDA_FA_SPLIT_CONST=0` reproduces the pre-fix pair exactly.
+Only the 3-device tensor plain arm moved (it moved onto the verify's ascending order); 4B 1 GPU `-sm layer`
+`be6407e421c8`, 27B 2 GPU tensor `b1c84ba23a2c` and 27B 3 GPU `-sm layer` `f59aa0be6536` are unchanged.  Decode is flat
+at every depth to 131k (tg128 46.6 / 45.6 / 42.3 / 34.6 t/s at d0/8k/32k/131k, both arms) and prefill is untouched.
+
+**Record.**  `INVARIANTS.md` r319, `MANIFESTS.md` gate 36, `ENVIRONMENT.md` §8 (`GGML_CUDA_FA_SPLIT_CONST`),
+`WORKLOG.md` 261119.003, `benchmarks/2026-11-19-fa-split-boundary-purity.md`, `scripts/gate-spec-purity.sh`,
+`tests/test-logits-width-probe.cpp` (the boundary arm), issue #330.
