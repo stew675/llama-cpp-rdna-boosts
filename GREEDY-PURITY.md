@@ -168,6 +168,7 @@ is worth keeping moves it to that archive under its own number rather than growi
 | **§93** | **a fusion that reads an expert table DIRECTLY is only reachable above the decode/verify band when that table is DEVICE-resident, so an in-place contract for it is unverifiable — and must not be assumed to be the carrier of a residency-dependent text:** a routed `MUL_MAT_ID` whose weight is a host buffer is its own single-node scheduler split, so `gate`/`up`/`GLU` never share a graph and the four prefill MoE fusions (MMB routed GLU, the MMQ gate+up+GLU triple, the MMQ shared-quantize pair, the MMQ `swiglu→down` fold) decline for SHAPE on every `-ncmoe` arm (census 0/0 on 35B-A3B Q8_0/Q4_K_M/Q3_K_M and Flash-Next IQ3_XXS, `-sm layer` and `-sm tensor`; `pair=0/117` only on a fully device-resident model, where the cache has no tables).  So the r258/r266 in-place stand-down guarded a case that cannot occur, a 'residency selected the kernel set' differential must be re-attributed before it is fixed, and the contract is still worth carrying (three-state: NONE / IN_PLACE / MIXED-stand-down) because it is what makes the fusions residency-neutral *if* a config ever reaches them.  Read the `-lv 4` census (`prefill MoE fusions: <kind>=<in_place>/<staged> … mixed_lanes=N`) first | doctrine + finding (r297, blocks 09/10, `TODO` #327 retired; `benchmarks/2026-11-16-prefill-in-place-fusion-contract.md`) |
 | **§94** | **a table resolved from a recycled scheduler buffer must be identified by its SEMANTIC ROLE, not by device + layer — and a take-over's "do not fill the copy" promise must be repairable:** a layer's `ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps` share a device and a layer number, and a layer's routed ops are issued back to back, so the graph allocator's recycled `input_cpy` address is routinely a *sibling role's*; the hooks resolve the host master (right role) while the consumer's redirect resolved the copy pointer, so a stale alias made the redirect serve the neighbour's arena in place — `blk.43.ffn_up_exps` computed from `blk.43.ffn_down_exps` (`nan`, then `-2.1e7`, Flash-Next + MTP, 2 devices `-sm layer`, `-c 32768`), one near-tie flip, and a degenerate continuation where a capture bakes the wrong pointer in.  The role check is one in-place string compare per routed op and rejects once in a 24 K-token prompt; the fallback is the existing `(layer, sem_role, device)` key.  A byte validator cannot see it (`MOE_EXPERT_CACHE_VALIDATE=3` read 0 `MISMATCH` on the NaN arm: the arena held the model's bytes).  Separately, a hook's promise that the scheduler may skip `input_cpy` can be broken by an arena eviction landing between the hook and the consumer's launch, so the consumer re-fills the skipped buffer from the host master when the promise is still outstanding for that buffer (`MOE_EXPERT_TAKEOVER_FAULT=1` proves the path byte-identical to the staged arm; ordinary runs read `broken=0 repaired=0`) | doctrine + fix (r298, blocks 09/10/15, `TODO` #335 + #336 retired; `benchmarks/2026-11-16-in-place-read-alias-role.md`, `INVARIANTS.md` r298) |
 | **§96** | **a kernel-family test for a decode/verify kernel must read a RUN-CONSTANT per-layer attribute, never the used KV length**: at the FA op `K->ne[1]` is the layer's KV **cache size** (measured: 8192/16384 at `-c 8192`/`-c 16384`, and `n_swa + n_ubatch` = 1536 for a windowed layer) and is fixed for the run, so keying the RDNA4 band's 128-dim arm on `K->ne[1] * passes_saved >= 20000` keeps a decode step and its own verify on one kernel, while a test on the used length would move by `W-1` rows between them (the padded form can straddle a 256 boundary: 8190 -> 8192 decode against 8198 -> 8448 verify) and break invariant 1. The band's per-launch cost (the packed-mask prepass, the `P = nsm` fixup combine) is not amortized on a short cache, so the arm is a loss of 1.05-2.5x at the decode width below the crossover and a win of 2-7x above it; on a sliding-window/hybrid model the windowed layers hold a short cache for the WHOLE run, which is why the band was -4.5..-5.8 % at every depth until it was gated (r314, block 05, contributor PR #329) | doctrine + fix (r314; `INVARIANTS.md` r314; `benchmarks/2026-11-18-fa-band-h128.md`) |
+| **§98** | **a decode/verify kernel's fixup period is a NUMERIC-ORDER constant, so it must not depend on the query width or the KV extent — and the shipping value is the one the end-to-end arm ranks, not the op table**: the RDNA4 band's `P` (blocks per output tile) has a *width-dependent* optimum — the decode width wants 16 and the verify widths want 8 on gfx1201 (q8_0, medians of 3: 92.9 against 104.0 µs at kv 16384/n_q 1, 150.1 against 170.2 at kv 16384/n_q 8), so one constant is necessarily suboptimal somewhere and keying it on `n_q` would split a decode step from its own verify (invariant 1).  The quantized types' old default `nsm` (32) was 5-14 % off at every banded shape and shipped as `nsm/2` (r316); `P` 8 wins the verify rows and loses every end-to-end arm (40.86 against 42.45 t/s at d32768; 75.68 against 88.91 on a 20.5K MTP arm), and the attention-bound arm's +17.1 % token rate is only ~4.5 %/step of kernel — the rest is the acceptance re-roll a numeric-order change carries, so never quote a greedy speculative arm's t/s delta as the kernel's win.  A constant `P` is width-pure BY CONSTRUCTION (37 probe arms, maxdiff 0), which is what makes it cheap to gate: a *keyed* `P` would owe §97's crossing measurement | doctrine + fix (r316, block 05, `TODO` #346 closed; `INVARIANTS.md` r316; `benchmarks/2026-11-18-band-fixup-period.md`) |
 
 ---
 
@@ -2749,3 +2750,47 @@ KLD 0.000000 / 100.000 % canonical and 0.004967 / 98.804 % on the family-switch 
 
 **Record.**  `INVARIANTS.md` r315, `MANIFESTS.md` gate 05, `ENVIRONMENT.md` §8, `WORKLOG.md` 261118.010,
 `benchmarks/2026-11-18-fa-band-h256.md`.
+
+## 98. A fixup period is a numeric-order constant: one value, chosen end to end, never keyed on the width (r316, block 05, `TODO` #346)
+
+**Claim.**  The RDNA4 band splits each output tile's KV over a fixed number `P` of blocks (`b = tile*P + i`, the
+uniform fixup combines the `P` partials in a fixed order), so `P` is **numeric order** — a change to it moves the
+output text of every banded model, on every head class, for every native K/V type.  `TODO` #346 asked whether the
+native-quantized types should stop using `P = nsm` (32 on gfx1201) and take the 2-byte family's `nsm/2`.  They
+should: but the reason is not "16 is the optimum" — it is that the optimum depends on the *width*, so the
+constant has to be picked on the arm that pays.
+
+**Rule.**  Four parts.
+
+1. *A fixup period may not depend on `n_q` or on the KV extent.*  It must not, because decode and its own verify
+   have to share one summation order (invariant 1), and it need not, because the fixup layout is exact for any
+   constant `P` (a longer KV only appends masked no-op iterations).  Head class, K/V type and device (`nsm`) are
+   all allowed inputs; the width is not.  This is also what makes such a change cheap to gate: a constant `P`
+   **cannot straddle**, so `test-logits-width-probe` is a construction check, not a search.
+2. *Do not infer the constant from one width's table.*  Measured on one R9700 (`test-backend-ops perf`, band
+   forced, medians of 3): the decode width's minimum is 16 and the verify widths' is 8, monotonically in `P`
+   (256-dim GQA 6 q8_0: 92.9 / 99.5 / 104.0 and 150.1 / 179.7 / 269.5 µs for `P` 16 / 32 / 8 at kv 16384,
+   `n_q` 1 and 8).  The same holds for f16 (144.9 / 172.5 / 201.2 for `P` 8 / 16 / 32 at `n_q` 8).
+3. *Pick the value on the end-to-end arms, and quote the kernel's share honestly.*  Compute width's optimum (8)
+   loses every end-to-end arm; 16 wins or ties everywhere.  On a greedy *speculative* arm the token-rate delta
+   is not the kernel's win: the 27B `draft-mtp n7` 20.5K row moved 75.8 → 88.9 t/s (+17.1 %) while the mean
+   accepted length moved 3.26 → 3.82, i.e. 30.3 → 26.6 steps for the same 128 tokens — **~4.5 %/step**.  A
+   numeric-order change re-rolls greedy near-ties, so acceptance moves in either direction and that is a
+   property of the run.
+4. *Re-check every gate whose constant was calibrated with the old `P`.*  Both band gates' boundaries are
+   unchanged in cell terms and still land on the measured crossover with the new value (band/tile 1.07 at the
+   256-dim 8192-cell row and 0.85 at 16384; 1.06 / 0.88 for 128-dim ratio 10 at 4096 / 8192), and the new value
+   only improves the margins — so no constant moved, and that had to be *shown*, not assumed.
+
+**Numbers.**  P16 against the old quantized default 32: **+5-14 %** per op at every banded shape (kv
+16384-102400, both widths); end to end on q8_0 K/V, plain decode and the 128-dim class are noise (43.63/42.41
+vs 43.52/42.61 t/s; 26.07/25.42 vs 25.96/25.44), the 27B `draft-mtp n7` arms are **+5.8 %** (79.2 vs 74.9) and
+**+17.1 %** (88.9 vs 75.8, ~4.5 %/step of kernel).  One loss, at a short cache the gates keep off (1024 cells,
+`n_q` 1: 55.0 vs 42.6 µs).  `test-backend-ops` 7381/7381 × four arms; 37 width-probe arms PASS maxdiff 0;
+prefill KLD 0.000000 / 100.000 % canonical, and 0.002733 / 99.243 % (27B) and 0.000823 / 98.981 % (Ripple-65B)
+on a *banded* `-ub 4` family-switch point against same-kernel controls of 0.004182 / 98.822 % and 0.004133 /
+97.772 %; f16 K/V text byte-identical to r315 on five models, and the one moved q8_0 arm reproduces the r315
+build's `GGML_HIP_FA_BAND_WMMA_SPLIT=16` arm byte for byte.
+
+**Record.**  `INVARIANTS.md` r316, `MANIFESTS.md` gate 05, `ENVIRONMENT.md` §8, `WORKLOG.md` 261118.011,
+`benchmarks/2026-11-18-band-fixup-period.md`.

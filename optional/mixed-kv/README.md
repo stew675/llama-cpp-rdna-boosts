@@ -8,8 +8,14 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `85bdd776ed5d2e77e74bc978563f7706376bb222cb29395934b2b6b94c74fe08` (the r315 cut -- every re-cut moves the exported commit
+  `caee1ff2b7a4799ba0f2de9259b71959053be943c695bf57c9c7a96b9fb3d152` (the r316 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
+* **r316 re-cut verification**: applies strictly at the r316 default tree
+  `4119a6f862cff0f3b8840be51426e1a3028d8a71` (sha256
+  `caee1ff2b7a4799ba0f2de9259b71959053be943c695bf57c9c7a96b9fb3d152`), producing tree `003b6e09395c770fb5902e273ae9bad4f55fdf76`; with `0100` on top, the cumulative
+  tree is `3447592e07c2a260e25b0c17e1e9ecb3bf5f6b02`.  Block 05's r316 amendment rewrites the *band split helper*
+  in `fattn-rdna.cuh` (the tile-kernel `type_V` rows this artifact adds are untouched), so its **patch-id is
+  unchanged** from the r315 cut and `validate-set.sh` check 8 verifies all three trees on every run.
 * **r315 re-cut verification**: applies strictly at the r315 default tree
   `ff3c4d85732d9dda27a6a4914c728afb541d7ae6` and produces `dd400b9d74bf5d48cb8c96e2e2281e0cffe485e6`; cumulative with the other
   optional artifact, numeric order, is `7aec397b249a6f968e1cc425d63d89fbf8fad291`.  **The patch file moved**

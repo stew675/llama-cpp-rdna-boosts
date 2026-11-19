@@ -1,4 +1,4 @@
-From b3e2d0836cd31948512d001be65dd4228c597117 Mon Sep 17 00:00:00 2001
+From 6f3a5ad80d78f4c40ef66b0a70804228afccbde7 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 12 Nov 2026 08:22:10 -0600
 Subject: [PATCH 05/17] rdna-boosts: block 05: flash-attention band, native
@@ -155,6 +155,42 @@ cache the idle blocks cost nothing (a block that owns no iteration writes a neut
 smaller P serialises the KV iterations -- 512 cells with P = 8 measures 52.6 us against 31.1 for P = 16.
 P = 16 is the optimum in 30 of the 36 measured rows; the quantized default P = nsm is 10-20 % off it at most
 sizes, which is a separate tuning item (it moves every banded model's numerics).
+
+r316 (TODO #346 closed) -- the band's fixup period P stops depending on the K/V type: P = max(2, nsm/2) for
+EVERY type now (nsm 32 -> 16), so `ggml_cuda_fattn_band_wmma_two_byte()` and the launcher's P fallback are gone
+and `GGML_HIP_FA_BAND_WMMA_SPLIT` stays as the tuning override.  A sweep of the 256-dim class
+(`GGML_HIP_FA_BAND_WMMA_SPLIT` 8/16/24/32/48/64/96 x kv 512-102400 x n_q 1/8, q8_0, medians of 3,
+test-backend-ops perf) puts the DECODE width's optimum at 16 for both type families and the VERIFY widths' at 8,
+so one constant cannot serve both and 16 is the compromise the widths force: P 16 beats the old quantized
+default 32 by 5-14 % at kv 16384-102400 (92.9 against 99.5 us at kv 16384/n_q 1, 151.2 against 163.9 at 32768,
+425.0 against 447.5 at 102400, 279.7 against 318.4 at 32768/n_q 8) and only loses at the short caches every band
+gate keeps off (1024 cells/n_q 1: P 16 55.0 against P 32 42.6 -- measured and recorded, unreachable).  The
+long-standing comment claim that the verify cost is "flat for P 48..96 at kv 20K..200K" does not reproduce on
+this kernel (verify widths are monotone in P; what is flat is the decode width above P 24) and was replaced.
+
+End to end (3 GPU `-sm tensor`, q8_0 K/V, `ROCBLAS_USE_HIPBLASLT=0`): plain 27B tg64 43.66 / 42.45 t/s at
+d16384 / d32768 against 43.53 / 42.62 (noise -- a 27B Q8_0 decode is at the DRAM roof), Ripple-65B 26.07 / 25.41
+against 25.96 / 25.44 (noise), and the attention-bound arm that pays: 27B `draft-mtp n7` on the 20.5K prose
+prompt 88.91 against 75.83 t/s (+17.2 %, of which ~4.5 %/step is the kernel and the rest the acceptance re-roll a
+numeric-order change always carries) and 79.00 against 74.91 at ~10.5K (+5.5 %).  P 8 wins the op-level verify
+rows but loses every e2e arm (40.86 t/s at d32768, 75.68 on the 20.5K arm), so it was not taken.
+
+Correctness and purity: `test-backend-ops -o FLASH_ATTN_EXT` 7381/7381 in four arms (default, H256+H128 forced,
+`WMMA=0`, `WMMA=2`); `test-logits-width-probe` width purity PASS maxdiff 0 on 37 arms (both head classes, q8_0 /
+f16 / bf16, one GPU plus `SPLIT=tensor` and `SPLIT=layer`, P 3584 / 4096 / 10240 -- a constant P cannot
+straddle); prefill KLD 0.000000 / 100.000 % at the canonical point, and the family-switch point 0.002733 /
+99.243 % (27B) and 0.000823 / 98.981 % (Ripple-65B) against same-kernel controls of 0.004182 / 98.822 % and
+0.004133 / 97.772 %.  The four MTP axes are byte-identical to r315 on bf16 K/V (R `7dca501eeb0e` /
+`759c1a4515c6`, P `fcc0bdeb636b`, C `eb89102cb7d8`, K `a87c4318b649`, acceptance 348/486, 357/460, 368/427,
+372/375 reproduced exactly) and the q8_0 arms carry the same acceptance as r315's own (P-independent: the four
+axes sit below the band gate and never reach it).  Every text arm that moved -- 27B q8_0 at a 21K prompt
+`f7d157b1e07e` -> `774d1c325068` -- reproduces the previous build's `GGML_HIP_FA_BAND_WMMA_SPLIT=16` arm byte for
+byte, and `SPLIT=32` still reproduces the old default.  The 128-dim gate's decisions are unchanged in cell terms
+and every one of them is still on the right side of the measured crossover with P 16 (ratio 10: 4096 cells 1.06
+loss, 8192 0.88 win; ratio 5: 8192 0.62; ratio 7: 4096 0.60; ratio 12: 8192 1.06 tile, 32768 0.91 band).
+
+Records: `INVARIANTS.md` r316, `GREEDY-PURITY.md` 98, `benchmarks/2026-11-18-band-fixup-period.md`,
+`MANIFESTS.md` gate 05, `patches/README.md` block 05, `ENVIRONMENT.md` 8, `TODO.md` (#346 deleted).
 ---
  common/common.cpp                             |    6 +
  common/speculative.cpp                        |    4 +
@@ -165,9 +201,9 @@ sizes, which is a separate tuning item (it moves every banded model's numerics).
  ggml/src/ggml-cpu/ops.cpp                     |   34 +-
  ggml/src/ggml-cuda/convert.cu                 |    6 +
  ggml/src/ggml-cuda/dequantize.cuh             |   13 +
- ggml/src/ggml-cuda/fattn-common.cuh           |  830 +++++++++++-
+ ggml/src/ggml-cuda/fattn-common.cuh           |  832 +++++++++++-
  ggml/src/ggml-cuda/fattn-mma-f16.cuh          | 1198 ++++++++++++++---
- ggml/src/ggml-cuda/fattn-rdna.cuh             |  614 +++++++++
+ ggml/src/ggml-cuda/fattn-rdna.cuh             |  607 +++++++++
  ggml/src/ggml-cuda/fattn-tile.cu              |   44 +-
  ggml/src/ggml-cuda/fattn-tile.cuh             |  612 +++++++--
  ggml/src/ggml-cuda/fattn-vec.cuh              |   14 +-
@@ -497,7 +533,7 @@ sizes, which is a separate tuning item (it moves every banded model's numerics).
  src/llama-kv-cache.h                          |   23 +
  src/llama-kv-cells.h                          |   53 +
  tests/test-backend-ops.cpp                    |  220 ++-
- 341 files changed, 6324 insertions(+), 678 deletions(-)
+ 341 files changed, 6319 insertions(+), 678 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-rdna.cuh
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_4-ncols2_8-dkq256-dv256.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_8-ncols2_8-dkq256-dv256.cu
@@ -1042,7 +1078,7 @@ index 651524be7..a8cf54eb5 100644
      const block_q4_1 * x = (const block_q4_1 *) vx;
  
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 83a0e2254..4afdbb6d8 100644
+index 83a0e2254..8365cde4d 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -8,6 +8,51 @@
@@ -1950,7 +1986,7 @@ index 83a0e2254..4afdbb6d8 100644
      GGML_ASSERT(max_blocks_per_sm > 0);
      int parallel_blocks = max_blocks_per_sm;
  
-@@ -1231,7 +1985,29 @@ void launch_fattn(
+@@ -1231,7 +1985,31 @@ void launch_fattn(
          blocks_num.y = 1;
          blocks_num.z = 1;
  
@@ -1969,19 +2005,21 @@ index 83a0e2254..4afdbb6d8 100644
 +        // band_wmma is the evaluation the group-skip gate above reads, so the two cannot disagree.
 +
 +        if (band_wmma) {
-+            // P = nsm for the native-quantized types: measured on gfx1201 (head 256, GQA 6, 4 KV heads)
-+            // the verify cost is flat for P = 48..96 at kv 20K..200K and degrades below 32 or above 128.
-+            // The 2-byte types do less work per KV iteration, so the P partials' fixup is a larger
-+            // fraction of their cost; the split helper returns a smaller fixed P for them.
-+            const int split_env = ggml_cuda_fattn_band_wmma_split(dst);
-+            const int P         = split_env > 0 ? split_env : std::max(2, nsm);
++            // P = nsm/2 for every K/V type (r316): measured on gfx1201 (head 256, GQA 6, 4 KV heads,
++            // nsm 32) the decode width's optimum is 16 on both type families, and the verify widths'
++            // is 8 -- one constant cannot serve both, and the smaller one costs the decode width more
++            // than it buys the verify.  The r133-era note that the verify cost was "flat for P 48..96
++            // at kv 20K..200K" does not reproduce on this kernel (verify widths are monotone in P:
++            // at kv 32768, n_q 8, q8_0, P 8/16/32/48/64/96 = 269/280/318/345/369/401 us); what is
++            // flat is the *decode* width above P 24.  benchmarks/2026-11-18-band-fixup-period.md.
++            const int P = ggml_cuda_fattn_band_wmma_split(dst);
 +            blocks_num.x = ntiles_dst;
 +            blocks_num.y = P;
 +        } else if(use_stream_k) {
              const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
              // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
              // Only do this if the occupancy loss from rounding is acceptable.
-@@ -1247,8 +2023,9 @@ void launch_fattn(
+@@ -1247,8 +2025,9 @@ void launch_fattn(
              blocks_num.x = nblocks_stream_k;
          }
  
@@ -1993,7 +2031,7 @@ index 83a0e2254..4afdbb6d8 100644
          }
      } else {
          // parallel_blocks must not be larger than what the tensor size allows:
-@@ -1317,29 +2094,46 @@ void launch_fattn(
+@@ -1317,29 +2096,46 @@ void launch_fattn(
  
      GGML_ASSERT(block_dim.x % warp_size == 0);
  
@@ -2044,7 +2082,7 @@ index 83a0e2254..4afdbb6d8 100644
              const int bpt         = nblocks_sk / ntiles_dst;
  
              const uint3 fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * K->ne[2]);
-@@ -1354,7 +2148,7 @@ void launch_fattn(
+@@ -1354,7 +2150,7 @@ void launch_fattn(
                  (float *) KQV->data, dst_tmp_meta.ptr,
                   Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                   gqa_ratio, bpt, fd0, fd1, fd2);
@@ -3799,10 +3837,10 @@ index 33856a38a..f5b09931f 100644
      extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 2,  2); \
 diff --git a/ggml/src/ggml-cuda/fattn-rdna.cuh b/ggml/src/ggml-cuda/fattn-rdna.cuh
 new file mode 100644
-index 000000000..91099ce9c
+index 000000000..529e05f6c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/fattn-rdna.cuh
-@@ -0,0 +1,614 @@
+@@ -0,0 +1,607 @@
 +// RDNA/ROCm flash-attention predicates: the native-KV staging policy and selectors, and
 +// the RDNA4 decode/verify band (WMMA) helpers.  Split out of fattn-common.cuh (an upstream
 +// hub) so an upstream re-base collides with the predicate call points, not their bodies.
@@ -4164,13 +4202,6 @@ index 000000000..91099ce9c
 +    return v;
 +}
 +
-+// The 2-byte K/V types share the band's light per-iteration variant (see the ncols1 and split
-+// helpers).  bf16 only reaches the band through its opt-in native arm, where K->type is BF16.
-+static inline bool ggml_cuda_fattn_band_wmma_two_byte(const ggml_tensor * dst) {
-+    const ggml_tensor * K = dst != nullptr ? dst->src[1] : nullptr;
-+    return K != nullptr && (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_BF16);
-+}
-+
 +static inline int ggml_cuda_fattn_band_wmma_ncols1(const ggml_tensor * dst) {
 +    GGML_UNUSED(dst);
 +    const int v = ggml_cuda_fattn_band_wmma_ncols1_env();
@@ -4180,14 +4211,17 @@ index 000000000..91099ce9c
 +    return 4;
 +}
 +
-+// Blocks per output tile in the band (the interleave period P, see launch_fattn).  0 = one block per
-+// CU (nsm); GGML_HIP_FA_BAND_WMMA_SPLIT overrides it for tuning.  Whatever the source, it must not
-+// depend on n_q or on the KV length, or decode and verify would split differently.  The 2-byte types
-+// do less work per KV iteration, so the P partials' fixup is a larger fraction of their cost; half of
-+// nsm measured best for them on gfx1201 (nsm 32: P 16 beats 24/32 by 6-8 % at kv 16384-51200 and is
-+// within noise at 98304, for n_q = 1..8), while the quantized types keep nsm.  Expressed as a
-+// fraction of nsm so a smaller RDNA4 part scales down with it.
++// Blocks per output tile in the band (the interleave period P, see launch_fattn).  P = nsm/2 on
++// gfx1201 (nsm 32 -> 16), for every K/V type; GGML_HIP_FA_BAND_WMMA_SPLIT overrides it for tuning.
++// Whatever the source, it must not depend on n_q or on the KV length, or decode and verify would
++// split differently.  The value is a compromise the widths force: the decode width's optimum is the
++// larger one (P 16 beats 24/32/48/64/96 at kv 8192-102400 and is 5-8 % off at 20480-32768), while
++// the verify widths prefer half of that (P 8), and one constant has to serve both.  At a short cache
++// the band is below every gate anyway (and a small P is *worse* there: 1024 cells, q8_0, n_q = 1,
++// P 16 55.0 us against P 32 42.6).  Expressed as a fraction of nsm so a smaller RDNA4 part scales
++// down with it.  Record: benchmarks/2026-11-18-band-fixup-period.md (`r316`).
 +static inline int ggml_cuda_fattn_band_wmma_split(const ggml_tensor * dst) {
++    GGML_UNUSED(dst);
 +    static const int env_split = []() {
 +        const char * env = getenv("GGML_HIP_FA_BAND_WMMA_SPLIT");
 +        const int v = env ? atoi(env) : 0;
@@ -4195,9 +4229,6 @@ index 000000000..91099ce9c
 +    }();
 +    if (env_split > 0) {
 +        return env_split;
-+    }
-+    if (!ggml_cuda_fattn_band_wmma_two_byte(dst)) {
-+        return 0;
 +    }
 +    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
 +    return std::max(2, nsm/2);

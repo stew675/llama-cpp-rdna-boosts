@@ -21,8 +21,14 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `4ad739ce8b66f53ddee3fab6bbce990d816b5b48bd5e5fddb3af11a3406a47fc` (the r315 cut -- every re-cut moves the exported commit
+  `5ebab36f7f51f100eb7181498a2240325faeada169d1632ac87f61d4c565cd3a` (the r316 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
+* **r316 re-cut verification**: applies strictly at the r316 default tree
+  `4119a6f862cff0f3b8840be51426e1a3028d8a71` (sha256
+  `5ebab36f7f51f100eb7181498a2240325faeada169d1632ac87f61d4c565cd3a`), producing tree `d0cf0c723b1389dea7854f04ddd126a84d4f92cf`; with `0101` on top, the cumulative
+  tree is `3447592e07c2a260e25b0c17e1e9ecb3bf5f6b02`.  Block 05's r316 amendment touches
+  `fattn-rdna.cuh` / `fattn-common.cuh` only, which this artifact does not edit, so its **patch-id is unchanged**
+  from the r315 cut and `validate-set.sh` check 8 verifies all three trees on every run.
 * **r315 re-cut verification**: applies strictly at the r315 default tree
   `ff3c4d85732d9dda27a6a4914c728afb541d7ae6` and produces `6328a17fa5b71d5bb621ac74d6d906913935ae34`; cumulative with the other
   optional artifact, numeric order, is `7aec397b249a6f968e1cc425d63d89fbf8fad291`.  **The patch file moved**

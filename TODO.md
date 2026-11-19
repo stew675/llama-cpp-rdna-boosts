@@ -45,31 +45,7 @@ left in this file.  The r236 re-base
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
-| **346** | the band's fixup period `P`: `nsm` for the native-quantized K/V types, but `nsm/2` measures 10-20 % better at most sizes (30 of 36 rows) — a numeric-order change, so it moves every banded model's text | performance / kernel tuning (block 05) | **OPEN (r315)** — not shipped with #345: needs its own ladder and an end-to-end win; see the section |
 | **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure (per-block gate, clean checkout, hosted CI) dies in `ui-assets.cmake:137` -- the container images are unaffected (their `web` stage supplies `tools/ui/dist`) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround where it bites; re-check before the next per-block ladder — §342 |
-
-## 346. The band's fixup period `P` is `nsm` for the native-quantized K/V types, and `nsm/2` measures 10-20 % better at most sizes
-
-**Subject**: `ggml_cuda_fattn_band_wmma_split()` returns `nsm` for the native-quantized K/V types and `nsm/2` for
-the 2-byte ones. A `GGML_HIP_FA_BAND_WMMA_SPLIT` sweep of the 256-dim class (r315, `TODO` #345 scoping;
-`benchmarks/2026-11-18-fa-band-h256.md` §2/§5) puts the **optimum at `P` 16 = `nsm/2` in 30 of 36 rows**, both K/V
-type families and every query width, while the quantized arm's `P` 32 measures **10-20 % worse** at most sizes:
-512 cells nb1 q8_0 42.8 (`P`16) vs 63.3 (`P`32); 2048 38.2 vs 50.0; 4096 45.2 vs 54.6; 8192 59.7 vs 68.8; 32768
-146.8 vs 158.3 (and at verify widths 32768 nb8 287.4 vs 316.9). One row disagrees in the other direction (1024
-cells nb1: 53.3 vs 42.7) and the in-code note records the opposite conclusion from an earlier measurement ("flat
-for P = 48..96 at kv 20K..200K, degrading below 32") made at verify widths, so the two need reconciling before
-anything lands.
-
-**Why it is not part of r315**: `P` is a **numeric-order** attribute, so changing it moves the text of *every*
-banded model — both head classes, GQA 5..12, 128- and 256-dim — and needs the full ladder (band oracle, width
-purity on both classes and all three native K/V types, the four MTP axes, coherence on every class,
-`gate-prefill-logits`), plus a `GGML_HIP_FA_BAND_WMMA_SPLIT` default row in `ENVIRONMENT.md`.  Its end-to-end
-value is also unmeasured and would be small: below 10000 cells the 256-dim gate keeps the band off, and above it
-the box's arms are weight-bound except the deep verify shapes, where the band is already +6.4 % (#345's record).
-
-**Re-entry condition**: the next block-05 release, or an attention-bound arm where the op's 7-20 % is
-measurable end to end.  The measurement to reproduce is the `GGML_HIP_FA_BAND_WMMA_SPLIT` sweep in
-`benchmarks/2026-11-18-fa-band-h256.md` §2.
 
 ## Handle numbering
 
@@ -88,6 +64,10 @@ subject after that item has closed and left this file.  The recent ones, so the 
   class's per-layer work gate, with its preferred route (an adaptive `P`) refuted by measurement.  It was
   mistakenly listed here as retired at r311 while the open table still carried it; the r315 record is the
   authoritative closure.
+* **`#346`** (issued r315 -- the band's fixup period `P`) retired at **r316** (`WORKLOG.md` 261118.011): the
+  quantized types' `P = nsm` shipped as `nsm/2` (one constant for every K/V type), chosen on the deep
+  attention-bound arm; **`P` 8 was measured and rejected**, and the 2-byte family's own verify-width optimum is
+  recorded in the benchmark rather than acted on.
 * **`#338`-`#340`** retired at r301, **`#341`** (issued r303) retired at r309 (`WORKLOG.md` 261117.008).
 * **`#335`/`#336`** retired at r298 — an alias ROLE gap in the expert cache, `WORKLOG.md` 261116.005;
   **`#282`** at r299 — the mid-run latch's mixture is gated on the logits, `WORKLOG.md` 261116.006.

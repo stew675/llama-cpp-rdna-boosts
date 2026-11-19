@@ -957,6 +957,20 @@ almost all of them `template-instances/*.cu`.
 
 **Contents.**
 
+* **The band's fixup period `P` is one constant, `nsm/2`, for every K/V type (r316, `TODO` #346).**
+  `ggml_cuda_fattn_band_wmma_split()` returns `max(2, nsm/2)` (`P` 16 on gfx1201, `nsm` 32) instead of `nsm` for
+  the native-quantized types and `nsm/2` for f16/bf16; `ggml_cuda_fattn_band_wmma_two_byte()` and the launcher's
+  `P` fallback are gone (`GGML_HIP_FA_BAND_WMMA_SPLIT` still overrides, and the helper is now the only source of
+  the value).  `P` is numeric order — it moves the text of every banded model on both head classes and every
+  native K/V type — and its optimum is *width* dependent (decode width 16, verify widths 8, medians of 3 on
+  q8_0), so one constant is necessarily a compromise; the old quantized default measured **5-14 % slower** at
+  every shape the band actually runs (kv 16384-102400, both widths) and end to end it costs the attention-bound
+  arm **~4.5 % per step** (27B `draft-mtp n7`: +5.8 % and +17.1 % token rate on a 10.5K and a 20.5K prompt, the
+  rest of the larger number being the acceptance re-roll a numeric-order change carries), while plain decode and
+  the 128-dim class are noise.  `P` 8 was measured and rejected on every end-to-end arm.  Both band gates'
+  boundaries were re-checked against the new value and are unchanged.  Gate: `MANIFESTS.md` gate 05 (r316 row) —
+  `benchmarks/2026-11-18-band-fixup-period.md`, `INVARIANTS.md` r316, `GREEDY-PURITY.md` 98,
+  `ENVIRONMENT.md` 8.
 * **The tile loader's padded-head clamp is constant-folded for an unpadded head (r281, issue #311).**
   `flash_attn_ext_f16_load_tile_impl`'s K/V bounds carry upstream #30285's `min(k0_stop, DKQ/2)` (and the twin
   `min(i0_stop, DV)`) so a padded head (40/72, `DKQp > DKQ`) loads only its real head size.  For an unpadded head

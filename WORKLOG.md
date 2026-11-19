@@ -1,3 +1,76 @@
+## 261118.011 (r316, RELEASE v17-4f9dfa0e3-r316) -- `TODO` #346 closed: the band's fixup period `P` is one constant (`nsm/2`) for every K/V type, and it was chosen on the attention-bound arm (official block 05)
+
+**What shipped.**  Block **05** only: `ggml_cuda_fattn_band_wmma_split()` now returns `max(2, nsm/2)` for **every**
+K/V type (`P` 16 on gfx1201, `nsm` 32), so the native-quantized types lose the `nsm` they had carried since r92;
+`ggml_cuda_fattn_band_wmma_two_byte()` and the launcher's `P` fallback are removed and the helper is the only
+source of the value (`GGML_HIP_FA_BAND_WMMA_SPLIT` still overrides both families for measurement).  `release.json`
+at **`v17-4f9dfa0e3-r316`** (canonical tip `bc4e8a5c9` = `.tip`, tree `4119a6f86`; optional re-cut `76571784f` /
+`07fd7aed3`, their patch-ids **unchanged**, cumulative trees `d0cf0c723` / `003b6e093`).  Block count unchanged
+(17 official + `0300`).  Records: `ENVIRONMENT.md` §8, `patches/README.md` block 05, `MANIFESTS.md` gate 05,
+`INVARIANTS.md` r316, `GREEDY-PURITY.md` §98 (new), `benchmarks/2026-11-18-band-fixup-period.md`, `TODO.md`
+(#346 deleted).
+
+**The item's premise held, and its framing did not.**  `TODO` #346 recorded that the quantized default `P = nsm`
+measured 10-20 % worse than 16 in 30 of 36 rows.  Re-measured properly (band forced, `GGML_HIP_FA_BAND_WMMA_SPLIT`
+8/16/24/32/48/64/96, kv 512-102400, `n_q` 1 and 8, q8_0 medians of 3, on **both** head classes plus the tile
+kernel), the quantized `P = nsm` is **5-14 % slower at every shape the band actually runs**, so the item was
+right about the direction -- but "16 is the optimum" is only true at the *decode* width.  The verify widths'
+optimum is **8**, monotonically in `P` (256-dim q8_0 kv 32768, `n_q` 8: 269.5 / 279.7 / 318.4 / 344.9 / 401.1 for
+P 8/16/32/48/96), so a single shipping constant is necessarily suboptimal for one width, and keying it on `n_q`
+is forbidden (`P` is numeric order; it would split a decode step from its own verify).  16 is the compromise the
+end-to-end arms rank.  The item's anomalous row is **real**, not noise: 1024 cells / `n_q` 1 reads P16 55.0
+against P32 42.6 over three runs each -- and it is unreachable, because every band gate keeps the band off below
+10000 cells (256-dim) / 5-9k (128-dim).
+
+**The old comment was a decode-width reading with a verify-width claim.**  The note next to the helper said the
+verify cost was "flat for `P` = 48..96 at kv 20K..200K and degrades below 32 or above 128".  At the verify widths
+the curve is monotone (`P` 8 -> 96 costs 2.4x at 256-dim kv 32768/`n_q` 8); what *is* flat above 24 is the decode
+width at a long KV (kv 102400/`n_q` 1: 467 / 448 / 457 / 467 / 492 µs for 24/32/48/64/96) and "degrades below 32"
+reproduces exactly there.  Both the helper's comment and the launcher's now say what the numbers say.
+
+**End to end, it pays on exactly one arm -- and that is the arm the band exists for.**  3 GPU `-sm tensor`, q8_0
+K/V, `ROCBLAS_USE_HIPBLASLT=0`, interleaved A/B/B/A: plain 27B tg64 43.63/42.41 against 43.52/42.61 t/s at
+d16384/d32768 and Ripple-65B 26.07/25.42 against 25.96/25.44 -- noise, because a 27B Q8_0 decode is at the DRAM
+roof.  The 27B `draft-mtp n7` arm reads **88.9 against 75.8 t/s** on the 20.5K prose prompt (+17.1 %) and **79.2
+against 74.9** at ~10.5K (+5.8 %); decomposing the bigger one, the mean accepted length moved 3.26 -> 3.82, i.e.
+30.3 -> 26.6 steps for the same 128 tokens, so **~4.5 % per step is the kernel** and the rest is the acceptance
+re-roll any numeric-order change carries.  `P` 8 was measured on the same arms and **rejected** (40.86 t/s at
+d32768, 78.33 and 75.68 on the two MTP arms) even though it wins the op-level verify rows -- a real MTP step's
+verify width is not the `n_q` 8 op case.
+
+**Correctness and purity.**  `test-backend-ops -o FLASH_ATTN_EXT` **7381/7381** on all 3 GPU backends in four
+arms (default, `H256=1 H128=1`, `WMMA=0`, `WMMA=2`).  `test-logits-width-probe` **37 arms, PASS, worst maxdiff
+0** -- both head classes, `KV=q8_0/f16/bf16`, one GPU plus `SPLIT=tensor` and `SPLIT=layer`, P 3584/4096/10240
+(a constant `P` cannot straddle; this is a construction check, and it is the reason the change is cheap to gate).
+Prefill KLD canonical **0.000000 / 100.000 %**; `--family-switch` at a **banded** ubatch (`--kv q8_0 --ub 4`,
+base = `GGML_HIP_FA_BAND_WMMA_SPLIT=32`) **0.002733 / 99.243 %** on the 27B and **0.000823 / 98.981 %** on
+Ripple-65B, against same-kernel `-ub` controls of 0.004182 / 98.822 % and 0.004133 / 97.772 % -- less divergence
+than a benign reordering, and the arm has to be `-ub 4` because a default-ubatch prefill batch is not banded.
+f16 K/V coherence is byte-identical to r315 on all five models (4B `8d89080db673`, 27B `da2e2d192e21`, 35B-A3B
+`265c381dbc11`, Flash-Next `de61b9b1bed7`, Ripple-65B `c1e00039b55c`); with q8_0 K/V at a 21K prompt the 27B moves
+`f7d157b1e07e` -> **`774d1c325068`**, which is exactly the r315 build's `GGML_HIP_FA_BAND_WMMA_SPLIT=16` arm, and
+`SPLIT=32` on the new build reproduces the old default (the override still pins); 35B-A3B and Ripple-65B do not
+move at that depth.  The four MTP axes are byte-identical to r315 on bf16 K/V -- R `7dca501eeb0e` / draft
+`759c1a4515c6`, P `fcc0bdeb636b`, C `eb89102cb7d8`, K `a87c4318b649`, acceptance 348/486, 357/460, 368/427,
+372/375 to the digit -- and reproduce r315's own q8_0 arms under every `P` value, because those axes sit below
+the band gate.  Both band gates' boundaries were re-derived from the widths and are **unchanged in cell terms**
+(band/tile 1.07 at the 256-dim 8192-cell row and 0.85 at 16384; 1.06/0.88 for 128-dim ratio 10 at 4096/8192; 0.62
+ratio 5 at 8192; 0.60 ratio 7 at 4096; 1.06/0.91 ratio 12 at 8192/32768): every `TILE` decision is still a
+loss avoided and every `BAND` decision still a win.  `llama-batched-bench -npl 1,4,8` 44.35/151.21/257.49 against
+44.31/151.28/257.55 t/s.  Per-block gate **2/2** (`--fast --repo ~/llama-scratch --tip bc4e8a5c9
+--changed-from 2a81262f6`), `validate-set.sh` GREEN, tree `4119a6f86`, GPU journal and every log clean.
+
+**Findings for the maintainer (recorded, no handle -- not `TODO` rows).**  (1) The 2-byte family's own optimum at
+verify widths is **8** and it still ships 16: one constant cannot serve both widths, P 8 loses every end-to-end
+arm measured here, and keying on `n_q` is forbidden -- recorded in `benchmarks/2026-11-18-band-fixup-period.md`
+§5 as the starting point if a future change ever makes the verify width dominant.  (2) The four-axis MTP gate is
+**vacuous for `P`** (those prompts sit below the band gate), which is why this release quotes it as a regression
+check and gates the change on the probe and the deep arm instead.  (3) On q8_0 K/V the MTP *prose* axis has
+plain != draft-mtp (`120c74935967` vs `c1f9d0b3f5b6`) -- **inherited from r315 and `P`-independent** (identical at
+P 16 and P 32 on the r315 build, while bf16 K/V is equal on all four axes), so it is the quantized-cache fold
+family, not this change; it is reported because a delivery invariant expects plain == draft-mtp, and it was never
+measured on a q8_0 cache before.
+
 ## 261118.010 (r315, RELEASE v17-4f9dfa0e3-r315) -- `TODO` #345 closed: the 256-dim band gets the 128-dim arm's work gate; its preferred route (an adaptive `P`) is refuted, and r314's "cache size" fact is corrected (official block 05)
 
 **What shipped.**  Block **05** only: `ggml_cuda_fattn_band_wmma_applies()` now gates the **256-dim** head class

@@ -879,3 +879,67 @@ from 10000 cells for GQA 6 and from 20000 for GQA 8 and GQA 12.  Knobs: `GGML_HI
 
 Record: `benchmarks/2026-11-18-fa-band-h256.md`, `MANIFESTS.md` gate 05, `patches/README.md` block 05,
 `ENVIRONMENT.md` §8, `GREEDY-PURITY.md` §96/§97.
+
+## r316 (2026-11-18, `WORKLOG.md` 261118.011) — the band's fixup period `P` is ONE constant (`nsm/2`) for every K/V type: the widths disagree, and the end-to-end arm decides
+
+**Changed.**  Official block 05 only (`TODO` #346): `ggml_cuda_fattn_band_wmma_split()` returns
+`max(2, nsm/2)` for every K/V type (`P` 16 on gfx1201, `nsm` 32).  The native-quantized types kept `nsm` from
+r92 to r315; `ggml_cuda_fattn_band_wmma_two_byte()` and the launcher's `P` fallback are gone.
+`GGML_HIP_FA_BAND_WMMA_SPLIT` still overrides both families for measurement.
+
+1. **`P` is a width compromise, and the optimum differs by a factor of two between the widths.**  One R9700,
+   `test-backend-ops perf`, band forced, `GGML_HIP_FA_BAND_WMMA_SPLIT` 8…96, q8_0, medians of 3, 256-dim GQA 6:
+   at `n_q` 1 the minimum is **16** (kv 16384: 92.9 against 99.5 at 32 and 104.0 at 8; 32768: 151.2 / 163.9 /
+   180.9; 102400: 425.0 / 447.5 / 558.2), at `n_q` 8 it is **8** and monotone in `P` (kv 32768: 269.5 / 279.7 /
+   318.4 / 344.9 / 401.1 for 8/16/32/48/96).  The same holds for the 2-byte family (f16, `n_q` 8, kv 16384:
+   144.9 / 172.5 / 201.2 / 254.7).  So a *single* shipping constant is necessarily suboptimal for one width,
+   and `P` must not be keyed on `n_q` (it would split decode and verify differently).  `P` 8 was measured end
+   to end and rejected (below).
+2. **The quantized default `nsm` was 5-14 % off everywhere the band runs, and `nsm/2` is the better constant.**
+   kv 16384-102400, `n_q` 1: 92.9 vs 99.5, 106.1 vs 112.4, 151.2 vs 163.9, 425.0 vs 447.5 µs; `n_q` 8:
+   170.2 vs 179.7, 279.7 vs 318.4, 817.3 vs 840.2.  The only loss is the short cache (1024 cells, `n_q` 1:
+   55.0 vs 42.6 -- reproducible to ±0.1 over three runs), which every band gate keeps off (10000 cells for the
+   256-dim class, 5-9k for the 128-dim one), so it is recorded rather than avoided.
+3. **End to end it pays only on the attention-bound arm, and there by ~4.5 %/step.**  3 GPU `-sm tensor`, q8_0
+   K/V: plain 27B tg64 43.63/42.41 against 43.52/42.61 t/s at d16384/d32768 and Ripple-65B 26.07/25.42 against
+   25.96/25.44 -- noise, because a 27B Q8_0 decode is at the DRAM roof (r315 item 5).  The 27B `draft-mtp n7`
+   arm on the 20.5K prose prompt reads 88.9 against 75.8 t/s (**+17.1 %**) and 79.2 against 74.9 at ~10.5K
+   (**+5.8 %**).  The decomposition matters: the 20.5K row's mean accepted length moved 3.26 -> 3.82, i.e. 30.3
+   -> 26.6 steps for the same 128 tokens, so **~4.5 %/step is the kernel** and the rest is the acceptance
+   re-roll any numeric-order change carries.  Never quote the token-rate delta of a greedy speculative arm as
+   the kernel's win.
+4. **`P` 8 wins the op-level verify rows and loses every end-to-end arm.**  27B tg64 d32768 40.86 t/s, the
+   10.5K MTP arm 78.33, the 20.5K one 75.68 -- all worse than P16, and worse than the old P32 on the plain
+   decode row.  A real MTP step's verify width is not the `n_q` 8 op case.
+5. **The r133-era comment claim ("verify cost flat for P 48..96 at kv 20K..200K, degrading below 32") does not
+   reproduce; it was a DECODE-width, long-KV reading.**  At verify widths the curve is monotone (f16 256-dim
+   kv 32768, `n_q` 8: 289.7 / 312.3 / 337.3 / 385.2 for 8/16/32/64).  What is flat above 24 is the decode
+   width at a long KV (q8_0, kv 102400, `n_q` 1: 467.2 / 447.5 / 457.2 / 467.4 / 491.5 for 24/32/48/64/96),
+   and "degrades below 32" reproduces there (558.2 at 8).  Both comments now match the measurement.
+6. **Both band gates stay correctly calibrated, and their decisions are unchanged in cell terms.**  With P16 the
+   band/tile ratio is 0.85 at 16384 cells and 1.07 at 8192 for the 256-dim GQA 6 class (gate: band from 16384);
+   0.88 at 8192 and 1.06 at 4096 for 128-dim ratio 10 (gate: 8192), 0.62 at 8192 (ratio 5), 0.60 at 4096
+   (ratio 7), 1.06 at 8192 / 0.91 at 32768 (ratio 12, gate: 32768).  Every `TILE` decision is still a measured
+   loss and every `BAND` decision still a win; P16 only improves the margins.
+7. **A numeric-order constant is width-pure by construction, and that is what makes it cheap to gate.**  A
+   constant `P` cannot straddle: `test-logits-width-probe` reads **PASS maxdiff 0 on 37 arms** (both head
+   classes, q8_0/f16/bf16, 1 GPU + `SPLIT=tensor` + `SPLIT=layer`, P 3584/4096/10240).  Prefill KLD: canonical
+   0.000000 / 100.000 %; `--family-switch` at a *banded* ubatch (`--kv q8_0 --ub 4`) 0.002733 / 99.243 %
+   (27B) and 0.000823 / 98.981 % (Ripple-65B) against same-kernel `-ub` controls of 0.004182 / 98.822 % and
+   0.004133 / 97.772 % -- i.e. **less** divergence than a benign ubatch reordering.  The arm has to be `-ub 4`:
+   a default-ubatch prefill batch is not banded and the change is invisible to it.
+8. **Text moves exactly where the band runs and nowhere else, and every moved arm reproduces a pinned
+   alternative.**  f16 K/V coherence is byte-identical to r315 on all five models.  With q8_0 K/V at a 21K
+   prompt the 27B moves `f7d157b1e07e` -> `774d1c325068`, which is **the r315 build's
+   `GGML_HIP_FA_BAND_WMMA_SPLIT=16` arm** byte for byte, and `SPLIT=32` on the new build reproduces the old
+   default -- the override still pins.  35B-A3B and Ripple-65B do not move at that depth (P16 == P32 there).
+   The four MTP axes are byte-identical to r315 on bf16 K/V (acceptance 348/486, 357/460, 368/427, 372/375
+   reproduced to the digit) and reproduce r315's own q8_0 arms under all three `P` values, because those axes
+   sit below the band gate.
+9. **Not validated.**  gfx1100 / gfx1151 and Windows were not exercised; `P` is a fraction of `nsm`, and the
+   kernels are the ones both classes already ran.  A 128-dim GQA 5/7/12 *model* was not available (op level
+   only).  **Open:** the 2-byte family's own optimum at verify widths is 8 (it is 12-16 % faster there) and it
+   still ships 16 -- one constant cannot serve both widths, and P 8 loses every end-to-end arm measured here.
+
+Record: `benchmarks/2026-11-18-band-fixup-period.md`, `MANIFESTS.md` gate 05, `patches/README.md` block 05,
+`ENVIRONMENT.md` §8, `GREEDY-PURITY.md` §98.

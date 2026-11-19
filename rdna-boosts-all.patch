@@ -17822,7 +17822,7 @@ index 2d0b3cfea..9c99c71dd 100644
  
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 6667ca400..bd2265f05 100644
+index 6667ca400..9e5d08178 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -3,11 +3,62 @@
@@ -19130,7 +19130,7 @@ index 6667ca400..bd2265f05 100644
          // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
          const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DGX_SPARK && async_kv_preload && scan_mask;
  
-@@ -1231,7 +2300,29 @@ void launch_fattn(
+@@ -1231,7 +2300,31 @@ void launch_fattn(
          blocks_num.y = 1;
          blocks_num.z = 1;
  
@@ -19149,19 +19149,21 @@ index 6667ca400..bd2265f05 100644
 +        // band_wmma is the evaluation the group-skip gate above reads, so the two cannot disagree.
 +
 +        if (band_wmma) {
-+            // P = nsm for the native-quantized types: measured on gfx1201 (head 256, GQA 6, 4 KV heads)
-+            // the verify cost is flat for P = 48..96 at kv 20K..200K and degrades below 32 or above 128.
-+            // The 2-byte types do less work per KV iteration, so the P partials' fixup is a larger
-+            // fraction of their cost; the split helper returns a smaller fixed P for them.
-+            const int split_env = ggml_cuda_fattn_band_wmma_split(dst);
-+            const int P         = split_env > 0 ? split_env : std::max(2, nsm);
++            // P = nsm/2 for every K/V type (r316): measured on gfx1201 (head 256, GQA 6, 4 KV heads,
++            // nsm 32) the decode width's optimum is 16 on both type families, and the verify widths'
++            // is 8 -- one constant cannot serve both, and the smaller one costs the decode width more
++            // than it buys the verify.  The r133-era note that the verify cost was "flat for P 48..96
++            // at kv 20K..200K" does not reproduce on this kernel (verify widths are monotone in P:
++            // at kv 32768, n_q 8, q8_0, P 8/16/32/48/64/96 = 269/280/318/345/369/401 us); what is
++            // flat is the *decode* width above P 24.  benchmarks/2026-11-18-band-fixup-period.md.
++            const int P = ggml_cuda_fattn_band_wmma_split(dst);
 +            blocks_num.x = ntiles_dst;
 +            blocks_num.y = P;
 +        } else if(use_stream_k) {
              const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
              // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
              // Only do this if the occupancy loss from rounding is acceptable.
-@@ -1247,20 +2338,29 @@ void launch_fattn(
+@@ -1247,20 +2340,29 @@ void launch_fattn(
              blocks_num.x = nblocks_stream_k;
          }
  
@@ -19194,7 +19196,7 @@ index 6667ca400..bd2265f05 100644
              const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
              const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
  
-@@ -1309,69 +2409,270 @@ void launch_fattn(
+@@ -1309,69 +2411,270 @@ void launch_fattn(
  
      GGML_ASSERT(block_dim.x % warp_size == 0);
  
@@ -22968,10 +22970,10 @@ index 000000000..93fc0641f
 +}
 diff --git a/ggml/src/ggml-cuda/fattn-rdna.cuh b/ggml/src/ggml-cuda/fattn-rdna.cuh
 new file mode 100644
-index 000000000..91099ce9c
+index 000000000..529e05f6c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/fattn-rdna.cuh
-@@ -0,0 +1,614 @@
+@@ -0,0 +1,607 @@
 +// RDNA/ROCm flash-attention predicates: the native-KV staging policy and selectors, and
 +// the RDNA4 decode/verify band (WMMA) helpers.  Split out of fattn-common.cuh (an upstream
 +// hub) so an upstream re-base collides with the predicate call points, not their bodies.
@@ -23333,13 +23335,6 @@ index 000000000..91099ce9c
 +    return v;
 +}
 +
-+// The 2-byte K/V types share the band's light per-iteration variant (see the ncols1 and split
-+// helpers).  bf16 only reaches the band through its opt-in native arm, where K->type is BF16.
-+static inline bool ggml_cuda_fattn_band_wmma_two_byte(const ggml_tensor * dst) {
-+    const ggml_tensor * K = dst != nullptr ? dst->src[1] : nullptr;
-+    return K != nullptr && (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_BF16);
-+}
-+
 +static inline int ggml_cuda_fattn_band_wmma_ncols1(const ggml_tensor * dst) {
 +    GGML_UNUSED(dst);
 +    const int v = ggml_cuda_fattn_band_wmma_ncols1_env();
@@ -23349,14 +23344,17 @@ index 000000000..91099ce9c
 +    return 4;
 +}
 +
-+// Blocks per output tile in the band (the interleave period P, see launch_fattn).  0 = one block per
-+// CU (nsm); GGML_HIP_FA_BAND_WMMA_SPLIT overrides it for tuning.  Whatever the source, it must not
-+// depend on n_q or on the KV length, or decode and verify would split differently.  The 2-byte types
-+// do less work per KV iteration, so the P partials' fixup is a larger fraction of their cost; half of
-+// nsm measured best for them on gfx1201 (nsm 32: P 16 beats 24/32 by 6-8 % at kv 16384-51200 and is
-+// within noise at 98304, for n_q = 1..8), while the quantized types keep nsm.  Expressed as a
-+// fraction of nsm so a smaller RDNA4 part scales down with it.
++// Blocks per output tile in the band (the interleave period P, see launch_fattn).  P = nsm/2 on
++// gfx1201 (nsm 32 -> 16), for every K/V type; GGML_HIP_FA_BAND_WMMA_SPLIT overrides it for tuning.
++// Whatever the source, it must not depend on n_q or on the KV length, or decode and verify would
++// split differently.  The value is a compromise the widths force: the decode width's optimum is the
++// larger one (P 16 beats 24/32/48/64/96 at kv 8192-102400 and is 5-8 % off at 20480-32768), while
++// the verify widths prefer half of that (P 8), and one constant has to serve both.  At a short cache
++// the band is below every gate anyway (and a small P is *worse* there: 1024 cells, q8_0, n_q = 1,
++// P 16 55.0 us against P 32 42.6).  Expressed as a fraction of nsm so a smaller RDNA4 part scales
++// down with it.  Record: benchmarks/2026-11-18-band-fixup-period.md (`r316`).
 +static inline int ggml_cuda_fattn_band_wmma_split(const ggml_tensor * dst) {
++    GGML_UNUSED(dst);
 +    static const int env_split = []() {
 +        const char * env = getenv("GGML_HIP_FA_BAND_WMMA_SPLIT");
 +        const int v = env ? atoi(env) : 0;
@@ -23364,9 +23362,6 @@ index 000000000..91099ce9c
 +    }();
 +    if (env_split > 0) {
 +        return env_split;
-+    }
-+    if (!ggml_cuda_fattn_band_wmma_two_byte(dst)) {
-+        return 0;
 +    }
 +    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
 +    return std::max(2, nsm/2);
