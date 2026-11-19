@@ -956,3 +956,50 @@ r92 to r315; `ggml_cuda_fattn_band_wmma_two_byte()` and the launcher's `P` fallb
 
 Record: `benchmarks/2026-11-18-band-fixup-period.md`, `MANIFESTS.md` gate 05, `patches/README.md` block 05,
 `ENVIRONMENT.md` §8, `GREEDY-PURITY.md` §98, issue #330.
+
+## r317 (2026-11-19, `WORKLOG.md` 261119.001) — every fused MoE launch resolves the expert cache, or the take-over's skipped `input_cpy` is read stale (GitHub issue #294 closed)
+
+**Changed.**  Official blocks 09 and 10 only (`TODO` #327's fused-launch contract, completed).  The routed
+Weight fusions in `ggml-cuda-try-fuse.cu` (the 5/7- and 11/13-node `mmvq` subgraphs, the per-lane scale/bias
+pairs for `mmvf` and `mmvq`, the 3-node `mmvf` gate+up+GLU, the NVFP4 scale fold and both bias-only arms) and
+the routed readers in `mmvq.cu` (the shared-expert pair and the MoE down fold) now resolve their lanes through
+`moe_cache_fusion_serve()` instead of launching on the graph's tensors.  `MOE_CACHE_SERVE_MIXED` stands the
+fusion down (the per-op chain resolves each table itself); the staged branch calls `moe_cache_repair_copy()` for
+every lane, exactly as the per-op dispatch does.  The decode band got its own census
+(`decode MoE fusions: mmvf_glu=…/… mmvq_glu=…/… (in_place/staged) mixed_lanes=…`, kinds 4/5).  No environment
+variable and no default changed.
+
+1. **A take-over promise and a fused launch do not meet.**  `ggml_backend_sched` asks
+   `moe_cache_take_over()` before it fills a split input; a true answer skips the `input_cpy` copy and leaves
+   the expert bytes only in the arena.  The per-op `MUL_MAT_ID` dispatch honours that by redirecting
+   (`moe_cache_get_table`), but a fused launch never enters the dispatch, so every fused routed reader that
+   was not redirecting read a buffer the scheduler deliberately never wrote.  The reporter's tiny GGUF shows the
+   read side exactly: routed `up` all zero, one `gate` expert valid per device, first bad tensor
+   `ffn_moe_down-1` after a finite `hc` input; their branch bitmask isolated `ggml_cuda_mul_mat_vec_f` (the
+   BF16-expert gate/up path), and the same class was present at ten of the twelve routed fused sites.
+2. **`MIXED` is not `NONE`, and only the per-op chain may consume it.**  The take-over is per TABLE, so one
+   lane of a gate/up pair can be served in place while the other is staged.  A decline therefore re-fills the
+   copy (`moe_cache_repair_copy`, a no-op when no promise is outstanding) and a `MIXED` answer stands the
+   fusion down.  Before this, the report's `mmvq_glu` column could not even say whether the fused read went
+   through the arena.
+3. **A fully resident arena can read the stale copy and still be correct, which is why this box never saw the
+   corruption.**  With every table identity, the staged copy is the WHOLE table and, once written, stays
+   byte-correct for the life of the allocation, so the raw read lands on the same bytes (measured: base and
+   patched are byte-identical on the 35B-A3B `-sm tensor` full-residency arm while its census reads
+   `mmvq_glu=3/0`, 256/256 slots, `takeover=30`).  The failure needs a copy that was never written -- a new
+   capture/allocation, which is the mixed-architecture tensor split the reporter runs and this box cannot build.
+4. **The mechanism is exercised and text-neutral everywhere it can run here.**  Same-seed greedy text base vs
+   patched, byte-identical: 4B dense 3-GPU `7972f0185e01`, 35B-A3B Q8_0 3-GPU `-ncmoe 34` (full-residency
+   arena) `7399489b1685`, the same model 2-GPU `-sm layer` `7399489b1685`, Flash-Next IQ3_S 2-GPU `-sm tensor`
+   `14f3577be465` and `-sm layer` `3e2d3910b121`, Qwen3-Coder 30B 2-GPU `-sm tensor` `bdf34a354857`.
+   `gate-host-pool.sh` **59/59** (the take-over/repair gate), prefill-logit **0.000000 / 100.000 %**, MTP MoE
+   protocol on 35B-A3B (`draft-mtp` 227.0 t/s against plain 118.2, acceptance 0.75110 = 1370/1824, identical
+   both builds; fusion-off acceptance 0.76062 within noise), `llama-batched-bench -npl 1,4,8` flat, per-block
+   ladder **18/18**.
+5. **The reporter's patch is a correct subset, not the whole contract.**  It redirects five sites with
+   `moe_cache_redirect_fused()` (v1) and falls back to the graph tensor on a decline; that is safe for the exact
+   gate+up pair only because the fusion guard allows that pattern only when BOTH tables serve.  The per-lane
+   scale/bias arms are misclassified by that guard as the down fold, so v1's fallback could read a lane nobody
+   filled there -- which is why the shipped form uses the per-table `MIXED`-aware query and repairs instead.
+
+Record: `WORKLOG.md` 261119.001, `patches/README.md` blocks 09/10, `MANIFESTS.md` gates 09/10, issue #294.

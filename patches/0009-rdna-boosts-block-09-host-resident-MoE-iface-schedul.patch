@@ -1,4 +1,4 @@
-From 6107ac138551bc0fe8ad61795a42cd1e230bbd61 Mon Sep 17 00:00:00 2001
+From 1253c4d3a8f73c37a372068e945aad17067d8208 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/17] rdna-boosts: block 09: host-resident MoE (iface,
@@ -83,8 +83,8 @@ text/acceptance byte-identical everywhere.
  ggml/src/ggml-cuda/graph.cuh                  |    4 +
  ggml/src/ggml-cuda/mmvq.cu                    |  276 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 7084 +++++++++++++++++
- ggml/src/ggml-cuda/moe-expert-cache.h         |  382 +
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 7107 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.h         |  384 +
  ggml/src/ggml-cuda/norm.cu                    |   35 +
  ggml/src/ggml-cuda/norm.cuh                   |    1 +
  ggml/src/ggml-cuda/vendors/hip.h              |   13 +
@@ -122,7 +122,7 @@ text/acceptance byte-identical everywhere.
  tests/test-backend-tensor.cpp                 |    3 +
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 70 files changed, 18211 insertions(+), 540 deletions(-)
+ 70 files changed, 18236 insertions(+), 540 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -11007,10 +11007,10 @@ index 4140f681a..35f625eaa 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..95f3e7bc5
+index 000000000..4d7a64ff2
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,7084 @@
+@@ -0,0 +1,7107 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -11523,6 +11523,13 @@ index 000000000..95f3e7bc5
 +// Kinds: 0 = mmb-glu, 1 = mmq gate+up+GLU triple, 2 = mmq shared-quantize pair, 3 = mmq swiglu->down fold.
 +int64_t                             g_pf_fuse[4][2]   = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
 +int64_t                             g_pf_fuse_mixed   = 0;  // a fused consumer's lanes disagreed on residency (stood down)
++// issue #294: the same census for the DECODE/verify-band MoE fusions (mmvf/mmvq).  They used to launch on the
++// scheduler's staged copy without asking the cache, and a take-over promise means that copy may never have
++// been filled -- so a nonzero IN-PLACE column is also the proof that the fused read really went through the
++// arena.  Kinds: 4 = mmvf gate+up+GLU, 5 = mmvq gate+up+GLU (any of the subgraph / bias / shared-expert
++// shapes, and the single routed projection folds, which have no gate lane).
++int64_t                             g_dec_fuse[2][2]  = {{0, 0}, {0, 0}};
++int64_t                             g_dec_fuse_mixed  = 0;
 +// Fail-soft / --fit interaction (issue #33).  The arena is the LOWEST-priority VRAM consumer: it is
 +// sized from what is actually FREE at sizing time (after --fit, the compute reserve and the KV cache
 +// have taken theirs) minus `g_reserve_mib`, so it cannot over-commit and `--fit` does not need to know
@@ -17644,9 +17651,17 @@ index 000000000..95f3e7bc5
 +
 +moe_cache_serve_status moe_cache_fusion_launched(moe_cache_serve_status status, int kind) {
 +    if (status == MOE_CACHE_SERVE_MIXED) {
-+        g_pf_fuse_mixed++;
++        // The same kinds select the same census in both bands, so a mixed prefill and a mixed decode are
++        // counted where a reader looks for them.
++        if (kind >= 4) {
++            g_dec_fuse_mixed++;
++        } else {
++            g_pf_fuse_mixed++;
++        }
 +    } else if (kind >= 0 && kind < 4) {
 +        g_pf_fuse[kind][status == MOE_CACHE_SERVE_IN_PLACE ? 1 : 0]++;
++    } else if (kind >= 4 && kind < 6) {
++        g_dec_fuse[kind - 4][status == MOE_CACHE_SERVE_IN_PLACE ? 1 : 0]++;
 +    }
 +    return status;
 +}
@@ -17862,6 +17877,14 @@ index 000000000..95f3e7bc5
 +                  (long long) g_pf_fuse[2][1], (long long) g_pf_fuse[2][0],
 +                  (long long) g_pf_fuse[3][1], (long long) g_pf_fuse[3][0],
 +                  (long long) g_pf_fuse_mixed);
++    // issue #294: the decode/verify band's counterpart.  A nonzero IN-PLACE column says the fused launch read
++    // the arena (the take-over's promise is honoured); a nonzero mixed_lanes says a pair was stood down because
++    // only one of its lanes was served, which is the state the per-op chain must resolve on its own.
++    GGML_LOG_INFO("%s: decode MoE fusions: mmvf_glu=%lld/%lld mmvq_glu=%lld/%lld (in_place/staged) "
++                  "mixed_lanes=%lld\n",
++                  __func__, (long long) g_dec_fuse[0][1], (long long) g_dec_fuse[0][0],
++                  (long long) g_dec_fuse[1][1], (long long) g_dec_fuse[1][0],
++                  (long long) g_dec_fuse_mixed);
 +    if (g_cold_uva) {
 +        static const char * const admit_names[] = { "always", "value", "touch" };
 +        GGML_LOG_INFO("%s: cold admission=%s, admission-rejected (served cold)=%lld\n",
@@ -18097,10 +18120,10 @@ index 000000000..95f3e7bc5
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..006e62f4b
+index 000000000..86da99cb5
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,384 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -18447,8 +18470,10 @@ index 000000000..006e62f4b
 +//                                on its own, is the only correct consumer of that state.
 +//
 +// Every returned placement must be fed to `moe_cache_fusion_launched()` with the fusion's census `kind`
-+// (0 = mmb-glu, 1 = mmq gate+up+GLU triple, 2 = mmq shared-quantize pair, 3 = mmq swiglu->down fold), once the
-+// launch actually happens: that census is what a gate reads to prove residency no longer selects the kernel set.
++// (0 = mmb-glu, 1 = mmq gate+up+GLU triple, 2 = mmq shared-quantize pair, 3 = mmq swiglu->down fold,
++//  4 = decode mmvf gate+up+GLU, 5 = decode mmvq gate+up+GLU), once the launch actually happens: that census is
++// what a gate reads to prove residency no longer selects the kernel set.  Kinds 4/5 also cover the single-lane
++// routed folds (bias / scale / shared-expert), which have no gate lane; their MIXED count is a decode one.
 +enum moe_cache_serve_status {
 +    MOE_CACHE_SERVE_NONE     = 0,
 +    MOE_CACHE_SERVE_IN_PLACE = 1,

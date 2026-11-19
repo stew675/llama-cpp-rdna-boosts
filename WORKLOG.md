@@ -1,3 +1,98 @@
+## 261119.001 (r317, RELEASE v17-4f9dfa0e3-r317) -- GitHub issue #294 CLOSED: every fused MoE launch resolves the expert cache, so a take-over's skipped `input_cpy` is never read (blocks 09 + 10)
+
+**Release:** `v17-4f9dfa0e3-r317`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip
+`71aa6d779` (the `fork-refresh.sh` re-cut, tree `7d6b3f1106`), 17 official + 1 temporary = 18 default
+blocks, optional `0100` -> `a7ce03f62b` / `0101` -> `818626942e`.  **No block renumbered, split or
+created**: two same-block amendments, **block 09** (the cache's fusion census) and **block 10** (the
+fused-launch sites in the dispatcher, `ggml-cuda-try-fuse.cu` and `mmvq.cu`).  No kernel arithmetic
+changed, no default moved, no environment variable added.
+
+### What the reporter contributed, and what it proved
+
+@kapitalmouse built a tiny GGUF with BF16 expert weights and F32 activations and bisected the corruption to
+one fusion branch: `ggml_cuda_mul_mat_vec_f`'s routed gate/up.  Their probe is the decisive artefact -- the
+fused routed path read the **original meta-split expert tensors instead of the expert-cache arena**: routed
+`up` all zero, one routed `gate` expert valid per device, the first bad F32 tensor `ffn_moe_down-1` after a
+finite HC-mixed input and finite top-k ids.  Quantized fusion paths already called
+`moe_cache_redirect_fused()`; the F32/BF16 `ggml_cuda_mul_mat_vec_f` gate/up fusion (and several other
+routed readers) did not.  Their `rocm10-moe-fix.patch` redirects five sites and reproduces their tiny model
+at `-ub 8..256`.
+
+The root cause is the take-over promise, which this repo already tracks: `ggml_backend_sched` asks
+`moe_cache_take_over()` before it fills a split input, and a true answer **skips the `input_cpy` copy** --
+the expert bytes then exist only in the arena.  The per-op `MUL_MAT_ID` dispatch honours that by redirecting
+through `moe_cache_get_table`; a fused launch never enters the dispatch.  So any fused routed reader that did
+not redirect read a buffer the scheduler deliberately never wrote.  That is inactive on one device (no meta
+split) and active on every multi-device box, exactly the shape of all four rounds of this issue.
+
+### The fix: the fused-launch contract is now complete, not patched per site
+
+Every routed fused site resolves both lanes through `moe_cache_fusion_serve()` first (the same per-table
+query the per-op consumer makes), then:
+
+* `IN_PLACE` -> launch on the arena/remap copies (`fusion.gate` repointed too);
+* `NONE` -> launch on the graph's tensors, after `moe_cache_repair_copy()` for each lane (the per-op
+  dispatch's own repair, a no-op when no promise is outstanding -- this also closes the fused consumer's
+  hole when a mid-graph eviction breaks a promise, issue #335/#336's shape);
+* `MIXED` -> **stand the fusion down** and let the per-op chain resolve each table itself.  A take-over is
+  per TABLE, so one lane can be served while the other is staged; only the per-op chain may consume that.
+
+Sites covered: the 5/7-node and 11/13-node `mmvq` subgraphs, the per-lane scale/bias `mmvf`+`mmvq` pairs,
+the 3-node `mmvf` gate+up+GLU (the reporter's culprit; its `mmvq` sibling was the only one already
+redirecting), the NVFP4 scale fold, both bias-only arms, the shared-expert routed pair and the MoE down fold.
+The decode band also gets its own exit census, `decode MoE fusions: mmvf_glu=…/… mmvq_glu=…/…
+(in_place/staged) mixed_lanes=…` (kinds 4/5 in `moe_cache_fusion_launched`), because the prefill census
+could not say whether a decode fusion read the arena.
+
+The reporter's v1 patch is a correct **subset**: it redirects five sites and falls back to the graph tensor
+on a decline.  That is safe for the exact 3-node pair only because the fusion guard allows that pattern only
+when both tables serve; the scale/bias arms are misclassified by that guard as the down fold, so a one-lane
+fallback could read a lane nobody filled.  The shipped form is the per-table `MIXED`-aware query instead.
+
+### What could not be reproduced, and why that is expected
+
+This box (3 x gfx1201) cannot build the reporter's mixed gfx1100 + gfx1201 pair, and a homogeneous box does
+not reproduce the corruption even when the code is unfixed: with every table **identity** the staged copy is
+the WHOLE table, and once written it stays byte-correct for the life of the allocation, so the unredirected
+read lands on the same bytes.  Demonstrated rather than inferred: on the 35B-A3B Q8_0 3-GPU `-sm tensor`
+full-residency arm the census reads `mmvq_glu=3/0` (three arena launches, zero staged), `256/256` slots,
+`takeover=30`, `broken=0 repaired=0`, `evictions=0` -- and the base and patched builds are **byte-identical**
+there.  The failure needs a copy that was never written (a new capture/allocation, the mixed-architecture
+tensor split), which is why the reporter's tiny model shows zeros and this box cannot.
+
+### Verification (gfx1201, ROCm 10.1.0)
+
+| arm (same-seed greedy text, `ROCBLAS_USE_HIPBLASLT=0`, heat prior `MOE_EXPERT_HEATMAP=load`) | base (`ad9f5b36c` build) | patched |
+|---|---|---|
+| 4B dense, 3 GPU `-sm tensor` | `7972f0185e01` | `7972f0185e01` |
+| 35B-A3B Q8_0, 3 GPU `-sm tensor -ncmoe 34`, full-residency arena (`MOE_EXPERT_CACHE_MIB=11000`) | `7399489b1685` | `7399489b1685` |
+| 35B-A3B Q8_0, 2 GPU `-sm layer -ncmoe 34` | `7399489b1685` | `7399489b1685` |
+| Flash-Next GSQ-RCO IQ3_S, 2 GPU `-sm tensor` (field flags) | `14f3577be465` | `14f3577be465` |
+| Flash-Next GSQ-RCO IQ3_S, 2 GPU `-sm layer` | `3e2d3910b121` | `3e2d3910b121` |
+| Qwen3-Coder 30B-A3B Q4_K_M, 2 GPU `-sm tensor -ncmoe 34` | `bdf34a354857` | `bdf34a354857` |
+
+* `scripts/gate-host-pool.sh` **59/59** (the take-over/repair gate; every text arm equal to `ref`, the fill
+  faults rolled back, `takeover=0` under them, GPU-fault window clean).
+* `scripts/gate-prefill-logits.sh` **0.000000 / 100.000 %** against the recorded canonical base (decode-only
+  change, as expected).
+* MTP Protocol A on 35B-A3B Q8_0 (3 GPU `-sm tensor`, prose prompt, `-n 3000`, bf16 KV, cache on):
+  plain **118.2 t/s** / `draft-mtp` **227.0 t/s**, acceptance **0.75110 (1370/1824)**, mean len 3.25 --
+  **identical on both builds** (draft text `e4a1a5b56cdf` both).  Fusion off
+  (`GGML_CUDA_DISABLE_FUSION=1`): acceptance 0.76062 (1611/2118), mean len 3.28, i.e. within noise.
+* `llama-batched-bench -npl 1,4,8 -npp 512 -ntg 128`: 95.5/286.2/479.6 -> 97.9/285.9/480.8 t/s (noise).
+* `gate-per-block-build.sh` (full `all` ladder after amending an early block): **18/18, 0 failed,
+  3659 s**; `validate-set.sh` GREEN (strict 18/18, optional 0100/0101 alone and cumulative, tree
+  `7d6b3f1106`, Windows portability 512 files).
+* `check-gpu-faults.sh` clean on the gate runs' kernel-journal windows.
+
+### Tooling found along the way (no delivery change)
+
+`gate-per-block-build.sh` ran a 6-7 minute rung in total silence (its output goes to the rung log), which
+is indistinguishable from a hang.  It now prints `building …`, a **heartbeat every 30 s** while a rung
+compiles (`PROGRESS_SECS=N`, 0 disables), the rung as `[N/18]`, and a finish line carrying the rungs left
+and the cumulative gate time.  The build-time complaint behind it (a full ladder is ~1 h when a header
+moves) is a block-reorg discussion, not this release.
+
 ## 261118.012 (r316 follow-up, docs only) -- correction: the 3-device tensor split's plain != draft-mtp is NOT the fold family, and it is not cache-type specific (issue #330)
 
 **No code and no artifact changed.**  This entry corrects two claims published hours earlier and records the

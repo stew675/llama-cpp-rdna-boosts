@@ -32878,10 +32878,10 @@ index 000000000..d6ed08aeb
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 new file mode 100644
-index 000000000..b7906b2b9
+index 000000000..14cd060ae
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -0,0 +1,3392 @@
+@@ -0,0 +1,3510 @@
 +// CUDA graph fusion dispatcher: the delivery's matchers and the one-line-per-concern try-fuse
 +// arms.  Split out of ggml-cuda.cu so an upstream change to the shared graph/evaluate path
 +// collides with the single ggml_cuda_try_fuse() call, not with every arm body.
@@ -34630,10 +34630,11 @@ index 000000000..b7906b2b9
 +        if (i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
 +                cgraph->nodes[i + 1]->src[0] == node) {
 +            const bool ok = moe_cache_table_serves(node, node->src[0], device);
-+            // The down-fold is redirect-safe by construction: its call site (`moe_cache_redirect_fused`)
++            // The down-fold is redirect-safe by construction: its call site (`moe_cache_fusion_serve`)
 +            // sends a served table to the arena and falls back to the raw, scheduler-copied table when
-+            // the cache does not serve, and the raw fallback is bit-identical to the per-op chain.  Do
-+            // NOT stand it down while the arena is still cold: that selected raw MUL_MAT_ID + MWR at
++            // the cache does not serve, and the raw fallback is bit-identical to the per-op chain (the
++            // fallback re-fills a copy a broken take-over promise left empty).  Do NOT stand it down
++            // while the arena is still cold: that selected raw MUL_MAT_ID + MWR at
 +            // W=1 and the cache-aware down-fold at W>=2, which are not bit-identical (the qwen35moe
 +            // (35B-A3B) `-sm tensor -ncmoe` width impurity, TODO #53).
 +            moe_fuse_trace((int) node->ne[2], false, ok ? "down-fold" : "down-fold-unserveable-fallback");
@@ -34654,6 +34655,47 @@ index 000000000..b7906b2b9
 +    }
 +
 +    return false;
++}
++
++// issue #294 (TODO #327): the fused-launch contract for every fusion that reads a ROUTED expert table directly.
++// A fused MoE never passes `ggml_cuda_mul_mat_id`'s redirect, so without this it read the scheduler's
++// `input_cpy` -- which a cache take-over deliberately never filled.  Resolve every routed lane through the
++// cache with the same per-table query the per-op consumer makes, and hand the caller the arena copies:
++//   returns true  -> launch on `src0_c`/`ids_c`, with `args.gate` repointed at `gate_c`
++//   returns false -> the lanes are unanimous STAGED: keep the graph's tensors (the scheduler filled them)
++// `*stand_down` is set when the lanes DISAGREE (one served in place, one staged).  A take-over is per TABLE, so
++// one lane's copy may never have been written, and only the per-op chain -- which resolves each table for
++// itself -- may consume that state.  A caller that stands down must leave `fused_node_count` at 0, so the
++// nodes run unfused.  `kind` is the decode census kind (4 = mmvf, 5 = mmvq).
++static bool fuse_serve_routed(ggml_backend_cuda_context * ctx, const ggml_tensor * op,
++        const ggml_tensor * src0, const ggml_tensor * gate, const ggml_tensor * ids,
++        ggml_cuda_mm_fusion_args_host * args, int kind,
++        ggml_tensor * src0_c, ggml_tensor * ids_c, ggml_tensor * gate_c, bool * stand_down) {
++    *stand_down = false;
++    if (ids == nullptr) {
++        return false;   // a dense matmul: no routed table, so no take-over can be outstanding
++    }
++    const moe_cache_serve_status serve = moe_cache_fusion_serve(op, src0, gate, ids, ctx->device, ctx->stream(),
++                                                               src0_c, ids_c, gate_c);
++    moe_cache_fusion_launched(serve, kind);
++    if (serve == MOE_CACHE_SERVE_MIXED) {
++        *stand_down = true;
++        return false;
++    }
++    if (serve != MOE_CACHE_SERVE_IN_PLACE) {
++        // STAGED.  If a take-over promised this lane and the slab then took its arena, the scheduler's copy
++        // was never filled -- re-fill it exactly as the per-op dispatch does.  No promise outstanding (the
++        // ordinary case) makes this a no-op.  (MIXED stands down instead, and the per-op chain repairs.)
++        moe_cache_repair_copy(src0, ctx->device, ctx->stream());
++        if (gate != nullptr) {
++            moe_cache_repair_copy(gate, ctx->device, ctx->stream());
++        }
++        return false;
++    }
++    if (gate != nullptr) {
++        args->gate = gate_c;
++    }
++    return true;
 +}
 +
 +static int ggml_cuda_count_uses(const ggml_cgraph * cgraph, const ggml_tensor * t) {
@@ -35336,7 +35378,18 @@ index 000000000..b7906b2b9
 +                fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
 +
 +                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
-+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
++                    // issue #294: a taken-over routed table's `input_cpy` was never filled, so read the arena
++                    // exactly as the per-op chain would (and stand down when only one lane was served).
++                    ggml_cuda_mm_fusion_args_host fusion_local = fusion_data;
++                    ggml_tensor src0_c, ids_c, gate_c;
++                    bool stand_down = false;
++                    const bool arena = fuse_serve_routed(cuda_ctx, cgraph->nodes[glu_idx], src0, fusion_data.gate, ids,
++                                                         &fusion_local, 5, &src0_c, &ids_c, &gate_c, &stand_down);
++                    if (stand_down) {
++                        break;
++                    }
++                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, arena ? &src0_c : src0, src1, arena ? &ids_c : ids,
++                                            cgraph->nodes[glu_idx], &fusion_local);
 +                    fused_mul_mat_vec = true;
 +                    fused_node_count  = n_ops;
 +                    break;
@@ -35430,7 +35483,17 @@ index 000000000..b7906b2b9
 +                fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
 +
 +                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
-+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
++                    // issue #294: see the MUL_MAT arm above -- a routed lane may live only in the arena.
++                    ggml_cuda_mm_fusion_args_host fusion_local = fusion_data;
++                    ggml_tensor src0_c, ids_c, gate_c;
++                    bool stand_down = false;
++                    const bool arena = fuse_serve_routed(cuda_ctx, cgraph->nodes[glu_idx], src0, fusion_data.gate, ids,
++                                                         &fusion_local, 5, &src0_c, &ids_c, &gate_c, &stand_down);
++                    if (stand_down) {
++                        break;
++                    }
++                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, arena ? &src0_c : src0, src1, arena ? &ids_c : ids,
++                                            cgraph->nodes[glu_idx], &fusion_local);
 +                    fused_mul_mat_vec = true;
 +                    fused_node_count  = n_ops;
 +                    break;
@@ -35486,7 +35549,17 @@ index 000000000..b7906b2b9
 +                fusion_data.glu_op    = ggml_get_glu_op(glu);
 +                fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 +
-+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
++                // issue #294: the per-lane scale/bias shapes are NOT recognised by the cache's fusion
++                // guard, so one lane can be served while the other is staged -- resolve both here.
++                ggml_cuda_mm_fusion_args_host fusion_local = fusion_data;
++                ggml_tensor src0_c, ids_c, gate_c;
++                bool stand_down = false;
++                const bool arena = fuse_serve_routed(cuda_ctx, glu, src0, fusion_data.gate, ids, &fusion_local, 4,
++                                                     &src0_c, &ids_c, &gate_c, &stand_down);
++                if (stand_down) {
++                    break;
++                }
++                ggml_cuda_mul_mat_vec_f(*cuda_ctx, arena ? &src0_c : src0, src1, arena ? &ids_c : ids, glu, &fusion_local);
 +                fused_mul_mat_vec = true;
 +                fused_node_count  = 5;
 +                break;
@@ -35500,7 +35573,15 @@ index 000000000..b7906b2b9
 +                fusion_data.glu_op    = ggml_get_glu_op(glu);
 +                fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 +
-+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
++                ggml_cuda_mm_fusion_args_host fusion_local = fusion_data;
++                ggml_tensor src0_c, ids_c, gate_c;
++                bool stand_down = false;
++                const bool arena = fuse_serve_routed(cuda_ctx, glu, src0, fusion_data.gate, ids, &fusion_local, 5,
++                                                     &src0_c, &ids_c, &gate_c, &stand_down);
++                if (stand_down) {
++                    break;
++                }
++                ggml_cuda_mul_mat_vec_q(*cuda_ctx, arena ? &src0_c : src0, src1, arena ? &ids_c : ids, glu, &fusion_local);
 +                fused_mul_mat_vec = true;
 +                fused_node_count  = 5;
 +                break;
@@ -35553,7 +35634,17 @@ index 000000000..b7906b2b9
 +                fusion_data.glu_op    = ggml_get_glu_op(glu);
 +                fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 +
-+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
++                // issue #294: this arm reads F32/F16/BF16 expert weights directly -- the reporter's
++                // corrupting path on a BF16-expert layer -- so it must resolve the cache the same way.
++                ggml_cuda_mm_fusion_args_host fusion_local = fusion_data;
++                ggml_tensor src0_c, ids_c, gate_c;
++                bool stand_down = false;
++                const bool arena = fuse_serve_routed(cuda_ctx, glu, src0, fusion_data.gate, ids, &fusion_local, 4,
++                                                     &src0_c, &ids_c, &gate_c, &stand_down);
++                if (stand_down) {
++                    break;
++                }
++                ggml_cuda_mul_mat_vec_f(*cuda_ctx, arena ? &src0_c : src0, src1, arena ? &ids_c : ids, glu, &fusion_local);
 +                fused_mul_mat_vec = true;
 +                fused_node_count  = 3;
 +                break;
@@ -35565,19 +35656,18 @@ index 000000000..b7906b2b9
 +                fusion_data.glu_op    = ggml_get_glu_op(glu);
 +                fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 +
-+                // wip/moe-expert-cache: the decode MoE may read a compact arena + slot-remapped ids
-+                // instead of the full expert tables.  Redirect BOTH lanes together (the cache took
-+                // both inputs over, skipping the scheduler copy); on a decline the scheduler's full
-+                // copy stands and the original tensors are used.
-+                ggml_tensor src0_c, ids_c, gate_c;
++                // issue #294: the decode MoE may read a compact arena + slot-remapped ids instead of the
++                // full expert tables.  Resolve BOTH lanes together: a take-over skips the scheduler copy
++                // per TABLE, so a one-lane redirect would read a lane nobody filled.
 +                ggml_cuda_mm_fusion_args_host fusion_local = fusion_data;
-+                if (moe_cache_redirect_fused(glu, src0, fusion_data.gate, ids, cuda_ctx->device, cuda_ctx->stream(),
-+                                             &src0_c, &ids_c, &gate_c)) {
-+                    fusion_local.gate = &gate_c;
-+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
-+                } else {
-+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
++                ggml_tensor src0_c, ids_c, gate_c;
++                bool stand_down = false;
++                const bool arena = fuse_serve_routed(cuda_ctx, glu, src0, fusion_data.gate, ids, &fusion_local, 5,
++                                                     &src0_c, &ids_c, &gate_c, &stand_down);
++                if (stand_down) {
++                    break;
 +                }
++                ggml_cuda_mul_mat_vec_q(*cuda_ctx, arena ? &src0_c : src0, src1, arena ? &ids_c : ids, glu, &fusion_local);
 +                fused_mul_mat_vec = true;
 +                fused_node_count  = 3;
 +                break;
@@ -35756,7 +35846,18 @@ index 000000000..b7906b2b9
 +            fusion_data.x_scale = scale;
 +
 +            if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
-+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
++                // issue #294: the routed projection (optionally with a per-expert scale/bias) reads the
++                // expert table directly; a taken-over lane lives only in the arena.
++                ggml_cuda_mm_fusion_args_host fusion_local = fusion_data;
++                ggml_tensor src0_c, ids_c, gate_c;
++                bool stand_down = false;
++                const bool arena = fuse_serve_routed(cuda_ctx, out_node, src0, nullptr, ids, &fusion_local, 5,
++                                                     &src0_c, &ids_c, &gate_c, &stand_down);
++                if (stand_down) {
++                    break;
++                }
++                ggml_cuda_mul_mat_vec_q(*cuda_ctx, arena ? &src0_c : src0, src1, arena ? &ids_c : ids,
++                                        out_node, &fusion_local);
 +                fused_mul_mat_vec = true;
 +                fused_node_count  = n_ops;
 +                break;
@@ -35907,14 +36008,31 @@ index 000000000..b7906b2b9
 +        fusion_data.x_bias = bias_tensor;
 +
 +        if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
-+            ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
++            // issue #294: same contract as the gate+up+GLU arms -- a routed lane may exist only in the arena.
++            ggml_cuda_mm_fusion_args_host fusion_local = fusion_data;
++            ggml_tensor src0_c, ids_c, gate_c;
++            bool stand_down = false;
++            const bool arena = fuse_serve_routed(cuda_ctx, bias_node, src0, nullptr, ids, &fusion_local, 4,
++                                                 &src0_c, &ids_c, &gate_c, &stand_down);
++            if (stand_down) {
++                break;
++            }
++            ggml_cuda_mul_mat_vec_f(*cuda_ctx, arena ? &src0_c : src0, src1, arena ? &ids_c : ids, bias_node, &fusion_local);
 +            fused_mul_mat_vec = true;
 +            fused_node_count  = has_view ? 3 : 2;
 +            break;
 +        }
 +
 +        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
-+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
++            ggml_cuda_mm_fusion_args_host fusion_local = fusion_data;
++            ggml_tensor src0_c, ids_c, gate_c;
++            bool stand_down = false;
++            const bool arena = fuse_serve_routed(cuda_ctx, bias_node, src0, nullptr, ids, &fusion_local, 5,
++                                                 &src0_c, &ids_c, &gate_c, &stand_down);
++            if (stand_down) {
++                break;
++            }
++            ggml_cuda_mul_mat_vec_q(*cuda_ctx, arena ? &src0_c : src0, src1, arena ? &ids_c : ids, bias_node, &fusion_local);
 +            fused_mul_mat_vec = true;
 +            fused_node_count  = has_view ? 3 : 2;
 +            break;
@@ -65937,7 +66055,7 @@ index 000000000..a78472231
 +// K-split kernel).  `GGML_CUDA_WMMA_MMVQ` is the contributor's environment alias and wins when it is set.
 +void ggml_cuda_mmvq_wmma_set_min_cols(int n);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index c6d895db4..af196265e 100644
+index c6d895db4..c7164190d 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,8 @@
@@ -68231,7 +68349,7 @@ index c6d895db4..af196265e 100644
  void ggml_cuda_op_mul_mat_vec_q(
      ggml_backend_cuda_context & ctx,
      const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
-@@ -1613,3 +2654,1109 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -1613,3 +2654,1133 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }
@@ -69086,13 +69204,19 @@ index c6d895db4..af196265e 100644
 +            ggml_cuda_mm_fusion_args_host fusion_data{};
 +            fusion_data.x_scale             = weights;
 +            fusion_data.x_scale_channel_dst = true;
-+            // the down table may be cache-managed; redirect the weight table and the routing onto
-+            // the compact arena/remap exactly as the gate+up+GLU site does.
-+            ggml_tensor src0_c, ids_c;
-+            if (moe_cache_redirect_fused(mm_node, mm_node->src[0], nullptr, mm_node->src[2],
-+                                         ctx.device, ctx.stream(), &src0_c, &ids_c, nullptr)) {
++            // the down table may be cache-managed; resolve the weight table and the routing onto the
++            // compact arena/remap exactly as the gate+up+GLU site does (a single lane, so there is no
++            // MIXED state to stand down for).
++            ggml_tensor src0_c, ids_c, gate_c;
++            const moe_cache_serve_status serve = moe_cache_fusion_serve(mm_node, mm_node->src[0], nullptr,
++                                                                       mm_node->src[2], ctx.device, ctx.stream(),
++                                                                       &src0_c, &ids_c, &gate_c);
++            moe_cache_fusion_launched(serve, 5);
++            if (serve == MOE_CACHE_SERVE_IN_PLACE) {
 +                ggml_cuda_mul_mat_vec_q(ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);
 +            } else {
++                // re-fill a copy a broken take-over promise left empty (a no-op when none is outstanding)
++                moe_cache_repair_copy(mm_node->src[0], ctx.device, ctx.stream());
 +                ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
 +            }
 +            return 1;
@@ -69304,7 +69428,25 @@ index c6d895db4..af196265e 100644
 +    fusion.shared_up = shared->src[1]->src[0];
 +    fusion.shared_gate = shared->src[0]->src[0];
 +    fusion.shared_dst = shared;
-+    ggml_cuda_mul_mat_vec_q(ctx, up->src[0], up->src[1], up->src[2], routed, &fusion);
++    // issue #294: the ROUTED pair is read directly (the shared pair is a dense weight), so resolve both
++    // routed lanes through the cache exactly as the per-op chain would.  One lane served and one staged
++    // (MIXED) means the scheduler filled only one copy: stand the fusion down.
++    ggml_tensor src0_c, ids_c, gate_c;
++    const moe_cache_serve_status serve = moe_cache_fusion_serve(routed, up->src[0], fusion.gate, up->src[2],
++                                                               ctx.device, ctx.stream(), &src0_c, &ids_c, &gate_c);
++    moe_cache_fusion_launched(serve, 5);
++    if (serve == MOE_CACHE_SERVE_MIXED) {
++        return 0;
++    }
++    if (serve == MOE_CACHE_SERVE_IN_PLACE) {
++        fusion.gate = &gate_c;
++        ggml_cuda_mul_mat_vec_q(ctx, &src0_c, up->src[1], &ids_c, routed, &fusion);
++    } else {
++        // STAGED: re-fill a copy a broken take-over promise left empty (a no-op when none is outstanding).
++        moe_cache_repair_copy(up->src[0], ctx.device, ctx.stream());
++        moe_cache_repair_copy(fusion.gate, ctx.device, ctx.stream());
++        ggml_cuda_mul_mat_vec_q(ctx, up->src[0], up->src[1], up->src[2], routed, &fusion);
++    }
 +    return 5;
 +}
 +
@@ -69417,10 +69559,10 @@ index 5605bf7a4..711fb1651 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..0e1f67560
+index 000000000..b52ee5351
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,13701 @@
+@@ -0,0 +1,13724 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -70412,6 +70554,13 @@ index 000000000..0e1f67560
 +// Kinds: 0 = mmb-glu, 1 = mmq gate+up+GLU triple, 2 = mmq shared-quantize pair, 3 = mmq swiglu->down fold.
 +int64_t                             g_pf_fuse[4][2]   = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
 +int64_t                             g_pf_fuse_mixed   = 0;  // a fused consumer's lanes disagreed on residency (stood down)
++// issue #294: the same census for the DECODE/verify-band MoE fusions (mmvf/mmvq).  They used to launch on the
++// scheduler's staged copy without asking the cache, and a take-over promise means that copy may never have
++// been filled -- so a nonzero IN-PLACE column is also the proof that the fused read really went through the
++// arena.  Kinds: 4 = mmvf gate+up+GLU, 5 = mmvq gate+up+GLU (any of the subgraph / bias / shared-expert
++// shapes, and the single routed projection folds, which have no gate lane).
++int64_t                             g_dec_fuse[2][2]  = {{0, 0}, {0, 0}};
++int64_t                             g_dec_fuse_mixed  = 0;
 +// Fail-soft / --fit interaction (issue #33).  The arena is the LOWEST-priority VRAM consumer: it is
 +// sized from what is actually FREE at sizing time (after --fit, the compute reserve and the KV cache
 +// have taken theirs) minus `g_reserve_mib`, so it cannot over-commit and `--fit` does not need to know
@@ -82215,9 +82364,17 @@ index 000000000..0e1f67560
 +
 +moe_cache_serve_status moe_cache_fusion_launched(moe_cache_serve_status status, int kind) {
 +    if (status == MOE_CACHE_SERVE_MIXED) {
-+        g_pf_fuse_mixed++;
++        // The same kinds select the same census in both bands, so a mixed prefill and a mixed decode are
++        // counted where a reader looks for them.
++        if (kind >= 4) {
++            g_dec_fuse_mixed++;
++        } else {
++            g_pf_fuse_mixed++;
++        }
 +    } else if (kind >= 0 && kind < 4) {
 +        g_pf_fuse[kind][status == MOE_CACHE_SERVE_IN_PLACE ? 1 : 0]++;
++    } else if (kind >= 4 && kind < 6) {
++        g_dec_fuse[kind - 4][status == MOE_CACHE_SERVE_IN_PLACE ? 1 : 0]++;
 +    }
 +    return status;
 +}
@@ -82696,6 +82853,14 @@ index 000000000..0e1f67560
 +                  (long long) g_pf_fuse[2][1], (long long) g_pf_fuse[2][0],
 +                  (long long) g_pf_fuse[3][1], (long long) g_pf_fuse[3][0],
 +                  (long long) g_pf_fuse_mixed);
++    // issue #294: the decode/verify band's counterpart.  A nonzero IN-PLACE column says the fused launch read
++    // the arena (the take-over's promise is honoured); a nonzero mixed_lanes says a pair was stood down because
++    // only one of its lanes was served, which is the state the per-op chain must resolve on its own.
++    GGML_LOG_INFO("%s: decode MoE fusions: mmvf_glu=%lld/%lld mmvq_glu=%lld/%lld (in_place/staged) "
++                  "mixed_lanes=%lld\n",
++                  __func__, (long long) g_dec_fuse[0][1], (long long) g_dec_fuse[0][0],
++                  (long long) g_dec_fuse[1][1], (long long) g_dec_fuse[1][0],
++                  (long long) g_dec_fuse_mixed);
 +    if (g_cold_uva) {
 +        static const char * const admit_names[] = { "always", "value", "touch" };
 +        GGML_LOG_INFO("%s: cold admission=%s, admission-rejected (served cold)=%lld\n",
@@ -83124,10 +83289,10 @@ index 000000000..0e1f67560
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..653250d9e
+index 000000000..727d44a46
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,513 @@
+@@ -0,0 +1,515 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -83605,8 +83770,10 @@ index 000000000..653250d9e
 +//                                on its own, is the only correct consumer of that state.
 +//
 +// Every returned placement must be fed to `moe_cache_fusion_launched()` with the fusion's census `kind`
-+// (0 = mmb-glu, 1 = mmq gate+up+GLU triple, 2 = mmq shared-quantize pair, 3 = mmq swiglu->down fold), once the
-+// launch actually happens: that census is what a gate reads to prove residency no longer selects the kernel set.
++// (0 = mmb-glu, 1 = mmq gate+up+GLU triple, 2 = mmq shared-quantize pair, 3 = mmq swiglu->down fold,
++//  4 = decode mmvf gate+up+GLU, 5 = decode mmvq gate+up+GLU), once the launch actually happens: that census is
++// what a gate reads to prove residency no longer selects the kernel set.  Kinds 4/5 also cover the single-lane
++// routed folds (bias / scale / shared-expert), which have no gate lane; their MIXED count is a decode one.
 +enum moe_cache_serve_status {
 +    MOE_CACHE_SERVE_NONE     = 0,
 +    MOE_CACHE_SERVE_IN_PLACE = 1,
