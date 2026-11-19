@@ -1,3 +1,115 @@
+## 261119.005 (r321, RELEASE v17-4f9dfa0e3-r321) -- GitHub issue #332 CLOSED: a gate-less MoE fusion was judged "one lane served" when its only lane was STAGED, so every single-lane fused launch stood itself down for as long as its table was staged (and the STAGED answer now owns the broken-promise repair, so no fused site has to remember it)
+
+**Release:** `v17-4f9dfa0e3-r321`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `4262662b8`
+(the `apply-all.sh` re-cut, tree `add239134e37`), 17 official + 1 temporary = 18 default blocks, optional
+`0100` -> `1805237d4` / `0101` -> `ed39b9e5d` (cumulative `57feba373`).  **No block created, split or
+renumbered**: one same-block amendment, **block 10** (`moe_cache_fusion_serve()`'s placement contract in
+`ggml/src/ggml-cuda/moe-expert-cache.{cu,h}`, plus the three call sites whose local repair it now owns).  No
+kernel arithmetic changed, no default moved, no environment variable added, and the measured effect on every
+unchanged-purity arm is **zero** (KLD 0.000000, identical text, identical MTP acceptance).
+
+The function itself is block 09's; the amendment is block 10's because the repair the contract is built on
+(`moe_cache_repair_copy()`) and every fused site it governs are block 10's — and because a block-09 placement
+**does not build**: the first cut of this fix landed there, and `gate-per-block-build.sh` failed rung 1/3 with
+`error: use of undeclared identifier 'moe_cache_repair_copy'`.  The rule that follows is in `INVARIANTS.md` r321.
+
+### The report, and what is actually wrong
+
+Issue #332 (@briansp2020, reading the code, no failure on their side): `moe_cache_fusion_serve()` decided its
+placement per lane, and for a caller that passes `gate == nullptr` it computed
+
+```cpp
+const bool gate_ok = gate == nullptr || lane_serves(gate);
+```
+
+which is vacuously **true**.  A single-lane caller whose table is STAGED then reads `up_ok = false`,
+`gate_ok = true`: `!up_ok && !gate_ok` is false, `!up_ok || !gate_ok` is true, so the answer is
+`MOE_CACHE_SERVE_MIXED` — and every MIXED consumer stands down.  The gate-less callers are the decode
+`MUL_MAT_ID` + weighted-`MUL` down fold (`mmvq.cu`), the single-lane routed bias/scale folds
+(`fuse_serve_routed(..., nullptr, ids, ...)`, three sites) and the RDNA3_5 MMQ `swiglu -> down` fold, so a
+staged table made the fused kernel set a function of **residency** again — the impurity `TODO` #327 removed for
+the gated sites, in the one shape nobody had walked.
+
+Reproduced on this box (the reporter's own Flash-Next config reads `mixed_lanes=0`, exactly as they said, so
+their series could not see it):
+
+| arm (r320 build, `-lv 4` census) | before | after |
+|---|---|---|
+| 35B-A3B UD-Q3_K_M, 1 GPU, `-ncmoe 24 -c 8192`, `-n 128` | `mmvq_glu=166/0 mixed_lanes=112` | `mmvq_glu=166/112 mixed_lanes=0` |
+| the same, 5 246-token prose prompt, `-n 64` (`pair` fired too) | `mmvq_glu=121/0 mixed_lanes=80`, `pair=0/176` | `mmvq_glu=121/80 mixed_lanes=0`, `pair=0/176` |
+| the same with `MOE_EXPERT_TAKEOVER_FAULT=1` (every promise broken in its own pass) | `mmvq_glu=0/0 mixed_lanes=200`, `broken=216 repaired=216` | `mmvq_glu=0/200 mixed_lanes=0`, `broken=216 repaired=216` |
+| 35B-A3B `-ncmoe 40` with `MOE_EXPERT_CACHE_MIB=2048` (staged, eager-remap tier) | `273/0 mixed_lanes=0` | `273/0 mixed_lanes=0` |
+| Flash-Next GSQ-RCO IQ3_XXS, 2 x R9700 `-sm tensor -ncmoe 47 -c 16384` (the reporter's shape) | `0/0 mixed_lanes=0` | `0/0 mixed_lanes=0` |
+
+So the reach is not "a staged table" in general but "a table that is neither served in place nor served by the
+published slot-remap" — the eager tier serves every table it holds slots for, which is why a small
+`MOE_EXPERT_CACHE_MIB` reads clean while a 100 %-identity arena with a few zero-slot layers does not.
+
+### The fix, and the second defect the report pointed at
+
+The report's own line is the fix: `gate == nullptr ? up_ok : lane_serves(gate)` — a single-lane caller is
+served exactly when its one lane is, so a staged table now answers `MOE_CACHE_SERVE_NONE` (launch on the
+scheduler's copies) instead of MIXED (stand down).  Carried in a form that states the rule rather than the
+trick (`gate == nullptr ? up_ok : …`, with the census kind's doc saying a single-lane caller's MIXED can now
+only come from the mid-call flip).
+
+The report also noticed that the STAGED branch becomes reachable for these callers, and that a table whose
+take-over promise a mid-pass eviction broke must be re-filled (`moe_cache_repair_copy`) before the fused launch
+reads it — they added the call to the `mmq.cu` swiglu fold, the one site of theirs that had none.  **This fix
+puts that repair in the serve QUERY instead of at each site**, because two of the three pre-existing repairs
+were already duplicated and five sites had none at all:
+
+* `moe_cache_fusion_serve()`'s STAGED answer now re-fills every staged lane it just read (both lanes when a
+gate is passed).  A fused launch never passes the per-op dispatch that repairs, so this is the only place that
+cannot be forgotten by a new fusion site, and it is what makes the five sites that had no repair (the MMQ
+shared-quantize pair, the MMB routed triple, the two MMQ triples) owe nothing.
+* The three per-site repairs the delivery already had (`mmvq.cu`'s down fold and shared-expert fold,
+`ggml-cuda-try-fuse.cu`'s `fuse_serve_routed`) are removed — same bytes, one owner (`gate-moe-promise.sh`
+reads the identical result, below).
+
+The RDNA3_5-only `swiglu -> down` fold cannot be exercised on gfx1201, so the reporter's untested hunk stays
+untested; it no longer needs a local repair, which is why this release does not carry an unverifiable edit to it.
+
+### Correctness: nothing moved, and the censuses are the evidence
+
+* **Same-seed greedy text byte-identical r320 vs r321** on every arm: `ba65a38cf871` (35B-A3B, 1 GPU,
+  `-ncmoe 24`, reasoning prompt, 128 tokens), `cd5e36218bd2` (the same on 5 246-token prose, 64 tokens, with
+  and without `MOE_EXPERT_TAKEOVER_FAULT=1`), `ecc56835cf49` (Flash-Next IQ3_XXS, 2 x R9700 `-sm tensor
+  -ncmoe 47`), `a3a1a32d95c2` (35B-A3B `plain` **and** `draft-mtp n3`, q8_0 KV), `efdb7608a8c9` (35B-A3B,
+  **2-device `-sm tensor`**, q8_0 KV, `plain` and `draft-mtp`), `7e6229b260f6` (dense Qwen3.5-4B Q8_0, 1 GPU
+  and 3-GPU `-sm tensor`).  The 112/80/200 newly-fused launches therefore read the same bytes as the per-op
+  chain they replace — the fused fold is not merely "equivalent", it is bit-identical here.
+* **`scripts/gate-moe-promise.sh` PASS**, both arms: `seq` reads `stale=846`, `broken=0 repaired=0` and no
+  `moe_cache_repair_copy` line (the stale-promise half), and `fault` reads `broken=285 repaired=285` with text
+  `c0e7e91d84c4` == the no-fault arm — i.e. moving the repair into the serve query did not lose a repair.
+* **MTP four-axis Protocol A** (35B-A3B, 1 GPU, `-ncmoe 24`, cache active, `-n 3000`; R at `-n 2000`): draft
+  acceptance **identical to the digit** on all four axes — 0.67763 / 0.76233 / 0.86491 / 0.99467 — and
+  generation t/s at parity (175.4 vs 175.6, 185.8 vs 186.0, 203.4 vs 203.6, 221.6 vs 223.0).
+* **`llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8`** (the firing arm, two interleaved pairs): TG B1
+  100.05/99.59 against 99.73/99.67, B4 314.86/314.19 against 314.54/313.83, B8 437.54/436.34 against
+  438.43/436.33 t/s — inside the spread.
+* **`scripts/gate-prefill-logits.sh`** against a base re-recorded from the r320 binary: **0.000000 / 100.000 %**
+  (canonical point), and `--ab "MOE_EXPERT_PREFILL_IN_PLACE=0"` also **0.000000 / 100.000 %**.
+* **`scripts/gate-lora-fusion.sh` PASS** (it is owed by any release that touches block 10's dispatcher):
+  `faad90258a16` no-LoRA fused == unfused, `fe967e92321a` LoRA fused == unfused, adapter moves the text, and
+  the decode and `-ub 512` prefill pairs both hold.
+* **`test-backend-ops -o MUL_MAT_ID`** 1056/1056; **`scripts/validate-set.sh`** GREEN (applied tree
+  `add239134e37`, optional alone `1805237d4` / `ed39b9e5d`, cumulative `57feba373`, 512-file Windows
+  portability scan); **`gate-per-block-build.sh --changed-from b7e5da6c1 --fast` 2/2** (block 10 and the tip);
+  `check-gpu-faults.sh` clean.
+
+The block-09-placement failure is worth keeping: it is the per-block ladder doing exactly the job it exists
+for — a change that is correct at the tip but does not build at the block that would carry it belongs in a
+later block (or needs the earlier block to introduce the symbol).
+
+### Issue #332 is CLOSED on this release
+
+The report's line is the fix, its diagnosis of the staged branch is right, and the one thing it could not check
+is the one thing this box has: a config whose gate-less callers really are staged (all of the reporter's arms,
+including their production `-sm tensor` shape, read `mixed_lanes=0`).  The reply credits the find, records the
+reproduction and the census, and notes that their intended local repair is now a contract in the serve query
+instead (with the RDNA3_5 fold left alone rather than carrying an untested edit).
+
 ## 261119.004 (r320, RELEASE v17-4f9dfa0e3-r320) -- contributor PR #316 taken as a matcher correctness fix: the conv + q/k norm fold's overlap test now tests the buffer the kernel reads, and the PR's own claim (a refused fold on every DFlash2 verify call) is refuted on r244 and later
 
 **Release:** `v17-4f9dfa0e3-r320`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `b7e5da6c1`

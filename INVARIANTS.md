@@ -1142,3 +1142,44 @@ issue #330.
 
 Record: `WORKLOG.md` 261119.004, `GREEDY-PURITY.md` §100, `patches/README.md` block 10, `ENVIRONMENT.md`
 `GGML_CUDA_FUSE_GDN_CONV_NORM`, PR #316.
+
+## r321 (2026-11-19, `WORKLOG.md` 261119.005) — a fused MoE launch's STAGED answer is a PLACEMENT, not a stand-down, and it owns the broken-promise repair (issue #332)
+
+1. **A single-lane caller is served exactly when its ONE lane is.**  `moe_cache_fusion_serve()` is asked per lane,
+   and five call sites pass `gate == nullptr` (the decode `MUL_MAT_ID` + weighted-`MUL` down fold, the three
+   single-lane routed bias/scale folds, the RDNA3_5 MMQ `swiglu -> down` fold).  Written as
+   `gate_ok = gate == nullptr || lane_serves(gate)` that term is vacuously true, so a STAGED table answered
+   `MOE_CACHE_SERVE_MIXED` (one lane "served", one not) and every gate-less fusion **stood itself down** for as
+   long as its table was staged: residency selected the kernel set again, which is the impurity `TODO` #327 removed
+   for the gated sites.  The answer must be `gate == nullptr ? up_ok : lane_serves(gate)`.
+2. **The reach is "neither served in place nor served by the published slot-remap", not "staged".**  Measured on
+   the r320 build: 35B-A3B UD-Q3_K_M, 1 GPU, `-ncmoe 24 -c 8192` reads `mmvq_glu=166/0 mixed_lanes=112`; the same
+   with a 5 246-token prose prompt reads `121/0 mixed_lanes=80` (`pair=0/176` in both); with
+   `MOE_EXPERT_TAKEOVER_FAULT=1` (every promise broken inside its own pass) it reads `0/0 mixed_lanes=200`.  A
+   **small** arena (`MOE_EXPERT_CACHE_MIB=2048`, `-ncmoe 40`) and the reporter's Flash-Next IQ3_XXS 2-device
+   `-sm tensor -ncmoe 47` shape both read `mixed_lanes=0`, because the eager tier serves every table it holds slots
+   for — which is why the report could only find this by reading the code.
+3. **The STAGED answer must be REPAIRED, and the serve query is the only place that can own it.**  A take-over
+   promise can be broken by a mid-pass eviction between the hook and the launch, and a fused launch never passes
+   `ggml_cuda_mul_mat_id`'s per-op repair.  `moe_cache_fusion_serve()`'s NONE answer therefore re-fills every
+   staged lane it just read; the three site-local repairs the delivery had (`mmvq.cu` ×2, `fuse_serve_routed`)
+   are removed and `gate-moe-promise.sh` still reads `broken=<n> repaired=<n>` with `repaired == broken` and text
+   `c0e7e91d84c4`.  The MMQ shared-quantize pair, the MMB routed triple and the two MMQ triples had **no** repair
+   at all, so a both-lanes-staged state with a broken promise would have read an unfilled buffer; that state was
+   not observed to move text on this box (the 216 repairs of the fault arm happen on other paths), and it is now
+   covered by construction rather than by each site remembering.
+4. **The newly-fused launches are bit-identical to the per-op chain they replace.**  112/80/200 launches move from
+   stand-down to fused with the text unchanged: `ba65a38cf871` (35B-A3B 1 GPU `-ncmoe 24`), `cd5e36218bd2` (5 246-
+   token prose, with and without `MOE_EXPERT_TAKEOVER_FAULT=1`), `ecc56835cf49` (Flash-Next 2 x R9700
+   `-sm tensor`), `a3a1a32d95c2` (35B-A3B `plain` == `draft-mtp`), `efdb7608a8c9` (35B-A3B 2-device `-sm tensor`,
+   `plain` == `draft-mtp`), `7e6229b260f6` (dense 4B, 1 and 3 GPU).  MTP acceptance identical to the digit on all
+   four Protocol A axes (0.67763 / 0.76233 / 0.86491 / 0.99467), prefill KLD 0.000000 / 100.000 %.
+5. **A fix that touches a block-10-owned contract belongs in block 10, even when the line it edits is block 09's.**
+   The first cut amended block 09 (which writes `moe_cache_fusion_serve()`) and `gate-per-block-build.sh` failed
+   rung 1/3 with `error: use of undeclared identifier 'moe_cache_repair_copy'` — that function and every fused
+   site are introduced by block 10.  The per-block ladder is the instrument that makes the ownership question
+   decidable; the rule is "the block that owns the behaviour and the symbols it needs", not "the block that
+   created the line".
+
+Record: `WORKLOG.md` 261119.005, `GREEDY-PURITY.md` §101, `patches/README.md` block 10, `MANIFESTS.md` gate 28,
+issue #332, `scripts/gate-moe-promise.sh`.

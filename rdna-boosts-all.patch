@@ -32952,10 +32952,10 @@ index 000000000..d6ed08aeb
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 new file mode 100644
-index 000000000..12e91060e
+index 000000000..22df8b2df
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -0,0 +1,3528 @@
+@@ -0,0 +1,3525 @@
 +// CUDA graph fusion dispatcher: the delivery's matchers and the one-line-per-concern try-fuse
 +// arms.  Split out of ggml-cuda.cu so an upstream change to the shared graph/evaluate path
 +// collides with the single ggml_cuda_try_fuse() call, not with every arm body.
@@ -34775,13 +34775,10 @@ index 000000000..12e91060e
 +        return false;
 +    }
 +    if (serve != MOE_CACHE_SERVE_IN_PLACE) {
-+        // STAGED.  If a take-over promised this lane and the slab then took its arena, the scheduler's copy
-+        // was never filled -- re-fill it exactly as the per-op dispatch does.  No promise outstanding (the
-+        // ordinary case) makes this a no-op.  (MIXED stands down instead, and the per-op chain repairs.)
-+        moe_cache_repair_copy(src0, ctx->device, ctx->stream());
-+        if (gate != nullptr) {
-+            moe_cache_repair_copy(gate, ctx->device, ctx->stream());
-+        }
++        // STAGED: the lanes the scheduler copied.  A lane whose take-over promise was broken by a mid-pass
++        // eviction has already been re-filled by the serve query (`moe_cache_fusion_serve` owns that repair
++        // for every fusion, so a new fused site cannot forget it); return false so the caller launches on the
++        // graph's own tensors.
 +        return false;
 +    }
 +    if (gate != nullptr) {
@@ -66147,7 +66144,7 @@ index 000000000..a78472231
 +// K-split kernel).  `GGML_CUDA_WMMA_MMVQ` is the contributor's environment alias and wins when it is set.
 +void ggml_cuda_mmvq_wmma_set_min_cols(int n);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index c6d895db4..c7164190d 100644
+index c6d895db4..535ea76cc 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,8 @@
@@ -68441,7 +68438,7 @@ index c6d895db4..c7164190d 100644
  void ggml_cuda_op_mul_mat_vec_q(
      ggml_backend_cuda_context & ctx,
      const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
-@@ -1613,3 +2654,1133 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -1613,3 +2654,1131 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }
@@ -69298,7 +69295,8 @@ index c6d895db4..c7164190d 100644
 +            fusion_data.x_scale_channel_dst = true;
 +            // the down table may be cache-managed; resolve the weight table and the routing onto the
 +            // compact arena/remap exactly as the gate+up+GLU site does (a single lane, so there is no
-+            // MIXED state to stand down for).
++            // MIXED state to stand down for, and the STAGED answer has already re-filled a copy a broken
++            // take-over promise left empty -- `moe_cache_fusion_serve` owns that repair for every fusion).
 +            ggml_tensor src0_c, ids_c, gate_c;
 +            const moe_cache_serve_status serve = moe_cache_fusion_serve(mm_node, mm_node->src[0], nullptr,
 +                                                                       mm_node->src[2], ctx.device, ctx.stream(),
@@ -69307,8 +69305,6 @@ index c6d895db4..c7164190d 100644
 +            if (serve == MOE_CACHE_SERVE_IN_PLACE) {
 +                ggml_cuda_mul_mat_vec_q(ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);
 +            } else {
-+                // re-fill a copy a broken take-over promise left empty (a no-op when none is outstanding)
-+                moe_cache_repair_copy(mm_node->src[0], ctx.device, ctx.stream());
 +                ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
 +            }
 +            return 1;
@@ -69534,9 +69530,8 @@ index c6d895db4..c7164190d 100644
 +        fusion.gate = &gate_c;
 +        ggml_cuda_mul_mat_vec_q(ctx, &src0_c, up->src[1], &ids_c, routed, &fusion);
 +    } else {
-+        // STAGED: re-fill a copy a broken take-over promise left empty (a no-op when none is outstanding).
-+        moe_cache_repair_copy(up->src[0], ctx.device, ctx.stream());
-+        moe_cache_repair_copy(fusion.gate, ctx.device, ctx.stream());
++        // STAGED: the lanes the scheduler copied (the serve query re-filled any a broken take-over promise
++        // left empty).
 +        ggml_cuda_mul_mat_vec_q(ctx, up->src[0], up->src[1], up->src[2], routed, &fusion);
 +    }
 +    return 5;
@@ -69651,10 +69646,10 @@ index 5605bf7a4..711fb1651 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..b52ee5351
+index 000000000..2a43303cc
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,13724 @@
+@@ -0,0 +1,13738 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -82438,9 +82433,23 @@ index 000000000..b52ee5351
 +        // The same routing-shape check the per-op consumer applies before it reads a remap.
 +        return rm == nullptr || (nu == ids->ne[0] && nt == ids->ne[1]);
 +    };
++    // A gate-less caller has ONE lane -- the decode down fold, the single-lane routed bias/scale folds and the
++    // RDNA3_5 swiglu->down fold all pass `gate == nullptr` -- so `gate_ok` must follow `up_ok` there.  Read as
++    // `gate == nullptr || lane_serves(gate)` it was vacuously true, which made a STAGED single-lane caller look
++    // one-lane-served and answer MIXED: every gate-less fusion stood itself down for as long as its table was
++    // staged, i.e. its kernel set was a function of residency (issue #332, the same impurity TODO #327 removes).
 +    const bool up_ok   = lane_serves(src0);
-+    const bool gate_ok = gate == nullptr || lane_serves(gate);
++    const bool gate_ok = gate == nullptr ? up_ok : lane_serves(gate);
 +    if (!up_ok && !gate_ok) {
++        // STAGED: the fused launch reads the scheduler's copies.  A take-over promise can still be outstanding
++        // for a lane whose arena the slab took between the hook and this query (TODO #335/#336), and a fused
++        // launch never passes the per-op dispatch that repairs it -- so re-fill each staged lane HERE, once, and
++        // no call site has to remember (the gate+up pair, the MMB/MMQ triples and the down/swiglu folds all get
++        // it from this one place).  No promise outstanding for the lane -> no work, no log.
++        moe_cache_repair_copy(src0, device, stream);
++        if (gate != nullptr) {
++            moe_cache_repair_copy(gate, device, stream);
++        }
 +        return MOE_CACHE_SERVE_NONE;   // staged: the scheduler's copies are what every fused lane reads
 +    }
 +    if (!up_ok || !gate_ok) {
@@ -83381,10 +83390,10 @@ index 000000000..b52ee5351
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..727d44a46
+index 000000000..31d0fd4ef
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
-@@ -0,0 +1,515 @@
+@@ -0,0 +1,523 @@
 +#pragma once
 +
 +// wip/moe-expert-cache — Phase 1a foundation (2026-09-28).
@@ -83854,18 +83863,26 @@ index 000000000..727d44a46
 +// from a staged one, and a run's greedy text a function of the persisted heat prior (TODO #321, r284).  This
 +// answers the same question per lane as `moe_cache_get_table` and returns the placement the fusion must use:
 +//
-+//   MOE_CACHE_SERVE_NONE      -- no lane is served: keep the graph's tensors (the scheduler staged them).
++//   MOE_CACHE_SERVE_NONE      -- no lane is served: keep the graph's tensors (the scheduler staged them).  The
++//                                query has ALREADY re-filled any staged lane whose take-over promise a mid-pass
++//                                eviction broke (`moe_cache_repair_copy`), so the fused launch reads live bytes.
 +//   MOE_CACHE_SERVE_IN_PLACE  -- every lane is served: pass `src0_cpy`/`gate_cpy`/`ids_cpy` to the fused launch.
 +//   MOE_CACHE_SERVE_MIXED     -- the lanes disagree (or a lane flipped unserveable mid-call): STAND THE FUSION
 +//                                DOWN.  A one-lane redirect would read a table the scheduler never copied (its
 +//                                in-place decision is per split), so the per-op chain, which resolves each table
 +//                                on its own, is the only correct consumer of that state.
 +//
++// `gate == nullptr` is a SINGLE-lane caller (the decode down fold, the single-lane routed bias/scale folds, the
++// RDNA3_5 swiglu->down fold): it is served exactly when its one lane is, so a staged table answers NONE (issue
++// #332 -- reading it as "the gate lane is satisfied" made every gate-less fusion stand down for as long as its
++// table was staged, i.e. residency selected its kernel set again).
++//
 +// Every returned placement must be fed to `moe_cache_fusion_launched()` with the fusion's census `kind`
 +// (0 = mmb-glu, 1 = mmq gate+up+GLU triple, 2 = mmq shared-quantize pair, 3 = mmq swiglu->down fold,
 +//  4 = decode mmvf gate+up+GLU, 5 = decode mmvq gate+up+GLU), once the launch actually happens: that census is
 +// what a gate reads to prove residency no longer selects the kernel set.  Kinds 4/5 also cover the single-lane
-+// routed folds (bias / scale / shared-expert), which have no gate lane; their MIXED count is a decode one.
++// routed folds (bias / scale / shared-expert / down fold), which have no gate lane; their MIXED count is a
++// decode one and now only comes from the mid-call flip, never from a plainly staged table.
 +enum moe_cache_serve_status {
 +    MOE_CACHE_SERVE_NONE     = 0,
 +    MOE_CACHE_SERVE_IN_PLACE = 1,

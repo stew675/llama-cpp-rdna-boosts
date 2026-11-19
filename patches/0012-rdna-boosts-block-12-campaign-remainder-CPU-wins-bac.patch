@@ -1,4 +1,4 @@
-From 387cf74e34229302e56cc9f59b51348174c95393 Mon Sep 17 00:00:00 2001
+From 5842c7e8f7612cb68c24b44d5e291928b4264d26 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/17] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -2988,7 +2988,7 @@ index bab71d893..d6ed08aeb 100644
                            "target=%.1f MiB boundary=%.1f MiB limit=%.1f MiB armed=%d\n",
                            device, (double) size/1048576.0, (double) want/1048576.0,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index f5e293971..12e91060e 100644
+index d5541cc8a..22df8b2df 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 @@ -1706,7 +1706,7 @@ static bool ggml_cuda_cache_blocks_fusion(ggml_backend_cuda_context * cuda_ctx,
@@ -3895,7 +3895,7 @@ index 985d9d091..b88443081 100644
                                      }
                                  }
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index dd1330149..705417ee7 100644
+index 10c8a7ab3..3091b9983 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -10,10 +10,12 @@
@@ -9727,7 +9727,7 @@ index dd1330149..705417ee7 100644
      if (t.arena == nullptr || t.slots <= 0 || t.remap_dev == nullptr || t.remap_n_used <= 0) {
          return false;
      }
-@@ -6929,11 +10554,49 @@ bool moe_cache_table_serves(const ggml_tensor * op, const ggml_tensor * weight,
+@@ -6943,11 +10568,49 @@ bool moe_cache_table_serves(const ggml_tensor * op, const ggml_tensor * weight,
      return t.identity && t.arena != nullptr && t.slots >= t.n_experts;
  }
  
@@ -9778,7 +9778,7 @@ index dd1330149..705417ee7 100644
      if (name_layer(weight) < 0) {
          return false;
      }
-@@ -6947,26 +10610,18 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -6961,26 +10624,18 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
      // OPEN 2 slab: gate per TABLE.  The `identity` check below already requires THIS table's arena
      // and slots, so this hook, the update hook and `moe_cache_get_table` agree per table; only the fusion
      // guard is global (`moe_cache_has_arena()`), so a partial cache loses the fusions but keeps serving.
@@ -9808,7 +9808,7 @@ index dd1330149..705417ee7 100644
          t.taken_cpy = weight_cpy;   // TODO #335/#336: the promise this hook makes to the scheduler
          if (g_takeover_fault && t.arena != nullptr && t.slots > 0) {
              fault_arena = t.arena;
-@@ -7052,6 +10707,13 @@ void moe_cache_init(int device) {
+@@ -7066,6 +10721,13 @@ void moe_cache_init(int device) {
          ensure_env();
          if (!g_init_done) {
              g_init_done = true;
@@ -9822,7 +9822,7 @@ index dd1330149..705417ee7 100644
              if (!g_enabled) {
                  return;
              }
-@@ -7063,6 +10725,36 @@ void moe_cache_init(int device) {
+@@ -7077,6 +10739,36 @@ void moe_cache_init(int device) {
                      atexit(moe_cache_report);
                  }
              }
@@ -9859,7 +9859,7 @@ index dd1330149..705417ee7 100644
              GGML_LOG_INFO("%s: MoE expert cache enabled on device %d: budget=%s MiB/device, period=%lld steps, %s\n",
                            __func__, device, budget_desc(), (long long) g_period,
                            g_slots_hint > 0 ? "explicit slots/table" : "adaptive uniform slots (deferred sizing)");
-@@ -7070,53 +10762,100 @@ void moe_cache_init(int device) {
+@@ -7084,53 +10776,100 @@ void moe_cache_init(int device) {
      }
  }
  
@@ -9989,7 +9989,7 @@ index dd1330149..705417ee7 100644
      GGML_LOG_INFO("%s: takeover=%lld decline_all=%lld get_ok=%lld cold=%s cold_reaches=%lld\n",
                    __func__, (long long) g_takeover, (long long) g_decline_all, (long long) g_get_ok,
                    g_cold_uva ? "uva" : "off", (long long) g_cold_reaches);
-@@ -7215,6 +10954,7 @@ void moe_cache_report() {
+@@ -7229,6 +10968,7 @@ void moe_cache_report() {
              }
          }
          heat_map_save_locked();   // final flush at process exit (the debounce must not lose the run)
@@ -9997,7 +9997,7 @@ index dd1330149..705417ee7 100644
          uint64_t total   = 0;
          int64_t  nonzero = 0, experts = 0;
          struct heat_top_t { uint64_t v; int layer; const char * role; int e; };
-@@ -7258,16 +10998,104 @@ void moe_cache_report() {
+@@ -7272,16 +11012,104 @@ void moe_cache_report() {
                        g_trace_path.c_str());
      }
  
@@ -10104,7 +10104,7 @@ index dd1330149..705417ee7 100644
      GGML_LOG_INFO("%s: VRAM budget: requested=%s MiB/device, free-clamped=%lld, arena alloc failures=%lld (fail-soft)\n",
                    __func__, budget_desc(), (long long) g_alloc_clamped, (long long) g_alloc_failed);
      // wip/arena-steady-sizing: the sizing pass samples the arena while the wide (prefill) compute view is
-@@ -7278,6 +11106,70 @@ void moe_cache_report() {
+@@ -7292,6 +11120,70 @@ void moe_cache_report() {
                    __func__, (long long) g_steady_raised, (long long) g_steady_skipped,
                    g_steady_gain_pp, g_steady_min_gain_pp, g_steady_allow ? "taking the band" : "leaving the band",
                    (double) g_arena_bytes / (1024 * 1024));
@@ -10175,7 +10175,7 @@ index dd1330149..705417ee7 100644
      if (g_acc_hits + g_acc_fills + g_acc_colds > 0) {
          const int64_t acc   = g_acc_hits + g_acc_fills + g_acc_colds;
          const int64_t bytes = g_fill_bytes + g_cold_bytes;
-@@ -7304,6 +11196,21 @@ void moe_cache_report() {
+@@ -7318,6 +11210,21 @@ void moe_cache_report() {
      }
  }
  
@@ -10198,7 +10198,7 @@ index dd1330149..705417ee7 100644
  // self-test: synthetic table, known pattern, fill + byte-verify.  Does not need a model.
  // ---------------------------------------------------------------------------------------------
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 57370c3f8..4b29cbbc2 100644
+index a92329e68..de6dfb8f8 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
 @@ -112,6 +112,14 @@ void moe_cache_set_extra_reserve(int device, size_t bytes);

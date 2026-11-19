@@ -748,6 +748,15 @@ in CI.  The model-level gates are manual:
      base-pointer swap, and it is the arm that `TODO` #336 was owed;
    * plus `scripts/gate-host-pool.sh` (the host-expert scheduler path) and `scripts/gate-kv-residency.sh` when the
      change also touches residency.
+   * **the placement arm (r321, issue #332)** — any change to `moe_cache_fusion_serve()`'s three-state answer owes a
+     **staged** arm, because the tip's own configs usually are not: the `-lv 4` census on a table that is neither
+     served in place nor slot-remapped must read `mixed_lanes=0` with the gate-less kinds in the **staged** column
+     (`mmvq_glu=<in_place>/<staged>`), where a vacuous "gate lane satisfied" term reads `mixed_lanes>0` and silently
+     stands the fusion down.  35B-A3B UD-Q3_K_M, 1 GPU, `-ncmoe 24 -c 8192` is such an arm (`166/0 mixed_lanes=112`
+     pre-fix against `166/112 mixed_lanes=0`, text `ba65a38cf871` both); the same arm with
+     `MOE_EXPERT_TAKEOVER_FAULT=1` is the both-lanes-staged + broken-promise case (`mixed_lanes=200` against 0,
+     `broken=216 repaired=216`).  A flat staged config (`MOE_EXPERT_CACHE_MIB=2048`) and the Flash-Next
+     `-sm tensor` shape read `mixed_lanes=0` on BOTH builds, i.e. they are **vacuous** here — do not use them.
    A byte validator cannot substitute for any of this: `MOE_EXPERT_CACHE_VALIDATE=3` reads 0 `MISMATCH` on the NaN arm
    (`INVARIANTS.md` r298 fact 3).
 

@@ -1,4 +1,4 @@
-From 3a38c95869d5c8bb09adb23df7c62bb52c3f7a08 Mon Sep 17 00:00:00 2001
+From 74de2a80186845e44044d040c34fd76e45125f7c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH 15/17] rdna-boosts: block 15: the UMA GTT expert store -- an
@@ -1647,7 +1647,7 @@ index 000000000..ae7567213
 +// kernel reclaims it anyway, but the registration is a HOLD (probe 09) and must be dropped explicitly.
 +void ggml_cuda_gtt_store_free();
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 13d01fab7..b52ee5351 100644
+index 6e989251b..2a43303cc 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1,6 +1,7 @@
@@ -5443,7 +5443,7 @@ index 13d01fab7..b52ee5351 100644
          return false;
      }
      if (t.arena == nullptr || t.slots <= 0 || t.remap_dev == nullptr || t.remap_n_used <= 0) {
-@@ -10806,27 +13068,147 @@ static void report_locked() {
+@@ -10820,27 +13082,147 @@ static void report_locked() {
      GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
                    __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
                    n_tables, n_slots, (double) arena_b / (1024 * 1024), budget_desc());
@@ -5600,7 +5600,7 @@ index 13d01fab7..b52ee5351 100644
      }
      if (g_uploadp_calls > 0) {
          GGML_LOG_INFO("%s: scheduler pageable-master fallback: %lld ranges, %.1f MiB served through the per-table "
-@@ -10872,6 +13254,15 @@ static void report_locked() {
+@@ -10886,6 +13268,15 @@ static void report_locked() {
                        g_sink_copies > 0 ? 100.0 * (double) g_sink_uses / (double) g_sink_copies : 0.0);
          GGML_LOG_WARN("%s: sink mirror tables (full coverage -> exchange INERT, spare=0): %lld\n", __func__,
                        (long long) g_sink_mirror_tables);
@@ -5616,7 +5616,7 @@ index 13d01fab7..b52ee5351 100644
          if (g_sink_near_mirror_tables > 0) {
              GGML_LOG_WARN("%s: sink near-mirror tables (coverage gap < 4 %% of the set -> exchange DISENGAGED): "
                            "%lld\n", __func__, (long long) g_sink_near_mirror_tables);
-@@ -11093,6 +13484,31 @@ static void report_locked() {
+@@ -11107,6 +13498,31 @@ static void report_locked() {
                            (double) g_stage_span_read_us / 1000.0);
          }
      }
@@ -5649,7 +5649,7 @@ index 13d01fab7..b52ee5351 100644
          // The prefill band's storage reads when they are NOT coalesced (a chunk that fell back, the 2-D
          // geometry, a pool with no free slot yet).  Read it against the span line above: `%.1f MiB/read`
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 4b29cbbc2..727d44a46 100644
+index de6dfb8f8..31d0fd4ef 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
 @@ -102,6 +102,22 @@ bool moe_cache_floor_active();

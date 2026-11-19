@@ -1,4 +1,4 @@
-From 9f924e6b9f68a5f6aeee8c711c60663150c18066 Mon Sep 17 00:00:00 2001
+From 90eb6f0ede93602d806e3506a454918fae5b789f Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/17] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -152,7 +152,7 @@ Co-authored-by: burnoutIA <72673971+burnoutIA@users.noreply.github.com>
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |  283 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |   27 +
  ggml/src/ggml-cuda/ggml-cuda-slab.cu          | 1847 +++++
- ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 3400 +++++++++
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 3397 +++++++++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cuh     |   43 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   60 +
  ggml/src/ggml-cuda/ggml-cuda.cu               | 6315 ++++++-----------
@@ -167,10 +167,10 @@ Co-authored-by: burnoutIA <72673971+burnoutIA@users.noreply.github.com>
  ggml/src/ggml-cuda/mmvq-moe.cu                |  457 ++
  ggml/src/ggml-cuda/mmvq-moe.cuh               |   14 +
  ggml/src/ggml-cuda/mmvq-vecdot.cuh            |   96 +
- ggml/src/ggml-cuda/mmvq.cu                    | 1791 +++--
+ ggml/src/ggml-cuda/mmvq.cu                    | 1789 +++--
  ggml/src/ggml-cuda/mmvq.cuh                   |   17 +-
- ggml/src/ggml-cuda/moe-expert-cache.cu        |  325 +-
- ggml/src/ggml-cuda/moe-expert-cache.h         |   31 +-
+ ggml/src/ggml-cuda/moe-expert-cache.cu        |  341 +-
+ ggml/src/ggml-cuda/moe-expert-cache.h         |   43 +-
  ggml/src/ggml-cuda/moe-weighted-reduction.cu  |   83 +
  ggml/src/ggml-cuda/moe-weighted-reduction.cuh |    2 +
  ggml/src/ggml-cuda/norm-gated.cu              |  121 +-
@@ -203,7 +203,7 @@ Co-authored-by: burnoutIA <72673971+burnoutIA@users.noreply.github.com>
  tests/test-fusion-gate-beta-multiseq.cpp      |  321 +
  tests/test-logits-width-probe.cpp             |  233 +-
  tools/server/server-context.cpp               |   30 +-
- 87 files changed, 17467 insertions(+), 5644 deletions(-)
+ 87 files changed, 17487 insertions(+), 5647 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -7580,10 +7580,10 @@ index 000000000..bab71d893
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 new file mode 100644
-index 000000000..4f220425f
+index 000000000..710d8c1ba
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -0,0 +1,3400 @@
+@@ -0,0 +1,3397 @@
 +// CUDA graph fusion dispatcher: the delivery's matchers and the one-line-per-concern try-fuse
 +// arms.  Split out of ggml-cuda.cu so an upstream change to the shared graph/evaluate path
 +// collides with the single ggml_cuda_try_fuse() call, not with every arm body.
@@ -9384,13 +9384,10 @@ index 000000000..4f220425f
 +        return false;
 +    }
 +    if (serve != MOE_CACHE_SERVE_IN_PLACE) {
-+        // STAGED.  If a take-over promised this lane and the slab then took its arena, the scheduler's copy
-+        // was never filled -- re-fill it exactly as the per-op dispatch does.  No promise outstanding (the
-+        // ordinary case) makes this a no-op.  (MIXED stands down instead, and the per-op chain repairs.)
-+        moe_cache_repair_copy(src0, ctx->device, ctx->stream());
-+        if (gate != nullptr) {
-+            moe_cache_repair_copy(gate, ctx->device, ctx->stream());
-+        }
++        // STAGED: the lanes the scheduler copied.  A lane whose take-over promise was broken by a mid-pass
++        // eviction has already been re-filled by the serve query (`moe_cache_fusion_serve` owns that repair
++        // for every fusion, so a new fused site cannot forget it); return false so the caller launches on the
++        // graph's own tensors.
 +        return false;
 +    }
 +    if (gate != nullptr) {
@@ -21034,7 +21031,7 @@ index 000000000..b471e4949
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 57467c1dd..c7164190d 100644
+index 57467c1dd..535ea76cc 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,6 +1,7 @@
@@ -22237,7 +22234,7 @@ index 57467c1dd..c7164190d 100644
          ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
          ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
  }
-@@ -3285,11 +2810,726 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
+@@ -3285,11 +2810,725 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
              (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
      }
  }
@@ -22938,7 +22935,8 @@ index 57467c1dd..c7164190d 100644
 +            fusion_data.x_scale_channel_dst = true;
 +            // the down table may be cache-managed; resolve the weight table and the routing onto the
 +            // compact arena/remap exactly as the gate+up+GLU site does (a single lane, so there is no
-+            // MIXED state to stand down for).
++            // MIXED state to stand down for, and the STAGED answer has already re-filled a copy a broken
++            // take-over promise left empty -- `moe_cache_fusion_serve` owns that repair for every fusion).
 +            ggml_tensor src0_c, ids_c, gate_c;
 +            const moe_cache_serve_status serve = moe_cache_fusion_serve(mm_node, mm_node->src[0], nullptr,
 +                                                                       mm_node->src[2], ctx.device, ctx.stream(),
@@ -22947,8 +22945,6 @@ index 57467c1dd..c7164190d 100644
 +            if (serve == MOE_CACHE_SERVE_IN_PLACE) {
 +                ggml_cuda_mul_mat_vec_q(ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);
 +            } else {
-+                // re-fill a copy a broken take-over promise left empty (a no-op when none is outstanding)
-+                moe_cache_repair_copy(mm_node->src[0], ctx.device, ctx.stream());
 +                ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
 +            }
 +            return 1;
@@ -22965,7 +22961,7 @@ index 57467c1dd..c7164190d 100644
      if (i + 8 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
          return 0;
      }
-@@ -3359,8 +3599,10 @@ int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const g
+@@ -3359,8 +3598,10 @@ int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const g
  // Shared-expert output chain: down + gate + gating + residual adds.  Returns 5 when fused.
  // GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1 turns it off.
  int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
@@ -22978,7 +22974,7 @@ index 57467c1dd..c7164190d 100644
      if (disable_shexp_down_gate || i + 5 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
          return 0;
      }
-@@ -3413,39 +3655,9 @@ int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const gg
+@@ -3413,39 +3654,9 @@ int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const gg
      return 0;
  }
  
@@ -23021,7 +23017,7 @@ index 57467c1dd..c7164190d 100644
  bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
      if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
          return false;
-@@ -3495,6 +3707,8 @@ bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, in
+@@ -3495,6 +3706,8 @@ bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, in
      return true;
  }
  
@@ -23030,7 +23026,7 @@ index 57467c1dd..c7164190d 100644
  int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
      if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID || !ctx.stream_context().concurrent_events.empty() ||
              !ggml_cuda_match_shared_expert(cgraph, i, i + 3) ||
-@@ -3515,12 +3729,33 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
+@@ -3515,12 +3728,32 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
      fusion.shared_up = shared->src[1]->src[0];
      fusion.shared_gate = shared->src[0]->src[0];
      fusion.shared_dst = shared;
@@ -23049,9 +23045,8 @@ index 57467c1dd..c7164190d 100644
 +        fusion.gate = &gate_c;
 +        ggml_cuda_mul_mat_vec_q(ctx, &src0_c, up->src[1], &ids_c, routed, &fusion);
 +    } else {
-+        // STAGED: re-fill a copy a broken take-over promise left empty (a no-op when none is outstanding).
-+        moe_cache_repair_copy(up->src[0], ctx.device, ctx.stream());
-+        moe_cache_repair_copy(fusion.gate, ctx.device, ctx.stream());
++        // STAGED: the lanes the scheduler copied (the serve query re-filled any a broken take-over promise
++        // left empty).
 +        ggml_cuda_mul_mat_vec_q(ctx, up->src[0], up->src[1], up->src[2], routed, &fusion);
 +    }
      return 5;
@@ -23099,7 +23094,7 @@ index 35f625eaa..711fb1651 100644
  void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 4d7a64ff2..dd1330149 100644
+index 4d7a64ff2..10c8a7ab3 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -138,6 +138,15 @@ struct table_t {
@@ -23570,7 +23565,32 @@ index 4d7a64ff2..dd1330149 100644
  moe_cache_serve_status moe_cache_fusion_serve(const ggml_tensor * op, const ggml_tensor * src0,
                                               const ggml_tensor * gate, const ggml_tensor * ids,
                                               int device, void * stream,
-@@ -6694,6 +6947,8 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -6620,9 +6873,23 @@ moe_cache_serve_status moe_cache_fusion_serve(const ggml_tensor * op, const ggml
+         // The same routing-shape check the per-op consumer applies before it reads a remap.
+         return rm == nullptr || (nu == ids->ne[0] && nt == ids->ne[1]);
+     };
++    // A gate-less caller has ONE lane -- the decode down fold, the single-lane routed bias/scale folds and the
++    // RDNA3_5 swiglu->down fold all pass `gate == nullptr` -- so `gate_ok` must follow `up_ok` there.  Read as
++    // `gate == nullptr || lane_serves(gate)` it was vacuously true, which made a STAGED single-lane caller look
++    // one-lane-served and answer MIXED: every gate-less fusion stood itself down for as long as its table was
++    // staged, i.e. its kernel set was a function of residency (issue #332, the same impurity TODO #327 removes).
+     const bool up_ok   = lane_serves(src0);
+-    const bool gate_ok = gate == nullptr || lane_serves(gate);
++    const bool gate_ok = gate == nullptr ? up_ok : lane_serves(gate);
+     if (!up_ok && !gate_ok) {
++        // STAGED: the fused launch reads the scheduler's copies.  A take-over promise can still be outstanding
++        // for a lane whose arena the slab took between the hook and this query (TODO #335/#336), and a fused
++        // launch never passes the per-op dispatch that repairs it -- so re-fill each staged lane HERE, once, and
++        // no call site has to remember (the gate+up pair, the MMB/MMQ triples and the down/swiglu folds all get
++        // it from this one place).  No promise outstanding for the lane -> no work, no log.
++        moe_cache_repair_copy(src0, device, stream);
++        if (gate != nullptr) {
++            moe_cache_repair_copy(gate, device, stream);
++        }
+         return MOE_CACHE_SERVE_NONE;   // staged: the scheduler's copies are what every fused lane reads
+     }
+     if (!up_ok || !gate_ok) {
+@@ -6694,6 +6961,8 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
      // OPEN 2 slab: gate per TABLE.  The `identity` check below already requires THIS table's arena
      // and slots, so this hook, the update hook and `moe_cache_get_table` agree per table; only the fusion
      // guard is global (`moe_cache_has_arena()`), so a partial cache loses the fusions but keeps serving.
@@ -23579,7 +23599,7 @@ index 4d7a64ff2..dd1330149 100644
      {
          std::lock_guard<std::mutex> lock(g_mutex);
          const auto it = g_key_to_id.find({ (const void *) weight, device });
-@@ -6713,6 +6968,18 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -6713,6 +6982,18 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
          // `moe_cache_update_host`), so the alias must track the current tensor.
          g_alias_to_id[weight_cpy] = id;
          t.taken_cpy = weight_cpy;   // TODO #335/#336: the promise this hook makes to the scheduler
@@ -23598,7 +23618,7 @@ index 4d7a64ff2..dd1330149 100644
      }
      return true;
  }
-@@ -6853,6 +7120,12 @@ void moe_cache_report() {
+@@ -6853,6 +7134,12 @@ void moe_cache_report() {
      GGML_LOG_INFO("%s: takeover=%lld decline_all=%lld get_ok=%lld cold=%s cold_reaches=%lld\n",
                    __func__, (long long) g_takeover, (long long) g_decline_all, (long long) g_get_ok,
                    g_cold_uva ? "uva" : "off", (long long) g_cold_reaches);
@@ -23612,7 +23632,7 @@ index 4d7a64ff2..dd1330149 100644
      // it ran on an arena table (the redirect).  A residency state that reroutes a kind from one column to the
      // other is exactly what this item removes, so a gate reads both columns and requires the same set of
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
-index 86da99cb5..57370c3f8 100644
+index 86da99cb5..a92329e68 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.h
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
 @@ -196,9 +196,13 @@ bool moe_cache_is_sized();
@@ -23669,6 +23689,35 @@ index 86da99cb5..57370c3f8 100644
  // Structural takeover for the decode/verify band: true when the table is cache-managed and the consumer
  // can read the arena without the host routing (an identity table, served with the raw ids).  Every other
  // table takes the eager host-routing path (`moe_cache_update_host`), which materializes the remap on the
+@@ -336,18 +363,26 @@ bool moe_cache_redirect_fused(const struct ggml_tensor * op,
+ // from a staged one, and a run's greedy text a function of the persisted heat prior (TODO #321, r284).  This
+ // answers the same question per lane as `moe_cache_get_table` and returns the placement the fusion must use:
+ //
+-//   MOE_CACHE_SERVE_NONE      -- no lane is served: keep the graph's tensors (the scheduler staged them).
++//   MOE_CACHE_SERVE_NONE      -- no lane is served: keep the graph's tensors (the scheduler staged them).  The
++//                                query has ALREADY re-filled any staged lane whose take-over promise a mid-pass
++//                                eviction broke (`moe_cache_repair_copy`), so the fused launch reads live bytes.
+ //   MOE_CACHE_SERVE_IN_PLACE  -- every lane is served: pass `src0_cpy`/`gate_cpy`/`ids_cpy` to the fused launch.
+ //   MOE_CACHE_SERVE_MIXED     -- the lanes disagree (or a lane flipped unserveable mid-call): STAND THE FUSION
+ //                                DOWN.  A one-lane redirect would read a table the scheduler never copied (its
+ //                                in-place decision is per split), so the per-op chain, which resolves each table
+ //                                on its own, is the only correct consumer of that state.
+ //
++// `gate == nullptr` is a SINGLE-lane caller (the decode down fold, the single-lane routed bias/scale folds, the
++// RDNA3_5 swiglu->down fold): it is served exactly when its one lane is, so a staged table answers NONE (issue
++// #332 -- reading it as "the gate lane is satisfied" made every gate-less fusion stand down for as long as its
++// table was staged, i.e. residency selected its kernel set again).
++//
+ // Every returned placement must be fed to `moe_cache_fusion_launched()` with the fusion's census `kind`
+ // (0 = mmb-glu, 1 = mmq gate+up+GLU triple, 2 = mmq shared-quantize pair, 3 = mmq swiglu->down fold,
+ //  4 = decode mmvf gate+up+GLU, 5 = decode mmvq gate+up+GLU), once the launch actually happens: that census is
+ // what a gate reads to prove residency no longer selects the kernel set.  Kinds 4/5 also cover the single-lane
+-// routed folds (bias / scale / shared-expert), which have no gate lane; their MIXED count is a decode one.
++// routed folds (bias / scale / shared-expert / down fold), which have no gate lane; their MIXED count is a
++// decode one and now only comes from the mid-call flip, never from a plainly staged table.
+ enum moe_cache_serve_status {
+     MOE_CACHE_SERVE_NONE     = 0,
+     MOE_CACHE_SERVE_IN_PLACE = 1,
 diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
 index 45eb1a2c1..bcf732500 100644
 --- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu
