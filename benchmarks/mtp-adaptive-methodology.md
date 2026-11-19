@@ -173,6 +173,15 @@ measured **-5%** vs fixed `n3` at `-n 256` (mean accepted length 4.32) and **+28
 This is the same class of blind spot as the reasoning flag: a gate that does not reproduce the real
 usage shape optimises for the wrong thing.
 
+> **2026-11-19 (r319, issue #330): the three-device tensor arm now lives in its own gate.**  This protocol is
+> run on 1 GPU / `-sm layer`, and it reported `plain == draft-mtp` on 3 of 4 axes while a **3-device `-sm tensor`**
+> split diverged (the tile FA launcher keyed its KV split on the padded used KV extent; see `GREEDY-PURITY.md` §99).
+> `scripts/gate-spec-purity.sh` is that arm: manifest A (q8_0) and B (bf16) must read one text, with a `--control`
+> arm that must diverge, plus `test-logits-width-probe`'s 256-cell-boundary prefix arm.  Run it alongside this
+> protocol for any decode/verify or FA-launcher change, and run this four-axis protocol on 3 devices `-sm tensor`
+> on both cache types when the change can reach the tensor-split path (r319: plain == draft on all four axes on both
+> caches, acceptance 0.57755 / 0.81776 / 0.86555 / 0.99200 at `-n 1000`).
+
 Gate rules:
 0. **Length**: the four-axis gate runs at `-n 3000` (floor `-n 2000`).  A shorter run may be used as a
    smoke check for correctness (acceptance > 0, text purity), never as a performance verdict.  Record
