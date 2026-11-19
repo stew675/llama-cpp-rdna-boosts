@@ -940,6 +940,19 @@ r92 to r315; `ggml_cuda_fattn_band_wmma_two_byte()` and the launcher's `P` fallb
    kernels are the ones both classes already ran.  A 128-dim GQA 5/7/12 *model* was not available (op level
    only).  **Open:** the 2-byte family's own optimum at verify widths is 8 (it is 12-16 % faster there) and it
    still ships 16 -- one constant cannot serve both widths, and P 8 loses every end-to-end arm measured here.
+10. **`plain != draft-mtp` on a 3-device `-sm tensor` split is NOT the quantized-KV fold family, and it is not
+   cache-type specific** (recorded 2026-11-18 in `WORKLOG.md` 261118.012, tracked as issue #330; the r316
+   records first guessed the fold family and that guess is refuted).  Disabling all six fold switches
+   (`GGML_CUDA_KV_FOLD_Q8_0`, `GGML_CUDA_QK_ROTATE_HADAMARD`, `GGML_CUDA_FUSE_V_FWHT`,
+   `GGML_CUDA_FA_COMBINE_FWHT`, `GGML_CUDA_QK_PAIR_FWHT`, `GGML_CUDA_FUSE_ROPE_FWHT`) leaves both texts byte
+   for byte unchanged, and a **bf16** cache shows the same divergence on the reasoning axis
+   (`7dca501eeb0e` plain / `759c1a4515c6` draft, r315's own published pair).  It needs **3 devices on
+   `-sm tensor`**: equal on 1 device, on a 2-device tensor split and on 3 devices `-sm layer`.
+   `GGML_CUDA_ALLREDUCE=internal` changes both texts but does not remove the divergence.  `P` is not involved
+   (identical at `GGML_HIP_FA_BAND_WMMA_SPLIT` 16 and 32 on the r315 build), and
+   `test-logits-width-probe` reads PASS maxdiff 0 throughout because it drives its own batches rather than a
+   speculator's verify.  Do not attribute a plain/draft text divergence to the KV type or to a fold without
+   the kill-switch arm.
 
 Record: `benchmarks/2026-11-18-band-fixup-period.md`, `MANIFESTS.md` gate 05, `patches/README.md` block 05,
-`ENVIRONMENT.md` §8, `GREEDY-PURITY.md` §98.
+`ENVIRONMENT.md` §8, `GREEDY-PURITY.md` §98, issue #330.

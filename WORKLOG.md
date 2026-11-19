@@ -1,3 +1,39 @@
+## 261118.012 (r316 follow-up, docs only) -- correction: the 3-device tensor split's plain != draft-mtp is NOT the fold family, and it is not cache-type specific (issue #330)
+
+**No code and no artifact changed.**  This entry corrects two claims published hours earlier and records the
+bisection that refuted them.  It opens **no `TODO` handle**: the finding is tracked as GitHub
+[issue #330](https://github.com/stew675/llama-cpp-rdna-boosts/issues/330).
+
+**What was wrong.**  `WORKLOG.md` 261118.011 (finding 3) and `benchmarks/2026-11-18-band-fixup-period.md` §4
+attributed a `plain != draft-mtp` greedy divergence on a q8_0 cache to "the quantized-cache fold family".  The
+`P`-independence half of that claim stands (identical at `GGML_HIP_FA_BAND_WMMA_SPLIT` 16 and 32 on the r315
+build), the attribution does not.
+
+**What the bisection shows** (all arms one binary, 27B Q8_0, `-n 512`, seed 42, temp 0, `ROCBLAS_USE_HIPBLASLT=0`):
+
+* Disabling the whole quantized-KV fold family (`GGML_CUDA_KV_FOLD_Q8_0=0 GGML_CUDA_QK_ROTATE_HADAMARD=0
+  GGML_CUDA_FUSE_V_FWHT=0 GGML_CUDA_FA_COMBINE_FWHT=0 GGML_CUDA_QK_PAIR_FWHT=0 GGML_CUDA_FUSE_ROPE_FWHT=0`)
+  leaves the divergence **byte for byte unchanged**: plain `120c74935967`, draft `c1f9d0b3f5b6`.  So it is not
+  that family.
+* It is **not cache-type specific**.  On a **bf16** cache the *reasoning* axis diverges the same way
+  (`7dca501eeb0e` plain against `759c1a4515c6` draft, which is r315's own published pair -- so it is
+  pre-existing, and r315's "plain == draft-mtp on all four" sentence is false for that axis).  A quantized
+  cache only decides *where* the difference lands, not whether it can.
+* It needs **3 devices on `-sm tensor`**: equal on 1 device (`17ce2d3db8be`), on the 2 device (0,2) pair
+  (`b1c84ba23a2c`) and on the same 3 devices with `-sm layer` (`f59aa0be6536`).
+* Forcing `GGML_CUDA_ALLREDUCE=internal` changes both texts (`bdaaa6e4b10d` / `c19866607aa4`), so the
+  all-reduce arm does select the numerics, but it does **not** remove the divergence -- if the locus is block
+  01 it is inside the internal pipeline, not in the arm choice.
+* `test-logits-width-probe` cannot see it: PASS, worst maxdiff 0, on the 27B at `KV=q8_0/f16/bf16`, P 3584 /
+  4096 / 10240, one device and `SPLIT=tensor`/`layer`.  The probe drives its own batches, which is exactly why
+  a speculator-driven verify can still diverge.
+
+**Why it matters and what is left.**  A speculator must not change greedy text (invariant 1).  The issue carries
+the reproduction, the full locality matrix, the two manifests and the candidate loci (block 01's internal
+all-reduce and its `n_rs_batch` split, block 09's split-state/graph composition, the verify-band fusion set,
+the derived kq mask) so it can be worked without re-deriving any of it.  Whatever the fix is, the four-axis MTP
+gate should gain a **3 device `-sm tensor`** arm on both a q8_0 and a bf16 cache.
+
 ## 261118.011 (r316, RELEASE v17-4f9dfa0e3-r316) -- `TODO` #346 closed: the band's fixup period `P` is one constant (`nsm/2`) for every K/V type, and it was chosen on the attention-bound arm (official block 05)
 
 **What shipped.**  Block **05** only: `ggml_cuda_fattn_band_wmma_split()` now returns `max(2, nsm/2)` for **every**
@@ -69,7 +105,8 @@ check and gates the change on the probe and the deep arm instead.  (3) On q8_0 K
 plain != draft-mtp (`120c74935967` vs `c1f9d0b3f5b6`) -- **inherited from r315 and `P`-independent** (identical at
 P 16 and P 32 on the r315 build, while bf16 K/V is equal on all four axes), so it is the quantized-cache fold
 family, not this change; it is reported because a delivery invariant expects plain == draft-mtp, and it was never
-measured on a q8_0 cache before.
+measured on a q8_0 cache before.  *(Corrected in 261118.012: it is NOT the fold family and NOT cache-type
+specific -- it is a 3-device `-sm tensor` plain != draft divergence, tracked as issue #330.)*
 
 ## 261118.010 (r315, RELEASE v17-4f9dfa0e3-r315) -- `TODO` #345 closed: the 256-dim band gets the 128-dim arm's work gate; its preferred route (an adaptive `P`) is refuted, and r314's "cache size" fact is corrected (official block 05)
 

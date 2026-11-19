@@ -185,8 +185,16 @@ real MTP step are not the `n_q` 8 op case; the constant has to be chosen end to 
   K `a87c4318b649`, acceptance R 346/489, P 355/467, C 369/424, K 372/375) reproduce **r315's own q8_0 arms
   under all three P values** -- the axes sit below the band gate (~5-6K cells), so they are a regression check
   for this change, not a test of it.  The P axis's plain/draft divergence on q8_0 (`120c74935967` vs
-  `c1f9d0b3f5b6`) is **inherited from r315 and P-independent** (identical at P 16 and P 32 on the r315 build);
-  it is the quantized-cache fold family, not this change.
+  `c1f9d0b3f5b6`) is **inherited from r315 and P-independent** (identical at P 16 and P 32 on the r315 build).
+  *Corrected after this record was published:* this file and `WORKLOG.md` 261118.011 first attributed that
+  divergence to the quantized-cache fold family.  **That is refuted** -- disabling all six fold switches
+  (`GGML_CUDA_KV_FOLD_Q8_0`, `GGML_CUDA_QK_ROTATE_HADAMARD`, `GGML_CUDA_FUSE_V_FWHT`,
+  `GGML_CUDA_FA_COMBINE_FWHT`, `GGML_CUDA_QK_PAIR_FWHT`, `GGML_CUDA_FUSE_ROPE_FWHT`) leaves both hashes
+  unchanged -- and it is not cache-type specific either: the **bf16** reasoning axis diverges the same way on
+  the same split (`7dca501eeb0e` vs `759c1a4515c6`, which is r315's own published pair).  Both need
+  **3 devices on `-sm tensor`** and are equal on 1 device, on 2 devices and on 3 devices `-sm layer`.  It is
+  tracked as **issue #330**; it is a pre-existing greedy-purity question about the tensor split, not this
+  change and not a fold.
 * Coherence (3 GPU `-sm tensor`, `-c 4096/8192/2048`, `-n 96`, `--seed 42 --temp 0`, no `-lv`): with the default
   f16 K/V **nothing moved** -- 4B `8d89080db673`, 27B `da2e2d192e21`, 35B-A3B `265c381dbc11`, Flash-Next
   `de61b9b1bed7`, Ripple-65B (`-c 2048`) `c1e00039b55c`, all identical to r315.  With q8_0 K/V and a deep
