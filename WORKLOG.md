@@ -1,3 +1,108 @@
+## 261119.002 (r318, RELEASE v17-4f9dfa0e3-r318) -- GitHub issue #331 CLOSED: the Q8_1 MUL fusion counted only direct readers, so a LoRA's delta was dropped (block 10)
+
+**Release:** `v17-4f9dfa0e3-r318`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `51a0d4256`
+(the `apply-all.sh` re-cut, tree `d586e2a5fd`), 17 official + 1 temporary = 18 default blocks, optional
+`0100` -> `ffb6c3239d` / `0101` -> `9a884993b6` (cumulative `820b327d23`).  **No block created, split or
+renumbered**: one same-block amendment, **block 10** (`ggml-cuda-try-fuse.cu`).  No kernel arithmetic changed,
+no default moved, no environment variable added (`GGML_CUDA_FUSE_TRACE` gains one line).
+
+### What the reporter found, and what this box reproduced
+
+@Nyshone runs a rank-1 abliteration LoRA (`attn_output`, `ssm_out`, `ffn_down`, 102 modules) on Qwen3.8-27B
+UD-Q2_K_XL with `--spec-type draft-mtp,ngram-mod` and reported that the adapter loads, `/lora-adapters` shows
+the scale, and the model still refuses -- while `GGML_CUDA_DISABLE_FUSION=1` or upstream b12532 behave.  They
+bisected the guard themselves: `ggml_cuda_find_mul_q8_1_matmul()` requires the MUL to have exactly one
+consumer, because the fused `ggml_cuda_op_unary_mul_q8_1()` writes only the matmul's Q8_1 activation and never
+the F32 MUL, and the guard counted only **direct** `src == mul` readers.  `build_lora_mm()` appends a
+`MUL_MAT` on the same activation, reached through the same no-op reshape the matmul reads, so the LoRA delta
+read a buffer nobody wrote.  Their one-hunk patch (count through views, expect 1 or 2) is the fix's core.
+
+Reproduced here on gfx1201 with the published `abliteration-lora.gguf` and Qwen3.8-27B `UD-Q4_K_XL`
+(1 GPU, seed 42, temp 0, 64 tokens):
+
+| arm | text |
+|---|---|
+| no adapter, fusions on (and off) | `b7c2006e41dc` |
+| adapter, `GGML_CUDA_DISABLE_FUSION=1` | `f7026ffb399a` |
+| adapter, fusions on, **pre-fix** | `f3e8501e7b38` |
+| adapter, fusions on, **post-fix** | `f7026ffb399a` |
+
+### The fix
+
+The guard now counts with the view-aware `ggml_cuda_count_uses()` and expects `1` (the matmul reads the MUL
+directly) or `2` (a reshape plus the matmul through it) -- the fused chain must own every reader, and a
+LoRA-free graph owns exactly those.  The reporter's expected-value arithmetic is kept as written; the shipped
+form uses the shared helper (no duplicated loop) and adds a deduped `FUSE_TRACE MUL_Q8_1 DECLINE ne=…
+readers=… want=…` line under the existing `GGML_CUDA_FUSE_TRACE`, so a gate can prove the matcher reached the
+shape instead of trusting a text diff.
+
+Where it actually bites, and where it does not: the declines are all on the **ssm_out** activation (the GDN
+`norm * silu(z)` MUL) -- `ne=4096` on the 4B, `6144`/`12288`/`24576`/`258048` on the 27B, at
+`readers=2 want=1` (direct) and `readers=3 want=2` (through the reshape).  A `ffn_down` LoRA does **not** move,
+because that FFN is a `GGML_OP_GLU` whose launcher writes the F32 output as well
+(`ggml_cuda_glu_q8_1_mark`), and the prefill `GGML_CUDA_FUSE_SWIGLU_MMQ` arm already requires a direct reader,
+so the graph's own use count declines it.
+
+### The gate the fix needed (no existing gate reached a LoRA)
+
+`ggml_cuda_should_fuse_mul_q8_1` had no arm anywhere in the ladder, and a LoRA is the only thing on this box
+that adds a reader through a view.  Two new tools, both part of the release flow:
+
+* `scripts/make-test-lora.py` -- a deterministic synthetic adapter (reads the model's own shapes, rank 2,
+  N(0, 0.05), seed 331, `alpha = 0`).  A published LoRA exists for one model only, so a gate using one could
+  not run on the models this box validates.  Two traps are recorded in `INVARIANTS.md` r318 item 5.
+* `scripts/gate-lora-fusion.sh` -- A: no-LoRA fused == unfused (the oracle is exact here); B: LoRA fused ==
+  LoRA unfused (the claim); C: LoRA != no-LoRA (NON-VACUITY); D: `GGML_CUDA_FUSE_TRACE=1` logs a
+  `MUL_Q8_1 DECLINE` on the LoRA arm and **none** without an adapter; E: a `-ub 512`, ~2k-token pair repeats
+  A/B/C so a 512-token prefill graph is built with an adapter loaded.
+
+| arm (4B Q8_0, 1 GPU, seed 42, temp 0) | r318 | pre-fix control |
+|---|---|---|
+| A no-LoRA, fusions on / `GGML_CUDA_DISABLE_FUSION=1` | `faad90258a16` / `faad90258a16` | `faad90258a16` / `faad90258a16` |
+| B adapter, fusions on / off | `fe967e92321a` / `fe967e92321a` | `04ea54ab3e38` / `fe967e92321a` (**FAIL**) |
+| C adapter moved the text | yes (`faad90258a16` -> `fe967e92321a`) | yes |
+| D declines with / without adapter | **2 / 0** (`ne=4096 readers=2 want=1`, `readers=3 want=2`) | 0 / 0 (**FAIL**) |
+| E prefill pair `-ub 512` | `942ef687096b` / `942ef687096b` | `38cf6a35eec1` / `942ef687096b` (**FAIL**) |
+| gate run time | ~2 min | -- |
+
+### Verification (gfx1201, ROCm 10.1.0)
+
+| arm (same-seed greedy text) | r317 build | r318 build |
+|---|---|---|
+| 4B Q8_0, 1 GPU | `7e6229b260f6` | `7e6229b260f6` |
+| 4B Q8_0, 3 GPU `-sm tensor` | `7e6229b260f6` | `7e6229b260f6` |
+| 27B UD-Q4_K_XL, 1 GPU | `1acb04bd9104` | `1acb04bd9104` |
+| 27B UD-Q4_K_XL, 3 GPU `-sm layer` | `1acb04bd9104` | `1acb04bd9104` |
+| 35B-A3B Q4_K_M, `-ncmoe 34` | `461ca8cd0e88` | `461ca8cd0e88` |
+
+* `scripts/gate-lora-fusion.sh` **PASS** (table above; negative-tested against the pre-fix binary, which fails
+  B, D and E).
+* `scripts/gate-fusion-alias-copy.sh` **PASS** -- anchor `3fab4da87774` unmoved, `GLU<-NONE/copy@` declined,
+  `MOE_HOST_POOL_FILL_FAULT` arm equal, journal clean.
+* `scripts/gate-prefill-logits.sh` **0.000000 / 100.000 %** against the recorded canonical base.
+* MTP Protocol A, 35B-A3B Q8_0 3 GPU `-sm tensor`, `-n 1000`, `-lv 4`: draft acceptance **0.76374 (695/910),
+  mean len 3.29 on both builds**, 233.3 vs 233.4 t/s.  (`--spec-type none` on the same shape: 132.9 t/s,
+  text `a6fd601b0127`; the `draft-mtp` runs' own text `4c58122c048d` on both builds -- the two spec modes
+  differ by design, so each is compared against its own previous-build value, not against the other.)
+* `llama-batched-bench -npl 1,4,8 -npp 512 -ntg 128` (3 GPU `-sm tensor`): TG 137.50 / 395.24 / 597.08 vs
+  138.12 / 394.95 / 597.52 t/s (noise).
+* `scripts/gate-per-block-build.sh --changed-from 71aa6d779` **2/2** (`all` profile, 63 s: block 10 and the
+  0300 tip -- every other block's patch-id is unchanged).
+* `scripts/validate-set.sh` GREEN: strict 18/18, optional `0100`/`0101` alone and cumulative (trees
+  `ffb6c3239d` / `9a884993b6` / `820b327d23`), applied tree `d586e2a5fd`, Windows portability 512 files.
+* `scripts/check-gpu-faults.sh` clean over the whole session window.
+
+### Tooling/findings along the way (no delivery change)
+
+* The optional artifacts' READMEs had gone **one release stale**: r317 re-cut both (`0100` sha
+  `9ce3f440…`, `0101` sha `cd90c002…`) without adding a bullet, so the file still claimed the r316 cut.  This
+  release records both the r317 and the r318 re-cut (r318 amends block 10, which neither artifact edits; only
+  the exported commit id moved).
+* The prefill arm of the new gate initially compared two copies of the **prompt echo**: a 5256-token prompt
+  against `-c 4096` makes `llama-cli` abort and echo the prompt, which looks like a byte-identical pass.  The
+  gate now fails an arm that exits non-zero or logs `exceeds the available context size`, and truncates the
+  prose prompt to fit (`PREFILL_CHARS`, `PREFILL_CTX`).  Worth remembering for any text gate.
+
 ## 261119.001 (r317, RELEASE v17-4f9dfa0e3-r317) -- GitHub issue #294 CLOSED: every fused MoE launch resolves the expert cache, so a take-over's skipped `input_cpy` is never read (blocks 09 + 10)
 
 **Release:** `v17-4f9dfa0e3-r317`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip

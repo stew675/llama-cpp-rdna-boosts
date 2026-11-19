@@ -8,8 +8,20 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `caee1ff2b7a4799ba0f2de9259b71959053be943c695bf57c9c7a96b9fb3d152` (the r316 cut -- every re-cut moves the exported commit
+  `d347cb7248e62998d77be649eca6fc6b05c2a45f69b57b22a8c1529093606807` (the r318 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
+* **r318 re-cut verification**: applies strictly at the r318 default tree
+  `d586e2a5fdfda303ea8363dfac20ca72784bf90a` (sha256
+  `d347cb7248e62998d77be649eca6fc6b05c2a45f69b57b22a8c1529093606807`), producing tree `9a884993b61dbacebac025fa772ff1c1764088b7`; with the other
+  optional artifact on top, the cumulative tree is `820b327d2310a3d0f105d66de0e9767199bed7ff`.  r318 amends **block 10**
+  (`ggml-cuda-try-fuse.cu`: the Q8_1 MUL fusion now counts readers through views, issue #331), a file this
+  artifact owns no hunk of, so only the exported commit id moved and `validate-set.sh` check 8 verifies all
+  three trees on every run.
+* **r317 re-cut verification**: applies strictly at the r317 default tree
+  `7d6b3f11062aa16922f6680af0c336973f847d1b`, producing tree `818626942ed29d2d691ee1da8096e713a2d750c8`; cumulative with the other
+  optional artifact, numeric order, is `8ebf851d99874fc9992a212c775160ec16f4ee6f`.  Recorded here for the
+  first time: r317 re-cut both artifacts (blocks 09/10 amendments) but wrote no bullet, so this file still
+  claimed the r316 cut for one release.
 * **r316 re-cut verification**: applies strictly at the r316 default tree
   `4119a6f862cff0f3b8840be51426e1a3028d8a71` (sha256
   `caee1ff2b7a4799ba0f2de9259b71959053be943c695bf57c9c7a96b9fb3d152`), producing tree `003b6e09395c770fb5902e273ae9bad4f55fdf76`; with `0100` on top, the cumulative

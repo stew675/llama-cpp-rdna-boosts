@@ -1003,3 +1003,48 @@ variable and no default changed.
    filled there -- which is why the shipped form uses the per-table `MIXED`-aware query and repairs instead.
 
 Record: `WORKLOG.md` 261119.001, `patches/README.md` blocks 09/10, `MANIFESTS.md` gates 09/10, issue #294.
+
+## r318 (2026-11-19, `WORKLOG.md` 261119.002) — a fusion that replaces a node's output has to count readers THROUGH VIEWS, and a LoRA is such a reader
+
+**Changed.**  Official block 10 only (GitHub issue #331): `ggml_cuda_find_mul_q8_1_matmul()` counts with the
+view-aware `ggml_cuda_count_uses()` and expects `1` (the matmul reads the MUL directly) or `2` (a no-op reshape
+plus the matmul through it).  `GGML_CUDA_FUSE_TRACE=1` gains `FUSE_TRACE MUL_Q8_1 DECLINE ne=… readers=…
+want=…`.  No kernel changed, no default moved, no new environment variable.
+
+1. **The Q8_1 MUL fusion writes only the matmul's Q8_1 blocks; the F32 MUL buffer is never written.**  So its
+   guard is a *reader* count, and the count must be the view-aware one: the matmul reads a `RESHAPE` of the MUL
+   (mmvq wants a 2-D activation), so a direct-only count cannot see anything else that reaches the MUL through
+   that reshape.  `ggml_cuda_count_uses()` (the helper the neighboring matchers already use) counts `src == t`
+   *and* `src->view_src == t`; the LoRA-free graph therefore reads exactly 2 in the reshape form and 1 in the
+   direct form, which is what makes the fix free for every existing arm.
+2. **`build_lora_mm()` appends a `MUL_MAT` on the same activation, so every LoRA on a projection whose input is
+   that MUL was silently dropped.**  The chain is `sigmoid(z) -> MUL(norm, ·) -> RESHAPE -> MUL_MAT(ssm_out)` in
+   a GDN layer, and `silu(gate) * up -> MUL_MAT(ffn_down)` on a model that builds the GLU as UNARY+MUL; the
+   adapter loads, `/lora-adapters` reports the scale, and the model behaves as if it were absent.  Measured on
+   the reported shape (Qwen3.8-27B `UD-Q4_K_XL`, 1 GPU, seed 42, temp 0, 64 tokens, the published
+   `abliteration-lora.gguf`): fused `f3e8501e7b38`, `GGML_CUDA_DISABLE_FUSION=1` `f7026ffb399a`, without the
+   adapter `b7c2006e41dc` -- i.e. the fused LoRA arm was not the unfused one.  After the fix the fused LoRA arm
+   reads `f7026ffb399a`, byte for byte with the unfused chain.
+3. **A GLU node is NOT exposed to this bug, which is why only one of the reporter's three modules moved.**
+   `ggml_cuda_glu_q8_1_mark()`'s launcher writes the F32 GLU *and* the Q8_1 blocks, and the prefill
+   `GGML_CUDA_FUSE_SWIGLU_MMQ` arm requires `nodes[i+1]->src[1] == node` (a direct reader), so the graph's own
+   use count catches the adapter's second reader and the fusion declines by itself.  The census agrees: the
+   declines are all at the ssm_out activation (`ne=4096` on the 4B, `6144`/`12288`/`24576`/`258048` on the 27B)
+   with `readers=2 want=1` (direct) and `readers=3 want=2` (through the reshape).
+4. **The count is inert for a LoRA-free graph, and that is checkable rather than assumed.**  Five no-LoRA
+   coherence arms are byte-identical to r317 (4B 1 GPU and 3 GPU `-sm tensor` `7e6229b260f6`, 27B 1 GPU and
+   3 GPU `-sm layer` `1acb04bd9104`, 35B-A3B `-ncmoe 34` `461ca8cd0e88`), the same arms with
+   `GGML_CUDA_FUSE_TRACE=1` log **zero** `MUL_Q8_1 DECLINE` lines, prefill KLD is `0.000000 / 100.000 %`,
+   `gate-fusion-alias-copy.sh` keeps its anchor `3fab4da87774`, MTP acceptance on 35B-A3B 3 GPU `-sm tensor`
+   is identical to five decimals (0.76374, 695/910, mean len 3.29) and `llama-batched-bench -npl 1,4,8` is
+   flat.  A reader count that changed a LoRA-free decision would move one of those.
+5. **The test adapter is synthetic on purpose.**  A published LoRA exists for exactly one model, so a gate
+   using one could not run on the models this box validates: `scripts/make-test-lora.py` reads the model's own
+   tensor shapes and writes rank-2 `lora_a`/`lora_b` for the requested projections from a fixed seed
+   (`adapter.lora.alpha = 0`, i.e. scale = the adapter scale, like the published file).  Two traps are in that
+   script and cost a load failure each: gguf-py writes a numpy shape **reversed** into the ggml dims (so
+   `ne0 = in` is a `(rank, in)` array), and an adapter that carries `blk.<block_count-1>…` is refused with
+   "does not exist in base model" because the appended nextn/MTP block is not addressable by name.
+
+Record: `WORKLOG.md` 261119.002, `MANIFESTS.md` gate 1b + the block-10 row, `patches/README.md` block 10,
+`ENVIRONMENT.md` `GGML_CUDA_FUSE_TRACE`, `scripts/gate-lora-fusion.sh`, `scripts/make-test-lora.py`, issue #331.

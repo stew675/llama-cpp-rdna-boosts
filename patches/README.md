@@ -1,5 +1,24 @@
 # The delivery patches — what each block is and what it does
 
+> **r318: the Q8_1 MUL fusion counts readers THROUGH VIEWS, so a LoRA's delta is not dropped (GitHub issue #331, `Nyshone`), an amendment to block 10.**
+> `ggml_cuda_find_mul_q8_1_matmul()` guards the `UNARY(silu/sigmoid/softplus) -> MUL -> MUL_MAT` decode fusion by
+> requiring the MUL to have exactly one consumer, because the fused kernel writes only the matmul's Q8_1 activation
+> and never the F32 tensor the MUL was declared to produce.  It counted **direct** `src == mul` readers only, so a
+> reader that reaches the MUL through a **reshape** -- which the matmul itself does, since mmvq wants a 2-D
+> activation -- was invisible.  `build_lora_mm()` appends a LoRA `MUL_MAT` on the same activation, so a LoRA on
+> `ssm_out` (its input is the GDN `norm * silu(z)` MUL) computed its delta from a buffer nobody wrote: the adapter
+> loaded, `/lora-adapters` reported the scale, and the model behaved as if it were absent -- exactly the report
+> ("silently ignored unless `GGML_CUDA_DISABLE_FUSION=1`").  The count is now the view-aware
+> `ggml_cuda_count_uses()` (the helper the neighbouring matchers already use), with the expected value `1` for the
+> direct chain and `2` for the reshape chain, i.e. the fused chain must own **every** reader.  A LoRA-free graph
+> reads exactly that, so no LoRA-free decision moved (five coherence arms byte-identical to r317, and the new
+> `FUSE_TRACE MUL_Q8_1 DECLINE` census reads 0 declines without an adapter); a LoRA graph reads more and the fusion
+> stands down onto the unfused chain, which writes the F32 activation and lets the matmul quantize it.  Reported by
+> @Nyshone with the guard analysis and a one-hunk patch; the shipped form is the shared helper plus the census line.
+> Gate: `scripts/gate-lora-fusion.sh` (release gate 1b, MANIFESTS.md gate 10 row), `scripts/make-test-lora.py` (a
+> deterministic synthetic adapter, so the gate needs no published LoRA).  Record: `WORKLOG.md` 261119.002,
+> `INVARIANTS.md` r318, `ENVIRONMENT.md` `GGML_CUDA_FUSE_TRACE`.
+>
 > **r313: the Q8_0 hyper-connection mixer runs the BF16 mixer's launch count (contributor PR #326, `briansp2020`), an amendment to block 11.**
 > The fused Q8_0 `GGML_OP_HC_MIX` -- the op **every unsloth UD qwen4exp file** takes, because a BF16-hc model takes
 > `hc_mix_bf16_*` instead -- went from ~8 launches per hc site to 3-4: persistent `down_dots` counters

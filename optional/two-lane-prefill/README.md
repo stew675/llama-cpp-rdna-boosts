@@ -1,8 +1,9 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r307`** (against the r307
-default delivery tree `f91aa81202fd32d060f9afb0f9c54824116758b9` = official blocks `0000`-`0016` plus the
-temporary `0300`; the r288 re-cut is at the bottom of the list, against the r288 default delivery tree
+**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r318`** (against the r318
+default delivery tree `d586e2a5fdfda303ea8363dfac20ca72784bf90a` = official blocks `0000`-`0016` plus the
+temporary `0300`; the r307 cut is at the bottom of the list, against the r307 default delivery tree
+`f91aa81202fd32d060f9afb0f9c54824116758b9`; the r288 re-cut is at the bottom of the list, against the r288 default delivery tree
 `79d18f41b9ab9b235d35fd3a5034858eddd94844` = official blocks `0000`-`0015` plus the
 temporary `0300`; the r259, r254, r247, r246, r243, r241 and r229 cuts and their measurements are kept below
 as the dated record).  The r288 re-cut is **mechanical**: the r285 patch applied STRICTLY on the r288 default
@@ -21,8 +22,20 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `5ebab36f7f51f100eb7181498a2240325faeada169d1632ac87f61d4c565cd3a` (the r316 cut -- every re-cut moves the exported commit
+  `eb19211a0f3cbdf3bf6bb332d1d3fa389b64c17c8ff7ae1684e5cad6ad0cc911` (the r318 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
+* **r318 re-cut verification**: applies strictly at the r318 default tree
+  `d586e2a5fdfda303ea8363dfac20ca72784bf90a` (sha256
+  `eb19211a0f3cbdf3bf6bb332d1d3fa389b64c17c8ff7ae1684e5cad6ad0cc911`), producing tree `ffb6c3239df6098f1f9315fc472273a062d3aa94`; with the other
+  optional artifact on top, the cumulative tree is `820b327d2310a3d0f105d66de0e9767199bed7ff`.  r318 amends **block 10**
+  (`ggml-cuda-try-fuse.cu`: the Q8_1 MUL fusion now counts readers through views, issue #331), a file this
+  artifact owns no hunk of, so only the exported commit id moved and `validate-set.sh` check 8 verifies all
+  three trees on every run.
+* **r317 re-cut verification**: applies strictly at the r317 default tree
+  `7d6b3f11062aa16922f6680af0c336973f847d1b`, producing tree `a7ce03f62b2a87d149bbdc82760005916a2c2934`; cumulative with the other
+  optional artifact, numeric order, is `8ebf851d99874fc9992a212c775160ec16f4ee6f`.  Recorded here for the
+  first time: r317 re-cut both artifacts (blocks 09/10 amendments) but wrote no bullet, so this file still
+  claimed the r316 cut for one release.
 * **r316 re-cut verification**: applies strictly at the r316 default tree
   `4119a6f862cff0f3b8840be51426e1a3028d8a71` (sha256
   `5ebab36f7f51f100eb7181498a2240325faeada169d1632ac87f61d4c565cd3a`), producing tree `d0cf0c723b1389dea7854f04ddd126a84d4f92cf`; with `0101` on top, the cumulative

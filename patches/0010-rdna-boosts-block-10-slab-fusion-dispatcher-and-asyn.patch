@@ -1,4 +1,4 @@
-From d0980515a10ddd3869d5c8db53c99017b2d53d36 Mon Sep 17 00:00:00 2001
+From 889050fa496cf437645004cf7926edaa2dacbde3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/17] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -150,7 +150,7 @@ projection type ran each step as its own launch.  Extended, one switch per piece
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |  283 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |   27 +
  ggml/src/ggml-cuda/ggml-cuda-slab.cu          | 1847 +++++
- ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 3382 +++++++++
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 3400 +++++++++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cuh     |   43 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   60 +
  ggml/src/ggml-cuda/ggml-cuda.cu               | 6315 ++++++-----------
@@ -201,7 +201,7 @@ projection type ran each step as its own launch.  Extended, one switch per piece
  tests/test-fusion-gate-beta-multiseq.cpp      |  321 +
  tests/test-logits-width-probe.cpp             |   44 +-
  tools/server/server-context.cpp               |   30 +-
- 87 files changed, 17325 insertions(+), 5564 deletions(-)
+ 87 files changed, 17343 insertions(+), 5564 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -7565,10 +7565,10 @@ index 000000000..bab71d893
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 new file mode 100644
-index 000000000..b0d46d910
+index 000000000..4f220425f
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -0,0 +1,3382 @@
+@@ -0,0 +1,3400 @@
 +// CUDA graph fusion dispatcher: the delivery's matchers and the one-line-per-concern try-fuse
 +// arms.  Split out of ggml-cuda.cu so an upstream change to the shared graph/evaluate path
 +// collides with the single ggml_cuda_try_fuse() call, not with every arm body.
@@ -7799,6 +7799,24 @@ index 000000000..b0d46d910
 +    return true;
 +}
 +
++static int ggml_cuda_count_uses(const ggml_cgraph * cgraph, const ggml_tensor * t);
++
++// GGML_CUDA_FUSE_TRACE=1 (presence-only): one line per process per (elements, readers) whose Q8_1 MUL fusion was
++// declined because the MUL has more readers than the fused chain accounts for (issue #331 -- a LoRA matmul reading
++// the same activation through a view).
++static void mul_q8_1_trace_decline(const ggml_tensor * mul, int uses, int want) {
++    static const bool on = getenv("GGML_CUDA_FUSE_TRACE") != nullptr;
++    if (!on) {
++        return;
++    }
++    static std::map<std::string, int> seen;
++    const std::string k = std::to_string((long long) ggml_nelements(mul)) + "/" + std::to_string(uses) + "/" + std::to_string(want);
++    if (seen.emplace(k, 1).second) {
++        GGML_LOG_WARN("FUSE_TRACE MUL_Q8_1 DECLINE ne=%lld readers=%d want=%d\n",
++                (long long) ggml_nelements(mul), uses, want);
++    }
++}
++
 +// If the MUL output feeds a single mmvq matmul (directly or via a no-op
 +// reshape at the next node), return that matmul; otherwise return nullptr.
 +static const ggml_tensor * ggml_cuda_find_mul_q8_1_matmul(const ggml_cgraph * cgraph,
@@ -7818,17 +7836,17 @@ index 000000000..b0d46d910
 +        return nullptr;
 +    }
 +
-+    // The MUL output must have exactly one consumer (the matmul or its view).
-+    int uses = 0;
-+    for (int j = 0; j < n; ++j) {
-+        const ggml_tensor * t = cgraph->nodes[j];
-+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
-+            if (t->src[s] == mul) {
-+                uses++;
-+            }
-+        }
-+    }
-+    if (uses != 1) {
++    // The MUL output must have exactly the readers the fused chain accounts for: the matmul itself when it reads
++    // the MUL directly, or the no-op reshape plus the matmul when it reads a view of it.  Count readers THROUGH
++    // VIEWS (ggml_cuda_count_uses), not just direct `src` pointers: the fused kernel writes only the Q8_1 activation
++    // and never the F32 output, so any other reader of the MUL -- or of a reshape of it, e.g. the LoRA A matmul
++    // llama_graph_apply_lora appends for a down/out projection -- would read an F32 buffer nobody wrote (issue #331).
++    // A LoRA-free graph reads exactly `want` (it did before this check: the reshape counts directly and the matmul
++    // through it), so the fusion still fires there.
++    const int want = n1 == mm ? 1 : 2;
++    const int uses = ggml_cuda_count_uses(cgraph, mul);
++    if (uses != want) {
++        mul_q8_1_trace_decline(mul, uses, want);
 +        return nullptr;
 +    }
 +

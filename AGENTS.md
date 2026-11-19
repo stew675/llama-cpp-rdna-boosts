@@ -378,6 +378,7 @@ tier runs what); this table is the quick answer for a change in flight.
 | the narrow-row norm fusion (`norm-gated.cu`), its alloc-dep registration, or a new fusion that pre-dispatches a node | `scripts/gate-norm-rows-alias.sh` |
 | the hc base copy, `bf16_src1_cache_put()`, or the device `pool_stack` | `scripts/gate-hc-base-copy.sh` |
 | the fusion-window range check (`ggml_cuda_check_fusion_memory_ranges()`), a fusion's out-node set, or a host-expert scheduler copy | `scripts/gate-fusion-alias-copy.sh` |
+| a fusion's READER COUNT (`ggml_cuda_find_mul_q8_1_matmul`, `ggml_cuda_should_fuse_mul_q8_1`, `ggml_cuda_count_uses`) or anything that makes another node read a fused intermediate (a LoRA, a second consumer) | `scripts/gate-lora-fusion.sh` (MANIFESTS gate 1b: a synthetic adapter's delta must survive the fused chain, and a LoRA-free graph must keep every fusion decision) |
 | a fused-op PROBE (`resolve_fused_ops()`), a `cparams.auto_*` / `fused_*` enable decision, or a probe descriptor | `scripts/gate-fused-probe-splits.sh` (a probe that cannot verify an op must disable it and must SAY how it verified, so a bare `enabled` fails; `splits` bounded by the LAYOUT, never text -- `--fixture-only` is the cheap class-wide arm) |
 | a grid-stall pad call site, or `ggml_cuda_grid_stall_pad()` itself | `scripts/gate-grid-stall-pad.sh` |
 | the MTP draft KV window (block 14 Goal C) | `scripts/gate-spec-draft-window.sh` |
