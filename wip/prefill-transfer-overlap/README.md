@@ -4,6 +4,12 @@
 implemented, nothing in `patches/`.**
 Opened 2026-11-18 by the maintainer's instruction ("create the campaign").
 
+**Pass 2 (same night) measured the window: 57-71 % of a shallow-arena prefill's wall is the gather kernel, and
+0 % at full residency** (`RESULTS-2026-11-18.md`, §Pass 2).  The gather is **link-bound** (36-42 GB/s of this
+box's own 28.7 GB/s calibrated H2D figure, and its per-call cost is nearly width-independent), which is the
+property a co-scheduled decode step needs.  Instrument: `probe-gather-timer.patch`, applied to a scratch build
+dir and **reverted from the tree**; `build-probe` is its binary.
+
 **Pass 1 re-scoped the mechanism, not the goal.**  On a partial-residency arena a host-expert prefill spends
 up to **~50 % of its wall** on host-tier work (42 % residency: 2415 t/s against 5409 t/s for the same model at
 100 %), but the carrier is **no longer an asynchronous H2D copy with the SMs idle** — the delivery's device
@@ -288,4 +294,4 @@ promotion time, per `AGENTS.md`.
 | [`RESULTS-2026-11-18.md`](RESULTS-2026-11-18.md) | **pass 1**: the ten-arm table, the four findings (the tier is free at 100 % residency; a partial arena costs ~56 %; the gather is 2.12x over staging and is the carrier now; the staging path is not a baseline), and the `G0`/`G1`/`G2` test that decides mechanism (D) |
 | `runs/arm.sh`, `runs/summ.sh` | the arm runner and the log re-parser (one summary line per arm, `F` from the delivery's own calibrated 28.7 GB/s H2D figure) |
 | `runs/*.log`, `runs/summary.tsv` | every raw log + the machine-readable table |
-| *(to come)* `probe-prefill-overlap.patch` | the `MOE_PROBE_PF_OVERLAP` decomposition (per-call timers around the gather launch, the consuming op and the fill sites) — **not shipped**; only needed for the `G1` attribution, not for `G0` |
+| [`probe-gather-timer.patch`](probe-gather-timer.patch) | the temporary `MOE_PROBE_PF_OVERLAP` instrument: an event pair around `ggml_backend_cuda_moe_cache_gather()` on the compute stream, folded with one sync per 64 calls, printing the cumulative gather wall.  Applied with `git apply`, built in `build-probe`, **reverted from the tree afterwards**.  Never shipped |

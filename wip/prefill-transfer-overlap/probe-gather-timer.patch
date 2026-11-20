@@ -1,0 +1,77 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+index 2fe0655d1..aa7d8478b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+@@ -283,9 +283,72 @@ int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend) {
+     return moe_cache_max_tok_dev(cuda_ctx->device);
+ }
+ 
++
++// ---------------------------------------------------------------------------------------------------
++// WIP PROBE -- prefill-transfer-overlap campaign (wip/prefill-transfer-overlap/ in the delivery repo).
++// NEVER SHIPPED.  `MOE_PROBE_PF_OVERLAP=1` times the DEVICE GATHER on the compute stream, which is what
++// moves a pool-backed host-expert table's bytes during a prefill since `GGML_SCHED_DEVGATHER` (measured
++// 2.12x over the staging path).  It exists to answer one question the cache's census cannot: how much of
++// a partial-residency prefill's wall is the gather kernel -- i.e. how much a co-scheduled decode step
++// could attack.  Event pairs are folded with one stream synchronize per 64 calls, so the total is
++// accurate to within 64 gathers and the perturbation is one sync per 64.
++static const bool g_pf_probe = [] {
++    const char * e = getenv("MOE_PROBE_PF_OVERLAP");
++    return e != nullptr && e[0] != '\0' && atoi(e) != 0;
++}();
++
++struct pf_probe_ring {
++    static const int CAP = 64;
++    hipEvent_t ev0[CAP] = {};
++    hipEvent_t ev1[CAP] = {};
++    int        n     = 0;
++    long long  calls = 0;
++    double     ms    = 0.0;
++
++    void begin(hipStream_t st) {
++        if (n >= CAP) {
++            drain(st);
++        }
++        if (ev0[0] == nullptr) {
++            for (int i = 0; i < CAP; ++i) {
++                (void) hipEventCreate(&ev0[i]);
++                (void) hipEventCreate(&ev1[i]);
++            }
++        }
++        (void) hipEventRecord(ev0[n], st);
++    }
++    void end(hipStream_t st) {
++        (void) hipEventRecord(ev1[n], st);
++        n++;
++    }
++    void drain(hipStream_t st) {
++        if (n == 0) {
++            return;
++        }
++        (void) hipStreamSynchronize(st);
++        for (int i = 0; i < n; ++i) {
++            float v = 0.0f;
++            (void) hipEventElapsedTime(&v, ev0[i], ev1[i]);
++            ms += v;
++        }
++        calls += n;
++        n = 0;
++        fprintf(stderr, "MOE_PROBE_PF_OVERLAP: gather calls=%lld wall=%.1f ms (%.3f ms/call)\n",
++                calls, ms, calls > 0 ? ms / (double) calls : 0.0);
++    }
++};
++static pf_probe_ring g_pf_ring;
++// ---------------------------------------------------------------------------------------------------
++
+ bool ggml_backend_cuda_moe_cache_gather(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, size_t slice_off, int split_axis) {
+     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_cuda_set_device(ctx->device);   // issue #294: the scheduler leaves another split's device current
++    if (g_pf_probe) {
++        g_pf_ring.begin((hipStream_t) ctx->stream());
++        const bool ok = moe_cache_gather_host(weight, weight_cpy, ids, ctx->stream(), ctx->device, slice_off, split_axis);
++        g_pf_ring.end((hipStream_t) ctx->stream());
++        return ok;
++    }
+     return moe_cache_gather_host(weight, weight_cpy, ids, ctx->stream(), ctx->device, slice_off, split_axis);
+ }
+ 
