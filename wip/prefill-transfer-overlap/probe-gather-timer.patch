@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-index 2fe0655d1..db59bd097 100644
+index 2fe0655d1..d0af39c1a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-@@ -283,9 +283,115 @@ int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend) {
+@@ -283,9 +283,130 @@ int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend) {
      return moe_cache_max_tok_dev(cuda_ctx->device);
  }
  
@@ -48,6 +48,7 @@ index 2fe0655d1..db59bd097 100644
 +    float *     burn_out    = nullptr;
 +    int        n     = 0;
 +    long long  calls = 0;
++    long long  burn_launches = 0;
 +    double     ms    = 0.0;
 +    double     burn_ms = 0.0;
 +
@@ -69,9 +70,23 @@ index 2fe0655d1..db59bd097 100644
 +            }
 +        }
 +        if (burn_stream != nullptr) {
-+            (void) hipEventRecord(bv0[n], burn_stream);
-+            pf_burn_kernel<<<64, 256, 0, burn_stream>>>(burn_out, 2000000, 0.25f);
-+            (void) hipEventRecord(bv1[n], burn_stream);
++            // mode 3 (the BUDGET sweep): launch the decode-shaped workload only once every `every` gathers and
++            // with a tunable size, so the prefill's own cost curve against the co-scheduled work can be read.
++            // mode 2 launches one per gather at the default size (the headroom proof of pass 4).
++            static const int burn_iters = [] {
++                const char * e = getenv("MOE_PROBE_BURN_ITERS");
++                return e != nullptr && e[0] != '\0' ? atoi(e) : 2000000;
++            }();
++            static const int burn_every = [] {
++                const char * e = getenv("MOE_PROBE_BURN_EVERY");
++                return e != nullptr && e[0] != '\0' && atoi(e) > 0 ? atoi(e) : 1;
++            }();
++            if ((calls + n) % burn_every == 0) {
++                (void) hipEventRecord(bv0[n], burn_stream);
++                pf_burn_kernel<<<64, 256, 0, burn_stream>>>(burn_out, burn_iters, 0.25f);
++                (void) hipEventRecord(bv1[n], burn_stream);
++                burn_launches++;
++            }
 +        }
 +        (void) hipEventRecord(ev0[n], st);
 +    }
@@ -97,9 +112,9 @@ index 2fe0655d1..db59bd097 100644
 +        calls += n;
 +        n = 0;
 +        fprintf(stderr, "MOE_PROBE_PF_OVERLAP: gather calls=%lld wall=%.1f ms (%.3f ms/call)"
-+                        " burn=%.1f ms (%.3f ms/call) overlap=%.2f\n",
++                        " burn=%.1f ms (%.3f ms/call) launches=%lld overlap=%.2f\n",
 +                calls, ms, calls > 0 ? ms / (double) calls : 0.0,
-+                burn_ms, calls > 0 ? burn_ms / (double) calls : 0.0,
++                burn_ms, calls > 0 ? burn_ms / (double) calls : 0.0, burn_launches,
 +                (burn_ms > 0.0 && ms > 0.0) ? (burn_ms + ms) / fmax(ms, burn_ms) : 0.0);
 +    }
 +};

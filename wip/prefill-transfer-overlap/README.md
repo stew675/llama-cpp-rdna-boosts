@@ -4,6 +4,16 @@
 implemented, nothing in `patches/`.**
 Opened 2026-11-18 by the maintainer's instruction ("create the campaign").
 
+**Pass 5 (same night) stated the target numerically and quantified the budget.**  Smoothness A/B on the shallow
+arena (`arms/smooth.py`, `arms/smooth-2026-11-18.tsv`): with the duty cycle **off** the prefill keeps **3552
+t/s** but the decoder gets **one token per prefill step — ITL p50/p95 525/568 ms**; with it **on** the decoder's
+p50 becomes **13.5 ms** and it gets 13x the tokens, but its **p95 is still 519 ms** and the **prefill pays 30 %**
+(2544 t/s).  Neither gives both, and the target is therefore **~3550 t/s of prefill AND an ITL p95 in the tens
+of ms**.  Work budget for the window (probe mode 3): ~two-thirds of co-scheduled work is absorbed, one-third
+charged — **~1.15 s of free SM compute in a 2.03 s prefill, ~75 decode steps at this shape's 15 ms token**.
+Both objectives — throughput and smoothness — are reachable *if* the window is used; the missing piece is a
+place to submit the decode from (§10.1).
+
 **Pass 4 (same night) proved the headroom, and its ceiling.**  A compute-bound kernel co-scheduled with the
 gather leaves the gather **−1.2 %** (2.436 vs 2.466 ms/call) while stretching the prefill 4.3x — so the gather's
 window is genuinely free, but *only* that window: the prefill's compute phases are compute-bound, so an
