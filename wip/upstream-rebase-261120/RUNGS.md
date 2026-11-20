@@ -32,7 +32,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 
 | rung | blk | source commit | conflicts | decisions | status |
 |---|---|---|---|---|---|
-| R00 | 00 | `de99fa2d0` | 4 (7 regions) | D1 (take upstream's), D2 (carry) | **DONE 2026-11-20** — `4cba0ad32`, tree `a3824ea0e`; coherence `1c5d32ac537d`; MUL_MAT_ID 1078/0 (16 dup); one known-red (upstream's qwen4exp indexer top-k, fixed by block 10 at R10) |
+| R00 | 00 | `de99fa2d0` | 4 (7 regions) | D1 (take upstream's), D2 (carry), **fix placement (A/B/C) — asked** | **DONE 2026-11-20** — `4cba0ad32`, tree `a3824ea0e`; coherence `1c5d32ac537d`; MUL_MAT_ID 1078/0 (16 dup); one known-red: the VMM pool refuses upstream's strided 2-D indexer top-k copy (base+revert-only reproduces it, so **not** block 00) |
 | R01 | 01 | `a94e2214c` | 0 | — | **DONE 2026-11-20** — `14a0414bb`, tree `6566ca3ac`; one rung repair (HIP's 64-bit warp mask); 3-device tensor text `1c5d32ac537d` == R00; pipeline census 3 GPUs |
 | R02 | 02 | `cef19b032` | 5 | D5 | not started |
 | R03 | 03 | `36da15029` | 1 | — | not started |
@@ -107,10 +107,10 @@ R00 build runs the 4B arm at 242/90.7 t/s with VMM **OFF**.  `ggml_cuda_pool_vmm
 revert, and *not* the delivery's later pool work (`g_pool_mapped`, `ggml_cuda_pool_trace*`), which belongs to
 blocks 09/15 and is therefore absent at this rung as expected.
 
-## R00.6 Known-red: upstream's qwen4exp indexer top-k (fixed by block 10 at R10)
+## R00.6 Known-red: upstream's qwen4exp indexer top-k, under the delivery's REQUIRED VMM pool
 
 **Symptom.** `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S` (2 devices, `-sm tensor`, no `-ncmoe`, `-c 8192 -ub 1024`)
-aborts after prefill starts:
+aborts once prefill starts:
 
 ```
 ROCm error: invalid argument
@@ -118,31 +118,46 @@ ROCm error: invalid argument
   hipMemcpy2DAsync(dst, k * sizeof(int), tmp, ncols * sizeof(int), k * sizeof(int), iter_nrows, ...)
 ```
 
-**It is not this re-base, and it is not the 512 kernel.**  Measured today:
+**It is NOT block 00, and block 00 touches nothing here** (`git show 4cba0ad32 --stat` matches no
+qwen4exp / indexer / top-k / kpool file).  The decisive measurement is a build of the **pristine base with
+nothing but the `#30542` revert** — no delivery code at all — which aborts identically:
 
-| arm | result |
-|---|---|
-| pristine base (`build-base-novmm`, VMM **ON**) | prefill **1594.3 t/s**, no crash |
-| R00 (VMM **OFF**) | **abort**, any placement (`-sm tensor`, `-sm layer`, `GGML_GLU_INPLACE=0`, `GGML_CUDA_DISABLE_MMID_512=1` all identical) |
-| R00 rebuilt with `GGML_HIP_NO_VMM=ON` (`build-r00-novmm`) | prefill **1683.2 t/s**, no crash |
-| r327 (`build-rocm/bin-r327`) | prefill **2101.1 t/s**, no crash |
-| instrumented R00 | the failing call is the **qwen4exp lightning-indexer** `ggml_top_k`: `ncols=576 nrows=1024 k=512`, `err_after_sort=no error` → the **2-D copy** is refused, not the argsort; the equal-pitch call (`ncols=k=320`) just before it succeeds.  Under VMM=ON the same op runs with `n_pool=832`, so the *pool size* selects the shape that trips it |
+| build | delivery code | VMM pool | result |
+|---|---|---|---|
+| `build-base-novmm` (pristine base, `GGML_HIP_NO_VMM=ON`) | none | **no** | prefill **1594.3 t/s** |
+| `build-revert-only` (pristine base + **only** the `#30542` revert) | **none** | yes | **ABORT** `top_k_argsort_cuda` |
+| `build-r00-novmm` (R00, `GGML_HIP_NO_VMM=ON`) | block 00 | no | prefill **1683.2 t/s** |
+| R00 (`build-rocm`) | block 00 | yes | **ABORT** |
+| r327 (`bin-r327`, all 18 blocks) | all | yes | prefill **2101.1 t/s** — because block 10 replaced the copy |
 
-**The delivery already owns this fix.**  Block **10** (`7bbf540d5`) replaced exactly this copy with a
-`top_k_gather_rows` kernel, and its comment names the same site and the same refusal:
+**So the trigger is the VMM pool, not the revert and not any delivery source change.**  The pool is the
+delivery's required configuration (the host-expert arena needs VMM; `#30542` only makes the pool *usable* on
+this box — without the revert the base hangs, which is why the no-revert arm cannot be measured).  The
+refused call is a **strided 2-D D2D copy with `spitch != dpitch`** into a VMM-backed destination; the
+equal-pitch call (`ncols == k = 320`) immediately before it succeeds, and the instrumented run shows
+`err_after_sort=no error`, i.e. the argsort kernel is fine and the copy alone is refused.  A standalone HIP
+repro of the pool's exact layout is **inconclusive** — the same geometry on a freshly built VMM pool
+succeeds, so the refusal needs something the live pool has and the synthetic one does not (mapping reuse /
+`hipMemSetAccess` history).  It is recorded as a ROCm-runtime question, not a delivery defect.
 
-> `cudaMemcpy2DAsync` is NOT usable for it: a padded 2-D copy into a graph tensor view fails with "invalid
-> argument" when the destination sits in the movable-boundary slab … Measured here on the dsv4 indexer's top-k
+**The delivery already fixed it, in block 10** (`7bbf540d5`): `top_k_gather_rows` replaces the 2-D copy, and
+its comment names the same site and the same refusal.  `ggml_cuda_cpy_as_memcpy_2d` in the CPY path is the
+same class and gets its own guard from the same area — so from R00 to R09 *any* mismatched-pitch 2-D copy into
+a pool-backed destination can be refused, and the indexer top-k is only the instance that fires on this model.
 
-So it is **red from R00 to R09 and must be re-verified at R10** (a Flash-Next prefill past ~500 tokens, the
-two-device `-sm tensor` arm above).  Nothing is patched at R00: re-fixing it here would duplicate block 10 and
-put the same hunk in two blocks.
+### Where the fix should live — for the maintainer (block-structure decision)
 
-**Consequence for the deferred A/B:** `mm_ids_helper_512_10` needs a Flash-Next prefill to measure its
-+4.5 %/+5.2 %, and that prefill is exactly what this rung cannot run.  The kernel's *correctness* is
-unverified by text too (the model cannot reach the decode step), so the A/B moves to **R10** with the
-known-red, not to a later re-base.  `test-backend-ops -o MUL_MAT_ID` does not cover the shape (its largest
-`n_mats` is 28), which is why 1078/1078 does not close it.
+`AGENTS.md` makes a cross-block move the maintainer's call.  The three shapes:
+
+| option | block 00 | block 10 | cost |
+|---|---|---|---|
+| **A — move the fix down** (recommended) | carries `top_k_gather_rows` + `top_k_gather_cuda`, used by `top_k_argsort_cuda` | keeps only its own slab/CPY guard; the gather is already in the tree | none: the code is written and measured, and it makes every rung from R00 verifiable on the field model |
+| **B — minimal fix in 00, deactivated in 10** | a `#define`-gated narrow fix (e.g. `nrows` 1-D copies when `spitch != dpitch`) | deletes that branch when it installs the gather kernel | a temporary switch to document in `ENVIRONMENT.md` and then remove, plus a delete-hunk in block 10 |
+| **C — leave known-red** | nothing | the fix | R00-R09 cannot run the field model; the `mm_ids_helper_512_10` A/B waits until R10 |
+
+**A and B have the same end state**; A gets there without a switch that exists only to be removed, and the
+kernel is *smaller* than the 1-D loop B implies.  Whichever is chosen, the **known-red must NOT be closed by
+patching top-k.cu twice**, and the `mm_ids_helper_512_10` A/B stays deferred until a Flash-Next prefill runs.
 
 ## R00.7 The rung's own trap: `GGML_CUDA_FA_QUANTS`
 
