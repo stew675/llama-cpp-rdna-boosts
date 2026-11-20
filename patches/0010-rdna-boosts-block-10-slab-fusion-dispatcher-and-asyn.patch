@@ -1,4 +1,4 @@
-From 1dbe36310d8360cfe45df93be3c6029152aabf2c Mon Sep 17 00:00:00 2001
+From 50a7dd79d85eb092ff80cce9338c486e3738a396 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/17] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -256,10 +256,10 @@ index 1f140fb40..5ad464fd8 100644
      // may be NULL and each cell's value is derived in the kernel as
      //     cell_pos[cell] >= tok_lo[token] && cell_pos[cell] <= tok_hi[token]  ->  0.0f, else -INF
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index 013df057d..cd7c8fb29 100644
+index 8e4390150..47c81979b 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
-@@ -951,7 +951,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
+@@ -982,7 +982,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
  }
  
  static bool ggml_gallocr_reserve_n_impl(
@@ -268,7 +268,7 @@ index 013df057d..cd7c8fb29 100644
      size_t min_hash_size = graph->n_nodes + graph->n_leafs;
      // add 25% margin to avoid hash collisions
      min_hash_size += min_hash_size / 4;
-@@ -1055,6 +1055,9 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -1086,6 +1086,9 @@ static bool ggml_gallocr_reserve_n_impl(
              }
          }
          if (realloc) {
@@ -278,7 +278,7 @@ index 013df057d..cd7c8fb29 100644
  #ifndef NDEBUG
              {
                  size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
-@@ -1064,10 +1067,15 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -1095,10 +1098,15 @@ static bool ggml_gallocr_reserve_n_impl(
                  }
              }
  #endif
@@ -296,7 +296,7 @@ index 013df057d..cd7c8fb29 100644
                  galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                  if (galloc->buffers[i] == NULL) {
                      GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
-@@ -1082,7 +1090,7 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -1113,7 +1121,7 @@ static bool ggml_gallocr_reserve_n_impl(
  
  void ggml_gallocr_reserve_n_size(
          ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * sizes) {
@@ -305,7 +305,7 @@ index 013df057d..cd7c8fb29 100644
      for (int i = 0; i < galloc->n_buffers; i++) {
          sizes[i] = 0;
          for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
-@@ -1091,8 +1099,18 @@ void ggml_gallocr_reserve_n_size(
+@@ -1122,8 +1130,18 @@ void ggml_gallocr_reserve_n_size(
      }
  }
  

@@ -1,6 +1,6 @@
-From 7d3f2c7265b8d88f5fef2d7203fbb2800b02e9f6 Mon Sep 17 00:00:00 2001
+From de99fa2d03632f49e19e5c088dd944e7f4fefc56 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
-Date: Wed, 21 Oct 2026 10:40:31 -0500
+Date: Thu, 19 Nov 2026 18:21:41 -0600
 Subject: [PATCH 00/17] rdna-boosts: block 00: foundation - band-uniformity,
  Meta-wrapper and allocator fixes
 
@@ -60,10 +60,30 @@ streams on 2x R9700); the dispatcher drops 454 -> 287 B.
 Rename-only -Wshadow sweeps are not carried as part of this block: they re-skin every
 re-base conflict in the files later blocks also touch and silence a warning class that is
 not an error (the llama target keeps -Wshadow enabled for new code).
+
+r323 amendment (contributor PR #334, item 1 of 3): ggml-alloc: a GLU may take the memory of its gate.
+GGML_OP_GLU joins ggml_op_can_inplace behind GGML_GLU_INPLACE (on unless 0), so an FFN's gate, up and GLU
+output are no longer all live at once.  The allocator's existing preconditions do the gating -- same layout
+(the two-input form; the one-input form halves ne[0] and never qualifies) and one reader with no views --
+and only the FIRST operand is ever offered: the streaming GLU kernels read both operands before writing, but
+CANN's gated GLU is a chain (aclnn Silu into dst, then aclnnInplaceMul(dst, src1)), which would square the
+destroyed up operand and lose the gate, so ggml_gallocr_allocate_node stops the scan at src[0] for this op.
+dst == src0 there is the in-place UNARY path every backend already runs.  Measured: 624.97 -> 475.37 MiB of
+ROCm0 compute buffer on Qwen3.8-27B UD-Q4_K_XL (1 GPU, -ub 2048) and +7.0 % greedy decode on the 35B-A3B
+host-expert shape (-ncmoe 40 --host-experts pool, 2 GPU -sm tensor, 121.7 -> 130.3 t/s over 3 pairs); dense
+27B MTP is neutral.  Text byte-identical on 4B/27B/35B-A3B/CPU arms and prefill logits bit-identical (mean KLD
+0.000000, same-top-p 100.000 %) at 1 device and at 3 devices -sm tensor.  tests/test-alloc.cpp gains
+test_glu_inplace: the gate is taken, the up never is, a second gate reader declines, and the split form never
+qualifies (negative-tested: GGML_GLU_INPLACE=0 fails it).  Gate: scripts/gate-glu-inplace.sh.
+scripts/gate-fusion-alias-copy.sh pins GGML_GLU_INPLACE=0 for its two trace arms, because the fused window's
+output now takes the gate's memory and can no longer land on the dead scheduler copy (the protection is still
+required wherever the rule does not apply, and the pinned arm proves it still declines).
+
+Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
 ---
  common/arg.cpp                                |  23 +-
  common/speculative.cpp                        |  10 +-
- ggml/src/ggml-alloc.c                         |  88 +++++
+ ggml/src/ggml-alloc.c                         | 121 ++++++-
  ggml/src/ggml-backend-meta.cpp                | 111 ++++++-
  ggml/src/ggml-cpu/llamafile/sgemm.cpp         |   8 +-
  ggml/src/ggml-cuda/fattn-common.cuh           |  10 +-
@@ -93,11 +113,12 @@ not an error (the llama target keeps -Wshadow enabled for new code).
  src/llama.cpp                                 |  40 ++-
  src/models/kimi-linear.cpp                    |   8 +-
  src/models/step35.cpp                         |  16 +-
+ tests/test-alloc.cpp                          |  64 ++++
  tools/cli/README.md                           |   2 +-
  tools/completion/README.md                    |   2 +-
  tools/llama-bench/llama-bench.cpp             |  10 +-
  tools/server/README.md                        |   2 +-
- 36 files changed, 1049 insertions(+), 357 deletions(-)
+ 37 files changed, 1145 insertions(+), 358 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index 6bf9355fb..34342f2fb 100644
@@ -155,10 +176,48 @@ index 63cb5e611..bb487f5ce 100644
  
          llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ is_mem_shared);
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index 65d2bea27..d59ea35eb 100644
+index 65d2bea27..d7933f00b 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
-@@ -488,6 +488,10 @@ struct ggml_gallocr {
+@@ -18,6 +18,27 @@
+ //#define AT_PRINTF(...) GGML_LOG_DEBUG(__VA_ARGS__)
+ #define AT_PRINTF(...)
+ 
++// GGML_GLU_INPLACE (on unless 0): a GLU may take the memory of its gate, so an FFN's gate, up and GLU output
++// are not all live at once.  The allocator's own preconditions do the gating -- the parent must have the same
++// layout (the two-input form: the one-input form halves ne[0] and never qualifies) and exactly one reader with
++// no views -- so the saving is the gate buffer itself: Qwen3.8-27B UD-Q4_K_XL, 1 GPU, -ub 2048, -fa 1, -c 16384:
++// 624.97 -> 475.37 MiB of compute buffer, and +7.1 % greedy decode on the 35B-A3B host-expert shape at
++// -ncmoe 40 --host-experts pool (see WORKLOG.md r323 and benchmarks/2026-11-19-glu-inplace.md).  The kernels
++// that write a GLU read the element at index i of BOTH operands before writing index i of the output, so
++// dst == src0 is safe on the CPU (ggml_vec_*glu_*, no restrict), CUDA/HIP (unary_gated_op_kernel), Metal
++// (kernel_*glu), Vulkan/SYCL/WebGPU/OpenCL (one element per invocation).  Only the GATE is ever taken (see
++// ggml_gallocr_allocate_node): a backend whose gated GLU is a chain would break on the up operand.
++// The switch exists for A/B and bisection; text and prefill logits are bit-identical with it on and off
++// (KLD 0.000000 / same-top-p 100.000 % on the canonical point).
++static bool ggml_glu_inplace(void) {
++    static int on = -1;
++    if (on < 0) {
++        const char * e = getenv("GGML_GLU_INPLACE");
++        on = e == NULL || atoi(e) != 0;
++    }
++    return on != 0;
++}
++
+ // ops that return true for this function must not use restrict pointers for their backend implementations
+ bool ggml_op_can_inplace(enum ggml_op op) {
+     switch (op) {
+@@ -42,6 +63,9 @@ bool ggml_op_can_inplace(enum ggml_op op) {
+         case GGML_OP_SOFT_MAX_BACK:
+             return true;
+ 
++        case GGML_OP_GLU:
++            return ggml_glu_inplace();
++
+         default:
+             return false;
+     }
+@@ -488,6 +512,10 @@ struct ggml_gallocr {
      struct node_alloc * node_allocs; // [n_nodes]
      int n_nodes;
  
@@ -169,7 +228,7 @@ index 65d2bea27..d59ea35eb 100644
      struct leaf_alloc * leaf_allocs; // [n_leafs]
      int n_leafs;
  };
-@@ -593,6 +597,42 @@ static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor
+@@ -593,6 +621,42 @@ static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor
          || ggml_gallocr_is_own(galloc, t); // tensor will be allocated by galloc
  }
  
@@ -212,7 +271,23 @@ index 65d2bea27..d59ea35eb 100644
  // free the extra space at the end if the new tensor is smaller
  static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_tensor * node, struct ggml_tensor * parent) {
      struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
-@@ -757,6 +797,41 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
+@@ -627,7 +691,14 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+ 
+         // try to reuse a parent's buffer (inplace)
+         if (ggml_op_can_inplace(node->op)) {
+-            for (int i = 0; i < GGML_MAX_SRC; i++) {
++            // GGML_OP_GLU may take only its FIRST operand (the gate).  The streaming GLU kernels read both
++            // operands before they write, so either would be safe there, but the gate and the up are symmetric
++            // in an FFN and a backend whose gated GLU is a chain must not see the up aliased: CANN runs
++            // `aclnn Silu` into dst and then `aclnnInplaceMul(dst, src1)`, which would multiply the destroyed
++            // up operand by itself and lose the gate.  dst == src0 there is the in-place UNARY path CANN
++            // already runs for GGML_OP_UNARY.  See ggml_glu_inplace() above.
++            const int n_src_inplace = node->op == GGML_OP_GLU ? 1 : GGML_MAX_SRC;
++            for (int i = 0; i < n_src_inplace; i++) {
+                 struct ggml_tensor * parent = node->src[i];
+                 if (parent == NULL) {
+                     continue;
+@@ -757,6 +828,41 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
          }
      }
  
@@ -254,7 +329,7 @@ index 65d2bea27..d59ea35eb 100644
      // allocate tensors
      for (int i = 0; i < graph->n_nodes; i++) {
          struct ggml_tensor * node = graph->nodes[i];
-@@ -844,6 +919,10 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -844,6 +950,10 @@ static bool ggml_gallocr_reserve_n_impl(
      // allocate in hash table
      ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
  
@@ -265,7 +340,7 @@ index 65d2bea27..d59ea35eb 100644
      // set the node_allocs from the hash table
      if (galloc->n_nodes < graph->n_nodes) {
          free(galloc->node_allocs);
-@@ -1018,6 +1097,15 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
+@@ -1018,6 +1128,15 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
          return true;
      }
  
@@ -2618,6 +2693,88 @@ index 5bed70163..179fb78ea 100644
          layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_v * n_head_l, n_embd}, mtp_flags);
  
          layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head_l}, TENSOR_NOT_REQUIRED);
+diff --git a/tests/test-alloc.cpp b/tests/test-alloc.cpp
+index 45d9a3eda..c148e2baa 100644
+--- a/tests/test-alloc.cpp
++++ b/tests/test-alloc.cpp
+@@ -677,6 +677,69 @@ static void test_graph_optimize_alloc_dep() {
+     GGML_ASSERT(!graph_reuses_allocation(true));
+ }
+ 
++// GGML_OP_GLU in place (r323): an FFN's gate, up and GLU output are not all live at once -- the GLU output takes
++// the GATE's memory when the gate has exactly one reader and no views, which is the whole of an FFN's saving
++// (Qwen3.8-27B at -ub 2048: 150 MiB of compute buffer).  Three properties matter and each has a way to be wrong:
++//   * the UP must never be taken (a backend whose gated GLU is a chain destroys it -- CANN's `aclnn Silu` into dst
++//     followed by `aclnnInplaceMul(dst, src1)` would square the up operand),
++//   * a second reader of the gate must decline,
++//   * the one-input (split) form halves ne[0], so it never has the same layout and never qualifies.
++// This is the only coverage of the rule: `test-backend-ops` cannot see a memory-layout decision, and a wrong
++// answer here is a silent one.  The GGML_GLU_INPLACE=0 arm is the shell gate's (scripts/gate-glu-inplace.sh).
++static void test_glu_inplace() {
++    {
++        // one reader each: the output takes the gate, not the up
++        dummy_backend backend      = dummy_backend_init(SIZE_MAX);
++        auto [ctx, graph, ctx_ptr] = make_context();
++
++        ggml_tensor * x[3];
++        x[0] = make_input_1d(ctx, 8);
++        x[1] = make_input_1d(ctx, 8);
++        x[2] = ggml_glu_split(ctx, x[0], x[1], GGML_GLU_OP_SWIGLU);
++        assign_names(ctx);
++
++        ggml_gallocr_ptr galloc = allocate_graph(graph, x[2], &backend.buffer_type);
++        check_all_allocated(graph);
++        check_no_overlap(graph);
++        GGML_ASSERT(x[2]->data == x[0]->data);
++        GGML_ASSERT(x[2]->data != x[1]->data);
++        GGML_ASSERT(backend.context->allocated_total() <= 2*32);   // gate + up; the output lives in the gate
++    }
++    {
++        // a second reader of the gate: the output is allocated on its own
++        dummy_backend backend      = dummy_backend_init(SIZE_MAX);
++        auto [ctx, graph, ctx_ptr] = make_context();
++
++        ggml_tensor * x[4];
++        x[0] = make_input_1d(ctx, 8);
++        x[1] = make_input_1d(ctx, 8);
++        x[2] = ggml_glu_split(ctx, x[0], x[1], GGML_GLU_OP_SWIGLU);
++        x[3] = ggml_add(ctx, x[0], x[2]);   // x0 now has two readers
++        assign_names(ctx);
++
++        ggml_gallocr_ptr galloc = allocate_graph(graph, x[3], &backend.buffer_type);
++        check_all_allocated(graph);
++        GGML_ASSERT(x[2]->data != x[0]->data);
++        GGML_ASSERT(x[2]->data != x[1]->data);
++        GGML_ASSERT(backend.context->allocated_total() > 2*32);     // the output is its own allocation
++    }
++    {
++        // the one-input form: ne[0] is halved, so the layouts differ and the gate is not reused
++        dummy_backend backend      = dummy_backend_init(SIZE_MAX);
++        auto [ctx, graph, ctx_ptr] = make_context();
++
++        ggml_tensor * x[2];
++        x[0] = make_input_1d(ctx, 16);
++        x[1] = ggml_glu(ctx, x[0], GGML_GLU_OP_SWIGLU, false);
++        assign_names(ctx);
++        GGML_ASSERT(x[1]->ne[0] == 8);
++
++        ggml_gallocr_ptr galloc = allocate_graph(graph, x[1], &backend.buffer_type);
++        check_all_allocated(graph);
++        GGML_ASSERT(x[1]->data != x[0]->data);
++    }
++}
++
+ // Check that the size reported by ggml_backend_alloc_ctx_tensors_from_buft_size
+ // matches the actual size of the buffer allocated for the ctx tensors
+ static ggml_backend_buffer_ptr check_size_matches(ggml_backend_buffer_type_t buft, ggml_context * ctx) {
+@@ -1121,6 +1184,7 @@ int main() {
+     run("test_buffer_size_zero", test_buffer_size_zero);
+     run("test_reallocation", test_reallocation);
+     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
++    run("test_glu_inplace", test_glu_inplace);
+     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
+     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
+     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);
 diff --git a/tools/cli/README.md b/tools/cli/README.md
 index 475becd2e..a6899275d 100644
 --- a/tools/cli/README.md

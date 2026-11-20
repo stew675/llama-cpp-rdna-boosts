@@ -1,3 +1,95 @@
+## 261119.007 (r323, RELEASE v17-4f9dfa0e3-r323) -- contributor PR #334 taken as item 1 only: an FFN's GLU may take the memory of its gate (-149.6 MiB of compute buffer, +7.0 % on the host-expert MoE decode); the PR's other two items are declined and asked for as separate PRs
+
+**Release:** `v17-4f9dfa0e3-r323`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `bdd7fc6ee`
+(the `apply-all.sh` re-cut, tree `4f94e92a0`), 17 official + 1 temporary = 18 default blocks, optional
+`0100` -> `705df1213` / `0101` -> `69cfea715` (cumulative `adf514489`).  **No block created, split or
+renumbered**: one same-block amendment, **block 00** (`ggml_op_can_inplace()` and the parent-reuse scan in
+`ggml/src/ggml-alloc.c`, plus `tests/test-alloc.cpp`).  One environment variable added (`GGML_GLU_INPLACE`,
+kill switch, default on), no kernel arithmetic touched, and **no token moved**.
+
+### The PR, and what was taken from it
+
+overdoingism's PR #334 is three unrelated changes, one commit each.  The maintainer's decision was to take
+**item 1 only** and to ask for items 2 and 3 as separate PRs with the promotion requirements spelled out
+(`TODO` #347/#348); the review with the measurements is on the PR, and the PR is closed with that pointer.
+
+* **Item 1 (taken): a GLU may take the memory of one of its inputs.**  `GGML_OP_GLU` joins
+  `ggml_op_can_inplace()`, so an FFN's gate, up and GLU output are not all live at once.
+* **Item 2 (declined for now): HIP graph replay up to 16 tokens** (`GGML_CUDA_GRAPH_MAX_TOKENS`).  At the
+  delivery's default drafting (`--spec-draft-n-max 7`, so at most an 8-row verify) it is **provably inert**:
+  the `GGML_CUDA_GRAPH_TRACE` census is identical at `=8` and `=16` (`direct=7554 replay=37482 capture=819
+  properties_changed=858` in both).  Where 9..16-row verify batches do occur (a fixed deep draft, the 4-slot
+  aligned server) the delivery's own text is not run-to-run stable above the 8-row purity band
+  (`GREEDY-PURITY.md` §11) — measured: the same binary at `--spec-draft-n-max 15` gave three different texts
+  in three runs, so "bit for bit" cannot be asserted there — and the capture count rises 138 -> 924 as each
+  distinct width needs its own graph.  It needs the multi-slot arm (whose spread is ±7 %) and a 4B arm
+  (WORKLOG 260928.003 measured verify graphs ~2.5 % slower on a 4B) before it can be judged.
+* **Item 3 (declined for now): one FA KV-group bitmap per graph evaluation** (`GGML_CUDA_FA_KQ_BLOCKS_REUSE`).
+  The mechanism is correct and was verified with a temporary census (`built=1 reused=15` in its best-case
+  shape, so every replayed decode step carries one memset + prepass instead of sixteen) — and it is worth
+  **nothing measurable here**: 31.90/31.88/31.85 t/s with the reuse against 31.83/31.86/31.86 without, at
+  ~31 ms/step.  It is also unreachable in every single-sequence arm (a single-sequence batch takes the
+  *derived* bitmap; the packed one needs a multi-sequence ubatch or the RDNA4 band at depth) and it carries two
+  lifetime defects: process-global maps keyed by a raw `ggml_backend_cuda_context *` with no erase and a
+  64 KiB `cudaMalloc` that is never freed, so a context re-created at the same address on another device
+  would reuse a foreign device's pointer.  It needs a census, that teardown, and a demonstrated win — its
+  argument is 15 removed *launches* per step, i.e. a Windows/WDDM measurement.
+
+### The rule, and why only the gate
+
+`ggml_gallocr_allocate_node()` takes the parent's block only when the layout matches (the **two-input** form;
+the one-input/split form halves `ne[0]`) and the parent has one reader and no views, so gate/up/out collapse to
+two buffers.  **Only `src[0]` is offered**: the streaming GLU kernels read both operands before writing (CPU
+`ggml_vec_*glu_*` without `restrict`, CUDA/HIP `unary_gated_op_kernel` where the same layout makes
+`i == j0 == j1`, Metal `kernel_*glu`, Vulkan/SYCL/WebGPU/OpenCL one element per invocation), so the up would be
+numerically safe there — but **CANN**'s gated GLU is a chain (`aclnn Silu` into dst, then
+`aclnnInplaceMul(dst, src1)`), which with the output on the up squares a destroyed operand and loses the gate.
+`dst == src0` there is the in-place `GGML_OP_UNARY` path every backend already runs, and an FFN's gate and up
+are symmetric, so the restriction costs nothing (it was in place for every number below).  This is the
+"other backends uninjured" half of the scope policy: the rule is shared by every backend, so the audit is
+recorded even though only the HIP and CPU paths can be run here.
+
+### Numbers (all in `benchmarks/2026-11-19-glu-inplace.md`)
+
+* Compute buffer, 27B UD-Q4_K_XL, 1 GPU, `-ub 2048 -fa 1 -c 16384`: **624.97 -> 475.37 MiB (-149.60, -23.9 %)**.
+* Greedy decode, 35B-A3B Q8_0, 2 GPU `-sm tensor -ncmoe 40 --host-experts pool`, `-n 128`, three interleaved
+  pairs: **121.6/121.6/121.7 -> 130.5/130.2/130.1 t/s (+7.0 %)**.  Dense 27B, 3 GPU `-sm tensor` + `draft-mtp n7`:
+  neutral (109.4/109.2/108.9 vs 109.2/109.2/109.0).
+* Text byte-identical ON/OFF on a dense 4B, a dense 27B (1 GPU and 3-device tensor + MTP), the 35B-A3B
+  host-expert shape and the **CPU** backend, and every hash equals the r322 build's (`b065f37593b3`,
+  `707c7bec1465`, `5d485275db6d`, `54e07e5a163c`, `1acb04bd9104`).
+* Prefill logits: **mean KLD 0.000000 / same-top-p 100.000 %** at 1 device and at 3 devices `-sm tensor`.
+
+### Correctness and gates (all green)
+
+* `scripts/gate-glu-inplace.sh` (**new**, its unit leg is `tests/test-alloc.cpp::test_glu_inplace`):
+  **PASS** — 33/33 cases, the unit leg **fails** with `GGML_GLU_INPLACE=0` (non-vacuity), the compute-buffer
+  leg prints -149.60 MiB, and both text arms are identical.  The unit case is also **negative-tested against
+  the src[0] restriction**: with the up offered, it fails at `x[2]->data != x[1]->data`.
+* `scripts/gate-prefill-logits.sh` at 1 device and `--device 0,1,2 --sm tensor`: **PASS** (0.000000 / 100.000 %
+  both), the allocator deciding which kernels a fused FFN window may run being the reason it is owed.
+* `scripts/gate-fusion-alias-copy.sh`: **PASS** — and it had to be amended, which is the one behavioural
+  interaction of this release: with the rule on, the fused `MUL_MAT_ID(gate) MUL_MAT_ID(up) GLU` window's
+  output takes the gate's memory, so it can no longer land on the dead host-expert scheduler copy and the
+  default env declines **0** classes where r322 declined 1 (`GLU<-NONE/copy@268435456`).  The two trace arms now
+  pin `GGML_GLU_INPLACE=0` (they still log the decline, so the protection is proven live wherever the rule does
+  not apply) and the default arm's count is printed rather than asserted.  Texts: `3fab4da87774` in every arm.
+* `scripts/gate-lora-fusion.sh`: **PASS** (LoRA delta survives the fused chain, declines as recorded,
+  `984e0da01c40` -> `942ef687096b` on the prefill pair).
+* `test-backend-ops -o FLASH_ATTN_EXT` on ROCm0/1/2 and CPU: **OK**, as r322.  (`test-backend-ops` cannot see
+  an allocator rule, which is why the unit case is the real op-level coverage.)
+* `scripts/gate-per-block-build.sh` (`all`, whole ladder because an EARLY block was amended):
+  **18/18 built**, 3178 s.  `scripts/validate-set.sh`: **GREEN**, tree `4f94e92a0`; optional `0100`/`0101`
+  re-verified strictly on the new tree (`705df1213` / `69cfea715` / cumulative `adf514489`).
+* Kernel journal and every run log clean (`scripts/check-gpu-faults.sh`).
+
+### What moved for a consumer
+
+`GGML_GLU_INPLACE=0` restores the pre-r323 allocator.  Nothing else: no default changed, no knob removed, no
+kernel arithmetic touched, and a same-seed run reads the same text as r322 on every shape measured.  The one
+thing to know is the gate amendment above: a run that used to show a `FUSE_TRACE ALIAS GLU<-NONE/copy@` decline
+on the default env no longer does, because the GLU no longer lands on that block.
+
 ## 261119.006 (r322, RELEASE v17-4f9dfa0e3-r322) -- GitHub issue #333 CLOSED: the band's fixup period `P` is "enough blocks to fill the machine", not a flat `nsm/2`, so a tensor split that leaves a device 1 or 2 output tiles no longer idles half of it
 
 **Release:** `v17-4f9dfa0e3-r322`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `20aaa0fb6`

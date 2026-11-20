@@ -389,6 +389,7 @@ tier runs what); this table is the quick answer for a change in flight.
 | the Meta split-state cache: the warm walk, a cache version, the resolve step or `calculate_split_state` (block 09) | `scripts/gate-seqpar.sh` plus the `-sm tensor` arms of `scripts/gate-host-pool.sh` and `scripts/gate-prefill-logits.sh`, and identical `-sm tensor` text against the previous build |
 | the `--load-mode mlock`/`mmap+mlock` pin, `llama_mlock` itself, or where an `-lme` hole is placed | `scripts/gate-host-read-transport.sh` (its `mlock-hole` / `mlock-nohole` arms) |
 | the GTT store, its residency/eviction, the fill transport, the prefill stream/IN-PLACE band, the admission ladder, the lock/budget policy or the shape decision (block 15) | `scripts/gate-uma-experts.sh` (its `inplace` and `pfcp` arms), `scripts/gate-prefill-server-slots.sh` (two slots: one decoding while the other prefills), plus `scripts/gate-prefill-logits.sh` and (discrete) `scripts/gate-host-pool.sh` |
+| the allocator's in-place rule (`ggml_op_can_inplace`, which parent's memory a node may take) | `scripts/gate-glu-inplace.sh` (the unit leg plus the compute-buffer saving and ON/OFF text), and the **whole** per-block ladder when the block is an early one |
 | the delivery set itself (any regenerated patch) | `scripts/validate-set.sh` |
 | anything (before a tag) | `scripts/gate-per-block-build.sh --changed-from <prev tip>` + `scripts/check-gpu-faults.sh` |
 

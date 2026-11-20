@@ -94,6 +94,35 @@ the slack up front moves the cost to before the arena is sized.
   this is what restores a dense model's pre-slab compute-buffer sizes (issue #120).
 * Compute-only: model weights, the KV cache and the arena are untouched.
 
+### 1.1b `GGML_GLU_INPLACE` — **kill switch**, default on (r323, block 00; contributor PR #334 item 1)
+
+A GLU may take the memory of its **gate**, so an FFN's gate, up and GLU output are not all live at once.
+`GGML_OP_GLU` joins `ggml_op_can_inplace()`, and the allocator's own preconditions do the gating: the parent
+must have the same layout (the **two-input** form — the one-input/split form halves `ne[0]`, so it never
+qualifies) and exactly one reader with no views.
+
+* **Only the gate is ever offered.**  `ggml_gallocr_allocate_node()` stops its parent scan at `src[0]` for this
+  op.  The streaming GLU kernels read both operands before writing, so either would be numerically safe on
+  them, but CANN's gated GLU is a *chain* (`aclnn Silu` into dst, then `aclnnInplaceMul(dst, src1)`): an output
+  aliasing the **up** would square a destroyed operand and lose the gate.  `dst == src0` there is the in-place
+  `GGML_OP_UNARY` path every backend already runs.  The gate and the up are symmetric in an FFN, so the
+  restriction costs nothing in practice.
+* Measured (gfx1201): ROCm0 compute buffer **624.97 → 475.37 MiB** on Qwen3.8-27B UD-Q4_K_XL (1 GPU,
+  `-ub 2048 -fa 1 -c 16384`), i.e. **−149.6 MiB (−23.9 %)**, and **+7.0 %** greedy decode on the host-expert
+  shape (35B-A3B Q8_0, 2 GPU `-sm tensor -ncmoe 40 --host-experts pool`: 121.6/121.6/121.7 →
+  130.5/130.2/130.1 t/s over three interleaved pairs).  Dense 27B `-sm tensor` + MTP is neutral.
+* It changes **no token**: same-seed greedy text is byte-identical on/off on a dense 4B, a dense 27B
+  (1 GPU and 3-device `-sm tensor` + `draft-mtp`), the 35B-A3B host-expert shape and the CPU backend, and
+  those hashes equal the previous release's build; prefill logits are bit-identical too (mean KLD 0.000000 /
+  same-top-p 100.000 %) at 1 device and at 3 devices `-sm tensor`.
+* `0` restores the pre-r323 allocator (A/B and bisect only).  Gate: `scripts/gate-glu-inplace.sh` (the unit leg
+  is `tests/test-alloc.cpp`'s `test_glu_inplace`, negative-tested: it fails with the switch off).  Record:
+  `benchmarks/2026-11-19-glu-inplace.md`.
+* One interaction worth knowing: a fused window's output no longer lands on the dead host-expert scheduler
+  copy, so `scripts/gate-fusion-alias-copy.sh` pins `GGML_GLU_INPLACE=0` for its two trace arms — the
+  leaf-copy protection is still required wherever the rule does not apply, and the pinned arm proves it
+  still declines (`GLU<-NONE/copy@268435456`).
+
 ### 1.2 MoE expert-cache arena
 
 | variable | default | class | notes |

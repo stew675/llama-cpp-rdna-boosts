@@ -29,7 +29,16 @@
 #          `3fab4da87774` for every other arm);
 #        - with `GGML_CUDA_FUSE_TRACE=1` the run logged >= 1 `FUSE_TRACE ALIAS .../copy@` line, i.e. the
 #          arm really reached a compute-buffer leaf overlap and the check is what declined the fusion.
-#          Without that line the arm would be vacuous (nothing to catch).
+#          Without that line the arm would be vacuous (nothing to catch).  **Since r323 that line comes from
+#          the `GGML_GLU_INPLACE=0` arm** (see the GLU note below): with the rule ON the fused `GLU` output
+#          takes its gate's memory, so it can no longer land on the dead scheduler-copy block and there is
+#          nothing to decline.  The default-env arm's decline count is reported, not asserted -- a decline
+#          is the protection firing, so requiring zero would punish it.
+#
+#   GLU IN PLACE (r323, block 00).  `ggml_op_can_inplace(GGML_OP_GLU)` hands an FFN's GLU the memory of its
+#   gate, which is exactly the block the allocator used to give the fused window's output here.  The two
+#   trace arms therefore pin `GGML_GLU_INPLACE=0` to keep the hazard reachable: the protection is still
+#   needed whenever the rule does not apply (a second reader of the gate, the split form, the switch off).
 #      The reporter's other control (`GGML_CUDA_DISABLE_MMVQ_MOE_BAND=1`, which makes the 14-token batch
 #      ineligible for the fused MMVQ) must produce the same text.
 #   B. THE FAILED-FILL ARM.  The same arm with `MOE_HOST_POOL_FILL_FAULT=200`: a declined/failed host fill
@@ -172,11 +181,15 @@ if [ "$A_ARM" -eq 1 ]; then
 
         # The mechanism: the run must have DECLINED a fusion over a compute-buffer leaf copy.  Without
         # this line the arm is vacuous (the fused window never saw the copy, so nothing could be caught).
+        # `GGML_GLU_INPLACE=0` restores the overlap r323 removed: by default the GLU output takes the gate's
+        # memory and cannot land on the dead scheduler copy, so the default arm has nothing to decline.
         run_arm a_trace "-lv 2" MOE_EXPERT_CACHE_MIB=0 GGML_OP_OFFLOAD_MIN_BATCH=9 GGML_CUDA_FUSE_TRACE=1
-        if grep -qE 'FUSE_TRACE ALIAS [A-Z_]+<-[A-Z_]+/copy@' "$KEEPOUT/a_trace.log"; then
-            note "trace: $(sed -n 's/.*FUSE_TRACE ALIAS \(.*\)/\1/p' "$KEEPOUT/a_trace.log" | sort -u | tr '\n' ' ')"
+        run_arm a_trace_gluoff "-lv 2" MOE_EXPERT_CACHE_MIB=0 GGML_OP_OFFLOAD_MIN_BATCH=9 GGML_CUDA_FUSE_TRACE=1 GGML_GLU_INPLACE=0
+        note "trace: default env declines $(grep -c 'FUSE_TRACE ALIAS' "$KEEPOUT/a_trace.log") class(es), GGML_GLU_INPLACE=0 declines $(grep -c 'FUSE_TRACE ALIAS' "$KEEPOUT/a_trace_gluoff.log")"
+        if grep -qE 'FUSE_TRACE ALIAS [A-Z_]+<-[A-Z_]+/copy@' "$KEEPOUT/a_trace_gluoff.log"; then
+            note "trace: $(sed -n 's/.*FUSE_TRACE ALIAS \(.*\)/\1/p' "$KEEPOUT/a_trace_gluoff.log" | sort -u | tr '\n' ' ')"
         else
-            fail "the repro arm declined no fusion over a compute-buffer leaf copy (no 'FUSE_TRACE ALIAS .../copy@' line): MMVQ_MOE_BAND, GGML_OP_OFFLOAD_MIN_BATCH, UB or the model no longer reach the shape (log: $KEEPOUT/a_trace.log)"
+            fail "the repro arm declined no fusion over a compute-buffer leaf copy (no 'FUSE_TRACE ALIAS .../copy@' line in the GGML_GLU_INPLACE=0 arm): MMVQ_MOE_BAND, GGML_OP_OFFLOAD_MIN_BATCH, UB or the model no longer reach the shape (log: $KEEPOUT/a_trace_gluoff.log)"
         fi
     fi
 fi
@@ -201,12 +214,15 @@ if [ "$C_ARM" -eq 1 ]; then
     else
         note "c_cache_on: ${c_chars} chars ${c_sha} == anchor ${ANCHOR}"
     fi
-    # ... and the check really does bite on the delivery's own config, i.e. it is not inert there.
+    # ... and the check really does bite when the hazard exists: pin `GGML_GLU_INPLACE=0`, because with the
+    # rule ON the GLU output takes the gate's memory and never lands on the dead copy (r323, see the header).
     run_arm c_trace "-lv 2" GGML_OP_OFFLOAD_MIN_BATCH=9 GGML_CUDA_FUSE_TRACE=1
+    run_arm c_trace_gluoff "-lv 2" GGML_OP_OFFLOAD_MIN_BATCH=9 GGML_CUDA_FUSE_TRACE=1 GGML_GLU_INPLACE=0
     c_declines="$(grep -c 'FUSE_TRACE ALIAS' "$KEEPOUT/c_trace.log")"
-    note "c_trace: ${c_declines:-0} distinct (output <- src) alias classes declined"
-    [ "${c_declines:-0}" -ge 1 ] ||
-        fail "the cache-on arm declined nothing at all: the leaf-copy check is inert on the production path"
+    c_declines_gluoff="$(grep -c 'FUSE_TRACE ALIAS' "$KEEPOUT/c_trace_gluoff.log")"
+    note "c_trace: ${c_declines:-0} class(es) declined on the default env, ${c_declines_gluoff:-0} with GGML_GLU_INPLACE=0"
+    [ "${c_declines_gluoff:-0}" -ge 1 ] ||
+        fail "the GGML_GLU_INPLACE=0 arm declined nothing at all: the leaf-copy check is inert on the production path"
 fi
 
 if [ "$FAULTS" -eq 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then

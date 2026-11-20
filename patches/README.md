@@ -580,7 +580,7 @@ only as a rough shape.
 
 | # | patch | subject | +/− | files |
 |---|---|---|---|---|
-| 00 | `0000-…-block-00-foundation-band-uniformity-Meta` | foundation: band uniformity, Meta wrapper, allocator (+ r237: `--lazy-mode mlockr`, i.e. populate then **release** the lazy table's pin — see the block section) | +986 / −352 | 34 |
+| 00 | `0000-…-block-00-foundation-band-uniformity-Meta` | foundation: band uniformity, Meta wrapper, allocator (+ r323: a GLU may take its gate's memory, `GGML_GLU_INPLACE`; + r237: `--lazy-mode mlockr`, i.e. populate then **release** the lazy table's pin — see the block section) | +1145 / −358 | 37 |
 | 01 | `0001-…-block-01-hybrid-HIP-all-reduce-RDNA4-gat` | hybrid HIP all-reduce (+ r259: `GGML_CUDA_ALLREDUCE=q8ce` — the copy-engine chain with a **lossy, opt-in** 8-bit wire: q8_0 blocks of Walsh-Hadamard-rotated values, any rank count, +8-13 % prefill on the delivery's own 3-device box; the concept is contributor PR #298) | +2846 / −46 | 4 |
 | 02 | `0002-…-block-02-adaptive-MTP-draft-depth` | adaptive MTP draft depth (+ r218: `spec_draft_align_cache()` realigns the drafter's KV with the batch it ingests, issue #272) | +1381 / −62 | 23 |
 | 03 | `0003-…-block-03-chunked-gated-delta-net-prefill` | chunked GDN prefill + rollback tracker (+ r241: the conv-state store's rollback index is built once per graph per device instead of once per conv layer, `LLAMA_SHARE_SLOT_REV=0` the kill switch — GitHub issue #291) | +3362 / −31 | 25 |
@@ -609,6 +609,26 @@ split, tree-identical.
 ---
 
 ## Block 00 — foundation: band uniformity, the Meta wrapper, the allocator
+
+> **r323 amendment (contributor PR #334, item 1 of 3): a GLU may take the memory of its gate**
+> (`GGML_GLU_INPLACE`, on unless `0`).  `GGML_OP_GLU` joins `ggml_op_can_inplace()`, so an FFN's gate, up and
+> GLU output are not all live at once.  The allocator's own preconditions do the gating (same layout — the
+> two-input form; the one-input/split form halves `ne[0]` and never qualifies — and one reader with no views),
+> and **only `src[0]` is offered**: the streaming GLU kernels read both operands before writing (CPU
+> `ggml_vec_*glu_*` without `restrict`, CUDA/HIP `unary_gated_op_kernel` where `i == j0 == j1`, Metal
+> `kernel_*glu`, Vulkan/SYCL/WebGPU/OpenCL one element per invocation), but **CANN**'s gated GLU is a chain
+> (`aclnn Silu` into dst, then `aclnnInplaceMul(dst, src1)`), which would square a destroyed up operand and
+> lose the gate; `dst == src0` there is the in-place `GGML_OP_UNARY` path every backend already runs.  The gate
+> and the up are symmetric in an FFN, so the restriction costs nothing.  Measured: ROCm0 compute buffer
+> **624.97 → 475.37 MiB** (27B UD-Q4_K_XL, 1 GPU, `-ub 2048`) and **+7.0 %** greedy decode on the 35B-A3B
+> host-expert shape (121.6 → 130.5 t/s, three pairs); dense 27B MTP neutral.  No token moves: text
+> byte-identical on/off on 4B / 27B (1 GPU and 3-device `-sm tensor` + MTP) / 35B-A3B host-expert / CPU, equal
+> to the previous release's build, and prefill logits bit-identical (KLD 0.000000, top-p 100.000 %) at 1 and 3
+> devices.  Gate: `scripts/gate-glu-inplace.sh` (`tests/test-alloc.cpp`'s `test_glu_inplace` is its unit leg and
+> is negative-tested against the switch).  `scripts/gate-fusion-alias-copy.sh` now pins `GGML_GLU_INPLACE=0`
+> for its two trace arms, because the fused window's output can no longer land on the dead host-expert
+> scheduler copy — the protection is still needed wherever the rule does not apply, and the pinned arm proves
+> it still declines.  Record: `benchmarks/2026-11-19-glu-inplace.md`, `ENVIRONMENT.md` §1.1b.
 
 > **r275 amendment (issue #306 cleanup):** the `-Wshadow` arm is now scoped on clang.  Plain clang `-Wshadow` also
 > reports upstream's "local/parameter named after the field" idiom (102 sites, deliberately not renamed -- TODO #101),
@@ -684,7 +704,10 @@ band rule it satisfies starts here.
   table on the evictable page-cache path.
 * **`ggml-alloc`**: release view sources whose views are never consumed (a real leak), and fingerprint the
   graph layout by node order + output marking so a *different* graph cannot reuse a layout computed for
-  another (issue #183).
+  another (issue #183).  Since **r323** a **GLU may take the memory of its gate** (`GGML_GLU_INPLACE`, on
+  unless `0`, `ggml_op_can_inplace(GGML_OP_GLU)`; only `src[0]` is offered, for CANN's chained gated GLU) —
+  624.97 → 475.37 MiB of compute buffer on the 27B at `-ub 2048` and +7.0 % on the host-expert MoE decode,
+  with no token moved.
 * **`MUL_MAT_ID` repeated ids** — emit every `(token, iex)` occurrence as its own compact row and size the
   column grids for the expanded expert list (upstream bug; the delivery was the reproducer).
 * **Shared-NextN MTP heads keep their own KV** — the draft driver inferred KV sharing from `ctx_other`
@@ -698,7 +721,8 @@ band rule it satisfies starts here.
 `src/llama-model-loader.h`, `include/llama.h`, `common/arg.cpp`, `tools/*/README.md`, `src/CMakeLists.txt`,
 `src/models/*` (the shadow rename), `src/llama-grammar.cpp`, `common/speculative.cpp`.
 
-**Knobs.**  `GGML_READBACK_SYNC` (diagnostic), `LLAMA_LOAD_STAGE_MB` (tuning, default `4`).  The rest are behaviour, not switches.
+**Knobs.**  `GGML_READBACK_SYNC` (diagnostic), `LLAMA_LOAD_STAGE_MB` (tuning, default `4`),
+`GGML_GLU_INPLACE` (kill switch, default on).  The rest are behaviour, not switches.
 
 **Notes.**  Block 00 is the *only* block whose changes are not gated on RDNA: it fixes code paths every
 backend shares.  A re-base conflict here is usually an upstream fix arriving for the same bug — keep

@@ -1218,3 +1218,44 @@ issue #332, `scripts/gate-moe-promise.sh`.
 
 Record: `WORKLOG.md` 261119.006, `GREEDY-PURITY.md` §98, `patches/README.md` block 05, `MANIFESTS.md` gate 05/36,
 `ENVIRONMENT.md` §8, issue #333, `benchmarks/2026-11-19-band-split-blocks-per-sm.md`.
+
+## r323 (2026-11-19, `WORKLOG.md` 261119.007) — an FFN's GLU may take its GATE, and only its gate (contributor PR #334 item 1)
+
+1. **The saving is the whole gate buffer, and the allocator's own preconditions are what make it safe to
+   take.**  `GGML_OP_GLU` in `ggml_op_can_inplace()` reuses `ggml_gallocr_allocate_node`'s existing rule --
+   same layout and exactly one reader with no views -- so nothing about the gate/up/GLU triple is special-cased:
+   the two-input form's output has the gate's layout, and the one-input (split) form halves `ne[0]` and can
+   never qualify.  Measured on Qwen3.8-27B UD-Q4_K_XL (1 GPU, `-ub 2048 -fa 1 -c 16384`): ROCm0 compute buffer
+   **624.97 -> 475.37 MiB (-149.60, -23.9 %)**, and on the host-expert MoE shape (35B-A3B Q8_0, 2 GPUs
+   `-sm tensor -ncmoe 40 --host-experts pool`) greedy decode **121.6/121.6/121.7 -> 130.5/130.2/130.1 t/s
+   (+7.0 %)** over three interleaved pairs.  A dense 27B on 3 devices `-sm tensor` with `draft-mtp n7` is
+   neutral (109.3 vs 109.2 t/s): the win is the MoE shape's, not a general decode gain.
+2. **Only `src[0]` may be offered, and CANN is why.**  Every streaming GLU kernel reads both operands before
+   writing the element at the same index (CPU `ggml_vec_*glu_*` with no `restrict`, CUDA/HIP
+   `unary_gated_op_kernel` where the same layout makes `i == j0 == j1`, Metal `kernel_*glu`, Vulkan / SYCL /
+   WebGPU / OpenCL one element per invocation), so `dst == src1` would be numerically safe on them -- but CANN's
+   gated GLU is a **chain** (`aclnn Silu` into dst, then `aclnnInplaceMul(dst, src1)`), which with `dst == src1`
+   squares a destroyed up operand and loses the gate.  `ggml_gallocr_allocate_node()` therefore stops its parent
+   scan at `src[0]` for this op; `dst == src0` is the in-place `GGML_OP_UNARY` path every backend already runs,
+   and the gate and the up are symmetric in an FFN, so the restriction costs nothing in practice.  The unit
+   case (`tests/test-alloc.cpp::test_glu_inplace`) asserts the up is never taken and is negative-tested by
+   offering both (`x[2]->data != x[1]->data` fails).
+3. **It moves no token, so the gate is the buffer and the text, not an acceptance rate.**  Same-seed greedy
+   text is byte-identical ON/OFF on a dense 4B, a dense 27B (1 GPU and 3-device `-sm tensor` + `draft-mtp`), the
+   35B-A3B host-expert shape and the CPU backend, and those hashes equal the r322 build's
+   (`b065f37593b3` / `707c7bec1465` / `5d485275db6d` / `54e07e5a163c` / `1acb04bd9104`); prefill logits are
+   bit-identical too (mean KLD 0.000000, same-top-p 100.000 %) at 1 device **and** at 3 devices `-sm tensor`.
+   The rule must therefore be judged on the compute buffer it saves (a size that stops moving means the FFN
+   layout stopped giving the gate a single reader) plus the ON/OFF text pair -- `test-backend-ops` cannot see a
+   memory-layout decision at all.
+4. **It changes which fusion windows can overlap a dead scheduler copy, so the leaf-copy gate now pins
+   `GGML_GLU_INPLACE=0` for its trace arms.**  With the rule on, the fused `MUL_MAT_ID(gate) MUL_MAT_ID(up) GLU`
+   window's output takes the gate's memory, so it can no longer land on the host-expert scheduler copy the
+   window still reads (issue #287) and `scripts/gate-fusion-alias-copy.sh` declines **0** classes on the
+   default env, where r322 declined 1 (`GLU<-NONE/copy@268435456`).  The protection is still required wherever
+   the rule does not apply (a second reader of the gate, the split form, the switch off), so the decline
+   assertion moved to the pinned arm -- which still logs it -- and the default arm's count is printed, never
+   asserted: a decline is the protection firing, so requiring zero would punish it.
+
+Record: `WORKLOG.md` 261119.007, `benchmarks/2026-11-19-glu-inplace.md`, `patches/README.md` block 00,
+`MANIFESTS.md` gate 00/37, `ENVIRONMENT.md` §1.1b, `scripts/gate-glu-inplace.sh`, PR #334.

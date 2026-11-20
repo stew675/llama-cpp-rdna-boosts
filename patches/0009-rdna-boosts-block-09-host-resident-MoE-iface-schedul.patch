@@ -1,4 +1,4 @@
-From da7f4d54a64ff45dda20a11b736108707a13f51e Mon Sep 17 00:00:00 2001
+From b2f1e86e507fa3d4ec6673f9266a68d72c966e81 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/17] rdna-boosts: block 09: host-resident MoE (iface,
@@ -2087,10 +2087,10 @@ index afb86338a..ef754735e 100644
      // Utils
      //
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index d59ea35eb..013df057d 100644
+index d7933f00b..8e4390150 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
-@@ -418,6 +418,52 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
+@@ -442,6 +442,52 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
      return size;
  }
  
@@ -2143,7 +2143,7 @@ index d59ea35eb..013df057d 100644
  static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
      struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
      if (buf == NULL) {
-@@ -425,8 +471,10 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
+@@ -449,8 +495,10 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
      }
  
      for (int n = 0; n < talloc->n_chunks; n++) {
@@ -2156,7 +2156,7 @@ index d59ea35eb..013df057d 100644
          if (buf->chunks[n] == NULL) {
              ggml_vbuffer_free(buf);
              return NULL;
-@@ -494,6 +542,14 @@ struct ggml_gallocr {
+@@ -518,6 +566,14 @@ struct ggml_gallocr {
  
      struct leaf_alloc * leaf_allocs; // [n_leafs]
      int n_leafs;
@@ -2171,7 +2171,7 @@ index d59ea35eb..013df057d 100644
  };
  
  ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
-@@ -1256,3 +1312,28 @@ size_t ggml_backend_alloc_ctx_tensors_from_buft_size(struct ggml_context * ctx,
+@@ -1287,3 +1343,28 @@ size_t ggml_backend_alloc_ctx_tensors_from_buft_size(struct ggml_context * ctx,
  ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors(struct ggml_context * ctx, ggml_backend_t backend) {
      return ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(backend));
  }
