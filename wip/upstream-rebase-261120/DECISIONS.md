@@ -402,3 +402,13 @@ were still adopted, because they are unrelated to the rotation — dropping them
 (q8_0 KV: `GGML_CUDA_FA_KV_NATIVE=1` 88.6 vs 83.9 t/s decode, +5.6 %, identical text).  If the rotation is ever
 wanted back it must arrive as a *combined* model with that matrix green — i.e. as option 1, which remains
 available and is what this decision declines for now.
+
+**Addendum (2026-11-20, R05 repair `c3860af1e`):** the maintainer asked whether anything relies on `nb32` being
+64-bit wide, and it does.  The per-head term adopted from upstream, `nb32*(zt_Q % ne32)`, is an `int`
+multiplication when `nb32` is `int32_t`; the head index scales it by up to 71, so at 128k context with a
+2048-token ubatch the product is 35.5 GiB and wraps (`nb32` alone, 512 MiB, fits — which is why the first
+answer said "safe" and was wrong).  Overflow starts around 28.8 MiB of `nb32` (~15.1M cell-tokens).  `nb32` is
+now `int64_t` in the typedef and in all four kernels, exactly as `#32217` does.  This is the general lesson for
+the rest of the climb: **"take the delivery's side" applies to a shared *mechanism*, not to a type widening
+that upstream introduced to make its own new code correct** — the per-head mask is upstream's feature and its
+arithmetic is upstream's to get right.

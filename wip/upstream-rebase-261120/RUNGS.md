@@ -503,11 +503,19 @@ its parameter list are byte-identical between block 05's commit and the merged t
 
 ## R05.3 Three fixes the compiler forced, all worth recording
 
-1. **`nb32` stays `int32_t`.**  Upstream widened mask's row stride to `int64_t` in the `fattn_kernel_t` typedef.
-   The delivery's kernels are the ones in the tree, so a half-widened typedef/definition pair does not link
-   ("assigning to `fattn_kernel_t` from incompatible type").  Keeping the delivery's `int32_t` is numerically
-   safe for a per-head mask (`nb32` is `ne[1]*ne[0]*2` bytes; a 128k-cell row is 262 KB, and it is multiplied by
-   `zt_Q % ne32` <= 4).
+1. **`nb32` is `int64_t` — and my first answer here was WRONG, corrected by the maintainer's question.**  I
+   initially kept the delivery's `int32_t` (a half-widened typedef does not link against an int32 kernel, and
+   `nb32` on its own looked small: `mask->nb[2]` = `n_kv*xn_tokens*2` bytes, 512 MiB at 128k context with a
+   2048-token ubatch).  **But `nb32` is not used on its own.**  The per-head term this rung *adopted from
+   upstream* is `nb32*(zt_Q % ne32)`, an `int` multiplication with a head index up to 71: 512 MiB x 71 =
+   **35.5 GiB**, so the product wraps and the mask pointer is wrong.  Overflow begins at `nb32` > 2^31/71 =
+   **28.8 MiB**, i.e. ~15.1M cell-tokens — e.g. a 64k context with a 16-token ubatch.  Upstream widened it in
+   the typedef **and all four kernel definitions together**; that is now done here in the same four places
+   (`fattn-common.cuh`, `fattn-mma-f16.cuh`, `fattn-tile.cuh`, `fattn-vec.cuh`); `nb31` stays `int32_t`, as
+   upstream leaves it.  Repair `c3860af1e`; FA matrix re-verified 7428/7428.
+   **Honest gap:** the op matrix exercises **zero** cases with `mask_heads > 1`, so the per-head path this
+   serves has no automated coverage here, and there is no Inkling 2 model on this box — the type is correct by
+   construction and matches upstream, but it is not locally validated.
 2. **`#31617`'s typed masks reach block 05's own code.**  HIP now static_asserts a 64-bit warp mask, so the
    seven raw `__shfl[_xor]_sync(0xFFFFFFFF, ...)` calls in the band/fetch-ahead code had to become
    `ggml_cuda_shfl_xor` / `ggml_cuda_shfl` — the same class of repair as R01, but inside block 05's new code
