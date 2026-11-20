@@ -1,9 +1,18 @@
 # prefill-transfer-overlap — spend the H2D window on the decoder
 
-**Status: OPEN — scoping note + measurement plan.  Nothing implemented, nothing in `patches/`.**
-Opened 2026-11-18 by the maintainer's instruction ("create the campaign").  The mechanism, the numbers and
-the pass/fail thresholds are below; the probe that produces the deciding number has **not** been cut yet
-(§6.1).
+**Status: OPEN — pass 1 MEASURED (2026-11-18, [`RESULTS-2026-11-18.md`](RESULTS-2026-11-18.md)).  Nothing
+implemented, nothing in `patches/`.**
+Opened 2026-11-18 by the maintainer's instruction ("create the campaign").
+
+**Pass 1 re-scoped the mechanism, not the goal.**  On a partial-residency arena a host-expert prefill spends
+up to **~50 % of its wall** on host-tier work (42 % residency: 2415 t/s against 5409 t/s for the same model at
+100 %), but the carrier is **no longer an asynchronous H2D copy with the SMs idle** — the delivery's device
+gather (`GGML_SCHED_DEVGATHER`, worth **2.12x** over the staging path) turned it into a **link-bound kernel**.
+So the window is still there and it is bigger than the copy census suggested (that census counts arena fills
+only: 572.7 MiB of a 2.13 s prefill), but it is spent **on the SMs**, which means **co-scheduling** (mechanism
+D below), not copy-stream reordering, is the mechanism to build.  A fully resident arena makes the tier
+effectively **free** (−2.7 % against no host tier at all, `h=0.0000 (0/0 reaches)`), so any interleave must be
+gated on residency rather than shipped as a default.
 
 This is a **WIP campaign, not a delivery item**.  Per `AGENTS.md` nothing here is applied to
 `~/llama.cpp` or any checkout without the maintainer explicitly asking for that specific item, and a new
@@ -31,6 +40,13 @@ The interleave can convert **at most F** of the prefill's wall time into decode 
 service a token faster than the decode step itself (`D`).  The period of the ping-pong is therefore
 `max(fill quantum, D)`, not something we choose.  §7 works this through on the field numbers, because the
 "~10 ms rapid ping-pong" intuition needs one correction.
+
+**Pass 1 correction (2026-11-18).**  `F` is not what the cache census reports.  On the arms measured, the
+census's `expert H2D traffic` is ~1 % of the prefill wall, while the *throughput* cost of a partial arena is
+**~56 %** — the bytes are moved by the **device gather kernel**, whose traffic no census counts, and whose
+wall time is SM-occupied rather than SM-idle.  The campaign's budget is therefore
+`F ≈ (t_resident − t_partial) / t_resident` (up to 0.57 measured), and the question is not "is there an idle
+window" but **"does a link-bound gather leave SM headroom for a co-scheduled decode step"**.
 
 ## 1. What the window is (evidence)
 
@@ -85,15 +101,24 @@ previous-pass routing) are a *placement* question, already handled; this campaig
 
 ## 4. The three candidate mechanisms
 
-### (A) Copy-stream lookahead of the next split's staging — *no decode step needed*
+### (A) Copy-stream lookahead of the next split's staging — *DEMOTED by pass 1*
+With `GGML_SCHED_DEVGATHER` on (the shipped default for a pool-backed table at every width) the transfer is a
+**device gather kernel**, not a staged copy: there is not one `H2D staging` line in any pass-1 arm, and
+`MOE_EXPERT_PREFILL_IN_PLACE=0` is inert on the shape.  Reordering copies therefore has no target.  Kept in
+the record because it is the mechanism the *staging* path would need (2.12x slower; do not use it as a
+baseline).
+
+<details><summary>the demoted form, kept for the record</summary>
+
 Move `sched_stage_issue(split k+1)` ahead of split `k`'s compute.  The ring, the per-slot free/done events
 and the depth are already there; the missing piece is only *when* the issue happens
 (`ggml-backend.cpp:3733` issues it inside the loop, right before the split's own copies).
 * **Hides**: the *predicted* portion of the next layer's transfer, plus any layer whose routing is reused
   (a chat follow-up's prefix, a repeated prompt).
-* **Costs**: ring slots (pinned host memory, `depth × span`), not VRAM — the one resource the arena
-  campaigns are fighting for.
-* **Does not** hide the exact fill, for §3's reason.  This is the stepping stone, not the destination.
+* **Costs**: ring slots (pinned host memory, `depth × span`), not VRAM.
+* **Does not** hide the exact fill, for §3's reason.
+
+</details>
 
 ### (B) Layer-chunk interleave — the coarse control point
 Split a prefill ubatch into `G` layer ranges, hand the hidden state across the graph boundary
@@ -126,6 +151,14 @@ cache's single global mutex.
 
 **(C) is the destination; (A) is free-ish and should be measured first; (B) is the control point if the
 server needs one.**  (A) and (C) are independent and compose.
+
+### (D) Co-schedule a decode step with the gather — *added by pass 1, now the first thing to test*
+The gather is launched from `ggml_backend_sched_compute_splits()` and consumed by the split's `MUL_MAT_ID` on
+the same stream.  A decode step submitted on a second scheduler's stream **between** those two launches is
+concurrent with the gather — no suspension, no layer-range graph, no handoff buffer, no reordering of
+existing work.  It works only if the gather really is link-bound (so the SMs have occupancy to spare) and only
+if the decode step is **fill-free** (§5.5): `GGML_MOE_DEVREMAP`'s sync-free band with resident tables.
+Pass 1's §4 names the three arms (`G0`/`G1`/`G2`) that decide it, and the control that keeps it honest.
 
 ## 5. Landmines (each one has already bitten this repo)
 
@@ -252,5 +285,7 @@ promotion time, per `AGENTS.md`.
 | file | what |
 |---|---|
 | this `README.md` | the campaign record |
-| *(to come)* `probe-prefill-overlap.patch` | the temporary `MOE_PROBE_PF_OVERLAP` decomposition (§6.1) — **not shipped**, cut against the current `release.json` tree |
-| *(to come)* `runs/` | raw logs + a `summary.tsv` per verdict, the way the archived campaigns keep theirs |
+| [`RESULTS-2026-11-18.md`](RESULTS-2026-11-18.md) | **pass 1**: the ten-arm table, the four findings (the tier is free at 100 % residency; a partial arena costs ~56 %; the gather is 2.12x over staging and is the carrier now; the staging path is not a baseline), and the `G0`/`G1`/`G2` test that decides mechanism (D) |
+| `runs/arm.sh`, `runs/summ.sh` | the arm runner and the log re-parser (one summary line per arm, `F` from the delivery's own calibrated 28.7 GB/s H2D figure) |
+| `runs/*.log`, `runs/summary.tsv` | every raw log + the machine-readable table |
+| *(to come)* `probe-prefill-overlap.patch` | the `MOE_PROBE_PF_OVERLAP` decomposition (per-call timers around the gather launch, the consuming op and the fill sites) — **not shipped**; only needed for the `G1` attribution, not for `G0` |
