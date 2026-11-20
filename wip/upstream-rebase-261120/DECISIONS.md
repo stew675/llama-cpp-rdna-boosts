@@ -1,0 +1,242 @@
+# Critical decision points — 2026-11-20 re-base
+
+Every entry here is a place where **upstream now implements, or is refactoring, something the delivery
+owns**.  The policy is `AGENTS.md` → *Report findings before shipping*: the delivery's code is never dropped
+because upstream's "looked newer".  A rung that reaches an `OPEN` entry **stops and asks**.
+
+Two classes, because they need different treatment:
+
+- **A — subsumption.**  Upstream landed a feature the delivery also ships.  Dropping ours is a code deletion
+  and needs the maintainer's word, even when the answer is obvious.
+- **B — structural collision.**  Upstream refactored the surface our feature sits on.  Resolving it in-rung
+  is the ladder's job; it becomes a decision only if the refactor leaves our feature no home (or gives it a
+  better one).
+
+Entry numbers are **campaign-local** (`D1`..`D14`); they do not continue the r278 campaign's numbering
+(which lives in `archive/work/upstream-rebase-261113/DECISIONS.md` and must not be confused with this file).
+
+Status: `OPEN` = waiting on the maintainer · `DECIDED` = answered, with the date and the choice ·
+`MERGE` = resolved inside the rung, recorded in `RUNGS.md` (not a question).
+
+---
+
+## D1 — `#32505` duplicate expert IDs subsumes block 00's carried upstream-PR port  ·  **OPEN**
+
+**Claim.** Block 00 carries a *port* of the delivery's own upstream-PR candidate
+(`upstream/UPSTREAM-PR-mul-mat-id-dup.patch`) so the CUDA `MUL_MAT_ID` handles a repeated expert id.  Upstream
+`b94959a64` (*CUDA: implement support for duplicate expert IDs (#32505)*, 2026-11-19) lands the same feature
+in the backend, removes the `[TAG_MUL_MAT_ID_DUPLICATE_ID]` caveat from `ggml.h`, and reworks `mmid.cu`
+(+209) and `mmf.cuh` (−245/+…: the `mmf.cuh` few-row machinery is restructured).
+
+**Evidence.**
+
+| item | value |
+|---|---|
+| our port | block 00 commit message: "the upstream MUL_MAT_ID duplicate-ids fix … `mmids_helper` keeps every occurrence … `test-backend-ops -o MUL_MAT_ID` 931/931" |
+| upstream | `b94959a64`, 9 files, +251/−271; also deletes the `ggml.h` caveat block (6 lines) |
+| conflict it causes | block 00: `mmid.cu`, `mmf.cuh`; blocks 06/08: `mmid.cu` (`mmf.cuh` at 08) — **5 of the 61 conflicted paths** |
+| our `upstream/` record | `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` + its README |
+
+**Options.**
+
+1. **Take upstream's `mmid.cu`/`mmf.cuh`/`ggml.h`, drop the block-00 port** (recommended).  Upstream's is the
+   canonical implementation, it is what every later block will be rebased against, and it removes ~5 conflict
+   paths from the climb.  The `upstream/UPSTREAM-PR-mul-mat-id-dup.patch` candidate is then **retired** (it
+   has been merged upstream; the record moves to `archive/work/`).
+2. Keep ours and re-port on top of upstream's rework.  Cost: a rewrite of `mmid.cu` against a restructured
+   `mmf.cuh`, for no gain — the features are the same one.
+3. Keep both behind a switch.  Rejected on sight: two duplicate-id implementations is a correctness hazard,
+   not a preference.
+
+**Needs the maintainer because:** option 1 deletes delivery code and retires an `upstream/` candidate.
+
+**Verification for option 1 (R00 exit):** `test-backend-ops -o MUL_MAT_ID` on gfx1201, plus the block-00
+`quantize_mmq_q8_1` item the port also fixed.
+
+---
+
+## D2 — `#30542` HIP VMM pool: carry block 00's revert a second time  ·  **OPEN (re-confirm)**
+
+**Claim.** The r278 campaign's **BASE BLOCKER B1** is still live at `919794500`: the pristine base, built the
+way the delivery builds (`GGML_HIP_NO_VMM=OFF`, ROCm 10.1.0, gfx1201), never returns from its first GPU
+compute.  The standing r278 decision was "carry the revert in block 00; drop it at the next re-base".
+
+**Evidence, measured today on the pristine base (`build-base`).**
+
+| arm | result |
+|---|---|
+| `HIP_VISIBLE_DEVICES=0 llama-cli -m Qwen3.5-4B-Q8_0 -ngl 99 -sm layer -n 20` | **hang** — SIGKILLed at 150 s (rc 137), no `load time` line |
+| upstream code | `ggml-cuda.cu:709-712` still has the `#30542` reserve-before-`cuMemCreate` + halve-on-`OUT_OF_MEMORY` retry loop, byte-for-byte the trigger the r278 campaign pinned |
+| (`GGML_HIP_NO_VMM` is a **CMake** option, not an env var — a runtime `GGML_HIP_NO_VMM=ON` changes nothing; a `build-base-novmm` control build was made to prove the mechanism) |
+
+**Options.**
+
+1. **Carry the revert again, folded into block 00** (recommended — it is the r278 standing decision, the code
+   upstream ships is unchanged, and it is the only configuration that restores the VMM path the delivery's
+   host-expert tier needs).
+2. HIP-gate the revert.  Same cost, no validated benefit, and it forks the VMM pool per backend.
+3. Open an upstream issue and build the whole climb with `GGML_HIP_NO_VMM=ON`.  Blocks 09/15 (host-expert
+   arena, GTT store) cannot be verified that way, so the climb would carry unverified rungs.
+
+**Recorded at r278:** `archive/work/upstream-rebase-261113/BASE-BLOCKER.md` — nothing in it has expired.
+
+---
+
+## D3 — `#32387` BF16 ROPE/SET_ROWS and the bf16-cache rope fusion vs block 04  ·  **OPEN**
+
+**Claim.** Upstream `7fce5439f` adds BF16 to `ROPE` and `SET_ROWS` on CPU and CUDA **and** "`cuda : fuse BF16
+rope into a BF16 cache`" — the same fused `ROPE + VIEW + SET_ROWS`-into-`BF16` path block 04 added, and it
+lands on the same assertion (`src0 F32 -> dst F16 **or BF16**`) in `rope.cu`.
+
+**Evidence.**
+
+| item | value |
+|---|---|
+| ours (block 04, `rope.cu`) | changes the fused-path assertion to `src0->type == F32 && (dst == F16 \|\| dst == BF16)` and adds the `rope_multi<forward,float,bf16>` dispatch arm |
+| upstream | `7fce5439f`, 13 files, "cuda : fuse BF16 rope into a BF16 cache"; touches `rope.cu` (+63), `set-rows.cu` (+53), `ggml-cuda.cu` (+13), `ggml.c`, `ops.cpp`, tests |
+| conflict it causes | block 04 `rope.cu`, `ggml-cuda.cu`; block 08 `set-rows.cu`; block 10 `rope.cu` — 4 paths |
+| the rest of block 04 | untouched by upstream: `fattn-tile.cu(h)` (+623/−191 `f16`-tile bf16-native work), `fattn-mma-f16.cuh` (+30), `common.cuh` (+53) |
+
+**Options.**
+
+1. **Take upstream's `rope.cu` bf16 arm + assertion; keep block 04's `fattn-tile`/`fattn-mma` bf16 attention**
+   (recommended if the arms are equivalent — to be checked at R04 by diffing the two dispatches and confirming
+   the bf16 KV cache + native bf16 FA still measures its kill-switch delta).
+2. Keep ours and drop upstream's — wrong: upstream's also serves CUDA-on-NVIDIA and other backends, and the
+   delivery's scope policy says a non-AMD path must not be injured.
+3. Keep both arms if they are not the same code path (possible: ours may fuse *during* the tile kernel,
+   upstream's in `rope.cu`).
+
+**Ask before R04** because option 1 may delete our `rope.cu` change (the small part of block 04).
+
+---
+
+## D4 — `#32454` CUDA NORM + MUL (+ ADD) fusion vs block 08's `norm-gated.cu`  ·  **OPEN**
+
+**Claim.** Upstream now ships a NORM+MUL(+ADD) fusion in `norm.cu` + a `ggml-cuda.cu` dispatch decision.
+Block 08 ships `norm-gated.cu` — a narrow-row (ncols ≤ 256) wave-per-row RMS norm with an optional sigmoid
+gate and a bit-exact reduction order — plus the delivery's fusion dispatcher.  These are two mechanisms for
+"do not launch a separate MUL after a norm".
+
+**Evidence.**
+
+| item | value |
+|---|---|
+| ours | `ggml/src/ggml-cuda/norm-gated.cu` (block 08), guarded by `GGML_CUDA_DISABLE_NORM_ROWS`, gate `scripts/gate-norm-rows-alias.sh`; 8 rows/256-thread block, `rms_norm_f32<256>`-identical reduction |
+| upstream | `03ec5b432` — `ggml-cuda.cu` +30, `norm.cu` +72/−26, `norm.cuh` +5; a fused epilogue on the *general* kernel |
+| conflict it causes | block 08 `norm.cu`, `ggml-cuda.cu` |
+| why they are not the same | ours is a *launch-shape* win for the ~786 k narrow rows (block-scheduling bound); upstream's is a *fusion* win (one fewer kernel).  Both can hold, but only if the dispatcher picks exactly one. |
+
+**These are probably complementary** — the loud question is which one takes the fused case, and whether the
+delivery's fusion dispatcher (block 10) still owns the decision.
+
+**Options.**
+
+1. Keep both, with a documented precedence (ours for narrow rows, upstream's otherwise) and a gate arm proving
+   each still fires (recommended, pending the R08 diff).
+2. Drop `norm-gated.cu` if upstream's fusion + the narrow-row launch equals its measured win at R08.
+3. Drop upstream's fusion on the narrow-row path only.
+
+Measured at R08 before any deletion, with `GGML_CUDA_DISABLE_NORM_ROWS=0/1` and the prefill-logit gate.
+
+---
+
+## D5 — DFlash speculative-decoding refactor (`#32016`, `#31904`) vs blocks 02/12  ·  **OPEN**
+
+**Claim.** Upstream restructured the DFlash-based speculative decoding methods (`32bdc3a89`) and added
+DFLASH2 (`de32b268c`).  That is the surface blocks 02 (adaptive MTP draft depth) and 12 (DFlash) sit on, and
+block 13's draft-vocabulary subset touches the same `common/speculative.cpp` plumbing.
+
+**Evidence.** `32bdc3a89` touches `common/common.h`, `common/speculative.cpp`, `docs/speculative.md`, both
+READMEs, `src/models/dflash.cpp` — the five block-02 conflicts plus block 12's `speculative.cpp` and
+`dflash.cpp`.  `652d559ed` also rewrites DFlash's node-budget rule in `dflash.cpp` (see D8).
+
+**Options / what to measure.** The refactor is *structural*, so the first question is mechanical: does the
+delivery's adaptive-depth control still have a seam?  Then: does upstream's structure change the four-axis
+MTP protocol's baseline (`benchmarks/mtp-adaptive-methodology.md`)?  Stop at R02 and present the diff.
+
+---
+
+## D6 — `llama_batch_ext` migration (`#32356`, `#32306`)  ·  **MERGE (high cost)**
+
+The old batch API is deprecated and `llama_batch_ext` introduced.  Blocks 02, 12, 16 (and every gate arm that
+builds a `llama_batch`) must migrate.  Not a subsumption — the ladder does it — but it is the single biggest
+*mechanical* cost in this re-base and the reason R12/R16 should not be scheduled beside a benchmark.
+Note it also affects the **gate scripts** (`llama-batched-bench`, the CLI arms), not only the sources.
+
+---
+
+## D7 — server `slot_sched` refactor (`#32154`) vs block 16 / block 12  ·  **MERGE (structural)**
+
+`429460dc0` adds `server_slot_sched` and a prompt running hash and rewrites `server-context.cpp` /
+`server-task.{cpp,h}`.  Block 16 (max-min fair admission, per-step chunk, prefill/decode duty cycle) and
+block 12 (idle-slot parking, server prompt cache) both live there.  Both blocks apply **clean** in the probe,
+which means the probe is *not* seeing this one — read the refactor at R12 and R16 and check that:
+the admission policy still runs per step, the parking path still has its seam, and `gate-prefill-fairness.sh`
+/ `gate-park-idle-slots.sh` still reach their code.
+
+---
+
+## D8 — graph node budget into the model classes (`#32648`) + MoE-cache node reserve (`#32636`)  ·  **MERGE**
+
+Upstream moved the nodes-per-tensor factor into `llama_model::graph_nodes_per_tensor()` (defaults 8; 32/64
+overrides in `models.h`; DFlash keeps its hparams rule in `dflash.cpp`) and added
+`res += 32*n_layer_all` when `cparams.moe_cache_size > 0`.  The delivery (block 10) owns the budget's other
+half: the KV-rotation leaf accounting and the hard "over its node budget" refusal.  The merge is additive —
+keep upstream's factor function, keep our rotation leaves and refusal, and re-run `scripts/gate-node-budget.sh`.
+**Note:** upstream's MoE-cache reserve is for *their* `--moe-cache`, not for block 09's arena; check whether
+block 09 needs its own term.
+
+---
+
+## D9 — indexer key rotation into the model classes (`#32653`)  ·  **MERGE**
+
+`4783b1145` replaces the architecture list in `llama-kv-cache.cpp` with `llama_model::lid_k_hdmd()` (and fixes
+DeepSeek4.1).  Blocks 09 (KV cache) and 11 (qwen4exp/indexer) both touch that decision.  Merge: keep the
+virtual, make qwen4exp's answer explicit in its model class rather than in the cache's list.
+
+---
+
+## D10 — `--tensor-split` up to `llama_max_devices()` (`#31435`) vs block 0300  ·  **MERGE**
+
+`7804be063` relaxes the argument limit for `--tensor-split`/`--fit-target`.  Block 0300 (`-sm relaxed-tensor`)
+is adjacent but independent.  Check that the relaxed-tensor path's own device-count assumption still holds, and
+that `test-arg-parser` (block 02 touches it) still agrees.
+
+---
+
+## D11 — upstream HIP/GCN MMQ + MMVQ tuning vs blocks 06/07/08  ·  **MERGE, measure**
+
+Upstream retuned the AMD MMQ configs in a **new file** `mmq-config-gcn.cuh` (`b79696f1f` +128/−83,
+`2e53a0bab` +456/−237 incl. stream-K on GCN) and the MMVQ `ne11` gate for RDNA3_5 (`c7518dbec`).  The
+delivery's blocks 06/07/08 tune `mmq.cuh`, `mmq.cu`, `mmvq.cu` (wide-VDR MoE, Q6_K MMQ, verify-band WMMA) and
+carry their own per-arch defaults.  **Risk: double tuning** — a delivery default that silently overrides
+upstream's new table, or vice versa.  Resolve as "one source of truth per knob", then re-measure the MMB/MMVQ
+arms at R08 rather than assume.
+
+---
+
+## D12 — staging buffer from the CPU buffer type (`#31438`) vs block 10  ·  **MERGE**
+
+`3e41ae69d` allocates `llama_context`'s tensor staging buffer from the CPU buffer type.  Block 10's async
+input ring is a staging path with its own lifetime rules.  Check whether it now allocates twice or whether
+upstream's change is the better home for it.
+
+---
+
+## D13 — qwen4exp upstream work (`#32483`, `#32476`) vs block 11  ·  **MERGE, read**
+
+Upstream fixed the qwen4exp graph reallocation from the n-gram table scale and FP8 checkpoint conversion.
+Both are in `src/models/qwen4exp.cpp` — a file block 11 owns.  Take upstream's fixes; confirm the delivery's
+QSA/indexer/lazy-reader additions still sit on top, and re-run `gate-qwen4exp-quant-coherence.sh` at R11.
+
+---
+
+## D14 — UI moved `tools/ui/` -> `ui/`  ·  **MERGE (tooling)**
+
+The delivery's `scripts/ui-dist-cache.sh` (`TODO` #342) seeds `${checkout}/tools/ui/dist`; upstream's
+`scripts/ui-assets.cmake` now resolves `SRC_DIST_DIR = ${UI_SOURCE_DIR}/dist` with `UI_SOURCE_DIR = ui`.
+Priority-1 provisioning therefore misses, and the per-block release ladder would pay a HF download per rung
+again.  Fix the cache path before the **R18** ladder (not needed for a per-rung build, whose build dir keeps
+its own copy).  Verified today: the pristine base build fell back to `latest` after `b12597` returned
+`HTTP response code said error`, which is the same class of failure `TODO` #342 describes.

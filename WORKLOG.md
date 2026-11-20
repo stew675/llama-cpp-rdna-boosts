@@ -1,3 +1,45 @@
+## 261120.005 (r327) -- re-base campaign opened: 18 blocks `4f9dfa0e3` -> `919794500`, measured conflict map, 14 decision points, and the r278 base blocker is still live (no delivery change)
+
+**No delivery patch changed, no block created, split or renumbered, no release.**  This entry records the
+opening of the r328 re-base campaign (record: [`wip/upstream-rebase-261120/`](wip/upstream-rebase-261120/README.md)),
+which is a ladder climb across sessions, exactly as the r278 re-base was.
+
+### What was measured before any rung was climbed
+
+| item | value |
+|---|---|
+| upstream drift | **228 commits**, 1944 files, **+147 254 / −41 182** (r278's was 164 / 751 / +40 612) |
+| delivery shape | 18 block commits, 557 distinct files; **96** of them upstream also touched |
+| text conflicts | **61 conflicted paths across 12 blocks**; only blocks 01, 13, 15, 16 and 0300 apply clean (`probe-conflicts.py`) |
+| semantic pressure | **every** block shares files with upstream; the worst exposures are block 09 (136 upstream commits on its files), 12 (143), 11 (140), 10 (135) (`probe-overlap.py`) |
+
+### Findings that need the maintainer before R00
+
+- **`D1` — `#32505` (duplicate expert ids) subsumes block 00's carried upstream-PR port.**  Upstream landed
+the same feature with its own mechanism (`mm_ids_helper_store` + shared-memory store, +209/-271 across
+`mmid.cu`/`mmf.cuh`/`ggml.h`).  Recommendation: take upstream's, drop ours, retire the
+`upstream/UPSTREAM-PR-mul-mat-id-dup.patch` candidate.  This is the only *delivery code deletion* in R00 and
+it needs the maintainer's word.
+- **`D2` — the r278 BASE BLOCKER B1 is still live.**  The pristine `919794500` base, built the delivery's way
+(`GGML_HIP_NO_VMM=OFF`, the host-expert tier needs VMM), **hangs on its first GPU compute** (SIGKILL at 150 s,
+no `load time` line); a `GGML_HIP_NO_VMM=ON` control build of the same tree runs the 4B arm in 2 s at
+`247.7 / 92.2` t/s and reads `100 chars sha=1c5d32ac537d`.  `#30542`'s reserve-and-halve retry is unchanged at
+`ggml-cuda.cu:709-712`, so block 00 carries the revert again — the r278 standing decision.
+- The other 12 entries in `wip/upstream-rebase-261120/DECISIONS.md` are staged for their rung: the NORM+MUL
+fusion, BF16 ROPE/SET_ROWS, few-row MMQ for `MUL_MAT_ID`, the DFlash spec refactor, `llama_batch_ext`, the
+server `slot_sched` refactor, the node-budget move into the model classes, the indexer key rotation, HIP MMQ
+tuning and the UI move `tools/ui/` -> `ui/` (which breaks `ui-dist-cache.sh`'s Priority-1 path for the
+per-block ladder).
+
+### State
+
+`rebase-r328` exists in `~/llama.cpp` at `919794500` (clean); `build-rocm/bin-r327` preserves the shipping
+binary; `build-base` / `build-base-novmm` are the pristine-base oracle and its control.  R00 is
+conflict-by-conflict analysed in `RUNGS.md` and **stops there** pending `D1`/`D2`.  Nothing in `patches/`,
+`release.json`, `rdna-boosts-all.patch` or the fork has been touched.
+
+---
+
 ## 261120.004 (r327, RELEASE v17-4f9dfa0e3-r327) -- one FA KV-group bitmap per graph evaluation, in the default set but OPT-IN: exact, censused, and worth nothing on this box (contributor PR #337, `TODO` #348 retired)
 
 **Release:** `v17-4f9dfa0e3-r327`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `e159adfc2` (tree
