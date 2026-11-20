@@ -1,8 +1,13 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: OPEN — scaffolded 2026-11-20. Nothing is delivery yet. Zero rungs climbed.**
+**Status: OPEN — 2 of 18 rungs climbed (R00, R01) on 2026-11-20. Nothing is delivery yet.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
-the final rung (R18).  Target: the next release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
+the final rung (R18).  Ladder branch `rebase-r328` = `14a0414bb` (tree `6566ca3ac`) after R01; every rung so
+far is green on build + coherence and each has one entry in [`RUNGS.md`](RUNGS.md).  **Known-red from R00 to
+R09:** upstream's qwen4exp lightning-indexer `ggml_top_k` aborts under the delivery's VMM pool
+(`hipMemcpy2DAsync` "invalid argument") — block 10's `top_k_gather_rows` is the fix, so it is re-verified at
+R10, and the `mm_ids_helper_512_10` A/B waits with it.  Next rung: **R02** (block 02, adaptive MTP), whose 5
+conflicts are all the DFlash spec refactor (`DECISIONS.md` D5 — stop and present).  Target: the next release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 
 This is a **ladder climb, not a single rebase**: one rung per delivery block, each rung ending in a resolved
