@@ -216,12 +216,16 @@ in CI.  The model-level gates are manual:
    the `all` profile** -- the cost is the `tests/test-backend-ops.cpp` TU, ~5 min, several distinct contents).  The
    gate prints a `configured (Ns)` line and ticks while it CONFIGURES as well as while it compiles: a per-rung
    configure is ~20-25 s of silent cmake, and a heartbeat that only covered compiling made a working ladder look
-   hung.  **Before the ladder, put the UI assets in `tools/ui/dist` of the checkout** (64 files, copied from a
-   working build; untracked and gitignored, so it survives the gate's checkouts): `ui-assets.cmake`'s Priority 1
-   then skips the per-rung HuggingFace fetch, which otherwise runs for EVERY rung because the download lives in
-   the build dir the gate wipes -- measured r326: rung 14 died on `UI: download dist.tar.gz.sha256 from b12387
-   failed: Timeout was reached` with `HF_UI_VERSION` pinned, 13/14 rungs wasted.  (The container build does the
-   same by construction: its `web` stage copies a pre-built `tools/ui/dist` in.)  **Run it against the long-lived checkout** (its default
+   hung.  **The UI fetch is blocked by tooling since r326 (`TODO` #342): nothing to do by hand.**
+   `ui-assets.cmake`'s asset cache lives in the BUILD dir, so before r326 every rung refetched the bundle from
+   HuggingFace *inside its compile time*, and a timeout failed the rung (measured r326: rung 14,
+   `UI: download dist.tar.gz.sha256 from b12387 failed: Timeout was reached` with `HF_UI_VERSION` pinned, 13
+   finished rungs discarded).  The gate now calls `scripts/ui-dist-cache.sh` before the loop (one validated
+   bundle per machine in `~/.cache/rdna-boosts/ui-dist`, mirrored into the checkout's `tools/ui/dist` --
+   Priority 1, untracked + gitignored so it survives the per-rung checkouts) **and** configures every rung with
+   `LLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF`, so a machine with no cache builds without the embedded UI
+   instead of touching the network.  `scripts/scratch-tree.sh` does the same.  (The container build satisfied
+   this by construction all along: its `web` stage copies a pre-built `tools/ui/dist` in.)  **Run it against the long-lived checkout** (its default
    `--repo`, or `scripts/scratch-tree.sh gate`): ccache keys on the source path, so a per-arm worktree makes
    the first block a full cold build (measured: 5m56s / 85 CPU-min at a new path vs 8.6s for the same
    content at the established one).  The gate prints each commit's build time and the run's total; a first

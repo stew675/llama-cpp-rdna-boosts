@@ -427,7 +427,9 @@ to "the build is slow" (`archive/work/build-time-regression/`).
 
 Keep every arm in **one** long-lived source path (`scripts/scratch-tree.sh` switches states inside it) —
 ccache keys on the absolute path, so a new worktree is a full cold build (5-6 min) while a fresh build dir
-at the same path is ~9 s. **The release flow is `--fast --jobs 28`: measured 2.5-12 min for the full 18-rung ladder; the `all`
+at the same path is ~9 s. **The release flow is `--fast --jobs 28`: measured 2.5-12 min for the full 18-rung ladder** (the UI bundle is
+pre-placed from one shared cache by `scripts/ui-dist-cache.sh`, and every rung configures with the HF fetch
+off, so no rung pays a download -- `TODO` #342); **the `all`
 profile is the r2 standard for a re-base or a change that touches `tests/` or a shared header, and costs
 ~35-55 min** (one `tests/test-backend-ops.cpp` TU with several distinct contents).  `--changed-from <prev tip>`
 is a *delta* gate and is NOT a substitute for the ladder after amending an early block (r307: blocks 09-11

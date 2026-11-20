@@ -80,11 +80,20 @@ are larger than this box's, i.e. ROCm 10.0.0 launches more expensively than 10.1
   `configured (Ns)` per rung.  A per-rung configure is 20-25 s of silent cmake, so a healthy ladder looked like a
   hung one (an `all`-profile ladder was killed by hand at rung 15 after 55 min looking dead).  It also states the
   profile's cost up front.
-* **Put the UI assets in `tools/ui/dist` before the ladder** (`ui-assets.cmake` Priority 1).  The HF fetch lives in
-  the build dir the gate wipes, so it runs once per rung: rung 14 died on
-  `UI: download dist.tar.gz.sha256 from b12387 failed: Timeout was reached` with `HF_UI_VERSION` pinned and lost
-  13 rungs of work.  Recorded in `MANIFESTS.md` gate 5 and `AGENTS.md` (`all` vs `--fast`, and that
-  `--changed-from` is a delta gate, not a substitute, after amending an early block).
+* **The per-rung UI fetch is BLOCKED, not documented** (`TODO` #342's tooling half, closed here).  New
+  `scripts/ui-dist-cache.sh` keeps one validated bundle per machine (`~/.cache/rdna-boosts/ui-dist`; a bundle
+  with `index.html` but no `workbox*.js` -- the #342 signature -- is refused) and mirrors it into a checkout's
+  `tools/ui/dist`, which is `ui-assets.cmake`'s Priority 1 and survives the gate's per-rung checkouts because it
+  is untracked and gitignored.  `gate-per-block-build.sh` and `scripts/scratch-tree.sh` call it before their
+  first configure **and** configure with `LLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF`, so a machine with no
+  cache builds without the embedded UI rather than fetching (verified: with the assets and the cache removed the
+  gate re-seeded from a known-good build tree and the ladder never touched the network; with no assets at all
+  the build-time step reads `UI: no assets available - building without an embedded UI` and proceeds).  Before
+  this, the fetch lived in the build dir the gate wipes, so it ran once per rung inside that rung's compile
+  time: rung 14 died on `UI: download dist.tar.gz.sha256 from b12387 failed: Timeout was reached` with
+  `HF_UI_VERSION` pinned and lost 13 finished rungs.  `TODO` #342 now waits on upstream's `latest` bundle only.
+  `MANIFESTS.md` gate 5 + `AGENTS.md` record `all` vs `--fast` and that `--changed-from` is a delta gate, not a
+  substitute, after amending an early block.
 
 ## 261120.002 (r325, RELEASE v17-4f9dfa0e3-r325) -- the MoE device gather's launch shape: `n_split` 8 -> 32, a block 09 amendment (+7.5 % prefill on the 1-GPU host-expert shape)
 
