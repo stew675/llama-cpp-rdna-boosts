@@ -1259,3 +1259,67 @@ Record: `WORKLOG.md` 261119.006, `GREEDY-PURITY.md` §98, `patches/README.md` bl
 
 Record: `WORKLOG.md` 261119.007, `benchmarks/2026-11-19-glu-inplace.md`, `patches/README.md` block 00,
 `MANIFESTS.md` gate 00/37, `ENVIRONMENT.md` §1.1b, `scripts/gate-glu-inplace.sh`, PR #334.
+
+## r324 (2026-11-19, `WORKLOG.md` 261119.008) — the MoE weighted reduction is computed without fma contraction, and its fold outranks the MUL-only fold (contributor PR #335)
+
+The expert weighted reduction has two implementations of one arithmetic — the standalone
+`moe_weighted_reduction_f32_vec4`/`_f32` kernels and `mul_mat_vec_q_moe`'s `fusion.red_dst` fold — and a precedence
+rule between that fold and `ggml_cuda_moe_down_fold_try_fuse`.  Five things were learned, in the order they bit.
+
+1. **"The same expression" is not "the same arithmetic": the ROUNDING MODE is part of the claim.**  Both sites
+   accumulate `sum + (x * scale) * w`, which HIP clang contracts into `v_fmac_f32`; no unfused graph does.  So the
+   fold matched the standalone kernel exactly and **neither matched the `MUL`/`VIEW`/`ADD` chain**, and the r323
+   delivery's MoE decode text was not the chain's text on qwen35moe, qwen3moe *and* gemma4 (`bd111389f051` vs the
+   chain's `abed0bf40d87` on 35B-A3B Q4_K_M).  KLD against the fully unfused graph at `-ub 512` was
+   **0.006613 / 96.627 %**, with the unfused base logits byte-identical on both builds (sha256 `0a4a69973ab8…`,
+   base PPL 7.1177) — i.e. the reference was the same object and the divergence was entirely the fused paths.
+2. **`__fmul_rn` / `__fadd_rn` do not work; `#pragma clang fp contract(off)` does — and only in the right place.**
+   HIP lowers the intrinsics to plain ops and contracts those.  The pragma is legal only at file scope or **at the
+   start of a compound statement** (so every site opens a block for it), it needs a toolchain default of
+   `-ffp-contract=fast-honor-pragmas` (HIP clang's is; clang-CUDA's plain `fast` and nvcc both ignore it, so a
+   non-AMD backend keeps the contracted arithmetic and changes nothing), and it survives `__forceinline__` template
+   instantiation — verified in the emitted ISA (`v_fmac_f32` against `v_mul_f32` + `v_add_f32`), including through
+   a helper.
+3. **ONE knob for two implementations that replace each other.**  `GGML_CUDA_MWR_EXACT` drives both the fold's sum
+   (`fusion.red_contract = !ggml_cuda_mwr_exact()`) and the kernels (a `mwr_acc<exact>` template).  Two independent
+   switches are a trap: `EXACT=0` alone leaves the fold exact and the kernel contracted, a state no release
+   shipped, and a bisect would blame the fold.  The pair must also be *proven* to revert:
+   `GGML_CUDA_MWR_EXACT=0 GGML_CUDA_MWR_FOLD_FIRST=0` reproduces r323 bit for bit (`bd111389f051`), while
+   `EXACT=0` alone is its own third text (`0e1e59e500e8`) — which is the non-vacuity check for the knob.
+4. **A fold may only displace another where it can SERVE the node, so the predicate lives at the ARMING site.**
+   The precedence change makes `ggml_cuda_moe_down_fold_try_fuse` stand aside for an armed node, worth a launch per
+   MoE layer (`MWR FOLD` 1 of 83 armed sites on r323 → 163 of 163 here, with `MWR FOLD ASIDE` matching and
+   `MWR FOLD DECLINE` 0).  But `ggml_cuda_mwr_fold_mark` armed from the graph pattern alone, and the fold itself
+   also needs `warp_size == 32`, `ne[2] == ne[3] == 1`, a contiguous down output and
+   `ne[0] <= 2*GGML_CUDA_MOE_RED_CNT-2` = 8190.  Any disagreement (CDNA's warp 64, a large `n_embd`, an
+   `ne[3] != 1` graph) would have cost the MUL fold and bought nothing.  The conditions now live in one function,
+   `ggml_cuda_mwr_fold_serve_ok()`, enforced where the node is **armed**, so "armed implies servable" holds by
+   construction and the stand-aside site needs no copy of it.  `GGML_CUDA_MWR_FOLD_FIRST` defaults **off** outside
+   `GGML_USE_HIP` because nvcc ignores the pragma and there the fold would be the less exact of the two.
+5. **A short `-ub 1` KLD window cannot see this class; the greedy text and a census can.**  The submitter's own
+   decode row read ≈0 on the unpatched build and concluded "already exact" — while the same-seed 256-token text
+   differs from the chain's.  512 sequential token steps over 2 chunks do not accumulate what 256 greedy tokens
+   do, so `-ub 1` KLD is the wrong instrument here and the census is not optional: `GGML_CUDA_MWR_DEBUG` now prints
+   `MWR EXACT exact|contracted` once, plus `MWR FOLD` / `MWR FOLD ASIDE` / `MWR FOLD DECLINE` / `MWR FUSED`, which
+   is what makes the precedence and the arithmetic observable rather than inferred.
+
+Measured: KLD 0.006613 / 96.627 % → **0.000000 / 100.000 %**; the default text now EQUALS the fully unfused chain
+on 35B-A3B Q4_K_M, Qwen3-Coder-30B-A3B and gemma-4-26B-A4B, dense 4B unchanged (`18d8b09cd3d3`); tg128 **+3.3 %**
+on 35B-A3B Q4_K_M (121.66/121.71 → 125.90/125.33), **+2.2 %** on Qwen3-Coder-30B-A3B, flat on gemma4 (which already
+took the larger fold), pp512 flat everywhere.
+
+Two side findings, both fixed in the same change.  **The release prefill-logit base moves**: against an r323 base
+the gate now reads 0.006513 / 96.392 % (canonical), 0.006874 / 96.627 % (`-ub 512`) and 0.006412 / 96.588 %
+(3-device `-sm tensor`), so the base is re-recorded at r324 — the justification is item 1's first table, the new
+build *is* the unfused chain and the old one was not.  **`gate-server-arms.sh` was not reproducible and had two
+defects of its own**: it never pinned `MOE_EXPERT_HEATMAP`, so each run started from the prior the previous run
+wrote back into the model's `.moe-heatmap`, and it fired both slots' requests simultaneously, so the admission
+order was a race that selected between two states of both the text and the acceptance.  With
+`MOE_EXPERT_HEATMAP=load` and a fixed-order stagger each build reproduces its own numbers exactly (verified twice
+on r323 and on r324), and its anchors are re-recorded; the `35b10` arm's *second slot* still moves (a
+fixed-time stagger lands at a variable point in slot 0's prefill), so that arm's text is now reported rather than
+asserted — its acceptance checks, which are the collapse detector the arm exists for, stay hard (`TODO` #349).
+
+Record: `WORKLOG.md` 261119.008, `benchmarks/2026-11-19-mwr-exact.md`, `patches/README.md` block 10,
+`MANIFESTS.md` gate 37, `ENVIRONMENT.md` §8 (`GGML_CUDA_MWR_EXACT`, `GGML_CUDA_MWR_FOLD_FIRST`,
+`GGML_CUDA_MWR_DEBUG`), `scripts/gate-mwr-exact.sh`, `GREEDY-PURITY.md` §102, PR #335.

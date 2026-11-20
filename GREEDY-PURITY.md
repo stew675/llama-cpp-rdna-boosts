@@ -171,6 +171,7 @@ is worth keeping moves it to that archive under its own number rather than growi
 | **§98** | **a decode/verify kernel's fixup period is a NUMERIC-ORDER constant, so it must not depend on the query width or the KV extent — and the shipping value is the one the end-to-end arm ranks, not the op table**: the RDNA4 band's `P` (blocks per output tile) has a *width-dependent* optimum — the decode width wants 16 and the verify widths want 8 on gfx1201 (q8_0, medians of 3: 92.9 against 104.0 µs at kv 16384/n_q 1, 150.1 against 170.2 at kv 16384/n_q 8), so one constant is necessarily suboptimal somewhere and keying it on `n_q` would split a decode step from its own verify (invariant 1).  The quantized types' old default `nsm` (32) was 5-14 % off at every banded shape and shipped as `nsm/2` (r316); `P` 8 wins the verify rows and loses every end-to-end arm (40.86 against 42.45 t/s at d32768; 75.68 against 88.91 on a 20.5K MTP arm), and the attention-bound arm's +17.1 % token rate is only ~4.5 %/step of kernel — the rest is the acceptance re-roll a numeric-order change carries, so never quote a greedy speculative arm's t/s delta as the kernel's win.  A constant `P` is width-pure BY CONSTRUCTION (37 probe arms, maxdiff 0), which is what makes it cheap to gate: a *keyed* `P` would owe §97's crossing measurement | doctrine + fix (r316, block 05, `TODO` #346 closed; `INVARIANTS.md` r316; `benchmarks/2026-11-18-band-fixup-period.md`) |
 | **§99** | **a decode/verify KV split is the summation order, so it must be a RUN CONSTANT — never a function of the padded used KV extent**: the tile FA launcher's `parallel_blocks` (`gridDim.y`) decides which block owns KV iterations b, b+P, b+2P, …, and the combine sums the P partials in block order, so P re-groups real iterations.  `K->ne[1]` is `GGML_PAD(used, 256)` computed AFTER the batch is applied, so a W-row verify at position p sees `pad(p+W)` against the plain decode's `pad(p+1)`; at a 256-cell multiple the old efficiency search picked a different P for the same row (176 against 175 at 27B 3-device tensor `nkv` 5632) and moved the logits by up to 0.232868 — a greedy near-tie flipped, so `plain != draft-mtp` (issue #330).  Pin P to the search's one-full-wave value for `Q->ne[1] <= 8`: deep KV then appends only masked no-ops, shallow KV is one iteration per block (ascending), and the `ntiles_KV = P_const` crossing is exact | fix (r319, block 05, issue #330; `INVARIANTS.md` r319; `benchmarks/2026-11-19-fa-split-boundary-purity.md`) |
 | **§100** | **a fold's overlap test must test the buffers the kernel READS, not the nodes it was handed — a deferred gather makes the state node dead**: `gdn_conv_norm_match()` writes the GDN q/k norm outputs while the direct conv still streams `x`/state/`w`, so it refuses a SCALE output that overlaps them.  When the conv-state `GET_ROWS` is a **deferred** gather the kernel reads the cache row through the gather's row id and never touches `m.state->data`, so the allocator legitimately places the q output over that dead node — and the spans collide for any verify width >= 6 (`128*nk*T` against `3*C`; 27B: 20 480 B per row against 122 880 B), costing one norm launch per GDN layer per step.  Test `root->src[0]` (the cache tensor) in that case instead of dropping the test: the contributor form simply skipped it.  The reach is the CPY-snapshot verify shape ONLY — the rollback `SET_ROWS` store owns the DFlash2/MTP band and never enters the matcher — and the measured value there is **0.02 %** (38 692.4 -> 38 685.6 ms over 2048 tokens, 5 interleaved pairs, against 39 262.4 ms with the fold off), i.e. a correctness fix, not a decode win.  Because the decision moves no hash, the width-probe arm is vacuous without a matcher census (`deferred=1 base=overlap_state` -> `folded`) | doctrine + fix (r320, block 10, PR #316; `INVARIANTS.md` r320; `test-logits-width-probe KV=q8_0` `W=6..8`) |
+| **§102** | **a "same arithmetic" claim about a fold is a claim about the ROUNDING MODE, not the expression — and the two implementations that replace each other must be switched together**: the MoE expert weighted sum exists twice (`moe_weighted_reduction_f32_vec4`/`_f32` in the standalone kernel, and `mul_mat_vec_q_moe`'s `fusion.red_dst` fold), both accumulating `sum + (x * scale) * w`.  Written identically and compiled by HIP clang, BOTH contract that into `v_fmac_f32`; no unfused graph does, so the delivery's MoE decode text was **not** the `MUL`/`VIEW`/`ADD` chain's text on qwen35moe, qwen3moe and gemma4, and the `-ub 512` prefill point read mean KLD **0.006613 / 96.627 %** against the fully unfused graph on r323.  `__fmul_rn`/`__fadd_rn` do not fix it (HIP lowers them to plain ops and contracts them anyway); `#pragma clang fp contract(off)` at the head of a compound statement does, and it survives `__forceinline__` template instantiation (verified in the emitted ISA).  With it the same point reads **0.000000 / 100.000 %** and the greedy text EQUALS the unfused chain on all three families.  Three consequences: **(a)** ONE knob for both paths (`GGML_CUDA_MWR_EXACT`) — they replace each other at the same node, so an arm where only one is exact compares two arithmetics and a bisect blames the wrong one, and the `ENVIRONMENT.md` wording must say "own order *and expression*"; **(b)** a fold that displaces another fold must displace it only where it can SERVE it, so the serve predicate lives in one function enforced at the ARMING site (`ggml_cuda_mwr_fold_serve_ok()`), never duplicated at the stand-aside site; **(c)** the wrong instrument for this class is a short `-ub 1` KLD window (it reads ~0 on the broken build — 512 sequential steps do not accumulate what 256 greedy tokens do), and the right ones are the greedy text and a CENSUS (`MWR FOLD` / `MWR FOLD ASIDE` / `MWR FOLD DECLINE`) | doctrine + fix (r324, block 10, contributor PR #335; `INVARIANTS.md` r324; `scripts/gate-mwr-exact.sh`; `benchmarks/2026-11-19-mwr-exact.md`) |
 | **§101** | **a fused launch's STAGED answer is a PLACEMENT, not a stand-down -- and it owes the broken-promise repair**: `moe_cache_fusion_serve()` is asked per lane, and five call sites pass `gate == nullptr` (the decode MoE down fold, the three single-lane routed bias/scale folds, the RDNA3_5 MMQ `swiglu -> down` fold); written as `gate == nullptr || lane_serves(gate)` the gate term is vacuously TRUE, so a fully STAGED single-lane caller answered `MOE_CACHE_SERVE_MIXED` ("one lane served, one not") and every gate-less fusion stood itself down for as long as its table was staged -- residency selected the kernel set again, the impurity `TODO` #327 removed for the gated sites (issue #332, found by reading the code; the reporter's own Flash-Next `-sm tensor` shape reads `mixed_lanes=0` because flat staging is not the reach, "neither in place nor slot-remapped" is).  Census, r320 -> r321: 35B-A3B UD-Q3_K_M 1 GPU `-ncmoe 24` `mmvq_glu=166/0 mixed_lanes=112` -> `166/112 mixed_lanes=0` (text `ba65a38cf871` either way), the 5 246-token prose arm `121/0 mixed_lanes=80` -> `121/80 mixed_lanes=0` (`cd5e36218bd2`), and with every promise broken (`MOE_EXPERT_TAKEOVER_FAULT=1`) `mixed_lanes=200` -> `0` with `broken=216 repaired=216` and the same text.  Two consequences the fix must carry: the STAGED answer is where a broken take-over promise is re-filled (`moe_cache_repair_copy`), because a fused launch never passes the per-op dispatch that repairs -- putting it in the serve query instead of at each site is what covers the pair/MMB/triple arms that had no repair at all, and `gate-moe-promise.sh` still reads `repaired == broken` with unchanged text; and the newly fused launches must be **bit-identical** to the chain they replace (MTP acceptance identical to the digit on all four axes, prefill KLD 0.000000 / 100.000 %), which is the evidence that a fold's epilogue is the same arithmetic, not merely within tolerance | doctrine + fix (r321, block 10, issue #332; `INVARIANTS.md` r321; `scripts/gate-moe-promise.sh`) |
 
 ---
@@ -178,7 +179,7 @@ is worth keeping moves it to that archive under its own number rather than growi
 **How to read an entry.**  Every `§` has a row above.  `doctrine` = read before shipping · `current` = live
 behaviour · `fix` = a closed finding, kept because the *rule* it produced still binds.  The entries exist in
 three shapes: `§§1-10` are the **Background** block below (the k-quant rounding-order doctrine they all rest
-on), `§§11-76`, `§82`, `§84`, `§85`, `§86` and `§87` are full entries, and `§§77-81`, `§§88-93` and `§§100-101` are
+on), `§§11-76`, `§82`, `§84`, `§85`, `§86` and `§87` are full entries, and `§§77-81`, `§§88-93`, `§§100-102` are
 **row-only** -- their whole
 record is the row plus
 the `WORKLOG.md` entry it names.  A fact that changes is corrected in place, tagged with the revision that
@@ -2865,3 +2866,65 @@ at every depth to 131k (tg128 46.6 / 45.6 / 42.3 / 34.6 t/s at d0/8k/32k/131k, b
 **Record.**  `INVARIANTS.md` r319, `MANIFESTS.md` gate 36, `ENVIRONMENT.md` §8 (`GGML_CUDA_FA_SPLIT_CONST`),
 `WORKLOG.md` 261119.003, `benchmarks/2026-11-19-fa-split-boundary-purity.md`, `scripts/gate-spec-purity.sh`,
 `tests/test-logits-width-probe.cpp` (the boundary arm), issue #330.
+
+## 102. A "same arithmetic" claim about a fold is a claim about the ROUNDING MODE — and the two implementations that replace each other must be switched together (r324, block 10, contributor PR #335)
+
+**Claim.**  `ENVIRONMENT.md` had said since r175 that the down + weighted-reduction fold sums "in
+`moe_weighted_reduction`'s own order and expression".  Both halves were true of the *source*, and the identity
+still failed: HIP clang contracts `sum + (x * scale) * w` into `v_fmac_f32` in the fold **and** in the standalone
+kernel it replaces, while the graph's `MUL` / `VIEW` / `ADD` chain rounds each multiply and each add on its own.
+So the fold matched the kernel exactly — and neither matched the chain.  Two separate sites had to move together,
+which is why the first patch someone writes for this (the standalone kernel) is not a fix on its own: it makes
+the kernel exact and leaves the fold contracted, i.e. makes the two *disagree*.
+
+**Rule.**  Five parts.
+
+1. *Round-mode equality is part of "the same expression".*  A fold that reproduces another implementation's source
+   text has reproduced its ORDER and not necessarily its ARITHMETIC.  Say which one is being claimed, and if the
+   claim is "bit-identical to the chain it replaces" (§101), the rounding mode is the whole claim.
+2. *The mechanism has to be tested, not assumed.*  `__fmul_rn` / `__fadd_rn` do **not** work — HIP lowers them to
+   plain ops and contracts those.  `#pragma clang fp contract(off)` does, but only (a) at file scope or at the
+   start of a compound statement, and (b) under a toolchain whose default is `-ffp-contract=fast-honor-pragmas`
+   (HIP clang's is); under plain `fast` (clang-CUDA) or nvcc both variants compile to the contracted one, so a
+   non-AMD backend keeps its existing arithmetic and inherits nothing.  Verify the emitted ISA
+   (`clang++ --offload-arch=… --cuda-device-only -S`: `v_fmac_f32` against `v_mul_f32` + `v_add_f32`) — including
+   through `__forceinline__` template instantiation, which a helper's pragma must survive.
+3. *One knob for implementations that replace each other.*  Two switches (`…_FOLD_CONTRACT` and `…_EXACT`) look
+   tidier and are a trap: `EXACT=0` alone leaves the fold exact and the kernel contracted, which is a state no
+   release ever shipped and which a bisect would read as "the fold is wrong".  The kill switch that matters is the
+   pair's ("`=0` restores the pre-r324 contracted pair"), and it must be *proven* to revert: here
+   `GGML_CUDA_MWR_EXACT=0 GGML_CUDA_MWR_FOLD_FIRST=0` reproduces the r323 text bit for bit.
+4. *Displacing another fold is only allowed where you can serve the node.*  Making the reduction fold outrank the
+   MUL-only down fold is worth a launch per MoE layer, but the MUL fold steps aside on an *armed* node, and the
+   arming predicate was the graph pattern alone.  Any site that stands aside for another must ask that other's
+   full node predicate, and the predicate must live in **one** function enforced at the **arming** site — then
+   "armed implies servable" is a property of the code instead of a coincidence, and a warp-64 device (CDNA), an
+   `n_embd` above the counter span, a non-contiguous down output or an `ne[3] != 1` graph cannot trade a fold for
+   nothing.
+5. *Pick the instrument that can see it.*  A short `-ub 1` KLD window reads ~0 on the **broken** build (512
+   sequential steps over 2 chunks do not accumulate what 256 greedy tokens do), so it "confirms" the wrong
+   conclusion — the submitter's own decode row did exactly that.  The instruments that see this class are
+   same-seed greedy text against the fully unfused graph, and a census that names which arithmetic ran.
+
+**Numbers** (`benchmarks/2026-11-19-mwr-exact.md`, gfx1201, 1×R9700, ROCm 10.1).  KLD against the fully unfused
+graph (`GGML_CUDA_DISABLE_MOE_DOWN_FOLD=1 GGML_CUDA_MWR_FOLD=0 GGML_CUDA_DISABLE_MWR=1
+GGML_CUDA_DISABLE_FUSED_ADDMUL=1`), `-c 512`, 10 chunks: **0.006613 / 96.627 % → 0.000000 / 100.000 %**, with the
+unfused base logits byte-identical on both builds (sha256 `0a4a69973ab8…`) so the reference is the same object.
+Greedy text, 256 tokens, `prompts/prose-rdna-boosts.txt`:
+
+| arm | r323 default | r323 unfused | r324 default |
+|---|---|---|---|
+| Qwen3.6-35B-A3B Q4_K_M | `bd111389f051` | `abed0bf40d87` | `abed0bf40d87` |
+| Qwen3-Coder-30B-A3B Q4_K_M | `553b730d2e24` | `fc94447651c1` | `fc94447651c1` |
+| gemma-4-26B-A4B Q8_0 | `63f491378b41` | `6faaaeff2903` | `6faaaeff2903` |
+| Qwen3.5-4B Q8_0 (dense, inert) | `18d8b09cd3d3` | — | `18d8b09cd3d3` |
+
+Census (35B-A3B Q4_K_M, one graph capture): `MWR FOLD` 1 of 163 armed sites before, **163 of 163** after, with
+`MWR FOLD ASIDE` 163 and `MWR FOLD DECLINE` 0; `GGML_CUDA_MWR_FOLD_FIRST=0` restores 0 / 0.
+`GGML_CUDA_MWR_EXACT=0` alone is a third state (`0e1e59e500e8`, 859 chars) — that is what proves the knob is
+not inert.  tg128 **+3.3 %** (121.66/121.71 → 125.90/125.33) on 35B-A3B Q4_K_M, **+2.2 %** on Qwen3-Coder-30B-A3B,
+flat on gemma4 (which already took the larger fold); pp512 flat everywhere.
+
+**Record.**  This entry; `INVARIANTS.md` r324; `benchmarks/2026-11-19-mwr-exact.md`; `scripts/gate-mwr-exact.sh`
+(MANIFESTS gate 37 — 9 checks fail on the r323 build); `ENVIRONMENT.md` (`GGML_CUDA_MWR_EXACT`,
+`GGML_CUDA_MWR_FOLD_FIRST`, `GGML_CUDA_MWR_DEBUG`); `WORKLOG.md` 261119.008; `patches/README.md` block 10.

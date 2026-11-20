@@ -1,3 +1,99 @@
+## 261119.008 (r324, RELEASE v17-4f9dfa0e3-r324) -- contributor PR #335 taken in full, corrected: the MoE weighted reduction is computed without fma contraction and its fold outranks the MUL-only fold (block 10); the delivery's MoE decode text was NOT the unfused chain's text before this
+
+**Release:** `v17-4f9dfa0e3-r324`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `923b910eb`
+(the `apply-all.sh` re-cut, tree `d3babb65a`; the *working* chain tip `141ef9246` is a
+**different commit with the same tree** -- a rebase re-stamps committers, so it is never the value to record), 17 official + 1 temporary = 18 default blocks, optional
+`0100` -> `705df1213` / `0101` -> `69cfea715` (cumulative `adf514489`).  **No block created, split or
+renumbered**: one same-block amendment, **block 10** (`mmvq.cu`, `mmvq.cuh`, `mmvq-moe.cu`,
+`moe-weighted-reduction.cu/.cuh`, `common.cuh`).  Two environment variables added and one repurposed
+(`GGML_CUDA_MWR_EXACT`, `GGML_CUDA_MWR_FOLD_FIRST`, `GGML_CUDA_MWR_DEBUG`).
+
+### The finding
+
+The PR's two items are small and the second one is not cosmetic: `ENVIRONMENT.md` has said since r175 that the
+down + weighted-reduction fold sums "in `moe_weighted_reduction`'s own order **and expression**".  Both halves
+were true of the source and the identity still failed, because **HIP clang contracts `sum + (x * scale) * w` into
+an `v_fmac_f32`** — in the fold *and* in the standalone kernels it replaces — while the graph's `MUL`/`VIEW`/`ADD`
+chain rounds each multiply and each add on its own.  So the fold matched the kernel, and neither matched the
+chain: **the r323 delivery's MoE decode text was not the unfused chain's text** on qwen35moe, qwen3moe and
+gemma4, and the `-ub 512` prefill point read mean KLD **0.006613 / 96.627 %** against the fully unfused graph.
+Measured now: **0.000000 / 100.000 %**, with the unfused base logits byte-identical on both builds
+(sha256 `0a4a69973ab8…`, base PPL 7.1177) — the reference is the same object, so the divergence was entirely the
+fused paths.  The greedy text now EQUALS the chain on all three families:
+
+| arm (1 GPU, 256 tok, `prompts/prose-rdna-boosts.txt`) | r323 default | r323 unfused | r324 default |
+|---|---|---|---|
+| Qwen3.6-35B-A3B Q4_K_M | `bd111389f051` | `abed0bf40d87` | `abed0bf40d87` |
+| Qwen3-Coder-30B-A3B Q4_K_M | `553b730d2e24` | `fc94447651c1` | `fc94447651c1` |
+| gemma-4-26B-A4B Q8_0 | `63f491378b41` | `6faaaeff2903` | `6faaaeff2903` |
+| Qwen3.5-4B Q8_0 (dense, inert) | `18d8b09cd3d3` | — | `18d8b09cd3d3` |
+
+The second item is the other half of the same launch: `ggml_cuda_moe_down_fold_try_fuse` folded the weighted
+`MUL` into the down through `x_scale`, which **disqualified** the larger fold `ggml_cuda_mwr_fold_mark` had
+already armed for the same `MUL_MAT_ID`, so the reduction fell back to a second launch per MoE layer.
+`MWR FOLD` served **1 of 83** armed sites on r323 and serves **163 of 163** here (census, one graph capture of
+35B-A3B Q4_K_M; `MWR FOLD ASIDE` 163, `MWR FOLD DECLINE` 0).  tg128 **+3.3 %** (121.66/121.71 -> 125.90/125.33
+t/s), Qwen3-Coder-30B-A3B **+2.2 %**, gemma4 flat (it already took the larger fold), pp512 flat everywhere.
+
+### What was corrected before it shipped
+
+* **One knob, not two.**  The PR added `GGML_CUDA_MWR_FOLD_CONTRACT` (the fold's sum) beside `GGML_CUDA_MWR_EXACT`
+  (the kernels).  Both defaulted to exact, but `MWR_EXACT=0` alone would leave the fold exact and the kernel
+  contracted — a state no release shipped, and a bisect would blame the wrong one.  Collapsed into
+  `GGML_CUDA_MWR_EXACT`, which drives both (`fusion.red_contract = !ggml_cuda_mwr_exact()`).
+* **The stand-aside predicate was looser than the fold's** (a real, latent defect).  `mwr_fold_mark` armed from
+  the graph pattern alone, while the fold also needs `warp_size == 32`, `ne[2] == ne[3] == 1`, a contiguous down
+  output and `ne[0] <= 2*GGML_CUDA_MOE_RED_CNT-2` = 8190.  Any disagreement — CDNA's warp 64, an `n_embd` above
+  8190, an `ne[3] != 1` graph — would have made the MUL fold step aside and gained nothing.  The conditions now
+  live in `ggml_cuda_mwr_fold_serve_ok()` and are enforced at the **arming** site, so "armed implies servable" is
+  a property of the code.  Not reachable on anything this repo validates (every fleet MoE is `n_embd` 2048-2816
+  and every RDNA part is warp-32), which is exactly why it is closed by construction rather than by a gate arm.
+* **A census, because the PR had none.**  `GGML_CUDA_MWR_DEBUG` only printed when the *standalone* kernel ran,
+  and on these shapes it never does — so it read 0 in both arms and could not tell the precedence from a defect.
+  It now names the arithmetic once (`MWR EXACT exact|contracted`) and every decision (`MWR FOLD`,
+  `MWR FOLD ASIDE`, `MWR FOLD DECLINE`, plus the existing `MWR FUSED`).
+* **Two of the PR's own claims are wrong and are corrected on the PR**: its `-ub 1` decode row read 0.000000 on
+  the unpatched build and concluded "keeps an already-exact result" — that window cannot see the decode
+  difference (the text and the census can); and its "(flat, as expected: the fold already ran there)" for
+  Qwen3-30B-A3B does not generalise — on Qwen3-Coder-30B-A3B (same architecture) r323 takes the MUL fold on all
+  238 sites and r324 is +2.2 %.  Which fold wins is a per-shape property, not an architectural one.
+
+### Gates
+
+* `scripts/gate-mwr-exact.sh` (**new**, MANIFESTS gate 37): **PASS** — census (`exact`, `FOLD == ASIDE == 163`,
+  `DECLINE 0`), `default == unfused` on the MoE model *and* on the host-expert `-ncmoe` shape (the fold is one of
+  the gate-less `moe_cache_fusion_serve()` sites, §101), the `BEFORE_HASH` reproduced by the two kill switches,
+  `MWR_EXACT=0` alone as its own text, the dense arm inert.  **Negative-tested on the r323 build: 9 checks fail.**
+* `gate-prefill-logits.sh --ab "<the unfused env>"`: **PASS**, 0.000000 / 100.000 %.  On a **MoE** model against
+  an r323 base the same gate reads 0.006513 / 96.392 % (canonical), 0.006874 / 96.627 % (`-ub 512`) and
+  0.006412 / 96.588 % (3-device `-sm tensor`) — that shift IS the change, and it is a move onto the exact
+  reference.  **The canonical release point is a dense model** (`Qwen3.8/27B/Q8_0`, which this cannot reach) and
+  was re-recorded clean on build `923b910eb` (`base PPL=5.9325`, 0.000000 / 100.000 %), so
+  `fork-refresh.sh --gates` is green.  **Every MoE prefill-logit base recorded before r324 is stale**; they are
+  listed in `benchmarks/2026-11-19-mwr-exact.md`, they were left in place rather than deleted, and they must be
+  re-recorded before they are quoted.
+* `gate-host-pool.sh`: **59/59**.  `gate-moe-promise.sh`: **PASS** (`repaired == broken`, `c0e7e91d84c4` held).
+  `gate-fusion-alias-copy.sh`: **PASS** (anchor `3fab4da87774` held).
+  `gate-host-expert-text.sh`: **PASS 3/3** (informational anchor moves `319/a455bfe7267a` -> `296/3205db133b1d`).
+* `gate-server-arms.sh`: **PASS**, and it needed two repairs of its own (below).
+
+### The re-baselined gates, and one arm that stays reported
+
+`gate-server-arms.sh` (gate 24 step 5c, a *re-base* arm) was found **not reproducible** while re-recording it, and
+neither defect was this change: it never pinned `MOE_EXPERT_HEATMAP`, so every run started from the arena seed
+prior the previous run wrote back into the model's `.moe-heatmap` (r323 unpinned read `9e1a1221c30d e29d01e5edca`
+against its recorded `b337648c3ef9 b73aa781bca5`), and it fired both slots' requests **simultaneously**, so which
+slot the server admitted first was a race that selected between two states of both the text and the acceptance
+(r324 before the fix: 3 of 4 runs one state, 1 the other).  With `MOE_EXPERT_HEATMAP=load` plus a fixed-order
+stagger, each build reproduces its own numbers exactly — verified twice on r323 (`9e1a1221c30d e29d01e5edca` /
+0.69672) and on r324 (`9564942b467b 9564942b467b` / 0.69106) — and the anchors are re-recorded from the r324
+pair.  The `35b10` arm's **second slot** still moves (a fixed-*time* stagger lands at a variable point in slot 0's
+prefill), so that one arm's text is now *reported, not asserted*, with its acceptance checks — the collapse
+detector the arm exists for — unchanged; the deterministic form is `TODO` #349.
+
+`benchmarks/2026-11-19-mwr-exact.md` is the record; `GREEDY-PURITY.md` §102 is the doctrine (`INVARIANTS.md` r324).
+PR #335 is taken in full (review on the PR); its material is archived to `archive/work/mwr-exact/` as submitted.
+
 ## 261119.007 (r323, RELEASE v17-4f9dfa0e3-r323) -- contributor PR #334 taken as item 1 only: an FFN's GLU may take the memory of its gate (-149.6 MiB of compute buffer, +7.0 % on the host-expert MoE decode); the PR's other two items are declined and asked for as separate PRs
 
 **Release:** `v17-4f9dfa0e3-r323`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `bdd7fc6ee`

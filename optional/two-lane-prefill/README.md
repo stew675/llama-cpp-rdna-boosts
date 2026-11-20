@@ -24,8 +24,13 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `79cbf54eefcfeb699a863bed4054bef3f88a3a833a9eaed289680b27da76fa53` (the r320 cut -- every re-cut moves the exported commit
+  `c995ce750c286d0bce16c00921f871390747b8b9f718b8e272a8c61e7d1be551` (the r324 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
+* **r324 re-cut verification**: applies strictly at the r324 default tree `d3babb65a68b83a2669933c902d5d981933d807e`
+  (sha256 `c995ce750c286d0bce16c00921f871390747b8b9f718b8e272a8c61e7d1be551`), producing tree `9c1d723aab4cc50bbf4cfe6c99b842bae9201f63`; with the other optional artifact on top, the cumulative tree is
+  `ab8eb507387c468712fb2142d7e2481a529a1516`.  r324 amends **block 10** (the MoE weighted reduction: no fma contraction, one knob, and the
+  reduction fold ahead of the MUL-only down fold, PR #335), a file this artifact does not touch, so the
+  artifact's diff is byte-identical to the r323 cut and every number recorded here stands.
 * **r320 re-cut verification**: applies strictly at the r320 default tree
   `3334a4eb31124213805ae5a0a019f6aaf86d5d7b` (sha256
   `79cbf54eefcfeb699a863bed4054bef3f88a3a833a9eaed289680b27da76fa53`), producing tree

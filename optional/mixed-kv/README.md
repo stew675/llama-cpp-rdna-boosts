@@ -8,8 +8,13 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `0b60c08e256bef1c81bb9e37e1e63c328f2f67c466f3009cf0837f6f06db8694` (the r320 cut -- every re-cut moves the exported commit
+  `980b15e310adfbf46107eb7e57a3288e72ab7d2f89db3ebe603d6ff2e81d2e27` (the r324 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
+* **r324 re-cut verification**: applies strictly at the r324 default tree `d3babb65a68b83a2669933c902d5d981933d807e`
+  (sha256 `980b15e310adfbf46107eb7e57a3288e72ab7d2f89db3ebe603d6ff2e81d2e27`), producing tree `eef3589ce93c3c63f8c8bd4d59147d581d5444dc`; with the other optional artifact on top, the cumulative tree is
+  `ab8eb507387c468712fb2142d7e2481a529a1516`.  r324 amends **block 10** (the MoE weighted reduction: no fma contraction, one knob, and the
+  reduction fold ahead of the MUL-only down fold, PR #335), a file this artifact does not touch, so the
+  artifact's diff is byte-identical to the r323 cut and every number recorded here stands.
 * **r320 re-cut verification**: applies strictly at the r320 default tree
   `3334a4eb31124213805ae5a0a019f6aaf86d5d7b` (sha256
   `0b60c08e256bef1c81bb9e37e1e63c328f2f67c466f3009cf0837f6f06db8694`), producing tree

@@ -1,0 +1,116 @@
+From c5ba2ca3e0204e9e7873cc38db205076586fca80 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sun, 15 Nov 2026 21:31:00 +0000
+Subject: [PATCH 2/2] MoE weighted reduction: no fma contraction in the
+ standalone kernels (GGML_CUDA_MWR_EXACT=0: old)
+
+moe_weighted_reduction_f32_vec4 / _f32 sum (expert * scale) * weight with the multiply-add contracted into an
+fma, so the result differed from the unfused MUL + VIEW + ADD chain (and from the down + reduction fold of the
+previous patch). The accumulation now runs under `#pragma clang fp contract(off)`. BF16 variants (BLK16 /
+DOWN16, default off) unchanged.
+
+1 x R9700 (gfx1201), r321, KLD against the fully unfused graph at -ub 512: Qwen3.6-35B-A3B Q4_K_M
+0.008215 -> 0.000000, Qwen3-30B-A3B Q4_K_M 0.003479 -> 0.000000; same top token 100 %.
+---
+ ggml/src/ggml-cuda/moe-weighted-reduction.cu | 46 ++++++++++++++++----
+ 1 file changed, 37 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
+index bcf7325001..8d750aea91 100644
+--- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu
++++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
+@@ -11,11 +11,27 @@
+ // -40 ms on this kernel at gfx1151 pp8192 (session 14).
+ typedef float moe_nt_f4 __attribute__((ext_vector_type(4)));
+ 
++// sum + (x * scale) * w.  exact: no fma contraction, i.e. the graph's MUL (expert x weight) and each ADD of the reduction
++// round on their own, as the unfused MUL / VIEW / ADD chain does (contracted, the reduction read KLD ~0.002 against it on
++// Qwen3.6-35B-A3B / Qwen3-30B-A3B decode); the down + reduction fold (mmvq-moe.cu) computes the same.  !exact: the old
++// expression (HIP clang contracts it).  GGML_CUDA_MWR_EXACT=0: the old kernels.  The pragma needs HIP clang's default
++// -ffp-contract=fast-honor-pragmas; under plain fast (clang-CUDA) or nvcc both variants compile the same.
++template <bool exact>
++static __device__ __forceinline__ float mwr_acc(const float sum, const float x, const float scale, const float w) {
++    if constexpr (exact) {
++#pragma clang fp contract(off)
++        return sum + (x * scale) * w;
++    } else {
++        return sum + (x * scale) * w;
++    }
++}
++
+ // float4 quad variant: only valid when every expert row starts 16B-aligned, i.e. when
+ // n_embd % 4 == 0 (checked by the launcher). Real models have n_embd % 4 == 0, so the
+ // aligned path below covers them unchanged; the scalar kernel is the fallback for
+ // n_embd % 4 != 0, where a vectorized kernel could neither cover the trailing 1-3
+ // columns nor assume per-row alignment.
++template <bool exact>
+ static __global__ void moe_weighted_reduction_f32_vec4(const float * __restrict__ experts,
+                                                        const float * __restrict__ expert_scale,
+                                                        const float * __restrict__ weights,
+@@ -47,10 +63,10 @@ static __global__ void moe_weighted_reduction_f32_vec4(const float * __restrict_
+         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+         const moe_nt_f4 e   = __builtin_nontemporal_load(reinterpret_cast<const moe_nt_f4 *>(experts + row * n_embd + col));
+         const float   w     = weights[row];
+-        sum.x += (e[0] * scale) * w;
+-        sum.y += (e[1] * scale) * w;
+-        sum.z += (e[2] * scale) * w;
+-        sum.w += (e[3] * scale) * w;
++        sum.x = mwr_acc<exact>(sum.x, e[0], scale, w);
++        sum.y = mwr_acc<exact>(sum.y, e[1], scale, w);
++        sum.z = mwr_acc<exact>(sum.z, e[2], scale, w);
++        sum.w = mwr_acc<exact>(sum.w, e[3], scale, w);
+     }
+     reinterpret_cast<float4 *>(dst + token * n_embd + col)[0] = sum;
+ }
+@@ -185,6 +201,7 @@ static __global__ void moe_weighted_reduction_f32in_bf16out_v4(const float * __r
+ }
+ 
+ // scalar kernel, bounds-checked per column (upstream body): correct for any n_embd.
++template <bool exact>
+ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ experts,
+                                                   const float * __restrict__ expert_scale,
+                                                   const float * __restrict__ weights,
+@@ -204,7 +221,7 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
+     for (int expert = 1; expert < n_expert_used; ++expert) {
+         const uint64_t row   = first_row + expert;
+         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+-        sum += (__builtin_nontemporal_load(experts + row * n_embd + col) * scale) * weights[row];
++        sum = mwr_acc<exact>(sum, __builtin_nontemporal_load(experts + row * n_embd + col), scale, weights[row]);
+     }
+     dst[token * n_embd + col] = sum;
+ }
+@@ -217,16 +234,27 @@ static void launch_moe_weighted_reduction(const float * experts,
+                                           int64_t       n_tokens,
+                                           int           n_expert_used,
+                                           cudaStream_t  stream) {
++    static const bool exact = [] { const char * e = getenv("GGML_CUDA_MWR_EXACT"); return e == nullptr || atoi(e) != 0; }();
+     constexpr int threads = 256;
+     if (n_embd % 4 == 0) {
+         const int64_t n_embd4 = n_embd / 4;
+         const dim3 blocks(n_tokens, (n_embd4 + threads - 1) / threads, 1);
+-        moe_weighted_reduction_f32_vec4
+-            <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        if (exact) {
++            moe_weighted_reduction_f32_vec4<true>
++                <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        } else {
++            moe_weighted_reduction_f32_vec4<false>
++                <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        }
+     } else {
+         const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
+-        moe_weighted_reduction_f32
+-            <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        if (exact) {
++            moe_weighted_reduction_f32<true>
++                <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        } else {
++            moe_weighted_reduction_f32<false>
++                <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        }
+     }
+ }
+ 
+-- 
+2.53.0
+

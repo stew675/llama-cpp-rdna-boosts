@@ -1,4 +1,4 @@
-From 50a7dd79d85eb092ff80cce9338c486e3738a396 Mon Sep 17 00:00:00 2001
+From 6630602c46a2a5131233cb34efce75a7dc8df453 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/17] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -115,6 +115,34 @@ projection type ran each step as its own launch.  Extended, one switch per piece
   faults; `test-fusion-gate-beta-multiseq` 77/77 shapes (the F32 and Q4_K arms added here).
 
 Co-authored-by: burnoutIA <72673971+burnoutIA@users.noreply.github.com>
+
+r324 amendment (contributor PR #335, reported by briansp2020): the down + weighted-reduction fold takes
+precedence over the MUL-only down fold, and the expert weighted sum is computed without fma contraction.
+
+- Precedence: ggml_cuda_moe_down_fold_try_fuse folded the weighted MUL into the down and thereby set
+  x_scale, which disqualifies the larger fold ggml_cuda_mwr_fold_mark had armed for the same MUL_MAT_ID;
+  the reduction then ran as a second launch per MoE layer.  It now stands aside for an armed node
+  (GGML_CUDA_MWR_FOLD_FIRST=0 restores the old precedence; default off outside HIP because nvcc ignores
+  the pragma below, so there the fold would be the LESS exact of the two).
+- Arithmetic: HIP clang contracts `sum + (x * scale) * w` into an fma, so BOTH the fold and the standalone
+  moe_weighted_reduction_f32_vec4/_f32 kernels rounded differently from the graph's MUL/VIEW/ADD chain --
+  the shipped build's MoE decode text was NOT the unfused chain's text (measured on qwen35moe, qwen3moe and
+  gemma4).  Both now run the accumulation under `#pragma clang fp contract(off)`, behind ONE knob
+  (GGML_CUDA_MWR_EXACT=0 restores the contracted pair; two knobs would let the fold and the kernel it
+  replaces disagree, which is exactly the comparison a bisect must not get wrong).
+- Soundness: the fold's node conditions moved into ggml_cuda_mwr_fold_serve_ok(), enforced at the ARMING site,
+  so "armed implies servable" is a property of the code: a warp-64 device, n_embd above the counter span, a
+  non-contiguous down output or ne[3] != 1 can no longer make the MUL fold step aside for a fold that declines.
+- Census (GGML_CUDA_MWR_DEBUG): MWR EXACT exact|contracted, MWR FOLD, MWR FOLD ASIDE, MWR FOLD DECLINE, and
+  the existing MWR FUSED, so the precedence and the arithmetic are observable rather than inferred.
+
+Measured (gfx1201, ROCm 10.1, 1 x R9700): KLD against the fully unfused graph at -ub 512 (wikitext-2,
+10 x 512) 0.006613 / 96.627 % -> 0.000000 / 100.000 %, with the unfused base logits byte-identical on both
+builds; same-seed greedy text now equals the fully unfused chain on Qwen3.6-35B-A3B Q4_K_M (1002 ch
+abed0bf40d87), Qwen3-Coder-30B-A3B Q4_K_M (903 ch fc94447651c1) and gemma-4-26B-A4B Q8_0 (902 ch
+6faaaeff2903), where the r323 build read bd111389f051 / 553b730d2e24 / 63f491378b41; dense 4B unchanged
+(18d8b09cd3d3) and GGML_CUDA_MWR_EXACT=0 GGML_CUDA_MWR_FOLD_FIRST=0 reproduces r323 bit for bit
+(bd111389f051).  tg128 +3.3 % (121.66/121.71 -> 125.90/125.33 t/s), pp512 flat.
 ---
  ggml/include/ggml-alloc.h                     |   13 +
  ggml/include/ggml.h                           |    1 -
@@ -124,7 +152,7 @@ Co-authored-by: burnoutIA <72673971+burnoutIA@users.noreply.github.com>
  ggml/src/ggml-backend.cpp                     |   92 +-
  ggml/src/ggml-cuda/allreduce-hip.cu           |    3 +
  ggml/src/ggml-cuda/allreduce.cu               |    3 +
- ggml/src/ggml-cuda/common.cuh                 |  752 +-
+ ggml/src/ggml-cuda/common.cuh                 |  754 +-
  ggml/src/ggml-cuda/concat.cu                  |   82 +
  ggml/src/ggml-cuda/cpy-batch.cu               |   15 +-
  ggml/src/ggml-cuda/cpy-batch.cuh              |    1 +
@@ -164,15 +192,15 @@ Co-authored-by: burnoutIA <72673971+burnoutIA@users.noreply.github.com>
  ggml/src/ggml-cuda/mmvf.cu                    |  452 +-
  ggml/src/ggml-cuda/mmvf.cuh                   |   11 +-
  ggml/src/ggml-cuda/mmvq-ksplit-body.inc       |  366 +
- ggml/src/ggml-cuda/mmvq-moe.cu                |  457 ++
+ ggml/src/ggml-cuda/mmvq-moe.cu                |  471 ++
  ggml/src/ggml-cuda/mmvq-moe.cuh               |   14 +
  ggml/src/ggml-cuda/mmvq-vecdot.cuh            |   96 +
- ggml/src/ggml-cuda/mmvq.cu                    | 1789 +++--
- ggml/src/ggml-cuda/mmvq.cuh                   |   17 +-
+ ggml/src/ggml-cuda/mmvq.cu                    | 1815 +++--
+ ggml/src/ggml-cuda/mmvq.cuh                   |   22 +-
  ggml/src/ggml-cuda/moe-expert-cache.cu        |  341 +-
  ggml/src/ggml-cuda/moe-expert-cache.h         |   43 +-
- ggml/src/ggml-cuda/moe-weighted-reduction.cu  |   83 +
- ggml/src/ggml-cuda/moe-weighted-reduction.cuh |    2 +
+ ggml/src/ggml-cuda/moe-weighted-reduction.cu  |  160 +-
+ ggml/src/ggml-cuda/moe-weighted-reduction.cuh |    9 +
  ggml/src/ggml-cuda/norm-gated.cu              |  121 +-
  ggml/src/ggml-cuda/norm-gated.cuh             |   11 +-
  ggml/src/ggml-cuda/norm.cu                    |  166 +-
@@ -203,7 +231,7 @@ Co-authored-by: burnoutIA <72673971+burnoutIA@users.noreply.github.com>
  tests/test-fusion-gate-beta-multiseq.cpp      |  321 +
  tests/test-logits-width-probe.cpp             |  233 +-
  tools/server/server-context.cpp               |   30 +-
- 87 files changed, 17487 insertions(+), 5647 deletions(-)
+ 87 files changed, 17609 insertions(+), 5656 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -999,7 +1027,7 @@ index fbbe48432..a5e3a3a44 100644
              bf16_tmp[i].alloc(ne);
              ggml_cuda_set_device(p->devices[i]);
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index e342d5c43..9a055870c 100644
+index e342d5c43..58487dad9 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -131,6 +131,7 @@ static inline bool ggml_cuda_rms_norm_vec() {
@@ -1874,7 +1902,7 @@ index e342d5c43..9a055870c 100644
  };
  struct ggml_cuda_mm_fusion_args_device {
      const void * x_bias = nullptr;
-@@ -2381,6 +2850,50 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -2381,6 +2850,52 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * shared_gate = nullptr;
      float * shared_dst = nullptr;
      uint32_t shared_stride_col_dst = 0;
@@ -1893,6 +1921,8 @@ index e342d5c43..9a055870c 100644
 +    const float * red_w = nullptr;
 +    const float * red_scale = nullptr;
 +    int * red_cnt = nullptr;
++    // GGML_CUDA_MWR_EXACT=0: the fold's pre-r324 fma-contracted sum (the standalone kernels contract too, one knob)
++    bool red_contract = false;
 +    // GDN alpha/beta pair in one mmvf launch (ggml_cuda_gate_beta_bf16_try_fuse): rows >= gb_nrows read gb_x2 and
 +    // write gb_dst2; rows below write softplus(v + gb_dt[row]) * gb_a[row].
 +    const void * gb_x2 = nullptr;
@@ -1925,7 +1955,7 @@ index e342d5c43..9a055870c 100644
  };
  
  struct ggml_cuda_kernel_launch_params {
-@@ -2450,5 +2963,48 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+@@ -2450,5 +2965,48 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
      CUDA_CHECK(cudaGetLastError());
  }
  
@@ -20447,10 +20477,10 @@ index 000000000..a2f3c24de
 +    }
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
 new file mode 100644
-index 000000000..cbde50413
+index 000000000..1b954bfa6
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
-@@ -0,0 +1,457 @@
+@@ -0,0 +1,471 @@
 +#include "mmvq-moe.cuh"
 +#include "mmvq-vecdot.cuh"
 +#include "mmvq.cuh"
@@ -20682,12 +20712,26 @@ index 000000000..cbde50413
 +                if ((int) threadIdx.x < rows_valid) {
 +                    const int   r  = row0 + threadIdx.x;
 +                    const float s0 = fusion.red_scale != nullptr ? fusion.red_scale[0] : 1.0f;
-+                    float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
-+                    for (int e = 1; e < (int) nchannels_dst; ++e) {
-+                        const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
-+                        sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
++                    // This sum must be moe_weighted_reduction's own order AND expression: contracted, HIP clang
++                    // turns `sum + (x * scale) * w` into an fma and the fold stops matching the graph's MUL + ADD
++                    // chain (KLD 0.0021 against it on Qwen3-30B-A3B decode).  fusion.red_contract
++                    // (GGML_CUDA_MWR_EXACT=0) is the pre-r324 sum, and it contracts the standalone kernels too.
++                    if (!fusion.red_contract) {
++#pragma clang fp contract(off)
++                        float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
++                        for (int e = 1; e < (int) nchannels_dst; ++e) {
++                            const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
++                            sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
++                        }
++                        fusion.red_dst[r] = sum;
++                    } else {
++                        float sum = (__builtin_nontemporal_load(&dst[r]) * s0) * fusion.red_w[0];
++                        for (int e = 1; e < (int) nchannels_dst; ++e) {
++                            const float s = fusion.red_scale != nullptr ? fusion.red_scale[e] : 1.0f;
++                            sum += (__builtin_nontemporal_load(&dst[e*stride_channel_dst + r]) * s) * fusion.red_w[e];
++                        }
++                        fusion.red_dst[r] = sum;
 +                    }
-+                    fusion.red_dst[r] = sum;
 +                }
 +                if (threadIdx.x == 0) {
 +                    *cnt = 0;
@@ -21031,18 +21075,20 @@ index 000000000..b471e4949
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 57467c1dd..535ea76cc 100644
+index 57467c1dd..ca9f64aa1 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1,6 +1,7 @@
+@@ -1,7 +1,9 @@
  #include "mmvq.cuh"
  #include "mmvq-wmma.cuh"        // the verify-band WMMA iu8 family (block 07, opt-in: --wmma-verify)
  #include "graph.cuh"            // ggml_cuda_stream_context is defined there (the concurrent-region guard)
 +#include "gdn-conv.cuh"
  #include "moe-expert-cache.h"   // Phase 1b: moe_cache_enabled/moe_cache_get_cold (the UVA cold seam)
++#include "moe-weighted-reduction.cuh"   // ggml_cuda_mwr_exact: the reduction's ONE arithmetic knob
  #include "quantize.cuh"
  #include "unary.cuh"
-@@ -34,85 +35,8 @@ static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
+ #include "vecdotq.cuh"
+@@ -34,85 +36,8 @@ static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
  }
  #endif
  
@@ -21130,7 +21176,7 @@ index 57467c1dd..535ea76cc 100644
  
  enum mmvq_parameter_table_id {
      MMVQ_PARAMETERS_GENERIC = 0,
-@@ -152,6 +76,18 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+@@ -152,6 +77,18 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
  #endif
  }
  
@@ -21149,7 +21195,7 @@ index 57467c1dd..535ea76cc 100644
  static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
      if (GGML_CUDA_CC_IS_RDNA4(cc)) {
          return MMVQ_PARAMETERS_RDNA4;
-@@ -325,12 +261,21 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+@@ -325,12 +262,21 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
  // 1-token decode and an (n_draft + 1)-token speculative verify batch of the same MoE matmul to be
  // bit-identical, and MUL_MAT_ID mmvq (mul_mat_vec_q_moe, one warp per token) and MMQ reduce in
  // different orders, so no cap may split the band.  The cap still applies above the band.
@@ -21174,20 +21220,20 @@ index 57467c1dd..535ea76cc 100644
      // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
      if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
          cc = ggml_cuda_highest_compiled_arch(cc);
-@@ -346,24 +291,38 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+@@ -346,24 +292,38 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
      // AMD
      if (GGML_CUDA_CC_IS_AMD(cc)) {
          if (GGML_CUDA_CC_IS_RDNA4(cc)) {
 -            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type));
 +            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type), MMVQ_MOE_MAX_BATCH_SIZE);
-+        }
+         }
+-        if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc)) {
+-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type));
 +        if (GGML_CUDA_CC_IS_RDNA3(cc)) {
 +            // gfx1100 (RDNA3_0) and gfx1151 (RDNA3_5): the routed-expert 16-wide band is not used.
 +            const int floor_band = MMVQ_MAX_BATCH_SIZE;
 +            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type), floor_band);
-         }
--        if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc)) {
--            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type));
++        }
 +        if (GGML_CUDA_CC_IS_RDNA4_M(cc)) {
 +            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type), MMVQ_MAX_BATCH_SIZE);
          }
@@ -21219,7 +21265,7 @@ index 57467c1dd..535ea76cc 100644
  bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
      if (!ggml_is_quantized(type)) {
          return false;
-@@ -480,15 +439,19 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+@@ -480,15 +440,19 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
  template <ggml_type type>
  static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
  #if defined(RDNA4)
@@ -21244,7 +21290,7 @@ index 57467c1dd..535ea76cc 100644
  #elif !defined(GGML_USE_MUSA) && (__CUDA_ARCH__ == GGML_CUDA_CC_PASCAL || __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
      return MMVQ_MAX_BATCH_SIZE;
  #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
-@@ -728,7 +691,7 @@ static __global__ void mul_mat_vec_q(
+@@ -728,7 +692,7 @@ static __global__ void mul_mat_vec_q(
  
      constexpr int qk  = ggml_cuda_type_traits<type>::qk;
      constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -21253,7 +21299,7 @@ index 57467c1dd..535ea76cc 100644
      constexpr mmvq_parameter_table_id table_id = get_device_table_id();
      constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
      constexpr int rows_per_cuda_block = calc_rows_per_block_override(rows_per_block, type, ncols_dst, table_id, small_k, nwarps);
-@@ -1057,7 +1020,38 @@ static __device__ __forceinline__ float ggml_cuda_lf_reduce_scatter(const float
+@@ -1057,7 +1021,38 @@ static __device__ __forceinline__ float ggml_cuda_lf_reduce_scatter(const float
  // 12-block release kernel (same per-row chunk->group mapping as the old
  // ncols_dst == 1 path).
  // ---------------------------------------------------------------------------
@@ -21293,7 +21339,7 @@ index 57467c1dd..535ea76cc 100644
  __launch_bounds__(calc_nwarps_weight(type, ncols_dst, get_device_table_id(), long_k, small_m)*ggml_cuda_get_physical_warp_size(), 1)
  static __global__ void mul_mat_vec_q_ksplit(
          const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
-@@ -1066,556 +1060,46 @@ static __global__ void mul_mat_vec_q_ksplit(
+@@ -1066,556 +1061,46 @@ static __global__ void mul_mat_vec_q_ksplit(
          const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
          const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
          const uint32_t ids_stride, const uint32_t nrows_loop) {
@@ -21551,8 +21597,21 @@ index 57467c1dd..535ea76cc 100644
 -            if (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst) {
 -                dst[j*stride_col_dst + i] = lf_sum;
 -            }
--        }
--    } else {
++    if constexpr (table_id == MMVQ_PARAMETERS_RDNA4) {
++        static_assert(calc_nwarps_weight(type, 1, table_id, long_k, small_m) == calc_nwarps_weight(type_b, 1, table_id, long_k, small_m),
++                      "mixed row concat: both types must take the same nwarps");
++        constexpr int rpb = rows_per_block > 0 ? rows_per_block :
++            calc_rows_per_block_weight(type, 1, table_id, false, calc_nwarps_weight(type, 1, table_id, long_k, small_m));
++        const uint32_t row0 = rpb*blockIdx.x;
++        const int      kb   = fusion.cat2_k;
++        const uint32_t lo   = fusion.cat_row[kb];
++        const uint32_t hi   = (kb == 0 && fusion.cat_dst[1] != nullptr) ? fusion.cat_row[1] : 0xFFFFFFFFu;
++        if (row0 >= lo && row0 < hi) {
++            mul_mat_vec_q_ksplit_body<type_b, 1, false, false, false, rpb, long_k, small_m, true>(vx_ptr, vy_ptr, ids_ptr, fusion, dst_ptr, ncols_x, nchannels_y, fusion.cat2_stride_row, stride_col_y, stride_col_dst, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
++        } else {
++            mul_mat_vec_q_ksplit_body<type, 1, false, false, false, rpb, long_k, small_m, true>(vx_ptr, vy_ptr, ids_ptr, fusion, dst_ptr, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
+         }
+     } else {
 -    // sum up partial sums and write back result
 -    #pragma unroll
 -        for (int j = 0; j < ncols_dst; ++j) {
@@ -21632,20 +21691,7 @@ index 57467c1dd..535ea76cc 100644
 -                    dst[j*stride_col_dst + i] = result_val;
 -                }
 -            }
-+    if constexpr (table_id == MMVQ_PARAMETERS_RDNA4) {
-+        static_assert(calc_nwarps_weight(type, 1, table_id, long_k, small_m) == calc_nwarps_weight(type_b, 1, table_id, long_k, small_m),
-+                      "mixed row concat: both types must take the same nwarps");
-+        constexpr int rpb = rows_per_block > 0 ? rows_per_block :
-+            calc_rows_per_block_weight(type, 1, table_id, false, calc_nwarps_weight(type, 1, table_id, long_k, small_m));
-+        const uint32_t row0 = rpb*blockIdx.x;
-+        const int      kb   = fusion.cat2_k;
-+        const uint32_t lo   = fusion.cat_row[kb];
-+        const uint32_t hi   = (kb == 0 && fusion.cat_dst[1] != nullptr) ? fusion.cat_row[1] : 0xFFFFFFFFu;
-+        if (row0 >= lo && row0 < hi) {
-+            mul_mat_vec_q_ksplit_body<type_b, 1, false, false, false, rpb, long_k, small_m, true>(vx_ptr, vy_ptr, ids_ptr, fusion, dst_ptr, ncols_x, nchannels_y, fusion.cat2_stride_row, stride_col_y, stride_col_dst, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
-+        } else {
-+            mul_mat_vec_q_ksplit_body<type, 1, false, false, false, rpb, long_k, small_m, true>(vx_ptr, vy_ptr, ids_ptr, fusion, dst_ptr, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
-         }
+-        }
 -    }
 -
 -    if constexpr (!has_fusion) {
@@ -21657,7 +21703,7 @@ index 57467c1dd..535ea76cc 100644
 -    if constexpr (!row_loop) {
 -        GGML_UNUSED(nrows_loop);
 -        break;
-     } else {
+-    } else {
 -        if (uint32_t(row0) + rows_per_cuda_block*gridDim.x >= nrows_loop) {
 -            break;
 -        }
@@ -21883,7 +21929,7 @@ index 57467c1dd..535ea76cc 100644
  
  template<ggml_type type, bool weight_rule = false>
  static std::pair<dim3, dim3> calc_launch_params(
-@@ -1662,6 +1146,14 @@ static void mul_mat_vec_q_switch_fusion(
+@@ -1662,6 +1147,14 @@ static void mul_mat_vec_q_switch_fusion(
          sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
  }
  
@@ -21898,7 +21944,7 @@ index 57467c1dd..535ea76cc 100644
  template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false, bool small_m = false>
  static void mul_mat_vec_q_switch_fusion_ksplit(
          const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-@@ -1675,7 +1167,42 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+@@ -1675,7 +1168,42 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
      const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                              fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
                              fusion.conv_input != nullptr;
@@ -21941,7 +21987,7 @@ index 57467c1dd..535ea76cc 100644
          if (has_fusion) {
              const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
              ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, true, small_k, halve_iters, rows_per_block, long_k, small_m>, launch_params,
-@@ -1695,98 +1222,6 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+@@ -1695,98 +1223,6 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
          sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
  }
  
@@ -22040,7 +22086,7 @@ index 57467c1dd..535ea76cc 100644
  
  template <ggml_type type>
  static void mul_mat_vec_q_switch_ncols_dst(
-@@ -1799,7 +1234,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1799,7 +1235,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
          const int ids_stride, cudaStream_t stream) {
  
      GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
@@ -22051,7 +22097,7 @@ index 57467c1dd..535ea76cc 100644
  
      const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
      const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
-@@ -1815,7 +1252,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1815,7 +1253,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
      // How the K loop divides up at the baseline block width, both decisions below use these.
      constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
      constexpr int qi                    = ggml_cuda_type_traits<type>::qi;
@@ -22060,7 +22106,7 @@ index 57467c1dd..535ea76cc 100644
      const int     blocks_per_row_x      = ncols_x / qk;
      const int     blocks_per_iter_1warp = vdr * warp_size / qi;
  
-@@ -1896,7 +1333,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1896,7 +1334,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
      }
  
      switch (ncols_dst) {
@@ -22070,7 +22116,7 @@ index 57467c1dd..535ea76cc 100644
              // dispatch per ncols with a compile-time tag
              const auto dispatch = [&](auto ncols_tag) {
                  constexpr int c_ncols_dst = decltype(ncols_tag)::value;
-@@ -1945,7 +1383,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1945,7 +1384,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                      const int blocks_per_row_x = ncols_x / ggml_cuda_type_traits<type>::qk;
                      const int qi_type = ggml_cuda_type_traits<type>::qi;
                      const int n_groups = qi_type > 0
@@ -22079,7 +22125,7 @@ index 57467c1dd..535ea76cc 100644
                          : 0;
                      int rpb = 1;
                      if (blocks_per_row_x > 0 && n_groups > 0 && blocks_per_row_x < n_groups) {
-@@ -2013,7 +1451,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -2013,7 +1452,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  // Every row keeps its own one-warp dot product: bit-identical.
                  uint32_t nrows_loop = 0;
                  constexpr int c_rpb_eff = c_rpb > 0 ? c_rpb : 1;
@@ -22088,7 +22134,7 @@ index 57467c1dd..535ea76cc 100644
                      c_rpb_eff <= 2 && dims.second.y == 1 && dims.first.x * c_rpb_eff == (unsigned) nrows_x &&
                      nrows_x >= 2048 && nrows_x <= 16384 && dims.first.x > GGML_MMVQ_RDNA4_DECODE_GRID) {
                      const int nblocks = dims.first.x;
-@@ -2059,7 +1497,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -2059,7 +1498,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  constexpr int c_rpb_weight = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, 1);
                  if constexpr (c_rpb_weight > 1) {
                      // the rows the launch will actually use (Q8_0 short-K: 8-warp blocks take fewer rows;
@@ -22097,7 +22143,7 @@ index 57467c1dd..535ea76cc 100644
                      const int rpb_w = calc_rows_per_block_weight(type, c_ncols_dst, table_id, false,
                          calc_nwarps_weight(type, c_ncols_dst, table_id, long_k, small_m));
                      if ((table_id == MMVQ_PARAMETERS_RDNA4 || table_id == MMVQ_PARAMETERS_RDNA3_0) && rpb_w > 1 &&
-@@ -2173,6 +1611,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -2173,6 +1612,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
              // item-split accumulator layout is register-bound at ncols_dst > 1.
              launch_ksplit(std::integral_constant<int, 8>{});
          } break;
@@ -22115,7 +22161,7 @@ index 57467c1dd..535ea76cc 100644
                  default: GGML_ABORT("fatal error"); break;
              }
          } break;
-@@ -2352,18 +1801,21 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -2352,18 +1802,21 @@ void ggml_cuda_mul_mat_vec_q(
      GGML_ASSERT(        nb0        == ts_dst);
      GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
  
@@ -22139,7 +22185,7 @@ index 57467c1dd..535ea76cc 100644
          // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
          // non-negligible for some models such as gpt-oss-20b. The per-token MoE scale is a second exception.
          GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4 || fusion->x_scale_channel_dst);
-@@ -2429,11 +1881,84 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -2429,11 +1882,86 @@ void ggml_cuda_mul_mat_vec_q(
          }
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;
@@ -22210,14 +22256,16 @@ index 57467c1dd..535ea76cc 100644
 +    }
 +
 +    // MoE down + weighted reduction fold, armed by ggml_cuda_mwr_fold_mark for this MUL_MAT_ID
-+    if (ids && ctx.mwr_fold_experts == dst && ggml_cuda_info().devices[ctx.device].warp_size == 32 &&
++    if (ids && ctx.mwr_fold_experts == dst && ggml_cuda_mwr_fold_serve_ok(ctx, dst) &&
 +            fusion_local.gate == nullptr && fusion_local.shared_up == nullptr &&
-+            fusion_local.x_bias == nullptr && fusion_local.x_scale == nullptr && dst->ne[2] == 1 && dst->ne[3] == 1 &&
-+            ggml_is_contiguous(dst) && dst->ne[0] <= 2*GGML_CUDA_MOE_RED_CNT - 2) {
++            fusion_local.x_bias == nullptr && fusion_local.x_scale == nullptr) {
 +        fusion_local.red_dst   = (float *) ctx.mwr_fold_dst->data;
 +        fusion_local.red_w     = (const float *) ctx.mwr_fold_weights->data;
 +        fusion_local.red_scale = ctx.mwr_fold_scale ? (const float *) ctx.mwr_fold_scale->data : nullptr;
 +        fusion_local.red_cnt   = ctx.moe_red_counters();
++        // the reduction's arithmetic is ONE knob: the fold must compute what the kernel it replaces computes
++        fusion_local.red_contract = !ggml_cuda_mwr_exact();
++        if (ggml_cuda_mwr_debug()) GGML_LOG_INFO("MWR FOLD %s\n", dst->name);
 +        ctx.mwr_done_graph = ctx.mwr_fold_graph;
 +        ctx.mwr_done_idx   = ctx.mwr_fold_idx;
 +    }
@@ -22225,7 +22273,7 @@ index 57467c1dd..535ea76cc 100644
  
      // If src0 is a temporary compute buffer, clear any potential padding.  A redirected expert
      // table (wip/moe-expert-cache) carries no buffer; its compact arena has no padding to clear,
-@@ -2509,7 +2034,7 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -2509,7 +2037,7 @@ void ggml_cuda_mul_mat_vec_q(
  
      mul_mat_vec_q_switch_type(
          src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
@@ -22234,7 +22282,7 @@ index 57467c1dd..535ea76cc 100644
          ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
          ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
  }
-@@ -3285,11 +2810,725 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
+@@ -3285,11 +2813,748 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
              (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
      }
  }
@@ -22910,6 +22958,13 @@ index 57467c1dd..535ea76cc 100644
 +
 +// MoE down fold: ffn_moe_weighted = moe_down * topk_weights.  Fold the MUL into the matmul epilogue
 +// via the x_scale_channel_dst path.  Returns 1 when fused.  GGML_CUDA_DISABLE_MOE_DOWN_FOLD=1 off.
++bool ggml_cuda_mwr_fold_serve_ok(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
++    return ggml_cuda_info().devices[ctx.device].warp_size == 32 &&
++           dst->ne[2] == 1 && dst->ne[3] == 1 &&
++           ggml_is_contiguous(dst) &&
++           dst->ne[0] <= 2*GGML_CUDA_MOE_RED_CNT - 2;
++}
++
 +int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
 +    static const bool disable_moe_down_fold = [] { const char * e = getenv("GGML_CUDA_DISABLE_MOE_DOWN_FOLD"); return e != nullptr && std::atoi(e); }();
 +    if (disable_moe_down_fold || i + 1 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
@@ -22917,6 +22972,22 @@ index 57467c1dd..535ea76cc 100644
 +    }
 +    ggml_tensor * mm_node  = cgraph->nodes[i];
 +    ggml_tensor * mul_node = cgraph->nodes[i + 1];
++
++    // The down + weighted-reduction fold covers this MUL and the reduction's ADDs in one launch; folding only the
++    // MUL here sets x_scale, which disqualifies that fold and leaves the reduction to a second launch per MoE
++    // layer.  ggml_cuda_mwr_fold_mark only ARMS a node ggml_cuda_mwr_fold_serve_ok() answers yes for, so an armed
++    // node really is one the reduction fold can serve -- standing aside here can never trade a fold for nothing.
++    // GGML_CUDA_MWR_FOLD_FIRST=0: the old precedence (default off outside HIP: nvcc ignores the fold sum's
++    // `#pragma clang fp contract(off)`, so there the fold would be the LESS exact of the two; =1 turns it on).
++#if defined(GGML_USE_HIP)
++    static const bool mwr_fold_first = [] { const char * e = getenv("GGML_CUDA_MWR_FOLD_FIRST"); return e == nullptr || atoi(e) != 0; }();
++#else
++    static const bool mwr_fold_first = [] { const char * e = getenv("GGML_CUDA_MWR_FOLD_FIRST"); return e != nullptr && atoi(e) != 0; }();
++#endif
++    if (mwr_fold_first && ctx.mwr_fold_experts == mm_node) {
++        if (ggml_cuda_mwr_debug()) GGML_LOG_INFO("MWR FOLD ASIDE %s\n", mm_node->name);
++        return 0;
++    }
 +
 +    const int out_nodes[] = { i + 1 };
 +    if (mul_node->op == GGML_OP_MUL &&
@@ -22961,7 +23032,7 @@ index 57467c1dd..535ea76cc 100644
      if (i + 8 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
          return 0;
      }
-@@ -3359,8 +3598,10 @@ int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const g
+@@ -3359,8 +3624,10 @@ int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const g
  // Shared-expert output chain: down + gate + gating + residual adds.  Returns 5 when fused.
  // GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1 turns it off.
  int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
@@ -22974,7 +23045,7 @@ index 57467c1dd..535ea76cc 100644
      if (disable_shexp_down_gate || i + 5 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
          return 0;
      }
-@@ -3413,39 +3654,9 @@ int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const gg
+@@ -3413,39 +3680,9 @@ int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const gg
      return 0;
  }
  
@@ -23017,7 +23088,7 @@ index 57467c1dd..535ea76cc 100644
  bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
      if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
          return false;
-@@ -3495,6 +3706,8 @@ bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, in
+@@ -3495,6 +3732,8 @@ bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, in
      return true;
  }
  
@@ -23026,7 +23097,7 @@ index 57467c1dd..535ea76cc 100644
  int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
      if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID || !ctx.stream_context().concurrent_events.empty() ||
              !ggml_cuda_match_shared_expert(cgraph, i, i + 3) ||
-@@ -3515,12 +3728,32 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
+@@ -3515,12 +3754,32 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
      fusion.shared_up = shared->src[1]->src[0];
      fusion.shared_gate = shared->src[0]->src[0];
      fusion.shared_dst = shared;
@@ -23062,10 +23133,10 @@ index 57467c1dd..535ea76cc 100644
      ctx.glu_q8_1_node = nullptr;
      ctx.glu_q8_1_mm   = nullptr;
 diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
-index 35f625eaa..711fb1651 100644
+index 35f625eaa..4aef754a5 100644
 --- a/ggml/src/ggml-cuda/mmvq.cuh
 +++ b/ggml/src/ggml-cuda/mmvq.cuh
-@@ -52,10 +52,25 @@ bool ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(const ggml_tensor * experts, const
+@@ -52,10 +52,30 @@ bool ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(const ggml_tensor * experts, const
  void ggml_cuda_mul_mat_id_weighted_rdna3_5(
      ggml_backend_cuda_context & ctx,
      const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
@@ -23084,6 +23155,11 @@ index 35f625eaa..711fb1651 100644
 +bool ggml_cuda_gdn_epi_enabled();
 +int ggml_cuda_gdn_epi_verify_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 +int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
++// The down + weighted-reduction fold's NODE-level serve conditions (mmvq-moe.cu's `fusion.red_dst` store).  Anything
++// that stands aside for that fold must ask THIS predicate: ggml_cuda_mwr_fold_mark arms from the graph pattern
++// alone, so a looser test in moe_down_fold_try_fuse would hand back its own fold for a node the reduction fold
++// cannot serve (a warp-64 device, n_embd above the counter span, a non-contiguous down output, ne[3] != 1).
++bool ggml_cuda_mwr_fold_serve_ok(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
 +
  int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
  int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
@@ -23719,19 +23795,137 @@ index 86da99cb5..a92329e68 100644
      MOE_CACHE_SERVE_NONE     = 0,
      MOE_CACHE_SERVE_IN_PLACE = 1,
 diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
-index 45eb1a2c1..bcf732500 100644
+index 45eb1a2c1..d022a5097 100644
 --- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu
 +++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
-@@ -1,4 +1,5 @@
+@@ -1,5 +1,7 @@
  #include "moe-weighted-reduction.cuh"
 +#include "ggml-moe-weighted-reduction.h"
  #include "mmb.cuh"
++#include "mmvq.cuh"   // ggml_cuda_mwr_fold_serve_ok: the fold's own node conditions
  
  // HIP's float4 is a struct, and __builtin_nontemporal_load/_store only accept builtin scalar or
-@@ -297,3 +298,85 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
+ // vector types, so use an ext_vector_type view of the same 16 bytes for the streaming access.
+@@ -10,11 +12,42 @@
+ // -40 ms on this kernel at gfx1151 pp8192 (session 14).
+ typedef float moe_nt_f4 __attribute__((ext_vector_type(4)));
+ 
++// The reduction's arithmetic, one knob (see moe-weighted-reduction.cuh).  Reading it also names the arm under
++// GGML_CUDA_MWR_DEBUG, so a census can never grade an arm the run did not take.
++bool ggml_cuda_mwr_exact() {
++    static const bool exact = [] {
++        const char * e = getenv("GGML_CUDA_MWR_EXACT");
++        const bool   on = e == nullptr || atoi(e) != 0;
++        if (getenv("GGML_CUDA_MWR_DEBUG") != nullptr) {
++            GGML_LOG_INFO("MWR EXACT %s\n", on ? "exact" : "contracted");
++        }
++        return on;
++    }();
++    return exact;
++}
++
++// sum + (x * scale) * w.  exact: no fma contraction, i.e. the graph's MUL (expert x weight) and each ADD of the
++// reduction round on their own, as the unfused MUL / VIEW / ADD chain does (HIP clang contracts the plain
++// expression, and contracted the reduction read KLD 0.0035-0.0082 against that chain on Qwen3.6-35B-A3B /
++// Qwen3-30B-A3B prefill); the down + reduction fold (mmvq-moe.cu) computes the same.  !exact: the old expression.
++// The pragma needs HIP clang's default -ffp-contract=fast-honor-pragmas; under plain `fast` (clang-CUDA) or nvcc
++// both variants compile the same, i.e. non-HIP backends keep their existing arithmetic either way.
++template <bool exact>
++static __device__ __forceinline__ float mwr_acc(const float sum, const float x, const float scale, const float w) {
++    if constexpr (exact) {
++#pragma clang fp contract(off)
++        return sum + (x * scale) * w;
++    } else {
++        return sum + (x * scale) * w;
++    }
++}
++
+ // float4 quad variant: only valid when every expert row starts 16B-aligned, i.e. when
+ // n_embd % 4 == 0 (checked by the launcher). Real models have n_embd % 4 == 0, so the
+ // aligned path below covers them unchanged; the scalar kernel is the fallback for
+ // n_embd % 4 != 0, where a vectorized kernel could neither cover the trailing 1-3
+ // columns nor assume per-row alignment.
++template <bool exact>
+ static __global__ void moe_weighted_reduction_f32_vec4(const float * __restrict__ experts,
+                                                        const float * __restrict__ expert_scale,
+                                                        const float * __restrict__ weights,
+@@ -46,10 +79,10 @@ static __global__ void moe_weighted_reduction_f32_vec4(const float * __restrict_
+         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+         const moe_nt_f4 e   = __builtin_nontemporal_load(reinterpret_cast<const moe_nt_f4 *>(experts + row * n_embd + col));
+         const float   w     = weights[row];
+-        sum.x += (e[0] * scale) * w;
+-        sum.y += (e[1] * scale) * w;
+-        sum.z += (e[2] * scale) * w;
+-        sum.w += (e[3] * scale) * w;
++        sum.x = mwr_acc<exact>(sum.x, e[0], scale, w);
++        sum.y = mwr_acc<exact>(sum.y, e[1], scale, w);
++        sum.z = mwr_acc<exact>(sum.z, e[2], scale, w);
++        sum.w = mwr_acc<exact>(sum.w, e[3], scale, w);
+     }
+     reinterpret_cast<float4 *>(dst + token * n_embd + col)[0] = sum;
+ }
+@@ -184,6 +217,7 @@ static __global__ void moe_weighted_reduction_f32in_bf16out_v4(const float * __r
+ }
+ 
+ // scalar kernel, bounds-checked per column (upstream body): correct for any n_embd.
++template <bool exact>
+ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ experts,
+                                                   const float * __restrict__ expert_scale,
+                                                   const float * __restrict__ weights,
+@@ -203,7 +237,7 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
+     for (int expert = 1; expert < n_expert_used; ++expert) {
+         const uint64_t row   = first_row + expert;
+         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+-        sum += (__builtin_nontemporal_load(experts + row * n_embd + col) * scale) * weights[row];
++        sum = mwr_acc<exact>(sum, __builtin_nontemporal_load(experts + row * n_embd + col), scale, weights[row]);
+     }
+     dst[token * n_embd + col] = sum;
+ }
+@@ -216,16 +250,28 @@ static void launch_moe_weighted_reduction(const float * experts,
+                                           int64_t       n_tokens,
+                                           int           n_expert_used,
+                                           cudaStream_t  stream) {
++    const bool exact = ggml_cuda_mwr_exact();
+     constexpr int threads = 256;
++    // both instantiations are kept so the arm is a runtime choice (one process can A/B it)
+     if (n_embd % 4 == 0) {
+         const int64_t n_embd4 = n_embd / 4;
+         const dim3 blocks(n_tokens, (n_embd4 + threads - 1) / threads, 1);
+-        moe_weighted_reduction_f32_vec4
+-            <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        if (exact) {
++            moe_weighted_reduction_f32_vec4<true>
++                <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        } else {
++            moe_weighted_reduction_f32_vec4<false>
++                <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        }
+     } else {
+         const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
+-        moe_weighted_reduction_f32
+-            <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        if (exact) {
++            moe_weighted_reduction_f32<true>
++                <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        } else {
++            moe_weighted_reduction_f32<false>
++                <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++        }
+     }
+ }
+ 
+@@ -297,3 +343,99 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
                                    (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, stream);
      CUDA_CHECK(cudaGetLastError());
  }
++
++// GGML_CUDA_MWR_DEBUG: the fold census.  FOLD = the mmvq launch wrote the reduction; FOLD ASIDE = the MUL-only down
++// fold stepped back for it; FOLD DECLINE = the pattern matched but the fold cannot serve the node (the MUL fold was
++// NOT asked to step back); FUSED = the standalone reduction kernel ran.
++bool ggml_cuda_mwr_debug() {
++    static const bool on = getenv("GGML_CUDA_MWR_DEBUG") != nullptr;
++    return on;
++}
 +
 +// MoE weighted expert reduction (the MUL over the expert weights): returns the number of graph
 +// nodes to skip when fused, 0 otherwise.  GGML_CUDA_DISABLE_MWR=1 turns it off.
@@ -23741,7 +23935,6 @@ index 45eb1a2c1..bcf732500 100644
 +        return 0;
 +    }
 +    ggml_moe_weighted_reduction_match match;
-+    static const bool mwr_dbg2 = getenv("GGML_CUDA_MWR_DEBUG") != nullptr;
 +    if (!ggml_match_moe_weighted_reduction(cgraph, i, match)) {
 +        return 0;
 +    }
@@ -23775,7 +23968,7 @@ index 45eb1a2c1..bcf732500 100644
 +        ctx.mwr_done_idx   = -1;
 +        return count - 1;
 +    }
-+    if (mwr_dbg2) GGML_LOG_INFO("MWR FUSED %s\n", cgraph->nodes[i]->name);
++    if (ggml_cuda_mwr_debug()) GGML_LOG_INFO("MWR FUSED %s\n", cgraph->nodes[i]->name);
 +    ggml_cuda_op_moe_weighted_reduction(ctx, match.experts, match.expert_scale, match.weights, match.dst, merge);
 +    return count - 1;
 +}
@@ -23786,6 +23979,7 @@ index 45eb1a2c1..bcf732500 100644
 +void ggml_cuda_mwr_fold_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
 +    static const bool on = [] { const char * e = getenv("GGML_CUDA_MWR_FOLD"); return e == nullptr || atoi(e) != 0; }();
 +    static const bool disable_mwr = [] { const char * e = getenv("GGML_CUDA_DISABLE_MWR"); return e != nullptr && std::atoi(e); }();
++    (void) ggml_cuda_mwr_exact();   // names the arm under GGML_CUDA_MWR_DEBUG even when both paths are switched off
 +    ctx.mwr_fold_experts = nullptr;
 +    const ggml_tensor * node = cgraph->nodes[i];
 +    if (!on || disable_mwr || node->op != GGML_OP_MUL_MAT_ID || node->type != GGML_TYPE_F32 || node->ne[2] != 1 ||
@@ -23807,6 +24001,12 @@ index 45eb1a2c1..bcf732500 100644
 +    if (d0 < i0 + ggml_nbytes(ids) && i0 < d0 + ggml_nbytes(match.dst)) {
 +        return;
 +    }
++    // Arm only a node the fold can actually serve (the predicate mmvq reads): ggml_cuda_moe_down_fold_try_fuse
++    // stands aside for an armed node, so arming one the fold declines would cost the MUL-only fold and buy nothing.
++    if (!ggml_cuda_mwr_fold_serve_ok(ctx, node)) {
++        if (ggml_cuda_mwr_debug()) GGML_LOG_INFO("MWR FOLD DECLINE %s\n", node->name);
++        return;
++    }
 +    ctx.mwr_fold_experts = node;
 +    ctx.mwr_fold_weights = match.weights;
 +    ctx.mwr_fold_scale   = match.expert_scale;
@@ -23815,15 +24015,22 @@ index 45eb1a2c1..bcf732500 100644
 +    ctx.mwr_fold_idx     = i + 1;
 +}
 diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cuh b/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
-index 894c4b1a3..31136cb03 100644
+index 894c4b1a3..5752f8b7d 100644
 --- a/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
 +++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
-@@ -6,3 +6,5 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
+@@ -6,3 +6,12 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
                                           const ggml_tensor *         weights,
                                           ggml_tensor *               dst,
                                           const ggml_tensor *         merge = nullptr);
 +int ggml_cuda_moe_weighted_reduction_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 +void ggml_cuda_mwr_fold_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
++// GGML_CUDA_MWR_EXACT (default 1; =0 restores the pre-r324 fma-contracted kernels): no fma contraction in the expert
++// weighted sum, so the fold and the standalone kernels round exactly as the graph's MUL / VIEW / ADD chain does.
++// ONE knob for both paths on purpose -- they replace each other at the same node, so an arm where only one is exact
++// would compare two different arithmetics and blame the wrong one.
++bool ggml_cuda_mwr_exact();
++// GGML_CUDA_MWR_DEBUG is on (the fold census: FOLD / FOLD ASIDE / FOLD DECLINE / FUSED / EXACT)
++bool ggml_cuda_mwr_debug();
 diff --git a/ggml/src/ggml-cuda/norm-gated.cu b/ggml/src/ggml-cuda/norm-gated.cu
 index d7d4bc9b6..a7bd8b0c6 100644
 --- a/ggml/src/ggml-cuda/norm-gated.cu
