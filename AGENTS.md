@@ -427,11 +427,17 @@ to "the build is slow" (`archive/work/build-time-regression/`).
 
 Keep every arm in **one** long-lived source path (`scripts/scratch-tree.sh` switches states inside it) —
 ccache keys on the absolute path, so a new worktree is a full cold build (5-6 min) while a fresh build dir
-at the same path is ~9 s. **The release flow is `--fast --jobs 28`: measured 2.5-12 min for the full 18-rung ladder** (the UI bundle is
+at the same path is ~9 s. **The release flow is `--fast --jobs 28` and it is the gate's DEFAULT since r327:
+measured 2.5-12 min for the full 18-rung ladder** (the UI bundle is
 pre-placed from one shared cache by `scripts/ui-dist-cache.sh`, and every rung configures with the HF fetch
-off, so no rung pays a download -- `TODO` #342); **the `all`
-profile is the r2 standard for a re-base or a change that touches `tests/` or a shared header, and costs
-~35-55 min** (one `tests/test-backend-ops.cpp` TU with several distinct contents).  `--changed-from <prev tip>`
+off, so no rung pays a download -- `TODO` #342).  `--all` is the r2 standard and costs ~35-55 min: **use it for
+a re-base, or for a commit that edits a `tests/` TU or the build graph (CMakeLists / *.cmake) -- a shared
+header is NOT a reason**, because `--fast` already recompiles the shipped binaries and `test-backend-ops` in
+every rung, which are the TUs an `all` rung would catch; what `all` alone adds is the *other* test/example/tool
+binaries compiling in every intermediate tree, and ONE `all` build at the tip covers that (the release flow's
+own build does it).  Before r327 the rule named "a shared header" as an `all` case, so an ordinary PR
+integration that amended block 10 took a ~70 min ladder for that one extra guarantee -- do not repeat it.
+`--changed-from <prev tip>`
 is a *delta* gate and is NOT a substitute for the ladder after amending an early block (r307: blocks 09-11
 stayed uncompilable for three releases).  Cost table and both profiles: `MANIFESTS.md` → Release gates (gate 5)
 and the gate script's own header.

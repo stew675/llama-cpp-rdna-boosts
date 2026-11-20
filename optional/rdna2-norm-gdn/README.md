@@ -5,9 +5,9 @@ and kernels it took before.  Nothing here is in `patches/`, `release.json.tree`,
 default `scripts/apply-all.sh` apply.
 
 * `0102-rdna2-norm-gdn.patch` — the artifact.  sha256 `ec5a3797d8a610f569b18f1d925d6e125a6f5928b8c9d8f0028029ea38955312`
-* Cut against the r324 default tree; on r326 the same bytes apply strictly (`git am`) on the default tree
-  `2849b18c8eba4e1d538474c59a85ba3c5b671ad7` (`a5026130c`), producing tree `5d833d82318f46ea22ccafc6f84b74f2e94291f0`,
-  and in numeric order after `0100` + `0101` (tree `c030f69b491f05c98f79aa87ee211c26aad20d47`).
+* Cut against the r324 default tree; on r327 the same bytes apply strictly (`git am`) on the default tree
+  `4792f98b82a4c6433bf11c629fdf01c21a143ce9` (`e159adfc2`), producing tree `bdb5525cc3024c1a2aad3df3031d9796c96a4b52`,
+  and in numeric order after `0100` + `0101` (tree `eba3f4b395b0f71223afd2766c5cbdf0296a8dd0`).
 
 ## What it changes
 

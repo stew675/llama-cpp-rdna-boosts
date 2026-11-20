@@ -24,8 +24,18 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `c995ce750c286d0bce16c00921f871390747b8b9f718b8e272a8c61e7d1be551` (the r324 cut -- every re-cut moves the exported commit
+  `1ffa60a9d2f8165ab1457bd85be50c51f7f8c190339a6c4b1d574e5f904b0945` (the r327 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
+* **r327 re-cut verification (current)**: applies strictly at the r327 default tree `4792f98b82a4c6433bf11c629fdf01c21a143ce9` (sha256
+  `1ffa60a9d2f8165ab1457bd85be50c51f7f8c190339a6c4b1d574e5f904b0945`), producing tree `410b6f1b16926d53a6a95f340bfb876cb2411a19`; with the other optional artifact on top, the cumulative tree is
+  `8c1e74631c653862c3f2da5968042ec0cbba99f0`.  r327 amends **block 10** with one packed FA KV-group bitmap per graph evaluation
+  (`GGML_CUDA_FA_KQ_BLOCKS_REUSE`, opt-in; `ggml-cuda.cu` gains two lines in the context destructor and
+  at the head of `ggml_backend_cuda_graph_compute()`, PR #337).  This artifact's `ggml-cuda.cu` hunks sit
+  in the backend's stream/lane plumbing, far from both, so nothing was reconciled and its own diff is
+  byte-identical (the sha256 moved only with the export's commit id and offsets).  **Corrects a records
+  gap:** the r324 entry below still names the r324 sha256, but r325 (block 09) and r326 (block 10) both
+  re-cut this artifact -- the value quoted here is the current one.  `validate-set.sh` check 8 verifies
+  all three trees on every run.
 * **r324 re-cut verification**: applies strictly at the r324 default tree `d3babb65a68b83a2669933c902d5d981933d807e`
   (sha256 `c995ce750c286d0bce16c00921f871390747b8b9f718b8e272a8c61e7d1be551`), producing tree `9c1d723aab4cc50bbf4cfe6c99b842bae9201f63`; with the other optional artifact on top, the cumulative tree is
   `ab8eb507387c468712fb2142d7e2481a529a1516`.  r324 amends **block 10** (the MoE weighted reduction: no fma contraction, one knob, and the

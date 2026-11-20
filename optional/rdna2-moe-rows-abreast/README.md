@@ -5,10 +5,10 @@ device pass and armed by the launch from the device's compute capability.  Nothi
 `release.json.tree`, `rdna-boosts-all.patch` or the default `scripts/apply-all.sh` apply.
 
 * `0104-rdna2-moe-rows-abreast.patch` — the artifact.  sha256 `6051fb4e62fb2bcee2b263434913fe1bbe40db74f385f7f7ba1eefe16198d160`
-* Cut against the r325 default tree; on r326 the same bytes apply strictly (`git am`) on the default tree
-  `2849b18c8eba4e1d538474c59a85ba3c5b671ad7` (`a5026130c`), producing tree `f3f5d42ed8aae5d3ea2c0fcc445bfb9b1fed9dad`,
+* Cut against the r325 default tree; on r327 the same bytes apply strictly (`git am`) on the default tree
+  `4792f98b82a4c6433bf11c629fdf01c21a143ce9` (`e159adfc2`), producing tree `23a76dae1a649b494c3832ea05aabe770c1c7801`,
   and in numeric order after `0100` + `0101` + `0102` + `0103` (cumulative tree
-  `cfc641bbdba41c04e6457aee052e3a7b6f10a109`).
+  `8dfb3d65948de4369b86a83fa18b95c1630a0482`).
 
 ## What it changes
 
@@ -79,7 +79,7 @@ accumulation order from this tree's, so it is not taken here.
 Any arch other than `gfx1030` (the loop is not compiled there); a model-level decode or verify run.  The perf
 numbers were taken on the r324 default tree + `0100`..`0103`, in a build whose HIP flags included
 `-funsafe-math-optimizations`; the r325 cut was built with the default flags and run through the correctness and
-byte checks only.  On r326 the strict apply and the trees above were re-checked, and the r326 default tree +
+byte checks only.  On r327 the strict apply and the trees above were re-checked, and the r327 default tree +
 `0100`..`0104` + the fix of PR #339, built with `-funsafe-math-optimizations`, passes `-o MUL_MAT_ID` 1056/1056,
 `-o RMS_NORM` 121/121, `-o RMS_NORM_MUL_ADD` 113/113, `-o GATED_DELTA_NET` 55/55 and `-o FLASH_ATTN_EXT` 7405/7405
-on `ROCm1`; the byte and perf runs were not repeated on r326.
+on `ROCm1`; the byte and perf runs were not repeated on r327.

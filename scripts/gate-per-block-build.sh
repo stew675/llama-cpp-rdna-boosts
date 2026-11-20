@@ -39,12 +39,22 @@
 #   ladder: 2101s cold, 95s once every block tree is in ccache.
 #
 #   Two profiles, both honest:
-#     * GATE_TARGETS_FAST (release flow): the libraries + the shipped binaries.  The op tests are
-#       run separately at the tip (`test-backend-ops -o ...`), which is where they can actually
-#       fail, so nothing is lost except "the test TU compiles in every intermediate tree".
-#     * `all` (the r2 standard, the default here): use it when a commit touches tests/ or a
-#       shared header, or once for a re-base when you want the strongest statement.
+#     * --fast (**the DEFAULT since r327**): the libraries + the shipped binaries.  The op tests are
+#       RUN separately at the tip (`test-backend-ops -o ...`), which is where they can actually fail, so
+#       nothing is lost except "a test/example/tool binary compiles in every intermediate tree" -- and
+#       that claim is carried by ONE `all` build at the tip, which the release flow does anyway
+#       (`~/bin/build-llama-rocm` builds `all`).
+#     * --all (the r2 standard): every target in every intermediate tree.  Use it for a RE-BASE, or for
+#       a commit that edits a `tests/` TU or the build graph (CMakeLists / *.cmake).  A shared header
+#       (`common.cuh`, `ggml-impl.h`) is NOT a reason on its own: it recompiles every shipped binary in
+#       every rung anyway, i.e. the TUs that carry the delivery code; what `--all` alone adds is the
+#       test/example/tool binaries, and one `all` build at the tip covers those.
 #   Do NOT read a fast-profile pass as "every target builds in every block" — it is not that claim.
+#
+#   WHY THE DEFAULT MOVED (r327): the old rule named "a change that touches a shared header" as an
+#   `all` case, so an ordinary contributor-PR integration that amended block 10 (~`common.cuh`) took a
+#   ~70 min ladder instead of ~11 min -- and the only thing the extra hour bought was the other test
+#   executables compiling in each intermediate tree.  The rule now matches what the gate measures.
 #
 # This gate has NO kernel-journal fault check, by design: it only compiles (it never loads a model or
 # dispatches a kernel), so it cannot record a GPU fault.  The runs that can are the block gates (#294).
@@ -77,16 +87,17 @@
 #                                (`HF_UI_VERSION=b12387 ./scripts/gate-per-block-build.sh ...`); incremental
 #                                builds never see it, which is why it bites exactly here.  Drop it when the
 #                                bundle validates again.
-#   --fast                       build the release profile per commit instead of
-#                                `all`: ggml-hip, llama, llama-cli, llama-server,
-#                                llama-bench, llama-perplexity.  Drops the test and
-#                                example/tool binaries; their coverage is the tip's
-#                                own gates (the release flow builds the tip with
-#                                `all` once and runs `test-backend-ops -o ...`
-#                                there).  See the COST note for the measured reason
-#                                (one test TU is 5m13s cold, and a re-base gives it
-#                                ~4 distinct contents, i.e. ~21 of ~35 minutes)
-#   --targets "T1 T2 ..."        an explicit target list (default: `all`)
+#   --fast                       build the release profile per commit (the DEFAULT since r327):
+#                                ggml-hip, llama, llama-cli, llama-server, llama-bench,
+#                                llama-perplexity.  Drops the test and example/tool binaries; their
+#                                coverage is ONE `all` build at the tip
+#                                (the release flow does that anyway) plus `test-backend-ops -o ...`.
+#                                See the COST note for the measured reason (one test TU is 5m13s cold
+#                                and a re-base gives it ~4 distinct contents, i.e. ~21 of ~35 minutes)
+#   --all                        build EVERY target in every rung (the r2 standard).  For a re-base,
+#                                or a commit that edits a `tests/` TU or the build graph -- not for a
+#                                shared header alone
+#   --targets "T1 T2 ..."        an explicit target list (overrides the profile)
 #   --list-only                  print the commits that would be built, then exit
 #
 #   PROGRESS_SECS=N              heartbeat period, in seconds, while a rung is COMPILING (default 30,
@@ -128,7 +139,8 @@ PROGRESS_SECS="${PROGRESS_SECS:-30}"
 # test and example/tool binaries, whose coverage is the tip's own gates (the release flow builds the
 # tip with `all` once, and `test-backend-ops -o ...` runs there).
 GATE_TARGETS_FAST="ggml-hip llama llama-cli llama-server llama-bench llama-perplexity"
-TARGETS="${GATE_TARGETS:-all}"
+# The release profile is the DEFAULT since r327 (see the header): `--all` asks for the r2 standard.
+TARGETS="${GATE_TARGETS:-$GATE_TARGETS_FAST}"
 TARGETS_GIVEN=0
 BASE=""
 TIP=""
@@ -149,6 +161,7 @@ while [ $# -gt 0 ]; do
         --changed-from) CHANGED_FROM="$2"; shift 2 ;;
         --targets)    TARGETS="$2"; TARGETS_GIVEN=1; shift 2 ;;
         --fast)       TARGETS="$GATE_TARGETS_FAST"; TARGETS_GIVEN=1; shift ;;
+        --all)        TARGETS="all"; TARGETS_GIVEN=1; shift ;;
         --list-only)  LIST_ONLY=1; shift ;;
         -h|--help)    usage 0 ;;
         *) echo "unknown option: $1" >&2; usage 2 ;;
@@ -236,12 +249,13 @@ else
     echo "               embedded UI (seed a cache once: scripts/ui-dist-cache.sh --checkout $REPO)"
 fi
 if [ "$TARGETS" = "all" ]; then
-    echo "    profile: all (the r2 standard) -- measured ~35 min cold / ~55 min from a partial cache, because"
-    echo "             tests/test-backend-ops.cpp is one ~5 min TU with several distinct contents.  The"
-    echo "             RELEASE flow uses --fast (measured 2.5-12 min); use all for a re-base or a change"
-    echo "             that touches tests/ or a shared header."
+    echo "    profile: --all (the r2 standard) -- measured ~35 min cold / ~55 min from a partial cache, because"
+    echo "             tests/test-backend-ops.cpp is one ~5 min TU with several distinct contents.  Reserve it"
+    echo "             for a re-base or a tests/-or-build-graph change; a shared header alone does not need it."
 else
-    echo "    profile: --fast (the release flow); the tip's test-backend-ops coverage comes from its own gates"
+    echo "    profile: --fast (the release flow, default since r327): shipped binaries only; tests/ and"
+    echo "             the examples are covered by ONE 'all' build at the tip, not by every rung."
+    echo "             NOTE: ~30 s of each rung is the fresh configure, i.e. ~9 min of the ~11 min floor."
 fi
 [ -n "$CHANGED_FROM" ] && echo "    changed-from: $CHANGED_FROM (blocks whose own delta is unchanged are skipped; the tip is always built)"
 
@@ -367,9 +381,9 @@ if [ "$TARGETS" = "all" ]; then
     echo "==> result: $ok/$total built, $failed failed in $(( $(date +%s) - t_gate0 ))s (build dir wiped per commit)"
 else
     echo "==> result: $ok/$total built, $failed failed in $(( $(date +%s) - t_gate0 ))s (build dir wiped per commit)"
-    echo "    profile: --fast (NOT the r2 'all' standard): tests/ and the example/tool binaries are"
-    echo "    not built here -- the tip's own release gates cover them (build the tip with 'all' once"
-    echo "    and run test-backend-ops there)"
+    echo "    profile: --fast (NOT the r2 'all' standard): tests/ and the example/tool binaries are not"
+    echo "    built here -- ONE 'all' build at the tip covers them (the release flow builds the tip with"
+    echo "    'all' anyway)"
 fi
 echo "    (a first block that took minutes on an otherwise unchanged tree means ccache has never seen"
 echo "     this --repo path: rerun on the long-lived checkout, see the COST note in this script)"

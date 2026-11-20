@@ -92,5 +92,5 @@ optional block by the maintainer (the r288 block-number re-org moved `mixed-kv` 
 
 | `rdna2-moe-rows-abreast/` | **`0104`** | RDNA2 (`gfx1030`) only: `mul_mat_vec_q_moe` walks the K-blocks once with the rows of a block side by side instead of one (row, K-block) item at a time; bit-identical output; `GGML_CUDA_MOE_ROWS_ABREAST=0` restores the item loop. | contributed; measured on a Radeon Pro V620 only (quantized `MUL_MAT_ID` n = 1..8: 1.26-1.32x, n >= 32 unchanged; 175 byte-compared cases, 0 differences) |
 
-Cumulative tree with all five applied in numeric order (`0100`..`0104`): `cfc641bbdba41c04e6457aee052e3a7b6f10a109`
-(`release.json.optional_tree`); `0100` then `0101` alone give `ebba8573756497ea711bf8f88b8f392d28411412`.
+Cumulative tree with all five applied in numeric order (`0100`..`0104`): `8dfb3d65948de4369b86a83fa18b95c1630a0482`
+(`release.json.optional_tree`); `0100` then `0101` alone give `8c1e74631c653862c3f2da5968042ec0cbba99f0`.
