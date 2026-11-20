@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 20 Nov 2026 05:26:25 +0000
+Subject: [PATCH 4/6] mmb: tiny-M BF16 reads the bf16 activation copy
+ (GGML_CUDA_MMB_TINY_BF16_XH=0: F32)
+
+The tiny-M kernel is bandwidth-bound on the BF16 hc inject (84 MB of F32
+activation at T 2048, ~176 us per launch, 174 ms of a pf31k prompt per GPU),
+and the bf16 copy of that activation is usually already in the MMB
+activation cache from the pair's other GEMM (inject [10240 -> 320], router
+[2560 -> 512]). Read it instead: half the bytes, no extra conversion on a
+hit, and the activation is rounded to bf16 exactly as the dense tile does.
+
+IQ3_S, 2 x R9700, one run vs the two F32-read runs: pf31k 3898-3908 -> 3932,
+midpf prompt 3070-3085 -> 3098, needle prefill 3485-3490 -> 3516 t/s; the
+production model (UD IQ4_XS) never reaches this kernel.
+---
+ ggml/src/ggml-cuda/mmb.cu | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 99794a0122..25f306577a 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -2331,11 +2331,16 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+         CUDA_CHECK(cudaGetLastError()); return;
+     }
+     if (src0->type == GGML_TYPE_BF16 && mmb_tiny_m_bf16_ok(K, M)) {
+-        // tiny-M BF16 weight: the warp-per-token kernel instead of padding the dense tile; reads the
+-        // F32 activation (or its bf16 copy when marked BF16-only, as for the F32 weight).
++        // tiny-M BF16 weight: the warp-per-token kernel instead of padding the dense tile.  It reads the
++        // bf16 activation copy: the kernel is bandwidth-bound (84 MB F32 for the hc inject at T 2048), and
++        // the copy is usually already in the MMB activation cache from the pair's other GEMM (inject [10240 -> 320],
++        // router [2560 -> 512]), so this halves the read at no extra conversion -- and rounds the activation to bf16
++        // exactly as the dense tile does.  GGML_CUDA_MMB_TINY_BF16_XH=0: the F32 activation.
++        static const bool use_xh = [] { const char * e = getenv("GGML_CUDA_MMB_TINY_BF16_XH"); return e == nullptr || atoi(e) != 0; }();
+         const ggml_tensor * x_root = src1;
+         while (x_root->view_src) x_root = x_root->view_src;
+-        const uint16_t * Xh = ggml_cuda_mmb_is_bf16_only(x_root) ? ggml_cuda_mmb_cache_lookup(x_root) : nullptr;
++        const uint16_t * Xh = ggml_cuda_mmb_is_bf16_only(x_root) ? ggml_cuda_mmb_cache_lookup(x_root)
++                            : use_xh ? mmb_bf16_activation(ctx, src1, (size_t) T * K, stream) : nullptr;
+         const float * Xf = Xh ? (const float *) Xh : (const float *) src1->data;
+         mmb_tiny_m_launch<true>(src0->data, Xf, Xh != nullptr, (float *) dst->data, M, K, T, mmb_tiny_m_f32_tt(), stream);
+         return;
+-- 
+2.53.0
+

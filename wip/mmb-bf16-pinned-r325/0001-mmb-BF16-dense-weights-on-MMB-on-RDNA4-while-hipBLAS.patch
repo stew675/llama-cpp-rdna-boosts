@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 20 Nov 2026 03:39:34 +0000
+Subject: [PATCH 1/6] mmb: BF16 dense weights on MMB on RDNA4 while hipBLASLt
+ is off, prompt band from 33 tokens (GGML_CUDA_MMB_BF16_DENSE=0: rocBLAS)
+
+With hipBLASLt off (ROCBLAS_USE_HIPBLASLT=0, the determinism control) the BF16
+dense GEMMs of a GSQ Flash-Next (hc mixer, BF16 router, shared-expert gate) run
+on rocBLAS's own Tensile kernels, which are much slower on these shapes than
+hipBLASLt. On RDNA4 they now take the MMB bf16-WMMA tile from 33 tokens (above
+the MMVF band) while hipBLASLt is off; mmb_dense_flag() stays off there, so
+BF16 gets its own switch (GGML_CUDA_MMB_BF16_DENSE, floor
+GGML_CUDA_MMB_BF16_MIN_T). With hipBLASLt on nothing changes.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  3 +++
+ ggml/src/ggml-cuda/mmb.cu       | 38 +++++++++++++++++++++++++++++++--
+ 2 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c9bd545904..276ca38a5c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7368,6 +7368,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     // MMB: bf16-WMMA dequant weight GEMM (pwilkin strix-halo port). Prefill-only: the predicate
+     // requires T >= GGML_CUDA_MMB_MIN_T (default 512), so the whole decode/verify band
+     // (n_tokens <= 8) stays on the existing kernels and W = 1..8 is bit-identical either way.
++    // BF16 dense weights on RDNA4 take MMB from 33 tokens (MMVF_MAX_BATCH_SIZE_FLAT + 1) while hipBLASLt is
++    // off (ROCBLAS_USE_HIPBLASLT=0): rocBLAS's own Tensile kernels are much slower on these shapes
++    // (GGML_CUDA_MMB_BF16_DENSE / GGML_CUDA_MMB_BF16_MIN_T).
+     if (ggml_cuda_mmb_supported_mm(src0, src1, dst)) {
+         MMB_T(ggml_cuda_mul_mat_mmb(ctx, src0, src1, dst), 0);
+         return;
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 916d368c08..eca9b36cd7 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -5,6 +5,7 @@
+ #include <map>
+ #include <utility>
+ #include "mmid.cuh"
++#include "mmvf.cuh"
+ #include <cstdlib>
+ #include <cstring>
+ #include <vector>
+@@ -1504,6 +1505,8 @@ struct mmb_arch_cfg {
+     int  hc16           = 1, down16 = 0, gatemix = 1, blk16 = 0, res16 = 0;   // hc16 + gatemix default ON (policy 2026-09-21; gatemix is RDNA3_5-only at its call site)
+     int  glu            = 1;     // fused routed gate+up+GLU
+     int  bf16w          = 1;     // BF16 dense weights
++    int  bf16_dense     = 0;     // BF16 dense weights take MMB even where mmb_dense_flag() is off (see mmb_bf16_dense)
++    int  bf16_min_t     = 512;   // n_tokens >= this may take the BF16 dense tile (see mmb_bf16_min_t)
+     int  routed         = 1;     // the routed MoE (MUL_MAT_ID) path + its fused GLU
+     int  dense_geom     = MMB_GEOM_GFX11_SPLIT;  // see mmb_geom_id
+     int  big_q4k_only   = 0;     // 128x256 dense tile only for Q4_K weights (others take 128x128)
+@@ -1537,6 +1540,13 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+         // wip/mmb-general/gfx1201-s13-f32-hc16.md.
+         c.f32split_mode = 1;
+         c.tiny_m       = 1;
++        // BF16 dense weights (qwen4exp hc mixer, BF16 router, shared-expert gate): with hipBLASLt off
++        // (ROCBLAS_USE_HIPBLASLT=0, the determinism control) these GEMMs run on rocBLAS's own Tensile kernels,
++        // which cost a GSQ IQ3_S Flash-Next about a third of its prefill.  mmb_dense_flag() stays off on RDNA4
++        // (the quantized dense GEMMs are no faster on MMB there), so BF16 gets its own switch, applied only
++        // while hipBLASLt is off (mmb_bf16_dense).  Floor 33 = above the MMVF band.
++        c.bf16_dense   = 1;
++        c.bf16_min_t   = MMVF_MAX_BATCH_SIZE_FLAT + 1;
+         // gatemix: the kernel's arch-aware `mmb_frag_t`/`mmb_wmma_bf16`/`MMB_ACC_M` shim runs on
+         // gfx12 too, and the fusion is bit-identical to the GEMM+sigmoid+mix chain.  Ported to RDNA4
+         // 2026-09-24 (gfx1201): +5.8 %/+5.4 %/+5.3 % qwen4exp IQ4_NL prefill at pp8192/32768/65536,
+@@ -1846,6 +1856,24 @@ bool mmb_tiny_m_f32_ok(const int64_t K, const int64_t M) {
+     return v != 0 && M >= 1 && M <= 8 && K % 4 == 0;
+ }
+ int mmb_tiny_m_f32_tt() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_TINY_TT"); return e ? atoi(e) : mmb_cfg_for_device(d).tiny_tt; }); }
++// True when rocBLAS was told to keep GEMMs off hipBLASLt (ROCBLAS_USE_HIPBLASLT=0, the determinism control).
++static bool mmb_hipblaslt_off() {
++#if defined(GGML_USE_HIP)
++    static const bool off = [] { const char * e = getenv("ROCBLAS_USE_HIPBLASLT"); return e != nullptr && atoi(e) == 0; }();
++    return off;
++#else
++    return false;
++#endif
++}
++// BF16 dense weights on MMB independently of mmb_dense_flag().  The arch default applies only while hipBLASLt is
++// off: with hipBLASLt on, these GEMMs stay on it.  GGML_CUDA_MMB_BF16_DENSE=0 / 1 forces off / on.
++static bool mmb_bf16_dense() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_BF16_DENSE"); return e ? atoi(e) : (mmb_cfg_for_device(d).bf16_dense && mmb_hipblaslt_off() ? 1 : 0); }) != 0; }
++// Lowest n_tokens for a BF16 dense weight on MMB.  Never below MMVF_MAX_BATCH_SIZE_FLAT + 1, like the F32 split
++// tile: the decode/verify band must stay on MMVF.  GGML_CUDA_MMB_BF16_MIN_T overrides.
++static int mmb_bf16_min_t() {
++    const int v = mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_BF16_MIN_T"); return e ? atoi(e) : mmb_cfg_for_device(d).bf16_min_t; });
++    return v > MMVF_MAX_BATCH_SIZE_FLAT ? v : MMVF_MAX_BATCH_SIZE_FLAT + 1;
++}
+ bool mmb_bf16w() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_BF16W"); return e ? atoi(e) : mmb_cfg_for_device(d).bf16w; }) != 0; }
+ bool mmb_hc16() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_HC16"); return e ? atoi(e) : mmb_cfg_for_device(d).hc16; }) != 0; }
+ int mmb_tall_mode() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_TALL"); return e ? atoi(e) : mmb_cfg_for_device(d).tall_mode; }); }
+@@ -2167,7 +2195,7 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
+     // decision (see mmb_dense_type_ok / the S10 note); the HC tall-M tile is model-specific and
+     // keeps its path.
+     const bool quant   = mmb_wtype_ok_glu(src0->type) && (mmb_dense_type_ok(src0->type) || mmb_tall_shape(src0->type, K, M, T));
+-    const bool bf16w   = src0->type == GGML_TYPE_BF16 && mmb_bf16w() && mmb_dense_flag();
++    const bool bf16w   = src0->type == GGML_TYPE_BF16 && mmb_bf16w() && (mmb_dense_flag() || mmb_bf16_dense());
+     const bool f32cand = src0->type == GGML_TYPE_F32;
+     if (!quant && !bf16w && !f32cand) return false;
+     // shape-aware F32 (mode 1, default): take only the shapes where MMB beat rocBLAS (see the
+@@ -2189,7 +2217,13 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
+     if (f32cand && !f32w) return false;   // this F32 shape is better on rocBLAS -- no fusion stand-down either
+     if ((f32cand ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
+     if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ2_XXS) && K % 256 != 0) return false;   // whole 256-value super-blocks
+-    if (T < mmb_min_t() || T > INT32_MAX / 4) return false;
++    // BF16 dense weights where mmb_bf16_dense() routes them have their own floor (mmb_bf16_min_t); every
++    // other MMB GEMM keeps min_t.
++    const bool bf16_path = src0->type == GGML_TYPE_BF16 && mmb_bf16_dense();
++    const int64_t t_min = bf16_path ? mmb_bf16_min_t() : mmb_min_t();
++    if (T < t_min || T > INT32_MAX / 4) return false;
++    // ggml_cuda_mul_mat keys its MMVF band on ne11 alone; a 3D/4D src1 must not leave it via T.
++    if (bf16_path && src1->ne[1] <= MMVF_MAX_BATCH_SIZE_FLAT) return false;
+     return ggml_nrows(dst) == T;
+ }
+ 
+-- 
+2.53.0
+

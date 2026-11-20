@@ -1,0 +1,63 @@
+# prab325.sh: stock r325 vs patched (prbf-r325), 2 x R9700, -sm tensor, GSQ IQ3_S, PR #304 pool settings, ROCm 10.1
+# stock = 78fecc4861 (tree 5959be96f8), patched = a738ce487d (tree 6d107fe88d)
+### prab325 9:36 AM stock 78fecc486 PR a738ce487
+=== lt 9:36 AM
+   smallpf: 8 prompts, 3092 tok in 6010 ms = 514.4 t/s (751.3 ms each)
+   first prefill 31537 tok in 12.8 s = 2456.8 t/s
+   greedy: sha c74123bcb468 114.2 t/s draft 259/417
+   pdecs fresh: 512 tok, windows of 64 (t/s): 141 131 119 143 129 134 140 | first 64 tok 0.65 s | server 128.2 t/s | sha ded2b2ae08d7
+   midpf: 4363 tok prompts, prompt 2105 t/s, decode 109.0 t/s, wall 26.2 s, sha e1e5389cebb9
+   prefill 31537 tok in 12.9 s = 2438.9 t/s
+   long: prompt 259620 tok in 111 s (2331 t/s), gen 85 @ 90.7 t/s: There are 6,358 buildings mentioned (buildings 0 through 6357).
+   faults 0
+=== off 9:41 AM
+   smallpf: 8 prompts, 3092 tok in 6944 ms = 445.3 t/s (868.0 ms each)
+   first prefill 31537 tok in 16.8 s = 1879.6 t/s
+   greedy: sha c74123bcb468 107.8 t/s draft 258/420
+   pdecs fresh: 512 tok, windows of 64 (t/s): 141 129 125 144 124 156 125 | first 64 tok 0.62 s | server 128.0 t/s | sha 15c4d47c988b
+   midpf: 4363 tok prompts, prompt 1678 t/s, decode 110.8 t/s, wall 30.3 s, sha e56e80d8ff07
+   prefill 31537 tok in 16.8 s = 1881.7 t/s
+   long: prompt 259620 tok in 142 s (1822 t/s), gen 85 @ 90.8 t/s: There are 6,358 buildings mentioned (buildings 0 through 6357).
+   faults 0
+=== proff 9:46 AM
+   smallpf: 8 prompts, 3092 tok in 6264 ms = 493.6 t/s (783.0 ms each)
+   first prefill 31537 tok in 13.0 s = 2427.8 t/s
+   greedy: sha c74123bcb468 112.8 t/s draft 257/423
+   pdecs fresh: 512 tok, windows of 64 (t/s): 140 132 130 150 126 148 124 | first 64 tok 0.62 s | server 129.7 t/s | sha 35643e0220e1
+   midpf: 4363 tok prompts, prompt 2072 t/s, decode 109.7 t/s, wall 26.4 s, sha e38a0ebba0ec
+   prefill 31537 tok in 13.1 s = 2403.7 t/s
+   long: prompt 259620 tok in 112 s (2308 t/s), gen 85 @ 91.0 t/s: There are 6,358 buildings mentioned (buildings 0 through 6357).
+   faults 0
+=== prlt 9:50 AM
+   smallpf: 8 prompts, 3092 tok in 6063 ms = 510.0 t/s (757.9 ms each)
+   first prefill 31537 tok in 12.9 s = 2453.0 t/s
+   greedy: sha c74123bcb468 114.0 t/s draft 259/417
+   pdecs fresh: 512 tok, windows of 64 (t/s): 140 131 119 143 130 134 139 | first 64 tok 0.65 s | server 128.0 t/s | sha ded2b2ae08d7
+   midpf: 4363 tok prompts, prompt 2107 t/s, decode 108.2 t/s, wall 26.3 s, sha e1e5389cebb9
+   prefill 31537 tok in 12.9 s = 2437.2 t/s
+   long: prompt 259620 tok in 112 s (2327 t/s), gen 85 @ 90.4 t/s: There are 6,358 buildings mentioned (buildings 0 through 6357).
+   faults 0
+=== proff start 2 9:54 AM
+   sha c74123bcb468 | pdecs 35643e0220e1 | midpf e38a0ebba0ec
+   faults 0
+=== proff start 3 9:56 AM
+   sha c74123bcb468 | pdecs 35643e0220e1 | midpf e38a0ebba0ec
+   faults 0
+=== proff start 4 9:57 AM
+   sha c74123bcb468 | pdecs 35643e0220e1 | midpf e38a0ebba0ec
+   faults 0
+=== proff start 5 9:59 AM
+   sha c74123bcb468 | pdecs 35643e0220e1 | midpf e38a0ebba0ec
+   faults 0
+### prab325 DONE 10:00 AM
+
+# KLD (llama-perplexity, wikitext-2, -c 8192 --chunks 3 -ub 4096, same 2-GPU setup), base = stock + ROCBLAS_USE_HIPBLASLT=0
+Final estimate: PPL = 2.7192 +/- 0.04607
+proff: chunk PPL ln(PPL(Q)/PPL(base)) KL Divergence Δp RMS Same top p Mean PPL(Q)/PPL(base) : 0.993816 ± 0.001814 Mean KLD: 0.013868 ± 0.000443 Same top p: 96.304 ± 0.170 % 
+lt: chunk PPL ln(PPL(Q)/PPL(base)) KL Divergence Δp RMS Same top p Mean PPL(Q)/PPL(base) : 0.999615 ± 0.001836 Mean KLD: 0.013985 ± 0.000461 Same top p: 96.573 ± 0.164 % 
+
+# test-backend-ops -o MUL_MAT -b ROCm0, ROCBLAS_USE_HIPBLASLT=0
+r325:  2679/2680 tests passed | bf16 cases OK 239, FAIL 0
+[MUL_MAT] ERR = 0.004297126 > 0.000500000   MUL_MAT(type_a=f16,type_b=f32,m=16,n=2105344,k=32,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): [1;31mFAIL[0m
+prbf325:  2679/2680 tests passed | bf16 cases OK 239, FAIL 0
+[MUL_MAT] ERR = 0.004274229 > 0.000500000   MUL_MAT(type_a=f16,type_b=f32,m=16,n=2105344,k=32,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): [1;31mFAIL[0m
