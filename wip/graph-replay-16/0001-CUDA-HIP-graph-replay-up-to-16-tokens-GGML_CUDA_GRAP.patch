@@ -1,0 +1,41 @@
+From d0ac1e7f353572af49ee641b32134f9f6cf67b76 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 01:51:52 +0800
+Subject: [PATCH] CUDA/HIP: graph replay up to 16 tokens
+ (GGML_CUDA_GRAPH_MAX_TOKENS, 8 restores the previous limit)
+
+ggml_cuda_graph_is_multi_token() lets graphs of up to GGML_CUDA_GRAPH_MAX_TOKENS tokens (default 16, was
+MMVQ_MAX_BATCH_SIZE = 8) take the graph path, so 9..16-token verifies are replayed like the 2..8 widths.  It pays where
+such a width repeats (several slots verifying together under LLAMA_SPEC_ALIGN, a fixed-depth draft); a width that moves
+every step is captured once per new width.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c9bd54590..57516ef90 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -8802,7 +8802,16 @@ static bool ggml_cuda_graph_trace() {
+ 
+ static bool ggml_cuda_graph_is_multi_token(const ggml_cgraph * cgraph) {
+     static const bool verify_graphs_off = getenv("GGML_CUDA_DISABLE_VERIFY_GRAPHS") != nullptr;
+-    return ggml_cuda_graph_n_tokens(cgraph) > (verify_graphs_off ? 1 : MMVQ_MAX_BATCH_SIZE);
++    // GGML_CUDA_GRAPH_MAX_TOKENS: the most tokens a graph may have and still take the graph path.  Unset: 16, so the
++    // 9..16-token verifies are replayed too (the same kernels; the graph cache keeps one graph per width).  It pays where
++    // such a width repeats step after step (several slots verifying together under LLAMA_SPEC_ALIGN, a fixed-depth draft);
++    // a width that moves every step is captured once per new width instead (GGML_CUDA_GRAPH_TRACE counts both).
++    // GGML_CUDA_GRAPH_MAX_TOKENS=8 restores the previous limit.
++    static const int max_tokens = [] {
++        const char * e = getenv("GGML_CUDA_GRAPH_MAX_TOKENS");
++        return e != nullptr && atoi(e) >= 1 ? atoi(e) : 16;
++    }();
++    return ggml_cuda_graph_n_tokens(cgraph) > (verify_graphs_off ? 1 : max_tokens);
+ }
+ 
+ // `GGML_CUDA_GRAPH_TRACE` also reports how each `graph_compute` call was served.  The distinction is
+-- 
+2.43.0
+
