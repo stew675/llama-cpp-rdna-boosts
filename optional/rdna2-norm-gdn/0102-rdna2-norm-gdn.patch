@@ -1,0 +1,313 @@
+From 3fbce1089e9eb548c67c890c79e650eb99937564 Mon Sep 17 00:00:00 2001
+From: John Stamagal <jstamagal@gmail.com>
+Date: Fri, 20 Nov 2026 03:22:44 -0500
+Subject: [PATCH] rdna-boosts: block 0102: RDNA2 RMS_NORM and GATED_DELTA_NET
+ dispatch (optional)
+
+RDNA2 (gfx1030) only; every other arch takes the launches and kernels it
+took before.
+
+norm.cu
+- ncols <= 128 on RDNA2 launches rms_norm_f32<.., 32, 4, false, ..>: one warp
+  stands in for the four of a 128-thread launch and adds the per-warp sums in
+  the order block_reduce's cross-warp butterfly does.  The default grouping
+  (ggml_cuda_rms_norm_vec() in common.cuh) is unchanged: output is
+  byte-identical to the 256-thread launch on 11 shapes (f32/bf16, ncols
+  1..128).  GGML_CUDA_RMS_NORM_NARROW=0 selects a 128-thread launch instead.
+- on RDNA2 the plain path (dst16 == nullptr && store_f32) takes a kernel
+  specialization without the dst16 branch (has_dst16 = false).
+- GGML_CUDA_RMS_NORM_VEC is read through ggml_cuda_rms_norm_vec() as before,
+  so the plain norm and the fused norm kernels stay on one grouping.
+
+gated_delta_net.cu
+- with GGML_CUDA_GDN_CHUNKED unset, RDNA2 takes the FP32 chunked prefill only
+  for H * n_seqs <= 4 && n_tokens > 256 and the sequential kernel otherwise.
+  GGML_CUDA_GDN_CHUNKED=0|1 still forces either.
+
+tests/test-backend-ops.cpp
+- GATED_DELTA_NET perf shapes at the gate edge (8 and 12 heads, 4 heads x 2
+  sequences).
+
+Radeon Pro V620, idle card, us per call:
+  RMS_NORM [128,16384]  f32 79.3 -> 25.5   bf16 77.8 -> 16.6
+  GATED_DELTA_NET S_v=128, sequential / chunked:
+    H=32  n=64 60/193   n=256 208/588   n=512 409/1126   n=1024 812/2160
+    H=16 x3 v_repeat (Qwen3.8-27B)  n=512 560/1374   n=1024 1168/2707
+    H=12  n=512 282/521      H=8  n=512 288/310   n=1024 569/607
+    H=4   n=64 76/176   n=256 126/150   n=512 299/240   n=1024 589/462
+test-backend-ops (gfx1030): RMS_NORM* 234/234 (default, NARROW=0, VEC=1),
+GATED_DELTA_NET* 63/63 (gate, CHUNKED=1, CHUNKED=0).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PDDPmxJfGe1s7ZcKKfy9pX
+---
+ ggml/src/ggml-cuda/gated_delta_net.cu |  21 +++-
+ ggml/src/ggml-cuda/norm.cu            | 151 ++++++++++++++++++++++----
+ tests/test-backend-ops.cpp            |   7 ++
+ 3 files changed, 156 insertions(+), 23 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 85d1fe6fa..675b16d83 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -462,10 +462,27 @@ static void ggml_cuda_op_gated_delta_net_impl(
+     if (!kda && n_tokens > 1 &&
+         (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
+         // read once as a value: a cached getenv() pointer is unsafe on Windows (the CRT buffer is reused)
+-        static const bool chunked_on = [] {
++        // -1 = auto (default), 0 = force sequential, 1 = force chunked
++        static const int chunked_env = [] {
+             const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
+-            return env == nullptr || strcmp(env, "0") != 0;
++            if (env == nullptr) {
++                return -1;
++            }
++            return strcmp(env, "0") != 0 ? 1 : 0;
+         }();
++        // On RDNA2 (gfx1030, no BF16 WMMA) the FP32 chunked kernel only wins on low-head long prefill.
++        // Measured on a V620, sequential / chunked us per call, S_v = 128:
++        //   H=4:  n=64 76/176, n=256 126/150, n=512 299/240, n=1024 589/462   -> chunked above 256 tokens
++        //   H=8:  n=256 147/172, n=512 288/310, n=1024 569/607                -> sequential
++        //   H=4 x 2 seqs: n=512 285/302; H=12: n=512 282/521; H=32: n=512 409/1126
++        //   H=16 with v_repeat=3 (Qwen3.8-27B): n=512 560/1374                -> sequential
++        // H * n_seqs of 5..7 is unmeasured and takes the sequential kernel.
++        bool chunked_on = (chunked_env != 0);
++#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
++        if (chunked_env < 0 && GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
++            chunked_on = (H * n_seqs <= 4 && n_tokens > 256);
++        }
++#endif
+         if (chunked_on) {
+             // Threshold for the chunked path: a batch above it is chunked on its first
+             // n_tokens - D tokens and finished by the sequential tail.  D is the snapshot-set
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index fa52bd00a..56bc352ac 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -118,7 +118,7 @@ static __device__ __forceinline__ void rms_norm_store4(T * dst, const int i, con
+ }
+ 
+ // x and dst are float or nv_bfloat16, mul is float, add is float or the type of x
+-template <typename T, int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, typename T_add = float>
++template <typename T, int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, typename T_add = float, bool has_dst16 = false>
+ static __global__ void rms_norm_f32(const T *     x,
+                                     T *           dst,
+                                     const int     ncols,
+@@ -182,11 +182,13 @@ static __global__ void rms_norm_f32(const T *     x,
+             }
+ 
+             // MMB BF16 streams (block 08): the norm may write a bf16 copy in place of / next to the
+-            // f32 output (dst16 + store_f32).  Both branches below honour it; the default is
+-            // store_f32 = true, dst16 = nullptr, i.e. exactly the upstream behaviour.
+-            uint16_t * dst16c = nullptr;
+-            if (dst16 != nullptr) {
+-                dst16c = dst16 + ((sample*nchannels + channel)*nrows + row)*ncols;
++            // f32 output (dst16 + store_f32).  Specialized via has_dst16 so the standard path
++            // (dst16 == nullptr && store_f32) compiles with zero extra branch/VGPR overhead.
++            [[maybe_unused]] uint16_t * dst16c = nullptr;
++            if constexpr (has_dst16) {
++                if (dst16 != nullptr) {
++                    dst16c = dst16 + ((sample*nchannels + channel)*nrows + row)*ncols;
++                }
+             }
+ 
+             if constexpr (do_vec) {
+@@ -232,15 +234,92 @@ static __global__ void rms_norm_f32(const T *     x,
+                             r.z *= scale_out;
+                             r.w *= scale_out;
+                         }
+-                        if (store_f32) {
++                        if constexpr (has_dst16) {
++                            if (store_f32) {
++                                rms_norm_store4(dstc, i, r);
++                            }
++                            if (dst16c != nullptr) {
++                                dst16c[4*i + 0] = norm_f2bf(r.x);
++                                dst16c[4*i + 1] = norm_f2bf(r.y);
++                                dst16c[4*i + 2] = norm_f2bf(r.z);
++                                dst16c[4*i + 3] = norm_f2bf(r.w);
++                            }
++                        } else {
+                             rms_norm_store4(dstc, i, r);
+                         }
++                    }
++                }
++            } else if constexpr (vpt > 1) {
++                float tmp = 0.0f;
++
++                // Narrow form of the strided scalar reduction for ncols <= vpt*WARP_SIZE: one warp stands in
++                // for the vpt warps of a (vpt*WARP_SIZE)-thread launch.  Lane `tid` owns the threads
++                // tid + k*WARP_SIZE of that launch, each of which holds at most one column.  Every stand-in
++                // warp is reduced with the same butterfly, and the per-warp sums are then added in the order
++                // block_reduce's cross-warp butterfly adds them (lanes 0..3, xor 2 then xor 1; the higher
++                // lanes hold +0).  The result is bit-identical to RMS_NORM_LAUNCH(128, 1, false) and
++                // RMS_NORM_LAUNCH(256, 1, false) at these widths, so the default grouping
++                // (ggml_cuda_rms_norm_vec() in common.cuh) is unchanged.  The lane keeps its columns in
++                // registers, so the row is read once.
++                // The match was checked byte-for-byte on gfx1030 (ROCm 7.14), f32 and bf16, ncols 1..128.
++                // It relies on the compiler contracting `x*x` into the first butterfly add exactly as it
++                // does in the wide form: writing the square as fmaf(x, x, 0.0f) changes the output bits.
++                // Re-check after touching the next two loops or the compiler.
++                static_assert(block_size == WARP_SIZE && vpt == 4, "narrow scalar rms_norm is one warp standing in for four");
++
++                // one output column: v from the row's scale and the column's input, then the store(s);
++                // the same expressions as the wide form's loop below
++                const auto emit = [&](const int col, const float xi, const float scale) {
++                    float v;
++                    if constexpr (do_multiply && do_add) {
++                        const int mul_col = fastmodulo(col, mul_ncols_packed);
++                        const int add_col = fastmodulo(col, add_ncols_packed);
++                        v = scale * xi * mulc[mul_col] + ggml_cuda_cast<float>(addc[add_col]);
++                    } else if constexpr (do_multiply) {
++                        const int mul_col = fastmodulo(col, mul_ncols_packed);
++                        v = scale * xi * mulc[mul_col];
++                    } else if constexpr (do_scale) {
++                        v = scale_out * (scale * xi);
++                    } else {
++                        v = scale * xi;
++                    }
++                    if constexpr (has_dst16) {
++                        if (store_f32) {
++                            dstc[col] = ggml_cuda_cast<T>(v);
++                        }
+                         if (dst16c != nullptr) {
+-                            dst16c[4*i + 0] = norm_f2bf(r.x);
+-                            dst16c[4*i + 1] = norm_f2bf(r.y);
+-                            dst16c[4*i + 2] = norm_f2bf(r.z);
+-                            dst16c[4*i + 3] = norm_f2bf(r.w);
++                            dst16c[col] = norm_f2bf(v);
+                         }
++                    } else {
++                        dstc[col] = ggml_cuda_cast<T>(v);
++                    }
++                };
++                float xk[4];
++                float part[4];
++#pragma unroll
++                for (int k = 0; k < 4; k++) {
++                    const int col = tid + k*WARP_SIZE;
++                    xk[k]   = 0.0f;
++                    part[k] = 0.0f;
++                    if (col < ncols) {
++                        xk[k]   = ggml_cuda_cast<float>(xc[col]);
++                        part[k] = xk[k] * xk[k];
++                    }
++                }
++#pragma unroll
++                for (int k = 0; k < 4; k++) {
++                    part[k] = warp_reduce_sum(part[k]);
++                }
++                tmp = (part[0] + part[2]) + (part[1] + part[3]);
++
++                // same two statements as the wide form
++                const float mean = tmp / ncols;
++                const float scale = rsqrtf(mean + eps);
++#pragma unroll
++                for (int k = 0; k < 4; k++) {
++                    const int col = tid + k*WARP_SIZE;
++                    if (col < ncols) {
++                        emit(col, xk[k], scale);
+                     }
+                 }
+             } else {
+@@ -272,12 +351,16 @@ static __global__ void rms_norm_f32(const T *     x,
+                     } else {
+                         v = scale * xi;
+                     }
+-                    if (store_f32) {
++                    if constexpr (has_dst16) {
++                        if (store_f32) {
++                            dstc[col] = ggml_cuda_cast<T>(v);
++                        }
++                        if (dst16c != nullptr) {
++                            dst16c[col] = norm_f2bf(v);
++                        }
++                    } else {
+                         dstc[col] = ggml_cuda_cast<T>(v);
+                     }
+-                    if (dst16c != nullptr) {
+-                        dst16c[col] = norm_f2bf(v);
+-                    }
+                 }
+             }
+ 
+@@ -537,12 +620,21 @@ static void group_norm_f32_cuda(
+     do { \
+         const dim3 block_dims(BLOCK_SIZE, 1, 1); \
+         const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream }; \
+-        ggml_cuda_kernel_launch(rms_norm_f32<T, BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, T_add>, launch_params, \
+-            x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, \
+-            mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
+-            mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
+-            add, add_stride_row, add_stride_channel, add_stride_sample, \
+-            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, dst16, store_f32); \
++        if (rdna2_plain && dst16 == nullptr && store_f32) { \
++            ggml_cuda_kernel_launch(rms_norm_f32<T, BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, T_add, false>, launch_params, \
++                x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, \
++                mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
++                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
++                add, add_stride_row, add_stride_channel, add_stride_sample, \
++                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, dst16, store_f32); \
++        } else { \
++            ggml_cuda_kernel_launch(rms_norm_f32<T, BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, T_add, true>, launch_params, \
++                x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, \
++                mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
++                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
++                add, add_stride_row, add_stride_channel, add_stride_sample, \
++                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, dst16, store_f32); \
++        } \
+     } while (0)
+ 
+ template <bool do_multiply, bool do_add, bool do_scale, typename T_add = float, typename T>
+@@ -563,6 +655,11 @@ static void rms_norm_f32_dispatch(
+     const float * mul = mul_t ? (const float *) mul_t->data : nullptr;
+     const T_add * add = add_t ? (const T_add *) add_t->data : nullptr;
+ 
++    // Block 0102 is RDNA2-only (gfx1030 is the only arch it was measured and byte-compared on): the kernel
++    // without the dst16 branch and the narrow launch for ncols <= 128.  Every other arch takes exactly the
++    // launches it took before.
++    const bool rdna2_plain = GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
++
+     // dst is written at row * ncols, i.e. always at a multiple of ncols, so only its base needs checking here.
+     // `vec` is the float4 grouping ggml-org/llama.cpp#29720 introduced; it is opt-in (issue #229) so that the
+     // delivery's default reduction stays the one every MTP number and every fused norm kernel is built on --
+@@ -596,6 +693,18 @@ static void rms_norm_f32_dispatch(
+         } else {
+             RMS_NORM_LAUNCH(1024, 1, false);
+         }
++    } else if (rdna2_plain && ncols <= 128) {
++        // one warp per row, same reduction tree as the 128- and 256-thread launches (see the kernel);
++        // GGML_CUDA_RMS_NORM_NARROW=0 is the A/B switch back to the 128-thread launch
++        static const bool narrow = [] {
++            const char * e = getenv("GGML_CUDA_RMS_NORM_NARROW");
++            return e == nullptr || atoi(e) != 0;
++        }();
++        if (narrow) {
++            RMS_NORM_LAUNCH(32,   4, false);
++        } else {
++            RMS_NORM_LAUNCH(128,  1, false);
++        }
+     } else if (ncols < 1024) {
+         RMS_NORM_LAUNCH(256,  1, false);
+     } else {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 63bb2de9e..c015f8bd7 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -14956,6 +14956,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
++    // 8 heads, and 4 heads x 2 sequences: the edge of the RDNA2 chunked-prefill gate (H * n_seqs <= 8)
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 256, 1));  // 8h PP-256
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 512, 1));  // 8h PP-512
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 1024, 1)); // 8h PP-1024
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 512, 1)); // 12h PP-512
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 1024, 1)); // 12h PP-1024
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 2));  // 4h x 2 seqs PP-512
+ 
+     // Qwen3.8-27B-shaped: H_k=16, H_v=48 (v_repeat=3), S_v=128, scalar gates (non-KDA)
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  64, 1, 3));
+-- 
+2.56.1
+
