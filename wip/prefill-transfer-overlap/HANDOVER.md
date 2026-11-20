@@ -4,8 +4,15 @@
 [`RESULTS-2026-11-18.md`](RESULTS-2026-11-18.md) (§ numbers are referenced below).  Everything here is **WIP**:
 nothing is in `patches/`, nothing has been applied to `~/llama.cpp`, and no delivery block has been amended.
 
-**Status: 9 measurement passes done in one night (2026-11-18).  The baseline is established and the physics is
-proven.  The mechanism itself has never run — it does not exist yet.  That is your job.**
+**Status: 11 passes.  2026-11-18 established the baseline and the window; 2026-11-20 (passes 10-11,
+[`RESULTS-2026-11-20.md`](RESULTS-2026-11-20.md)) built Task 1 and measured the interleave.**  The generic
+second KV-sharing context exists on the WIP branch `wip/prefill-overlap` and its text oracle holds; a decoder
+running beside a prefill on the shallow-arena shape gets **32-35 tokens through a 2.27 s prefill at ITL p95
+49-53 ms** while the prefill pays **−11.3 %** (shipping: p95 519-568 ms at −30 %).  What pass 11 **refuted**:
+the window is *not* free to a real decode step (**79 % of the step is charged**; pass 5's "two-thirds
+absorbed" was ALU-only), and the time-bounded gate F is **not** the lever (F=0.25 is worse than ungated on
+both axes) — the submission/concurrency is.  Read §4 below as the plan that produced that result, not as an
+open question; the remaining work is listed at the end of the pass 10-11 record.
 
 ---
 

@@ -1,0 +1,375 @@
+diff --git a/include/llama.h b/include/llama.h
+index 2404d8b2a..7e6d56ddc 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -492,6 +492,14 @@ extern "C" {
+                           // derived mask serves every batch.  A 2-D batch that arrives anyway forces one
+                           // mid-run re-reserve instead (see llama_context::decode).
+ 
++        // wip/prefill-transfer-overlap [EXPERIMENTAL]: share `ctx_other`'s llama_memory with this context (the
++        // same cells, not a second copy) instead of allocating a private one.  Only meaningful together with
++        // `ctx_other`, and only the plain attention KV and the plain hybrid wrapper implement a shared view --
++        // any other memory module declines with a warning.  The arch-specific meanings of `ctx_other` above
++        // are separate and do not set this.  DEFAULT false: a private cache is what every existing caller
++        // gets, including the MTP drafter, which names a ctx_other it does NOT share a KV with.
++        bool ctx_other_share_memory;
++
+         // [EXPERIMENTAL]
+         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
+         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9a98670fd..5c2bc08fc 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -574,7 +574,8 @@ llama_context::llama_context(
+     cparams.cb_eval           = params.cb_eval;
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
+ 
+-    cparams.ctx_other = nullptr;
++    cparams.ctx_other       = nullptr;
++    cparams.ctx_other_share = params.ctx_other_share_memory;
+ 
+     // TODO: more generic
+     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+@@ -586,6 +587,24 @@ llama_context::llama_context(
+         cparams.ctx_other = params.ctx_other;
+     }
+ 
++    // wip/prefill-transfer-overlap: a GENERIC second context.  Any architecture may name another context of
++    // the SAME model and share its llama_memory -- that is the one place a decode can be submitted from while
++    // this context's llama_process() is open (the server's step is one graph compute, and it cannot yield
++    // inside it).  The arch-gated blocks above stay: they decide what the sharing MEANS for their arch (a
++    // reduced-vocab drafter borrowing a token_embd, a shared-NextN head, a gemma4 assistant view).  This only
++    // lifts the gate for everyone else.  `create_memory` decides whether the arch's memory module can share
++    // at all and says so loudly when it cannot, so "shares" is never an assumption.
++    if (cparams.ctx_other == nullptr && params.ctx_other != nullptr) {
++        if (&params.ctx_other->get_model() != &model) {
++            throw std::runtime_error("ctx_other must be a context of the same model");
++        }
++
++        cparams.ctx_other = params.ctx_other;
++
++        LLAMA_LOG_INFO("%s: ctx_other = %p: this context shares the memory of the named context (generic)\n",
++                __func__, (const void *) cparams.ctx_other);
++    }
++
+     if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_QWEN4EXP) {
+         if (model.tok_embd == nullptr || model.output == nullptr) {
+             if (params.ctx_other == nullptr) {
+@@ -6528,6 +6547,7 @@ llama_context_params llama_context_default_params() {
+         /*.kv_unified                  =*/ false,
+         /*.drop_compute_buffers        =*/ false,
+         /*.pos_2d                      =*/ false,
++        /*.ctx_other_share_memory      =*/ false,
+         /*.sampler                     =*/ nullptr,
+         /*.n_sampler                   =*/ 0,
+         /*.ctx_other                   =*/ nullptr,
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 2c60b755e..a1f04262d 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -93,6 +93,10 @@ struct llama_cparams {
+ 
+     llama_context * ctx_other;
+ 
++    // wip/prefill-transfer-overlap: view ctx_other's memory instead of allocating a private one
++    // (llama_context_params::ctx_other_share_memory; default false)
++    bool ctx_other_share = false;
++
+     // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()
+     llama_context * ctx_state_src;
+ };
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index bd38e90fe..18275a598 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -536,8 +536,9 @@ llama_kv_cache::llama_kv_cache(
+                      bool   v_enabled,
+                      bool   kv_pool_capable,
+                     int32_t kv_pool_cells,
+-                     bool   swa_ring) :
+-    model(model), hparams(hparams), v_trans(v_trans),
++                     bool   swa_ring,
++                     bool   other_coowner) :
++    model(model), hparams(hparams), v_trans(v_trans), other_coowner(other_coowner),
+     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max),
+     n_pad_prefill(kv_n_pad_prefill_default(model)), n_swa(n_swa), swa_ring(swa_ring), is_indexer(is_indexer),
+     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
+@@ -1334,7 +1335,7 @@ void llama_kv_cache::clear(bool data) {
+ 
+ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+-    if (other) {
++    if (is_mirror()) {
+         return true;
+     }
+ 
+@@ -1419,7 +1420,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+ 
+ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+-    if (other) {
++    if (is_mirror()) {
+         return;
+     }
+ 
+@@ -1515,7 +1516,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
+ 
+ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+-    if (other) {
++    if (is_mirror()) {
+         return;
+     }
+ 
+@@ -1850,7 +1851,7 @@ bool llama_kv_cache::can_park() const {
+ 
+ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+-    if (other) {
++    if (is_mirror()) {
+         return;
+     }
+ 
+@@ -1900,7 +1901,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
+ 
+ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+-    if (other) {
++    if (is_mirror()) {
+         return;
+     }
+ 
+@@ -2171,7 +2172,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
+ 
+ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+-    if (other) {
++    if (is_mirror()) {
+         return true;
+     }
+ 
+@@ -2528,7 +2529,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+ 
+ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+-    if (other) {
++    if (is_mirror()) {
+         return;
+     }
+ 
+@@ -4093,7 +4094,7 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
+ 
+ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_context * lctx) const {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+-    GGML_ASSERT(!other);
++    GGML_ASSERT(!is_mirror());
+ 
+     auto * ctx = res->get_ctx();
+     auto * gf  = res->get_gf();
+@@ -4124,7 +4125,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
+ 
+ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+-    if (other) {
++    if (is_mirror()) {
+         return;
+     }
+ 
+@@ -4205,7 +4206,7 @@ void llama_kv_cache::state_read_sinfo(
+       slot_info_vec_t *   sinfos_out,
+ const slot_info_vec_t *   sinfos_in) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+-    if (other) {
++    if (is_mirror()) {
+         return;
+     }
+ 
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 62771f305..77e435e7d 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -134,7 +134,12 @@ public:
+         // by evicting the sequence's oldest cells when position-based reclaim cannot place the batch
+         // (issue #297).  false for every other cache, INCLUDING a model's own sliding-window attention,
+         // where a cell inside the window must never be reused.
+-                         bool   swa_ring = false);
++                         bool   swa_ring = false,
++        // wip/prefill-transfer-overlap: `mem_other` is a CO-OWNER (a second context of the SAME model that
++        // owns its own sequences) rather than a read-only MIRROR (a drafter that reads the target's cells).
++        // A mirror must not touch the source's cell bookkeeping; a co-owner must, or its own cells never get
++        // positions/seq ids and its attention reads garbage.  Default false: the drafter/gemma4 paths.
++                         bool   other_coowner = false);
+ 
+     ~llama_kv_cache();
+ 
+@@ -391,6 +396,13 @@ private:
+     // false for a model's own sliding-window attention: there a cell inside the window is still attended
+     const bool swa_ring = false;
+ 
++    // wip/prefill-transfer-overlap: this cache CO-OWNS the source cache's cells (same-model second context)
++    // rather than mirroring them read-only.  A mirror skips every mutable cell path; a co-owner runs them,
++    // because the cells it allocates for its own sequences live in the shared `v_cells`.
++    const bool other_coowner = false;
++
++    bool is_mirror() const { return other != nullptr && !other_coowner; }
++
+     // the ring eviction above is reported ONCE (INFO, then DEBUG): it explains why a draft batch evicted
+     // cells the position window still held, which is the issue #297 shape, and it must be visible without
+     // `-lv 4` the first time it happens to a run
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index 1ff00d5f9..8f3b4ce9d 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -8,6 +8,16 @@
+ // llama_memory_hybrid
+ //
+ 
++// wip/prefill-transfer-overlap: the attention cache of the source context a second (same-model) context views.
++// A hybrid source never hands out its recurrent memory yet -- see the note in the ctor.
++static llama_memory_t hybrid_mem_other_attn(llama_memory_t mem_other) {
++    if (mem_other == nullptr) {
++        return nullptr;
++    }
++
++    return static_cast<llama_memory_hybrid *>(mem_other)->get_mem_attn();
++}
++
+ llama_memory_hybrid::llama_memory_hybrid(
+         const llama_model & model,
+                      bool   no_alloc,
+@@ -32,7 +42,8 @@ llama_memory_hybrid::llama_memory_hybrid(
+     const layer_filter_cb & filter_attn,
+     const layer_filter_cb & filter_recr,
+                      bool   kv_pool,
+-                     int32_t kv_pool_cells) :
++                     int32_t kv_pool_cells,
++           llama_memory_t   mem_other) :
+     hparams(model.hparams),
+     mem_attn(new llama_kv_cache(
+         model,
+@@ -47,17 +58,22 @@ llama_memory_hybrid::llama_memory_hybrid(
+         n_seq_max,
+         n_swa,
+         swa_type,
+-        nullptr,
++        hybrid_mem_other_attn(mem_other),
+         filter_attn == nullptr ?
+             [&](int32_t il) { return !hparams.is_recr(il); }
+             : filter_attn,
+         nullptr,
+-        nullptr,
++        // wip/prefill-transfer-overlap: a second context of the same model views the source cache's K/V
++        // tensors layer for layer (identity: same model, same layer ids).  Without this the cache would
++        // allocate its own K/V and only share the CELL METADATA, which is not sharing.
++        mem_other == nullptr ? nullptr : llama_kv_cache::layer_share_cb([](int32_t il) { return il; }),
+         /* name_tag   */ "",
+         /* is_indexer */ false,
+         /* v_enabled  */ true,
+         /* kv_pool    */ kv_pool,
+-        /* kv_pool_cells */ kv_pool_cells
++        /* kv_pool_cells */ kv_pool_cells,
++        /* swa_ring   */ false,
++        /* other_coowner */ mem_other != nullptr
+     )),
+     mem_recr(new llama_memory_recurrent(
+         model,
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+index 371203648..e0f517f68 100644
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -43,7 +43,10 @@ public:
+     const layer_filter_cb & filter_recr = nullptr,
+     // wip/kv-residency (TODO #118) B-A: the attention cache may take the attendance pool
+                      bool   kv_pool     = false,
+-                     int32_t kv_pool_cells = 0);
++                     int32_t kv_pool_cells = 0,
++    // wip/prefill-transfer-overlap: a second context of the SAME model whose attention KV this one views
++    // (llama_context_params::ctx_other_share_memory).  Its recurrent memory is NOT shared yet.
++           llama_memory_t   mem_other = nullptr);
+ 
+     ~llama_memory_hybrid() = default;
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 50c89460d..a969800f0 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3412,6 +3412,15 @@ uint32_t llama_spec_draft_kv_cells(uint32_t n_ctx_seq, uint32_t n_ubatch, uint32
+ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+     llama_memory_i * res;
+ 
++    // wip/prefill-transfer-overlap: a second context of the same model may VIEW the existing memory (the same
++    // cells) instead of allocating a private copy -- this is what lets a decode be submitted while another
++    // context's llama_process() is open.  Opt-in, because `ctx_other` itself already means different things to
++    // different arches (the MTP drafter names a target it deliberately keeps its own KV against).  Only the two
++    // modules wired below implement the view; the rest DECLINE loudly, since a private cache would look like
++    // sharing and behave like a second copy of the KV.
++    llama_memory_t mem_other      = cparams.ctx_other_share ? params.mem_other : nullptr;
++    bool           mem_other_used = false;
++
+     // the non-causal LFM2 and LFM3 decision graphs read the whole prompt in one batch, nothing is kept
+     if (arch == LLM_ARCH_LFM2 && !hparams.causal_attn && hparams.n_layer_decision > 0) {
+         return nullptr;
+@@ -3919,6 +3928,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* kv_pool           */ params.kv_pool,
+                             /* kv_pool_cells     */ params.kv_pool_cells);
+                     } else {
++                        mem_other_used = mem_other != nullptr;
++
+                         res = new llama_memory_hybrid(
+                             /* model             */ *this,
+                             /* no_alloc          */ params.no_alloc,
+@@ -3939,7 +3950,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* filter_attn       */ std::move(filter_attn),
+                             /* filter_recr       */ std::move(filter_recr),
+                             /* kv_pool           */ params.kv_pool,
+-                            /* kv_pool_cells     */ params.kv_pool_cells);
++                            /* kv_pool_cells     */ params.kv_pool_cells,
++                            /* mem_other         */ mem_other);
+                     }
+                 } else {
+                     llama_kv_cache::layer_filter_cb filter = nullptr;
+@@ -4082,6 +4094,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             }
+                         }
+ 
++                        // wip/prefill-transfer-overlap: a sharing context views the source cache's K/V tensors
++                        // layer for layer.  Identity, because it is the same model: same layer ids, same
++                        // geometry.  The cell metadata is shared by llama_kv_cache itself (`other != nullptr`).
++                        mem_other_used = mem_other != nullptr;
++
+                         res = new llama_kv_cache(
+                                 *this,
+                                 params.no_alloc,
+@@ -4095,21 +4112,28 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                                 cparams.n_seq_max,
+                                 mtp_n_swa,
+                                 mtp_swa_type,
+-                                nullptr,
++                                mem_other,
+                                 filter,
+                                 nullptr,
+-                                nullptr,
++                                mem_other == nullptr ? nullptr
++                                                     : llama_kv_cache::layer_share_cb([](int32_t il) { return il; }),
+                                 "",
+                                 false,
+                                 true,
+                                 false,
+                                 -1,
+-                                /*.swa_ring    =*/ mtp_ring);
++                                /*.swa_ring    =*/ mtp_ring,
++                                /*.other_coowner =*/ mem_other != nullptr);
+                     }
+                 }
+             }
+     }
+ 
++    if (mem_other != nullptr && !mem_other_used) {
++        LLAMA_LOG_WARN("%s: ctx_other_share_memory was requested, but this architecture's memory module "
++                       "implements no shared view -- this context has its OWN cache (%s)\n", __func__, arch_name().c_str());
++    }
++
+     return res;
+ }
+ 

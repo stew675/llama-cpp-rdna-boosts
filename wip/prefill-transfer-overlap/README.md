@@ -1,8 +1,29 @@
 # prefill-transfer-overlap — spend the H2D window on the decoder
 
-**Status: OPEN — pass 1 MEASURED (2026-11-18, [`RESULTS-2026-11-18.md`](RESULTS-2026-11-18.md)).  Nothing
-implemented, nothing in `patches/`.**
+**Status: OPEN — the enabling change EXISTS and the first overlap numbers are measured (2026-11-20,
+[`RESULTS-2026-11-20.md`](RESULTS-2026-11-20.md), passes 10-11).  Nothing implemented in the delivery, nothing
+in `patches/`; the code lives on the WIP branch `wip/prefill-overlap` of `~/llama.cpp`.**
 Opened 2026-11-18 by the maintainer's instruction ("create the campaign").
+
+**Pass 10-11 (2026-11-20) — Task 1 done, and the window is NOT free to a real decode step.**  A **generic
+second `llama_context` sharing the first one's KV** exists behind one new opt-in bool
+(`llama_context_params::ctx_other_share_memory`; the arch gate at `llama-context.cpp` lifted, a co-owner flag
+in `llama_kv_cache` so the second context may write the shared cells, and the hybrid wrapper wiring for
+`qwen35moe`).  Its text oracle holds on the dense 4B and on the campaign's 35B-A3B, including **two contexts
+computing concurrently** — at full residency and with no host tier.  On a **partial arena** two *decoders*
+running at once do not read one text, non-deterministically, and the carrier is the **sync-free decode-band
+device remap** (`GGML_MOE_DEVREMAP=0` reads one text 3/3; residency itself is refuted as the carrier — a
+different residency with the same text is measured).  A *prefill* context plus a *decode* context is the safe
+pair, which is the campaign's own arm.
+Then the physics, measured on the shallow-arena shape (arena **5000** MiB: 8 GiB does not fit two contexts)
+with a 4932-token prompt and 128 decoder tokens: prefill **2529 t/s** alone, **2457** with an idle second
+context (**−3 %**), **2172** ungated (**−11.3 %**), decoder gets **32-35 tokens** through the 2.27 s prefill at
+**ITL p95 49-53 ms** (shipping: 519-568 ms) — but the marginal cost is **7.7 ms per decode token against a
+10.9 ms standalone step, i.e. 79 % charged**.  Pass 5's "two-thirds absorbed" was an **ALU-only** kernel; a MoE
+decode step on a shallow arena is itself link-bound.  The time-bounded gate (F = 0 / .25 / .5 / 1 / ∞) is
+**not** the lever: F=0.25 is worse than flat out on the decoder's p95 and saves nothing on the prefill.  The
+result is a **PARTIAL** by the handover's definition — a Pareto improvement over both shipping rows on both
+axes (smoothness ~11x, prefill cost a third of the duty cycle's) and not the 5 %-prefill / <50 ms PASS.
 
 **Pass 8 answered the ideal-scenario question: there the window is exactly ZERO.**  No `-ncmoe` at all
 (Q4_K_M, 6350 t/s solo prefill, `gather calls = 0`): the duty tax is the same −32 % as in both host-tier
@@ -350,6 +371,9 @@ promotion time, per `AGENTS.md`.
 | this `README.md` | the campaign record |
 | [`HANDOVER.md`](HANDOVER.md) | **start here in a fresh session**: goal + PASS/PARTIAL/FAIL, the baseline table, what is established, the (D) plan with file pointers, the landmines, and every command |
 | [`PROMPT.md`](PROMPT.md) | the first message to hand a cold session |
+| [`RESULTS-2026-11-20.md`](RESULTS-2026-11-20.md) | **passes 10-11**: the generic second KV-sharing context (its text oracle, the co-owner vs mirror distinction, the decode-band-remap collision), the VRAM cost of a second context, and the first overlap numbers + the gate sweep (prefill −11.3 %, decoder p95 49-53 ms, 79 % of a decode step charged) |
+| [`candidate-generic-second-context.patch`](candidate-generic-second-context.patch) | The pass-10 change as one patch against the delivery tree (`git diff` of the WIP branch `wip/prefill-overlap` in `~/llama.cpp` vs `rdna-boosts`): 8 files, +111/-23.  **WIP only** — it is not in `patches/`, no block was created or amended, and it is not applied to any checkout |
+| [`arms/two_ctx.cpp`](arms/two_ctx.cpp), [`arms/build-two-ctx.sh`](arms/build-two-ctx.sh) | the pass 10-11 instrument: one process, one model, two contexts; modes `single`/`dual`/`dual-parallel`/`pf-alone`/`dec-alone`/`pf-dec` (+ `TWO_CTX_GATE_F`, `TWO_CTX_REPS`, `TWO_CTX_B_BATCH`) |
 | [`RESULTS-2026-11-18.md`](RESULTS-2026-11-18.md) | **pass 1**: the ten-arm table, the four findings (the tier is free at 100 % residency; a partial arena costs ~56 %; the gather is 2.12x over staging and is the carrier now; the staging path is not a baseline), and the `G0`/`G1`/`G2` test that decides mechanism (D) |
 | `arms/arm.sh`, `arms/summ.sh` | the arm runner and the log re-parser (one summary line per arm, `F` from the delivery's own calibrated 28.7 GB/s H2D figure) |
 | `arms/summary.tsv` | the machine-readable arm table (the raw `runs/*.log` are per-run scratch and are **gitignored** by the repo-wide `runs/` rule, like every other campaign's) |
