@@ -4,6 +4,12 @@
 implemented, nothing in `patches/`.**
 Opened 2026-11-18 by the maintainer's instruction ("create the campaign").
 
+**Pass 4 (same night) proved the headroom, and its ceiling.**  A compute-bound kernel co-scheduled with the
+gather leaves the gather **−1.2 %** (2.436 vs 2.466 ms/call) while stretching the prefill 4.3x — so the gather's
+window is genuinely free, but *only* that window: the prefill's compute phases are compute-bound, so an
+interleave must be **rate-limited to the gather window** (the ceiling is `F`, ~57 % of the wall), not 'submit a
+decode step whenever a prefill runs'.
+
 **Pass 3 (same night) measured the bar an interleave must beat.**  On the same shallow-arena shape the shipped
 duty cycle (`scripts/gate-prefill-duty.sh`) delivers **12.5x the decode tokens (15 → 187) for a 1.53x prefill
 stretch** (4.25 → 6.51 s) — 172 extra tokens for 2.26 s, i.e. **13.1 ms per token against a 15.2 ms standalone
