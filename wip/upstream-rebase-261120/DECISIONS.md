@@ -356,3 +356,34 @@ identical (`71 chars sha=1de99b7e6ee6`); `test-backend-ops -o ROPE` 515/515; f16
 `1c5d32ac537d`.  The alternative — keeping upstream's guard — is recorded in `RUNGS.md` R04.2 with the cost it
 would carry, so the choice is auditable rather than silent.  In R04.2's terms this was option 1 *plus* the
 union of option 3: no delivery arm was deleted.
+
+---
+
+## D16 — two incompatible FA iteration models: `#32407` (rotation) vs block 05 (band)  ·  **OPEN, asked at R05**
+
+`flash_attn_ext_f16_process_tile` is the tile loop of the MMA FA kernel.  Upstream `054a1babf` (`#32407`,
+*Rotate K/V read order for better L2 cache hit rates*) and the delivery's block 05 **both rewrite it**, and the
+two rewrites are different partitions of the same work:
+
+- upstream: `nkb = nkb_pre + nkb_post` over a contiguous run plus a rotated remainder, stepping `kb0 + 1` and
+  wrapping at `kb0_max`; the loop is the `nstages > 1` double-buffered pipeline;
+- the delivery: a strided band, `for (; kb0 < kb0_stop; kb0 += kb0_step)`, with a `kq_blocks` bitmap skip, a
+  neutral partial for a band block that owns no iteration, and the RDNA4 fetch-ahead ring.
+
+`#32407` is not a prefetch hint — it changes which blocks a tile visits and in what order, and its bookkeeping
+must account for every block exactly once, so a merge is a **third model**, not a union.  A wrong model is
+invisible to short-prompt text and silently wrong at depth.
+
+**Options** (full detail and the 22-region classification: `RUNGS.md` R05.1/R05.2):
+
+1. **Combined model** — highest fidelity, highest risk; the oracle is `test-backend-ops -o FLASH_ATTN_EXT`
+   (7381 cases, ~25 min per iteration) + the prefill-logit KLD gate + text, at every step. 2-4 sessions.
+2. **Keep block 05's model, drop the rotation** (recommended) — the other 17 regions still get the union, so
+   `#32217`'s per-head-mask fix and the type changes survive; only the rotation is not carried.  Its own commit
+   message records no number, and the band/stream-K split it would displace is a shipped, gated delivery
+   feature.  Reversible later as a rung-repair or an `upstream/` candidate.
+3. **Keep upstream's model, re-band later** — equivalent to redoing block 05.
+
+**Why it is asked rather than decided:** option 2 drops an upstream performance change, which is the
+maintainer's call under `AGENTS.md`, and option 1 is a multi-session design task that must not be started
+without agreement on the oracle and the risk.

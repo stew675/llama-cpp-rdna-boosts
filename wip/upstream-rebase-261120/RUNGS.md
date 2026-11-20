@@ -36,7 +36,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | R01 | 01 | `a94e2214c` | 0 | — | **DONE 2026-11-20** — `14a0414bb`, tree `6566ca3ac`; one rung repair (HIP's 64-bit warp mask); 3-device tensor text `1c5d32ac537d` == R00; pipeline census 3 GPUs |
 | R02 | 02 | `cef19b032` | 5 | D5 (**resolved: MERGE**, no code dropped) | **DONE 2026-11-20** — `3941bad4e`, tree `0799ebfad`; all 5 conflicts are unions; adaptive arm 29.3 -> 65.2 t/s with identical text; enum count 13 -> 14 |
 | R03 | 03 | `36da15029` | 1 | — | **DONE 2026-11-20** — `e612388ba`, tree `971953b99`; test-file union; GATED_DELTA_NET 76/76; chunked prefill +8.8 % with identical text |
-| R04 | 04 | `cfe40b5f9` | 2 | **D3 (resolved: union + drop upstream's guard)** | **DONE 2026-11-20** — `768d27561`, tree `0866d4229`; 7 rope arms; fusion worth +5.8 % pp / +16.5 % tg at bf16 KV, identical text; ROPE 515/515 || R05 | 05 | `7362b5958` | 7 | — | not started |
+| R04 | 04 | `cfe40b5f9` | 2 | **D3 (resolved: union + drop upstream's guard)** | **DONE 2026-11-20** — `768d27561`, tree `0866d4229`; 7 rope arms; fusion worth +5.8 % pp / +16.5 % tg at bf16 KV, identical text; ROPE 515/515 || R05 | 05 | `7362b5958` | 7 (22 regions) | **D16 — two incompatible FA iteration models** | **BLOCKED, analysed 2026-11-20** — 17 regions are union work, 5 are a design decision (upstream `#32407` rotation vs block 05's band); cherry-pick aborted, ladder clean at `768d27561` |
 | R06 | 06 | `f0564df7d` | 2 | D11 | not started |
 | R07 | 07 | `f5bdbefda` | 1 | D11 | not started |
 | R08 | 08 | `fe283f27c` | 9 | **D4**, D3, D11 | not started |
@@ -396,6 +396,59 @@ bf16-KV path, so it is recorded here rather than taken silently.
   *not* a decode win here; the value of the block is the native (non-scratch) bf16 attention path, which the
   prefill-logit gate and the FA op test grade, not a rate.
 - The `-ctk bf16 -ctv bf16` arm needs `-fa on`; with FA off the cache type falls back and the arm is vacuous.
+
+---
+
+# R05 — block 05, FA band + native quantized K/V  ·  **BLOCKED ON A DECISION (D16)** — analysed, not resolved
+
+```
+git cherry-pick 7362b5958     # 341 files, 7 conflicted paths, 22 conflict regions
+```
+
+The cherry-pick was taken and **aborted** on 2026-11-20 so the ladder stays clean at `768d27561`.  Nothing is
+half-merged.
+
+## R05.0 Why this rung is different from R00-R04
+
+Upstream `054a1babf` (`#32407`, *Rotate K/V read order for better L2 cache hit rates*) and block 05 **rewrite the
+same iteration model** in `flash_attn_ext_f16_process_tile`, in incompatible ways:
+
+| | upstream `#32407` | block 05 |
+|---|---|---|
+| loop shape | `if constexpr (nstages > 1)` + a contiguous run and a rotated remainder, `kb0_next = kb0 + 1 == kb0_max ? 0 : kb0 + 1`, `nkb = nkb_pre + nkb_post`, `kb0 = ... ? 0 : kb0_start` | `if (kb0 < kb0_stop)` then `for (; kb0 < kb0_stop; kb0 += kb0_step)`, `kb0_step > 1` = the round-robin KV split of a band block |
+| extra state | `kb0_max` (skip fully-masked blocks past it) | `kq_blocks` bitmap skip (issue #48), a **neutral partial** written by a band block that owns no iteration, and the RDNA4 fetch-ahead ring (`band_ring_v`, `band_q8`, `band_kb0_next`) |
+| `nbatch_*` / `Q_in_reg` / `nstages` / `swz` | unchanged | parameterised on `ncols2`, `band_wide`, `band_fetch_ahead` |
+
+`#32407` is **not** a prefetch hint: it changes *which* blocks a tile visits and in what order, and its
+bookkeeping (`nkb_pre`/`nkb_post`) must account for every block exactly once.  Block 05's band model is a
+different partition of the same work.  A merge is therefore a **third iteration model** that supports a strided
+band *and* the rotation — inside a ~3000-line template kernel, where a subtle off-by-one silently corrupts
+attention on every MMA-path model.
+
+## R05.1 The 22 regions, classified
+
+| class | count | regions |
+|---|---|---|
+| mechanical — parameter types / appended parameters (`int32_t nb32` -> `int64_t`, plus the delivery's `derived`/`kv_native`/band parameters) | 5 | `fattn-common.cuh` r1, `fattn-vec.cuh` r1, `fattn-tile.cuh` r1, `fattn-mma-f16.cuh` r1, r4, r10 |
+| mechanical — call sites that only need upstream's renamed argument (`kb0_next*nbatch_fa`, `kb0, kb0_next`) plus the delivery's extras | 4 | `fattn-mma-f16.cuh` r2, r3, r6, r7 |
+| small semantic union — the per-head-mask fix (`#32217`) vs the delivery's derived-mask predicate (`ggml_cuda_flash_attn_ext_has_mask(dst)`) | 3 | `fattn-tile.cuh` r2, r3, `fattn.cu` r1, r2 (r2 = the `maskh` head term `nb32*(head0 % ne32)`) |
+| mechanical — test parameters (`derived`/`derived_hole` + upstream's `n_kv_max`/`q_head_padding`/`mask_heads`) | 3 | `tests/test-backend-ops.cpp` r1, r2, r3 |
+| small port — upstream refactored the kq-mask builder into `build_attn_inp_attn_mask` (+38 lines) and the delivery threads a `derived` flag through `build_attn_inp_kq_mask` | 1 | `src/llama-graph.cpp` r1 |
+| **the iteration model** | **5** | `fattn-mma-f16.cuh` r5, r8, r9, r11, r12 |
+
+So ~17 of the 22 are ordinary union work; **5 regions are a design decision**, and they are the core of the
+block.
+
+## R05.2 The options (a maintainer decision — `DECISIONS.md` D16)
+
+| option | what | cost / risk |
+|---|---|---|
+| **A — combined model** | design a third iteration model: a strided band that also honours the rotation, `nkb_pre`/`nkb_post` and `kb0_max` | highest fidelity, highest risk. The oracle is `test-backend-ops -o FLASH_ATTN_EXT` (**7381 cases, ~25 min per iteration**) plus the prefill-logit KLD gate and text arms. Estimate 2-4 focused sessions, and it should not be attempted without that gate green at every step |
+| **B — keep block 05's model, drop `#32407`** (recommended) | the 17 mechanical/small regions still get the union treatment, so upstream's per-head-mask fix (`#32217`) and the type changes survive; only the rotation is not carried | loses an upstream L2 micro-optimisation with **no recorded number** in its own commit message or in this repo's benchmarks; the delivery's band/stream-K split is a shipped, gated feature. Reversible: the rotation can come back as its own rung-repair or an `upstream/` candidate once the band model is stable |
+| **C — take upstream's model, re-band later** | keep `#32407`, re-implement the band/stream-K split on top | equivalent to redoing block 05; the delivery's FA band is one of its headline features |
+
+**Not attempted: a blend of A and B without the decision**, because the two models disagree about which blocks
+a tile owns, and a wrong choice is invisible to text on a short prompt while silently wrong at depth.
 
 ---
 
