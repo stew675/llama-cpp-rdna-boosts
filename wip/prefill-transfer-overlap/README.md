@@ -4,14 +4,22 @@
 implemented, nothing in `patches/`.**
 Opened 2026-11-18 by the maintainer's instruction ("create the campaign").
 
-**Pass 6 (same night) found a THROUGHPUT win that is independent of the interleave.**  Two arms with the same
+**Pass 7 (same night) REFUTED pass 6's attribution, and restored the thesis with a caveat.**  Measured directly,
+the host body of `moe_cache_gather_host` is **0.037 ms per call** (1.5 % of 2.466) — so the per-call cost is the
+gather **kernel's own device time**, and `GGML_MOE_GATHER_ONCE=1` (one launch fewer) changes nothing.  With an
+inferred 5-10 MiB routed set per call that is **2-4 GB/s, an order of magnitude under the link**, and it did not
+move when the non-resident set doubled — the kernel is **latency/occupancy bound**.  That is the *best* case for
+co-scheduling (pass 4 measured −1.2 %), and it adds a third lever: **a faster gather kernel** (occupancy /
+`n_split` / coalescing), which would buy up to the gather's ~55 % share on every shallow-arena shape and needs
+one missing counter first (routed distinct experts + bytes per call, at `-lv 4`).
+
+**Pass 6 (superseded in part) found a throughput lead.**  Two arms with the same
 gather call count and **2x different byte volumes** read the same per-call cost (2.605 vs 2.466 ms for ~43 vs
 ~89 MiB), so the gather is **not transfer-bound at all** — it is dominated by per-call fixed work (the cache's
 global mutex, a 120-entry linear table scan, two 256-entry map rebuilds, a 1 KiB memcmp, two kernel launches),
 which is **~55 % of a shallow-arena prefill's wall** (448 calls x 2.47 ms = 1105 ms of 2031 ms).  Amortising
-that per-call work would be worth **~+85 % prefill on this shape** (`~2030 -> ~1100 ms`, an estimate) and is a
-**block 09/12** change needing the delivery's gates and the maintainer's go-ahead — not this campaign's
-mechanism.  It also re-frames the campaign: a cheaper gather shrinks the window *and* the wall.
+that per-call work would be worth **~+85 % prefill on this shape** (`~2030 -> ~1100 ms`, an estimate) (the host-bookkeeping attribution of pass 6 was **refuted in pass 7**; the lead survives as "the gather kernel
+is latency-bound", which is a different and still-unpriced lever — see §7.2 of the results).
 
 **Pass 5 (same night) stated the target numerically and quantified the budget.**  Smoothness A/B on the shallow
 arena (`arms/smooth.py`, `arms/smooth-2026-11-18.tsv`): with the duty cycle **off** the prefill keeps **3552

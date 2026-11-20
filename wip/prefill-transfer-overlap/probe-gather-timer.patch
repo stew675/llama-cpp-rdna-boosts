@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-index 2fe0655d1..d0f873b9d 100644
+index 2fe0655d1..e8e0e7b15 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-@@ -283,9 +283,135 @@ int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend) {
+@@ -283,9 +283,137 @@ int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend) {
      return moe_cache_max_tok_dev(cuda_ctx->device);
  }
  
@@ -119,6 +119,8 @@ index 2fe0655d1..d0f873b9d 100644
 +                burn_ms, calls > 0 ? burn_ms / (double) calls : 0.0, burn_launches,
 +                host_ms, calls > 0 ? host_ms / (double) calls : 0.0,
 +                (burn_ms > 0.0 && ms > 0.0) ? (burn_ms + ms) / fmax(ms, burn_ms) : 0.0);
++        fprintf(stderr, "MOE_PROBE_PF_HOST: calls=%lld host=%.1f ms (%.3f ms/call)\n",
++                calls, host_ms, calls > 0 ? host_ms / (double) calls : 0.0);
 +    }
 +};
 +static pf_probe_ring g_pf_ring;
