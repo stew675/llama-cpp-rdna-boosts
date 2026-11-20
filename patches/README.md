@@ -1763,6 +1763,20 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 
 ## Block 09 — host-resident MoE: iface, scheduler, expert cache, staging rings
 
+> **r325 amendment: the MoE device gather's launch shape is sized for the PREFILL band (`MOE_GATHER_NSPLIT`).**
+> `moe_cache_gather_host` launched `moe_cache_gather_kernel<<<n_experts * n_split, ...>>>` with `n_split = 8`, a
+> constant chosen for the **decode** band's shape ("~64 concurrent blocks for the usual 8 routed experts").  A
+> prefill ubatch routes essentially every expert of the table, so 8 left only 8 blocks per expert, each
+> carrying a 0.6-1 MiB copy, and the copy was pipeline-limited rather than link-limited wherever the per-call
+> volume is small.  `n_split` is now **32**, with `MOE_GATHER_NSPLIT` (1..256) as the A/B and bisect knob.
+> Measured on the r325 tree (1 x R9700, gfx1201, `-b 2048 -ub 2048`, a 4932-token prompt, interleaved reps):
+> Q8_0 at 84 % residency **2307.9/2307.2 -> 2480.8/2480.8 t/s (+7.5 %)**, Q4_K_M at an 8000 MiB arena
+> **2414.6 -> 2470.4 (+2.3 %)**, and **neutral on a 3-device `-sm tensor` split (4125.8 -> 4141.4, +0.4 %)** --
+> so it is a 1-GPU host-expert-tier win and never measured worse.  Greedy text is byte-identical
+> (`572 chars sha=40e29c2b46b6`) and `gate-prefill-logits.sh --ab "MOE_GATHER_NSPLIT=8"` reads mean KLD
+> **-0.000000 / 99.990 % top-p**: the gather only partitions the same bytes across more blocks, it does not
+> reorder them.  `ENVIRONMENT.md` §2; `WORKLOG.md` 261120.002.
+
 > **r317 amendment (GitHub issue #294 closed): the decode band gets its own MoE-fusion census, and the
 > fused-launch contract is `MIXED`-aware.**  `moe_cache_fusion_launched()` gained kinds **4 = mmvf** and
 > **5 = mmvq**, counted in a new `g_dec_fuse[2][2]` / `g_dec_fuse_mixed` pair, and the exit report prints

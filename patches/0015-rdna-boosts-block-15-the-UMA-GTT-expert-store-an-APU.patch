@@ -1,4 +1,4 @@
-From 5daf9556b96418711cc4d736794656c054c0062c Mon Sep 17 00:00:00 2001
+From f07a9b7abbbdc8f25042116983109c05034d3208 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH 15/17] rdna-boosts: block 15: the UMA GTT expert store -- an
@@ -1647,7 +1647,7 @@ index 000000000..ae7567213
 +// kernel reclaims it anyway, but the registration is a HOLD (probe 09) and must be dropped explicitly.
 +void ggml_cuda_gtt_store_free();
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 6e989251b..2a43303cc 100644
+index 368e0b107..08cc946e9 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1,6 +1,7 @@
@@ -4248,7 +4248,7 @@ index 6e989251b..2a43303cc 100644
                  e += (int) n;   // the leftover tail of a run: the per-expert path reads it
                  continue;
              }
-@@ -9471,6 +10620,1099 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -9486,6 +10635,1099 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
      return false;
  }
  
@@ -5348,7 +5348,7 @@ index 6e989251b..2a43303cc 100644
  // Geometry-only registration: the half of `moe_cache_update_host` that needs no routing.
  //
  // The scheduler calls it for every routed host-expert input of EVERY split before the first split of a
-@@ -9555,8 +11797,6 @@ int moe_cache_register_host(const ggml_tensor * weight, const ggml_tensor * weig
+@@ -9570,8 +11812,6 @@ int moe_cache_register_host(const ggml_tensor * weight, const ggml_tensor * weig
          table_t & t = g_tables[table];
          if (!t.primed) {
              t.primed = true;
@@ -5357,7 +5357,7 @@ index 6e989251b..2a43303cc 100644
          }
          if (!g_sized && g_size_at_prime && moe_cache_tables_complete_locked()) {
              GGML_LOG_INFO("%s: the host-expert table set is complete at registration (%d tables); arming "
-@@ -9672,7 +11912,23 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -9687,7 +11927,23 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
              }
              t.prefill_tokens += n_tok;
          }
@@ -5382,7 +5382,7 @@ index 6e989251b..2a43303cc 100644
      }
  
      // TODO #64.1: the first decode-band pass after a prefill is the moment the prompt's routing is known
-@@ -9735,6 +11991,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -9750,6 +12006,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          t.device = device;
          alloc_table_locked(t, old_slots);
          t.slot_expert.assign(t.slots, -1);
@@ -5390,7 +5390,7 @@ index 6e989251b..2a43303cc 100644
          t.expert_slot.clear();
          GGML_LOG_WARN("%s: migrated layer=%d role=%s arena from device %d to %d (%d slots)\n",
                        __func__, t.layer, t.role.c_str(), old_device, device, t.slots);
-@@ -9746,7 +12003,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -9761,7 +12018,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // (priming, no arena, or `!all` below), the scheduler copies the FULL expert table and the op must
      // read that copy - not the previous token's remap.  The consumer only redirects while
      // `remap_n_used > 0`, so zeroing it here turns "hook declined" into "op reads `input_cpy`".
@@ -5400,7 +5400,7 @@ index 6e989251b..2a43303cc 100644
  
      // Sizing and priming (see `alloc_all_locked`): with no explicit slot override, the first pass
      // only registers the tables and runs uncached (the scheduler copies the full experts); the
-@@ -10203,8 +12461,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -10218,8 +12476,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
      }
      g_write_seq++;
      const auto decline = [&]() {
@@ -5412,7 +5412,7 @@ index 6e989251b..2a43303cc 100644
          return false;
      };
      const int64_t n  = n_used * n_tok;
-@@ -10262,8 +12521,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -10277,8 +12536,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
                  continue;
              }
              if (!devremap_prep_locked(u, stream)) {
@@ -5424,7 +5424,7 @@ index 6e989251b..2a43303cc 100644
                  continue;   // its own call retries
              }
              add_job(u, k);
-@@ -10411,11 +12671,13 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
+@@ -10426,11 +12686,13 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
          if (n_tok)        *n_tok        = 0;
          return true;
      }
@@ -5443,7 +5443,7 @@ index 6e989251b..2a43303cc 100644
          return false;
      }
      if (t.arena == nullptr || t.slots <= 0 || t.remap_dev == nullptr || t.remap_n_used <= 0) {
-@@ -10820,27 +13082,147 @@ static void report_locked() {
+@@ -10835,27 +13097,147 @@ static void report_locked() {
      GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
                    __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
                    n_tables, n_slots, (double) arena_b / (1024 * 1024), budget_desc());
@@ -5600,7 +5600,7 @@ index 6e989251b..2a43303cc 100644
      }
      if (g_uploadp_calls > 0) {
          GGML_LOG_INFO("%s: scheduler pageable-master fallback: %lld ranges, %.1f MiB served through the per-table "
-@@ -10886,6 +13268,15 @@ static void report_locked() {
+@@ -10901,6 +13283,15 @@ static void report_locked() {
                        g_sink_copies > 0 ? 100.0 * (double) g_sink_uses / (double) g_sink_copies : 0.0);
          GGML_LOG_WARN("%s: sink mirror tables (full coverage -> exchange INERT, spare=0): %lld\n", __func__,
                        (long long) g_sink_mirror_tables);
@@ -5616,7 +5616,7 @@ index 6e989251b..2a43303cc 100644
          if (g_sink_near_mirror_tables > 0) {
              GGML_LOG_WARN("%s: sink near-mirror tables (coverage gap < 4 %% of the set -> exchange DISENGAGED): "
                            "%lld\n", __func__, (long long) g_sink_near_mirror_tables);
-@@ -11107,6 +13498,31 @@ static void report_locked() {
+@@ -11122,6 +13513,31 @@ static void report_locked() {
                            (double) g_stage_span_read_us / 1000.0);
          }
      }

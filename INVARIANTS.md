@@ -1323,3 +1323,30 @@ asserted — its acceptance checks, which are the collapse detector the arm exis
 Record: `WORKLOG.md` 261119.008, `benchmarks/2026-11-19-mwr-exact.md`, `patches/README.md` block 10,
 `MANIFESTS.md` gate 37, `ENVIRONMENT.md` §8 (`GGML_CUDA_MWR_EXACT`, `GGML_CUDA_MWR_FOLD_FIRST`,
 `GGML_CUDA_MWR_DEBUG`), `scripts/gate-mwr-exact.sh`, `GREEDY-PURITY.md` §102, PR #335.
+
+## r325 (2026-11-20, `WORKLOG.md` 261120.002) — the MoE device gather's block count is a DECODE-band constant, and a prefill ubatch wants 4x more of them (block 09, `TODO` #350 retired)
+
+1. **`moe_cache_gather_kernel`'s parallelism is `n_experts * n_split`, and `n_split = 8` was chosen for the decode
+   band** ("~64 concurrent blocks for the usual 8 routed experts", the kernel's own comment).  A *prefill* ubatch
+   routes essentially every expert of the table (8-of-256 per token over >= 512 tokens saturates the set), so the
+   same constant leaves 8 blocks per expert, each carrying a 0.6-1 MiB copy, and the copy runs pipeline-limited
+   instead of link-limited whenever the per-call volume is small — worst exactly at HIGH residency, where the
+   non-resident set is small.  `n_split = 32` (r325, `MOE_GATHER_NSPLIT`): **+7.5 %** prefill on 1 x R9700,
+   Q8_0 at 84 % residency (2307.9/2307.2 -> 2480.8/2480.8 t/s, interleaved reps), **+2.3 %** on Q4_K_M at an
+   8000 MiB arena, **neutral (+0.4 %)** on a 3-device `-sm tensor` split.
+2. **It is a pure launch-shape change: same bytes, same order per byte, different partition across blocks.**  The
+   greedy text is byte-identical (`572 chars sha=40e29c2b46b6` on the Q8_0 arm) and
+   `gate-prefill-logits.sh --ab "MOE_GATHER_NSPLIT=8"` reads mean KLD **-0.000000 / 99.990 % top-p** — an exact
+   fallback, which is what the A/B mode exists to certify.  So a gather change does NOT owe a numerics apology;
+   it owes the fill-path gates (`gate-host-pool.sh` 59/59 here) because it sits on the same transport.
+3. **The optimum is flat, not fitted.**  The earlier sweep (2026-11-18) put Q8_0's peak at 16-32 (48 -> 2252 ms,
+   128 -> 2342 ms on the old arm) and Q4_K_M flat across 8..32, so 32 is a safe default rather than a
+   model-specific choice; `MOE_GATHER_NSPLIT` is the A/B knob and is clamped to 1..256.
+4. **Scope, stated so it is not over-read: this is a 1-GPU host-expert-tier win.**  On a 3-device `-sm tensor`
+   split each device gathers its own slice (a third of the volume) and the constant is already enough
+   parallelism, so the arm reads 4125.8 -> 4141.4 t/s (noise).  A release that quotes "+7.5 % prefill" must say
+   which shape it was measured on.
+
+Record: `WORKLOG.md` 261120.002, `benchmarks/` — measured in the retired campaign
+`archive/work/prefill-transfer-overlap/` (pass 9 + the r325 re-measurement), `patches/README.md` block 09,
+`ENVIRONMENT.md` §2.

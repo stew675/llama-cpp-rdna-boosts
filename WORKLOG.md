@@ -1,3 +1,61 @@
+## 261120.002 (r325, RELEASE v17-4f9dfa0e3-r325) -- the MoE device gather's launch shape: `n_split` 8 -> 32, a block 09 amendment (+7.5 % prefill on the 1-GPU host-expert shape)
+
+**Release:** `v17-4f9dfa0e3-r325`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `4132c5155` (tree
+`5959be96f`), 17 official + 1 temporary = 18 default blocks, optional `0100` -> `c3a25080d` / `0101` ->
+`547321720` (cumulative `fa0dc3aae`).  **No block created, split or renumbered**: one same-block amendment,
+**block 09** (`ggml/src/ggml-cuda/moe-expert-cache.cu`, `moe_cache_gather_host`).  One environment variable
+added (`MOE_GATHER_NSPLIT`).
+
+### The finding
+
+`moe_cache_gather_host` launches `moe_cache_gather_kernel<<<n_experts * n_split, ...>>>` with `n_split = 8` — a
+constant chosen for the **decode** band ("~64 concurrent blocks for the usual 8 routed experts", the kernel's own
+comment).  A **prefill** ubatch routes essentially every expert of the table, so 8 left only 8 blocks per expert,
+each carrying a 0.6-1 MiB copy, and the copy was pipeline-limited instead of link-limited wherever the per-call
+volume is small (i.e. worst at HIGH residency, where the non-resident set is smallest).  `n_split` is now **32**,
+with `MOE_GATHER_NSPLIT` (1..256) as the A/B and bisect knob.
+
+| arm (1 x R9700, gfx1201, `-b 2048 -ub 2048`, 4932-token prompt, interleaved reps) | `=8` | `=32` | delta |
+|---|---|---|---|
+| Q8_0, auto arena (84 % residency) | 2307.9 / 2307.2 t/s | **2480.8 / 2480.8 t/s** | **+7.5 %** |
+| Q4_K_M, arena 8000 MiB | 2414.6 t/s | 2470.4 t/s | +2.3 % |
+| 3 GPU `-sm tensor`, Q8_0 | 4125.8 t/s | 4141.4 t/s | +0.4 % (neutral) |
+
+Greedy text is byte-identical (`572 chars sha=40e29c2b46b6`) and the KLD point is an exact fallback (below): the
+gather only partitions the same bytes across more blocks.  **Scope: this is a 1-GPU host-expert-tier win**; on a
+3-device tensor split each device gathers a third of the volume and the constant was already enough parallelism.
+
+### Gates
+
+* `scripts/validate-set.sh` — **green**: 18 default patches + 2 optional + `rdna-boosts-all.patch` checksums,
+  strict apply on a fresh `4f9dfa0e3` tarball, applied tree **`5959be96f`** == `release.json`, both optionals
+  apply alone (`c3a25080d` / `547321720`) and cumulatively (`fa0dc3aae`), Windows portability scan clean.
+* `scripts/gate-host-expert-text.sh` (the host-expert text oracle, pins applied) — **PASS**, 3/3 runs read
+  `296 chars sha=3205db133b1d`; the flipped-library arm reads its own text (reported, r310) and GPU faults are
+  clean.
+* **The change is a `moe_cache_gather` implementation change, so it owes the kill-switch arms** (MANIFESTS gate 1):
+  Flash-Next IQ3_XXS, `-ncmoe 47`, pins applied, 2 runs each — default, `GGML_MOE_DEVREMAP=0`,
+  `MOE_HOST_POOL_COLD=0` and `--host-experts pool` (with `-lme auto`) **all read `160 chars sha=200edcd422c7`,
+  2/2 each**.
+* `scripts/gate-prefill-logits.sh --ab "MOE_GATHER_NSPLIT=8"` (35B-A3B Q8_0, `-ncmoe 48 -ub 2048`, device 0) —
+  **PASS**: mean KLD **-0.000000** (limit 0.005), same-top-p **99.990 %** (floor 98.0 %), GPU faults clean.  The
+  base is recorded with the fallback `=8` arm, so this is the exact-fallback A/B the mode exists for.
+* `scripts/gate-host-pool.sh` — **PASS, 59/59 checks** (`takeover=0` under both fill faults, every failed fill
+  reporting NOT resident, the census printed once from the teardown, no abort in any of the 9 arms), every arm's
+  text as recorded and GPU faults clean.
+* `scripts/gate-per-block-build.sh --fast` (the release target profile, **all 18 rungs**) — **PASS, 18/18**
+  (`all 18 block commits build the release target profile`, 2008 s of gate time; the four heavy rungs, blocks
+  11-13 and 15, are the ones that recompile HIP kernels).
+  (`HF_UI_VERSION=b12387` was needed: the known `TODO` #342 `ui-assets.cmake:137` failure, unrelated to this
+  change.)
+
+### Notes
+
+* The retired campaign that found this (`archive/work/prefill-transfer-overlap/`, pass 9) and the campaign it
+  opened (`wip/prefill-decode-arms/`) are recorded in `WORKLOG.md` 261120.001.
+* The optional artifacts were re-cut against the new default tree; their recorded trees moved
+  (`c3a25080d` / `547321720` / cumulative `fa0dc3aae`) because block 09 changed.
+
 ## 261120.001 (r324) -- campaign housekeeping: `prefill-transfer-overlap` retired, `prefill-decode-arms` opened, and the gather's `n_split` re-measured and scoped (no delivery change)
 
 **No delivery patch changed, no block created, split or renumbered, no release.**  This entry records a

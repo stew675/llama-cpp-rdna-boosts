@@ -49,7 +49,6 @@ left in this file.  The r236 re-base
 | **347** | PR #334 item 2 (HIP graph replay up to 16 tokens, `GGML_CUDA_GRAPH_MAX_TOKENS`): needs its own PR plus the multi-slot and 4B arms, because it is inert at the delivery's default draft depth and the delivery's text is not stable above the 8-row purity band | contribution / waiting on the submitter (`PR #334` declined for now) | **WAITING** -- separate PR requested; requirements in the PR review and §347 |
 | **348** | PR #334 item 3 (one FA KV-group bitmap per graph evaluation, `GGML_CUDA_FA_KQ_BLOCKS_REUSE`): correct as designed (`built=1 reused=15`) but worth nothing measurable on this box, unreachable in every single-sequence arm, and it leaks a per-context `cudaMalloc` behind a raw context pointer | contribution / waiting on the submitter (`PR #334` declined for now) | **WAITING** -- separate PR requested with a census, a context teardown and a Windows/launch-bound measurement; §348 |
 | **349** | `scripts/gate-server-arms.sh`'s `35b10` arm is not bit-reproducible on its **second slot** even with both of r324's fixes (a `MOE_EXPERT_HEATMAP=load` pin and a fixed-order admission): slot 0 is stable, slot 1 reads three different texts at three acceptances, because a 0.5 s stagger lands at a *variable* point in slot 0's prefill | tooling / gate (`TODO` #295's gate, gate 24 step 5c) | **OPEN** -- admit slot 1 on slot 0's first STREAMED TOKEN instead of on a clock; until then that arm's text is reported, not asserted (its acceptance checks stay hard, which is the collapse detector the arm exists for); §349 |
-| **350** | the expert gather's launch shape: `moe_cache_gather_kernel` is launched with `n_split = 8`, a DECODE-band constant, on a PREFILL band where a ubatch routes essentially every expert of the table — `MOE_GATHER_NSPLIT=32` is **+7.5 % prefill** on the 1-GPU 84 %-residency shape and +2.3 % at 42 %, neutral on a 3-GPU `-sm tensor` split, text byte-identical everywhere | performance (delivery, blocks 09/12's gather path; found by the retired `prefill-transfer-overlap` campaign) | **WAITING** — measured on the current tip, needs the block decision (new block vs a 09/12 amendment) and the delivery gates (`gate-prefill-logits.sh`, `gate-host-pool.sh`, `check-gpu-faults.sh`); candidate `archive/work/prefill-transfer-overlap/candidate-gather-nsplit.patch` — §350 |
 
 ## Handle numbering
 
@@ -271,38 +270,6 @@ that got.  An order race became a timing race.
 release slot 1 on the first chunk) instead of on the clock; verify two runs on each of two builds reproduce;
 then restore an exact anchor.  Do not serialise the two requests -- with one sequence decoding at a time the
 arm cannot reach the shape it exists for.
-
-## 350. The expert gather's `n_split`: a decode-band constant on a prefill-band launch
-
-**Waiting on a block decision and the delivery gates.**  Found by the retired
-[`prefill-transfer-overlap`](archive/work/prefill-transfer-overlap/README.md) campaign (pass 9) and re-measured
-on the current tip (`923b910eb`) in the session that retired it.
-
-`moe_cache_gather_host` launches `moe_cache_gather_kernel<<<n_experts * n_split, ...>>>` with `n_split = 8`,
-chosen (the kernel's own comment) for the DECODE band's shape — "~64 concurrent blocks for the usual 8 routed
-experts".  A prefill ubatch routes essentially **every** expert of the table, so 8 leaves only 8 blocks per
-expert, each carrying 0.6-1 MiB, and the copy becomes pipeline-limited instead of link-limited.
-
-Measured (1 x R9700, gfx1201, ROCm 10.1.0-gfx120X, `-b 2048 -ub 2048`, the 4932-token
-`prompts/kld-corpus-35b-in-domain.txt` prefix, `MOE_EXPERT_HEATMAP=load` + `ROCBLAS_USE_HIPBLASLT=0`,
-interleaved reps):
-
-| shape | `MOE_GATHER_NSPLIT=8` | `=32` | delta |
-|---|---|---|---|
-| 1 GPU, Q8_0, auto arena (84 % residency) | 2307.9 / 2307.2 t/s | **2480.8 / 2480.8 t/s** | **+7.5 %** |
-| 1 GPU, Q4_K_M, arena 8000 MiB | 2414.6 t/s | 2470.4 t/s | +2.3 % |
-| 3 GPU `-sm tensor`, Q8_0 | 4125.8 t/s | 4141.4 t/s | +0.4 % (neutral) |
-
-Greedy text is **byte-identical** in every pair (`572 chars sha=40e29c2b46b6`).  The change is one constant
-plus the `MOE_GATHER_NSPLIT` override (an A/B knob); it does not reorder bytes, it only partitions them across
-more blocks.  So the honest scope is: a 1-GPU host-expert-tier win (the shallow-arena class this repo already
-treats as its target), neutral on the 3-GPU tensor split, and worth shipping because it never measured worse.
-
-**What it needs**: (a) the block decision — a new `01xx`/`000N` block or an amendment to block 09/12, which
-own the gather path and the cache (`AGENTS.md`: a block decision is never a gate outcome); (b) the gates —
-`scripts/gate-prefill-logits.sh` (a prefill-path change always needs the KLD point),
-`scripts/gate-host-pool.sh` (the gather sits on the fill path: fill faults, rollback, `takeover=0`) and
-`scripts/check-gpu-faults.sh` on every arm; (c) `ENVIRONMENT.md` §8 gains `MOE_GATHER_NSPLIT`.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 
