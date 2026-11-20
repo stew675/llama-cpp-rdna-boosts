@@ -35,7 +35,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | R00 | 00 | `de99fa2d0` | 4 (7 regions) | D1 (take upstream's), D2 (carry), D15 (top-k fix in 00) | **DONE 2026-11-20** — `4cba0ad32` (tree `a3824ea0e`) + repair `3ea8b0212` (tree `e12a34bad`); coherence `1c5d32ac537d`; MUL_MAT_ID 1078/0 (16 dup); Flash-Next prefill 1692 t/s after the repair; MMID_512 A/B +0.7 % (text identical) |
 | R01 | 01 | `a94e2214c` | 0 | — | **DONE 2026-11-20** — `14a0414bb`, tree `6566ca3ac`; one rung repair (HIP's 64-bit warp mask); 3-device tensor text `1c5d32ac537d` == R00; pipeline census 3 GPUs |
 | R02 | 02 | `cef19b032` | 5 | D5 (**resolved: MERGE**, no code dropped) | **DONE 2026-11-20** — `3941bad4e`, tree `0799ebfad`; all 5 conflicts are unions; adaptive arm 29.3 -> 65.2 t/s with identical text; enum count 13 -> 14 |
-| R03 | 03 | `36da15029` | 1 | — | not started |
+| R03 | 03 | `36da15029` | 1 | — | **DONE 2026-11-20** — `e612388ba`, tree `971953b99`; test-file union; GATED_DELTA_NET 76/76; chunked prefill +8.8 % with identical text |
 | R04 | 04 | `cfe40b5f9` | 2 | **D3** | not started || R05 | 05 | `7362b5958` | 7 | — | not started |
 | R06 | 06 | `f0564df7d` | 2 | D11 | not started |
 | R07 | 07 | `f5bdbefda` | 1 | D11 | not started |
@@ -288,6 +288,49 @@ the release cannot go out stale again.
   build clean; they are not part of `--fast`, so they are first compiled here (the full build compiles them).
 - `spec_draft_align_cache()` / `spec_align_enabled()` / `spec_align_width_band()` (block 02's draft-KV align
   helpers) merged cleanly; their gate is `scripts/gate-spec-align.sh` at R18.
+
+---
+
+# R03 — block 03, chunked gated-delta-net prefill  ·  **DONE 2026-11-20** — `e612388ba`, tree `971953b99`
+
+```
+git cherry-pick 36da15029        # 25 files (702 + 996 + 1015 lines of chunked-GDN kernels)
+```
+
+| exit criterion | result |
+|---|---|
+| conflicts | **1 file, 2 regions** — `tests/test-backend-ops.cpp` |
+| build | green (`all` targets), 0 errors |
+| coherence 4B (a GDN hybrid, so the chunked path runs) | `100 chars sha=1c5d32ac537d` — unchanged |
+| `test-backend-ops -o GATED_DELTA_NET` | **76 OK / 0 FAIL**, 2/2 backends (this is the file the conflict was in) |
+| **the block's own switch moves its own measurement** | chunked prefill **ON 6870.1 t/s** vs **OFF 6314.6 t/s** on a 5298-token prompt (**+8.8 %**), decode 87.8 both, text **identical** (`43 chars sha=aeef162bc0ce`) |
+
+## R03.1 The two resolutions — both are unions of independent additions
+
+**Region 1 (`test_gated_delta_net::build_graph`).**  Upstream added `padded_q` / `permuted_k` layout
+variants and calls `ggml_gated_delta_net(...)` with 8 arguments; the delivery's block 03 adds a ninth,
+`n_rs_batch`.  Resolution: keep upstream's two layout blocks and pass `/*n_rs_batch=*/1` — the test now
+exercises the delivery's parameter *in* upstream's new layouts, which is strictly more coverage than either
+side had.
+
+**Region 2 (`initialize_tensors`, the `g` gate).**  Upstream's new `correlated` case initialises the gate at a
+constant `-1e-4`; the delivery replaced the general `-20 .. -1e-4` range with `-0.5 .. -1e-4` because the old
+range decayed the state to zero and hid `n_seqs > 1` bugs.  Resolution: `correlated ? -1e-4f : -0.5f`, i.e.
+upstream's near-no-decay stress case plus the delivery's realistic floor, with the delivery's comment kept
+(it explains why the floor exists).
+
+## R03.2 Later-rung notes
+
+- **Upstream still has no chunked GDN on CUDA**: `ggml/src/ggml-cuda/gated_delta_net.cu` at `919794500` carries
+  `//TODO: Add chunked kernel for even faster pre-fill`.  The only upstream "chunked GDN" in the range is
+  **Vulkan** (`16f80bd0c`, `#30207`), a different backend — so this block is not subsumed and R03 needed no
+  `DECISIONS.md` entry.
+- The block builds three new kernel translation units (`gated_delta_net_chunked{,_bf16,_bf16_gfx11}.cu`), so
+  the build time steps up here; the per-rung `--fast` profile does not build them until the release ladder.
+- Knobs seen at this rung (all pre-existing): `GGML_CUDA_GDN_CHUNKED`, `GGML_CUDA_GDN_CHUNKED_BF16`,
+  `GDN_CHUNKED_MIN_TOKENS`, `GDN_CHUNKED_NTHREADS`, `GDN_CHUNKED_CS`, `GDN_CHUNKED_VT`,
+  `GDN_CHUNKED_STATE_PIPE`.  `GDN_CHUNKED_MIN_TOKENS` and `n_rs_batch`'s use as a kernel input are what
+  `scripts/gate-spec-gdn-split.sh` grades at R18.
 
 ---
 
