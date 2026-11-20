@@ -36,7 +36,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | R01 | 01 | `a94e2214c` | 0 | — | **DONE 2026-11-20** — `14a0414bb`, tree `6566ca3ac`; one rung repair (HIP's 64-bit warp mask); 3-device tensor text `1c5d32ac537d` == R00; pipeline census 3 GPUs |
 | R02 | 02 | `cef19b032` | 5 | D5 (**resolved: MERGE**, no code dropped) | **DONE 2026-11-20** — `3941bad4e`, tree `0799ebfad`; all 5 conflicts are unions; adaptive arm 29.3 -> 65.2 t/s with identical text; enum count 13 -> 14 |
 | R03 | 03 | `36da15029` | 1 | — | **DONE 2026-11-20** — `e612388ba`, tree `971953b99`; test-file union; GATED_DELTA_NET 76/76; chunked prefill +8.8 % with identical text |
-| R04 | 04 | `cfe40b5f9` | 2 | **D3 (resolved: union + drop upstream's guard)** | **DONE 2026-11-20** — `768d27561`, tree `0866d4229`; 7 rope arms; fusion worth +5.8 % pp / +16.5 % tg at bf16 KV, identical text; ROPE 515/515 || R05 | 05 | `7362b5958` | 7 (22 regions) | **D16 — two incompatible FA iteration models** | **BLOCKED, analysed 2026-11-20** — 17 regions are union work, 5 are a design decision (upstream `#32407` rotation vs block 05's band); cherry-pick aborted, ladder clean at `768d27561` |
+| R04 | 04 | `cfe40b5f9` | 2 | **D3 (resolved: union + drop upstream's guard)** | **DONE 2026-11-20** — `768d27561`, tree `0866d4229`; 7 rope arms; fusion worth +5.8 % pp / +16.5 % tg at bf16 KV, identical text; ROPE 515/515 || R05 | 05 | `7362b5958` | 7 (22 regions) | **D16 — decided: the delivery's iteration model wins** | **DONE 2026-11-20** — `1c9bfa37c`, tree `13683655d`; FA op matrix 7428/0; native q8_0 K/V +5.6 % decode; rotation not carried, verified absent |
 | R06 | 06 | `f0564df7d` | 2 | D11 | not started |
 | R07 | 07 | `f5bdbefda` | 1 | D11 | not started |
 | R08 | 08 | `fe283f27c` | 9 | **D4**, D3, D11 | not started |
@@ -449,6 +449,82 @@ block.
 
 **Not attempted: a blend of A and B without the decision**, because the two models disagree about which blocks
 a tile owns, and a wrong choice is invisible to text on a short prompt while silently wrong at depth.
+
+---
+
+# R05 — block 05, FA band + native quantized K/V + derived kq mask  ·  **DONE 2026-11-20** — `1c9bfa37c`, tree `13683655d`
+
+```
+git cherry-pick 7362b5958     # 341 files, 7 conflicted files, 22 conflict regions
+```
+
+**`D16` decided (maintainer, 2026-11-20): option 2 — the delivery's FA iteration model wins, upstream's
+`#32407` K/V read-order rotation is not carried.**  The standing bias stated with the decision: across every
+re-base so far, upstream has never beaten the delivery on a shared mechanism, so where the two are
+alternatives the delivery's side is taken and the loss is recorded and measured rather than assumed absent.
+
+| exit criterion | result |
+|---|---|
+| conflicts | 7 files / **22 regions** (classification below) |
+| build | green, `all` targets, 0 errors |
+| coherence 4B | `100 chars sha=1c5d32ac537d` — unchanged |
+| **`test-backend-ops -o FLASH_ATTN_EXT`** | **7428 OK / 0 FAIL**, 2/2 backends — the whole FA matrix, and precisely the oracle a combined iteration model would have needed at every step |
+| the block's own switch, on the path it exists for | q8_0 KV: `GGML_CUDA_FA_KV_NATIVE=1` **88.6 t/s** decode vs **83.9** staged (**+5.6 %**), identical text `71 chars sha=1de99b7e6ee6`; f16 KV is a wash (staging only costs anything for a *quantized* cache, so the f16 arm was vacuous and is recorded as such) |
+
+## R05.1 What was decided and what it cost
+
+| | upstream `#32407` | block 05 (kept) |
+|---|---|---|
+| iteration | `nkb = nkb_pre + nkb_post` — contiguous run + rotated remainder, `kb0 + 1`, wrap at `kb0_max` | strided band `for (; kb0 < kb0_stop; kb0 += kb0_step)` |
+| skip | `kb0 >= kb0_max` | `kq_blocks` bitmap (issue #48) |
+| empty block | n/a | a neutral partial (`max -FLT_MAX/2`, rowsum 0, VKQ 0) the fixup ignores |
+| extra | — | RDNA4 fetch-ahead ring (`band_ring_v`, `band_q8`, `band_kb0_next`) |
+
+**Cost of the choice:** the rotation is gone.  It is a pure L2-locality reordering with **no number in its own
+commit message**; the band/stream-K split it would have displaced is a shipped, gated feature.  Reversible: it
+can return as a rung-repair or an `upstream/` candidate once the band model is stable — and if it does, it must
+arrive as a *combined* model with the FA op matrix green, which is the work option 1 would have been.
+
+**Verified absent** (so nothing of it is silently half-wired): no `nkb_pre`, `nkb_post`, `kb0_max` or `kb0_rot`
+anywhere in the FA sources; every `kb0_next` in the tree is the delivery's own fetch-ahead.  `KV_max` *is*
+present and is the delivery's own, pre-existing — the merge did not import it (the `fattn_kernel_t` typedef and
+its parameter list are byte-identical between block 05's commit and the merged tree).
+
+## R05.2 The 22 regions
+
+| class | n | what |
+|---|---|---|
+| iteration model | 5 | `fattn-mma-f16.cuh` r5, r8, r9, r11, r12 — **ours** |
+| rotation plumbing in signatures / call sites | 7 | `fattn-mma-f16.cuh` r1, r2, r3, r4, r6, r7, r10 (`kb0_next`/`kb0_max` params and their call sites) — **ours** |
+| per-head mask (`#32217`), taken from upstream | 4 | `fattn-tile.cuh` r2 (`+ nb32*(head0 % ne32)`) and r3, `fattn.cu` r1, r2 — unioned into our derived-mask predicate |
+| signature types | 3 | `fattn-common.cuh` r1, `fattn-vec.cuh` r1, `fattn-tile.cuh` r1 — ours' parameters, `nb32` kept `int32_t` (see below) |
+| graph refactor | 1 | `src/llama-graph.cpp` — upstream's `build_inp_mem_hybrid_iswa_rel` + `build_attn_inp_attn_mask`, called through the delivery's derived-mask signatures |
+| test parameters | 3 | `tests/test-backend-ops.cpp` — `derived`/`derived_hole`/`mask_hole` **and** `n_kv_max`/`q_head_padding`/`mask_heads` |
+
+## R05.3 Three fixes the compiler forced, all worth recording
+
+1. **`nb32` stays `int32_t`.**  Upstream widened mask's row stride to `int64_t` in the `fattn_kernel_t` typedef.
+   The delivery's kernels are the ones in the tree, so a half-widened typedef/definition pair does not link
+   ("assigning to `fattn_kernel_t` from incompatible type").  Keeping the delivery's `int32_t` is numerically
+   safe for a per-head mask (`nb32` is `ne[1]*ne[0]*2` bytes; a 128k-cell row is 262 KB, and it is multiplied by
+   `zt_Q % ne32` <= 4).
+2. **`#31617`'s typed masks reach block 05's own code.**  HIP now static_asserts a 64-bit warp mask, so the
+   seven raw `__shfl[_xor]_sync(0xFFFFFFFF, ...)` calls in the band/fetch-ahead code had to become
+   `ggml_cuda_shfl_xor` / `ggml_cuda_shfl` — the same class of repair as R01, but inside block 05's new code
+   rather than in an untouched file.
+3. **`fattn-tile.cuh` needed upstream's `mask` tensor declaration.**  The delivery's launcher predates `#32217`,
+   so `mask->ne[2] == 1` had no `mask` to test: `const ggml_tensor * mask = dst->src[3];` is restored (null for
+   the derived form, which is exactly what the predicate wants).
+
+## R05.4 Notes for later rungs
+
+- `GGML_CUDA_FA_QUANTS` was restored to include `iq4_nl-iq4_nl` at this rung, as `RUNGS.md` R00.7 required —
+  block 05 adds `iq4_nl` to `FA_TYPES`, and the configure fails without it before R05 and with it after.
+- The FA op matrix is the gate for anything that touches this file; it took ~4 min here (7428 cases), not the
+  ~25 min the cost note warns about, because `-o FLASH_ATTN_EXT` on one device is much cheaper than the full
+  sweep.
+- `-fa on` is required for the native-K/V arms; with FA off the cache type is not used by the attention kernel
+  and both arms collapse to the same path.
 
 ---
 

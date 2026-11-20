@@ -1,8 +1,8 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: OPEN — 5 of 18 rungs climbed (R00-R04) on 2026-11-20. Nothing is delivery yet.**
+**Status: OPEN — 6 of 18 rungs climbed (R00-R05) on 2026-11-20. Nothing is delivery yet.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
-the final rung (R18).  Ladder branch `rebase-r328` = `768d27561` (tree `0866d4229`): R00..R04 and one R00
+the final rung (R18).  Ladder branch `rebase-r328` = `1c9bfa37c` (tree `13683655d`): R00..R05 and one R00
 rung repair; every rung is green on build + coherence and each has one entry in [`RUNGS.md`](RUNGS.md).
 **The one known-red is closed at R00** (repair `3ea8b0212`): the delivery's required VMM pool refuses
 upstream's strided 2-D indexer top-k copy, and it reproduces on the pristine base with *only* the `#30542`
@@ -14,8 +14,10 @@ adaptive arm at 29.3 -> 65.2 t/s on identical text.  R03 is done too: one test-f
 conflict (a union of upstream's new `padded_q`/`permuted_k` layouts with the delivery's `n_rs_batch`), and the
 block's switch moves its own measurement -- chunked prefill +8.8 % with identical text.  R04 is done: `D3` resolved by
 unioning seven rope arms and dropping upstream's blanket guard (which the delivery's own kernels invalidate),
-worth +5.8 % prefill / +16.5 % decode at bf16 KV with identical text.  Next rung: **R05** (block 05,
-flash-attention band + native quantized K/V), the widest file set (341 files) but only 7 conflicted paths.  Target: the next release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
+worth +5.8 % prefill / +16.5 % decode at bf16 KV with identical text.  R05 is done: `D16` decided the delivery's FA
+iteration model wins over upstream's `#32407` rotation (verified absent, FA matrix 7428/0, native q8_0 K/V
++5.6 % decode).  Next rung: **R06** (block 06, MMB quantized prefill GEMM), where `D11`'s MMQ/MMVQ tuning A/B
+begins.  Target: the next release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 
 This is a **ladder climb, not a single rebase**: one rung per delivery block, each rung ending in a resolved

@@ -359,7 +359,7 @@ union of option 3: no delivery arm was deleted.
 
 ---
 
-## D16 — two incompatible FA iteration models: `#32407` (rotation) vs block 05 (band)  ·  **OPEN, asked at R05**
+## D16 — two incompatible FA iteration models: `#32407` (rotation) vs block 05 (band)  ·  **DECIDED 2026-11-20 (maintainer): option 2 — the delivery's model wins, the rotation is not carried**
 
 `flash_attn_ext_f16_process_tile` is the tile loop of the MMA FA kernel.  Upstream `054a1babf` (`#32407`,
 *Rotate K/V read order for better L2 cache hit rates*) and the delivery's block 05 **both rewrite it**, and the
@@ -387,3 +387,18 @@ invisible to short-prompt text and silently wrong at depth.
 **Why it is asked rather than decided:** option 2 drops an upstream performance change, which is the
 maintainer's call under `AGENTS.md`, and option 1 is a multi-session design task that must not be started
 without agreement on the oracle and the risk.
+
+**Decision (maintainer, 2026-11-20).**  Option 2, with the standing rationale stated: *in every re-base so far
+upstream has never done something better than the delivery*, so where the two are alternatives the delivery's
+side is taken and the cost is recorded and measured rather than assumed absent.  Implemented at R05
+(`1c9bfa37c`): the band iteration model is kept, upstream's rotation is not carried, and its absence is
+verified rather than assumed (no `nkb_pre`/`nkb_post`/`kb0_max`/`kb0_rot` in the FA sources; every `kb0_next`
+left is the delivery's own fetch-ahead).  The `#32217` per-head-mask fix and the `#31617` typed-mask conversion
+were still adopted, because they are unrelated to the rotation — dropping them would have removed a
+*correctness* fix for Inkling 2, which is a different thing from preferring our performance model.
+
+**Evidence the choice is safe:** `test-backend-ops -o FLASH_ATTN_EXT` **7428/7428, 0 failures, 2/2 backends**;
+4B coherence unchanged (`1c5d32ac537d`); and the block's own switch is non-vacuous where the feature lives
+(q8_0 KV: `GGML_CUDA_FA_KV_NATIVE=1` 88.6 vs 83.9 t/s decode, +5.6 %, identical text).  If the rotation is ever
+wanted back it must arrive as a *combined* model with that matrix green — i.e. as option 1, which remains
+available and is what this decision declines for now.
