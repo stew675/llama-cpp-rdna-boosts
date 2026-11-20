@@ -23,6 +23,9 @@ hardware rewards).  Stream priority (genuinely applied -- the device reports lea
 **measured no-op**.  So the campaign's mechanism reduces to **two contexts, free-running, driver-scheduled**:
 concurrency is the win, and every host-side policy we can express is neutral or worse.
 
+The arena sweep (pass 13) then shows the price and the value move **opposite ways**: 7.7 / 12.8 / 16.0 ms
+charged per decode token at arena 5000 / 4000 / 3000, i.e. the deeper the window, the dearer the decoder.
+
 Then the physics, measured on the shallow-arena shape (arena **5000** MiB: 8 GiB does not fit two contexts)
 with a 4932-token prompt and 128 decoder tokens: prefill **2529 t/s** alone, **2457** with an idle second
 context (**−3 %**), **2172** ungated (**−11.3 %**), decoder gets **32-35 tokens** through the 2.27 s prefill at
