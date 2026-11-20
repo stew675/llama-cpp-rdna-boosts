@@ -4,6 +4,14 @@
 implemented, nothing in `patches/`.**
 Opened 2026-11-18 by the maintainer's instruction ("create the campaign").
 
+**Pass 3 (same night) measured the bar an interleave must beat.**  On the same shallow-arena shape the shipped
+duty cycle (`scripts/gate-prefill-duty.sh`) delivers **12.5x the decode tokens (15 → 187) for a 1.53x prefill
+stretch** (4.25 → 6.51 s) — 172 extra tokens for 2.26 s, i.e. **13.1 ms per token against a 15.2 ms standalone
+decode step (~86 % of its own cost)**.  At step granularity the two *are serialized on one stream*, so that
+measurement cannot tell "additive because software" from "additive because no spare capacity" — which is
+precisely what (D) must test.  A two-process concurrency test is **not feasible on this box** (two `-ncmoe`
+contexts OOM at load on a 32 GiB card): the concurrency question has to be answered inside one process.
+
 **Pass 2 (same night) measured the window: 57-71 % of a shallow-arena prefill's wall is the gather kernel, and
 0 % at full residency** (`RESULTS-2026-11-18.md`, §Pass 2).  The gather is **link-bound** (36-42 GB/s of this
 box's own 28.7 GB/s calibrated H2D figure, and its per-call cost is nearly width-independent), which is the
@@ -292,6 +300,6 @@ promotion time, per `AGENTS.md`.
 |---|---|
 | this `README.md` | the campaign record |
 | [`RESULTS-2026-11-18.md`](RESULTS-2026-11-18.md) | **pass 1**: the ten-arm table, the four findings (the tier is free at 100 % residency; a partial arena costs ~56 %; the gather is 2.12x over staging and is the carrier now; the staging path is not a baseline), and the `G0`/`G1`/`G2` test that decides mechanism (D) |
-| `runs/arm.sh`, `runs/summ.sh` | the arm runner and the log re-parser (one summary line per arm, `F` from the delivery's own calibrated 28.7 GB/s H2D figure) |
-| `runs/*.log`, `runs/summary.tsv` | every raw log + the machine-readable table |
+| `arms/arm.sh`, `arms/summ.sh` | the arm runner and the log re-parser (one summary line per arm, `F` from the delivery's own calibrated 28.7 GB/s H2D figure) |
+| `arms/summary.tsv` | the machine-readable arm table (the raw `runs/*.log` are per-run scratch and are **gitignored** by the repo-wide `runs/` rule, like every other campaign's) |
 | [`probe-gather-timer.patch`](probe-gather-timer.patch) | the temporary `MOE_PROBE_PF_OVERLAP` instrument: an event pair around `ggml_backend_cuda_moe_cache_gather()` on the compute stream, folded with one sync per 64 calls, printing the cumulative gather wall.  Applied with `git apply`, built in `build-probe`, **reverted from the tree afterwards**.  Never shipped |
