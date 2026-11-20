@@ -142,9 +142,13 @@ the R00 build before declaring the rung green.
 ## R00 exit (once D1/D2/D3 are answered)
 
 - `test-backend-ops -o MUL_MAT_ID` on gfx1201, plus the `quantize_mmq_q8_1` arm the old port also fixed.
+- **The `mm_ids_helper_512_10` re-port needs the 512-experts / 10-used shape to mean anything**: that is
+  `Qwen3.8-Flash-Next` (`/llm/models/Qwen3.8/Flash-Next/Q4_K_M/…`, qwen4exp, 512 experts x 10 used, 48
+  blocks).  Note the box's other MoE models are **not** that shape — `Qwen3.5-122B-A10B` reports
+  `n_expert = 256, n_expert_used = 8` (measured 2026-11-20), so an A/B on it is vacuous for this path.
+  Arm: prefill `-p 2048` and `-p 16384` with `GGML_CUDA_DISABLE_MMID_512=0/1`, 3 reps, one device count.
 - Coherence 4B, `sha` recorded.  (R00 touches numerics-adjacent code — the sigmoid/bf16 asserts, the
   `llamafile_sgemm` routing — so a text difference against the base oracle is *allowed* but must be explained.)
-- `GGML_CUDA_DISABLE_MMID_512=1` A/B on a 512-expert/10-used model if the re-port is nontrivial.
 
 ---
 
