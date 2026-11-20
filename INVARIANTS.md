@@ -1350,3 +1350,50 @@ Record: `WORKLOG.md` 261119.008, `benchmarks/2026-11-19-mwr-exact.md`, `patches/
 Record: `WORKLOG.md` 261120.002, `benchmarks/` — measured in the retired campaign
 `archive/work/prefill-transfer-overlap/` (pass 9 + the r325 re-measurement), `patches/README.md` block 09,
 `ENVIRONMENT.md` §2.
+
+## r326 (2026-11-20, `WORKLOG.md` 261120.003) — the graph-replay width band is a TOKEN COUNT, not "a verify"; a moving width pays a capture per width, and a captured graph may no longer grow the FA staging arena (block 10, contributor PR #336)
+
+1. **The band `ggml_cuda_graph_is_multi_token()` compares against was `MMVQ_MAX_BATCH_SIZE` (8) by accident of
+   r20's argument, not by measurement.**  r20's rule was "only a true PRE-FILL (a varying ubatch) skips capture,
+   because capture never amortises there" and it used 8 as the prefill/verify boundary.  That boundary is wrong
+   for the one shape that matters more than any other on a server: **4 slots x `draft-mtp n3` under
+   `LLAMA_SPEC_ALIGN` is a fixed 16-row verify every step**.  Measured r326 (gfx1201, ROCm 10.1.0, 27B
+   UD-Q4_K_XL, 8 interleaved runs per arm): **178.1 -> 184.3 t/s (+3.5 %)**, with every run of one arm above
+   every run of the other; 4B Q8_0 +1.8 %; `llama-batched-bench -npl 16` +1.2 % on both models with npl 1/4/8
+   untouched (+-0.1 %).  `GGML_CUDA_GRAPH_MAX_TOKENS` (default 16) is that band.
+2. **The delivery default is provably untouched, and that is a text claim, not a rate claim.**
+   `--spec-draft-n-max 7` can produce at most an 8-row verify, so at the default the `GGML_CUDA_GRAPH_TRACE`
+   census is **identical** at `=8` and `=16` (1 GPU `direct=53 replay=1713 capture=18 properties_changed=14`,
+   3 GPU `-sm tensor` `3657/21819/813`) and the same-seed text is byte-identical; `ngram-mod` likewise.  A change
+   to this predicate therefore owes a *census-identity* arm, not a throughput arm, for the default path.
+3. **"It pays where the width repeats" is exact, and it is why a bare width threshold is only safe because the
+   delivery default cannot reach it.**  A moving width captures once per new width: 3 devices `-sm tensor`,
+   `--spec-draft-n-max 15`, captures **150-240 -> 1350-1430 (9x)**, `properties_changed` 279 -> 1053-1926.
+   That shape's **rate is bimodal in BOTH arms** (9 runs span 46.5-57.6 t/s, acceptance 0.1395 vs 0.166-0.168),
+   because above an 8-row verify the text is not run-to-run stable (§11) and the draft depth follows the
+   acceptance the drifting text produces — so neither a win nor a regression can be attributed to the band
+   there.  A "only capture when the width repeated" rule does NOT fix it (the depth saturates, so the width stays
+   16 while the FA mask extent moves each step).  Recorded as an accepted limitation: it needs `n_max >= 8`,
+   i.e. a user already outside the purity band, and `=8` restores r325 bit for bit.
+4. **A token count is not a verify: 9..16-row PRE-FILL ubatches are captured too.**  A short prompt, a prefill
+   tail, or a small `-ub` produces 9..16-row prefill graphs; `-ub 12` over a 5298-token prompt captures **21**
+   graphs at `n_tokens=12` and reads **+1.2 %** prefill.  The r20 comment ("only a true pre-fill skips") is
+   therefore no longer the whole story, and any future argument about prefill graph capture must be made on the
+   *token count*, not on the word "prefill".
+5. **A captured graph must never grow the FA staging arena — the old justification is retired.**  The arena's
+   scratch is deliberately outside the node allocation, outside the pool budget and outside `--fit`, and
+   `fattn-common.cuh` argued it was safe "because a multi-token graph is never CUDA-graph captured".  With the
+   band at 16 that is false: above the 8-row band a native-capable K/V cache STAGES, so a 9..16-row staged FA op
+   can be inside a capture (measured: the `-ub 12` arm logs the capture-time staged call once).  The rule is now
+   `ggml_backend_cuda_context::capturing`: no growth from inside a capture (on CUDA `cudaMalloc`/`cudaFree`
+   return `cudaErrorStreamCaptureUnsupported`; HIP's relaxed mode tolerates them, which would be a per-runtime
+   difference), so that call reads the K/V cache natively — same arithmetic, same tokens, no scratch.  A growth
+   *between* calls still frees the old arena only after `ggml_cuda_graph_mem_freed()`, so a capture that baked
+   the old pointer is re-made before it is read.
+6. **The gate's negative test is part of the evidence.**  `scripts/gate-graph-replay-width.sh` PASSes on the
+   r326 build and **fails 3 of its 5 checks on the shipped r325 binary** (no 9..16 capture in the default arm,
+   the kill switch changes nothing, no pre-fill capture) — a graph-decision change that cannot fail on the
+   previous build is not testing the decision.
+
+Record: `WORKLOG.md` 261120.003, `benchmarks/2026-11-20-graph-replay-16-tokens.md`,
+`patches/README.md` block 10, `ENVIRONMENT.md` §7.4, `MANIFESTS.md` gate 38.

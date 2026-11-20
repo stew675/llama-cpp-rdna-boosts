@@ -1,3 +1,91 @@
+## 261120.003 (r326, RELEASE v17-4f9dfa0e3-r326) -- the graph-replay width band is a token count: `GGML_CUDA_GRAPH_MAX_TOKENS` 8 -> 16, a block 10 amendment (contributor PR #336)
+
+**Release:** `v17-4f9dfa0e3-r326`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `a5026130c` (tree
+`2849b18c8`), 17 official + 1 temporary = 18 default blocks, optional `0100` -> `b9c861785` / `0101` ->
+`c504346d8` (cumulative `ebba85737`).  **No block created, split or renumbered**: one same-block amendment,
+**block 10** (`ggml/src/ggml-cuda/ggml-cuda.cu`, `common.cuh`, `fattn-common.cuh`).  One environment variable
+added (`GGML_CUDA_GRAPH_MAX_TOKENS`).  Contribution: `@overdoingism`, PR #336 (cut on r324; the review that
+asked for the arms is PR #334's, `TODO` #347).
+
+### The finding
+
+`ggml_cuda_graph_is_multi_token()` compared the graph's token count with `MMVQ_MAX_BATCH_SIZE` (**8**) and that
+number came from r20's argument ("above the verify widths it is a pre-fill, a varying ubatch, where capture
+never amortises"), not from a measurement of the one shape where 9..16 rows repeat: **4 slots x `draft-mtp n3`
+under `LLAMA_SPEC_ALIGN` is a fixed 16-row verify every step**.  The band is now
+`GGML_CUDA_GRAPH_MAX_TOKENS` (default **16**; `8` restores r325 bit for bit).
+
+| arm (gfx1201, ROCm 10.1.0; A = `=8`, B = default) | A | B | delta |
+|---|---|---|---|
+| 4-slot server, 4x`draft-mtp n3`, 27B UD-Q4_K_XL, 8 interleaved runs/arm | 179.2 / 177.7 / 177.7 / 177.8 (178.1) | 185.8 / 184.1 / 184.8 / 182.6 (184.3) | **+3.5 %** (every B above every A) |
+| same, 4B Q8_0 (state-matched pairs) | 640.8 / 641.1 | 652.1 | +1.8 % |
+| `llama-batched-bench -npl 16`, 27B / 4B | 242.70, 242.72 / 798.23, 798.86 | 245.69, 245.66 / 804.64, 806.41 | **+1.2 % / +0.9 %** |
+| `-npl 1 / 4 / 8`, both models | — | — | inert (±0.1 %) |
+| delivery default `n_max 7`, 1 GPU and 3 GPU `-sm tensor` | `direct=53 replay=1713 capture=18` / `3657/21819/813` | **identical census, identical text** | inert |
+| `ngram-mod` n15, 3 GPU | `4245/111069/1548` | identical | inert |
+
+The submitter's graph-census counts reproduce within a couple of calls (`1966/3054/59 -> 170/4756/153` on their
+box, `1973/3210/62 -> 180/4746/156` here); their +2.5 %/+4.1 % `-npl 16` and +1.5 %/+2.1 % multi-slot numbers
+are larger than this box's, i.e. ROCm 10.0.0 launches more expensively than 10.1.0 — the direction and the
+"1..8 untouched" claim are what reproduce.
+
+### What the submission did not cover, and is now covered
+
+1. **9..16-row PRE-FILL ubatches are captured too** (a short prompt, a prefill tail, a small `-ub`) — the PR
+   frames the change as verify widths.  `-ub 12` over the 5 298-token prose prompt: **21** captures at
+   `n_tokens=12`, **+1.2 %** prefill.  The r20 comment ("only a true pre-fill skips") is corrected at the source.
+2. **The FA staging arena may no longer be grown from inside a capture.**  Above the 8-row band a
+   native-capable K/V cache *stages*, and `fattn-common.cuh` justified the arena being outside the node
+   allocation with "a multi-token graph is never CUDA-graph captured" — false at 16.  New:
+   `ggml_backend_cuda_context::capturing` (set around the capture, checked by `fattn_stage_try_get`), so such a
+   call reads the K/V cache natively for that op — same arithmetic, same tokens — and logs one line the first
+   time.  The gate counts it.  (Measured motive: HIP's relaxed capture tolerates `cudaMalloc` mid-capture, CUDA
+   returns `cudaErrorStreamCaptureUnsupported`; relying on the difference would be a per-runtime bug.)
+3. **The moving-width cost is recorded, not hidden.**  3-device `-sm tensor` at `n_max 15`: captures
+   **150-240 -> 1350-1430** (9x).  That shape's *rate* is bimodal in **both** arms (46.5-57.6 t/s over 9 runs;
+   acceptance 0.1395 vs 0.166-0.168), because above an 8-row verify this set's text is not run-to-run stable
+   (`GREEDY-PURITY.md` §11) and the draft depth follows the acceptance the drifting text produces — so neither a
+   win nor a loss is attributable to the knob there.  A "only capture when the width repeated" prototype does
+   not help (the depth saturates, so the width stays 16 while the FA mask extent moves).  It needs
+   `n_max >= 8`, i.e. a user already outside the purity band, and `=8` is the bisect arm: accepted limitation,
+   `ENVIRONMENT.md` §7.4 + `INVARIANTS.md` r326.
+
+### Gates
+
+* `scripts/validate-set.sh` — **green**: 18 default + 2 optional, strict apply on a fresh `4f9dfa0e3` tarball,
+  applied tree **`2849b18c8`** == `release.json`, both optionals alone (`b9c861785` / `c504346d8`) and
+  cumulatively (`ebba85737`), Windows portability scan clean.
+* **`scripts/gate-graph-replay-width.sh` (new, MANIFESTS gate 38)** — **PASS**: (A) 4-slot arm captures 12-14
+  graphs at `n_tokens=16` and replays them (`direct=53 replay=832`), 5 accepted-draft lines; (B) `=8` captures
+  **0** graphs at 9..16 and fewer overall (18 vs 36); (C) delivery default **identical census**
+  (`direct=13 replay=113 capture=3 properties_changed=0`) and **byte-identical text**
+  (`383 chars sha=a1e7338c194c`); (D) 21 pre-fill captures at `n_tokens=12` vs 0, and the capture-time staged-FA
+  line logged once vs never; GPU faults clean.  **Negative-tested: the same gate fails 3 of its 5 checks on the
+  shipped r325 binary.**
+* `scripts/gate-prefill-logits.sh` (canonical point, base `923b910eb`) — **PASS**, mean KLD **0.000000**,
+  same-top-p **100.000 %**: the band changes which graphs are replayed, not a kernel.
+* **MTP Protocol A** (canonical dense arm, `-n 3000`): `none` **30.7 t/s** vs `draft-mtp` **53.9 t/s**, same text
+  `12331 chars sha=eace21fc3399` — the same text r325 recorded, so the default drafting is untouched.
+* **Coherence against the r325 build** (same-seed greedy): 4B Q8_0 `147 chars sha=b065f37593b3` and 27B
+  UD-Q4_K_XL 3-device `-sm tensor` + `draft-mtp n7` `139 chars sha=ad1333a99867` — **identical in both builds**.
+* `llama-batched-bench -npl 1,4,8,16` — the table above (rule 5).
+* `scripts/gate-per-block-build.sh --fast --jobs 28` — **PASS, 18/18 in 1441 s** (two rungs cold).  The tip
+  itself is built with `all` in the shared tree, which is where `test-backend-ops` would run; this change touches
+  no kernel.
+* GPU faults — clean on every arm above (scoped `--since` per gate, plus the journal check at the end).
+
+### Tooling fixed on the way (both cost real time today and will cost it again)
+
+* **`gate-per-block-build.sh` now heartbeats while a rung CONFIGURES, not only while it compiles**, and prints
+  `configured (Ns)` per rung.  A per-rung configure is 20-25 s of silent cmake, so a healthy ladder looked like a
+  hung one (an `all`-profile ladder was killed by hand at rung 15 after 55 min looking dead).  It also states the
+  profile's cost up front.
+* **Put the UI assets in `tools/ui/dist` before the ladder** (`ui-assets.cmake` Priority 1).  The HF fetch lives in
+  the build dir the gate wipes, so it runs once per rung: rung 14 died on
+  `UI: download dist.tar.gz.sha256 from b12387 failed: Timeout was reached` with `HF_UI_VERSION` pinned and lost
+  13 rungs of work.  Recorded in `MANIFESTS.md` gate 5 and `AGENTS.md` (`all` vs `--fast`, and that
+  `--changed-from` is a delta gate, not a substitute, after amending an early block).
+
 ## 261120.002 (r325, RELEASE v17-4f9dfa0e3-r325) -- the MoE device gather's launch shape: `n_split` 8 -> 32, a block 09 amendment (+7.5 % prefill on the 1-GPU host-expert shape)
 
 **Release:** `v17-4f9dfa0e3-r325`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `4132c5155` (tree

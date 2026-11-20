@@ -45,8 +45,7 @@ left in this file.  The r236 re-base
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
-| **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure (per-block gate, clean checkout, hosted CI) dies in `ui-assets.cmake:137` -- the container images are unaffected (their `web` stage supplies `tools/ui/dist`) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the workaround where it bites; re-check before the next per-block ladder — §342 |
-| **347** | PR #334 item 2 (HIP graph replay up to 16 tokens, `GGML_CUDA_GRAPH_MAX_TOKENS`): needs its own PR plus the multi-slot and 4B arms, because it is inert at the delivery's default draft depth and the delivery's text is not stable above the 8-row purity band | contribution / waiting on the submitter (`PR #334` declined for now) | **WAITING** -- separate PR requested; requirements in the PR review and §347 |
+| **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure (per-block gate, clean checkout, hosted CI) dies in `ui-assets.cmake:137` -- the container images are unaffected (their `web` stage supplies `tools/ui/dist`) | environment / waiting on upstream | **WAITING** — `HF_UI_VERSION=b12387` is the *version* workaround, but it is not enough: the fetch itself then runs **per rung** (it lives in the build dir the gate wipes) and a timeout kills the ladder (r326: rung 14, 13 rungs lost).  The robust workaround is `ui-assets.cmake`'s Priority 1: copy a good `tools/ui/dist` (64 files) into the checkout's `tools/ui/` — untracked and gitignored, so it survives the gate's checkouts and no rung touches the network; re-check before the next per-block ladder — §342 |
 | **348** | PR #334 item 3 (one FA KV-group bitmap per graph evaluation, `GGML_CUDA_FA_KQ_BLOCKS_REUSE`): correct as designed (`built=1 reused=15`) but worth nothing measurable on this box, unreachable in every single-sequence arm, and it leaks a per-context `cudaMalloc` behind a raw context pointer | contribution / waiting on the submitter (`PR #334` declined for now) | **WAITING** -- separate PR requested with a census, a context teardown and a Windows/launch-bound measurement; §348 |
 | **349** | `scripts/gate-server-arms.sh`'s `35b10` arm is not bit-reproducible on its **second slot** even with both of r324's fixes (a `MOE_EXPERT_HEATMAP=load` pin and a fixed-order admission): slot 0 is stable, slot 1 reads three different texts at three acceptances, because a 0.5 s stagger lands at a *variable* point in slot 0's prefill | tooling / gate (`TODO` #295's gate, gate 24 step 5c) | **OPEN** -- admit slot 1 on slot 0's first STREAMED TOKEN instead of on a clock; until then that arm's text is reported, not asserted (its acceptance checks stay hard, which is the collapse detector the arm exists for); §349 |
 
@@ -200,27 +199,6 @@ Do not add a `HF_UI_VERSION` pin to `build-containers.sh` for this.
 
 Where it does bite, `HF_UI_VERSION=b12387` (the bundle this box had stamped) carries `workbox-b3c04f83.js` and
 validates; the per-block gate's header records it.  Drop the pin when `latest` validates again.
-
-## 347. PR #334 item 2 — HIP graph replay for 9..16-token graphs (separate PR requested)
-
-**Waiting on the submitter** (r323).  `GGML_CUDA_GRAPH_MAX_TOKENS` (default 16) makes a 9..16-token verify
-graph replayable, on the argument that those widths "keep a fixed shape from step to step like the <=
-`MMVQ_MAX_BATCH_SIZE` widths".  Measured here on r322+r323:
-
-* at the delivery's **default** drafting (`--spec-draft-n-max 7`, so at most an 8-row verify) it is **inert**:
-  `GGML_CUDA_GRAPH_TRACE=1` reads `direct=7554 replay=37482 capture=819 properties_changed=858` at `=8` and at
-  `=16` alike (no 9..16-token graph exists there), and plain decode likewise;
-* where 9..16-row verifies do occur it moves most steps onto replay (`direct` 45783 -> 8490) and pays a capture
-  per distinct width (`capture` 138 -> 924, `properties_changed` 183 -> 1002) -- which is the wrong trade for
-  block 02's per-sequence *adaptive* depth and the n-gram family's variable draft length;
-* "bit for bit" cannot be asserted there: above the 8-row band the delivery's own text is not run-to-run stable
-  (`GREEDY-PURITY.md` §11).  The same binary at `--spec-draft-n-max 15` read three different texts in three runs.
-
-**What it needs**: a multi-slot arm measured with the repo's own instrument (`LLAMA_SPEC_ALIGN` makes those
-verifies a fixed 16 rows; run-to-run spread at 4 slots is ±7 %, so several reps), a **4 B** arm (WORKLOG
-260928.003 measured verify graphs ~2.5 % slower there and left a size gate unshipped), a `llama-batched-bench
--npl 1,4,8` arm, and the `ENVIRONMENT.md` + gate + record treatment any block owes.  Review:
-`https://github.com/stew675/llama-cpp-rdna-boosts/pull/334#issuecomment-7025668812`.
 
 ## 348. PR #334 item 3 — one FA KV-group bitmap per graph evaluation (separate PR requested)
 

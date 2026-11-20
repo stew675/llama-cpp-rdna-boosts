@@ -1,4 +1,4 @@
-From e4bc5cc54ad00d96ea39b01ea3bd9e71e4a242ef Mon Sep 17 00:00:00 2001
+From 9ef76c0e948bb3be2b984a6f2ba6810f1713e013 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/17] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -3001,7 +3001,7 @@ index d5541cc8a..22df8b2df 100644
          if (node->ne[2] > MOE_EXPERT_CACHE_MAX_TOK) {
              // TODO #133 / TODO #327: ABOVE the band an identity (fully resident) table is served IN PLACE -- the
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 28fb35ec7..52f3234ce 100644
+index 4343105f5..ac26168c3 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -2764,6 +2764,10 @@ struct ggml_backend_cuda_comm_context {
@@ -3690,7 +3690,7 @@ index 28fb35ec7..52f3234ce 100644
  static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
      ggml_cuda_async_input_drain(cuda_ctx->device);
-@@ -8217,6 +8729,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8246,6 +8758,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
  }
  
  
@@ -3699,7 +3699,7 @@ index 28fb35ec7..52f3234ce 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -8246,6 +8760,12 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -8275,6 +8789,12 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
      /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
@@ -3712,7 +3712,7 @@ index 28fb35ec7..52f3234ce 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -8797,6 +9317,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8826,6 +9346,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              }
          case GGML_OP_DUP:
                  return true;
@@ -3723,7 +3723,7 @@ index 28fb35ec7..52f3234ce 100644
          case GGML_OP_ARGMAX:
          case GGML_OP_COUNT_EQUAL:
              return true;
-@@ -9081,7 +9605,11 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -9110,7 +9634,11 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  // tier, and it is added by block 12, which defines that buffer type -- naming it here would leave blocks 09-11
  // uncompilable (`INVARIANTS.md` r307 fact 5).
  static bool ggml_backend_buft_is_cuda_host_expert(ggml_backend_buffer_type_t buft) {
@@ -3736,7 +3736,7 @@ index 28fb35ec7..52f3234ce 100644
  }
  
  // Issue #323: the host-expert offload relaxation, default ON.  `GGML_MOE_HOST_OFFLOAD=0` restores the
-@@ -9235,6 +9763,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
+@@ -9264,6 +9792,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
      return moe_cache_enabled() ? moe_cache_max_tok_dev(ctx->device) : 0;
  }
  
@@ -3759,7 +3759,7 @@ index 28fb35ec7..52f3234ce 100644
  static bool ggml_backend_cuda_device_moe_cache_rearm(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): re-arm the expert-cache arena after a compute-buffer drop returned the VRAM.
      (void) dev;
-@@ -9254,6 +9798,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
+@@ -9283,6 +9827,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
  
  // wip/host-expert-tier: the persisted heat prior, so the loader can fill the pinned host-master tier in
  // descending hotness.  The prior is process-global in the cache, so any CUDA device serves.
@@ -3771,7 +3771,7 @@ index 28fb35ec7..52f3234ce 100644
  static void ggml_backend_cuda_device_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes) {
      (void) dev;
      moe_cache_set_host_pool_budget(bytes);
-@@ -9277,6 +9826,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -9306,6 +9855,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
      moe_cache_set_host_source(tensor_data, path, offs, n_experts, host_bytes, total_bytes);
  }
  
@@ -3791,7 +3791,7 @@ index 28fb35ec7..52f3234ce 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -9411,11 +9973,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -9440,11 +10002,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .slab_set_ring_cap         = */ ggml_backend_cuda_device_slab_set_ring_cap,
      /* .slab_enabled              = */ ggml_backend_cuda_device_slab_enabled,
      /* .slab_ring_slots           = */ ggml_backend_cuda_device_slab_ring_slots,
@@ -3806,7 +3806,7 @@ index 28fb35ec7..52f3234ce 100644
  };
  
  // backend reg
-@@ -9530,6 +10094,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -9559,6 +10123,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
          return (void *)ggml_backend_cuda_comm_allreduce_tensor;
      }

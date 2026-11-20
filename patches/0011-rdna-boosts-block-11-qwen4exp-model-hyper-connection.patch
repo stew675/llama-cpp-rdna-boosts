@@ -1,4 +1,4 @@
-From a9e798b1f8aad06fe794b0f3e4097dab380b3cdc Mon Sep 17 00:00:00 2001
+From e4f62d372aa3e3759479565e606b15cdb3f64912 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/17] rdna-boosts: block 11: qwen4exp (model,
@@ -1257,7 +1257,7 @@ index aac527a64..e068a3a0a 100644
  void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 58487dad9..2e14c57f9 100644
+index 88f9e9764..0d1f8d6c6 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1725,6 +1725,7 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
@@ -1296,7 +1296,7 @@ index 58487dad9..2e14c57f9 100644
      // GLU -> Q8_1 (verify band): ggml_cuda_try_fuse sets these for the GLU node it is about to leave to the regular
      // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
      // matmul's Q8_1 activation into the quantize cache.  Reset on every try_fuse call, so they never outlive the node.
-@@ -2775,6 +2790,29 @@ static inline bool ggml_cuda_bf16_src1_cache_on() {
+@@ -2799,6 +2814,29 @@ static inline bool ggml_cuda_bf16_src1_cache_on() {
      return on;
  }
  
@@ -3248,7 +3248,7 @@ index 710d8c1ba..d5541cc8a 100644
      // UNARY(sigmoid) -> MUL -> ADD with a per-row gate (GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0: off): one kernel
      if (const int n_sig_mul_add = ggml_cuda_sigmoid_mul_add_try_fuse(*cuda_ctx, cgraph, i)) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 7c050de32..28fb35ec7 100644
+index a46ef806c..4343105f5 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -29,6 +29,9 @@
@@ -3369,7 +3369,7 @@ index 7c050de32..28fb35ec7 100644
          case GGML_OP_RWKV_WKV7:
              ggml_cuda_op_rwkv_wkv7(ctx, dst);
              break;
-@@ -7345,12 +7414,152 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7374,12 +7443,152 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -3522,7 +3522,7 @@ index 7c050de32..28fb35ec7 100644
      static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
  
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
-@@ -8794,8 +9003,33 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8823,8 +9032,33 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
