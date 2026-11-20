@@ -1,3 +1,64 @@
+## 261120.001 (r324) -- campaign housekeeping: `prefill-transfer-overlap` retired, `prefill-decode-arms` opened, and the gather's `n_split` re-measured and scoped (no delivery change)
+
+**No delivery patch changed, no block created, split or renumbered, no release.**  This entry records a
+research campaign's retirement, the campaign that replaces it, and the one measured candidate it left behind.
+
+### The campaign result, in one line
+
+A prefill and a decode on one GPU should **not** be interleaved by policy at all: give the server **two
+contexts on two threads** (a prefill arm and a decode arm), let the GPU schedule them, and move a slot between
+the arms only at a request boundary.  Measured on 1 x R9700, Qwen3.6-35B-A3B Q4_K_M, `-ncmoe 40 -lme auto`,
+arena 5000 MiB, a 4932-token prompt + a 128-token decoder, warm reps: the decoder reads **p95 50 ms** during a
+2.27 s prefill for a prefill cost of **-11.3 %**, against the shipped duty cycle's **p95 519-568 ms at -30 %**
+(the `DUTY=0` row is `p95 568 ms` at -2 %).  Every host-side policy on top of the concurrency was measured and
+**lost**: a cumulative rate gate (F = 0 / .25 / .5 / 1 / inf), a per-gather yield point built on a new sched
+callback (`splits = 120` per ubatch, so the per-layer switch point does exist) and HIP stream priority
+(verified applied — the device reports `least=1/greatest=-1`).  The reason is queue depth: a phase-locked
+decoder waits ~600 ms for its step because a lone queued burst schedules behind the prefill's deep kernel
+queue, while a free-running one always has work pending (42 ms).
+
+Two constraints are measured, not assumed, and both are written into the new campaign's landmines: the window
+exists **only** on a residency-deficient host-expert tier (full residency: zero gathers, two contexts
+byte-identical to one, compute-vs-compute), and **two contexts that both submit decode-band work corrupt each
+other** through the per-table, per-process `GGML_MOE_DEVREMAP` map (`=0` reads one text 3/3; a prefill+decode
+pair does not collide).  The cost is real resource sharing: ~7.7 ms of prefill per decode token against a
+10.9 ms standalone step, rising to 12.8 / 16.0 ms at arena 4000 / 3000 — the window is dearest exactly where
+it is worth most.
+
+### What moved
+
+* `wip/prefill-transfer-overlap/` -> `archive/work/prefill-transfer-overlap/` (**retired**; it answered its
+  question).  The record carries passes 1-13, the two losing patches
+  (`candidate-split-yield-and-priority.patch`), the gather probe, the `two_ctx` harness and the `smooth.py`
+  baseline table.
+* Its enabling change (a generic second `llama_context` sharing the first one's KV, `qwen35moe` included,
+  text-verified on the dense 4B and 35B-A3B) moved to the new campaign as
+  `wip/prefill-decode-arms/enabling-0001-second-context-shared-kv.patch`.
+* **`wip/prefill-decode-arms/` opened** (`wip/CAMPAIGNS.md`): one prefill arm + one decode arm in
+  `llama-server`.  First task is the hybrid model's **recurrent** state (a slot cannot cross arms without it);
+  then the server skeleton, the boundary handover with a per-request text oracle, the opt-in gate and the
+  measurements.  Nothing is implemented and nothing is in `patches/`.
+
+### The gather's `n_split`, re-measured on this tip and scoped (`TODO` #350)
+
+`moe_cache_gather_kernel`'s block count is `n_experts * n_split` with `n_split = 8`, a constant chosen for the
+**decode** band; a prefill ubatch routes essentially every expert of the table, so only 8 blocks per expert
+carry a 0.6-1 MiB copy each.  Re-measured on `923b910eb` (interleaved reps, `MOE_EXPERT_HEATMAP=load` +
+`ROCBLAS_USE_HIPBLASLT=0`, `-b 2048 -ub 2048`, the 4932-token corpus prefix):
+
+| shape | `MOE_GATHER_NSPLIT=8` | `=32` | delta |
+|---|---|---|---|
+| 1 GPU, Q8_0, auto arena (84 % residency) | 2307.9 / 2307.2 t/s | **2480.8 / 2480.8 t/s** | **+7.5 %** |
+| 1 GPU, Q4_K_M, arena 8000 MiB | 2414.6 t/s | 2470.4 t/s | +2.3 % |
+| 3 GPU `-sm tensor`, Q8_0 | 4125.8 t/s | 4141.4 t/s | +0.4 % (neutral) |
+
+Greedy text byte-identical in every pair (`572 chars sha=40e29c2b46b6`), and the change only partitions the
+same bytes across more blocks.  So it is a **1-GPU host-expert-tier win, neutral on the 3-GPU tensor split** —
+worth shipping because it never measured worse, and it is left **WAITING** on a block decision (a new block or
+a 09/12 amendment; that is the maintainer's call, not a gate outcome) plus `gate-prefill-logits.sh`,
+`gate-host-pool.sh` and `check-gpu-faults.sh`.  Candidate:
+`archive/work/prefill-transfer-overlap/candidate-gather-nsplit.patch`.
+
 ## 261119.008 (r324, RELEASE v17-4f9dfa0e3-r324) -- contributor PR #335 taken in full, corrected: the MoE weighted reduction is computed without fma contraction and its fold outranks the MUL-only fold (block 10); the delivery's MoE decode text was NOT the unfused chain's text before this
 
 **Release:** `v17-4f9dfa0e3-r324`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `923b910eb`

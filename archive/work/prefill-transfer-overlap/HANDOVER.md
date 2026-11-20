@@ -1,5 +1,10 @@
 # HANDOVER — prefill-transfer-overlap, toward per-layer switching during prefill
 
+> **RETIRED 2026-11-20.**  Kept as the record of how the win was established.  The answer to this handover's
+> question is in `RESULTS-2026-11-20.md` passes 10-13: a second context sharing the KV, run concurrently on
+> its own thread, is the mechanism; the per-layer yield this file proposes was built and **lost** to plain
+> concurrency.  Product work: [`wip/prefill-decode-arms/`](../../../wip/prefill-decode-arms/README.md).
+
 **For a fresh session with no context.**  Read this, then `README.md`, then
 [`RESULTS-2026-11-18.md`](RESULTS-2026-11-18.md) (§ numbers are referenced below).  Everything here is **WIP**:
 nothing is in `patches/`, nothing has been applied to `~/llama.cpp`, and no delivery block has been amended.

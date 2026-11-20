@@ -1,5 +1,20 @@
 # prefill-transfer-overlap — spend the H2D window on the decoder
 
+> **RETIRED 2026-11-20 — this campaign did its job and is closed.**  It was opened to answer "is there a
+> recoverable window in a host-expert prefill, and what mechanism can spend it?" and it answered that: the
+> window is real on a residency-deficient arena, the mechanism is **two independent contexts running
+> concurrently on two threads** (every host-side policy — a rate gate, a per-gather yield, a stream
+> priority — measured neutral or worse), and the result is a Pareto win over both shipping rows
+> (decoder p95 50 ms vs 519-568 ms, at 11 % of the prefill cost the duty cycle charges 30 % for).
+>
+> **The product work continues in [`wip/prefill-decode-arms/`](../../../wip/prefill-decode-arms/README.md)** —
+> one prefill arm and one decode arm inside `llama-server`.  Its enabling patch was moved there as
+> `enabling-0001-second-context-shared-kv.patch`.  The two policies that lost (`candidate-split-yield-and-priority.patch`)
+> and the delivered candidate found here (`candidate-gather-nsplit.patch`, promotion tracked as `TODO` #351)
+> stay in this record.  Nothing here is applied by anything: `archive/work/` is reference only.
+>
+> **Historical status line follows.**
+
 **Status: OPEN — the enabling change EXISTS and the first overlap numbers are measured (2026-11-20,
 [`RESULTS-2026-11-20.md`](RESULTS-2026-11-20.md), passes 10-11).  Nothing implemented in the delivery, nothing
 in `patches/`; the code lives on the WIP branch `wip/prefill-overlap` of `~/llama.cpp`.**
@@ -383,7 +398,7 @@ promotion time, per `AGENTS.md`.
 | [`HANDOVER.md`](HANDOVER.md) | **start here in a fresh session**: goal + PASS/PARTIAL/FAIL, the baseline table, what is established, the (D) plan with file pointers, the landmines, and every command |
 | [`PROMPT.md`](PROMPT.md) | the first message to hand a cold session |
 | [`RESULTS-2026-11-20.md`](RESULTS-2026-11-20.md) | **passes 10-11**: the generic second KV-sharing context (its text oracle, the co-owner vs mirror distinction, the decode-band-remap collision), the VRAM cost of a second context, and the first overlap numbers + the gate sweep (prefill −11.3 %, decoder p95 49-53 ms, 79 % of a decode step charged) |
-| [`candidate-generic-second-context.patch`](candidate-generic-second-context.patch) | The pass-10 change as one patch against the delivery tree (`git diff` of the WIP branch `wip/prefill-overlap` in `~/llama.cpp` vs `rdna-boosts`): 8 files, +111/-23.  **WIP only** — it is not in `patches/`, no block was created or amended, and it is not applied to any checkout |
+| [`candidate-generic-second-context.patch`](../../../wip/prefill-decode-arms/enabling-0001-second-context-shared-kv.patch) | The pass-10 change as one patch against the delivery tree (`git diff` of the WIP branch `wip/prefill-overlap` in `~/llama.cpp` vs `rdna-boosts`): 8 files, +111/-23.  **MOVED to the follow-on campaign** as `enabling-0001-second-context-shared-kv.patch`; it is not in `patches/`, no block was created or amended, and it is not applied to any checkout |
 | [`candidate-split-yield-and-priority.patch`](candidate-split-yield-and-priority.patch) | Task 2 as one patch: the sched-level per-gather yield callback, `llama_set_split_yield_callback`, and `llama_set_stream_priority` (a **measured loser** and a **measured no-op**; kept so a later session does not re-derive them) |
 | [`arms/two_ctx.cpp`](arms/two_ctx.cpp), [`arms/build-two-ctx.sh`](arms/build-two-ctx.sh) | the pass 10-11 instrument: one process, one model, two contexts; modes `single`/`dual`/`dual-parallel`/`pf-alone`/`dec-alone`/`pf-dec` (+ `TWO_CTX_GATE_F`, `TWO_CTX_REPS`, `TWO_CTX_B_BATCH`) |
 | [`RESULTS-2026-11-18.md`](RESULTS-2026-11-18.md) | **pass 1**: the ten-arm table, the four findings (the tier is free at 100 % residency; a partial arena costs ~56 %; the gather is 2.12x over staging and is the carrier now; the staging path is not a baseline), and the `G0`/`G1`/`G2` test that decides mechanism (D) |
