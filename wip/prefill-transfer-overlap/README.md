@@ -348,6 +348,8 @@ promotion time, per `AGENTS.md`.
 | file | what |
 |---|---|
 | this `README.md` | the campaign record |
+| [`HANDOVER.md`](HANDOVER.md) | **start here in a fresh session**: goal + PASS/PARTIAL/FAIL, the baseline table, what is established, the (D) plan with file pointers, the landmines, and every command |
+| [`PROMPT.md`](PROMPT.md) | the first message to hand a cold session |
 | [`RESULTS-2026-11-18.md`](RESULTS-2026-11-18.md) | **pass 1**: the ten-arm table, the four findings (the tier is free at 100 % residency; a partial arena costs ~56 %; the gather is 2.12x over staging and is the carrier now; the staging path is not a baseline), and the `G0`/`G1`/`G2` test that decides mechanism (D) |
 | `arms/arm.sh`, `arms/summ.sh` | the arm runner and the log re-parser (one summary line per arm, `F` from the delivery's own calibrated 28.7 GB/s H2D figure) |
 | `arms/summary.tsv` | the machine-readable arm table (the raw `runs/*.log` are per-run scratch and are **gitignored** by the repo-wide `runs/` rule, like every other campaign's) |
