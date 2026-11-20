@@ -1,3 +1,87 @@
+## 261120.004 (r327, RELEASE v17-4f9dfa0e3-r327) -- one FA KV-group bitmap per graph evaluation, in the default set but OPT-IN: exact, censused, and worth nothing on this box (contributor PR #337, `TODO` #348 retired)
+
+**Release:** `v17-4f9dfa0e3-r327`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `e159adfc2` (tree
+`4792f98b8`), 17 official + 1 temporary = 18 default blocks, optional `0100` -> `410b6f1b1` / `0101` ->
+`4a6da1ba3` (cumulative `8c1e74631`).  **No block created, split or renumbered**: one same-block amendment,
+**block 10** (`common.cuh`, `fattn-common.cuh`, `fattn.cu`, `fattn.cuh`, `ggml-cuda.cu`) -- the bitmap *producer*
+is block 05's, the sharing layer and the `ggml_backend_cuda_graph_compute()` hook are block 10's (the
+`q8_1_cache_clear()` / `bf16_src1_cache_clear()` / `mwr_done_graph` family).  Two environment variables added
+(`GGML_CUDA_FA_KQ_BLOCKS_REUSE`, **opt-in / off by default**; `GGML_CUDA_FA_KQ_BLOCKS_CENSUS`, diagnostic).
+Contribution: `@overdoingism`, PR #337 (item 3 of PR #334, re-sent on its own as the r323 review asked).
+
+### What the r323 review asked for, and what arrived
+
+`TODO` #348 declined PR #334's item 3 with four requirements: a `-lv 4` census (otherwise no arm can be told from
+the pre-change behaviour), the **teardown** of the process-global maps keyed on a raw `const
+ggml_backend_cuda_context *` (whose 64 KiB `cudaMalloc` was never freed and whose address is routinely reused --
+across devices, `llama-bench` over several models, `test-backend-ops`), a comment saying the reuse key must be
+re-audited whenever the band's split moves, and a **measured** win.  PR #337 delivered the first three and said
+plainly that it has no win on Linux and no Windows measurement -- which, by this repo's own rule, is
+`optional/<name>/` material.  **The maintainer's decision at review was different and is what shipped: keep it in
+the default set as an OPT-IN switch**, so the mechanism is maintained and rebased with the blocks instead of
+drifting in `optional/`, and so a consumer with the platform that pays for it has it one variable away.
+
+### What changed from the submission
+
+1. **Default flipped to OFF** (`GGML_CUDA_FA_KQ_BLOCKS_REUSE=1` enables).  This is not the "beneficial is
+   default-on" policy inverted by taste: there is no measured benefit here (see below), so default-on would put an
+   unmeasured trade in every consumer's build.  `TODO` #348's promotion test -- a win on one of the delivery's own
+   configurations -- is the only thing that flips it.
+2. **The capture check uses r326's `ggml_backend_cuda_context::capturing`** instead of its own
+   `hipStreamIsCapturing`/`cudaStreamIsCapturing` pair.  r326 introduced that flag for exactly this hazard (a
+   capture must not allocate), so a second, platform-preprocessor-guarded copy of the same query is drift.
+3. **The census is no longer vacuous in the OFF arm.**  The submission counted only inside the enabled path, so
+   `reuse=off` read `built=0 reused=0 fallback=0` -- indistinguishable from a run that never reached the code.
+   `calls` is now incremented before the switch is read (`reuse=off calls=16` proves the arm ran), and the single
+   `fallback` counter is split into the four declines (`noeval`, `stream`, `size`, `capture`) plus `nomem`.
+4. **A failed 64 KiB allocation DECLINES instead of aborting.**  A cache may not turn a fit run into a crash; the
+   site builds into the pool as before and logs one line.
+5. **Re-cut against the current tree** (the submission was cut on r324, two releases back; it did apply strictly,
+   producing the same tree, but an artifact is not left two releases behind).
+
+### Measurement (gfx1201, ROCm 10.1.0, 1 x R9700)
+
+Shape: 2-slot `--kv-unified` server, 27B UD-Q4_K_XL, q8_0 K/V, `-c 65536`, slot 0 parks a **25,700-token** prompt
+(`n_predict 1`), then three 64-token greedy decodes in slot 1.  This is the shape that reaches the **packed** bitmap
+(a single-sequence batch takes the *derived* one, so `llama-bench` and `test-backend-ops` cannot see this feature at
+all).
+
+| arm | decode t/s (3 requests per run) | census |
+|---|---|---|
+| `GGML_CUDA_FA_KQ_BLOCKS_REUSE=1` | 31.87 / 31.91 / 31.89 (**31.89**) | `calls=16 built=1 reused=15 declined noeval=0 stream=0 size=0 capture=0 nomem=0` |
+| unset (the shipped default) | 31.83 / 31.86 / 31.85 (**31.85**) | `calls=16 built=0 reused=0 declined ... 0` |
+| r326 release build | 31.86 / 31.88 / 31.87 (**31.87**) | -- (no code) |
+
+**Text `b0ff20f2404e` in all three arms** (and 3/3 within each), so the reuse moves no token -- as it must, since a
+reused bitmap is the same words.  **+0.13 % is noise**: the submitter's +0.04 % and this box's measurement agree on
+the only claim that matters, i.e. nothing.  Co-batched two-slot prefill (the other reachable shape) fires hard and
+cleanly -- `calls=128 built=8 reused=120`, no fault, no assert -- but that arm is **not** a text oracle (a two-slot
+pair changes the ubatch shape and its admission order is a timing race, `GREEDY-PURITY.md` §63 / `TODO` #349).
+
+### Gates
+
+* `scripts/validate-set.sh` -- **GREEN**: 18 default + 2 optional, strict apply on a fresh `4f9dfa0e3` tarball,
+  applied tree **`4792f98b8`** == `release.json`, both optionals alone (`410b6f1b1` / `4a6da1ba3`) and cumulatively
+  (`8c1e74631`), Windows portability scan clean (513 files).
+* `test-backend-ops -o FLASH_ATTN_EXT -b ROCm0` with the switch **ON** -- **7381/7381, 2/2 backends**, census
+  `calls=2260 built=2260 reused=0` (a single-node test graph has no second layer to share with; `reused=0` there is
+  the *correct* answer, not a gap).
+* `scripts/gate-per-block-build.sh` (`all` profile -- the amendment touches a shared header, `common.cuh`, and
+  `AGENTS.md` names that as an `all` case) -- **PASS, `RC=0`: all 18 block commits build the `all` target**.  Cost:
+  **~70 min wall** (`--jobs 28`, warm ccache) against the `--fast` release flow's ~11 min -- which is exactly the
+  clause the maintainer flagged at review, since a PR integration used to be a 60-90 minute exercise and this one
+  was 3 h.  See the tooling follow-up in the same review.  (The `all` rung that actually earns its keep here is
+  the one this gate exists for: an intermediate tree whose `tests/` TU no longer compiles.)
+* No prefill-logit run is owed: the default path is the pre-change path (with the switch off the launcher still
+  performs the same memset + prepass launches, and the function returns before any decision), and the opt-in path is
+  bit-identical by construction and text-verified above.
+
+### Where it stands
+
+`TODO` **#348 is retired** (the handle stays permanent).  The feature is in the default set, off, with
+`ENVIRONMENT.md` §7.4 naming the promotion test: **a measured win on a supported configuration** -- the candidate is
+Windows/WDDM, where this repo's own numbers put launch-bound moves at +16-19 %, and which it does not validate.
+
 ## 261120.003 (r326, RELEASE v17-4f9dfa0e3-r326) -- the graph-replay width band is a token count: `GGML_CUDA_GRAPH_MAX_TOKENS` 8 -> 16, a block 10 amendment (contributor PR #336)
 
 **Release:** `v17-4f9dfa0e3-r326`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `a5026130c` (tree

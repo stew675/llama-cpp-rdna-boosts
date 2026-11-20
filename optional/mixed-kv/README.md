@@ -8,8 +8,18 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `980b15e310adfbf46107eb7e57a3288e72ab7d2f89db3ebe603d6ff2e81d2e27` (the r324 cut -- every re-cut moves the exported commit
+  `9dc88d433b8949fd0c5646e314a9276f997931a2c2bce60204efef9e960cd7c8` (the r327 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
+* **r327 re-cut verification (current)**: applies strictly at the r327 default tree `4792f98b82a4c6433bf11c629fdf01c21a143ce9` (sha256
+  `9dc88d433b8949fd0c5646e314a9276f997931a2c2bce60204efef9e960cd7c8`), producing tree `4a6da1ba3d5799e6983116fb22ff3be7869ef31e`; with the other optional artifact on top, the cumulative tree is
+  `8c1e74631c653862c3f2da5968042ec0cbba99f0`.  r327 amends **block 10** with one packed FA KV-group bitmap per graph evaluation
+  (`GGML_CUDA_FA_KQ_BLOCKS_REUSE`, opt-in; `common.cuh`, `fattn-common.cuh`, `fattn.cu`, `fattn.cuh`,
+  `ggml-cuda.cu`, PR #337).  This artifact's `fattn.cu` hunk anchors at the end of the file, after the
+  inserted block, so git moved it and nothing was reconciled: the artifact's own diff is byte-identical
+  (its sha256 moved only because the export's commit id and offsets did).  **Corrects a records gap:**
+  the r324 entry below still names the r324 sha256, but r325 (block 09) and r326 (block 10) both re-cut
+  this artifact -- the value quoted here is the current one.  `validate-set.sh` check 8 verifies all
+  three trees on every run.
 * **r324 re-cut verification**: applies strictly at the r324 default tree `d3babb65a68b83a2669933c902d5d981933d807e`
   (sha256 `980b15e310adfbf46107eb7e57a3288e72ab7d2f89db3ebe603d6ff2e81d2e27`), producing tree `eef3589ce93c3c63f8c8bd4d59147d581d5444dc`; with the other optional artifact on top, the cumulative tree is
   `ab8eb507387c468712fb2142d7e2481a529a1516`.  r324 amends **block 10** (the MoE weighted reduction: no fma contraction, one knob, and the

@@ -2573,6 +2573,26 @@ next item) and the census to expect is `direct` ~= 0 with `properties_changed` i
 
 ## Block 10 — the slab, the fusion dispatcher, the async input ring (infrastructure)
 
+> **r327 amendment (contributor PR #337, `TODO` #348 retired): one packed FA KV-group bitmap per graph
+> evaluation, opt-in.**  `GGML_CUDA_FA_KQ_BLOCKS_REUSE=1` makes the FIRST attention layer of a graph evaluation
+> build the packed bitmap (`flash_attn_mask_to_KV_blocks`) into a 64 KiB buffer the CUDA context owns, and the
+> other layers of that evaluation read it instead of repeating the memset + prepass: on a dense 27B with 16
+> attention layers, 16 memset + prepass pairs per step become one.  The producer is block 05's, and the code lands
+> here because this block owns what the change *is*: a per-graph-evaluation cache (the `q8_1_cache_clear()` /
+> `bf16_src1_cache_clear()` / `mwr_done_graph` family) plus the `ggml_backend_cuda_graph_compute()` hook and
+> `ggml_backend_cuda_context`'s per-context small buffers.  The key is the producer's **argument list**
+> (`n_kv`, `n_tps`, `s31`, `s33`, `n_tiles`, `n_streams`, `n_mask_streams`) plus its template parameter `ncols1`,
+> besides the mask tensor and its `data` pointer -- so a band tile/KV-split change that reaches the producer through
+> those arguments moves the key with it, and a change to what it *computes* from them must extend the key
+> (`INVARIANTS.md` r327).  **Bit-identical** (the reused bitmap is the same words, so the attention arithmetic
+> cannot see it) and **off by default**: the measured shape reads 31.89 t/s with it against 31.85 without (release
+> build 31.87), so the 15 launches/step it removes are free on this box and its case is Windows/WDDM launch cost,
+> which the delivery does not validate.  A site the shared buffer cannot serve -- another stream of the same
+> evaluation, a bitmap over 16384 words, an allocation that would happen inside a capture, or a 64 KiB allocation
+> that fails -- declines and builds into the pool exactly as before; all four are censused
+> (`GGML_CUDA_FA_KQ_BLOCKS_CENSUS=1`, `calls`/`declined` counts that are non-vacuous with the switch OFF too).
+> Gate: `MANIFESTS.md` gate 10's r327 row.  Record: `WORKLOG.md` 261120.004, `ENVIRONMENT.md` §7.4.
+
 > **r321 amendment (GitHub issue #332): the fused MoE serve query's placement contract.**  `moe_cache_fusion_serve()`
 > is written by block 09, but the fused sites it governs and the `moe_cache_repair_copy()` it now owns are block
 > 10's -- and that is not a style choice: the first cut of this fix amended block 09 and the per-block ladder

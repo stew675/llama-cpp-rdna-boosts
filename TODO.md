@@ -46,7 +46,6 @@ left in this file.  The r236 re-base
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure dies in `ui-assets.cmake:137` -- and `ui-assets.cmake`'s asset cache lives in the BUILD dir, so every fresh build dir (the per-block gate wipes it per commit) refetched from HF **inside its compile time** and failed the rung on a timeout | environment / waiting on upstream (the *tooling* half is FIXED, r326) | **WAITING (upstream content only)** — the delivery no longer depends on the fetch: `scripts/ui-dist-cache.sh` seeds one shared bundle (`~/.cache/rdna-boosts/ui-dist`, validated for `workbox*.js`) and mirrors it into a checkout's `tools/ui/dist` (untracked, gitignored, survives the gate's checkouts), `gate-per-block-build.sh` + `scripts/scratch-tree.sh` call it before their first configure, and both now configure with `LLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF`, so a rung with no cache builds without the embedded UI instead of fetching.  `HF_UI_VERSION=b12387` is still the pin for a *manual* configure that wants a real UI; re-check the upstream `latest` before dropping it — §342 |
-| **348** | PR #334 item 3 (one FA KV-group bitmap per graph evaluation, `GGML_CUDA_FA_KQ_BLOCKS_REUSE`): correct as designed (`built=1 reused=15`) but worth nothing measurable on this box, unreachable in every single-sequence arm, and it leaks a per-context `cudaMalloc` behind a raw context pointer | contribution / waiting on the submitter (`PR #334` declined for now) | **WAITING** -- separate PR requested with a census, a context teardown and a Windows/launch-bound measurement; §348 |
 | **349** | `scripts/gate-server-arms.sh`'s `35b10` arm is not bit-reproducible on its **second slot** even with both of r324's fixes (a `MOE_EXPERT_HEATMAP=load` pin and a fixed-order admission): slot 0 is stable, slot 1 reads three different texts at three acceptances, because a 0.5 s stagger lands at a *variable* point in slot 0's prefill | tooling / gate (`TODO` #295's gate, gate 24 step 5c) | **OPEN** -- admit slot 1 on slot 0's first STREAMED TOKEN instead of on a clock; until then that arm's text is reported, not asserted (its acceptance checks stay hard, which is the collapse detector the arm exists for); §349 |
 
 ## Handle numbering
@@ -199,29 +198,6 @@ Do not add a `HF_UI_VERSION` pin to `build-containers.sh` for this.
 
 Where it does bite, `HF_UI_VERSION=b12387` (the bundle this box had stamped) carries `workbox-b3c04f83.js` and
 validates; the per-block gate's header records it.  Drop the pin when `latest` validates again.
-
-## 348. PR #334 item 3 — one FA KV-group bitmap per graph evaluation (separate PR requested)
-
-**Waiting on the submitter** (r323).  The mechanism is sound and was verified here with a temporary census: in
-its best-case shape (2-slot `--kv-unified` server, 27B, q8_0 KV, `-c 65536`, a parked 10.5 k-token slot) the
-packed bitmap is built **once** per evaluation and reused 15 times, i.e. every replayed decode step carries one
-memset + prepass instead of sixteen.  It is worth **nothing measurable on gfx1201**: 31.90/31.88/31.85 t/s with
-the reuse against 31.83/31.86/31.86 without (~31 ms/step).  It is also unreachable in every single-sequence arm
-(a single-sequence batch takes the *derived* bitmap; the packed form needs a multi-sequence ubatch or the RDNA4
-band at depth, which itself has a work floor `K->ne[1]*saving >= 20000`).
-
-**Two defects**: `fattn_eval`/`fattn_kq_blocks` are process-global maps keyed by
-`const ggml_backend_cuda_context *`, with nothing erased at `ggml_backend_cuda_free` and a 64 KiB `cudaMalloc`
-never freed — the address is routinely reused (`llama-bench` over several models, `test-backend-ops` across
-devices), and if the new context is on a **different device** the stale pointer is handed to that device's
-kernel.  Key the entry on `ctx.device` as well, and erase + free in the context destructor.
-
-**What it needs**: a `-lv 4` census (`built= reused= fallback=`, otherwise no arm can be told from the pre-change
-behaviour), the teardown above, a comment saying the reuse key must be re-audited whenever the band's split
-changes (r319/#330 and r322/#333 both moved it), and a **measured** win.  The argument is 15 removed *launches*
-per step, so Windows/WDDM — where this repo's own #58 measurement showed verify graphs worth +16-19 % — is the
-platform to make it on; a feature that only pays on a platform this repo does not validate belongs in
-`optional/<name>/` (or `beta/` for a tester) until one of its own configurations shows a win.
 
 ## 349. `gate-server-arms.sh`'s `35b10` arm: slot 1 is not bit-reproducible
 

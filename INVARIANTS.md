@@ -1397,3 +1397,44 @@ Record: `WORKLOG.md` 261120.002, `benchmarks/` — measured in the retired campa
 
 Record: `WORKLOG.md` 261120.003, `benchmarks/2026-11-20-graph-replay-16-tokens.md`,
 `patches/README.md` block 10, `ENVIRONMENT.md` §7.4, `MANIFESTS.md` gate 38.
+
+## r327 (2026-11-20, `WORKLOG.md` 261120.004) — one FA KV-group bitmap per graph evaluation: exact, worth nothing on this box, and OPT-IN (block 10, contributor PR #337)
+
+1. **The packed bitmap is a function of the mask's CONTENTS and the producer's arguments, so one graph evaluation
+   needs one build, not one per attention layer.**  With a unified KV cache every layer of a decode step classifies
+   the same cells: on a dense 27B with 16 attention layers, 16 `cudaMemsetAsync` + 16 `flash_attn_mask_to_KV_blocks`
+   launches per step become one, and the census reads `built=1 reused=15` in the shape that reaches it.  It is
+   **bit-identical** by construction — the reused words are the same words, so the kernel sees nothing new — and
+   measured so: the same greedy text as the previous build in both arms, `test-backend-ops -o FLASH_ATTN_EXT`
+   7381/7381 with the switch ON.
+2. **It is worth NOTHING on gfx1201, and that is the reason it ships off.**  2-slot `--kv-unified` server, 27B
+   UD-Q4_K_XL, q8_0 K/V, a 25.7 k-token parked slot, 3 greedy decodes: **31.89 t/s on, 31.85 off, 31.87 on the
+   release build** — the 15 launches it removes per step are free on Linux.  Its whole case is launch COST
+   (Windows/WDDM, where this repo's own measurements put launch-bound moves at +16-19 %), i.e. a platform the
+   delivery does not validate.  So: a first-class, always-present switch whose default is OFF, not a "beneficial
+   feature turned off" — the promotion test is a measured win on a supported configuration, nothing else.
+   A default-on candidate for this shape is the r20-era `MMVQ_MAX_BATCH_SIZE` class of mistake in reverse: an
+   argument about launch count is not a measurement.
+3. **Reach is narrower than "every attention layer".**  A single-sequence batch takes the *DERIVED* bitmap
+   (`kq_block_skip_derived`, host-classified) and never reaches the packed form; the packed form needs a
+   multi-sequence ubatch or the RDNA4 band at depth (its own work floor `K->ne[1]*saving >= 20000`).  So
+   `test-backend-ops` (one attention node per graph) and `llama-bench` (`-p`/`-n`, one sequence) read `built=0`,
+   and an arm built on them is vacuous about this feature by construction.  The reachable shapes are a server
+   with a resident second slot, and a co-batched prefill (`built=10 reused=150` measured).
+4. **A per-graph-evaluation cache keyed on the producer's ARGUMENTS is safe only while those arguments ARE the
+   inputs.**  The key is `n_kv`, `n_tps`, `s31`, `s33`, `n_tiles`, `n_streams`, `n_mask_streams` and the template
+   parameter `ncols1`, plus the mask tensor + its `data` pointer (`n_groups` follows from `n_kv` and
+   `FATTN_KQ_STRIDE`).  A band tile/KV-split change that reaches the producer through those moves the key with it
+   (r319/#330 and r322/#333 did, and needed no change here); a change to what the producer *computes from* them must
+   extend the key.  This is the maintenance contract, and it is written at the declaration and in `patches/README.md`
+   block 10 — a silent extension of what the producer reads is exactly how a shared cache goes wrong.
+5. **A decline must be counted, and the OFF arm must not read all zeros.**  One shared 64 KiB buffer per context
+   means four legitimate declines (another stream of the same evaluation, a bitmap over 16384 words, an allocation
+   that would land inside a capture, a failed allocation) and a fifth (no evaluation started).  Each has its own
+   census counter, and `calls` is incremented **before** the switch is read, so `reuse=off calls=16` proves the arm
+   reached the code — the contributor's first form reported `built=0 reused=0 fallback=0` when off, i.e. an arm
+   indistinguishable from one that never ran.  A failed 64 KiB allocation DECLINES rather than aborting: a cache may
+   not turn a fit run into a crash.  A replayed graph repeats its captured decisions and is not counted, so a
+   captured 16-layer step reports `built=1 reused=15`, not one per step.
+
+Record: `WORKLOG.md` 261120.004, `patches/README.md` block 10, `ENVIRONMENT.md` §7.4, `MANIFESTS.md` gate 10.
