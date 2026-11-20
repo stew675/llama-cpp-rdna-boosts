@@ -297,3 +297,39 @@ answer is the same on both bases — `LLAMA_USE_PREBUILT_UI` exists at `4f9dfa0e
   Priority 1 without touching the bucket or the validator.  Its paths still target the pre-r328 `tools/ui/`
   layout: moving them to `ui/apps/chat` (+ `ui/lib/ui`, `ui/lib/voice`) is **`TODO` #352**, done at R18
   because a Dockerfile edit is only correct once the tree has the new layout.
+
+---
+
+## D15 — where the VMM-pool top-k workaround lives  ·  **DECIDED 2026-11-20: block 00, as a rung repair**
+
+`upstream's top_k_argsort_cuda` does a strided `cudaMemcpy2DAsync` out of its sorted-index temporary, and
+this stack refuses a padded D2D 2-D copy (`spitch != dpitch`) whose destination is VMM-backed.  The delivery
+requires the VMM pool (host-expert arena, slab, GTT store), so the refusal is reachable on the shipped
+configuration and is **not** caused by any delivery source change: a build of the pristine base carrying
+**only** the `#30542` revert aborts identically (`RUNGS.md` R00.6 has the four-arm table).
+
+**The question** (raised by the maintainer): block 00 is where the symptom starts, block 10 is where the
+delivery already fixed it — which block owns the fix?
+
+**Decision: block 00**, i.e. the first block that needs it, because block 00's own revert is what enables the
+pool.  Implemented as the rung repair `3ea8b0212`, which adopts block 10's `top_k_gather_rows` /
+`top_k_gather_cuda` verbatim.  Consequences, all recorded in `RUNGS.md` R00.6:
+
+- block 10 **drops its copy of the hunk** when R10 is climbed (keep-local on that file), so the final tree
+  carries the copy once;
+- the repair is **squashed into block 00 at R18**;
+- the `mm_ids_helper_512_10` A/B is unblocked and reads **+0.7 %** prefill at 5298 tokens, **not** the
+  recorded +4.5 %/+5.2 % — text identical, so the re-port is correct, and the claim of record is re-measured
+  at R18 before anyone quotes it.
+
+**Alternatives rejected.** Leaving it red to R10 (loses the field-model oracle for R02-R09, and with it the
+only measurement that reaches `mm_ids_helper_512_10`); a `#define`'d minimal fix in block 00 that block 10
+then deletes (a switch that exists only to be removed, plus a delete-hunk, and the 1-D loop is more code than
+the kernel); and moving the **revert** to block 09 so R00-R08 never enable the pool (that would verify eight
+rungs on an allocator the release does not use — the r278 "not a rung" trap — and this very bug is proof that
+the allocator changes op behaviour, which is exactly the class a rung exists to catch).
+
+**Why the delivery owns this rather than upstream:** upstream's HIP default is `GGML_HIP_NO_VMM=ON`, so no
+upstream HIP user has the VMM pool and none of them can hit it.  The refusal itself may be worth an upstream
+or ROCm report as a runtime question, but the delivery's answer is the device-side gather, which it already
+had.

@@ -32,7 +32,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 
 | rung | blk | source commit | conflicts | decisions | status |
 |---|---|---|---|---|---|
-| R00 | 00 | `de99fa2d0` | 4 (7 regions) | D1 (take upstream's), D2 (carry), **fix placement (A/B/C) — asked** | **DONE 2026-11-20** — `4cba0ad32`, tree `a3824ea0e`; coherence `1c5d32ac537d`; MUL_MAT_ID 1078/0 (16 dup); one known-red: the VMM pool refuses upstream's strided 2-D indexer top-k copy (base+revert-only reproduces it, so **not** block 00) |
+| R00 | 00 | `de99fa2d0` | 4 (7 regions) | D1 (take upstream's), D2 (carry), D15 (top-k fix in 00) | **DONE 2026-11-20** — `4cba0ad32` (tree `a3824ea0e`) + repair `3ea8b0212` (tree `e12a34bad`); coherence `1c5d32ac537d`; MUL_MAT_ID 1078/0 (16 dup); Flash-Next prefill 1692 t/s after the repair; MMID_512 A/B +0.7 % (text identical) |
 | R01 | 01 | `a94e2214c` | 0 | — | **DONE 2026-11-20** — `14a0414bb`, tree `6566ca3ac`; one rung repair (HIP's 64-bit warp mask); 3-device tensor text `1c5d32ac537d` == R00; pipeline census 3 GPUs |
 | R02 | 02 | `cef19b032` | 5 | D5 | not started |
 | R03 | 03 | `36da15029` | 1 | — | not started |
@@ -41,7 +41,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | R07 | 07 | `f5bdbefda` | 1 | D11 | not started |
 | R08 | 08 | `fe283f27c` | 9 | **D4**, D3, D11 | not started |
 | R09 | 09 | `123d53419` | 4 | D8, D9 | not started |
-| R10 | 10 | `7bbf540d5` | 9 | D8, D12 | not started |
+| R10 | 10 | `7bbf540d5` | 9 | D8, D12 + **drop block 10's `top_k` hunk (R00.6 obligation 1)** | not started |
 | R11 | 11 | `61168c60b` | 5 | D9, D13 | not started |
 | R12 | 12 | `dad1442b3` | 9 | D5, D6, D7 | not started |
 | R13 | 13 | `1014e6bf5` | 0 | — | not started |
@@ -107,10 +107,10 @@ R00 build runs the 4B arm at 242/90.7 t/s with VMM **OFF**.  `ggml_cuda_pool_vmm
 revert, and *not* the delivery's later pool work (`g_pool_mapped`, `ggml_cuda_pool_trace*`), which belongs to
 blocks 09/15 and is therefore absent at this rung as expected.
 
-## R00.6 Known-red: upstream's qwen4exp indexer top-k, under the delivery's REQUIRED VMM pool
+## R00.6 RESOLVED at R00: the VMM pool refuses upstream's strided 2-D top-k copy
 
-**Symptom.** `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S` (2 devices, `-sm tensor`, no `-ncmoe`, `-c 8192 -ub 1024`)
-aborts once prefill starts:
+**Symptom (before the repair).** `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S` (2 devices, `-sm tensor`, `-c 8192
+-ub 1024`) aborted once prefill started:
 
 ```
 ROCm error: invalid argument
@@ -118,46 +118,51 @@ ROCm error: invalid argument
   hipMemcpy2DAsync(dst, k * sizeof(int), tmp, ncols * sizeof(int), k * sizeof(int), iter_nrows, ...)
 ```
 
-**It is NOT block 00, and block 00 touches nothing here** (`git show 4cba0ad32 --stat` matches no
-qwen4exp / indexer / top-k / kpool file).  The decisive measurement is a build of the **pristine base with
-nothing but the `#30542` revert** — no delivery code at all — which aborts identically:
+**Attribution: it is the delivery's required allocator, not any delivery source change.**  A build of the
+**pristine base with nothing but the `#30542` revert** — zero delivery code — aborts identically:
 
 | build | delivery code | VMM pool | result |
 |---|---|---|---|
-| `build-base-novmm` (pristine base, `GGML_HIP_NO_VMM=ON`) | none | **no** | prefill **1594.3 t/s** |
-| `build-revert-only` (pristine base + **only** the `#30542` revert) | **none** | yes | **ABORT** `top_k_argsort_cuda` |
+| `build-base-novmm` (pristine base, `GGML_HIP_NO_VMM=ON`) | none | no | prefill **1594.3 t/s** |
+| `build-revert-only` (pristine base + **only** the `#30542` revert) | **none** | yes | **ABORT** |
 | `build-r00-novmm` (R00, `GGML_HIP_NO_VMM=ON`) | block 00 | no | prefill **1683.2 t/s** |
-| R00 (`build-rocm`) | block 00 | yes | **ABORT** |
-| r327 (`bin-r327`, all 18 blocks) | all | yes | prefill **2101.1 t/s** — because block 10 replaced the copy |
+| R00 before the repair (`build-rocm`) | block 00 | yes | **ABORT** |
+| r327 (`bin-r327`) | all 18 | yes | prefill 2101.1 t/s — block 10 already fixed the copy |
 
-**So the trigger is the VMM pool, not the revert and not any delivery source change.**  The pool is the
-delivery's required configuration (the host-expert arena needs VMM; `#30542` only makes the pool *usable* on
-this box — without the revert the base hangs, which is why the no-revert arm cannot be measured).  The
-refused call is a **strided 2-D D2D copy with `spitch != dpitch`** into a VMM-backed destination; the
-equal-pitch call (`ncols == k = 320`) immediately before it succeeds, and the instrumented run shows
-`err_after_sort=no error`, i.e. the argsort kernel is fine and the copy alone is refused.  A standalone HIP
-repro of the pool's exact layout is **inconclusive** — the same geometry on a freshly built VMM pool
-succeeds, so the refusal needs something the live pool has and the synthetic one does not (mapping reuse /
-`hipMemSetAccess` history).  It is recorded as a ROCm-runtime question, not a delivery defect.
+The refused call is a **strided D2D 2-D copy with `spitch != dpitch` into a VMM-backed destination**; the
+equal-pitch call (`ncols == k`) just before it succeeds, and the instrumented run shows
+`err_after_sort=no error`, so the argsort was fine and only the copy was refused.  A standalone HIP repro of
+the pool's exact layout does **not** reproduce it, so the remaining detail is a ROCm-mapping question
+(mapping reuse / `hipMemSetAccess` history) — recorded as such, not as a delivery defect.  The same refusal
+class is already on the record twice: `ggml_cuda_cpy_as_memcpy_2d`'s guard, and the windowed KV's 2-D state
+copy (issue #313, block 14).
 
-**The delivery already fixed it, in block 10** (`7bbf540d5`): `top_k_gather_rows` replaces the 2-D copy, and
-its comment names the same site and the same refusal.  `ggml_cuda_cpy_as_memcpy_2d` in the CPY path is the
-same class and gets its own guard from the same area — so from R00 to R09 *any* mismatched-pitch 2-D copy into
-a pool-backed destination can be refused, and the indexer top-k is only the instance that fires on this model.
+**Decision (maintainer, 2026-11-20): put the fix in the first block that needs it — block 00 — not in block
+10.**  Block 00's own revert is what enables the pool, so block 00 is the block that needs the workaround.
+Rejected alternatives: leaving it red to R10 (loses the field-model oracle for R02-R09 and the `MMID_512`
+A/B); a `#define`'d minimal fix in 00 that block 10 deletes (a switch that exists only to be removed, and
+more code than the kernel it replaces); and moving the **revert** to block 09 to dodge it (that would build
+R00-R08 on a different allocator than the release — the r278 trap — and we now know the allocator changes op
+behaviour, which is exactly what a rung must not hide).
 
-### Where the fix should live — for the maintainer (block-structure decision)
+**The repair (`3ea8b0212`)** adopts block 10's `top_k_gather_rows` / `top_k_gather_cuda` **verbatim** and
+calls it from `top_k_argsort_cuda`.  Verification:
 
-`AGENTS.md` makes a cross-block move the maintainer's call.  The three shapes:
+| arm | result |
+|---|---|
+| the red arm: Flash-Next IQ3_S, 2 devices, `-sm tensor`, 5298-token prompt | **prefill 1692.5 t/s**, no abort |
+| 4B coherence (the sampler's top-k runs through the same gather) | `100 chars sha=1c5d32ac537d` — **unchanged** |
+| `mm_ids_helper_512_10` A/B, now reachable | **ON 1642.7 / 1638.7 vs OFF 1635.4 / 1624.2 t/s (+0.7 %)**, text identical `52 chars sha=b3de97c70c88` |
 
-| option | block 00 | block 10 | cost |
-|---|---|---|---|
-| **A — move the fix down** (recommended) | carries `top_k_gather_rows` + `top_k_gather_cuda`, used by `top_k_argsort_cuda` | keeps only its own slab/CPY guard; the gather is already in the tree | none: the code is written and measured, and it makes every rung from R00 verifiable on the field model |
-| **B — minimal fix in 00, deactivated in 10** | a `#define`-gated narrow fix (e.g. `nrows` 1-D copies when `spitch != dpitch`) | deletes that branch when it installs the gather kernel | a temporary switch to document in `ENVIRONMENT.md` and then remove, plus a delete-hunk in block 10 |
-| **C — leave known-red** | nothing | the fix | R00-R09 cannot run the field model; the `mm_ids_helper_512_10` A/B waits until R10 |
-
-**A and B have the same end state**; A gets there without a switch that exists only to be removed, and the
-kernel is *smaller* than the 1-D loop B implies.  Whichever is chosen, the **known-red must NOT be closed by
-patching top-k.cu twice**, and the `mm_ids_helper_512_10` A/B stays deferred until a Flash-Next prefill runs.
+**Obligations this creates.**
+1. **R10:** when block 10 is cherry-picked, **drop its `top_k_gather_rows` hunk** — the tree already has it
+   (keep-local on that file's conflict).  Block 10 keeps its `ggml_cuda_cpy_as_memcpy_2d` guard, which is a
+   different site.
+2. **R18:** squash `3ea8b0212` into block 00 (the r278 rung-repair pattern).
+3. **R18, measurement:** the `MMID_512` claim of record is **+4.5 % pp16384 / +5.2 % pp2048**; at this base
+   it reads **+0.7 %** on a 5298-token prompt at 2 devices (2 reps per arm, text identical).  Re-measure with
+   the delivery's own pp16384 arm before any number is quoted; if it does not reproduce, the block-00
+   per-block note and `ENVIRONMENT.md`/`patches/README.md` must say so rather than repeat the old figures.
 
 ## R00.7 The rung's own trap: `GGML_CUDA_FA_QUANTS`
 
@@ -242,6 +247,8 @@ the rung's commit id.
 3. The block-owned gates for every block whose code the re-base touched (see the *Pick the gate for what you
    changed* table in `AGENTS.md`).
 4. `scripts/gate-prefill-logits.sh --record` on the new build, then the gate itself.
+4b. **Squash the R00 repair** (`3ea8b0212`) into block 00 — it is a rung repair, not a block of its own
+   (`RUNGS.md` R00.6, obligation 2).
 5. `scripts/make-patches.sh` from a **canonical fork rebuilt at the new base** via `scripts/apply-all.sh`,
    then `scripts/make-release.sh`, then `scripts/validate-set.sh`.
 6. `scripts/fork-refresh.sh --build --gates --push` (personal fork only), tag, then the worker container
