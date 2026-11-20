@@ -1,0 +1,152 @@
+From 77d962116f85a7bfbef5ac059a928dfe5c2ef5e1 Mon Sep 17 00:00:00 2001
+From: John Stamagal <jstamagal@gmail.com>
+Date: Fri, 20 Nov 2026 09:04:18 -0500
+Subject: [PATCH] rdna-boosts: block 0104: RDNA2 mul_mat_vec_q_moe walks the
+ K-blocks with the rows side by side (optional)
+
+RDNA2 (gfx1030) only: the new loop is compiled for the RDNA2 device pass
+and armed by the launch from the device's compute capability.
+
+The MoE mmvq kernel takes one (row, K-block) item at a time: a divide and a
+modulo per item, and one dot product in flight per thread.  Every routed
+MUL_MAT_ID width up to the band limit goes through it, n == 1 included, so
+on gfx1030 the small widths were slower than ggml-org (quantized n == 4:
+0.83x).
+
+On RDNA2 the kernel now walks the K-blocks once and keeps the rows of the
+block side by side.  A thread group g takes the items it == g (mod n_groups),
+so in row i it takes the K-blocks kbx == g - i*blocks_per_row (mod n_groups)
+in rising order; the new loop visits exactly those K-blocks in that order
+for each row, so every partial sum is built the same way and the output is
+bit-identical.  When blocks_per_row is a multiple of n_groups all rows share
+the K-block and its y load; otherwise each row starts at its own offset.
+IQ2_XS keeps the item loop in the second case (its two-items-in-flight
+unroll is faster there).
+
+The switch is one bool in ggml_cuda_mm_fusion_args_device, false unless the
+launch sets it.  GGML_CUDA_MOE_ROWS_ABREAST=0 restores the item loop.
+
+Radeon Pro V620, ROCm 7.14, idle card:
+- byte compare of MUL_MAT_ID output against the unmodified build, switch on
+  and off: 20 quantized types x 12 shapes (blocks per row both divisible and
+  not divisible by the group count), 175 comparable cases, 0 differences
+- test-backend-ops test -o MUL_MAT_ID: 1056/1056
+- test-backend-ops perf -o MUL_MAT_ID, geomean over the quantized cases, two
+  runs within 0.2 % of each other: n=1 1.32x, n=4 1.30x, n=5 1.26x,
+  n=6 1.29x, n=7 1.30x, n=8 1.31x; n >= 32 unchanged (1.00x)
+- against ggml-org on the same card: quantized n=4 0.83x -> 1.07x,
+  n=1 0.98x -> 1.26x, n=8 1.29x -> 1.68x
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PDDPmxJfGe1s7ZcKKfy9pX
+---
+ ggml/src/ggml-cuda/common.cuh  |  3 ++
+ ggml/src/ggml-cuda/mmvq-moe.cu | 60 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 2e14c57f9..c8c3bd542 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -2905,6 +2905,9 @@ struct ggml_cuda_mm_fusion_args_device {
+     int * red_cnt = nullptr;
+     // GGML_CUDA_MWR_EXACT=0: the fold's pre-r324 fma-contracted sum (the standalone kernels contract too, one knob)
+     bool red_contract = false;
++    // RDNA2, mul_mat_vec_q_moe: walk the K-blocks once with the rows of a block side by side instead of one
++    // (row, K-block) item at a time (set by the launch; GGML_CUDA_MOE_ROWS_ABREAST=0: off)
++    bool moe_rows_abreast = false;
+     // GDN alpha/beta pair in one mmvf launch (ggml_cuda_gate_beta_bf16_try_fuse): rows >= gb_nrows read gb_x2 and
+     // write gb_dst2; rows below write softplus(v + gb_dt[row]) * gb_a[row].
+     const void * gb_x2 = nullptr;
+diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
+index 1b954bfa6..77eb2f3db 100644
+--- a/ggml/src/ggml-cuda/mmvq-moe.cu
++++ b/ggml/src/ggml-cuda/mmvq-moe.cu
+@@ -137,6 +137,58 @@ static __global__ void mul_mat_vec_q_moe(
+     const int n_items    = rows_valid * blocks_per_row_x;
+     const int n_groups = warp_size / (qi/vdr);
+     const int kqs      = vdr * (threadIdx.x % (qi/vdr));
++#if defined(RDNA2)
++    // RDNA2: the item loop below costs a divide per (row, K-block) item and keeps one dot product in flight.
++    // Walk the K-blocks with the rows of the block side by side instead.  A thread group g takes the items
++    // it == g (mod n_groups), so in row i it takes the K-blocks kbx == g - i*blocks_per_row_x (mod n_groups), in
++    // rising order: each row's partial sum is built from the same K-blocks in the same order as the item loop
++    // builds it, so the result is bit-identical.  GGML_CUDA_MOE_ROWS_ABREAST=0: off.
++    const bool rows_abreast = fusion.moe_rows_abreast;
++#else
++    constexpr bool rows_abreast = false;
++#endif
++    static_assert((n_groups & (n_groups - 1)) == 0, "the thread group count must be a power of two");
++    if (rows_abreast && blocks_per_row_x % n_groups == 0) {
++        // every row keeps the same K-blocks: one y block serves all rows
++        for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += n_groups) {
++            const int kby = kbx * (qk/QK8_1);
++#pragma unroll
++            for (int i = 0; i < c_rows_per_block; ++i) {
++                if (i < rows_valid) {
++                    tmp[i] += vec_dot_q_cuda(vx_use, &y[kby], kbx_offset + i*stride_row_x_use + kbx, kqs);
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            tmp_gate[i] += vec_dot_q_cuda(vgate_use, &y[kby], kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
++                        }
++                    }
++                }
++            }
++        }
++    } else if (rows_abreast && type != GGML_TYPE_IQ2_XS) {
++        // the group's first K-block shifts from row to row; a row past the last valid one gets none
++        // (IQ2_XS stays on the item loop here: its two items in flight are faster, k=2560 n=1 15.6 vs 16.5 us)
++        const int g = threadIdx.x / (qi/vdr);
++        int kb0[c_rows_per_block];
++#pragma unroll
++        for (int i = 0; i < c_rows_per_block; ++i) {
++            kb0[i] = i < rows_valid ? ((g - i*blocks_per_row_x) & (n_groups - 1)) : blocks_per_row_x;
++        }
++        for (int k0 = 0; k0 < blocks_per_row_x; k0 += n_groups) {
++#pragma unroll
++            for (int i = 0; i < c_rows_per_block; ++i) {
++                const int kbx = kb0[i] + k0;
++                if (kbx < blocks_per_row_x) {
++                    const int kby = kbx * (qk/QK8_1);
++                    tmp[i] += vec_dot_q_cuda(vx_use, &y[kby], kbx_offset + i*stride_row_x_use + kbx, kqs);
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            tmp_gate[i] += vec_dot_q_cuda(vgate_use, &y[kby], kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
++                        }
++                    }
++                }
++            }
++        }
++    } else {
+     // IQ2_XS is ALU/latency bound here: two items in flight per thread (-9 %); the other types lose from it
+ #pragma unroll type == GGML_TYPE_IQ2_XS ? 2 : 1
+     for (int it = threadIdx.x / (qi/vdr); it < n_items; it += n_groups) {
+@@ -150,6 +202,7 @@ static __global__ void mul_mat_vec_q_moe(
+             }
+         }
+     }
++    }
+ 
+     ggml_cuda_pdl_lc();
+ 
+@@ -411,11 +464,16 @@ void mul_mat_vec_q_moe_launch(
+                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
+                             fusion.red_dst != nullptr;
+ 
++    // RDNA2: rows side by side in the kernel's K loop (see mul_mat_vec_q_moe).  GGML_CUDA_MOE_ROWS_ABREAST=0: off.
++    static const bool rows_abreast_on = [] { const char * e = getenv("GGML_CUDA_MOE_ROWS_ABREAST"); return e == nullptr || atoi(e) != 0; }();
++    ggml_cuda_mm_fusion_args_device fusion_k = fusion;
++    fusion_k.moe_rows_abreast = rows_abreast_on && GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[dev].cc);
++
+     const auto launch = [&](auto rpb_c, auto fusion_c) {
+         constexpr int  RPB   = decltype(rpb_c)::value;
+         constexpr bool CFUSE = decltype(fusion_c)::value;
+         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, RPB, CFUSE>, launch_params,
+-            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
++            vx, vy, ids, fusion_k, dst, ncols_x, nchannels_y, nrows_x,
+             stride_row_x, stride_col_y, stride_col_dst,
+             stride_channel_x, stride_channel_y, stride_channel_dst,
+             ncols_dst, ids_stride, nchannels_dst,
+-- 
+2.56.1
+

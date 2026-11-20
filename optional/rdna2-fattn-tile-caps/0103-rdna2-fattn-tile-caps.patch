@@ -1,0 +1,87 @@
+From 9479957793013f221f9efc3ca9adfa128e0389a7 Mon Sep 17 00:00:00 2001
+From: John Stamagal <jstamagal@gmail.com>
+Date: Fri, 20 Nov 2026 03:22:44 -0500
+Subject: [PATCH] rdna-boosts: block 0103: lift stale RDNA2 FlashAttention tile
+ cols_per_block and ncols2 caps (optional)
+
+RDNA2 (gfx1030) only: the caps removed here were already RDNA2-conditional.
+
+launch_fattn computes RDNA2 occupancy itself, so the occupancy-0 abort
+workarounds in fattn-tile.cuh are no longer needed:
+- cols_per_block caps (D=512 <= 8, D=128 <= 8, D=576 <= 16, D=256 MHA <= 8)
+  are lifted, so prefill uses the full 32/64-column tiles.
+- the ncols2 <= 2 cap for D=128 is lifted (D=256 already was), so GQA-8
+  D=128 decode does not re-read the KV cache 4x.
+The flags stay as `false` constants so this artifact's hunks stay off the
+lines optional block 0101 changes.
+
+Radeon Pro V620, idle card, test-backend-ops perf, geomean vs the capped
+tiles / vs ggml-org c406f4367:
+  D=128 f16 prefill  1.88x / 1.06x     D=128 f16 decode  1.21x / 0.98x
+  D=128 q8_0 prefill 1.73x / 0.95x     D=512 f16 prefill 2.15x / 1.02x
+  D=576 f16 prefill  1.33x / 1.05x     D=576 q8_0 prefill 1.47x / 0.99x
+  D=256 f16 prefill  1.09x / 0.92x     D=256 q8_0 prefill 1.12x / 0.87x
+No FLASH_ATTN_EXT case slower than 0.95x.  test-backend-ops
+FLASH_ATTN_EXT 7405/7405.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PDDPmxJfGe1s7ZcKKfy9pX
+---
+ ggml/src/ggml-cuda/fattn-tile.cuh | 33 +++++++++++++------------------
+ 1 file changed, 14 insertions(+), 19 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index 3072e9b61..c94375084 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -1821,20 +1821,17 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+         return;
+     }
+ 
+-    // RDNA2 (gfx1030): even at occupancy 1 (see ggml_cuda_fattn_tile_get_config_amd_rdna2),
+-    // some wide-column kernels still fail the occupancy query and abort, so cap cols_per_block:
+-    //   D=512 (Gemma global attention): the ncols2<=2 kernels are not instantiated for
+-    //     DV=512, so cap cols_per_block<=8 to keep the accumulator set in registers.
+-    //   D=128: cols_per_block 16/32/64 need 33-43 KB LDS; cap to <=8 (with ncols2<=2 from
+-    //     switch_ncols2).
+-    //   D=576/DV=512 (DeepSeek MLA): cols_per_block=32 (kernel <512,8,4>) fails; cap to <=16.
+-    //   D=256 MHA/odd GQA (ncols2==1): <256,32,1> fails; cap to <=8. The GQA ncols2>=2 path
+-    //     keeps its working cols_per_block=32 (<256,16,2>) tile.
++    // RDNA2 (gfx1030): launch_fattn now computes RDNA2 occupancy itself, so the old
++    // cols_per_block caps (D=512<=8, D=128<=8, D=576<=16, D=256 MHA<=8) are lifted to let
++    // RDNA2 use the full upstream 32/64-column prefill tiles.
++    // The flags stay as `false` constants on purpose: this is an optional block, and editing the tests
++    // below (or the two rdna_cap_ncols2 tests further down) would put its hunks on lines optional block
++    // 0101 changes, so it could no longer apply strictly both alone and after 0101.
+     const bool rdna2       = GGML_CUDA_CC_IS_RDNA2(cc);
+-    const bool rdna512     = rdna2 && DKQ == 512;
+-    const bool rdna_d128   = rdna2 && DKQ == 128;
+-    const bool rdna576     = rdna2 && DKQ == 576;
+-    const bool rdna256_mha = rdna2 && DKQ == 256 && ncols2 == 1;
++    const bool rdna512     = false;
++    const bool rdna_d128   = false;
++    const bool rdna576     = false;
++    const bool rdna256_mha = false;
+ 
+ #ifdef GGML_USE_HIP
+     if constexpr (DKQ <= 128) {
+@@ -1948,12 +1945,10 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+     // ncols2 = 1 variants where the same op with a packed mask takes ncols2 > 1 (r268)
+     const bool use_gqa_opt = ggml_cuda_flash_attn_ext_has_mask(KQV) && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+ 
+-    // RDNA2 (gfx1030): cap ncols2<=2 for D=128. D=256 was capped on the belief that the wider
+-    // variants overflow the register file (occupancy 0 -> abort), but measured 4x8 D=256 launches
+-    // run fine -- the manual occupancy fallback keeps >=1 block resident even when the kernel
+-    // spills some scratch -- and they beat the 16x2 shape, so the cap is lifted for DKQ == 256.
+-    // Wave64 GCN fits the wider kernels, and RDNA3/4 keep upstream's selection.
+-    const bool rdna_cap_ncols2 = GGML_CUDA_CC_IS_RDNA2(device_cc) && DKQ == 128;
++    // RDNA2 (gfx1030): lift the stale ncols2<=2 cap for D=128 (already lifted for D=256);
++    // manual occupancy fallback handles wider GQA tiles without aborting, avoiding 4x KV re-reads
++    // on GQA-8 D=128 decode.
++    const bool rdna_cap_ncols2 = false;
+ 
+     if constexpr (DKQ == 320) {
+         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
+-- 
+2.56.1
+
