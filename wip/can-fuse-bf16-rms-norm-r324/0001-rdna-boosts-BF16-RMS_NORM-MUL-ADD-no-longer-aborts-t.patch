@@ -1,0 +1,81 @@
+From 5b4cb84f38fa5447fcd385ecae316310cad98c70 Mon Sep 17 00:00:00 2001
+From: John Stamagal <jstamagal@gmail.com>
+Date: Fri, 20 Nov 2026 02:34:07 -0500
+Subject: [PATCH] rdna-boosts: BF16 RMS_NORM + MUL (+ ADD) no longer aborts the
+ fusion check
+
+Block 10 carries ggml_cuda_can_fuse in ggml-cuda-try-fuse.cu with F32-only
+asserts on the norm, while the fork point (4f9dfa0e3, ggml-cuda.cu) accepts
+an F32 or BF16 norm there and norm.cu has the BF16 fused kernels.  A BF16
+RMS_NORM followed by MUL therefore aborts at
+GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32).
+
+Restore the fork point's type checks for RMS_NORM + MUL (+ ADD); RMS_NORM +
+SCALE declines a non-F32 norm instead of asserting.  An F32 graph takes the
+same decisions as before.
+
+r324, gfx1030, ROCm 7.14, default flags:
+  test-backend-ops test -o RMS_NORM_MUL_ADD   abort -> 113/113
+  test-backend-ops test -o RMS_NORM           121/121 -> 121/121
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PDDPmxJfGe1s7ZcKKfy9pX
+---
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 28 ++++++++++++++----------
+ 1 file changed, 16 insertions(+), 12 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 22df8b2df..83fafc051 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -1505,22 +1505,25 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+             add = cgraph->nodes[node_idx+2];
+         }
+ 
+-        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
+-        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
+-
+-        //rms norm only supports F32
+-        if (mul->src[0]->type != GGML_TYPE_F32 ||
+-            mul->src[1]->type != GGML_TYPE_F32 ||
+-            mul->type != GGML_TYPE_F32) {
++        // the mul operand is a norm weight, which model files store as F32;
++        // the add operand is an F32 bias or a residual with the type of x
++        const ggml_type type = rms_norm->type;
++        if ((type != GGML_TYPE_F32 && type != GGML_TYPE_BF16) || rms_norm->src[0]->type != type) {
+             return false;
+         }
+ 
+-        if (add && (add->src[0]->type != GGML_TYPE_F32 ||
+-            add->src[1]->type != GGML_TYPE_F32 ||
+-            add->type != GGML_TYPE_F32) ) {
++        const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
++        if (mul_src->type != GGML_TYPE_F32 || mul->type != type) {
+             return false;
+         }
+ 
++        if (add) {
++            const ggml_tensor * add_src = add->src[0] == mul ? add->src[1] : add->src[0];
++            if ((add_src->type != GGML_TYPE_F32 && add_src->type != type) || add->type != type) {
++                return false;
++            }
++        }
++
+         //if rms norm is the B operand, then we don't handle broadcast
+         if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
+             return false;
+@@ -1542,8 +1545,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+         const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+         const ggml_tensor * scale    = cgraph->nodes[node_idx+1];
+ 
+-        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
+-        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
++        if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32) {
++            return false;
++        }
+ 
+         float bias;
+         memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
+-- 
+2.56.1
+
