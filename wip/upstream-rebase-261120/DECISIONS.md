@@ -165,7 +165,7 @@ Measured at R08 before any deletion, with `GGML_CUDA_DISABLE_NORM_ROWS=0/1` and 
 
 ---
 
-## D5 — DFlash speculative-decoding refactor (`#32016`, `#31904`) vs blocks 02/12  ·  **OPEN**
+## D5 — DFlash speculative-decoding refactor (`#32016`, `#31904`) vs blocks 02/12  ·  **RESOLVED at R02: MERGE, no delivery code dropped**
 
 **Claim.** Upstream restructured the DFlash-based speculative decoding methods (`32bdc3a89`) and added
 DFLASH2 (`de32b268c`).  That is the surface blocks 02 (adaptive MTP draft depth) and 12 (DFlash) sit on, and
@@ -333,3 +333,14 @@ the allocator changes op behaviour, which is exactly the class a rung exists to 
 upstream HIP user has the VMM pool and none of them can hit it.  The refusal itself may be worth an upstream
 or ROCm report as a runtime question, but the delivery's answer is the device-side gather, which it already
 had.
+
+**Resolution (R02, 2026-11-20).**  `#32016` refactored by **adding sibling classes** (`DSpark`/`DFlash2`/
+`LiliCorr` derive from `impl_draft_dflash`) and left `common_speculative_impl_draft_mtp` as its own class —
+which is exactly where every block-02 hunk lands.  All five conflicts were unions (enum, name map,
+`type_to_str`, the `COUNT` static_assert 13 -> 14, `add_config_if_enabled`), plus a 420-line region where the
+two sides inserted at the same point and both belong.  The arm is not merely built but **measured**:
+`--spec-type none` 29.3 t/s vs `draft-mtp-adaptive` 65.2 t/s (+122 %) with **identical text**
+(`55824e640aa0`), acceptance 0.95238, per-position `(1.000, 1.000, 0.857)`.  The one thing to keep in step is
+`need_n_rs_seq()`, which upstream made an explicit list: a new upstream type that needs an rs_seq must be
+added there as well as to the enum.  Block 12's DFlash hunks re-open this at R12 and will be checked against
+the same finding.

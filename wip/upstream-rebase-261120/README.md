@@ -1,16 +1,17 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: OPEN — 2 of 18 rungs climbed (R00, R01) on 2026-11-20. Nothing is delivery yet.**
+**Status: OPEN — 3 of 18 rungs climbed (R00, R01, R02) on 2026-11-20. Nothing is delivery yet.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
-the final rung (R18).  Ladder branch `rebase-r328` = `3ea8b0212` (tree `e12a34bad`): R00, R01 and one R00
+the final rung (R18).  Ladder branch `rebase-r328` = `3941bad4e` (tree `0799ebfad`): R00, R01, R02 and one R00
 rung repair; every rung is green on build + coherence and each has one entry in [`RUNGS.md`](RUNGS.md).
 **The one known-red is closed at R00** (repair `3ea8b0212`): the delivery's required VMM pool refuses
 upstream's strided 2-D indexer top-k copy, and it reproduces on the pristine base with *only* the `#30542`
 revert, so the fix (block 10's `top_k_gather_rows`, moved down — [`DECISIONS.md`](DECISIONS.md) D15) lives in
 block 00.  Flash-Next now prefills at 1692 t/s, and `mm_ids_helper_512_10`'s A/B reads **+0.7 %** with
-identical text (the recorded +4.5 %/+5.2 % is re-measured at R18 before it is quoted again).  Next rung:
-**R02** (block 02, adaptive MTP), whose 5 conflicts are all the DFlash spec refactor (`DECISIONS.md` D5 —
-stop and present).  Target: the next release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
+identical text (the recorded +4.5 %/+5.2 % is re-measured at R18 before it is quoted again).  R02 is done: its 5
+conflicts were all the DFlash spec refactor and every one was a union, so `D5` resolved as MERGE with the
+adaptive arm at 29.3 -> 65.2 t/s on identical text.  Next rung: **R03** (block 03, chunked GDN prefill),
+one conflict (`tests/test-backend-ops.cpp`).  Target: the next release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 
 This is a **ladder climb, not a single rebase**: one rung per delivery block, each rung ending in a resolved

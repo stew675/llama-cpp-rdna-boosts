@@ -34,7 +34,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 |---|---|---|---|---|---|
 | R00 | 00 | `de99fa2d0` | 4 (7 regions) | D1 (take upstream's), D2 (carry), D15 (top-k fix in 00) | **DONE 2026-11-20** — `4cba0ad32` (tree `a3824ea0e`) + repair `3ea8b0212` (tree `e12a34bad`); coherence `1c5d32ac537d`; MUL_MAT_ID 1078/0 (16 dup); Flash-Next prefill 1692 t/s after the repair; MMID_512 A/B +0.7 % (text identical) |
 | R01 | 01 | `a94e2214c` | 0 | — | **DONE 2026-11-20** — `14a0414bb`, tree `6566ca3ac`; one rung repair (HIP's 64-bit warp mask); 3-device tensor text `1c5d32ac537d` == R00; pipeline census 3 GPUs |
-| R02 | 02 | `cef19b032` | 5 | D5 | not started |
+| R02 | 02 | `cef19b032` | 5 | D5 (**resolved: MERGE**, no code dropped) | **DONE 2026-11-20** — `3941bad4e`, tree `0799ebfad`; all 5 conflicts are unions; adaptive arm 29.3 -> 65.2 t/s with identical text; enum count 13 -> 14 |
 | R03 | 03 | `36da15029` | 1 | — | not started |
 | R04 | 04 | `cfe40b5f9` | 2 | **D3** | not started || R05 | 05 | `7362b5958` | 7 | — | not started |
 | R06 | 06 | `f0564df7d` | 2 | D11 | not started |
@@ -226,6 +226,68 @@ Block 01 adds `allreduce-hip.cu` (1795 lines) and a dispatch in `ggml-cuda.cu`. 
 inside it beyond the mask type, so later FA/MMQ rungs should not re-open it; if `GGML_CUDA_FA_QUANTS` or a
 fusion arm changes the *tensor sizes* the all-reduce sees, `gate-prefill-logits.sh` (R18) is the check, not a
 rung.
+
+---
+
+# R02 — block 02, adaptive MTP draft depth  ·  **DONE 2026-11-20** — `3941bad4e`, tree `0799ebfad`
+
+```
+git cherry-pick cef19b032        # 23 files -> 53 files changed, +5290/-420
+```
+
+**All 5 conflicts are the DFlash spec refactor (`#32016`, `32bdc3a89`) and every one is a union** — no
+delivery code was dropped, so `DECISIONS.md` **D5 resolves as MERGE, not as a decision**.
+
+| exit criterion | result |
+|---|---|
+| conflicts | 5 files, 9 regions (below) |
+| build | green, `~/bin/build-llama-rocm` (`all` targets), **0** errors |
+| coherence 4B, plain path | `100 chars sha=1c5d32ac537d` — unchanged |
+| **the adaptive arm** | `--spec-type draft-mtp-adaptive` on Qwen3.8-27B UD-Q4_K_XL: **29.3 -> 65.2 t/s** generation (**+122 %**) |
+| text identity | `none` and `draft-mtp-adaptive` both read **`138 chars sha=55824e640aa0`** — the adaptive controller changes speed, not output |
+| census (non-vacuity) | `adaptive draft depth enabled (draft-mtp-adaptive)`; `draft acceptance = 0.95238 (20/21), mean len = 3.86`; `#acc rate/pos = (1.000, 1.000, 0.857)` |
+
+## R02.1 The five resolutions (all unions)
+
+| region | HEAD (upstream `#32016`) | ours (block 02) | resolution |
+|---|---|---|---|
+| `common/common.h` enum | added `DRAFT_DFLASH2`, `DRAFT_LILICORR` after DSPARK | added `DRAFT_MTP_ADAPTIVE` after `DRAFT_MTP` | **both**, upstream's order, ours inserted after `MTP` |
+| `common/common.h` `need_n_rs_seq()` | explicit list: MTP, EAGLE3, DFLASH, DSPARK, **DFLASH2, LILICORR** | `has_mtp()` + EAGLE3/DFLASH/DSPARK | **both**: `has_mtp() || (EAGLE3, DFLASH, DSPARK, DFLASH2, LILICORR)`.  `has_mtp()` already covers `MTP_ADAPTIVE` (common.h:424) |
+| `common/speculative.cpp` name map | upstream's map incl. `draft-dflash2`, `draft-lilicorr` | ours incl. `draft-mtp-adaptive` | **both unioned** |
+| `common/speculative.cpp` **420-line region** | `#32016` inserted the DSpark / DFlash2 / LiliCorr classes (derived from `impl_draft_dflash`) at the same point we inserted the `mtp_dev_rows_enabled()` helper | 13 lines | **both**: upstream's classes first, then our helper, immediately before `struct common_speculative_impl_draft_mtp` |
+| `common/speculative.cpp` `type_to_str()` / `static_assert(COUNT == 13)` / `add_config_if_enabled()` | 13 types | 12 + ours | **both**; the count is now **14** |
+
+**D5's actual question — does the adaptive-depth control still have a seam?**  Yes.  `#32016` refactored by
+*adding sibling classes* (`DSpark`/`DFlash2`/`LiliCorr` derive from `impl_draft_dflash`) and left
+`common_speculative_impl_draft_mtp` as its own class, which is where every block-02 hunk (`adaptive`,
+`n_cap`/`n_hard`/`n_last`, `adaptive_ctrl`, `align_draft_caps()`, `set_prompt_end()`,
+`prompt_batch_unneeded()`, the rewritten `accept()`) landed **cleanly**.  So the delivery's controller is
+orthogonal to upstream's new speculators — the one thing to watch for is `need_n_rs_seq()`, which upstream
+made explicit and now needs to stay in step with the enum (a new upstream type that needs rs_seq must be
+added there).
+
+## R02.2 The generated docs: regenerate, never hand-merge
+
+`tools/cli/README.md`, `tools/server/README.md` and `docs/speculative.md` are generated from
+`common/arg.cpp` by `llama-gen-docs`.  The two tables were unioned by hand first, then **regenerated**
+(`./build-rocm/bin/llama-gen-docs`), which is the canonical form and is what R18 will do anyway.
+
+**That regeneration found a pre-existing defect, not caused by this re-base:** block 00's `arg.cpp` hunk adds
+the `--lazy-mode mlockr` help text (and is the only delivery block that does — the delivery's blocks were
+re-cut from the tip, so a later feature's help text sits in the foundation block), but neither
+`tools/cli/README.md` nor `docs/speculative.md` at **r327** lists `mlockr` at all
+(`git show e159adfc2:tools/cli/README.md | grep -c mlockr` = **0**, `arg.cpp` = **2**).  The docs are stale at
+the release.  The rung regeneration fixes it as a side effect; **R18 must regenerate and assert no drift** so
+the release cannot go out stale again.
+
+## R02.3 Notes for later rungs
+
+- The 27B single-GPU arm needs `--fit false -c 8192 -fa auto`; the default `--fit` tried a 16 GiB KV
+  allocation on a 32 GiB card and died in `llama_init_from_model`.
+- `tests/test-speculative-adaptive.cpp` and `tests/test-recurrent-state-depth.cpp` arrive with this block and
+  build clean; they are not part of `--fast`, so they are first compiled here (the full build compiles them).
+- `spec_draft_align_cache()` / `spec_align_enabled()` / `spec_align_width_band()` (block 02's draft-KV align
+  helpers) merged cleanly; their gate is `scripts/gate-spec-align.sh` at R18.
 
 ---
 
