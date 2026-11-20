@@ -49,6 +49,12 @@ gather only partitions the same bytes across more blocks.  **Scope: this is a 1-
   (`HF_UI_VERSION=b12387` was needed: the known `TODO` #342 `ui-assets.cmake:137` failure, unrelated to this
   change.)
 
+* **MTP Protocol A** (the canonical dense arm, 27B-UD-Q4_K_XL, `--fit off`, bf16 KV, `-n 3000`,
+  `benchmarks/mtp-adaptive-methodology.md`), both reasoning axes: **reasoning on** `draft-mtp` **55.9 t/s**
+  at acceptance **0.52801** (1838 accepted / 3481 generated) against `none` **30.7 t/s** — **+82 %** and the
+  same text (`12331 chars sha=eace21fc3399` in both arms); **reasoning off** the same 55.9 / 30.7 and the same
+  acceptance.  `draft-mtp >= plain` and acceptance > 0.45 both hold.
+
 ### Notes
 
 * The retired campaign that found this (`archive/work/prefill-transfer-overlap/`, pass 9) and the campaign it
