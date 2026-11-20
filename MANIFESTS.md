@@ -205,8 +205,17 @@ in CI.  The model-level gates are manual:
    part of the point — it is folded into the base file name, recorded in the base meta and **refused on
    mismatch** — because on that shape `ROCBLAS_USE_HIPBLASLT` alone moves the greedy text
    (`benchmarks/2026-11-18-host-expert-prefill-oracle.md`).
-5. **Per-block build** — `scripts/gate-per-block-build.sh` on a clean `all` build per commit (bisection and
-   review walk the blocks individually, so every block must build on its own).  Use `--changed-from` to
+5. **Per-block build** — `scripts/gate-per-block-build.sh` on a clean build per commit (bisection and
+   review walk the blocks individually, so every block must build on its own).  **The profile: `--fast` is the
+   default and the release flow (r327)** — shipped binaries + `test-backend-ops`, measured 2.5-12 min for 18
+   rungs, of which ~9 min is the fresh per-rung configure (~30 s each, the ladder's floor); `--all` is the r2
+   standard and belongs to a **re-base**, or to a commit that edits a **`tests/` TU or the build graph**
+   (CMakeLists / *.cmake).  A shared header is NOT an `all` case: `--fast` recompiles the shipped binaries and
+   `test-backend-ops` in every rung anyway, and ONE `all` build at the tip (which the release flow's own
+   `~/bin/build-llama-rocm` does) carries the "the other test/example/tool binaries still compile" claim.  The
+   old rule named a shared header as an `all` case, so the r327 integration of PR #337 (a `common.cuh`
+   amendment in block 10) spent ~70 min on a ladder whose extra hour bought only that one claim — the cost the
+   r327 tooling change exists to stop.  Use `--changed-from` to
    rebuild only the blocks a release changed -- but understand what that buys: it is a **delta** gate, so a block
    whose own patch-id did not move is not rebuilt even when its TREE moved (an amendment to an earlier block), and
    a symbol one block introduces for a LATER block's feature makes every tree between them uncompilable while the
@@ -216,7 +225,11 @@ in CI.  The model-level gates are manual:
    the `all` profile** -- the cost is the `tests/test-backend-ops.cpp` TU, ~5 min, several distinct contents).  The
    gate prints a `configured (Ns)` line and ticks while it CONFIGURES as well as while it compiles: a per-rung
    configure is ~20-25 s of silent cmake, and a heartbeat that only covered compiling made a working ladder look
-   hung.  **The UI fetch is blocked by tooling since r326 (`TODO` #342): nothing to do by hand.**
+   hung.  **`test-backend-ops -o <op>` is a CLAIM CHECK, not a delivery gate, for an opt-in change** (r327): the
+   full `FLASH_ATTN_EXT` arm is 7 381 cases and ~25 min, which is right when the change's own claim is "the op
+   family still passes" (a contributor PR's evidence, or a default-on kernel change), and waste when the change
+   is an opt-in scheduler path whose default path is unchanged -- there, the arms that matter are the census
+   non-vacuity and the text identity against the previous build.  **The UI fetch is blocked by tooling since r326 (`TODO` #342): nothing to do by hand.**
    `ui-assets.cmake`'s asset cache lives in the BUILD dir, so before r326 every rung refetched the bundle from
    HuggingFace *inside its compile time*, and a timeout failed the rung (measured r326: rung 14,
    `UI: download dist.tar.gz.sha256 from b12387 failed: Timeout was reached` with `HF_UI_VERSION` pinned, 13
