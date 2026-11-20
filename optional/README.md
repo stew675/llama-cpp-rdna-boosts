@@ -12,7 +12,7 @@ default apply:
 |---|---|---|---|
 | `00xx` | official supported blocks (`0000`-`0015`) | yes | **yes — `N` = the count** |
 | `03xx` | TEMPORARY block (`0300`, the `-sm relaxed-tensor` port) | yes, after the `00xx` blocks | no |
-| `01xx` | **optional** block (this directory: `0100`..`0103`) | no — `--include-optional` only | no |
+| `01xx` | **optional** block (this directory: `0100`..`0104`) | no — `--include-optional` only | no |
 
 So an artifact here is **optional block `01xx`**, applied in **numeric order** after the verified default
 tree.  `release.json` records `n_blocks` (official), `n_temporary`, `n_default` (the apply count) and
@@ -90,5 +90,7 @@ optional block by the maintainer (the r288 block-number re-org moved `mixed-kv` 
 | `rdna2-norm-gdn/` | **`0102`** | RDNA2 (`gfx1030`) only: a one-warp `RMS_NORM` launch for `ncols <= 128` that keeps the default grouping (byte-identical to the 256-thread launch), and a `GATED_DELTA_NET` gate that takes the FP32 chunked prefill only for `H * n_seqs <= 4 && n_tokens > 256`. | contributed; measured on a Radeon Pro V620 only (`RMS_NORM` `[128,16384]` 79 -> 25 us f32 / 78 -> 17 us bf16; GDN 32-head prefill 2.7-3.2x) |
 | `rdna2-fattn-tile-caps/` | **`0103`** | RDNA2 (`gfx1030`) only: lifts the `cols_per_block` and `ncols2` caps in `fattn-tile.cuh` that worked around an occupancy-0 abort `launch_fattn` no longer has. | contributed; measured on a Radeon Pro V620 only (prefill vs the capped tiles: D=128 1.9x, D=512 2.1x, D=576 1.3x, D=256 1.1x) |
 
-Cumulative tree with all four applied in numeric order (`0100`, `0101`, `0102`, `0103`): `cc652293b0cef6f3529ddf9bdbfcac64e17a7bbc`
-(`release.json.optional_tree`); `0100` then `0101` alone give `ab8eb507387c468712fb2142d7e2481a529a1516`.
+| `rdna2-moe-rows-abreast/` | **`0104`** | RDNA2 (`gfx1030`) only: `mul_mat_vec_q_moe` walks the K-blocks once with the rows of a block side by side instead of one (row, K-block) item at a time; bit-identical output; `GGML_CUDA_MOE_ROWS_ABREAST=0` restores the item loop. | contributed; measured on a Radeon Pro V620 only (quantized `MUL_MAT_ID` n = 1..8: 1.26-1.32x, n >= 32 unchanged; 175 byte-compared cases, 0 differences) |
+
+Cumulative tree with all five applied in numeric order (`0100`..`0104`): `cfc641bbdba41c04e6457aee052e3a7b6f10a109`
+(`release.json.optional_tree`); `0100` then `0101` alone give `ebba8573756497ea711bf8f88b8f392d28411412`.

@@ -1,3 +1,225 @@
+## 261120.003 (r326, RELEASE v17-4f9dfa0e3-r326) -- the graph-replay width band is a token count: `GGML_CUDA_GRAPH_MAX_TOKENS` 8 -> 16, a block 10 amendment (contributor PR #336)
+
+**Release:** `v17-4f9dfa0e3-r326`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `a5026130c` (tree
+`2849b18c8`), 17 official + 1 temporary = 18 default blocks, optional `0100` -> `b9c861785` / `0101` ->
+`c504346d8` (cumulative `ebba85737`).  **No block created, split or renumbered**: one same-block amendment,
+**block 10** (`ggml/src/ggml-cuda/ggml-cuda.cu`, `common.cuh`, `fattn-common.cuh`).  One environment variable
+added (`GGML_CUDA_GRAPH_MAX_TOKENS`).  Contribution: `@overdoingism`, PR #336 (cut on r324; the review that
+asked for the arms is PR #334's, `TODO` #347).
+
+### The finding
+
+`ggml_cuda_graph_is_multi_token()` compared the graph's token count with `MMVQ_MAX_BATCH_SIZE` (**8**) and that
+number came from r20's argument ("above the verify widths it is a pre-fill, a varying ubatch, where capture
+never amortises"), not from a measurement of the one shape where 9..16 rows repeat: **4 slots x `draft-mtp n3`
+under `LLAMA_SPEC_ALIGN` is a fixed 16-row verify every step**.  The band is now
+`GGML_CUDA_GRAPH_MAX_TOKENS` (default **16**; `8` restores r325 bit for bit).
+
+| arm (gfx1201, ROCm 10.1.0; A = `=8`, B = default) | A | B | delta |
+|---|---|---|---|
+| 4-slot server, 4x`draft-mtp n3`, 27B UD-Q4_K_XL, 8 interleaved runs/arm | 179.2 / 177.7 / 177.7 / 177.8 (178.1) | 185.8 / 184.1 / 184.8 / 182.6 (184.3) | **+3.5 %** (every B above every A) |
+| same, 4B Q8_0 (state-matched pairs) | 640.8 / 641.1 | 652.1 | +1.8 % |
+| `llama-batched-bench -npl 16`, 27B / 4B | 242.70, 242.72 / 798.23, 798.86 | 245.69, 245.66 / 804.64, 806.41 | **+1.2 % / +0.9 %** |
+| `-npl 1 / 4 / 8`, both models | — | — | inert (±0.1 %) |
+| delivery default `n_max 7`, 1 GPU and 3 GPU `-sm tensor` | `direct=53 replay=1713 capture=18` / `3657/21819/813` | **identical census, identical text** | inert |
+| `ngram-mod` n15, 3 GPU | `4245/111069/1548` | identical | inert |
+
+The submitter's graph-census counts reproduce within a couple of calls (`1966/3054/59 -> 170/4756/153` on their
+box, `1973/3210/62 -> 180/4746/156` here); their +2.5 %/+4.1 % `-npl 16` and +1.5 %/+2.1 % multi-slot numbers
+are larger than this box's, i.e. ROCm 10.0.0 launches more expensively than 10.1.0 — the direction and the
+"1..8 untouched" claim are what reproduce.
+
+### What the submission did not cover, and is now covered
+
+1. **9..16-row PRE-FILL ubatches are captured too** (a short prompt, a prefill tail, a small `-ub`) — the PR
+   frames the change as verify widths.  `-ub 12` over the 5 298-token prose prompt: **21** captures at
+   `n_tokens=12`, **+1.2 %** prefill.  The r20 comment ("only a true pre-fill skips") is corrected at the source.
+2. **The FA staging arena may no longer be grown from inside a capture.**  Above the 8-row band a
+   native-capable K/V cache *stages*, and `fattn-common.cuh` justified the arena being outside the node
+   allocation with "a multi-token graph is never CUDA-graph captured" — false at 16.  New:
+   `ggml_backend_cuda_context::capturing` (set around the capture, checked by `fattn_stage_try_get`), so such a
+   call reads the K/V cache natively for that op — same arithmetic, same tokens — and logs one line the first
+   time.  The gate counts it.  (Measured motive: HIP's relaxed capture tolerates `cudaMalloc` mid-capture, CUDA
+   returns `cudaErrorStreamCaptureUnsupported`; relying on the difference would be a per-runtime bug.)
+3. **The moving-width cost is recorded, not hidden.**  3-device `-sm tensor` at `n_max 15`: captures
+   **150-240 -> 1350-1430** (9x).  That shape's *rate* is bimodal in **both** arms (46.5-57.6 t/s over 9 runs;
+   acceptance 0.1395 vs 0.166-0.168), because above an 8-row verify this set's text is not run-to-run stable
+   (`GREEDY-PURITY.md` §11) and the draft depth follows the acceptance the drifting text produces — so neither a
+   win nor a loss is attributable to the knob there.  A "only capture when the width repeated" prototype does
+   not help (the depth saturates, so the width stays 16 while the FA mask extent moves).  It needs
+   `n_max >= 8`, i.e. a user already outside the purity band, and `=8` is the bisect arm: accepted limitation,
+   `ENVIRONMENT.md` §7.4 + `INVARIANTS.md` r326.
+
+### Gates
+
+* `scripts/validate-set.sh` — **green**: 18 default + 2 optional, strict apply on a fresh `4f9dfa0e3` tarball,
+  applied tree **`2849b18c8`** == `release.json`, both optionals alone (`b9c861785` / `c504346d8`) and
+  cumulatively (`ebba85737`), Windows portability scan clean.
+* **`scripts/gate-graph-replay-width.sh` (new, MANIFESTS gate 38)** — **PASS**: (A) 4-slot arm captures 12-14
+  graphs at `n_tokens=16` and replays them (`direct=53 replay=832`), 5 accepted-draft lines; (B) `=8` captures
+  **0** graphs at 9..16 and fewer overall (18 vs 36); (C) delivery default **identical census**
+  (`direct=13 replay=113 capture=3 properties_changed=0`) and **byte-identical text**
+  (`383 chars sha=a1e7338c194c`); (D) 21 pre-fill captures at `n_tokens=12` vs 0, and the capture-time staged-FA
+  line logged once vs never; GPU faults clean.  **Negative-tested: the same gate fails 3 of its 5 checks on the
+  shipped r325 binary.**
+* `scripts/gate-prefill-logits.sh` (canonical point, base `923b910eb`) — **PASS**, mean KLD **0.000000**,
+  same-top-p **100.000 %**: the band changes which graphs are replayed, not a kernel.
+* **MTP Protocol A** (canonical dense arm, `-n 3000`): `none` **30.7 t/s** vs `draft-mtp` **53.9 t/s**, same text
+  `12331 chars sha=eace21fc3399` — the same text r325 recorded, so the default drafting is untouched.
+* **Coherence against the r325 build** (same-seed greedy): 4B Q8_0 `147 chars sha=b065f37593b3` and 27B
+  UD-Q4_K_XL 3-device `-sm tensor` + `draft-mtp n7` `139 chars sha=ad1333a99867` — **identical in both builds**.
+* `llama-batched-bench -npl 1,4,8,16` — the table above (rule 5).
+* `scripts/gate-per-block-build.sh --fast --jobs 28` — **PASS, 18/18 in 1441 s** (two rungs cold).  The tip
+  itself is built with `all` in the shared tree, which is where `test-backend-ops` would run; this change touches
+  no kernel.
+* GPU faults — clean on every arm above (scoped `--since` per gate, plus the journal check at the end).
+
+### Tooling fixed on the way (both cost real time today and will cost it again)
+
+* **`gate-per-block-build.sh` now heartbeats while a rung CONFIGURES, not only while it compiles**, and prints
+  `configured (Ns)` per rung.  A per-rung configure is 20-25 s of silent cmake, so a healthy ladder looked like a
+  hung one (an `all`-profile ladder was killed by hand at rung 15 after 55 min looking dead).  It also states the
+  profile's cost up front.
+* **The per-rung UI fetch is BLOCKED, not documented** (`TODO` #342's tooling half, closed here).  New
+  `scripts/ui-dist-cache.sh` keeps one validated bundle per machine (`~/.cache/rdna-boosts/ui-dist`; a bundle
+  with `index.html` but no `workbox*.js` -- the #342 signature -- is refused) and mirrors it into a checkout's
+  `tools/ui/dist`, which is `ui-assets.cmake`'s Priority 1 and survives the gate's per-rung checkouts because it
+  is untracked and gitignored.  `gate-per-block-build.sh` and `scripts/scratch-tree.sh` call it before their
+  first configure **and** configure with `LLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF`, so a machine with no
+  cache builds without the embedded UI rather than fetching (verified: with the assets and the cache removed the
+  gate re-seeded from a known-good build tree and the ladder never touched the network; with no assets at all
+  the build-time step reads `UI: no assets available - building without an embedded UI` and proceeds).  Before
+  this, the fetch lived in the build dir the gate wipes, so it ran once per rung inside that rung's compile
+  time: rung 14 died on `UI: download dist.tar.gz.sha256 from b12387 failed: Timeout was reached` with
+  `HF_UI_VERSION` pinned and lost 13 finished rungs.  `TODO` #342 now waits on upstream's `latest` bundle only.
+  `MANIFESTS.md` gate 5 + `AGENTS.md` record `all` vs `--fast` and that `--changed-from` is a delta gate, not a
+  substitute, after amending an early block.
+
+## 261120.002 (r325, RELEASE v17-4f9dfa0e3-r325) -- the MoE device gather's launch shape: `n_split` 8 -> 32, a block 09 amendment (+7.5 % prefill on the 1-GPU host-expert shape)
+
+**Release:** `v17-4f9dfa0e3-r325`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `4132c5155` (tree
+`5959be96f`), 17 official + 1 temporary = 18 default blocks, optional `0100` -> `c3a25080d` / `0101` ->
+`547321720` (cumulative `fa0dc3aae`).  **No block created, split or renumbered**: one same-block amendment,
+**block 09** (`ggml/src/ggml-cuda/moe-expert-cache.cu`, `moe_cache_gather_host`).  One environment variable
+added (`MOE_GATHER_NSPLIT`).
+
+### The finding
+
+`moe_cache_gather_host` launches `moe_cache_gather_kernel<<<n_experts * n_split, ...>>>` with `n_split = 8` — a
+constant chosen for the **decode** band ("~64 concurrent blocks for the usual 8 routed experts", the kernel's own
+comment).  A **prefill** ubatch routes essentially every expert of the table, so 8 left only 8 blocks per expert,
+each carrying a 0.6-1 MiB copy, and the copy was pipeline-limited instead of link-limited wherever the per-call
+volume is small (i.e. worst at HIGH residency, where the non-resident set is smallest).  `n_split` is now **32**,
+with `MOE_GATHER_NSPLIT` (1..256) as the A/B and bisect knob.
+
+| arm (1 x R9700, gfx1201, `-b 2048 -ub 2048`, 4932-token prompt, interleaved reps) | `=8` | `=32` | delta |
+|---|---|---|---|
+| Q8_0, auto arena (84 % residency) | 2307.9 / 2307.2 t/s | **2480.8 / 2480.8 t/s** | **+7.5 %** |
+| Q4_K_M, arena 8000 MiB | 2414.6 t/s | 2470.4 t/s | +2.3 % |
+| 3 GPU `-sm tensor`, Q8_0 | 4125.8 t/s | 4141.4 t/s | +0.4 % (neutral) |
+
+Greedy text is byte-identical (`572 chars sha=40e29c2b46b6`) and the KLD point is an exact fallback (below): the
+gather only partitions the same bytes across more blocks.  **Scope: this is a 1-GPU host-expert-tier win**; on a
+3-device tensor split each device gathers a third of the volume and the constant was already enough parallelism.
+
+### Gates
+
+* `scripts/validate-set.sh` — **green**: 18 default patches + 2 optional + `rdna-boosts-all.patch` checksums,
+  strict apply on a fresh `4f9dfa0e3` tarball, applied tree **`5959be96f`** == `release.json`, both optionals
+  apply alone (`c3a25080d` / `547321720`) and cumulatively (`fa0dc3aae`), Windows portability scan clean.
+* `scripts/gate-host-expert-text.sh` (the host-expert text oracle, pins applied) — **PASS**, 3/3 runs read
+  `296 chars sha=3205db133b1d`; the flipped-library arm reads its own text (reported, r310) and GPU faults are
+  clean.
+* **The change is a `moe_cache_gather` implementation change, so it owes the kill-switch arms** (MANIFESTS gate 1):
+  Flash-Next IQ3_XXS, `-ncmoe 47`, pins applied, 2 runs each — default, `GGML_MOE_DEVREMAP=0`,
+  `MOE_HOST_POOL_COLD=0` and `--host-experts pool` (with `-lme auto`) **all read `160 chars sha=200edcd422c7`,
+  2/2 each**.
+* `scripts/gate-prefill-logits.sh --ab "MOE_GATHER_NSPLIT=8"` (35B-A3B Q8_0, `-ncmoe 48 -ub 2048`, device 0) —
+  **PASS**: mean KLD **-0.000000** (limit 0.005), same-top-p **99.990 %** (floor 98.0 %), GPU faults clean.  The
+  base is recorded with the fallback `=8` arm, so this is the exact-fallback A/B the mode exists for.
+* `scripts/gate-host-pool.sh` — **PASS, 59/59 checks** (`takeover=0` under both fill faults, every failed fill
+  reporting NOT resident, the census printed once from the teardown, no abort in any of the 9 arms), every arm's
+  text as recorded and GPU faults clean.
+* `scripts/gate-per-block-build.sh --fast` (the release target profile, **all 18 rungs**) — **PASS, 18/18**
+  (`all 18 block commits build the release target profile`, 2008 s of gate time; the four heavy rungs, blocks
+  11-13 and 15, are the ones that recompile HIP kernels).
+  (`HF_UI_VERSION=b12387` was needed: the known `TODO` #342 `ui-assets.cmake:137` failure, unrelated to this
+  change.)
+
+* **MTP Protocol A** (the canonical dense arm, 27B-UD-Q4_K_XL, `--fit off`, bf16 KV, `-n 3000`,
+  `benchmarks/mtp-adaptive-methodology.md`), both reasoning axes: **reasoning on** `draft-mtp` **55.9 t/s**
+  at acceptance **0.52801** (1838 accepted / 3481 generated) against `none` **30.7 t/s** — **+82 %** and the
+  same text (`12331 chars sha=eace21fc3399` in both arms); **reasoning off** the same 55.9 / 30.7 and the same
+  acceptance.  `draft-mtp >= plain` and acceptance > 0.45 both hold.
+
+### Notes
+
+* The retired campaign that found this (`archive/work/prefill-transfer-overlap/`, pass 9) and the campaign it
+  opened (`wip/prefill-decode-arms/`) are recorded in `WORKLOG.md` 261120.001.
+* The optional artifacts were re-cut against the new default tree; their recorded trees moved
+  (`c3a25080d` / `547321720` / cumulative `fa0dc3aae`) because block 09 changed.
+
+## 261120.001 (r324) -- campaign housekeeping: `prefill-transfer-overlap` retired, `prefill-decode-arms` opened, and the gather's `n_split` re-measured and scoped (no delivery change)
+
+**No delivery patch changed, no block created, split or renumbered, no release.**  This entry records a
+research campaign's retirement, the campaign that replaces it, and the one measured candidate it left behind.
+
+### The campaign result, in one line
+
+A prefill and a decode on one GPU should **not** be interleaved by policy at all: give the server **two
+contexts on two threads** (a prefill arm and a decode arm), let the GPU schedule them, and move a slot between
+the arms only at a request boundary.  Measured on 1 x R9700, Qwen3.6-35B-A3B Q4_K_M, `-ncmoe 40 -lme auto`,
+arena 5000 MiB, a 4932-token prompt + a 128-token decoder, warm reps: the decoder reads **p95 50 ms** during a
+2.27 s prefill for a prefill cost of **-11.3 %**, against the shipped duty cycle's **p95 519-568 ms at -30 %**
+(the `DUTY=0` row is `p95 568 ms` at -2 %).  Every host-side policy on top of the concurrency was measured and
+**lost**: a cumulative rate gate (F = 0 / .25 / .5 / 1 / inf), a per-gather yield point built on a new sched
+callback (`splits = 120` per ubatch, so the per-layer switch point does exist) and HIP stream priority
+(verified applied — the device reports `least=1/greatest=-1`).  The reason is queue depth: a phase-locked
+decoder waits ~600 ms for its step because a lone queued burst schedules behind the prefill's deep kernel
+queue, while a free-running one always has work pending (42 ms).
+
+Two constraints are measured, not assumed, and both are written into the new campaign's landmines: the window
+exists **only** on a residency-deficient host-expert tier (full residency: zero gathers, two contexts
+byte-identical to one, compute-vs-compute), and **two contexts that both submit decode-band work corrupt each
+other** through the per-table, per-process `GGML_MOE_DEVREMAP` map (`=0` reads one text 3/3; a prefill+decode
+pair does not collide).  The cost is real resource sharing: ~7.7 ms of prefill per decode token against a
+10.9 ms standalone step, rising to 12.8 / 16.0 ms at arena 4000 / 3000 — the window is dearest exactly where
+it is worth most.
+
+### What moved
+
+* `wip/prefill-transfer-overlap/` -> `archive/work/prefill-transfer-overlap/` (**retired**; it answered its
+  question).  The record carries passes 1-13, the two losing patches
+  (`candidate-split-yield-and-priority.patch`), the gather probe, the `two_ctx` harness and the `smooth.py`
+  baseline table.
+* Its enabling change (a generic second `llama_context` sharing the first one's KV, `qwen35moe` included,
+  text-verified on the dense 4B and 35B-A3B) moved to the new campaign as
+  `wip/prefill-decode-arms/enabling-0001-second-context-shared-kv.patch`.
+* **`wip/prefill-decode-arms/` opened** (`wip/CAMPAIGNS.md`): one prefill arm + one decode arm in
+  `llama-server`.  First task is the hybrid model's **recurrent** state (a slot cannot cross arms without it);
+  then the server skeleton, the boundary handover with a per-request text oracle, the opt-in gate and the
+  measurements.  Nothing is implemented and nothing is in `patches/`.
+
+### The gather's `n_split`, re-measured on this tip and scoped (`TODO` #350)
+
+`moe_cache_gather_kernel`'s block count is `n_experts * n_split` with `n_split = 8`, a constant chosen for the
+**decode** band; a prefill ubatch routes essentially every expert of the table, so only 8 blocks per expert
+carry a 0.6-1 MiB copy each.  Re-measured on `923b910eb` (interleaved reps, `MOE_EXPERT_HEATMAP=load` +
+`ROCBLAS_USE_HIPBLASLT=0`, `-b 2048 -ub 2048`, the 4932-token corpus prefix):
+
+| shape | `MOE_GATHER_NSPLIT=8` | `=32` | delta |
+|---|---|---|---|
+| 1 GPU, Q8_0, auto arena (84 % residency) | 2307.9 / 2307.2 t/s | **2480.8 / 2480.8 t/s** | **+7.5 %** |
+| 1 GPU, Q4_K_M, arena 8000 MiB | 2414.6 t/s | 2470.4 t/s | +2.3 % |
+| 3 GPU `-sm tensor`, Q8_0 | 4125.8 t/s | 4141.4 t/s | +0.4 % (neutral) |
+
+Greedy text byte-identical in every pair (`572 chars sha=40e29c2b46b6`), and the change only partitions the
+same bytes across more blocks.  So it is a **1-GPU host-expert-tier win, neutral on the 3-GPU tensor split** —
+worth shipping because it never measured worse, and it is left **WAITING** on a block decision (a new block or
+a 09/12 amendment; that is the maintainer's call, not a gate outcome) plus `gate-prefill-logits.sh`,
+`gate-host-pool.sh` and `check-gpu-faults.sh`.  Candidate:
+`archive/work/prefill-transfer-overlap/candidate-gather-nsplit.patch`.
+
 ## 261119.008 (r324, RELEASE v17-4f9dfa0e3-r324) -- contributor PR #335 taken in full, corrected: the MoE weighted reduction is computed without fma contraction and its fold outranks the MUL-only fold (block 10); the delivery's MoE decode text was NOT the unfused chain's text before this
 
 **Release:** `v17-4f9dfa0e3-r324`.  Base `4f9dfa0e3` (base tree `cfb1f99a27`), canonical tip `923b910eb`

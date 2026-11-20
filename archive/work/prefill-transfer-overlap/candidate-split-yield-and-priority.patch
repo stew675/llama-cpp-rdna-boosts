@@ -1,0 +1,278 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index b031d1b77..57188680c 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -389,6 +389,9 @@ extern "C" {
+     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
+     // Set the number of threads for the backend
+     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
++    // wip/prefill-transfer-overlap: set the priority of the streams a backend creates for its compute.
++    // -1 = low (a co-scheduled context that must YIELD to another one), 0 = default, +1 = high.
++    typedef bool                         (*ggml_backend_set_stream_priority_t)(ggml_backend_t backend, int priority);
+     // Get additional buffer types provided by the device (returns a NULL-terminated array)
+     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
+     // Set the abort callback for the backend
+@@ -500,6 +503,12 @@ extern "C" {
+     // `graph` is the compute graph of the split
+     typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
+ 
++    // wip/prefill-transfer-overlap: called once per split that issued a MoE device gather, after the gather is
++    // enqueued on the split backend's stream and immediately before the split's compute is launched.  The
++    // callee may enqueue work of its own (from ITS thread, so it lands on its own stream); it must not block
++    // for longer than it takes to enqueue.
++    typedef void (*ggml_backend_sched_yield_callback)(void * user_data);
++
+     // Callback when the buffers reserved for a graph are not sufficient and have to be reserved again
+     // it happens on the graph allocation path and costs a synchronization of the backends
+     // `sched` is the scheduler
+@@ -554,6 +563,8 @@ extern "C" {
+     // Set a callback to be called when the inputs weights of a split are being copied
+     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+ 
++    GGML_API void                 ggml_backend_sched_set_yield_callback(ggml_backend_sched_t sched, ggml_backend_sched_yield_callback callback, void * user_data);
++
+     // Set a callback to be called when the compute buffers of a graph are being reallocated
+     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
+ 
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 79a70b16e..12d45b862 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1511,6 +1511,9 @@ struct ggml_backend_sched_split {
+     struct ggml_tensor ** inputs;
+     int n_inputs;
+     int inputs_capacity;
++    // wip/prefill-transfer-overlap: this split issued a MoE device gather while copying its inputs, so its
++    // compute is about to run beside that gather (the campaign's per-layer window)
++    bool gathered;
+     // graph view of this split
+     struct ggml_cgraph graph;
+ };
+@@ -1577,6 +1580,11 @@ struct ggml_backend_sched {
+     ggml_backend_sched_realloc_callback callback_realloc;
+     void * callback_realloc_user_data;
+ 
++    // wip/prefill-transfer-overlap: called once per split that gathered its routed experts, after the gather
++    // is issued and immediately before the split's compute is launched -- the campaign's switch point.
++    ggml_backend_sched_yield_callback callback_yield;
++    void * callback_yield_user_data;
++
+     char * context_buffer;
+     size_t context_buffer_size;
+ 
+@@ -2283,6 +2291,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         }
+         split->i_start = 0;
+         split->n_inputs = 0;
++        split->gathered = false;
+         int cur_backend_id = split->backend_id;
+         // wip/moe-expert-cache: the layer of the routed expert weights the current split already owns.
+         // Used to keep the gate/up/down (and the GLU between them) of ONE layer in one split - see the
+@@ -2404,6 +2413,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                 split->backend_id = node_backend_id;
+                 split->i_start = i;
+                 split->n_inputs = 0;
++                split->gathered = false;
+                 cur_backend_id = node_backend_id;
+                 cur_moe_layer = next_moe_layer;   // -1 unless this split starts at a routed op
+             }
+@@ -3430,6 +3440,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+                 // per-op full device synchronize (SCHEDSYNC 1.12 -> ~0.1 ms/call on `-sm tensor`).
+                 if (split_backend->iface.moe_cache_gather(
+                         split_backend, input, input_cpy, ids_tensor, 0, -1)) {
++                    split->gathered = true;
+                     return;
+                 }
+             }
+@@ -3762,6 +3773,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        // wip/prefill-transfer-overlap: this split's routed experts are being gathered RIGHT NOW on the split
++        // backend's stream, and its compute is not launched yet -- the one host-visible window per layer.
++        if (split->gathered && sched->callback_yield != NULL) {
++            sched->callback_yield(sched->callback_yield_user_data);
++        }
++
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+@@ -4111,6 +4128,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+     sched->callback_eval_user_data = user_data;
+ }
+ 
++void ggml_backend_sched_set_yield_callback(ggml_backend_sched_t sched, ggml_backend_sched_yield_callback callback, void * user_data) {
++    GGML_ASSERT(sched);
++    sched->callback_yield = callback;
++    sched->callback_yield_user_data = user_data;
++}
++
+ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {
+     GGML_ASSERT(sched);
+     sched->callback_copy = callback;
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 2e14c57f9..7a383155b 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -2577,10 +2577,26 @@ struct ggml_backend_cuda_context {
+ 
+     ~ggml_backend_cuda_context();
+ 
++    // wip/prefill-transfer-overlap: -1 = low, 0 = default, +1 = high (see ggml_backend_set_stream_priority_t)
++    int stream_priority = 0;
++
+     cudaStream_t stream(int device, int stream) {
+         if (streams[device][stream] == nullptr) {
+             ggml_cuda_set_device(device);
+-            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
++            if (stream_priority == 0) {
++                CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
++            } else {
++                int least = 0, greatest = 0;
++#if defined(GGML_USE_HIP)
++                (void) hipDeviceGetStreamPriorityRange(&least, &greatest);
++                const int prio = stream_priority < 0 ? least : greatest;
++                CUDA_CHECK(hipStreamCreateWithPriority(&streams[device][stream], hipStreamNonBlocking, prio));
++#else
++                CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
++                const int prio = stream_priority < 0 ? least : greatest;
++                CUDA_CHECK(cudaStreamCreateWithPriority(&streams[device][stream], cudaStreamNonBlocking, prio));
++#endif
++            }
+         }
+         return streams[device][stream];
+     }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c9bd54590..93e8b423f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -12177,8 +12177,33 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buft_split_for_dev
+     return nullptr;
+ }
+ 
++// wip/prefill-transfer-overlap: a context may WANT to lose a fight for SM time (a decode co-scheduled with a
++// prefill), so its streams take a priority.  Streams are created lazily, so this must be called before the
++// context's first compute for it to take effect.
++static bool ggml_backend_cuda_set_stream_priority(ggml_backend_t backend, int priority) {
++    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
++    if (ctx->stream_priority == priority) {
++        return true;
++    }
++    // the streams exist as soon as the context is built, so re-create them with the new priority.  This is
++    // only valid BEFORE the first compute (nothing is in flight, no cuBLAS handle is bound): the caller
++    // (llama_set_stream_priority) is documented that way.
++    for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
++        if (ctx->streams[ctx->device][s] != nullptr) {
++            (void) cudaStreamDestroy(ctx->streams[ctx->device][s]);
++            ctx->streams[ctx->device][s] = nullptr;
++        }
++    }
++    ctx->stream_priority = priority;
++    (void) ctx->stream();   // create the compute stream now, with the priority
++    return true;
++}
++
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
++    if (strcmp(name, "ggml_backend_set_stream_priority") == 0) {
++        return (void *) ggml_backend_cuda_set_stream_priority;
++    }
+     if (strcmp(name, "ggml_backend_cuda_kv_pool_mirror_buft") == 0) {
+         return (void *) ggml_backend_cuda_kv_pool_mirror_buft_for_dev;
+     }
+diff --git a/include/llama.h b/include/llama.h
+index 7e6d56ddc..4534967ba 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1226,6 +1226,23 @@ extern "C" {
+                              enum llama_process_type   type,
+                               struct llama_batch_ext * batch);
+ 
++    // wip/prefill-transfer-overlap [EXPERIMENTAL]: set the priority of this context's backend compute
++    // streams.  -1 = low, 0 = default, +1 = high.  A co-scheduled decode context wants LOW so that the
++    // prefill's kernels are scheduled first and the decode only fills the SMs the gather leaves idle; this
++    // is the hardware form of "spend the window, not the compute".  Must be called before the context's first
++    // compute (the streams are created lazily).  Returns false if no backend of this context implements it.
++    LLAMA_API bool llama_set_stream_priority(struct llama_context * ctx, int priority);
++
++    // wip/prefill-transfer-overlap [EXPERIMENTAL]: install a per-split yield hook.  It is called once for every
++    // graph split that issued a MoE device gather, AFTER the gather is enqueued on the backend's stream and
++    // immediately BEFORE that split's compute is launched -- the one host-visible window per layer.  The
++    // callee may enqueue work of its own, but from ITS OWN thread: the backend's stream is the per-thread
++    // default stream, so work submitted on the yielding thread would serialize behind the split.
++    LLAMA_API void llama_set_split_yield_callback(
++            struct llama_context * ctx,
++                          void (*callback)(void *),
++                                    void * user_data);
++
+     // Set the number of threads used for decoding
+     // n_threads is the number of threads used for generation (single token)
+     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 5c2bc08fc..1b378f451 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3136,6 +3136,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+         ggml_backend_sched_reset(sched.get());
+         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++        // wip/prefill-transfer-overlap: re-installed per graph because the reset above drops the sched state
++        ggml_backend_sched_set_yield_callback(sched.get(), split_yield_cb, split_yield_data);
+ 
+         //const auto t_start_us = ggml_time_us();
+ 
+@@ -6832,6 +6834,30 @@ int32_t llama_n_threads_batch(llama_context * ctx) {
+     return ctx->n_threads_batch();
+ }
+ 
++bool llama_context::stream_priority_set(int priority) {
++    bool any = false;
++    for (auto & backend : backends) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
++        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++        if (reg == nullptr) {
++            continue;
++        }
++        auto fn = (ggml_backend_set_stream_priority_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_stream_priority");
++        if (fn != nullptr && fn(backend.get(), priority)) {
++            any = true;
++        }
++    }
++    return any;
++}
++
++bool llama_set_stream_priority(llama_context * ctx, int priority) {
++    return ctx->stream_priority_set(priority);
++}
++
++void llama_set_split_yield_callback(llama_context * ctx, void (*callback)(void *), void * user_data) {
++    ctx->split_yield_set(callback, user_data);
++}
++
+ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
+     ctx->set_abort_callback(abort_callback, abort_callback_data);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index aba46ec56..2500afbec 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -300,6 +300,19 @@ private:
+     //
+ 
+ public:
++    // wip/prefill-transfer-overlap: a per-split yield hook (the MoE gather window).  Not part of the delivery.
++    void split_yield_set(void (*cb)(void *), void * user_data) {
++        split_yield_cb   = cb;
++        split_yield_data = user_data;
++    }
++
++    void (*split_yield_cb)(void *) = nullptr;
++    void * split_yield_data        = nullptr;
++
++    // wip/prefill-transfer-overlap: the priority this context's backend compute streams take (-1 low,
++    // 0 default, +1 high); false if no backend implements it
++    bool stream_priority_set(int priority);
++
+     uint32_t graph_max_nodes() const;
+ 
+     // can reuse the llm_graph_result instance of the context (for example to update a memory module)

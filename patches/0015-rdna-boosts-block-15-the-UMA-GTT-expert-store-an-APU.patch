@@ -1,4 +1,4 @@
-From 5daf9556b96418711cc4d736794656c054c0062c Mon Sep 17 00:00:00 2001
+From 228ebd5af73a44e7aed37cf9f8d7017222152e1b Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH 15/17] rdna-boosts: block 15: the UMA GTT expert store -- an
@@ -543,7 +543,7 @@ index d82930ec3..69f0d4411 100644
  bool   ggml_backend_cuda_moe_cache_pending(ggml_backend_t backend);
  bool   ggml_backend_cuda_moe_cache_stage_ready(ggml_backend_t backend, const ggml_tensor * weight);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index af132035a..c9bd54590 100644
+index 95e5e6a9a..787ddc961 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -127,6 +127,7 @@
@@ -731,7 +731,7 @@ index af132035a..c9bd54590 100644
  // wip/host-expert-master-drop (TODO #55): the POOL-BACKED host expert master buffer type.
  //
  // It is a host buffer type that carries its device (`ROCm_HostMap`), so a `MUL_MAT_ID` weight placed in it
-@@ -10547,6 +10718,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -10576,6 +10747,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_register     = */ ggml_backend_cuda_moe_cache_register,
      /* .moe_cache_stage_ready  = */ ggml_backend_cuda_moe_cache_stage_ready,
      /* .moe_cache_in_place     = */ ggml_backend_cuda_moe_cache_in_place,
@@ -739,7 +739,7 @@ index af132035a..c9bd54590 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -11367,6 +11539,11 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
+@@ -11396,6 +11568,11 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
      return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)) ||
@@ -751,7 +751,7 @@ index af132035a..c9bd54590 100644
          (ggml_backend_buft_is_cuda_kv_pool_mirror(buft) && buft->device == dev);
  }
  
-@@ -11510,6 +11687,16 @@ void ggml_cuda_h2d_ring_cap_set(size_t bytes) {
+@@ -11539,6 +11716,16 @@ void ggml_cuda_h2d_ring_cap_set(size_t bytes) {
  static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes, size_t max_host_table_bytes) {
      ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool on = moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
@@ -768,7 +768,7 @@ index af132035a..c9bd54590 100644
      if (on) {
          // fit-slab-accounting revival (G3): remember the draft-context estimate for the slab reserve (it
          // is created BEFORE the draft context, so the reserve has to leave room for it).
-@@ -11593,9 +11780,10 @@ static void ggml_backend_cuda_device_moe_cache_set_host_fill_mode(ggml_backend_d
+@@ -11622,9 +11809,10 @@ static void ggml_backend_cuda_device_moe_cache_set_host_fill_mode(ggml_backend_d
      moe_cache_set_host_fill_mode(direct);
  }
  
@@ -781,7 +781,7 @@ index af132035a..c9bd54590 100644
  }
  
  static void ggml_backend_cuda_device_moe_heat_open(ggml_backend_dev_t dev, const char * model_path) {
-@@ -11622,13 +11810,110 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -11651,13 +11839,110 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
  // GPU, so there is no pinned duplicated copy to drop and its host buffers are directly usable -- it
  // keeps the historical pinned master.
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_moe_host_master_buft(ggml_backend_dev_t dev) {
@@ -894,7 +894,7 @@ index af132035a..c9bd54590 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -11770,6 +12055,12 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -11799,6 +12084,12 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .moe_heat_open             = */ ggml_backend_cuda_device_moe_heat_open,
      /* .moe_heat_score            = */ ggml_backend_cuda_device_moe_heat_score,
      /* .moe_cache_set_host_fill_mode = */ ggml_backend_cuda_device_moe_cache_set_host_fill_mode,
@@ -1647,7 +1647,7 @@ index 000000000..ae7567213
 +// kernel reclaims it anyway, but the registration is a HOLD (probe 09) and must be dropped explicitly.
 +void ggml_cuda_gtt_store_free();
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 6e989251b..2a43303cc 100644
+index 368e0b107..08cc946e9 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -1,6 +1,7 @@
@@ -4248,7 +4248,7 @@ index 6e989251b..2a43303cc 100644
                  e += (int) n;   // the leftover tail of a run: the per-expert path reads it
                  continue;
              }
-@@ -9471,6 +10620,1099 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -9486,6 +10635,1099 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
      return false;
  }
  
@@ -5348,7 +5348,7 @@ index 6e989251b..2a43303cc 100644
  // Geometry-only registration: the half of `moe_cache_update_host` that needs no routing.
  //
  // The scheduler calls it for every routed host-expert input of EVERY split before the first split of a
-@@ -9555,8 +11797,6 @@ int moe_cache_register_host(const ggml_tensor * weight, const ggml_tensor * weig
+@@ -9570,8 +11812,6 @@ int moe_cache_register_host(const ggml_tensor * weight, const ggml_tensor * weig
          table_t & t = g_tables[table];
          if (!t.primed) {
              t.primed = true;
@@ -5357,7 +5357,7 @@ index 6e989251b..2a43303cc 100644
          }
          if (!g_sized && g_size_at_prime && moe_cache_tables_complete_locked()) {
              GGML_LOG_INFO("%s: the host-expert table set is complete at registration (%d tables); arming "
-@@ -9672,7 +11912,23 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -9687,7 +11927,23 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
              }
              t.prefill_tokens += n_tok;
          }
@@ -5382,7 +5382,7 @@ index 6e989251b..2a43303cc 100644
      }
  
      // TODO #64.1: the first decode-band pass after a prefill is the moment the prompt's routing is known
-@@ -9735,6 +11991,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -9750,6 +12006,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          t.device = device;
          alloc_table_locked(t, old_slots);
          t.slot_expert.assign(t.slots, -1);
@@ -5390,7 +5390,7 @@ index 6e989251b..2a43303cc 100644
          t.expert_slot.clear();
          GGML_LOG_WARN("%s: migrated layer=%d role=%s arena from device %d to %d (%d slots)\n",
                        __func__, t.layer, t.role.c_str(), old_device, device, t.slots);
-@@ -9746,7 +12003,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -9761,7 +12018,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // (priming, no arena, or `!all` below), the scheduler copies the FULL expert table and the op must
      // read that copy - not the previous token's remap.  The consumer only redirects while
      // `remap_n_used > 0`, so zeroing it here turns "hook declined" into "op reads `input_cpy`".
@@ -5400,7 +5400,7 @@ index 6e989251b..2a43303cc 100644
  
      // Sizing and priming (see `alloc_all_locked`): with no explicit slot override, the first pass
      // only registers the tables and runs uncached (the scheduler copies the full experts); the
-@@ -10203,8 +12461,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -10218,8 +12476,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
      }
      g_write_seq++;
      const auto decline = [&]() {
@@ -5412,7 +5412,7 @@ index 6e989251b..2a43303cc 100644
          return false;
      };
      const int64_t n  = n_used * n_tok;
-@@ -10262,8 +12521,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -10277,8 +12536,9 @@ bool moe_cache_remap_dev(const ggml_tensor * weight, const ggml_tensor * weight_
                  continue;
              }
              if (!devremap_prep_locked(u, stream)) {
@@ -5424,7 +5424,7 @@ index 6e989251b..2a43303cc 100644
                  continue;   // its own call retries
              }
              add_job(u, k);
-@@ -10411,11 +12671,13 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
+@@ -10426,11 +12686,13 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
          if (n_tok)        *n_tok        = 0;
          return true;
      }
@@ -5443,7 +5443,7 @@ index 6e989251b..2a43303cc 100644
          return false;
      }
      if (t.arena == nullptr || t.slots <= 0 || t.remap_dev == nullptr || t.remap_n_used <= 0) {
-@@ -10820,27 +13082,147 @@ static void report_locked() {
+@@ -10835,27 +13097,147 @@ static void report_locked() {
      GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
                    __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
                    n_tables, n_slots, (double) arena_b / (1024 * 1024), budget_desc());
@@ -5600,7 +5600,7 @@ index 6e989251b..2a43303cc 100644
      }
      if (g_uploadp_calls > 0) {
          GGML_LOG_INFO("%s: scheduler pageable-master fallback: %lld ranges, %.1f MiB served through the per-table "
-@@ -10886,6 +13268,15 @@ static void report_locked() {
+@@ -10901,6 +13283,15 @@ static void report_locked() {
                        g_sink_copies > 0 ? 100.0 * (double) g_sink_uses / (double) g_sink_copies : 0.0);
          GGML_LOG_WARN("%s: sink mirror tables (full coverage -> exchange INERT, spare=0): %lld\n", __func__,
                        (long long) g_sink_mirror_tables);
@@ -5616,7 +5616,7 @@ index 6e989251b..2a43303cc 100644
          if (g_sink_near_mirror_tables > 0) {
              GGML_LOG_WARN("%s: sink near-mirror tables (coverage gap < 4 %% of the set -> exchange DISENGAGED): "
                            "%lld\n", __func__, (long long) g_sink_near_mirror_tables);
-@@ -11107,6 +13498,31 @@ static void report_locked() {
+@@ -11122,6 +13513,31 @@ static void report_locked() {
                            (double) g_stage_span_read_us / 1000.0);
          }
      }

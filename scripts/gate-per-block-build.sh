@@ -211,9 +211,38 @@ fi
 
 LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rboosts-per-block.XXXXXX")"
 ORIG_REF="$(git -C "$REPO" symbolic-ref -q --short HEAD || git -C "$REPO" rev-parse HEAD)"
+
+# UI ASSETS, BLOCKED BEFORE THE LADDER (TODO #342).  `scripts/ui-assets.cmake` caches the embedded Web UI
+# inside the BUILD dir, which this gate wipes per block commit, so by default every rung performs a
+# HuggingFace fetch inside its compile time -- and a network timeout fails the rung (measured r326: rung 14,
+# `UI: download dist.tar.gz.sha256 ... "Timeout was reached"`, 13 finished rungs discarded).  Priority 1 of
+# that script is a pre-built `tools/ui/dist` in the SOURCE tree (untracked + gitignored, so it survives the
+# per-rung checkouts); scripts/ui-dist-cache.sh maintains one shared copy per machine and mirrors it in.
+# The configure below also passes LLAMA_USE_PREBUILT_UI=OFF, so even with no cache a rung builds WITHOUT
+# the embedded UI (a warning, not a fetch) instead of depending on the network.
+UI_DIST_CACHE="$REPO_DIR/scripts/ui-dist-cache.sh"
+UI_ASSETS=0
+if [ -x "$UI_DIST_CACHE" ]; then
+    "$UI_DIST_CACHE" --checkout "$REPO" > "$LOG_DIR/ui-dist.log" 2>&1 && UI_ASSETS=1
+    sed 's/^/    /' "$LOG_DIR/ui-dist.log"
+fi
 echo "==> per-block build gate: $BASE..$TIP in $REPO (targets: $TARGETS)"
 echo "    logs: $LOG_DIR   build dir: $REPO/$BUILD_DIR   jobs: $JOBS"
-echo "    progress: a heartbeat every ${PROGRESS_SECS}s while a rung compiles (PROGRESS_SECS=0 disables)"
+echo "    progress: a heartbeat every ${PROGRESS_SECS}s while a rung CONFIGURES or compiles (PROGRESS_SECS=0 disables)"
+if [ "$UI_ASSETS" -eq 1 ]; then
+    echo "    ui assets: pre-placed in $REPO/tools/ui/dist (Priority 1 -- no fetch inside any rung)"
+else
+    echo "    ui assets: NONE available -- rungs configure with LLAMA_USE_PREBUILT_UI=OFF and build without the"
+    echo "               embedded UI (seed a cache once: scripts/ui-dist-cache.sh --checkout $REPO)"
+fi
+if [ "$TARGETS" = "all" ]; then
+    echo "    profile: all (the r2 standard) -- measured ~35 min cold / ~55 min from a partial cache, because"
+    echo "             tests/test-backend-ops.cpp is one ~5 min TU with several distinct contents.  The"
+    echo "             RELEASE flow uses --fast (measured 2.5-12 min); use all for a re-base or a change"
+    echo "             that touches tests/ or a shared header."
+else
+    echo "    profile: --fast (the release flow); the tip's test-backend-ops coverage comes from its own gates"
+fi
 [ -n "$CHANGED_FROM" ] && echo "    changed-from: $CHANGED_FROM (blocks whose own delta is unchanged are skipped; the tip is always built)"
 
 # --changed-from: map subject -> patch-id for the reference chain.  Block subjects are
@@ -264,8 +293,9 @@ for c in "${selected[@]}"; do
     git -C "$REPO" checkout -q "$c" || { echo "    CHECKOUT FAILED"; failed=$((failed+1)); fail_list+=("$c checkout"); [ "$KEEP_GOING" = 0 ] && break; continue; }
 
     rm -rf "$REPO/$BUILD_DIR"
+    t_cfg0="$(date +%s)"
     echo "    configuring (fresh build dir) ..."
-    if ! HIPCXX="$ROCM_DIR/lib/llvm/bin/clang" HIP_PATH="$ROCM_DIR" \
+    HIPCXX="$ROCM_DIR/lib/llvm/bin/clang" HIP_PATH="$ROCM_DIR" \
         cmake -S "$REPO" -B "$REPO/$BUILD_DIR" \
             -DGGML_RPC=1 -DGGML_HIP=ON -DGGML_NATIVE=1 -DGGML_HIP_RCCL=1 \
             -DHIP_PLATFORM=amd -DGGML_HIP_GRAPHS=ON -DGPU_TARGETS="$GPU_TARGETS" \
@@ -274,8 +304,20 @@ for c in "${selected[@]}"; do
             -DCMAKE_CXX_COMPILER="$ROCM_DIR/lib/llvm/bin/clang++" \
             -DCMAKE_INSTALL_RPATH="\$ORIGIN:$ROCM_DIR/lib" \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_HIP_FLAGS="$ISYSTEM" \
+            -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF \
             "${CCACHE_LAUNCHERS[@]}" \
-            > "$LOG_DIR/${total}.configure.log" 2>&1; then
+            > "$LOG_DIR/${total}.configure.log" 2>&1 &
+    cp=$!
+    if [ "$PROGRESS_SECS" -gt 0 ] 2>/dev/null; then
+        while kill -0 "$cp" 2>/dev/null; do
+            sleep "$PROGRESS_SECS"
+            kill -0 "$cp" 2>/dev/null || break
+            echo "    ... still configuring rung $total/$n_sel: $(( $(date +%s) - t_cfg0 ))s on this rung, $(( $(date +%s) - t_gate0 ))s total"
+        done
+    fi
+    wait "$cp"; cfgrc=$?
+    echo "    configured ($(( $(date +%s) - t_cfg0 ))s)"
+    if [ "$cfgrc" -ne 0 ]; then
         echo "    CONFIGURE FAILED (log: $LOG_DIR/${total}.configure.log)"
         tail -5 "$LOG_DIR/${total}.configure.log" | sed 's/^/      /'
         failed=$((failed+1)); fail_list+=("$c configure")

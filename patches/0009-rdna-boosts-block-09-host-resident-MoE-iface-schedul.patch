@@ -1,4 +1,4 @@
-From 43caee1d2260b0c8a57ecb3ae231c8196a2f2037 Mon Sep 17 00:00:00 2001
+From 123d53419e606cb628d1eab28e20d800d2a9f6b9 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/17] rdna-boosts: block 09: host-resident MoE (iface,
@@ -83,7 +83,7 @@ text/acceptance byte-identical everywhere.
  ggml/src/ggml-cuda/graph.cuh                  |    4 +
  ggml/src/ggml-cuda/mmvq.cu                    |  276 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 7107 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 7122 +++++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h         |  384 +
  ggml/src/ggml-cuda/norm.cu                    |   35 +
  ggml/src/ggml-cuda/norm.cuh                   |    1 +
@@ -122,7 +122,7 @@ text/acceptance byte-identical everywhere.
  tests/test-backend-tensor.cpp                 |    3 +
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 70 files changed, 18236 insertions(+), 540 deletions(-)
+ 70 files changed, 18251 insertions(+), 540 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -11007,10 +11007,10 @@ index 4140f681a..35f625eaa 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..4d7a64ff2
+index 000000000..9183f2296
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,7107 @@
+@@ -0,0 +1,7122 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -16628,8 +16628,23 @@ index 000000000..4d7a64ff2
 +    const int64_t head_pad = expert_bytes < 512 ? (int64_t) expert_bytes : 512;
 +    device_guard dg(device);
 +    const int threads = 256;
-+    // 8 chunks/expert -> ~64 concurrent blocks for the usual 8 routed experts (see the kernel comment).
-+    const int n_split = 8;
++    // Chunks per expert.  The block count is `n_experts * n_split`, and 8 was chosen for the DECODE band's
++    // shape ("~64 concurrent blocks for the usual 8 routed experts", see the kernel comment).  A PREFILL
++    // ubatch routes essentially every expert of the table, so the same constant leaves only 8 blocks per
++    // expert, each carrying a 0.6-1 MiB copy, and the copy is then pipeline-limited rather than
++    // link-limited wherever the per-call volume is small (the high-residency arena).  Measured (r325,
++    // 1 x R9700, gfx1201, `-b 2048 -ub 2048`, a 4932-token prompt, interleaved reps): Q8_0 at 84 %
++    // residency 2307.9/2307.2 -> 2480.8/2480.8 t/s (+7.5 %), Q4_K_M at an 8000 MiB arena 2414.6 -> 2470.4
++    // (+2.3 %), and NEUTRAL on a 3-device `-sm tensor` split (4125.8 -> 4141.4, +0.4 %); greedy text is
++    // byte-identical (`572 chars sha=40e29c2b46b6`) because this only partitions the same bytes across more
++    // blocks.  32 is within noise of each arm's best, so it is the default; `MOE_GATHER_NSPLIT` overrides
++    // the launch shape (8 restores the pre-r325 value for an A/B).
++    static const int g_gather_nsplit = [] {
++        const char * e = getenv("MOE_GATHER_NSPLIT");
++        const int v = e != nullptr && e[0] != '\0' ? atoi(e) : 32;
++        return v < 1 ? 1 : (v > 256 ? 256 : v);
++    }();
++    const int n_split = g_gather_nsplit;
 +    // The finite-head guard MUST run BEFORE the gather: the gather then overwrites every routed slot's
 +    // head with real data, so only the non-routed slots keep the zero (which is all the finite-byte
 +    // guard needs).  Launching it after the gather zeroes the routed experts' own first bytes and

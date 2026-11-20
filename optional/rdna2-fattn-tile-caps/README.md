@@ -5,9 +5,9 @@ RDNA2-conditional.  Nothing here is in `patches/`, `release.json.tree`, `rdna-bo
 `scripts/apply-all.sh` apply.
 
 * `0103-rdna2-fattn-tile-caps.patch` — the artifact.  sha256 `bb6f2256537d14efda9724552faaa2c4099a22e6f9dc4bd926bea3dee0e94ded`
-* Cut against the r324 default tree `d3babb65a68b83a2669933c902d5d981933d807e` (`923b910eb`).  Applies strictly
-  (`git am`) there, producing tree `e6b7c668f8d1980a9dc420416846973c67198635`, and in numeric order after `0100` + `0101` + `0102`
-  (cumulative tree `cc652293b0cef6f3529ddf9bdbfcac64e17a7bbc`).
+* Cut against the r324 default tree; on r326 the same bytes apply strictly (`git am`) on the default tree
+  `2849b18c8eba4e1d538474c59a85ba3c5b671ad7` (`a5026130c`), producing tree `96cbbccaeb72c5a2ead300b3f2a662bf2cf53a8e`,
+  and in numeric order after `0100` + `0101` + `0102` (cumulative tree `0ae1e54b404083f09635734734a96dad99dfeda4`).
 
 ## What it changes
 

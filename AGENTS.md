@@ -368,6 +368,7 @@ tier runs what); this table is the quick answer for a change in flight.
 | a `-sm tensor` **segmented (fused) tensor upload**, the meta backend's synchronous splice, or the loader's `--load-mode none` chunked upload | `scripts/gate-meta-seg-drain.sh` |
 | the expert-cache prefill transport: the staging/gather decision, the pre-staging `moe_cache_in_place` query, `moe_cache_get_table`'s identity branch, or a fused kernel that reads a routed expert table directly | `scripts/gate-prefill-logits.sh --ab "MOE_EXPERT_PREFILL_IN_PLACE=0"` on an **identity** arena (`-device 0,1,2 --sm tensor --ub 2048 --extra "-ncmoe 48"`, 35B-A3B Q8_0) must read KLD 0.000000, plus same-seed greedy text both arms and `gate-host-pool.sh` |
 | the server's idle-slot parking / a memory type carrying a second cache | `scripts/gate-park-idle-slots.sh` |
+| the graph-capture decision (`ggml_cuda_graph_is_multi_token()`, `GGML_CUDA_GRAPH_MAX_TOKENS`), the capture-time FA staging rule (`ggml_backend_cuda_context::capturing`), or the FA staging arena's growth | `scripts/gate-graph-replay-width.sh` (a repeating 16-row verify must capture **and** replay, the kill switch must capture no 9..16-row graph, the delivery default's census and text must be **identical**, and a 9..16-row pre-fill ubatch must be captured with the staging arena left alone) |
 | the node budget (`graph_max_nodes()`), the scheduler's sizing, or a memory module that adds graph nodes/leafs (the KV rotation is the current case) | `scripts/gate-node-budget.sh` |
 | the server's context-checkpoint or speculative-checkpoint path | `scripts/gate-ckpt-reuse.sh` / `scripts/gate-spec-ckpt-device.sh` |
 | a state save/restore (`llama_io_*`, `state_stage`) | `scripts/gate-state-pipe.sh` |
@@ -426,8 +427,14 @@ to "the build is slow" (`archive/work/build-time-regression/`).
 
 Keep every arm in **one** long-lived source path (`scripts/scratch-tree.sh` switches states inside it) —
 ccache keys on the absolute path, so a new worktree is a full cold build (5-6 min) while a fresh build dir
-at the same path is ~9 s. The per-block ladder's cost and the `--changed-from` shortcut are in
-`MANIFESTS.md` → Release gates (gate 4) and the gate script's own header.
+at the same path is ~9 s. **The release flow is `--fast --jobs 28`: measured 2.5-12 min for the full 18-rung ladder** (the UI bundle is
+pre-placed from one shared cache by `scripts/ui-dist-cache.sh`, and every rung configures with the HF fetch
+off, so no rung pays a download -- `TODO` #342); **the `all`
+profile is the r2 standard for a re-base or a change that touches `tests/` or a shared header, and costs
+~35-55 min** (one `tests/test-backend-ops.cpp` TU with several distinct contents).  `--changed-from <prev tip>`
+is a *delta* gate and is NOT a substitute for the ladder after amending an early block (r307: blocks 09-11
+stayed uncompilable for three releases).  Cost table and both profiles: `MANIFESTS.md` → Release gates (gate 5)
+and the gate script's own header.
 
 ### Build the release container images (worker by default)
 
