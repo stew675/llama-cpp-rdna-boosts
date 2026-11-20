@@ -106,7 +106,7 @@ Flint/Mellum/Mistral4 split mode — `#351` says so explicitly, for whoever read
 
 ---
 
-## D3 — `#32387` BF16 ROPE/SET_ROWS and the bf16-cache rope fusion vs block 04  ·  **OPEN**
+## D3 — `#32387` BF16 ROPE/SET_ROWS and the bf16-cache rope fusion vs block 04  ·  **RESOLVED at R04: union of arms, upstream's guard dropped, measured**
 
 **Claim.** Upstream `7fce5439f` adds BF16 to `ROPE` and `SET_ROWS` on CPU and CUDA **and** "`cuda : fuse BF16
 rope into a BF16 cache`" — the same fused `ROPE + VIEW + SET_ROWS`-into-`BF16` path block 04 added, and it
@@ -344,3 +344,15 @@ two sides inserted at the same point and both belong.  The arm is not merely bui
 `need_n_rs_seq()`, which upstream made an explicit list: a new upstream type that needs an rs_seq must be
 added there as well as to the enum.  Block 12's DFlash hunks re-open this at R12 and will be checked against
 the same finding.
+
+**Resolution (R04, 2026-11-20).**  `rope.cu` was a pure union — upstream added `BF16->BF16`/`BF16->F16`, block
+04 adds `F16->BF16` (its `F32->BF16` merged cleanly), so all {F32,F16,BF16} -> {F32,F16,BF16} pairs have a
+kernel.  `ggml_cuda_should_fuse_rope_set_rows()` was the real collision: upstream refuses every non-BF16 rope
+into a BF16 cache, which is exactly the delivery's bf16-KV path, and it refuses it only because *its* matrix
+lacks that arm.  With the unioned matrix the guard is what would disable the feature, so **the guard is
+dropped** and the cache-type list stays as the test.  Measured with `GGML_CUDA_DISABLE_FUSION=0/1` at
+`-ctk bf16 -ctv bf16`: **6786.5 / 88.8 t/s against 6417.0 / 76.2** (+5.8 % prefill, +16.5 % decode), text
+identical (`71 chars sha=1de99b7e6ee6`); `test-backend-ops -o ROPE` 515/515; f16-KV coherence unchanged at
+`1c5d32ac537d`.  The alternative — keeping upstream's guard — is recorded in `RUNGS.md` R04.2 with the cost it
+would carry, so the choice is auditable rather than silent.  In R04.2's terms this was option 1 *plus* the
+union of option 3: no delivery arm was deleted.

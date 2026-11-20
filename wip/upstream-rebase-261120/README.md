@@ -1,8 +1,8 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: OPEN — 4 of 18 rungs climbed (R00, R01, R02, R03) on 2026-11-20. Nothing is delivery yet.**
+**Status: OPEN — 5 of 18 rungs climbed (R00-R04) on 2026-11-20. Nothing is delivery yet.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
-the final rung (R18).  Ladder branch `rebase-r328` = `e612388ba` (tree `971953b99`): R00, R01, R02, R03 and one R00
+the final rung (R18).  Ladder branch `rebase-r328` = `768d27561` (tree `0866d4229`): R00..R04 and one R00
 rung repair; every rung is green on build + coherence and each has one entry in [`RUNGS.md`](RUNGS.md).
 **The one known-red is closed at R00** (repair `3ea8b0212`): the delivery's required VMM pool refuses
 upstream's strided 2-D indexer top-k copy, and it reproduces on the pristine base with *only* the `#30542`
@@ -12,8 +12,10 @@ identical text (the recorded +4.5 %/+5.2 % is re-measured at R18 before it is qu
 conflicts were all the DFlash spec refactor and every one was a union, so `D5` resolved as MERGE with the
 adaptive arm at 29.3 -> 65.2 t/s on identical text.  R03 is done too: one test-file
 conflict (a union of upstream's new `padded_q`/`permuted_k` layouts with the delivery's `n_rs_batch`), and the
-block's switch moves its own measurement -- chunked prefill +8.8 % with identical text.  Next rung: **R04**
-(block 04, BF16 KV + native BF16 FA), whose 2 conflicts are the BF16 ROPE/SET_ROWS work (`D3`).  Target: the next release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
+block's switch moves its own measurement -- chunked prefill +8.8 % with identical text.  R04 is done: `D3` resolved by
+unioning seven rope arms and dropping upstream's blanket guard (which the delivery's own kernels invalidate),
+worth +5.8 % prefill / +16.5 % decode at bf16 KV with identical text.  Next rung: **R05** (block 05,
+flash-attention band + native quantized K/V), the widest file set (341 files) but only 7 conflicted paths.  Target: the next release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 
 This is a **ladder climb, not a single rebase**: one rung per delivery block, each rung ending in a resolved

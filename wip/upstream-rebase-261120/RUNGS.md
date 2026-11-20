@@ -36,7 +36,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | R01 | 01 | `a94e2214c` | 0 | — | **DONE 2026-11-20** — `14a0414bb`, tree `6566ca3ac`; one rung repair (HIP's 64-bit warp mask); 3-device tensor text `1c5d32ac537d` == R00; pipeline census 3 GPUs |
 | R02 | 02 | `cef19b032` | 5 | D5 (**resolved: MERGE**, no code dropped) | **DONE 2026-11-20** — `3941bad4e`, tree `0799ebfad`; all 5 conflicts are unions; adaptive arm 29.3 -> 65.2 t/s with identical text; enum count 13 -> 14 |
 | R03 | 03 | `36da15029` | 1 | — | **DONE 2026-11-20** — `e612388ba`, tree `971953b99`; test-file union; GATED_DELTA_NET 76/76; chunked prefill +8.8 % with identical text |
-| R04 | 04 | `cfe40b5f9` | 2 | **D3** | not started || R05 | 05 | `7362b5958` | 7 | — | not started |
+| R04 | 04 | `cfe40b5f9` | 2 | **D3 (resolved: union + drop upstream's guard)** | **DONE 2026-11-20** — `768d27561`, tree `0866d4229`; 7 rope arms; fusion worth +5.8 % pp / +16.5 % tg at bf16 KV, identical text; ROPE 515/515 || R05 | 05 | `7362b5958` | 7 | — | not started |
 | R06 | 06 | `f0564df7d` | 2 | D11 | not started |
 | R07 | 07 | `f5bdbefda` | 1 | D11 | not started |
 | R08 | 08 | `fe283f27c` | 9 | **D4**, D3, D11 | not started |
@@ -331,6 +331,71 @@ upstream's near-no-decay stress case plus the delivery's realistic floor, with t
   `GDN_CHUNKED_MIN_TOKENS`, `GDN_CHUNKED_NTHREADS`, `GDN_CHUNKED_CS`, `GDN_CHUNKED_VT`,
   `GDN_CHUNKED_STATE_PIPE`.  `GDN_CHUNKED_MIN_TOKENS` and `n_rs_batch`'s use as a kernel input are what
   `scripts/gate-spec-gdn-split.sh` grades at R18.
+
+---
+
+# R04 — block 04, BF16 KV cache + native BF16 flash attention  ·  **DONE 2026-11-20** — `768d27561`, tree `0866d4229`
+
+```
+git cherry-pick cfe40b5f9        # 8 files -> 8 files changed, +606/-195
+```
+
+**This is `D3`, and it was a real collision — in the fusion *decision*, not in the text.**  Both sides added
+rope dispatch arms; only one side was allowed to win the predicate, and the delivery's side is the feature.
+
+| exit criterion | result |
+|---|---|
+| conflicts | 2 (`rope.cu`, `ggml-cuda.cu`), 1 region each |
+| build | green (`all` targets), 0 errors |
+| coherence 4B, f16 KV | `100 chars sha=1c5d32ac537d` — unchanged |
+| **bf16 KV arm** (the block's feature), f16 vs bf16 | prefill 6843.4 vs 6795.8, decode 89.8 vs 87.7, text **identical** both (`71 chars sha=1de99b7e6ee6`) |
+| **the fusion is taken AND worth having** | `GGML_CUDA_DISABLE_FUSION=0`: **6786.5 / 88.8** against **6417.0 / 76.2** with it off — **+5.8 % prefill, +16.5 % decode**, identical text |
+| `test-backend-ops -o ROPE` | **515 OK / 0 FAIL**, 2/2 backends |
+
+## R04.1 `rope.cu` — a pure union of complementary arms
+
+| arm | who added it |
+|---|---|
+| `float -> half`, `float -> float`, `half -> half` | pre-existing |
+| `float -> nv_bfloat16` | block 04 (merged cleanly) |
+| **`nv_bfloat16 -> nv_bfloat16`**, **`nv_bfloat16 -> half`** | upstream `#32387` |
+| **`half -> nv_bfloat16`** | block 04 (the conflict) |
+
+All seven arms are kept, so every pair of {F32, F16, BF16} now has a kernel.  That is what makes the next
+decision safe.
+
+## R04.2 `ggml-cuda.cu` — the actual `D3` decision
+
+`ggml_cuda_should_fuse_rope_set_rows()` decides whether `ROPE + VIEW + SET_ROWS` runs as one kernel.  Upstream
+`#32387` added:
+
+```cpp
+// BF16 rope fuses into an F16 or BF16 cache, other ropes not into a BF16 cache
+if (rope->type == GGML_TYPE_BF16 ? set_rows->type == GGML_TYPE_F32 : set_rows->type == GGML_TYPE_BF16) {
+    return false;
+}
+```
+
+i.e. **every non-BF16 rope into a BF16 cache is refused** — which is precisely the delivery's bf16-KV path
+(an f32/f16 rope writing into a bf16 cache).  Upstream refused it because *its* matrix had no `F32/F16 -> BF16`
+arm; the delivery's block 04 supplies them, so with the unioned matrix the refusal is the only thing that
+would disable the feature.  **Resolution: the guard is dropped and the outer cache-type list is the test.**
+That is not a delivery-code deletion — it removes a freshly added upstream guard whose premise the delivery's
+own kernels invalidate — and the measurement above is what justifies it (+5.8 % pp / +16.5 % tg at bf16 KV,
+identical text).
+
+If the maintainer would rather keep upstream's guard for non-delivery configurations, the alternative is to
+keep it and let the bf16-cache fusion go — that costs the numbers in the table above on the delivery's own
+bf16-KV path, so it is recorded here rather than taken silently.
+
+## R04.3 Notes for later rungs
+
+- `GGML_CUDA_DISABLE_FUSION` is the switch that grades any fusion decision; R08's norm/MMQ fusions and R10's
+  dispatcher will use the same arm shape (fusion ON vs OFF, text identical, rate moved).
+- The bf16 cache costs ~0.7 % prefill and ~2 % decode against f16 on this model at this size — i.e. it is
+  *not* a decode win here; the value of the block is the native (non-scratch) bf16 attention path, which the
+  prefill-logit gate and the FA op test grade, not a rate.
+- The `-ctk bf16 -ctv bf16` arm needs `-fa on`; with FA off the cache type falls back and the arm is vacuous.
 
 ---
 
