@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-index 2fe0655d1..aa7d8478b 100644
+index 2fe0655d1..db59bd097 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-@@ -283,9 +283,72 @@ int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend) {
+@@ -283,9 +283,115 @@ int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend) {
      return moe_cache_max_tok_dev(cuda_ctx->device);
  }
  
@@ -15,6 +15,24 @@ index 2fe0655d1..aa7d8478b 100644
 +// a partial-residency prefill's wall is the gather kernel -- i.e. how much a co-scheduled decode step
 +// could attack.  Event pairs are folded with one stream synchronize per 64 calls, so the total is
 +// accurate to within 64 gathers and the perturbation is one sync per 64.
++
++// The headroom test (`MOE_PROBE_PF_OVERLAP=2`): a compute-bound kernel launched on a SECOND stream right
++// after the gather.  It touches no global memory traffic beyond one store per block, so it models the
++// property a decode step needs -- SM work with no link use.  If the gather's own wall does not grow while
++// this runs, the gather's warps are waiting on the link and there is capacity to co-schedule into; if it
++// grows by ~the burn's duration, the device serialises and mechanism (D) has no window.
++static __global__ void pf_burn_kernel(float * out, int iters, float seed) {
++    float a = seed + (float) threadIdx.x;
++    float b = 1.000001f;
++    for (int i = 0; i < iters; ++i) {
++        a = __fmaf_rn(a, b, 0.5f);
++        b = __fmaf_rn(b, a, 1e-7f);
++    }
++    if (threadIdx.x == 0) {
++        out[blockIdx.x] = a + b;
++    }
++}
++
 +static const bool g_pf_probe = [] {
 +    const char * e = getenv("MOE_PROBE_PF_OVERLAP");
 +    return e != nullptr && e[0] != '\0' && atoi(e) != 0;
@@ -24,9 +42,14 @@ index 2fe0655d1..aa7d8478b 100644
 +    static const int CAP = 64;
 +    hipEvent_t ev0[CAP] = {};
 +    hipEvent_t ev1[CAP] = {};
++    hipEvent_t bv0[CAP] = {};
++    hipEvent_t bv1[CAP] = {};
++    hipStream_t burn_stream = nullptr;
++    float *     burn_out    = nullptr;
 +    int        n     = 0;
 +    long long  calls = 0;
 +    double     ms    = 0.0;
++    double     burn_ms = 0.0;
 +
 +    void begin(hipStream_t st) {
 +        if (n >= CAP) {
@@ -36,7 +59,19 @@ index 2fe0655d1..aa7d8478b 100644
 +            for (int i = 0; i < CAP; ++i) {
 +                (void) hipEventCreate(&ev0[i]);
 +                (void) hipEventCreate(&ev1[i]);
++                (void) hipEventCreate(&bv0[i]);
++                (void) hipEventCreate(&bv1[i]);
 +            }
++            const char * mode = getenv("MOE_PROBE_PF_OVERLAP");
++            if (mode != nullptr && atoi(mode) >= 2) {
++                (void) hipStreamCreateWithFlags(&burn_stream, hipStreamNonBlocking);
++                (void) hipMalloc((void **) &burn_out, 64 * sizeof(float));
++            }
++        }
++        if (burn_stream != nullptr) {
++            (void) hipEventRecord(bv0[n], burn_stream);
++            pf_burn_kernel<<<64, 256, 0, burn_stream>>>(burn_out, 2000000, 0.25f);
++            (void) hipEventRecord(bv1[n], burn_stream);
 +        }
 +        (void) hipEventRecord(ev0[n], st);
 +    }
@@ -53,11 +88,19 @@ index 2fe0655d1..aa7d8478b 100644
 +            float v = 0.0f;
 +            (void) hipEventElapsedTime(&v, ev0[i], ev1[i]);
 +            ms += v;
++            if (burn_stream != nullptr) {
++                float b = 0.0f;
++                (void) hipEventElapsedTime(&b, bv0[i], bv1[i]);
++                burn_ms += b;
++            }
 +        }
 +        calls += n;
 +        n = 0;
-+        fprintf(stderr, "MOE_PROBE_PF_OVERLAP: gather calls=%lld wall=%.1f ms (%.3f ms/call)\n",
-+                calls, ms, calls > 0 ? ms / (double) calls : 0.0);
++        fprintf(stderr, "MOE_PROBE_PF_OVERLAP: gather calls=%lld wall=%.1f ms (%.3f ms/call)"
++                        " burn=%.1f ms (%.3f ms/call) overlap=%.2f\n",
++                calls, ms, calls > 0 ? ms / (double) calls : 0.0,
++                burn_ms, calls > 0 ? burn_ms / (double) calls : 0.0,
++                (burn_ms > 0.0 && ms > 0.0) ? (burn_ms + ms) / fmax(ms, burn_ms) : 0.0);
 +    }
 +};
 +static pf_probe_ring g_pf_ring;
