@@ -32,12 +32,11 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 
 | rung | blk | source commit | conflicts | decisions | status |
 |---|---|---|---|---|---|
-| R00 | 00 | `de99fa2d0` | 4 (7 regions) | **D1, D2, D3** | **BLOCKED — waiting on D1/D2** (plan below) |
+| R00 | 00 | `de99fa2d0` | 4 (7 regions) | **D1 (decided: take upstream's), D2 (decided: carry)** | **READY** — decisions answered 2026-11-20, plan below |
 | R01 | 01 | `a94e2214c` | 0 | — | not started |
 | R02 | 02 | `cef19b032` | 5 | D5 | not started |
 | R03 | 03 | `36da15029` | 1 | — | not started |
-| R04 | 04 | `cfe40b5f9` | 2 | **D3** | not started |
-| R05 | 05 | `7362b5958` | 7 | — | not started |
+| R04 | 04 | `cfe40b5f9` | 2 | **D3** | not started || R05 | 05 | `7362b5958` | 7 | — | not started |
 | R06 | 06 | `f0564df7d` | 2 | D11 | not started |
 | R07 | 07 | `f5bdbefda` | 1 | D11 | not started |
 | R08 | 08 | `fe283f27c` | 9 | **D4**, D3, D11 | not started |
@@ -49,12 +48,12 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | R14 | 14 | `e88d45d9e` | 3 | — | not started |
 | R15 | 15 | `35a9ae985` | 0 | — | not started |
 | R16 | 16 | `286191b31` | 0 | D7 | not started |
-| R17 | T | `e159adfc2` | 0 | D10 | not started |
-| R18 | — | release | — | D14 (UI cache path) | not started |
+| R17 | T | `e159adfc2` | 0 | D10, **`TODO` #351 (the flint `-sm tensor` re-test)** | not started |
+| R18 | — | release | — | **`TODO` #352 (container `web` stage)** | not started |
 
 ---
 
-# R00 — block 00, foundation  ·  **BLOCKED**
+# R00 — block 00, foundation  ·  **READY (decisions answered 2026-11-20)**
 
 ```
 git cherry-pick de99fa2d0        # 37 files, +1145/-358
@@ -106,7 +105,7 @@ single-block helper for the 512-expert / 10-used shape (RDNA3_5 + RDNA4, measure
 pp2048 on gfx1201), gated by `GGML_CUDA_DISABLE_MMID_512`.  **It has to survive whatever D1 decides**, re-ported
 onto upstream's `store`/`ne_store` machinery if upstream's version wins.
 
-**Resolution (proposed, pending D1):** take upstream's `mmid.cu` wholesale
+**Resolution (decided 2026-11-20, `DECISIONS.md` D1):** take upstream's `mmid.cu` wholesale
 (`git checkout 919794500 -- ggml/src/ggml-cuda/mmid.cu`), then re-apply `mm_ids_helper_512_10` on top, adapted
 to the new helper's signature (`nbytes_shared`/`ne_store`).  Verify with `test-backend-ops -o MUL_MAT_ID`
 (gfx1201) and the 4B coherence arm.
@@ -157,10 +156,12 @@ the rung's commit id.
 
 ---
 
-## R18 — release ladder (do not start before R17 is green)
+### R18 — release ladder (do not start before R17 is green)
 
-1. **D14 first:** fix `scripts/ui-dist-cache.sh` for the `ui/` source path, or the per-block ladder pays one
-   HF download per rung (`TODO` #342).
+1. **`TODO` #352 first:** move the container `web` stage from `tools/ui/` to `ui/apps/chat` (+ `ui/lib/ui`,
+   `ui/lib/voice`) and the Priority-1 copy to `ui/apps/chat/dist`, else the container loses its embedded UI
+   (the HF-asset cache is already retired — `DECISIONS.md` D14, `WORKLOG.md` 261120.006 — so nothing else
+   needs seeding).
 2. `scripts/gate-per-block-build.sh --all` (a re-base is an `--all` case), plus `scripts/check-gpu-faults.sh`.
 3. The block-owned gates for every block whose code the re-base touched (see the *Pick the gate for what you
    changed* table in `AGENTS.md`).

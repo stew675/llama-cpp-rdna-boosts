@@ -112,13 +112,9 @@ configure_and_build() {
     local -a tgts
     if [ "$FAST" = 1 ]; then tgts=("${TARGETS_FAST[@]}"); else tgts=("${TARGETS_ALL[@]}"); fi
     if [ ! -f "$SCRATCH/$BUILD_DIR/CMakeCache.txt" ]; then
-        # Provision the embedded Web UI from the shared cache before the first configure (TODO #342): its
-        # cache lives in the BUILD dir, so a fresh one fetches from HuggingFace (`ui-assets.cmake` Priority 3)
-        # and a network hiccup fails the configure/build.  Priority 1 (`tools/ui/dist` in the source tree,
-        # untracked + gitignored) needs nothing but the files.
-        if [ -x "$REPO_DIR/scripts/ui-dist-cache.sh" ]; then
-            "$REPO_DIR/scripts/ui-dist-cache.sh" --checkout "$SCRATCH" | sed 's/^/    /'
-        fi
+        # The embedded web UI is OFF (see the configure below): `ui-assets.cmake` then fetches nothing from
+        # HuggingFace and runs no npm, so a fresh build dir is hermetic.  Nothing is provisioned (the
+        # retired `ui-dist-cache.sh` mirror is recorded in WORKLOG.md, TODO #342).
         echo "==> configure $SCRATCH/$BUILD_DIR"
         HIPCXX="$ROCM_DIR/lib/llvm/bin/clang" HIP_PATH="$ROCM_DIR" \
         cmake -S "$SCRATCH" -B "$SCRATCH/$BUILD_DIR" \

@@ -1,3 +1,64 @@
+## 261120.006 (r327) -- the HF-UI asset cache is retired: no delivery build fetches a UI bundle any more, and `TODO` #342 closes with it (no delivery change)
+
+**No delivery patch changed, no block created, split or renumbered, no release.**  This entry retires the
+HuggingFace UI-asset workaround the tooling has carried since r303 (`scripts/ui-dist-cache.sh` plus a
+pre-placed `tools/ui/dist` tree in the checkout) and records how the same problem is now handled.
+
+### What the hack was
+
+`ui-assets.cmake` provisions the embedded web UI from three sources in priority order: a pre-built
+`<src>/<ui>/dist`, an npm build, or a **HuggingFace bucket download cached inside the BUILD directory**.  The
+third is the problem: a fresh build dir re-downloads, and a freshened one is exactly what the per-block gate
+makes for every rung.  Measured r326: rung 14 died on `UI: download dist.tar.gz.sha256 ... "Timeout was
+reached"` and took 13 finished rungs with it.  A second failure mode is the upstream *content*: on 2026-11-17
+`latest` shipped no `workbox[hash].js`, which `ui-assets.cmake`'s validator rejects, so a fresh configure
+aborted outright.  The delivery's answer was to keep ONE validated bundle per machine
+(`~/.cache/rdna-boosts/ui-dist`) and mirror it into each checkout as `tools/ui/dist` (Priority 1, untracked and
+gitignored so it survived the gate's checkouts), with `HF_UI_VERSION=b12387` as the pin for a manual configure.
+
+### What it is now
+
+**Nothing is provisioned, because the UI is not built.**  Every delivery build that does not ship a UI now
+configures with `-DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF`:
+
+* `scripts/gate-per-block-build.sh` (already did) and `scripts/scratch-tree.sh` (already did) -- the cache call
+  is deleted, so nothing seeds a checkout any more;
+* `~/bin/build-llama-rocm` -- **new**, and the one user-visible change: a local canonical build now leaves the
+  UI out.  `UI=1` restores the old behaviour (prebuilt fetch from HF; `UI=1 BUILD_UI=1` for an npm build).
+
+With both flags off, `ui-assets.cmake` fetches nothing, runs no npm, and emits an empty asset table.  Measured
+on the pristine `919794500` tree: `-- UI: embedded 0 assets`, `libllama-ui.a` **1.8 KB** (against 3.1 MB for
+an embedded-UI build of the same tree, from a 13.5 MB generated `ui.cpp`), `llama-server` links and runs.
+A fresh-build-dir rung of the per-block gate on that tree -- the exact shape the ladder uses -- is now
+**90 s wall (30 s configure + 60 s build, warm ccache) with no network access of any kind**; before, the same
+configure fetched, validated, extracted and gzipped an 8.1 MB bundle of 291 assets first, with `TIMEOUT 30` on
+the checksum and `TIMEOUT 300` on the archive *per candidate* and two candidates tried (`b12597`, then
+`latest`).  In the happy path the UI is not a large build-time cost (provisioning 2 s, the `ui.cpp` TU 1.9 s);
+the hack's value was never speed, it was *not failing*, and the failure mode is now unreachable by
+construction rather than cached around.  Nothing needs pinning, seeding, checking or pruning.
+
+**The container build is unchanged and remains the one place a real UI is built**: its `web` stage runs npm and
+copies the result in as `ui-assets.cmake`'s Priority 1, so it never reaches the bucket or its validator.  That
+stage still targets the pre-r328 `tools/ui/` layout -- moving it to `ui/apps/chat` (+ `ui/lib/ui`,
+`ui/lib/voice`) is `TODO` **#352**, done at R18 of the re-base, because the change is only correct once the
+tree has the new layout.
+
+### What else this touches
+
+* `scripts/ui-dist-cache.sh` is **deleted**; `scripts/README.md`, `AGENTS.md`, `MANIFESTS.md` and
+  `INVARIANTS.md` (r303 fact 6) are corrected in place.
+* `TODO` **#342** is closed: its subject was "a broken upstream bundle breaks every fresh configure", and a
+  build that fetches no bundle cannot be broken by one.  The upstream content defect it was waiting on is
+  upstream's to fix and no longer affects the delivery.
+* Two new handles, both opened by this work: **#351** (does upstream now support `-sm tensor` for `flint`, i.e.
+  can the temporary block `0300` be dropped -- the maintainer asked for this test at the start of the r328
+  re-base) and **#352** (the container `web` stage's UI layout, above).
+* `upstream/mul-mat-id-dup/` is retired on the maintainer's decision (`wip/upstream-rebase-261120/DECISIONS.md`
+  `D1`): upstream `b94959a64` (`#32505`) landed duplicate-expert-id support itself, so the candidate has no
+  consumer.  Its record moved to `archive/work/upstream-mul-mat-id-dup-merged/`.
+
+---
+
 ## 261120.005 (r327) -- re-base campaign opened: 18 blocks `4f9dfa0e3` -> `919794500`, measured conflict map, 14 decision points, and the r278 base blocker is still live (no delivery change)
 
 **No delivery patch changed, no block created, split or renumbered, no release.**  This entry records the

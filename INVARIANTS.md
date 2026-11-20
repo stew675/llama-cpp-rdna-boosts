@@ -372,15 +372,21 @@
    the divergence predates r303 and gate 9's hard-arm invariant (r148, `GREEDY-PURITY.md`) does not currently
    hold on that class.  PPL is identical in both arms (2.1640), so it is ULP-class, not degenerate: it needs
    an owner (`TODO` #341) rather than a waiver, and the class's arms must not be quoted as a pass until then.
-6. **An upstream UI asset bundle can break every fresh SOURCE configure -- and only that one.**  On
-   2026-11-17 `ggml-org/llama-ui`'s `latest` (75 files) has no `workbox[hash].js`, so `ui-assets.cmake:137`
-   aborts a configure that has no `tools/ui/dist`: `gate-per-block-build.sh` (it wipes the build dir per
-   commit), a clean checkout, the hosted CI tiers.  Incremental builds never see it (the stamp caches the
-   resolved bundle) and **the container images are NOT affected**: `.devops/rdna-rocm.Dockerfile` builds the UI
-   in its `web` stage and `COPY --from=web /app/tools/ui/dist tools/ui/dist` runs BEFORE the cmake step, which
-   is `ui-assets.cmake`'s Priority 1 (pre-built assets win over npm and over the HF fetch, so a container build
-   neither downloads that bundle nor validates it).  The workaround where it does bite is
-   `HF_UI_VERSION=b12387` (the bundle `build-rocm` had stamped; it carries `workbox-b3c04f83.js`).
+6. **An upstream UI asset bundle can break every fresh SOURCE configure -- and only that one -- so the
+delivery no longer fetches one at all.**  On 2026-11-17 `ggml-org/llama-ui`'s `latest` (75 files) had no
+`workbox[hash].js`, so `ui-assets.cmake:137` aborted a configure that had no pre-built asset tree:
+`gate-per-block-build.sh` (it wipes the build dir per commit), a clean checkout, the hosted CI tiers.
+Incremental builds never saw it (the stamp caches the resolved bundle).  **Corrected at r328:** the delivery
+builds with `LLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF` everywhere it does not ship a UI (the per-block
+gate, `scripts/scratch-tree.sh`, `~/bin/build-llama-rocm`, `UI=1` opts back in), so `ui-assets.cmake` fetches
+nothing and runs no npm -- it emits `UI: embedded 0 assets` and a 1.8 KB `libllama-ui.a` (an embedded-UI
+build of the same tree is 3.1 MB from a 13.5 MB generated `ui.cpp`).  The `scripts/ui-dist-cache.sh` mirror and
+the `HF_UI_VERSION` pin are retired with it: the failure mode is gone by construction rather than cached
+around.  **The container images remain the one place a real UI is built** -- `.devops/rdna-rocm.Dockerfile`
+builds it in a `web` stage (npm) and copies the result in before the cmake step, which is
+`ui-assets.cmake`'s Priority 1, so a container build neither downloads nor validates the upstream bundle.
+That stage still targets the pre-r328 `tools/ui/` layout and moves to `ui/apps/chat` when the re-base lands
+(`TODO` #352).
 
 ## r304 (2026-11-17, `WORKLOG.md` 261117.003)
 

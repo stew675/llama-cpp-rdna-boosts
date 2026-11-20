@@ -45,12 +45,13 @@ left in this file.  The r236 re-base
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
-| **342** | upstream `ggml-org/llama-ui` `latest` has no `workbox[hash].js`, so a fresh SOURCE configure dies in `ui-assets.cmake:137` -- and `ui-assets.cmake`'s asset cache lives in the BUILD dir, so every fresh build dir (the per-block gate wipes it per commit) refetched from HF **inside its compile time** and failed the rung on a timeout | environment / waiting on upstream (the *tooling* half is FIXED, r326) | **WAITING (upstream content only)** — the delivery no longer depends on the fetch: `scripts/ui-dist-cache.sh` seeds one shared bundle (`~/.cache/rdna-boosts/ui-dist`, validated for `workbox*.js`) and mirrors it into a checkout's `tools/ui/dist` (untracked, gitignored, survives the gate's checkouts), `gate-per-block-build.sh` + `scripts/scratch-tree.sh` call it before their first configure, and both now configure with `LLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF`, so a rung with no cache builds without the embedded UI instead of fetching.  `HF_UI_VERSION=b12387` is still the pin for a *manual* configure that wants a real UI; re-check the upstream `latest` before dropping it — §342 |
 | **349** | `scripts/gate-server-arms.sh`'s `35b10` arm is not bit-reproducible on its **second slot** even with both of r324's fixes (a `MOE_EXPERT_HEATMAP=load` pin and a fixed-order admission): slot 0 is stable, slot 1 reads three different texts at three acceptances, because a 0.5 s stagger lands at a *variable* point in slot 0's prefill | tooling / gate (`TODO` #295's gate, gate 24 step 5c) | **OPEN** -- admit slot 1 on slot 0's first STREAMED TOKEN instead of on a clock; until then that arm's text is reported, not asserted (its acceptance checks stay hard, which is the collapse detector the arm exists for); §349 |
+| **351** | does upstream now support `-sm tensor` for `flint`?  If it does, the temporary block `0300` (`-sm relaxed-tensor`) can be dropped -- upstream's per-architecture refusal is the only reason the block exists | delivery structure / temporary block `0300` | **OPEN** -- re-tested at R17 of the r328 re-base (`wip/upstream-rebase-261120/`), on the real model this box has; §351 |
+| **352** | `.devops/rdna-rocm.Dockerfile`'s UI `web` stage still targets the pre-r328 `tools/ui/` layout; after the re-base it must build and copy `ui/apps/chat` (+ `ui/lib/ui`, `ui/lib/voice`) or the container silently loses its embedded UI and falls through to a HuggingFace fetch | release tooling (container build) | **OPEN** -- R18 of the r328 re-base, cannot be done before the tree moves; §352 |
 
 ## Handle numbering
 
-**New handles append after `#350`, the highest issued so far, so the next free handle is `#351`; a number is
+**New handles append after `#352`, the highest issued so far, so the next free handle is `#353`; a number is
 never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
 subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
 
@@ -182,23 +183,6 @@ arena is now read IN PLACE at any width (`MOE_EXPERT_PREFILL_IN_PLACE`: 1489.6 -
 `-sm tensor`, 3588.8 -> 4072.4 on the pool mirror).  Consolidating the three transports for a **partly resident**
 table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2026-11-10-prefill-in-place.md`.
 
-## 342. A broken upstream UI asset bundle breaks every fresh configure
-
-**Waiting on upstream** (r303). The llama-ui bucket's `latest` archive (75 files, 3.3 MB, 2026-11-17) has no
-`workbox[hash].js`, and `scripts/ui-assets.cmake:137` validates that file, so a configure with no
-`tools/ui/dist` aborts with `UI: missing required asset(s): workbox[hash].js`.  Incremental builds never see it
-(`build-rocm`'s stamp caches the resolved bundle), so it appears exactly where a source tree is configured
-fresh: `gate-per-block-build.sh` (wipes its build dir per commit), a clean checkout, the hosted CI tiers.
-
-**The container release path is NOT affected, verified on `radiance` for r303**: `.devops/rdna-rocm.Dockerfile`
-builds the UI in its own `web` stage (`npm ci` + `npm run build`) and copies it in before the cmake step
-(`COPY --from=web /app/tools/ui/dist tools/ui/dist`), which is `ui-assets.cmake`'s Priority 1 -- pre-built
-assets win over both npm and the HF fetch, so that build never downloads or validates the bucket's bundle.
-Do not add a `HF_UI_VERSION` pin to `build-containers.sh` for this.
-
-Where it does bite, `HF_UI_VERSION=b12387` (the bundle this box had stamped) carries `workbox-b3c04f83.js` and
-validates; the per-block gate's header records it.  Drop the pin when `latest` validates again.
-
 ## 349. `gate-server-arms.sh`'s `35b10` arm: slot 1 is not bit-reproducible
 
 **Open** (r324, found while re-recording the gate's anchors for the MoE reduction re-baseline).  The arm's
@@ -224,6 +208,56 @@ that got.  An order race became a timing race.
 release slot 1 on the first chunk) instead of on the clock; verify two runs on each of two builds reproduce;
 then restore an exact anchor.  Do not serialise the two requests -- with one sequence decoding at a time the
 arm cannot reach the shape it exists for.
+
+## 351. Does upstream now support `-sm tensor` for `flint`?  (block `0300`'s drop condition)
+
+**Open** (2026-11-20, opened by the maintainer at the start of the r328 re-base; the block-structure half is
+the maintainer's call).  The temporary block **`0300`** exists for one reason: upstream refuses `-sm tensor`
+for `flint` / `mellum` / `mistral4` because that architecture's MoE amax rescale needs a per-device scalar, and
+the delivery's `-sm relaxed-tensor` is the escape hatch.  The block is only kept while upstream refuses.
+
+**The test, on the model this box actually has** (`/llm/models/RecursiveAI/Flint/Q8_0/flint-Q8_0.gguf`,
+3 x R9700, `HIP_VISIBLE_DEVICES=0,1,2`):
+
+1. `-sm tensor` -- if it loads and decodes, upstream has grown support and `0300` can be retired.
+2. The refusal arm must still print upstream's own message and exit 1 on the r328 tree (`0300` only adds the
+   pointer to `-sm relaxed-tensor`).
+3. `-sm layer` vs `-sm relaxed-tensor` text identity (`--seed 42 --temp 0 -n 20`, hashed with
+   `scripts/extract-generated.py`): the r278 climb measured `103 chars sha=cc4fbc3e8367` both ways, so a
+   difference here is a defect, not a re-baseline.
+
+**Dropping `0300` is a maintainer decision, not a gate outcome** (`AGENTS.md` -> report findings before
+shipping): it changes the default apply set from 18 patches to 17.
+
+**Kept separate on purpose:** the `#30542` HIP-VMM revert is carried in block 00 for the **VMM pool** (the
+host-expert arena needs VMM; the reachable base hangs without the revert --
+`wip/upstream-rebase-261120/BASE-BLOCKER.md`), not for tensor-split support.  If the maintainer's intent was
+that the two are linked, the test above is what settles it: it runs with the revert in place, so a passing
+`-sm tensor` for `flint` cannot be an artifact of the revert's absence.
+
+## 352. The container `web` stage still targets the pre-r328 UI layout
+
+**Open** (2026-11-20, found while retiring the HF-UI asset cache at the start of the r328 re-base).  Upstream
+moved the embedded UI from `tools/ui/` to `ui/apps/chat` (the app) plus `ui/lib/ui` and `ui/lib/voice` (the
+sources the app compiles), and `scripts/ui-assets.cmake`'s Priority-1 pre-built path moved with it
+(`SRC_DIST_DIR = ui/apps/chat/dist`).
+
+`.devops/rdna-rocm.Dockerfile`'s `web` stage still does `WORKDIR /app/tools/ui`, `COPY tools/ui/ ./`, `npm ci`,
+`npm run build`, and the build stage copies
+`COPY --from=web /app/tools/ui/dist tools/ui/dist`.  On a post-r328 tree those COPYs fail (the directory does
+not exist); if they were merely relaxed, the assets would land where `ui-assets.cmake` no longer looks, so the
+container would fall through to a HuggingFace fetch -- exactly what the `web` stage exists to prevent.
+
+**Do it at R18 of the r328 re-base**, copying upstream's own shape (`.devops/cuda.Dockerfile` at `919794500`):
+`WORKDIR /app/ui/apps/chat`, `COPY ui/apps/chat/package*.json ./`, `npm ci`, `COPY ui/apps/chat/ ./`, then
+`ui/lib/ui/package.json`, `ui/lib/ui/src/lib/` and `ui/lib/voice/src/` into `/app/ui/lib/...`, `npm run build`,
+and in the build stage `COPY --from=web /app/ui/apps/chat/dist ui/apps/chat/dist`.
+
+It cannot be done earlier: the current release tree (`4f9dfa0e3`..r327) still has `tools/ui/`, so changing the
+Dockerfile now would break a container build of *that* tree.  Verify with
+`scripts/build-containers.sh --rocm 10.1 --arch gfx1201 --targets server` (a local smoke, no `--push`) and
+confirm the image's `llama-server` serves `index.html`.
+
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

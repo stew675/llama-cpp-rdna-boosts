@@ -80,13 +80,13 @@
 #                                subject in BASE..REV (release speedup: pass the
 #                                previous release tip); the tip is always built so
 #                                the final combination stays compiler-verified
-#   HF_UI_VERSION=b12387         NOT a gate option: an upstream breakage workaround.  Every commit here is
-#                                configured FRESH, so a broken `ggml-org/llama-ui` `latest` bundle aborts the
-#                                configure at `ui-assets.cmake:137` (missing `workbox[hash].js`) -- see `TODO.md`
-#                                #342 / `INVARIANTS.md` r303 item 6.  Export the pin for the gate window
-#                                (`HF_UI_VERSION=b12387 ./scripts/gate-per-block-build.sh ...`); incremental
-#                                builds never see it, which is why it bites exactly here.  Drop it when the
-#                                bundle validates again.
+#   HF_UI_VERSION=<tag>         NOT a gate option and no longer needed: every rung configures with
+#                                LLAMA_USE_PREBUILT_UI=OFF, so no UI bundle is fetched and a broken
+#                                `ggml-org/llama-ui` `latest` cannot abort a configure.  It remains
+#                                upstream's knob for a *manual* configure that wants a real embedded UI
+#                                (`ui-assets.cmake` validates the bundle; a `latest` with no `workbox*.js`
+#                                is rejected).  The delivery's own answer is not a pin but an off switch
+#                                -- `TODO` #342, `WORKLOG.md` 261120.006, `INVARIANTS.md` r303 item 6.
 #   --fast                       build the release profile per commit (the DEFAULT since r327):
 #                                ggml-hip, llama, llama-cli, llama-server, llama-bench,
 #                                llama-perplexity.  Drops the test and example/tool binaries; their
@@ -108,14 +108,14 @@
 #                                on that rung and the cumulative gate time; a finish line after each
 #                                rung adds the rungs still to go, so the end of the ladder is visible.
 #
-#   HF_UI_VERSION=<tag>          upstream's own knob (tools/ui/CMakeLists.txt) for the llama-ui
-#                                asset bundle a fresh configure downloads.  Unset (the default) it
-#                                resolves `latest`.  Set it when upstream publishes a bundle that
-#                                llama.cpp's validator rejects -- measured 2026-11-17: `latest`
-#                                (75 files) has no `workbox[hash].js`, so every block's configure dies
-#                                in ui-assets.cmake:137, while `HF_UI_VERSION=b12387` carries
-#                                `workbox-b3c04f83.js` and validates.  This gate wipes the build dir
-#                                per commit, so a broken upstream bundle hits it first.
+#   HF_UI_VERSION=<tag>          upstream's own knob (ui/apps/chat/CMakeLists.txt) for the llama-ui
+#                                asset bundle a fresh configure downloads.  NOT needed by this gate and
+#                                harmless when set: every rung configures with LLAMA_USE_PREBUILT_UI=OFF,
+#                                so no bundle is fetched at all and the server is built without the
+#                                embedded web UI.  It stays documented because a *manual* configure that
+#                                wants a real UI is the one place an upstream bundle problem (a `latest`
+#                                archive with no `workbox*.js`, which ui-assets.cmake rejects) can still
+#                                abort a configure -- measured 2026-11-17.
 #
 # Exit: 0 = every commit built, 1 = at least one failed, 2 = usage/prereq error.
 #
@@ -225,29 +225,16 @@ fi
 LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rboosts-per-block.XXXXXX")"
 ORIG_REF="$(git -C "$REPO" symbolic-ref -q --short HEAD || git -C "$REPO" rev-parse HEAD)"
 
-# UI ASSETS, BLOCKED BEFORE THE LADDER (TODO #342).  `scripts/ui-assets.cmake` caches the embedded Web UI
-# inside the BUILD dir, which this gate wipes per block commit, so by default every rung performs a
-# HuggingFace fetch inside its compile time -- and a network timeout fails the rung (measured r326: rung 14,
-# `UI: download dist.tar.gz.sha256 ... "Timeout was reached"`, 13 finished rungs discarded).  Priority 1 of
-# that script is a pre-built `tools/ui/dist` in the SOURCE tree (untracked + gitignored, so it survives the
-# per-rung checkouts); scripts/ui-dist-cache.sh maintains one shared copy per machine and mirrors it in.
-# The configure below also passes LLAMA_USE_PREBUILT_UI=OFF, so even with no cache a rung builds WITHOUT
-# the embedded UI (a warning, not a fetch) instead of depending on the network.
-UI_DIST_CACHE="$REPO_DIR/scripts/ui-dist-cache.sh"
-UI_ASSETS=0
-if [ -x "$UI_DIST_CACHE" ]; then
-    "$UI_DIST_CACHE" --checkout "$REPO" > "$LOG_DIR/ui-dist.log" 2>&1 && UI_ASSETS=1
-    sed 's/^/    /' "$LOG_DIR/ui-dist.log"
-fi
+# UI ASSETS: nothing to provision.  The embedded web UI is OFF for every rung (the configure below passes
+# LLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF), so `ui-assets.cmake` never fetches from HuggingFace and
+# never runs npm: it emits an empty asset table.  That is deliberate and it is why there is no asset cache
+# any more -- the previous `scripts/ui-dist-cache.sh` mirror existed only to stop each rung (whose build dir
+# this gate wipes) refetching the bundle inside its compile time, and a gate arm that wants the embedded UI
+# is not one of the things this gate measures (TODO #342; the retired cache is recorded in WORKLOG.md).
 echo "==> per-block build gate: $BASE..$TIP in $REPO (targets: $TARGETS)"
 echo "    logs: $LOG_DIR   build dir: $REPO/$BUILD_DIR   jobs: $JOBS"
 echo "    progress: a heartbeat every ${PROGRESS_SECS}s while a rung CONFIGURES or compiles (PROGRESS_SECS=0 disables)"
-if [ "$UI_ASSETS" -eq 1 ]; then
-    echo "    ui assets: pre-placed in $REPO/tools/ui/dist (Priority 1 -- no fetch inside any rung)"
-else
-    echo "    ui assets: NONE available -- rungs configure with LLAMA_USE_PREBUILT_UI=OFF and build without the"
-    echo "               embedded UI (seed a cache once: scripts/ui-dist-cache.sh --checkout $REPO)"
-fi
+echo "    ui assets: embedded UI off -- no HuggingFace fetch, no npm, no asset cache (LLAMA_USE_PREBUILT_UI=OFF)"
 if [ "$TARGETS" = "all" ]; then
     echo "    profile: --all (the r2 standard) -- measured ~35 min cold / ~55 min from a partial cache, because"
     echo "             tests/test-backend-ops.cpp is one ~5 min TU with several distinct contents.  Reserve it"

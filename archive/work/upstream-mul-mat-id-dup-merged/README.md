@@ -1,3 +1,22 @@
+# RETIRED (r328, 2026-11-20) — **upstream landed it**: `#32505`, not needed as a candidate any more
+
+`b94959a64` *CUDA: implement support for duplicate expert IDs (#32505)* (2026-11-19) implements the same
+feature in the backend: it removes the `[TAG_MUL_MAT_ID_DUPLICATE_ID]` caveat from `ggml.h`, reworks
+`mmid.cu` (+209) around a shared-memory `mm_ids_helper_store` + `check_experts<>`/`dump_store`, and
+restructures `mmf.cuh` (−245).  The delivery's block 00 carried a **port** of this candidate
+(`upstream/UPSTREAM-PR-mul-mat-id-dup.patch`) so the CUDA `MUL_MAT_ID` handled a repeated expert id; at the
+r328 re-base the maintainer's decision (`wip/upstream-rebase-261120/DECISIONS.md` `D1`) was **take upstream's,
+drop ours**, so block 00 no longer carries the port and this candidate has no consumer.
+
+The one thing that does **not** come from upstream, and must survive the r328 R00 rung, is the delivery's own
+`mm_ids_helper_512_10` fast path in `mmid.cu` (1024-thread single block for the 512-expert / 10-used shape,
+RDNA3_5 + RDNA4, +4.5 % pp16384 / +5.2 % pp2048 on gfx1201, kill switch `GGML_CUDA_DISABLE_MMID_512`), which
+has to be re-ported onto upstream's new helper signature.
+
+The record below is the candidate's own, unchanged (last re-cut against `a691b2345`, r252).
+
+---
+
 # UPSTREAM-PR: ggml-cuda — handle repeated expert ids in `MUL_MAT_ID`
 
 > **Upstream candidate** · re-cut 2026-11-10 against **`a691b2345`** (the current `release.json.base`), applies

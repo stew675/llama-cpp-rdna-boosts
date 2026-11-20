@@ -143,12 +143,23 @@ numerics; a difference there is recorded, not "fixed".
 5. `WORKLOG.md` gets **one** entry per *session* only when something delivery-affecting lands (an amendment,
    a promotion, the release).  The rung log lives here, not in `WORKLOG.md`.
 
-## §4  Open questions for the maintainer (asked 2026-11-20, before R00)
+## §4  Answers received (2026-11-20) and what changed in the tree as a result
 
-- **D1 (#30542 VMM revert)** — the standing decision at r278 was "carry the revert in block 00 until upstream
-  fixes it; drop it at the next re-base".  Upstream has **not** fixed it (`ggml-cuda.cu:709-712` still has the
-  reserve-and-halve retry), so the plan is to carry it again.  Confirm.
-- **D2 (#32505 duplicate expert ids)** — upstream landed the feature the delivery was carrying as an
-  upstream-PR port in block 00.  Recommendation: **take upstream's, drop ours**.  Needs the maintainer's word
-  because it deletes delivery code.
-- The other subsumption candidates (D3-D9 in `DECISIONS.md`) are stated now and resolved at their rung.
+- **D1 — decided: take upstream's `#32505`, drop block 00's carried port.**  The
+  `upstream/mul-mat-id-dup/` candidate is **retired** (moved to
+  `../../archive/work/upstream-mul-mat-id-dup-merged/`, index row removed), block 00 no longer carries it, and
+  the delivery's own `mm_ids_helper_512_10` fast path must be re-ported onto upstream's new helper signature at
+  R00.  `DECISIONS.md` D1 has the details.
+- **D2 — decided: carry the `#30542` revert again, "for now".**  The re-test that would let it go is tracked as
+  **`TODO` #351**: *does upstream now properly support `-sm tensor` for `flint`?* — the `0300`
+  (`-sm relaxed-tensor`) drop condition, tested at **R17** with the revert in place and the real model this box
+  has.  `DECISIONS.md` D2 records that the two mechanisms are separate (the revert is about the VMM pool the
+  host-expert arena needs).
+- **D11 — the maintainer wants both AMD MMQ/MMVQ tunings A/B'd and the better of each picked**, not assumed:
+  a concrete measurement plan (per knob, not per file) is in `DECISIONS.md` D11, run at R06/R07/R08.
+- **D14 — the HF-UI asset hack is retired and replaced by "no UI built where none is shipped".**  Done
+  2026-11-20, before R00: `scripts/ui-dist-cache.sh` deleted, `~/bin/build-llama-rocm` + both gate scripts
+  configure with `-DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF` (`UI=1` opts back in), the machine's
+  `~/.cache/rdna-boosts/ui-dist` and the checkout's `tools/ui/dist` removed, `TODO` #342 closed
+  (`WORKLOG.md` 261120.006).  The container `web` stage move is `TODO` #352 at R18.  This work is valid on
+  **both** bases (`LLAMA_USE_PREBUILT_UI` exists at `4f9dfa0e3`), so it did not have to wait for the climb.

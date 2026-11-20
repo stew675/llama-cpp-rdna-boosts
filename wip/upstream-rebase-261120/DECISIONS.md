@@ -20,7 +20,7 @@ Status: `OPEN` = waiting on the maintainer · `DECIDED` = answered, with the dat
 
 ---
 
-## D1 — `#32505` duplicate expert IDs subsumes block 00's carried upstream-PR port  ·  **OPEN**
+## D1 — `#32505` duplicate expert IDs subsumes block 00's carried upstream-PR port  ·  **DECIDED 2026-11-20: take upstream's, retire the candidate**
 
 **Claim.** Block 00 carries a *port* of the delivery's own upstream-PR candidate
 (`upstream/UPSTREAM-PR-mul-mat-id-dup.patch`) so the CUDA `MUL_MAT_ID` handles a repeated expert id.  Upstream
@@ -50,12 +50,27 @@ in the backend, removes the `[TAG_MUL_MAT_ID_DUPLICATE_ID]` caveat from `ggml.h`
 
 **Needs the maintainer because:** option 1 deletes delivery code and retires an `upstream/` candidate.
 
+**DECISION (maintainer, 2026-11-20): option 1 — take upstream's `mmid.cu`/`mmf.cuh`/`ggml.h`, drop the
+block-00 port, retire the `upstream/` candidate.**  Consequences for R00:
+
+- `git checkout 919794500 -- ggml/src/ggml-cuda/mmid.cu ggml/src/ggml-cuda/mmf.cuh` is the starting point for
+  those two paths, then the delivery's `mm_ids_helper_512_10` is re-ported onto upstream's new helper
+  signature (`nbytes_shared` / `ne_store`).  **That fast path is not upstream's and must survive**: 1024-thread
+  single block for the 512-experts / 10-used shape, RDNA3_5 + RDNA4, +4.5 % pp16384 / +5.2 % pp2048 on
+  gfx1201, kill switch `GGML_CUDA_DISABLE_MMID_512`.
+- `ggml.h`'s `[TAG_MUL_MAT_ID_DUPLICATE_ID]` caveat is gone on both sides, so that hunk becomes upstream's.
+- `upstream/mul-mat-id-dup/` is **retired** (moved to `archive/work/upstream-mul-mat-id-dup-merged/`, with the
+  reason in its README and the index row removed from `upstream/README.md`).  Recorded in `WORKLOG.md`
+  261120.006.
+- Everything else block 00 touches in `ggml-cuda.cu` (the band-uniformity / KV-split width work, the Meta
+  wrapper, the allocator fixes) is untouched by this decision and lands as planned.
+
 **Verification for option 1 (R00 exit):** `test-backend-ops -o MUL_MAT_ID` on gfx1201, plus the block-00
 `quantize_mmq_q8_1` item the port also fixed.
 
 ---
 
-## D2 — `#30542` HIP VMM pool: carry block 00's revert a second time  ·  **OPEN (re-confirm)**
+## D2 — `#30542` HIP VMM pool: carry block 00's revert a second time  ·  **DECIDED 2026-11-20: carry it (with a tracked re-test)**
 
 **Claim.** The r278 campaign's **BASE BLOCKER B1** is still live at `919794500`: the pristine base, built the
 way the delivery builds (`GGML_HIP_NO_VMM=OFF`, ROCm 10.1.0, gfx1201), never returns from its first GPU
@@ -79,6 +94,15 @@ compute.  The standing r278 decision was "carry the revert in block 00; drop it 
    arena, GTT store) cannot be verified that way, so the climb would carry unverified rungs.
 
 **Recorded at r278:** `archive/work/upstream-rebase-261113/BASE-BLOCKER.md` — nothing in it has expired.
+
+**DECISION (maintainer, 2026-11-20): carry the revert again — "for now".**  The re-test that would let it go
+is tracked as **`TODO` #351**: *does upstream now properly support `-sm tensor` for `flint`?*  That is the
+`0300` (`-sm relaxed-tensor`) drop condition, and the maintainer named it as the reason the escape hatch stays
+alive; `#351` records the exact arms (3-GPU `-sm tensor` load, the refusal arm, and `-sm layer` vs
+`-sm relaxed-tensor` text identity on `/llm/models/RecursiveAI/Flint/Q8_0/flint-Q8_0.gguf`).  It is run at
+R17, with the revert in place, so the result cannot be an artifact of the revert's absence.  Note the two
+mechanisms are *separate*: the revert restores the VMM pool the host-expert arena needs, and `0300` is the
+Flint/Mellum/Mistral4 split mode — `#351` says so explicitly, for whoever reads it next.
 
 ---
 
@@ -205,14 +229,32 @@ that `test-arg-parser` (block 02 touches it) still agrees.
 
 ---
 
-## D11 — upstream HIP/GCN MMQ + MMVQ tuning vs blocks 06/07/08  ·  **MERGE, measure**
+## D11 — upstream HIP/GCN MMQ + MMVQ tuning vs blocks 06/07/08  ·  **MERGE, measure — the maintainer wants both A/B'd and the better of each picked**
 
 Upstream retuned the AMD MMQ configs in a **new file** `mmq-config-gcn.cuh` (`b79696f1f` +128/−83,
 `2e53a0bab` +456/−237 incl. stream-K on GCN) and the MMVQ `ne11` gate for RDNA3_5 (`c7518dbec`).  The
 delivery's blocks 06/07/08 tune `mmq.cuh`, `mmq.cu`, `mmvq.cu` (wide-VDR MoE, Q6_K MMQ, verify-band WMMA) and
 carry their own per-arch defaults.  **Risk: double tuning** — a delivery default that silently overrides
-upstream's new table, or vice versa.  Resolve as "one source of truth per knob", then re-measure the MMB/MMVQ
-arms at R08 rather than assume.
+upstream's new table, or vice versa.
+
+**Maintainer's instruction (2026-11-20): assess both, run the performance tests, and pick the better of each
+change — do not assume either side.**  The measurement plan, run at R06/R07/R08 on the *same* build (one tree,
+kill switches instead of two builds wherever the switch already exists, which is most of them):
+
+| knob | arm A | arm B | measured by |
+|---|---|---|---|
+| MMQ config table (per type/J/cc) | upstream's `mmq-config-gcn.cuh` | the delivery's table | `llama-bench -p 512,2048,16384` + the 35B-A3B prefill shape, 3 reps, one device count |
+| MMVQ `ne11` gate (RDNA3_5) | upstream's | ours | `llama-bench -n 128` decode + the MoE decode shape |
+| Q6_K MMQ (block 07) | on (ours) | off (`GGML_CUDA_*` switch, else a two-build arm) | `llama-bench -p 512,2048` on a Q6_K-quantised model |
+| wide-VDR MoE (`vec_dot_*_moe`, block 07) | on | off on RDNA3_5 (already the default there) | the 1-GPU host-expert decode, `-n 128` |
+| MMB (block 06) | on | `GGML_CUDA_DISABLE_MMB`-equivalent | `llama-bench -p 2048,16384` |
+| few-row MMQ for `MUL_MAT_ID` (`#32065`) | upstream's dispatch | ours/MMB | the 35B-A3B prefill + `test-backend-ops -o MUL_MAT_ID` |
+
+Rules that decide the winner, in order: (1) the text is byte-identical on both arms; (2) prefill logits pass
+`gate-prefill-logits.sh` for a kernel change; (3) the faster arm wins **per knob**, not per file — the
+maintainer's instruction is "the best one of each change", so a mixed result (upstream's table, our VDR) is the
+expected shape and is a perfectly good outcome.  Never average two tables into a third without re-measuring.
+Record the numbers in `benchmarks/` and the choice in the rung log.
 
 ---
 
@@ -232,11 +274,26 @@ QSA/indexer/lazy-reader additions still sit on top, and re-run `gate-qwen4exp-qu
 
 ---
 
-## D14 — UI moved `tools/ui/` -> `ui/`  ·  **MERGE (tooling)**
+## D14 — UI moved `tools/ui/` -> `ui/`  ·  **DECIDED AND APPLIED 2026-11-20: the HF-asset hack is retired; no build fetches a UI bundle**
 
-The delivery's `scripts/ui-dist-cache.sh` (`TODO` #342) seeds `${checkout}/tools/ui/dist`; upstream's
-`scripts/ui-assets.cmake` now resolves `SRC_DIST_DIR = ${UI_SOURCE_DIR}/dist` with `UI_SOURCE_DIR = ui`.
-Priority-1 provisioning therefore misses, and the per-block release ladder would pay a HF download per rung
-again.  Fix the cache path before the **R18** ladder (not needed for a per-rung build, whose build dir keeps
-its own copy).  Verified today: the pristine base build fell back to `latest` after `b12597` returned
-`HTTP response code said error`, which is the same class of failure `TODO` #342 describes.
+The old workaround was `scripts/ui-dist-cache.sh`: one validated bundle per machine in
+`~/.cache/rdna-boosts/ui-dist`, mirrored into `${checkout}/tools/ui/dist` so `ui-assets.cmake`'s Priority 1
+never let a build reach the HuggingFace bucket (`TODO` #342: a per-build-dir cache re-fetched per rung, and r326
+rung 14 died on a timeout; `latest` also shipped a bundle with no `workbox*.js` on 2026-11-17, which the
+validator rejects).
+
+**The hack is gone and nothing replaces it**, because the delivery no longer builds a UI where it does not ship
+one.  Asked at the start of the re-base (the maintainer's stated reason for doing this re-base now), and the
+answer is the same on both bases — `LLAMA_USE_PREBUILT_UI` exists at `4f9dfa0e3` too:
+
+- `-DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF` in `gate-per-block-build.sh`, `scripts/scratch-tree.sh`
+  and **`~/bin/build-llama-rocm`** (`UI=1` opts back in; `BUILD_UI=1` adds the npm build).
+- `ui-assets.cmake` then fetches nothing and runs no npm: `-- UI: embedded 0 assets`, `libllama-ui.a` 1.8 KB
+  (an embedded-UI build of the same tree is 3.1 MB from a 13.5 MB generated `ui.cpp`).
+- `scripts/ui-dist-cache.sh` **deleted**; `HF_UI_VERSION` is no longer a workaround the gate needs.
+- `TODO` #342 **closed** (`WORKLOG.md` 261120.006); docs corrected in place (`INVARIANTS.md` r303 fact 6,
+  `MANIFESTS.md` gate 5, `AGENTS.md`, `scripts/README.md`).
+- **The container build still needs a real UI** and gets it from its own `web` stage (npm), which satisfies
+  Priority 1 without touching the bucket or the validator.  Its paths still target the pre-r328 `tools/ui/`
+  layout: moving them to `ui/apps/chat` (+ `ui/lib/ui`, `ui/lib/voice`) is **`TODO` #352**, done at R18
+  because a Dockerfile edit is only correct once the tree has the new layout.

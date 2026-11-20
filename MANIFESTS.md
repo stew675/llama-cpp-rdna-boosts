@@ -229,16 +229,16 @@ in CI.  The model-level gates are manual:
    full `FLASH_ATTN_EXT` arm is 7 381 cases and ~25 min, which is right when the change's own claim is "the op
    family still passes" (a contributor PR's evidence, or a default-on kernel change), and waste when the change
    is an opt-in scheduler path whose default path is unchanged -- there, the arms that matter are the census
-   non-vacuity and the text identity against the previous build.  **The UI fetch is blocked by tooling since r326 (`TODO` #342): nothing to do by hand.**
-   `ui-assets.cmake`'s asset cache lives in the BUILD dir, so before r326 every rung refetched the bundle from
-   HuggingFace *inside its compile time*, and a timeout failed the rung (measured r326: rung 14,
-   `UI: download dist.tar.gz.sha256 from b12387 failed: Timeout was reached` with `HF_UI_VERSION` pinned, 13
-   finished rungs discarded).  The gate now calls `scripts/ui-dist-cache.sh` before the loop (one validated
-   bundle per machine in `~/.cache/rdna-boosts/ui-dist`, mirrored into the checkout's `tools/ui/dist` --
-   Priority 1, untracked + gitignored so it survives the per-rung checkouts) **and** configures every rung with
-   `LLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF`, so a machine with no cache builds without the embedded UI
-   instead of touching the network.  `scripts/scratch-tree.sh` does the same.  (The container build satisfied
-   this by construction all along: its `web` stage copies a pre-built `tools/ui/dist` in.)  **Run it against the long-lived checkout** (its default
+   non-vacuity and the text identity against the previous build.  **The UI fetch is gone (r328):** the delivery now builds the
+   embedded UI **off** wherever it does not ship one (`-DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF` in
+   this gate, in `scripts/scratch-tree.sh` and in `~/bin/build-llama-rocm`), so `ui-assets.cmake` fetches
+   nothing from HuggingFace and runs no npm -- it emits `UI: embedded 0 assets` and a 1.8 KB
+   `libllama-ui.a`.  There is no asset cache to seed and nothing to pin: before r328 the asset cache lived in
+   the BUILD dir, so every rung refetched the bundle *inside its compile time* and a timeout failed the rung
+   (measured r326: rung 14, `UI: download dist.tar.gz.sha256 ... Timeout was reached`, 13 finished rungs
+   discarded).  `scripts/ui-dist-cache.sh` and the `HF_UI_VERSION=b12387` pin are retired with it (`TODO`
+   #342, `WORKLOG.md` 261120.006).  The container build is unaffected: its `web` stage supplies the assets as
+   `ui-assets.cmake`'s Priority 1.  **Run it against the long-lived checkout** (its default
    `--repo`, or `scripts/scratch-tree.sh gate`): ccache keys on the source path, so a per-arm worktree makes
    the first block a full cold build (measured: 5m56s / 85 CPU-min at a new path vs 8.6s for the same
    content at the established one).  The gate prints each commit's build time and the run's total; a first
