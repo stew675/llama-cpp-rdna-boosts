@@ -15,6 +15,14 @@ running at once do not read one text, non-deterministically, and the carrier is 
 device remap** (`GGML_MOE_DEVREMAP=0` reads one text 3/3; residency itself is refuted as the carrier — a
 different residency with the same text is measured).  A *prefill* context plus a *decode* context is the safe
 pair, which is the campaign's own arm.
+**Pass 12 built Task 2 and it LOST.**  The per-gather switch point is real (`splits = 120` per ubatch, and a
+sched yield callback + a decode-thread handshake now exist and run), but a phase-locked decoder is *worse*
+than a free-running one on both axes: 3-8 tokens at a p95 of 600+ ms against 32-35 tokens at p95 50 ms, because
+a lone queued burst is scheduled behind the prefill's deep kernel queue (queue depth, not phase, is what the
+hardware rewards).  Stream priority (genuinely applied -- the device reports least=1/greatest=-1) is a
+**measured no-op**.  So the campaign's mechanism reduces to **two contexts, free-running, driver-scheduled**:
+concurrency is the win, and every host-side policy we can express is neutral or worse.
+
 Then the physics, measured on the shallow-arena shape (arena **5000** MiB: 8 GiB does not fit two contexts)
 with a 4932-token prompt and 128 decoder tokens: prefill **2529 t/s** alone, **2457** with an idle second
 context (**−3 %**), **2172** ungated (**−11.3 %**), decoder gets **32-35 tokens** through the 2.27 s prefill at
@@ -373,6 +381,7 @@ promotion time, per `AGENTS.md`.
 | [`PROMPT.md`](PROMPT.md) | the first message to hand a cold session |
 | [`RESULTS-2026-11-20.md`](RESULTS-2026-11-20.md) | **passes 10-11**: the generic second KV-sharing context (its text oracle, the co-owner vs mirror distinction, the decode-band-remap collision), the VRAM cost of a second context, and the first overlap numbers + the gate sweep (prefill −11.3 %, decoder p95 49-53 ms, 79 % of a decode step charged) |
 | [`candidate-generic-second-context.patch`](candidate-generic-second-context.patch) | The pass-10 change as one patch against the delivery tree (`git diff` of the WIP branch `wip/prefill-overlap` in `~/llama.cpp` vs `rdna-boosts`): 8 files, +111/-23.  **WIP only** — it is not in `patches/`, no block was created or amended, and it is not applied to any checkout |
+| [`candidate-split-yield-and-priority.patch`](candidate-split-yield-and-priority.patch) | Task 2 as one patch: the sched-level per-gather yield callback, `llama_set_split_yield_callback`, and `llama_set_stream_priority` (a **measured loser** and a **measured no-op**; kept so a later session does not re-derive them) |
 | [`arms/two_ctx.cpp`](arms/two_ctx.cpp), [`arms/build-two-ctx.sh`](arms/build-two-ctx.sh) | the pass 10-11 instrument: one process, one model, two contexts; modes `single`/`dual`/`dual-parallel`/`pf-alone`/`dec-alone`/`pf-dec` (+ `TWO_CTX_GATE_F`, `TWO_CTX_REPS`, `TWO_CTX_B_BATCH`) |
 | [`RESULTS-2026-11-18.md`](RESULTS-2026-11-18.md) | **pass 1**: the ten-arm table, the four findings (the tier is free at 100 % residency; a partial arena costs ~56 %; the gather is 2.12x over staging and is the carrier now; the staging path is not a baseline), and the `G0`/`G1`/`G2` test that decides mechanism (D) |
 | `arms/arm.sh`, `arms/summ.sh` | the arm runner and the log re-parser (one summary line per arm, `F` from the delivery's own calibrated 28.7 GB/s H2D figure) |

@@ -26,6 +26,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -123,6 +125,77 @@ struct gate_t {
 
 static double now_ms() { return ggml_time_us() / 1000.0; }
 
+// --- the split-boundary switch (Task 2) ----------------------------------------------------------------
+// `llama_set_split_yield_callback` fires once per graph split that issued a MoE gather, after the gather is
+// enqueued and before the split's compute -- the campaign's per-layer window.  The prefill thread OFFERS a
+// window; the decoder thread is parked waiting for one, wakes, enqueues exactly ONE step on ITS OWN thread
+// (its own per-thread stream) and reports the enqueue; the prefill thread waits only for that report (bounded)
+// so the decoder's kernels are queued ahead of the split's compute.  A step is offered only while the decoder
+// is waiting and only `F x elapsed / step` of them have been placed -- HANDOVER §4.4's rule.
+struct yield_t {
+    std::mutex              m;
+    std::condition_variable cv;
+    uint64_t a_seq = 0;      // windows offered
+    uint64_t b_done = 0;     // windows the decoder has enqueued for
+    bool     b_ready = false;
+    bool     b_stop  = false;
+    bool     enabled = false;
+    bool     pf_running = false;
+    double   F = 1.0;
+    double   pf_start_ms = 0.0;
+    double   est_step_ms = 11.0;
+    int      placed = 0;
+    int      offered = 0;
+    int      skipped_not_ready = 0;
+    int      skipped_budget = 0;
+    double   wait_ms = 3.0;   // how long the prefill may stall for the decoder's enqueue
+    double   a_stall_ms = 0.0;
+    double   a_stall_max_ms = 0.0;
+};
+
+static void yield_offer(void * ud) {
+    auto * y = (yield_t *) ud;
+    std::unique_lock<std::mutex> lk(y->m);
+    if (!y->enabled || y->b_stop || !y->pf_running) { return; }
+    if (y->F <= 0.0)                                                 { y->skipped_budget++;  return; }
+    if (!y->b_ready)                                                 { y->skipped_not_ready++; return; }
+    const double budget = y->F * (now_ms() - y->pf_start_ms) / y->est_step_ms;
+    if ((double) y->placed >= budget)                                { y->skipped_budget++;  return; }
+
+    y->a_seq++;
+    y->offered++;
+    y->cv.notify_all();
+    const double t_w = now_ms();
+    y->cv.wait_for(lk, std::chrono::microseconds((long) (y->wait_ms * 1000.0)),
+                   [&] { return y->b_done >= y->a_seq || y->b_stop; });
+    const double d = now_ms() - t_w;
+    y->a_stall_ms += d;
+    if (d > y->a_stall_max_ms) { y->a_stall_max_ms = d; }
+}
+
+// the decoder: park for a window before a step.  Returns false when the prefill is over and the decoder
+// should go back to decoding freely.
+static bool yield_park(yield_t * y, uint64_t & seen) {
+    std::unique_lock<std::mutex> lk(y->m);
+    y->b_ready = true;
+    y->cv.notify_all();
+    y->cv.wait(lk, [&] { return y->a_seq > seen || y->b_stop || !y->pf_running; });
+    if (y->a_seq <= seen) {
+        y->b_ready = false;
+        return false;      // the prefill finished (or stopped): decode freely from here
+    }
+    seen = y->a_seq;
+    y->b_ready = false;
+    y->placed++;
+    return true;           // a window was granted: enqueue one step now
+}
+
+static void yield_enqueued(yield_t * y, uint64_t seen) {
+    std::lock_guard<std::mutex> lk(y->m);
+    y->b_done = seen;
+    y->cv.notify_all();
+}
+
 // --- the per-sequence runner ---------------------------------------------------------------------------
 struct seq_result {
     std::vector<llama_token> generated;
@@ -143,7 +216,8 @@ static seq_result run_seq(
         std::atomic<int>  * ready,
         gate_t * gate = nullptr,
         bool is_prefill = false,
-        bool is_decoder = false) {
+        bool is_decoder = false,
+        yield_t * yl = nullptr) {
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
     // a context sized for DECODE (a second context, n_batch = 8) ingests its prompt in small chunks
@@ -176,6 +250,11 @@ static seq_result run_seq(
     if (gate != nullptr && is_prefill) {
         gate->pf_start_ms.store(now_ms());
     }
+    if (yl != nullptr && is_prefill) {
+        std::lock_guard<std::mutex> lk(yl->m);
+        yl->pf_start_ms = now_ms();
+        yl->pf_running  = true;
+    }
 
     // prompt, in n_batch chunks (the last chunk asks for logits)
     llama_pos pos = 0;
@@ -192,6 +271,12 @@ static seq_result run_seq(
     res.t_prompt_ms = ggml_time_us() / 1000.0;
     if (gate != nullptr && is_prefill) {
         gate->pf_end_ms.store(res.t_prompt_ms);
+    }
+    if (yl != nullptr && is_prefill) {
+        std::lock_guard<std::mutex> lk(yl->m);
+        yl->pf_running = false;
+        yl->b_stop     = true;
+        yl->cv.notify_all();
     }
 
     // greedy loop: argmax over the last row, no sampler (the campaign's text oracle is plain greedy)
@@ -221,6 +306,14 @@ static seq_result run_seq(
                 std::this_thread::sleep_for(std::chrono::microseconds(500));
             }
         }
+        // Task 2: wait for the prefill to offer a window (only while it is running); the step is enqueued
+        // from THIS thread, so it lands on this thread's own per-thread stream
+        static uint64_t yl_seen = 0;
+        bool yl_window = false;
+        if (yl != nullptr && yl->enabled) {
+            yl_window = yield_park(yl, yl_seen);
+        }
+
         const double t_step = now_ms();
         if (!decode_chunk({ best }, pos, true)) {
             fprintf(stderr, "seq %d: decode failed at step %d\n", (int) seq_id, i);
@@ -228,6 +321,9 @@ static seq_result run_seq(
         }
         if (gate != nullptr && is_decoder) {
             gate->dec_spent_ms.store(gate->dec_spent_ms.load() + now_ms() - t_step);
+        }
+        if (yl != nullptr && yl_window) {
+            yield_enqueued(yl, yl_seen);
         }
         pos += 1;
     }
@@ -345,6 +441,19 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // wip/prefill-transfer-overlap: stream priorities, the hardware form of "spend the window, not the
+    // compute" -- a LOW decode context is scheduled only into the SMs the prefill's gathers leave idle.
+    if (const char * p = getenv("TWO_CTX_A_PRIO")) {
+        const int prio = strcmp(p, "low") == 0 ? -1 : (strcmp(p, "high") == 0 ? 1 : atoi(p));
+        printf("PRIO A = %d (%s)\n", prio, llama_set_stream_priority(ctx_a, prio) ? "set" : "NOT SUPPORTED");
+    }
+    if (ctx_b != nullptr) {
+        if (const char * p = getenv("TWO_CTX_B_PRIO")) {
+            const int prio = strcmp(p, "low") == 0 ? -1 : (strcmp(p, "high") == 0 ? 1 : atoi(p));
+            printf("PRIO B = %d (%s)\n", prio, llama_set_stream_priority(ctx_b, prio) ? "set" : "NOT SUPPORTED");
+        }
+    }
+
     printf("MODE %s  ctx A %s  ctx B %s\n", mode.c_str(),
            ctx_a ? "on" : "off", ctx_b ? (cparams.ctx_other_share_memory ? "on (KV shared with A)" : "on") : "off");
 
@@ -391,7 +500,15 @@ int main(int argc, char ** argv) {
         }
     } else if (mode == "pf-dec") {
         // THE CAMPAIGN'S PHYSICS ARM: A prefills the long prompt while B decodes.
-        gate_t gate;
+        gate_t  gate;
+        yield_t y;
+        if (const char * yy = getenv("TWO_CTX_YIELD")) {
+            y.enabled = atoi(yy) != 0;
+            y.F = getenv("TWO_CTX_GATE_F") ? atof(getenv("TWO_CTX_GATE_F")) : 1.0;
+            if (getenv("TWO_CTX_WAIT_MS")) { y.wait_ms = atof(getenv("TWO_CTX_WAIT_MS")); }
+            llama_set_split_yield_callback(ctx_a, yield_offer, &y);
+            printf("YIELD MODE: one decode step per gathered split, F=%.2f\n", y.F);
+        }
         if (const char * g = getenv("TWO_CTX_GATE_F")) {
             gate.enabled = true;
             gate.F = atof(g);
@@ -399,11 +516,11 @@ int main(int argc, char ** argv) {
         std::atomic<bool> go{false};
         std::atomic<int>  ready{0};
         seq_result ra, rb;
-        std::thread ta([&] { ra = run_seq(ctx_a, prompt_a, 4, seq_a, n_batch, &go, &ready, &gate, true, false); });
+        std::thread ta([&] { ra = run_seq(ctx_a, prompt_a, 4, seq_a, n_batch, &go, &ready, &gate, true, false, y.enabled ? &y : nullptr); });
         std::thread tb([&] {
             // B's own short prompt, then a long decode, in one call: the decode is what must overlap
             const std::string dec_prompt = prompt_b + " Give me a long list of numbers, one per line.";
-            rb = run_seq(ctx_b, dec_prompt, n_predict, seq_b, n_batch, &go, &ready, &gate, false, true);
+            rb = run_seq(ctx_b, dec_prompt, n_predict, seq_b, n_batch, &go, &ready, &gate, false, true, y.enabled ? &y : nullptr);
         });
         while (ready.load() < 2) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
         go.store(true);
@@ -414,6 +531,13 @@ int main(int argc, char ** argv) {
         char lbl[64];
         snprintf(lbl, sizeof(lbl), "pf-dec%s", gate.enabled ? " (gated)" : " (flat out)");
         report_itl(rb, ra, lbl);
+        if (y.enabled) {
+            std::lock_guard<std::mutex> lk(y.m);
+            printf("YIELD F=%.2f placed=%d offered=%d skipped(not-ready)=%d skipped(budget)=%d "
+                   "prefill_stall_ms=%.1f max=%.1f\n",
+                   y.F, y.placed, y.offered, y.skipped_not_ready, y.skipped_budget,
+                   y.a_stall_ms, y.a_stall_max_ms);
+        }
         if (gate.enabled) {
             printf("GATE F=%.2f decoder_spent_ms=%.1f prefill_wall_ms=%.1f\n",
                    gate.F, gate.dec_spent_ms.load(), ra.t_prompt_ms - ra.t_start_ms);
