@@ -4,6 +4,15 @@
 implemented, nothing in `patches/`.**
 Opened 2026-11-18 by the maintainer's instruction ("create the campaign").
 
+**Pass 6 (same night) found a THROUGHPUT win that is independent of the interleave.**  Two arms with the same
+gather call count and **2x different byte volumes** read the same per-call cost (2.605 vs 2.466 ms for ~43 vs
+~89 MiB), so the gather is **not transfer-bound at all** — it is dominated by per-call fixed work (the cache's
+global mutex, a 120-entry linear table scan, two 256-entry map rebuilds, a 1 KiB memcmp, two kernel launches),
+which is **~55 % of a shallow-arena prefill's wall** (448 calls x 2.47 ms = 1105 ms of 2031 ms).  Amortising
+that per-call work would be worth **~+85 % prefill on this shape** (`~2030 -> ~1100 ms`, an estimate) and is a
+**block 09/12** change needing the delivery's gates and the maintainer's go-ahead — not this campaign's
+mechanism.  It also re-frames the campaign: a cheaper gather shrinks the window *and* the wall.
+
 **Pass 5 (same night) stated the target numerically and quantified the budget.**  Smoothness A/B on the shallow
 arena (`arms/smooth.py`, `arms/smooth-2026-11-18.tsv`): with the duty cycle **off** the prefill keeps **3552
 t/s** but the decoder gets **one token per prefill step — ITL p50/p95 525/568 ms**; with it **on** the decoder's

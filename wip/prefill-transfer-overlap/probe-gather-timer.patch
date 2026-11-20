@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-index 2fe0655d1..d0af39c1a 100644
+index 2fe0655d1..d0f873b9d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-@@ -283,9 +283,130 @@ int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend) {
+@@ -283,9 +283,135 @@ int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend) {
      return moe_cache_max_tok_dev(cuda_ctx->device);
  }
  
@@ -49,9 +49,11 @@ index 2fe0655d1..d0af39c1a 100644
 +    int        n     = 0;
 +    long long  calls = 0;
 +    long long  burn_launches = 0;
++    double     host_ms = 0.0;   // HOST wall inside moe_cache_gather_host (bookkeeping + launches)
 +    double     ms    = 0.0;
 +    double     burn_ms = 0.0;
 +
++    void add_host(double ms_in) { host_ms += ms_in; }
 +    void begin(hipStream_t st) {
 +        if (n >= CAP) {
 +            drain(st);
@@ -115,6 +117,7 @@ index 2fe0655d1..d0af39c1a 100644
 +                        " burn=%.1f ms (%.3f ms/call) launches=%lld overlap=%.2f\n",
 +                calls, ms, calls > 0 ? ms / (double) calls : 0.0,
 +                burn_ms, calls > 0 ? burn_ms / (double) calls : 0.0, burn_launches,
++                host_ms, calls > 0 ? host_ms / (double) calls : 0.0,
 +                (burn_ms > 0.0 && ms > 0.0) ? (burn_ms + ms) / fmax(ms, burn_ms) : 0.0);
 +    }
 +};
@@ -126,7 +129,9 @@ index 2fe0655d1..d0af39c1a 100644
      ggml_cuda_set_device(ctx->device);   // issue #294: the scheduler leaves another split's device current
 +    if (g_pf_probe) {
 +        g_pf_ring.begin((hipStream_t) ctx->stream());
++        const int64_t t0 = ggml_time_us();
 +        const bool ok = moe_cache_gather_host(weight, weight_cpy, ids, ctx->stream(), ctx->device, slice_off, split_axis);
++        g_pf_ring.add_host((ggml_time_us() - t0) / 1000.0);
 +        g_pf_ring.end((hipStream_t) ctx->stream());
 +        return ok;
 +    }
