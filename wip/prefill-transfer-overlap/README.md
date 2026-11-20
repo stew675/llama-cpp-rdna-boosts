@@ -4,6 +4,22 @@
 implemented, nothing in `patches/`.**
 Opened 2026-11-18 by the maintainer's instruction ("create the campaign").
 
+**Pass 8 answered the ideal-scenario question: there the window is exactly ZERO.**  No `-ncmoe` at all
+(Q4_K_M, 6350 t/s solo prefill, `gather calls = 0`): the duty tax is the same −32 % as in both host-tier
+regimes, and the smoothest result of the three (ITL p95 during prefill **141.6 ms** vs 369 at a 100 % arena and
+519 at 42 %) purely because the prefill step is shortest.  Smoothness tracks the **prefill step time**, and the
+campaign's premise predicts nothing at full residency — (D) has no window to hide in and compute-vs-compute
+contention is charged 1:1 (pass 4).  **So this is a VRAM-starved-box mechanism and must be gated on a measured
+residency deficit, never shipped as a default.**
+
+**Pass 9: the one-gather-per-layer merge is REFUTED, and a much smaller win was found instead.**  The three
+roles are three different tables, so merging launches removes no bytes, and the per-call host work is 0.037 ms;
+what matters is the launch's *parallelism* — `moe_cache_gather_kernel`'s block count is `n_experts * n_split`
+with `n_split = 8`, a decode-band constant.  **`n_split` 8 -> 32 is worth −7.1 % of the prefill wall** on the
+84 %-residency arm (2134 -> 1983 ms, three interleaved reps each, text byte-identical) and −2.2 % at 42 %.
+Candidate: [`candidate-gather-nsplit.patch`](candidate-gather-nsplit.patch) (one constant + `MOE_GATHER_NSPLIT`),
+ready for the delivery's gates.
+
 **Pass 7 (same night) REFUTED pass 6's attribution, and restored the thesis with a caveat.**  Measured directly,
 the host body of `moe_cache_gather_host` is **0.037 ms per call** (1.5 % of 2.466) — so the per-call cost is the
 gather **kernel's own device time**, and `GGML_MOE_GATHER_ONCE=1` (one launch fewer) changes nothing.  With an

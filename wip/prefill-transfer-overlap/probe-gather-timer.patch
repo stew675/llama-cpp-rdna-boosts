@@ -140,3 +140,35 @@ index 2fe0655d1..e8e0e7b15 100644
      return moe_cache_gather_host(weight, weight_cpy, ids, ctx->stream(), ctx->device, slice_off, split_axis);
  }
  
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 2a43303cc..68813e17f 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -10113,9 +10113,24 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+     // and a zero laid down at one stride does not cover another's slots.
+     const int64_t head_pad = expert_bytes < 512 ? (int64_t) expert_bytes : 512;
+     device_guard dg(device);
+-    const int threads = 256;
+-    // 8 chunks/expert -> ~64 concurrent blocks for the usual 8 routed experts (see the kernel comment).
+-    const int n_split = 8;
++    // WIP probe (prefill-transfer-overlap campaign): the gather's launch shape.  The kernel's block count is
++    // `n_experts * n_split` and 8 was chosen for "~64 concurrent blocks for the usual 8 routed experts" -- a
++    // DECODE-band heuristic.  A prefill ubatch routes essentially every expert of the table, so the same
++    // constant leaves only 8 blocks per expert carrying a ~600 KiB-1 MiB copy each, and the measured
++    // per-call time is 2-3 ms for a volume that a 28.7 GB/s link would move in 1.5-3 ms: the copy is
++    // pipeline-limited, not link-limited, when the per-call volume is small (a high-residency arena).
++    static const int g_gather_nsplit = [] {
++        const char * e = getenv("MOE_GATHER_NSPLIT");
++        const int v = e != nullptr && e[0] != '\0' ? atoi(e) : 8;
++        return v < 1 ? 1 : (v > 256 ? 256 : v);
++    }();
++    static const int g_gather_threads = [] {
++        const char * e = getenv("MOE_GATHER_THREADS");
++        const int v = e != nullptr && e[0] != '\0' ? atoi(e) : 256;
++        return v < 32 ? 32 : (v > 1024 ? 1024 : v);
++    }();
++    const int threads = g_gather_threads;
++    const int n_split = g_gather_nsplit;
+     // The finite-head guard MUST run BEFORE the gather: the gather then overwrites every routed slot's
+     // head with real data, so only the non-routed slots keep the zero (which is all the finite-byte
+     // guard needs).  Launching it after the gather zeroes the routed experts' own first bytes and

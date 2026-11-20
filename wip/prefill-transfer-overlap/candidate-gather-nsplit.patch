@@ -1,0 +1,31 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 2a43303cc..124baacdd 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -10114,8 +10114,24 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
+     const int64_t head_pad = expert_bytes < 512 ? (int64_t) expert_bytes : 512;
+     device_guard dg(device);
+     const int threads = 256;
+-    // 8 chunks/expert -> ~64 concurrent blocks for the usual 8 routed experts (see the kernel comment).
+-    const int n_split = 8;
++    // Chunks per expert.  The block count is `n_experts * n_split`, and 8 was chosen for the DECODE band's
++    // shape ("~64 concurrent blocks for the usual 8 routed experts", see the kernel comment).  A PREFILL
++    // ubatch routes essentially every expert of the table, so the same constant leaves only 8 blocks per
++    // expert -- each carrying a 0.6-1 MiB copy -- and the copy is then pipeline-limited rather than
++    // link-limited whenever the per-call volume is small, which is exactly the high-residency arena.
++    // Measured (1 x R9700, gfx1201, 8.4 %-residency-agnostic arms, `-b 2048 -ub 2048`, a 4908-token prompt):
++    //   Q8_0 84 % residency: 8 -> 2134 ms prefill, 16 -> 2000, 32 -> 1983 (-7.1 %), 48 -> 2252, 128 -> 2342
++    //   Q4_K_M 42 % residency: 8 -> 2031 ms, 32 -> 1987 (-2.2 %)
++    // (three interleaved reps per point on the Q8_0 arm, spread < 0.3 %; greedy text byte-identical
++    //  `103 chars sha=8261876a1e61` at 8 and at 32).  32 is within noise of each arm's best, so it is the
++    // default; `MOE_GATHER_NSPLIT=8` restores the pre-change launch for an A/B.  `moe_cache_gather_kernel`
++    // partitions the expert's bytes by the split index (`chunk`/`s`), so this is a pure launch-shape change.
++    static const int g_gather_nsplit = [] {
++        const char * e = getenv("MOE_GATHER_NSPLIT");
++        const int v = e != nullptr && e[0] != '\0' ? atoi(e) : 32;
++        return v < 1 ? 1 : (v > 256 ? 256 : v);
++    }();
++    const int n_split = g_gather_nsplit;
+     // The finite-head guard MUST run BEFORE the gather: the gather then overwrites every routed slot's
+     // head with real data, so only the non-routed slots keep the zero (which is all the finite-byte
+     // guard needs).  Launching it after the gather zeroes the routed experts' own first bytes and
