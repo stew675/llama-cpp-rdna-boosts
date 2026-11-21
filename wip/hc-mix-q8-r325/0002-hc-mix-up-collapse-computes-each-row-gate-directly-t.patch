@@ -1,0 +1,185 @@
+From ab226630f04e54b07a15183e40fb33f6908f07bd Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Sat, 21 Nov 2026 02:38:37 +0000
+Subject: [PATCH 2/2] hc mix: up + collapse computes each row gate directly
+ (the reference butterfly over two chunk partials; GGML_CUDA_HC_UP_ROWS=0:
+ reference-block emulation)
+
+---
+ ggml/src/ggml-cuda/hc-mix.cu | 153 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 153 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index 688e2341f7..aef2a81e59 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -1075,6 +1075,143 @@ static __global__ void __launch_bounds__(S*256, 1) hc_mix_up_collapse_q8(
+     }
+ }
+ 
++// hc_mix_up_collapse_q8 without the reference-block emulation.  In the reference (the mmvq rpb=16
++// band kernel, vdr 2, 8 warps, items it = 8*warp + g + 64*m, lane = 4*g + p) the 10 items of row i (it = 10*i + k)
++// fall in exactly two 8-item chunks, each one warp's partial: chunk a = (10*i)/8 holds k < 8-o at g = o+k, chunk
++// a+1 holds the rest at g = k-(8-o), with o = (10*i)%8.  Every other lane contributes the +0.0 its acc starts from,
++// so a chunk's warp sum is the butterfly (xor 16, 8, 4 over g, then 2, 1 over p) with zero leaves, and the gate is
++// the sum of the two chunk partials (the other warps add +0.0; IEEE addition is commutative, so the warp order of the
++// two does not matter).  Here one thread holds one (row, phase p): its 10 weight items preloaded, 10 dots per token
++// as leaves 0.0f + dot, the g-levels of the butterfly in registers and the p-levels by two lane xors among the 4
++// lanes of the row.  Grid n_embd/32 x 512 threads: warp = (stream c, column octet), lane = 4*column + p.  The
++// collapse and its Q8_1 epilogue are hc_mix_up_collapse_q8's.  GGML_CUDA_HC_UP_ROWS=0: hc_mix_up_collapse_q8.
++template <int O>
++static __device__ __forceinline__ void hc_rows_chunks(const float (&d)[10], float & wa, float & wb) {
++    // chunk a: g = O..7 <- k = g-O; chunk b: g = 0..O+1 <- k = g+8-O; absent leaves are +0.0
++    float la[8], lb[8];
++#pragma unroll
++    for (int g = 0; g < 8; ++g) {
++        la[g] = g >= O ? d[g - O] : 0.0f;
++        lb[g] = g + 8 - O < 10 ? d[g + 8 - O] : 0.0f;
++    }
++    wa = ((la[0] + la[4]) + (la[2] + la[6])) + ((la[1] + la[5]) + (la[3] + la[7]));
++    wb = ((lb[0] + lb[4]) + (lb[2] + lb[6])) + ((lb[1] + lb[5]) + (lb[3] + lb[7]));
++}
++
++template <int NT>
++static __global__ void __launch_bounds__(512, 1) hc_mix_up_collapse_q8_rows(
++        const block_q8_1 * y_pre, const block_q8_0 * w, const float * xn, float * dst,
++        const int n_embd, const int hc, const float inv_hc,
++        const int64_t xn_stride_t, const int64_t dst_stride_t, block_q8_1 * q8, const int64_t q8_stride_t) {
++    constexpr int BPR = 10;
++    constexpr int HC  = 4;
++    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
++    static_assert(vdr == 2 && QI8_0/vdr == 4, "the chunk geometry assumes 4 lanes per item (vdr 2)");
++    extern __shared__ block_q8_1 y_s[];   // [NT][BPR]
++    __shared__ float gate_s[NT][HC][32];
++    const int lane = threadIdx.x;
++    const int c    = threadIdx.y / 4;
++    const int col  = 8*(threadIdx.y % 4) + lane/4;
++    const int p    = lane % 4;
++    const int kqs  = vdr*p;
++    const int row  = c*n_embd + 32*blockIdx.x + col;
++
++    int   wq[BPR][vdr];
++    float wd[BPR];
++    const block_q8_0 * wr = w + (int64_t) row*BPR;
++#pragma unroll
++    for (int k = 0; k < BPR; ++k) {
++#pragma unroll
++        for (int j = 0; j < vdr; ++j) {
++            wq[k][j] = get_int_b2(wr[k].qs, kqs + j);
++        }
++        wd[k] = wr[k].d;
++    }
++    {
++        const int * src = (const int *) y_pre;
++        int * dstw = (int *) y_s;
++        constexpr int nw = NT*BPR*sizeof(block_q8_1)/sizeof(int);
++        for (int k = 32*threadIdx.y + lane; k < nw; k += 32*16) {
++            dstw[k] = src[k];
++        }
++    }
++    __syncthreads();
++
++    const int o = (10*(row % 16)) % 8;
++#pragma unroll
++    for (int t = 0; t < NT; ++t) {
++        float d[BPR];
++#pragma unroll
++        for (int k = 0; k < BPR; ++k) {
++            const block_q8_1 * yb = &y_s[t*BPR + k];
++            int u[vdr];
++#pragma unroll
++            for (int j = 0; j < vdr; ++j) {
++                u[j] = get_int_b4(yb->qs, kqs + j);
++            }
++            float acc = 0.0f;
++            acc += vec_dot_q8_0_q8_1_impl<float, vdr>(wq[k], u, wd[k], __low2half(yb->ds));
++            d[k] = acc;
++        }
++        float wa, wb;
++        switch (o) {
++            case 0:  hc_rows_chunks<0>(d, wa, wb); break;
++            case 2:  hc_rows_chunks<2>(d, wa, wb); break;
++            case 4:  hc_rows_chunks<4>(d, wa, wb); break;
++            default: hc_rows_chunks<6>(d, wa, wb); break;
++        }
++        wa += __shfl_xor_sync(0xFFFFFFFF, wa, 2, 32);
++        wb += __shfl_xor_sync(0xFFFFFFFF, wb, 2, 32);
++        wa += __shfl_xor_sync(0xFFFFFFFF, wa, 1, 32);
++        wb += __shfl_xor_sync(0xFFFFFFFF, wb, 1, 32);
++        if (p == 0) {
++            gate_s[t][c][col] = wa + wb;
++        }
++    }
++    __syncthreads();
++    if (threadIdx.y >= NT) {
++        return;
++    }
++    const int t = threadIdx.y;
++    const int j = 32*blockIdx.x + lane;
++    const float * xn_t = xn + (int64_t) t*xn_stride_t;
++    float * dst_t = dst + (int64_t) t*dst_stride_t;
++    float gate[HC];
++#pragma unroll
++    for (int cc = 0; cc < HC; ++cc) {
++        gate[cc] = gate_s[t][cc][lane];
++    }
++    // hc_mix_up_collapse_q8's collapse and Q8_1 epilogue verbatim
++    float xi;
++    {
++#pragma clang fp contract(off)
++        float pp[8];
++        for (int cc = 0; cc < hc; ++cc) {
++            const float g = 1.0f / (1.0f + expf(-gate[cc]));
++            pp[cc] = xn_t[cc*n_embd + j] * g;
++        }
++        float sum = pp[0];
++        for (int cc = 1; cc < hc; ++cc) {
++            sum = sum + pp[cc];
++        }
++        xi = sum * inv_hc;
++    }
++    dst_t[j] = xi;
++    if (q8 == nullptr) {
++        return;
++    }
++    float amax = fabsf(xi);
++    amax = warp_reduce_max<QK8_1>(amax);
++    const float  dd = amax / 127.0f;
++    const int8_t q  = amax == 0.0f ? 0 : roundf(xi / dd);
++    const int  isum = warp_reduce_sum<QK8_1>((int) q);
++    block_q8_1 * y = q8 + (int64_t) t*q8_stride_t + j/QK8_1;
++    y->qs[lane] = q;
++    if (lane == 0) {
++        y->ds = make_half2(dd, dd * isum);
++    }
++}
++
+ // ---------------------------------------------------------------------------------------------------------------
+ // BF16 hc weights (Flash-Next GSQ-RCO). The unfused decode chain for BF16 weights is
+ //   rms_norm*gamma -> mul_mat_vec_f<bf16, 256> (down, K = hc_dim) -> scale+silu -> mul_mat_vec_f_vb<bf16, 160, 4>
+@@ -1799,6 +1936,22 @@ static void ggml_cuda_op_hc_mix_q8(ggml_backend_cuda_context & ctx, ggml_tensor
+             case 2: ggml_cuda_kernel_launch(hc_mix_up_collapse_q8<NT, 2>, ggml_cuda_kernel_launch_params{block_nums, dim3(32, 16), smem, stream}, y_v, (const block_q8_0 *) w_up->data, xn, dst_d, (int) n_embd, (int) hc_dim, hc, 1.0f / (float) hc, hc_dim, mixed_stride_t, q8, q8_stride_t); break; \
+             default: ggml_cuda_kernel_launch(hc_mix_up_collapse_q8<NT, 1>, ggml_cuda_kernel_launch_params{block_nums, dim3(32, 8), smem, stream}, y_v, (const block_q8_0 *) w_up->data, xn, dst_d, (int) n_embd, (int) hc_dim, hc, 1.0f / (float) hc, hc_dim, mixed_stride_t, q8, q8_stride_t); break; \
+         } } while (0)
++        static const bool up_rows = [] { const char * e = getenv("GGML_CUDA_HC_UP_ROWS"); return !e || std::atoi(e); }();
++        if (up_rows) {
++            const ggml_cuda_kernel_launch_params lp = {block_nums, dim3(32, 16), smem, stream};
++#define HC_UP_ROWS(NT) ggml_cuda_kernel_launch(hc_mix_up_collapse_q8_rows<NT>, lp, y_v, (const block_q8_0 *) w_up->data, xn, dst_d, (int) n_embd, hc, 1.0f / (float) hc, hc_dim, mixed_stride_t, q8, q8_stride_t)
++            switch (n_tokens) {
++                case 1: HC_UP_ROWS(1); break;
++                case 2: HC_UP_ROWS(2); break;
++                case 3: HC_UP_ROWS(3); break;
++                case 4: HC_UP_ROWS(4); break;
++                case 5: HC_UP_ROWS(5); break;
++                case 6: HC_UP_ROWS(6); break;
++                case 7: HC_UP_ROWS(7); break;
++                default: HC_UP_ROWS(8); break;
++            }
++#undef HC_UP_ROWS
++        } else
+         switch (n_tokens) {
+             case 1: HC_UP_FUSE(1); break;
+             case 2: HC_UP_FUSE(2); break;
+-- 
+2.53.0
+
