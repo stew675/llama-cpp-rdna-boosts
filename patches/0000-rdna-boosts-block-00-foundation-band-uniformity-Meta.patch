@@ -1,4 +1,4 @@
-From e46488ed555ed0d3f2da4af5cc4f0722278e9744 Mon Sep 17 00:00:00 2001
+From fbfa73317801d6fe955360331ed42a8528ee8735 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 19 Nov 2026 18:21:41 -0600
 Subject: [PATCH 00/17] rdna-boosts: block 00: foundation - band-uniformity,
@@ -83,6 +83,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
 ---
  common/arg.cpp                                |  23 ++-
  common/speculative.cpp                        |  10 +-
+ ggml/src/ggml-alloc.c                         | 121 +++++++++++-
  ggml/src/ggml-backend-meta.cpp                | 111 +++++++++--
  ggml/src/ggml-cpu/llamafile/sgemm.cpp         |   8 +-
  ggml/src/ggml-cuda/fattn-common.cuh           |  10 +-
@@ -116,7 +117,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  tools/completion/README.md                    |   2 +-
  tools/llama-bench/llama-bench.cpp             |  10 +-
  tools/server/README.md                        |   2 +-
- 35 files changed, 948 insertions(+), 262 deletions(-)
+ 36 files changed, 1068 insertions(+), 263 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index a63823767..9e0290dd5 100644
@@ -173,6 +174,187 @@ index b40eb5535..77bb6d458 100644
          chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
  
          llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ is_mem_shared);
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index 65d2bea27..d7933f00b 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -18,6 +18,27 @@
+ //#define AT_PRINTF(...) GGML_LOG_DEBUG(__VA_ARGS__)
+ #define AT_PRINTF(...)
+ 
++// GGML_GLU_INPLACE (on unless 0): a GLU may take the memory of its gate, so an FFN's gate, up and GLU output
++// are not all live at once.  The allocator's own preconditions do the gating -- the parent must have the same
++// layout (the two-input form: the one-input form halves ne[0] and never qualifies) and exactly one reader with
++// no views -- so the saving is the gate buffer itself: Qwen3.8-27B UD-Q4_K_XL, 1 GPU, -ub 2048, -fa 1, -c 16384:
++// 624.97 -> 475.37 MiB of compute buffer, and +7.1 % greedy decode on the 35B-A3B host-expert shape at
++// -ncmoe 40 --host-experts pool (see WORKLOG.md r323 and benchmarks/2026-11-19-glu-inplace.md).  The kernels
++// that write a GLU read the element at index i of BOTH operands before writing index i of the output, so
++// dst == src0 is safe on the CPU (ggml_vec_*glu_*, no restrict), CUDA/HIP (unary_gated_op_kernel), Metal
++// (kernel_*glu), Vulkan/SYCL/WebGPU/OpenCL (one element per invocation).  Only the GATE is ever taken (see
++// ggml_gallocr_allocate_node): a backend whose gated GLU is a chain would break on the up operand.
++// The switch exists for A/B and bisection; text and prefill logits are bit-identical with it on and off
++// (KLD 0.000000 / same-top-p 100.000 % on the canonical point).
++static bool ggml_glu_inplace(void) {
++    static int on = -1;
++    if (on < 0) {
++        const char * e = getenv("GGML_GLU_INPLACE");
++        on = e == NULL || atoi(e) != 0;
++    }
++    return on != 0;
++}
++
+ // ops that return true for this function must not use restrict pointers for their backend implementations
+ bool ggml_op_can_inplace(enum ggml_op op) {
+     switch (op) {
+@@ -42,6 +63,9 @@ bool ggml_op_can_inplace(enum ggml_op op) {
+         case GGML_OP_SOFT_MAX_BACK:
+             return true;
+ 
++        case GGML_OP_GLU:
++            return ggml_glu_inplace();
++
+         default:
+             return false;
+     }
+@@ -488,6 +512,10 @@ struct ggml_gallocr {
+     struct node_alloc * node_allocs; // [n_nodes]
+     int n_nodes;
+ 
++    // fingerprint of the graph the recorded layout (node_allocs/leaf_allocs) was computed for; see
++    // ggml_gallocr_graph_fp
++    uint64_t layout_fp;
++
+     struct leaf_alloc * leaf_allocs; // [n_leafs]
+     int n_leafs;
+ };
+@@ -593,6 +621,42 @@ static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor
+         || ggml_gallocr_is_own(galloc, t); // tensor will be allocated by galloc
+ }
+ 
++// FNV-1a over a per-tensor descriptor: a fingerprint of everything the linear-scan layout depends
++// on -- the node/leaf order, the op (which decides in-place eligibility), the element type and shape
++// (which decide the sizes) and the input/output/compute flags (outputs are never freed, and inputs
++// are allocated up front, so both change the plan).  Two graphs with the same fingerprint get the
++// same layout; a different one must not reuse node_allocs positionally -- that would hand a tensor
++// the address the plan gave to some unrelated tensor, which may be a block the plan recycles.
++//
++// This is not hypothetical: a graph built by ggml_build_forward_select (in-graph sampling, one chain
++// per sequence x output row) keeps its node count but changes both its node order and which tensors
++// are outputs when a different chain is selected, e.g. when another sequence starts drafting.
++static uint64_t ggml_gallocr_graph_fp(const struct ggml_cgraph * graph) {
++    uint64_t h = 1469598103934665603ull;
++
++    const uint32_t flags_mask = GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_COMPUTE;
++
++    const int n_tensors = graph->n_nodes + graph->n_leafs;
++    for (int i = 0; i < n_tensors; ++i) {
++        const struct ggml_tensor * t = i < graph->n_nodes ? graph->nodes[i] : graph->leafs[i - graph->n_nodes];
++
++        uint64_t v = (uint64_t) t->op;
++        v = v*0x100000001b3ull ^ (uint64_t) t->type;
++        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
++            v = v*0x100000001b3ull ^ (uint64_t) t->ne[d];
++        }
++        v = v*0x100000001b3ull ^ (uint64_t) (t->view_src != NULL);
++        v = v*0x100000001b3ull ^ (uint64_t) (t->flags & flags_mask);
++
++        h = (h ^ v) * 1099511628211ull;
++    }
++
++    // the node/leaf split itself is part of the plan
++    h = (h ^ ((uint64_t) graph->n_nodes << 32 | (uint32_t) graph->n_leafs)) * 1099511628211ull;
++
++    return h;
++}
++
+ // free the extra space at the end if the new tensor is smaller
+ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_tensor * node, struct ggml_tensor * parent) {
+     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+@@ -627,7 +691,14 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+ 
+         // try to reuse a parent's buffer (inplace)
+         if (ggml_op_can_inplace(node->op)) {
+-            for (int i = 0; i < GGML_MAX_SRC; i++) {
++            // GGML_OP_GLU may take only its FIRST operand (the gate).  The streaming GLU kernels read both
++            // operands before they write, so either would be safe there, but the gate and the up are symmetric
++            // in an FFN and a backend whose gated GLU is a chain must not see the up aliased: CANN runs
++            // `aclnn Silu` into dst and then `aclnnInplaceMul(dst, src1)`, which would multiply the destroyed
++            // up operand by itself and lose the gate.  dst == src0 there is the in-place UNARY path CANN
++            // already runs for GGML_OP_UNARY.  See ggml_glu_inplace() above.
++            const int n_src_inplace = node->op == GGML_OP_GLU ? 1 : GGML_MAX_SRC;
++            for (int i = 0; i < n_src_inplace; i++) {
+                 struct ggml_tensor * parent = node->src[i];
+                 if (parent == NULL) {
+                     continue;
+@@ -757,6 +828,41 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
+         }
+     }
+ 
++    // a view node that is never used as a source keeps its view source's n_views count elevated
++    // forever: the free pass below only decrements that count when the view itself is released, which
++    // never happens for a node with no consumers (e.g. a ggml_cpy expanded into the graph purely for
++    // its side effect - the "copy into a view of preallocated memory" idiom). The inflated count
++    // blocks both the view source's release and its in-place reuse, so the buffer grows by the size of
++    // every such view source. Fold those contributions in here, while the child counts are final.
++    // Graph outputs are exempt: they are never freed and may alias the view source, which must stay
++    // allocated for the application to read it.
++    for (int i = 0; i < graph->n_nodes; i++) {
++        struct ggml_tensor * node = graph->nodes[i];
++
++        if (!ggml_impl_is_view(node) || node->op == GGML_OP_NONE) {
++            continue;
++        }
++        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
++            continue;
++        }
++
++        struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
++        if (hn->n_children != 0) {
++            continue;
++        }
++
++        struct ggml_tensor * view_src = node->view_src;
++        struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
++        view_src_hn->n_views -= 1;
++
++        AT_PRINTF("unused view %s: view_src %s: %d children, %d views\n",
++            node->name, view_src->name, view_src_hn->n_children, view_src_hn->n_views);
++
++        if (view_src_hn->n_views == 0 && view_src_hn->n_children == 0 && view_src_hn->allocated) {
++            ggml_gallocr_free_node(galloc, view_src);
++        }
++    }
++
+     // allocate tensors
+     for (int i = 0; i < graph->n_nodes; i++) {
+         struct ggml_tensor * node = graph->nodes[i];
+@@ -844,6 +950,10 @@ static bool ggml_gallocr_reserve_n_impl(
+     // allocate in hash table
+     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+ 
++    // the layout now describes this graph; note the failure case leaves it recorded too, which the
++    // caller must handle (a failed buffer allocation is reported through the return value)
++    galloc->layout_fp = ggml_gallocr_graph_fp(graph);
++
+     // set the node_allocs from the hash table
+     if (galloc->n_nodes < graph->n_nodes) {
+         free(galloc->node_allocs);
+@@ -1018,6 +1128,15 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
+         return true;
+     }
+ 
++    // node_allocs/leaf_allocs are applied positionally, so the layout only holds for a graph with the
++    // same node order, ops, shapes and output/input markings (see ggml_gallocr_graph_fp)
++    if (galloc->layout_fp != ggml_gallocr_graph_fp(graph)) {
++#ifndef NDEBUG
++        GGML_LOG_DEBUG("%s: graph topology changed (fingerprint mismatch)\n", __func__);
++#endif
++        return true;
++    }
++
+     for (int i = 0; i < graph->n_nodes; i++) {
+         struct ggml_tensor * node = graph->nodes[i];
+         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
 index 595a5824a..930b58fb4 100644
 --- a/ggml/src/ggml-backend-meta.cpp

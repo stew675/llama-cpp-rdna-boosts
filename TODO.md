@@ -55,11 +55,13 @@ none is an r329 deliverable.  A green gate ladder is still not permission to ski
 | **349** | `scripts/gate-server-arms.sh`'s `35b10` arm is not bit-reproducible on its **second slot** even with both of r324's fixes (a `MOE_EXPERT_HEATMAP=load` pin and a fixed-order admission): slot 0 is stable, slot 1 reads three different texts at three acceptances, because a 0.5 s stagger lands at a *variable* point in slot 0's prefill | tooling / gate (`TODO` #295's gate, gate 24 step 5c) | **OPEN** -- admit slot 1 on slot 0's first STREAMED TOKEN instead of on a clock; until then that arm's text is reported, not asserted (its acceptance checks stay hard, which is the collapse detector the arm exists for); §349 |
 | **351** | does upstream now support `-sm tensor` for `flint`?  If it does, the temporary block `0300` (`-sm relaxed-tensor`) can be dropped -- upstream's per-architecture refusal is the only reason the block exists | delivery structure / temporary block `0300` | **OPEN, ANSWERED for r328** -- re-tested at R17 of the re-base on the real model this box has: **it cannot be dropped** (flint still refuses `-sm tensor` at `919794500`, while `-sm relaxed-tensor` is byte-identical to `-sm layer`); re-test at the next re-base; §351 |
 | **353** | no Inkling-2 model loads at `919794500`: the looped family needs support this snapshot lacks — Unsloth's file is `arch = inkling2` with 24 physical blocks but `block_count = 48` + `num_loops = 3` (the loader has no loop, so it asks for `blk.24.*`), and **GGML's reference file is `arch = inkling2_loop`, which this tree does not know at all** | upstream model support / validation target | **OPEN (waiting on upstream)** -- the pristine base repeats both failures and r327 knows neither arch, so no delivery change is involved; it blocks the only local validation of upstream's per-head FA mask (`#32217`) and of the `nb32` widening; §353 |
+| **358** | a re-base rung can silently drop a file: block 00's `ggml-alloc.c` half was missing from r328/r329 while its text, docs and its own unit test still described it (issue #345, fixed r331) | tooling / gate (re-base flow) | **OPEN** -- reconcile each rung's changed-file set against the patch it replaces and fail on a file the old patch touched and the new one does not; the 18/18 ladder cannot see it; §358 |
+| **359** | `gate-fusion-alias-copy.sh`'s arm A oracle (`fused == GGML_CUDA_DISABLE_FUSION=1` text at `-ub 14`) broke at the r328 re-base: the UNFUSED chain moved, the fused arm still reproduces the r239 anchor `3fab4da87774` | tooling / gate (issue #287 gate) | **OPEN** -- re-derive the oracle (a logit/KLD compare at that shape rather than text): r329 and r331 both read `a_chain` 194/`dfe59c9c5257` vs `a_fused` 193/`3fab4da87774`, and pinning `GGML_GLU_INPLACE=0` changes neither arm, so neither the r331 restore nor the allocator is the cause; §359 |
 
 
 ## Handle numbering
 
-**New handles append after `#357`, the highest issued so far, so the next free handle is `#358`; a number is
+**New handles append after `#359`, the highest issued so far, so the next free handle is `#360`; a number is
 never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
 subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
 
@@ -293,6 +295,48 @@ tensors, graph, the loop gates and `attn_res`), which is a feature campaign with
 `inkling2_loop.block_count = 24`, `expert_count = 128`, `expert_used_count = 8`, `head_count` 24 /
 `head_count_kv` 8.  The `dspark-Inkling-2-Mini-Q8_0.gguf` draft and `mmproj-F16.gguf` beside the Unsloth file
 load nothing either, for the same reason.
+
+## 358. A re-base rung can silently drop a file, and the ladder cannot see it
+
+The r328 re-base re-expressed block 00 on `919794500` as a cherry-pick from `de99fa2d0`.  Its R00 record says the
+pick went from `37 files, +1145/-358` to `34 files, +916/-260`: two of the three missing files were the D1
+decision (`mmf.cu`/`mmf.cuh`, retired because upstream `#32505` supplies the implementation), and the third,
+`ggml/src/ggml-alloc.c`, was **silent** — no decision row, no fixup-ledger row.  r328 and r329 shipped without
+it (issue #345), the block's own text in `patches/README.md`, `ENVIRONMENT.md` §1.1b, `MANIFESTS.md` gate 00 and
+`tests/test-alloc.cpp`'s `test_glu_inplace` all still described it, and both releases' gate tables omitted
+`gate-glu-inplace.sh`, so nothing ran the rule.
+
+What makes it a class rather than a mistake: **`scripts/gate-per-block-build.sh` proves a rung compiles, and a
+missing file's hunks live inside other files, so every rung compiled.**  The only instruments that could have
+seen it are the block's own behavioural gate (a test the code no longer satisfies) and a file-set comparison
+against the previous release.
+
+Owed: a mechanical check in the re-base flow — for each rung, compare `git diff-tree --name-only` against the
+file set of the patch it replaces (same subject, previous release's chain) and fail on a file the old patch
+touched and the new one does not, with an explicit allow-list for a retirement that a decision row names (D1's
+`mmf.cu`/`mmf.cuh`).  The natural home is `scripts/gate-per-block-build.sh` (it already walks `base..tip` and
+knows each commit's subject) or a `scripts/check-rebase-files.sh` it calls once per rung.  Record: `WORKLOG.md`
+261121.010, `INVARIANTS.md` r331.
+
+## 359. `gate-fusion-alias-copy.sh`'s fused-vs-chain text oracle does not survive the r328 base
+
+The gate (issue #287) asserts that the fused `MUL_MAT_ID(gate) MUL_MAT_ID(up) GLU` launch produces the same text
+as the `GGML_CUDA_DISABLE_FUSION=1` chain at `-ub 14`, `GGML_OP_OFFLOAD_MIN_BATCH=9`, expert cache off — true when
+it was written (r239, re-affirmed r323).  At r329 and r331 it reads **`a_chain` 194 chars `dfe59c9c5257`** against
+**`a_fused` 193 chars `3fab4da87774`**, so the check fails on both releases; `a_no_moe_band` follows `a_chain`.
+
+Attribution measured: pinning `GGML_GLU_INPLACE=0` changes neither arm, and an r329 build (no block-00 restore)
+reproduces both hashes exactly, so the r331 restore is not involved.  The **fused** arm still reproduces the r239
+anchor, i.e. what moved is the unfused chain — an r328 base change to the non-fused path.  The gate was last run at
+r323, so it could not have noticed.
+
+The protection is not idle: the `GGML_GLU_INPLACE=0` trace arms still decline a leaf-copy class (1 on the repro
+arm, 1 on the production arm), and the fused arm is not degenerate.  What is lost is only the *text* oracle.
+
+Owed: a re-derived oracle — most likely a prefill-logit/KLD compare at that shape (`--kl-divergence-base` per 1024
+scored tokens) instead of a greedy-text equality, since a 1-char difference at 193 chars is a near-tie and not
+evidence of corruption either way.  Do not "fix" it by widening the tolerance on the text.  Record: `WORKLOG.md`
+261121.010.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

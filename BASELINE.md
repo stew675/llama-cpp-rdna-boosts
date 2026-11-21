@@ -17,7 +17,12 @@ upstream moves.  It is not a changelog — the current release, tip/tree and per
 | release identity | `release.json .release` (`v<blocks>-<base>-r<N>`) |
 
 **The base is fixed by a re-base.**  The last re-base is **`v17-919794500-r328`** (2026-11-21);
-`v17-919794500-r329` amends three blocks on that same base and moves no fork point: it replayed the set
+`v17-919794500-r329` amends three blocks on that same base and moves no fork point, and
+`v17-919794500-r331` amends blocks 00 and 10 on it — block 00's `ggml-alloc.c` half (the GLU-in-place rule,
+W4's unused-view release and the issue-#183 `layout_fp` guard) is **restored** after the re-base dropped it
+(issue #345; the r328 rung landed 34 of the old block's 37 files), and block 10 renames the stale
+`GGML_CUDA_CC_DGX_SPARK` to upstream's `GGML_CUDA_CC_GB10` and restores the `GGML_CUDA_DISABLE_ROPE_SET_ROWS`
+bisect switch.  The re-base itself replayed the set
 from `4f9dfa0e3` onto **`919794500`** — 228 upstream commits, 1944 files, +147 k / −41 k — as a **ladder climb**
 (one rung per block, each resolved, built and coherent before the next), with the three rung repairs squashed
 into their owning blocks (00's top-k gather, 05's `nb32`, 16's sign-compare).  The ladder, the per-rung conflict

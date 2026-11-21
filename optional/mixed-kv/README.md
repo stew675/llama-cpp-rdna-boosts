@@ -8,9 +8,10 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `b4a5b11f4e09ef6fcf601bff06a21755a5106cc7ebcf75ce350d9c1b5fd74f63` (the r329 cut -- every re-cut moves the exported commit
+  `3851a677325afd7f0b59ddbcb143407014f12b9a8e23e602d51b524056a9b3c2` (the r331 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
-* **r329-tree port verification (current)**: the artifact is not merely *applied* on r329, it is
+* **r331 re-cut verification (current)**: applies strictly at the r331 default tree `b0096a273caca67d0d17e07252eebb8b1cd8ad2c` (sha256 `3851a677325afd7f0b59ddbcb143407014f12b9a8e23e602d51b524056a9b3c2`), producing tree `b17097cb354d0da855b9f69424755ff4f8abbfb9`; with the other optional artifact on top, the cumulative tree is `5d50ae4666aeba7688279d87135d2e77e92674be`.  Mechanical re-cut (`git am`, no `-3` needed): the r331 default tree differs from r329 only in block 00's restored `ggml-alloc.c` and block 10's GB10 constant + `GGML_CUDA_DISABLE_ROPE_SET_ROWS` switch, none of them this artifact's files -- so the hunk r329 re-anchored for the ext batch API still sits on the same context.  `validate-set.sh` check 8 verifies all three trees on every run; the **r329-tree port verification below is still the numbers of record** (the gate was not re-run on r331; the artifact's own code did not change).
+* **r329-tree port verification**: the artifact is not merely *applied* on r329, it is
   **exercised** there.  Built on one optional-applied tree (r329 chain tip `f8df8a484`, `build-opt`), its own gate
   `scripts/gate-mixed-kv.sh` reads **14/14 PASS**: `test-backend-ops -o FLASH_ATTN_EXT` **7453/7453** in the
   default, `GGML_CUDA_FA_KV_MIXED=0` and `GGML_CUDA_FA_KV_NATIVE=0` arms (the same case count as r328), width

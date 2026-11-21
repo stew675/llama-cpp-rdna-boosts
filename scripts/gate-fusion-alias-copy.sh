@@ -74,7 +74,7 @@ set -uo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$HOME/llama.cpp/build-rocm}"
 LLAMA_CLI="${LLAMA_CLI:-$BUILD_DIR/bin/llama-cli}"
-MODEL="${MODEL:-/llm/models/Qwen3.6/35B-A3B/LMStudio-Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf}"
+MODEL="${MODEL:-/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
 NCMOE="${NCMOE:-99}"
 UB="${UB:-14}"
 NGEN="${NGEN:-40}"

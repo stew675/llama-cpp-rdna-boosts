@@ -225,6 +225,22 @@ fi
 LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rboosts-per-block.XXXXXX")"
 ORIG_REF="$(git -C "$REPO" symbolic-ref -q --short HEAD || git -C "$REPO" rev-parse HEAD)"
 
+# SIGNAL SAFETY (r331).  A killed gate must not leave a build running: `timeout 3600 ./gate-per-block-build.sh`
+# killed only the script, its `cmake --build`/`clang` children kept going, and a second gate started into the
+# same build dir then fought them for an hour (rungs read 8-11 min on a box whose honest rung is 60 s, and the
+# ccache misses that follow look like a cache defect).  Each child runs in its own session (`setsid`), so the
+# trap can kill the whole tree, and the checkout is restored on the way out.
+CHILD_PGID=""
+cleanup_gate() {
+    if [ -n "$CHILD_PGID" ] && kill -0 "$CHILD_PGID" 2>/dev/null; then
+        kill -TERM -- "-$CHILD_PGID" 2>/dev/null || true
+        sleep 2
+        kill -KILL -- "-$CHILD_PGID" 2>/dev/null || true
+    fi
+    git -C "$REPO" checkout -q "$ORIG_REF" 2>/dev/null || true
+}
+trap 'cleanup_gate; exit 130' INT TERM HUP
+
 # UI ASSETS: nothing to provision.  The embedded web UI is OFF for every rung (the configure below passes
 # LLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF), so `ui-assets.cmake` never fetches from HuggingFace and
 # never runs npm: it emits an empty asset table.  That is deliberate and it is why there is no asset cache
@@ -297,7 +313,7 @@ for c in "${selected[@]}"; do
     t_cfg0="$(date +%s)"
     echo "    configuring (fresh build dir) ..."
     HIPCXX="$ROCM_DIR/lib/llvm/bin/clang" HIP_PATH="$ROCM_DIR" \
-        cmake -S "$REPO" -B "$REPO/$BUILD_DIR" \
+        setsid cmake -S "$REPO" -B "$REPO/$BUILD_DIR" \
             -DGGML_RPC=1 -DGGML_HIP=ON -DGGML_NATIVE=1 -DGGML_HIP_RCCL=1 \
             -DHIP_PLATFORM=amd -DGGML_HIP_GRAPHS=ON -DGPU_TARGETS="$GPU_TARGETS" \
             -DCMAKE_C_COMPILER="$ROCM_DIR/lib/llvm/bin/clang" \
@@ -308,7 +324,7 @@ for c in "${selected[@]}"; do
             -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF \
             "${CCACHE_LAUNCHERS[@]}" \
             > "$LOG_DIR/${total}.configure.log" 2>&1 &
-    cp=$!
+    cp=$!; CHILD_PGID="$cp"
     if [ "$PROGRESS_SECS" -gt 0 ] 2>/dev/null; then
         while kill -0 "$cp" 2>/dev/null; do
             sleep "$PROGRESS_SECS"
@@ -316,7 +332,7 @@ for c in "${selected[@]}"; do
             echo "    ... still configuring rung $total/$n_sel: $(( $(date +%s) - t_cfg0 ))s on this rung, $(( $(date +%s) - t_gate0 ))s total"
         done
     fi
-    wait "$cp"; cfgrc=$?
+    wait "$cp"; cfgrc=$?; CHILD_PGID=""
     echo "    configured ($(( $(date +%s) - t_cfg0 ))s)"
     if [ "$cfgrc" -ne 0 ]; then
         echo "    CONFIGURE FAILED (log: $LOG_DIR/${total}.configure.log)"
@@ -338,9 +354,9 @@ for c in "${selected[@]}"; do
     # every rung reports its elapsed time and how many rungs are left.
     echo "    building $TARGETS ..."
     t_build0="$(date +%s)"
-    cmake --build "$REPO/$BUILD_DIR" --target $TARGETS -j "$JOBS" -- -k \
+    setsid cmake --build "$REPO/$BUILD_DIR" --target $TARGETS -j "$JOBS" -- -k \
         > "$LOG_DIR/${total}.build.log" 2>&1 &
-    bp=$!
+    bp=$!; CHILD_PGID="$bp"
     if [ "$PROGRESS_SECS" -gt 0 ] 2>/dev/null; then
         while kill -0 "$bp" 2>/dev/null; do
             sleep "$PROGRESS_SECS"
@@ -348,7 +364,7 @@ for c in "${selected[@]}"; do
             echo "    ... still building rung $total/$n_sel: $(( $(date +%s) - t_build0 ))s on this rung, $(( $(date +%s) - t_gate0 ))s total"
         done
     fi
-    wait "$bp"; brc=$?
+    wait "$bp"; brc=$?; CHILD_PGID=""
     if [ "$brc" -eq 0 ]; then
         ok=$((ok+1))
         echo "    BUILD OK ($(( $(date +%s) - t_blk0 ))s)  -- rung $total/$n_sel done, $(( n_sel - total )) rung(s) left, $(( $(date +%s) - t_gate0 ))s of gate time so far"

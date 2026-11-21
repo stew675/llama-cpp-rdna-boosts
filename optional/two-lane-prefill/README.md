@@ -24,9 +24,10 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `4d802e697473e8039d72c5c00440dba48075ef5b16a5cc2f0696ad837e3be341` (the r329 cut -- every re-cut moves the exported commit
+  `8867b899f9f92e247139e9e78a46ab64c90801860a6dbfec374c5bd18f921687` (the r331 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
-* **r329-tree port verification (current)**: built and **measured** on the r329 tree (3 x R9700 gfx1201, ROCm
+* **r331 re-cut verification (current)**: applies strictly at the r331 default tree `b0096a273caca67d0d17e07252eebb8b1cd8ad2c` (sha256 `8867b899f9f92e247139e9e78a46ab64c90801860a6dbfec374c5bd18f921687`), producing tree `071f0c22fc86ce8fe9e9451ff30faaedc1f6a3d7`; with the other optional artifact on top, the cumulative tree is `5d50ae4666aeba7688279d87135d2e77e92674be`.  The re-cut is **mechanical**: the patch applied cleanly (`git am`) on the r331 default tree, whose only change from r329 is block 00's restored `ggml-alloc.c`, block 10's GB10 constant and its `GGML_CUDA_DISABLE_ROPE_SET_ROWS` switch -- none of them this artifact's files -- so its own mechanisms and the numbers of record are unchanged.  `validate-set.sh` check 8 verifies the strict apply of all three trees on every run.
+* **r329-tree port verification**: built and **measured** on the r329 tree (3 x R9700 gfx1201, ROCm
   10.1.0, `prompts/prose-rdna-boosts.txt`), not merely applied to it.
   * **Default path inert**: `-sm tensor` (3 GPUs) 4B Q8_0 greedy text is `1c5d32ac537d` for lanes unset, `1` and
     `2`, and the arm gate fires -- `LLAMA_PREFILL_LANES ignored (n_gpu = 1, pipeline_parallel = 0, draft = 0)`.

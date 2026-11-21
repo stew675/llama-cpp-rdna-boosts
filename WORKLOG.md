@@ -1,3 +1,88 @@
+## 261121.010 (r331) -- **RELEASE: the r328 re-base had silently dropped block 00's `ggml-alloc.c` half; blocks 00 and 10 are amended to restore it** (issue #345), plus a signal-safety fix that stops a killed ladder from orphaning its build
+
+**Delivery change: two blocks amended, no block added, split or renumbered, no fork point moved.**  Release
+**`v17-919794500-r331`**, base **`919794500`**, canonical tip **`a6851c9b6`**, tree
+**`b0096a273caca67d0d17e07252eebb8b1cd8ad2c`**, `optional_tree` **`5d50ae4666aeba7688279d87135d2e77e92674be`**.
+`release.json` is the source of truth.
+
+### What was wrong (issue #345, `@briansp2020`)
+
+Block 00 has always carried `ggml/src/ggml-alloc.c` (**+121/−2**) with three things: `GGML_GLU_INPLACE` (r323's
+`ggml_op_can_inplace(GGML_OP_GLU)` rule and its `n_src_inplace` gate-only restriction), **W4** (release view
+sources whose views are never consumed) and the **`layout_fp`** graph fingerprint that
+`ggml_gallocr_needs_realloc()` requires (the issue-#183 guard, still needed because `LLAMA_DRAFT_SCHED2` ships).
+The r328 re-base's R00 cherry-pick landed **34 of the old block's 37 files**: two were D1's intended retirement
+(`mmf.cu`/`mmf.cuh`, replaced by upstream `#32505`), and the third — `ggml-alloc.c` — was accounted for by no
+decision and no fixup-ledger row.  r328 and r329 shipped without it while the block's own text, `ENVIRONMENT.md`
+§1.1b, `MANIFESTS.md` gate 00 and `tests/test-alloc.cpp`'s `test_glu_inplace` all still described it, and **r329's
+`test-alloc` aborts at `test-alloc.cpp:704`** (reproduced on the r329 binary before touching anything).  Neither
+release's gate table ran `gate-glu-inplace.sh`, which is the block-00 gate and the only instrument that runs the
+rule.  The `--all` per-block ladder cannot see this class: a missing file's hunks live inside other files and
+compile fine (`TODO` #358).
+
+Two more re-base port misses were found by the same review (both block 10, both inert on HIP):
+`mmvq-ksplit-body.inc` tested `#if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK`, which upstream renamed to
+`GGML_CUDA_CC_GB10` at this base — an undefined name in `#if` reads as 0, so the GB10 early-prefetch block
+compiled out silently; and `ggml_cuda_should_fuse_rope_set_rows()` had lost its documented
+`GGML_CUDA_DISABLE_ROPE_SET_ROWS` bisect switch (`ENVIRONMENT.md` §7.3 named a switch that did not exist).
+
+### What changed
+
+* **block 00**: `ggml/src/ggml-alloc.c` restored **byte-for-byte from the r325 chain**.  Verified per rung, not
+  just at the tip: for all 18 commits, `git show <rung>:ggml/src/ggml-alloc.c` compares **equal** to the r325
+  chain's same rung, so the restore reintroduced exactly the lost content and moved nothing else.  Patch 0000 is
+  now +1068/−263 over 36 files (was +948/−262/35).  The block's commit message already described the three items,
+  so it is accurate again.
+* **block 10**: `GGML_CUDA_CC_DGX_SPARK` → `GGML_CUDA_CC_GB10`; the `GGML_CUDA_DISABLE_ROPE_SET_ROWS` switch
+  restored in `ggml_cuda_should_fuse_rope_set_rows()` (present-only, default on — no default changed).  Every other
+  `GGML_CUDA_CC_*` token in the tree was audited against `common.cuh`'s defines, including `*.inc` bodies: this was
+  the only one undefined.  Patch 0010 is now +17893/−5678 over 87 files.
+* **tooling**: `scripts/gate-per-block-build.sh` now runs each configure/build in its own session (`setsid`) and
+  kills the tree on INT/TERM/HUP, restoring the checkout.  A `timeout`-killed gate previously left `cmake
+  --build`/`clang` running; a second gate started into the same `build-per-block` then fought it, which read as
+  8-11 min rungs on a box whose honest rung is 60 s.  `gate-fusion-alias-copy.sh`'s default `MODEL` now names the
+  GGUF this box actually has (it pointed at a `LMStudio-Q4_K_M` path that does not exist, so the gate aborted with
+  `set MODEL` instead of running).
+* Docs: `patches/README.md` (r331 note + both block sections + block-index sizes), `MANIFESTS.md` (a re-base owes
+  **every** block's per-block gate — this is how a red block-00 gate went unnoticed), `ENVIRONMENT.md` (the §7.2
+  list named `GGML_CUDA_DISABLE_ROPE_SETROWS`, a name that never existed and is presence-only; it now lists the
+  real `GGML_CUDA_SCALE_UNARY` in the value-gated section), `INVARIANTS.md` (two facts, below), `TODO` #358.
+
+### Gates (release build, gfx1201)
+
+| gate | result |
+|---|---|
+| `scripts/gate-per-block-build.sh --base 919794500 --tip r331` | **18/18** rungs build the release profile, 0 failed, **1862 s** (the earlier 3 h reading was the orphaned-build contention above, not the gate: an idle rung is 60 s, a HIP TU from ccache 0.16 s) |
+| `build-rocm/bin/test-alloc` | **exit 0**, `test_glu_inplace PASSED` (was an abort at line 704 on r329) |
+| `scripts/gate-glu-inplace.sh` | **PASS** — unit leg 33/33, non-vacuity: `GGML_GLU_INPLACE=0` fails it at `test-alloc.cpp:704`; compute buffer **475.37 MiB ON vs 624.97 MiB OFF (149.60 MiB, 23.9 %)**; same-seed text identical ON/OFF, dense **`1acb04bd9104`** and host-expert 2-device `-sm tensor` **`2f79e37ca208`**; GPU journal clean |
+| `scripts/gate-prefill-logits.sh` | **PASS** — mean KLD **0.000000**, same-top-p **100.000 %** against the recorded base (the allocator decides which kernels a fused FFN window may run, so this is the point that could have moved) |
+| `scripts/validate-set.sh` | **GREEN** — 18 default patches apply strictly at `919794500` → tree `b0096a27…`, both optional artifacts re-cut and verified alone and cumulatively (`071f0c22f` / `b17097cb3` / `5d50ae46…`), 515 added files pass the Windows portability scan |
+
+**Not re-run, and why:** the MTP four-axis protocol (no decode/fusion kernel changed — the restored content is
+byte-identical to what shipped in r323-r327, whose four-axis record stands) and `gate-mixed-kv.sh` (the artifact's
+own files did not change; its r329-tree verification remains the numbers of record).
+
+### Found while gating, pre-existing at r329 (not this release's regression): `gate-fusion-alias-copy.sh` is red
+
+Its arm A asserts "the fused `MUL_MAT_ID(gate) MUL_MAT_ID(up) GLU` text == the `GGML_CUDA_DISABLE_FUSION=1` chain"
+at `-ub 14` with the expert cache off.  Measured today, **on the r329 release build and on r331 alike**:
+`a_chain` = **194 chars `dfe59c9c5257`**, `a_fused` = **193 chars `3fab4da87774`**, `a_no_moe_band` =
+`dfe59c9c5257`.  Pinning `GGML_GLU_INPLACE=0` changes neither arm, so the restore is not the cause: the **unfused
+chain** moved away from the r239/r323 anchor (`3fab4da87774`, which the fused arm still reproduces exactly) — an
+r328 base change to the non-fused path, and the gate was last run at r323.  The protection itself still fires
+(`GGML_GLU_INPLACE=0` trace arm declines 1 leaf-copy class, census arm too).  Owner: **`TODO` #359** — the r323
+"bit-identical to the unfused chain at this shape" claim no longer holds, so the oracle needs to be re-derived
+(most likely a logit/KLD compare at that shape instead of text).
+
+### Published
+
+* delivery: `main` -> this commit, tag `v17-919794500-r331`.
+* fork: `scripts/fork-refresh.sh --build --push`, `rdna-boosts` re-cut to `a6851c9b6` (tree `b0096a27…`).  The
+  branch tree is byte-identical to the tree the gates above ran on (`b0096a27…`), so `--gates` was not re-run for the
+  re-cut; `validate-set.sh` re-derived the same tree independently from the base tarball.
+* optional artifacts re-cut mechanically with `git am` on the new tree (READMEs record the new sha256/tree).
+* images: the worker watcher picks the tag up on `radiance`; nothing else is needed.
+
 ## 261121.009 (r330) -- the optional artifacts are verified **on** the r329 tree rather than merely applied to it, and `gate-mixed-kv.sh` can no longer call a run complete with a refusal arm it never ran (tooling + records only: no delivery patch changed, **no tag**)
 
 **Nothing in `patches/`, `release.json` (base/tip/tree) or the block structure changed**, so there is no release

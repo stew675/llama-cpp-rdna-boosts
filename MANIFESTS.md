@@ -104,6 +104,14 @@ a rev is retried at most `MAX_ATTEMPTS` times (3) before the script stops and na
 to remove.  The release container images are built **off-host by the worker** and are not a CI tier
 ([`CONTAINERS.md`](CONTAINERS.md)).
 
+**A re-base owes every block's per-block gate.**  Re-expressing the set touches all 18 blocks at once, so the
+per-block gate table below is owed **in full**, not only for the blocks whose text was edited.  The r328 re-base
+ran the ladder, the coherence arms, the prefill point and the block gates it remembered and **missed block 00's
+`gate-glu-inplace.sh`**, which is how that block's `ggml-alloc.c` half stayed dropped for two releases while its
+docs still described it (r331, issue #345, `WORKLOG.md` 261121.010).  The mechanical warning is a rung that lands
+**fewer files than the patch it replaces carried**: the ladder only proves that each rung *compiles*, and a
+missing file's hunks inside other files compile fine -- only the block's own gate runs the rule.
+
 `scripts/validate-set.sh` covers patch integrity only (checksums + a fresh-tarball strict apply) and runs
 in CI.  The model-level gates are manual:
 

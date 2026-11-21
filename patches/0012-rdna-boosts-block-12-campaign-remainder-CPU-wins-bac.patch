@@ -1,4 +1,4 @@
-From 63fa67754e1f5f231163ddcac63a37d2bd393501 Mon Sep 17 00:00:00 2001
+From c099756c4fd3e31c627487ffc7867062ec1a7d04 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/17] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -828,10 +828,10 @@ index 109f30edc..445c15230 100644
      GGML_API void   ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor);
  
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index 6ca91a45c..8e0aa8976 100644
+index 47c81979b..35b07f5f6 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
-@@ -979,15 +979,15 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -1089,15 +1089,15 @@ static bool ggml_gallocr_reserve_n_impl(
              if (buffers_grown != NULL) {
                  *buffers_grown = true;
              }
@@ -855,7 +855,7 @@ index 6ca91a45c..8e0aa8976 100644
              if (no_alloc) {
                  // sizing/probe path: leave the existing buffers untouched so that the layout can be
                  // computed (and whether a reallocation would be needed) without disturbing the memory
-@@ -1000,12 +1000,21 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -1110,12 +1110,21 @@ static bool ggml_gallocr_reserve_n_impl(
                  galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                  if (galloc->buffers[i] == NULL) {
                      GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
@@ -877,7 +877,7 @@ index 6ca91a45c..8e0aa8976 100644
      return true;
  }
  
-@@ -1038,6 +1047,31 @@ bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
+@@ -1148,6 +1157,31 @@ bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
      return ggml_gallocr_reserve_n(galloc, graph, NULL, NULL);
  }
  
@@ -909,7 +909,7 @@ index 6ca91a45c..8e0aa8976 100644
  static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
      int buffer_id = tensor_alloc->buffer_id;
      assert(tensor->data || tensor->view_src || ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
-@@ -1078,6 +1112,13 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
+@@ -1188,6 +1222,13 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
  }
  
  static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
@@ -923,7 +923,7 @@ index 6ca91a45c..8e0aa8976 100644
      if (galloc->n_nodes != graph->n_nodes) {
  #ifndef NDEBUG
          GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
-@@ -1242,28 +1283,3 @@ size_t ggml_backend_alloc_ctx_tensors_from_buft_size(struct ggml_context * ctx,
+@@ -1361,28 +1402,3 @@ size_t ggml_backend_alloc_ctx_tensors_from_buft_size(struct ggml_context * ctx,
  ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors(struct ggml_context * ctx, ggml_backend_t backend) {
      return ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(backend));
  }
@@ -3009,10 +3009,10 @@ index bab71d893..d6ed08aeb 100644
                            "target=%.1f MiB boundary=%.1f MiB limit=%.1f MiB armed=%d\n",
                            device, (double) size/1048576.0, (double) want/1048576.0,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index a2f74f356..3988b11cc 100644
+index 679a7a265..b36478105 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -1754,7 +1754,7 @@ static bool ggml_cuda_cache_blocks_fusion(ggml_backend_cuda_context * cuda_ctx,
+@@ -1760,7 +1760,7 @@ static bool ggml_cuda_cache_blocks_fusion(ggml_backend_cuda_context * cuda_ctx,
      const ggml_tensor * node = cgraph->nodes[i];
  
      // gate+up+GLU, the routed pair, and the qwen4exp weighted-down all start at the routed

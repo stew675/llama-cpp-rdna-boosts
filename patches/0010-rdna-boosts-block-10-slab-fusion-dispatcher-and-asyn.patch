@@ -1,4 +1,4 @@
-From b431a731be41d9ae1a19e24a3ca9552e6eeddae6 Mon Sep 17 00:00:00 2001
+From a0f1fd15ed9b59a7e832f6dfc38491a9a237f873 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/17] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -188,7 +188,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |  283 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |   27 +
  ggml/src/ggml-cuda/ggml-cuda-slab.cu          | 1847 +++++
- ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 3459 +++++++++
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 3465 +++++++++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cuh     |   43 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   60 +
  ggml/src/ggml-cuda/ggml-cuda.cu               | 6399 ++++++-----------
@@ -239,7 +239,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  tests/test-fusion-gate-beta-multiseq.cpp      |  321 +
  tests/test-logits-width-probe.cpp             |  234 +-
  tools/server/server-context.cpp               |   30 +-
- 87 files changed, 17887 insertions(+), 5678 deletions(-)
+ 87 files changed, 17893 insertions(+), 5678 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -292,10 +292,10 @@ index 43e933c93..9270dd99a 100644
      // may be NULL and each cell's value is derived in the kernel as
      //     cell_pos[cell] >= tok_lo[token] && cell_pos[cell] <= tok_hi[token]  ->  0.0f, else -INF
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index 84992b937..6ca91a45c 100644
+index 8e4390150..47c81979b 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
-@@ -876,7 +876,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
+@@ -982,7 +982,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
  }
  
  static bool ggml_gallocr_reserve_n_impl(
@@ -304,7 +304,7 @@ index 84992b937..6ca91a45c 100644
      size_t min_hash_size = graph->n_nodes + graph->n_leafs;
      // add 25% margin to avoid hash collisions
      min_hash_size += min_hash_size / 4;
-@@ -976,6 +976,9 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -1086,6 +1086,9 @@ static bool ggml_gallocr_reserve_n_impl(
              }
          }
          if (realloc) {
@@ -314,7 +314,7 @@ index 84992b937..6ca91a45c 100644
  #ifndef NDEBUG
              {
                  size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
-@@ -985,10 +988,15 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -1095,10 +1098,15 @@ static bool ggml_gallocr_reserve_n_impl(
                  }
              }
  #endif
@@ -332,7 +332,7 @@ index 84992b937..6ca91a45c 100644
                  galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                  if (galloc->buffers[i] == NULL) {
                      GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
-@@ -1003,7 +1011,7 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -1113,7 +1121,7 @@ static bool ggml_gallocr_reserve_n_impl(
  
  void ggml_gallocr_reserve_n_size(
          ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * sizes) {
@@ -341,7 +341,7 @@ index 84992b937..6ca91a45c 100644
      for (int i = 0; i < galloc->n_buffers; i++) {
          sizes[i] = 0;
          for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
-@@ -1012,8 +1020,18 @@ void ggml_gallocr_reserve_n_size(
+@@ -1122,8 +1130,18 @@ void ggml_gallocr_reserve_n_size(
      }
  }
  
@@ -7874,10 +7874,10 @@ index 000000000..bab71d893
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 new file mode 100644
-index 000000000..b7318dd7b
+index 000000000..26fad7df2
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -0,0 +1,3459 @@
+@@ -0,0 +1,3465 @@
 +// CUDA graph fusion dispatcher: the delivery's matchers and the one-line-per-concern try-fuse
 +// arms.  Split out of ggml-cuda.cu so an upstream change to the shared graph/evaluate path
 +// collides with the single ggml_cuda_try_fuse() call, not with every arm body.
@@ -8033,6 +8033,12 @@ index 000000000..b7318dd7b
 +static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
 +                                                const ggml_tensor * view,
 +                                                const ggml_tensor * set_rows) {
++    // The fusion is selected by ggml_cuda_check_fusion_memory_ranges(), i.e. by buffer addresses, so
++    // its rounding path must be identical to the unfused chain.  Keep a kill switch to bisect it.
++    static const bool disabled = getenv("GGML_CUDA_DISABLE_ROPE_SET_ROWS") != nullptr;
++    if (disabled) {
++        return false;
++    }
 +
 +    if (rope->op != GGML_OP_ROPE || view->op != GGML_OP_VIEW || set_rows->op != GGML_OP_SET_ROWS) {
 +        return false;
@@ -20516,7 +20522,7 @@ index 5a2477b07..822a67671 100644
      ggml_backend_cuda_context & ctx,
 diff --git a/ggml/src/ggml-cuda/mmvq-ksplit-body.inc b/ggml/src/ggml-cuda/mmvq-ksplit-body.inc
 new file mode 100644
-index 000000000..f8e01d7f4
+index 000000000..9cb9f8b8c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmvq-ksplit-body.inc
 @@ -0,0 +1,366 @@
@@ -20688,7 +20694,7 @@ index 000000000..f8e01d7f4
 +        // x block quant index when casting the quants to int
 +        const int kqs = vdr * (tid % (qi/vdr));
 +
-+#if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
++#if __CUDA_ARCH__ == GGML_CUDA_CC_GB10
 +        // start the next iterations' weight loads early
 +        if constexpr (mmvq_should_prefetch(type)) {
 +            // loop iterations, not blocks; q3_K and q6_K keep the distance in blocks they had with vdr 1

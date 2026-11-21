@@ -1527,3 +1527,31 @@ Record: `WORKLOG.md` 261121.007, `archive/work/r328-followups/` (§3 rows and `l
   `common/arg.cpp`) and by `scripts/check-gen-docs.sh`, which runs the generator built from the tree under test and
   fails on a rewrite.  Rule: when a file is generated, the generator run is part of the block's change, and the
   drift check runs before a tag.
+
+* **A re-base rung that lands fewer files than the patch it replaces has dropped something until proven otherwise, and the per-block build ladder cannot see it (r331, issue #345).**  Block 00's
+  `ggml/src/ggml-alloc.c` half (+121/−2: `GGML_GLU_INPLACE` with the `n_src_inplace` gate-only rule, W4's
+  unused-view release, and the `layout_fp` graph fingerprint that `ggml_gallocr_needs_realloc()` requires for
+  issue #183) was dropped by the r328 re-base's R00 cherry-pick (`37 files → 34 files`) with no decision row and
+  no fixup-ledger row, so r328 and r329 shipped without it while the block's own text, `ENVIRONMENT.md`, the
+  per-block gate table and `tests/test-alloc.cpp`'s `test_glu_inplace` still described it — and **r329's
+  `test-alloc` aborts at `test-alloc.cpp:704`**.  Two facts make it a class:
+  (1) `scripts/gate-per-block-build.sh` proves each rung *compiles*, and a missing file's hunks inside other
+  files compile fine, so an 18/18 `--all` ladder is green over it — only the block's own behavioural gate runs
+  the rule, and neither release's gate table ran `gate-glu-inplace.sh` (the block-00 row of `MANIFESTS.md`'s
+  per-block table names it for "every release that touches block 00", and a re-base touches all 18);
+  (2) the deliverable is reproducible from the previous release: restoring the r325 chain's file gave a r331 tree
+  whose `ggml-alloc.c` is **byte-identical at every one of the 18 rungs** (`git show <rung>:…` compared pairwise),
+  which is what proves the restore reintroduced exactly the lost content and nothing else.  Rule: reconcile each
+  rung's changed-file set against the patch it replaces (same subject, previous release), and treat a shrunk set
+  as a defect until a decision row names the retirement — `TODO` #358.  Record: `WORKLOG.md` 261121.010.
+
+* **An undefined `GGML_CUDA_CC_*` name in `#if __CUDA_ARCH__ == …` reads as 0: the guard is silently false, the block compiles out with no warning, and only the target arch notices (r331).**
+  Upstream renamed `GGML_CUDA_CC_DGX_SPARK` → `GGML_CUDA_CC_GB10` (both `1210`, `ggml/src/ggml-cuda/common.cuh`)
+  between the r325 fork point `4f9dfa0e3` and the r328 base `919794500`.  Block 10's `mmvq-ksplit-body.inc`
+  carried the old spelling through the re-base, so its early weight-load prefetch was compiled out on GB10
+  (`mmvq-ksplit-body.inc:169`, issue #345's second finding) — **inert on every HIP target**, which is exactly why
+  no gate here can see it, and why the check is a source audit instead: every `GGML_CUDA_CC_` token used in the
+  tree must be `#define`d in `common.cuh`, and the grep must include `*.inc` (`.cu`/`.cuh`/`.h` alone misses a
+  body file).  Audited clean at r331 apart from this one site, which now says `GGML_CUDA_CC_GB10`.  The same
+  re-base pass also lost `ggml_cuda_should_fuse_rope_set_rows()`'s `GGML_CUDA_DISABLE_ROPE_SET_ROWS` kill switch
+  (restored; a bisect knob only, `ENVIRONMENT.md` §7.3).  Record: `WORKLOG.md` 261121.010.
