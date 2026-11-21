@@ -1,4 +1,4 @@
-From a19bc6bc227d559e62f6b8b8b431c0eccb896b25 Mon Sep 17 00:00:00 2001
+From 1527543491afe6fa7a6d93ad5d01d19f5f09e349 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 07/17] rdna-boosts: block 07: k-quant boosts (mmvq VDR, Q6_K
@@ -243,7 +243,7 @@ index d9a88a56d..5c40713ed 100644
  int ggml_cuda_get_device();
  
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 2a257c63c..1474537d2 100644
+index ba046221e..f2d226136 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -37,6 +37,7 @@
@@ -254,7 +254,7 @@ index 2a257c63c..1474537d2 100644
  #include "ggml-cuda/moe-weighted-reduction.cuh"
  #include "ggml-cuda/mmf32.cuh"
  #include "ggml-cuda/norm.cuh"
-@@ -6713,13 +6714,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6716,13 +6717,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
  
@@ -272,7 +272,7 @@ index 2a257c63c..1474537d2 100644
          // graph->uid is set only for a compatible graph (see ggml_cuda_graph_update_required), so a reused graph needs no new check
          const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
          const bool graph_compatible = graph_reused || ggml_cuda_graph_check_compability(cgraph);
-@@ -8175,6 +8179,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -8178,6 +8182,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
          return (void *)ggml_backend_cuda_comm_init_rank;
      }
  #endif // GGML_USE_NCCL

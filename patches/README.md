@@ -1561,6 +1561,28 @@ a `k_idxs`/`s_copy`/`k_rot` tensor is always consumed by the node that needed it
 > two rows are both visible.  A homogeneous box is unaffected by construction (every device resolves the same
 > row): same-seed greedy text `1c5d32ac537d` (4B Q8_0, 1 GPU and 3-GPU `-sm tensor`) and prefill-logit KLD
 > **0.000000** against a base recorded from the r244 build.
+>
+> **r336 amendment (contributor PR #340, `@briansp2020`): BF16 dense weights take MMB while hipBLASLt is
+> off.**  With `ROCBLAS_USE_HIPBLASLT=0` — §44's determinism control, never pinned by the delivery — a
+> qwen4exp model's BF16 dense GEMMs (the hc mixer, the BF16 router, the shared-expert gate) fall back to
+> rocBLAS's own Tensile kernels and cost it 13-23 % of the prefill.  They now take the bf16-WMMA tile from 33
+> tokens (`mmb_bf16_dense`, gated on `mmb_hipblaslt_off()`), with the tiny-M warp-per-token kernel for `M <= 8`
+> reading the activation's bf16 copy and the producer-written RNE copy in `bf16_src1_cache`, and a 128x64 /
+> 64x32 tile when the 256x128 grid is thin.  RDNA4 also stops writing the hc gate's BF16 side copy
+> (`hc16` off): its readers only take it where a graph marks the output BF16-only, and those marking passes are
+> **RDNA3_5-gated**, so on RDNA4 it was written and never read — the one part of the amendment that is a
+> **default-path** win (+0.4 % prefill, output bit-identical).  Everything else is unreachable with hipBLASLt
+> on: census 0 BF16 launches, prefill-logit `-0.000000 / 100.000 %`, identical greedy text.  Measured
+> (gfx1201, ROCm 10.1, 2-GPU `-sm tensor`, Flash-Next GSQ IQ3_S, 5.2k-token prompt, 3 reps): pinned prefill
+> **1691 -> 2196 t/s (+29.9 %)**, i.e. above the default arm's 2027; decode flat; the W=1..8 width probe
+> bit-identical to the base on the same model (prefill-only, proven).  The pinned mode is a deliberate
+> **kernel-family switch** — mean KLD **0.013781 / 96.427 %** against the r334 pinned base — which is smaller
+> than the library gap r334's own default-vs-pinned pair already is (default vs pinned: **0.015033 / 96.24 %**
+> on r334, **0.014772 / 96.41 %** with this), so the pinned arm moves *towards* the default's numerics rather
+> than away: `GREEDY-PURITY.md` §44, `INVARIANTS.md` r336, `ENVIRONMENT.md` §10.2.  **Placement note:** the
+> tiny-M `XBF16` activation plumbing that block 10 used to add moved into this block with the shared
+> launcher, so block 10's patch is smaller by those hunks and the applied tree is unchanged; block 06 is a
+> layer, not a standalone build.
 
 **What it is.**  The prefill-GEMM block: `mmb.cu` (~2.4k lines) dequantizes quantized weights into bf16
 WMMA fragments on the fly (dense, routed/compact MoE, GLU, F32-split, tall/narrow, tiny-M, IQ3_XXS, HC16,
@@ -1598,8 +1620,9 @@ in-domain corpus can be the probe prompt rather than failing with `tokenize fail
 **Knobs.**  `GGML_CUDA_MMB` (master switch), `_TYPES`, `_DENSE`, `_ROUTED`/`_ROUTED_THRESH`, `_GLU`/`_GLU_THRESH`,
 `_F32SPLIT`(+`_MIN_K`/`_MIN_M`), `_TALL`(+`_MIN_M`), `_TINY_M`/`_TINY_TT`, `_DOWN16`, `_HC16`, `_IQ3XXS`,
 `_RDNA3`, `_CFG`, `_CACHE`/`_SHADOW*`, `_MIN_T`, `_TILE`, `_BF16W`, `_LOG`; `LLAMA_MMB_CVT_LOG`;
-`GGML_CUDA_MMF32` (kill switch, `=0`), `GGML_CUDA_MMF32_LOG` (diagnostic).  Everything is default-on and
-documented in `ENVIRONMENT.md` §§10/10.1.
+`GGML_CUDA_MMF32` (kill switch, `=0`), `GGML_CUDA_MMF32_LOG` (diagnostic); since r336 `_BF16_DENSE`
+(+`_BF16_MIN_T`), `_TINY_M_BF16`, `_TINY_BF16_XH`, `_PRODUCER_BF16`, `_SMALL_TILE` (+`_SMALL_GRID`).
+Everything is default-on and documented in `ENVIRONMENT.md` §§10/10.1/10.2.
 
 **Per-device arch dispatch (r132).**  Every per-arch decision in `mmb.cu` (`mmb_enabled`, `mmb_cfg`,
 `mmb_cfg_dump_once`, `mmb_dense_flag`, `mmb_wtype_mask`, `mmb_dense_tmask`) keys on

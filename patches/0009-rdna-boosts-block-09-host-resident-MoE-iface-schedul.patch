@@ -1,4 +1,4 @@
-From 682b015542e17844b77be2b5e60b210964f5dcba Mon Sep 17 00:00:00 2001
+From 61f26c020f59d00a3d20991f02a0fbe95bc49c4c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/17] rdna-boosts: block 09: host-resident MoE (iface,
@@ -7449,7 +7449,7 @@ index 000000000..8005b57b4
 +void   ggml_cuda_slab_set_ring_region(size_t bytes);
 +void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 5e749c937..43bfb8145 100644
+index d3b18c60b..0b20cc312 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -35,6 +35,7 @@
@@ -9480,7 +9480,7 @@ index 5e749c937..43bfb8145 100644
  
  // The weight scale that scale_node (MUL) applies to the output of mm_node (MUL_MAT), or nullptr.
  // Shared by ggml_cuda_try_fuse and graph_optimize so that both accept the same patterns.
-@@ -3785,6 +5360,62 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -3788,6 +5363,62 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
      GGML_ASSERT(src1->type == GGML_TYPE_F32);
      GGML_ASSERT(dst->type  == GGML_TYPE_F32);
  
@@ -9543,7 +9543,7 @@ index 5e749c937..43bfb8145 100644
      GGML_TENSOR_BINARY_OP_LOCALS
  
      const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -4408,6 +6039,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+@@ -4411,6 +6042,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
          return false;
      }
  
@@ -9553,7 +9553,7 @@ index 5e749c937..43bfb8145 100644
      if (backend_src != backend_dst) {
          // copy on src stream
          // compare the backing physical devices: distinct virtual devices may share one physical GPU,
-@@ -4462,6 +6096,27 @@ static bool ggml_cuda_graph_debug_enabled() {
+@@ -4465,6 +6099,27 @@ static bool ggml_cuda_graph_debug_enabled() {
  
  static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
  
@@ -9581,7 +9581,7 @@ index 5e749c937..43bfb8145 100644
      bool use_cuda_graph = true;
      // Loop over nodes in GGML graph to obtain info needed for CUDA graph
  
-@@ -4493,14 +6148,186 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -4496,14 +6151,186 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
      return use_cuda_graph;
  }
  
@@ -9771,7 +9771,7 @@ index 5e749c937..43bfb8145 100644
      ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
  
      if (cgraph->uid != 0 &&
-@@ -4533,6 +6360,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+@@ -4536,6 +6363,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
          }
  
          if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
@@ -9779,7 +9779,7 @@ index 5e749c937..43bfb8145 100644
              graph->node_props[i] = prop;
              res = true;
          }
-@@ -4589,6 +6417,28 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
+@@ -4592,6 +6420,28 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
      GGML_UNUSED(device);
  #endif // USE_CUDA_GRAPH_CLUSTER_CHECK
  
@@ -9808,7 +9808,7 @@ index 5e749c937..43bfb8145 100644
  #if CUDART_VERSION >= 12000
      cudaGraphExecUpdateResultInfo result_info;
      cudaError_t stat = cudaGraphExecUpdate(instance, cuda_graph, &result_info);
-@@ -5176,12 +7026,12 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
+@@ -5179,12 +7029,12 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
  }
  
  // returns whether the write (out) nodes overwrite the read nodes in operation
@@ -9823,7 +9823,7 @@ index 5e749c937..43bfb8145 100644
      auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
          const int64_t a_start = (int64_t) a->data;
          const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
-@@ -5701,11 +7551,130 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -5704,11 +7554,130 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
  }
  
  // try and fuse nodes and return the number of nodes to skip
@@ -9954,7 +9954,7 @@ index 5e749c937..43bfb8145 100644
  
      // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
      static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
-@@ -5714,24 +7683,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5717,24 +7686,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -9988,7 +9988,7 @@ index 5e749c937..43bfb8145 100644
      }
  
      if (node->op == GGML_OP_MUL) {
-@@ -6472,13 +8432,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -6475,13 +8435,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  break;
              }
  
@@ -10016,7 +10016,7 @@ index 5e749c937..43bfb8145 100644
                  fused_mul_mat_vec = true;
                  fused_node_count  = 3;
                  break;
-@@ -6684,6 +8656,95 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -6687,6 +8659,95 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -10112,7 +10112,7 @@ index 5e749c937..43bfb8145 100644
      // mul_mat + add, with an optional view (reshape) node between the matmul and the add
      for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
          const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
-@@ -6944,7 +9005,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -6947,7 +9008,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      return 0;
  }
  
@@ -10121,7 +10121,7 @@ index 5e749c937..43bfb8145 100644
      bool graph_evaluated_or_captured = false;
  
      // per-op timing instrumentation (env-gated, diagnostic only)
-@@ -7280,7 +9341,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -7283,7 +9344,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  }
  
  #ifdef USE_CUDA_GRAPH
@@ -10130,7 +10130,7 @@ index 5e749c937..43bfb8145 100644
      ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
  
      if (graph->instances.empty()) {
-@@ -7300,6 +9361,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7303,6 +9364,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
      ggml_cuda_set_device(cuda_ctx->device);
@@ -10139,7 +10139,7 @@ index 5e749c937..43bfb8145 100644
  
      ggml_cuda_mmb_begin_graph();
  
-@@ -7309,7 +9372,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7312,7 +9375,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      bool use_cuda_graph             = false;
      bool cuda_graph_update_required = false;
@@ -10148,7 +10148,7 @@ index 5e749c937..43bfb8145 100644
  
      // op timing instruments each node with stream events, which is not possible during capture
      const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
-@@ -7325,6 +9388,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7328,6 +9391,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
          const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
          const bool graph_compatible = graph_reused || ggml_cuda_graph_check_compability(cgraph);
          if (graph_compatible) {
@@ -10166,7 +10166,7 @@ index 5e749c937..43bfb8145 100644
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
  
              if (!graph->warmup_complete) {
-@@ -7351,10 +9425,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7354,10 +9428,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      cuda_graph_update_required = graph->instances.empty();
                  }
              }
@@ -10187,7 +10187,7 @@ index 5e749c937..43bfb8145 100644
      if (use_cuda_graph && cuda_graph_update_required) {
          // Start CUDA graph capture
          {
-@@ -7583,7 +9667,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7586,7 +9670,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  
  #ifdef USE_CUDA_GRAPH
@@ -10196,7 +10196,7 @@ index 5e749c937..43bfb8145 100644
      const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
  #else
      const bool use_cuda_graph = false;
-@@ -7825,6 +9909,184 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7828,6 +9912,184 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      }
  }
  
@@ -10381,7 +10381,7 @@ index 5e749c937..43bfb8145 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -7841,7 +10103,19 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -7844,7 +10106,19 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
      /* .event_record            = */ ggml_backend_cuda_event_record,
      /* .event_wait              = */ ggml_backend_cuda_event_wait,
@@ -10401,7 +10401,7 @@ index 5e749c937..43bfb8145 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -8111,8 +10385,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
+@@ -8114,8 +10388,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
  }
  
  static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
@@ -10412,7 +10412,7 @@ index 5e749c937..43bfb8145 100644
  }
  
  // TODO: move these functions here
-@@ -8646,9 +10920,71 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -8649,9 +10923,71 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
      }
  }
  
@@ -10484,7 +10484,7 @@ index 5e749c937..43bfb8145 100644
      return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
  }
  
-@@ -8683,6 +11019,155 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+@@ -8686,6 +11022,155 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
      CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
  }
  
@@ -10640,7 +10640,7 @@ index 5e749c937..43bfb8145 100644
  static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .get_name                = */ ggml_backend_cuda_device_get_name,
      /* .get_description         = */ ggml_backend_cuda_device_get_description,
-@@ -8699,6 +11184,31 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -8702,6 +11187,31 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .event_new               = */ ggml_backend_cuda_device_event_new,
      /* .event_free              = */ ggml_backend_cuda_device_event_free,
      /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
@@ -10672,7 +10672,7 @@ index 5e749c937..43bfb8145 100644
  };
  
  // backend reg
-@@ -8897,6 +11407,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -8900,6 +11410,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
          return nullptr;
      }
  

@@ -17,6 +17,7 @@ current; history is archived, not deleted).
 | `work/wip-archive/` | the older `wip/archive/` group (hybrid-allreduce, managed-ngrams, qwen35moe-prefill, qwen4exp), preserved with its original grouping |
 | `work/server-park-idle-slots/` | PR #225 (`@overdoingism`) promoted into block 12 as **r136**: idle-slot parking for the unified server KV cache (`RESOLUTION.md`, the original `README.md` and patch, `EVIDENCE-2026-10-25.md`) |
 | `work/can-fuse-bf16-rms-norm-r324/` | PR #339 (`@jstamagal`) **closed at r335 as already fixed**: the BF16 `RMS_NORM` + `MUL` (+ `ADD`) abort is real on r324-r327 and was removed by the r328 re-base onto `919794500` (no patch carried; `RESOLUTION.md` + the original `README.md`/patch) |
+| `work/mmb-bf16-pinned-r325/` | PR #340 (`@briansp2020`) **promoted at r336 into block 06**: BF16 dense GEMMs on MMB while `ROCBLAS_USE_HIPBLASLT=0` (the §44 pin costs 1-4 % instead of 13-23 %) plus the RDNA4 `hc16` dead-write removal (the one default-path item, +0.4 %); the six patches, the contributor's `README.md` and `logs/ab-r325.log` verbatim, and `RESOLUTION.md` with what was verified here |
 
 **2026-09-12 consolidation:** the completed `wip/` trees and the promoted block-15 beta record were
 moved here; `wip/` now holds only the active `wip/iq4nl-prefill/` handoff.  Cross-references in the

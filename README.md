@@ -20,7 +20,7 @@ and treat it as a stop-gap, not a feature.  Two further blocks are **optional** 
 default set: `0100` (two-lane prefill) and `0101` (mixed K/V cache types), applied only with
 `--include-optional` (see [`optional/README.md`](optional/README.md)).  The release `v<N>-...` prefix is
 the **official** block count (`N` = 17); `0300` and the optional blocks are not counted.  The current
-release is **`v17-919794500-r333`** (read `.release` in `release.json` -- it is the source of truth, not this
+release is **`v17-919794500-r336`** (read `.release` in `release.json` -- it is the source of truth, not this
 line): the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
@@ -661,6 +661,18 @@ rather than pinning it now ships as **block 06's `mmf32`** (`GREEDY-PURITY.md` �
 (12/12 fresh starts) and +4.2 % prefill on that model.  The campaign record, including the two refuted
 shortcuts and the in-code pin prototype that was *not* shipped, is
 [`archive/work/hipblaslt-bypass/`](archive/work/hipblaslt-bypass/README.md).
+
+**The pin is now cheap (r336, contributor PR #340) — and it is only needed below ROCm 10.2.**  The fix above
+is a `rocm-libraries` commit (`c50ea60130f`) that ships as hipBLASLt 1.5, i.e. **ROCm 10.2**: on 10.2 you do
+not need the pin for reproducibility at all.  On **ROCm ≤ 10.1**, where this section's pin is the only
+control, its prefill cost was 13-23 % on a qwen4exp model because the BF16 dense GEMMs (the hc mixer, the BF16
+router, the shared-expert gate) fell back to rocBLAS's Tensile kernels.  Block 06 now takes those GEMMs on MMB
+**only while `ROCBLAS_USE_HIPBLASLT=0`**, which brings the cost to 1-4 % — measured on a GSQ Flash-Next IQ3_S
+(2x gfx1201, 5.2k-token prompt): pinned prefill **1691 → 2196 t/s (+29.9 %)**, now *above* the
+hipBLASLt-enabled arm's 2027 t/s, with decode flat.  Nothing changes with hipBLASLt enabled (0 launches,
+prefill logits bit-identical), so a default run is unaffected; the delivery still never pins the variable
+itself.  If you pin for an unrelated reason on 10.2 (a hipBLASLt OOM at a tight slab headroom, say) you keep
+the speed as well.  Knobs: [`ENVIRONMENT.md`](ENVIRONMENT.md) §10.2.
 
 ## Concurrent serving with `--kv-unified` is not deterministic (issue #134)
 

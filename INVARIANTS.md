@@ -1617,3 +1617,50 @@ Record: `WORKLOG.md` 261121.007, `archive/work/r328-followups/` (§3 rows and `l
   are byte-identical (2944 bytes) to `919794500:ggml/src/ggml-cuda/ggml-cuda.cu`, `RMS_NORM + MUL + ROPE` is
   F32-only on both, and `test-backend-ops -o RMS_NORM_MUL_ADD` reads 124/124 with the BF16 and BF16-residual
   arms passing (gfx1201).  Record: `WORKLOG.md` 261121.014, `archive/work/can-fuse-bf16-rms-norm-r324/`.
+
+* **The `ROCBLAS_USE_HIPBLASLT=0` pin is now nearly free on qwen4exp, because the BF16 dense GEMMs are MMB's
+  while the pin is set — and a *version* gate for it would be the wrong switch (r336, contributor PR #340).**
+  Facts, all gfx1201 / ROCm 10.1 / 2-GPU `-sm tensor` / Flash-Next GSQ IQ3_S (host experts `-ncmoe 47 -lme 47`):
+  (1) **The gate is the user's pin, not a ROCm version.**  `mmb_hipblaslt_off()` reads `ROCBLAS_USE_HIPBLASLT`
+  and the arch default is an RDNA4 field gated on it, so with hipBLASLt enabled the census is **0** BF16 dense
+  launches and the default path is bit-identical (prefill-logit `-0.000000 / 100.000 %`, identical greedy text
+  both on the 4B 3-GPU arm (`7e6229b260f6`) and on Flash-Next (`c75182eb1697`)).  With the pin, 80+ launches
+  (the log caps at 80) and `GGML_CUDA_MMB_BF16_DENSE=0` returns to 0.  The pin is only *needed* below the
+  `c50ea60130f` fix (hipBLASLt 1.5 = ROCm 10.2), so a version check would remove the win from a 10.2 user who
+  pinned for another reason (e.g. a hipBLASLt OOM at a tight slab headroom, `runme`'s own documented
+  workaround) and give a sub-10.2 user who did not pin nothing — there is no cost to recover while hipBLASLt is
+  dispatching.  The honest limitation is the other direction: a box where hipBLASLt is *absent* (rocBLAS falls
+  back with the variable unset) is not detected, and `GGML_CUDA_MMB_BF16_DENSE=1` is the escape hatch.
+  (2) **The pin's prefill cost drops 13-23 % -> 1-4 %**: 1691 -> **2196 t/s (+29.9 %)** on a 5.2k-token prompt,
+  which is above the hipBLASLt-enabled arm's 2027; decode flat (55.2/55.9 -> 55.0/56.1 t/s at `-n 128`).
+  (3) **The change is provably prefill-only**: the W=1..8 width probe on the same (pinned) model reads
+  `width_purity=PASS (worst maxdiff 0)` on both its flat and boundary arms and every per-width
+  `row0/row1` hash is identical to the base build's.  That is the general fact — a BF16 dense path with a
+  33-token floor cannot reach the decode band, and the probe is what demonstrates it rather than asserting it.
+  (4) **Three of its four pieces are bit-identical by construction, and that is checkable**: `SMALL_TILE`
+  (geometry only, the K sum order is unchanged), `PRODUCER_BF16` (the producer's RNE copy == the conversion it
+  replaces) and `HC16=1` (the reverted slot write) each read **0.000000 / 100.000 %** on the pinned
+  prefill-logit point; `TINY_BF16_XH` alone moves numerics (**0.014143 / 96.402 %** against the F32-read arm)
+  because reading the activation's bf16 copy rounds it, which is the one piece that must be judged at the
+  logit level.
+  (5) **The pinned-mode family switch is smaller than the library gap it sits inside**, which is what makes it
+  decidable rather than a regression: pinned-vs-r334-pinned **0.013781 / 96.427 %**, while r334's own
+  default-vs-pinned pair is **0.015033 / 96.24 %** and r336's is **0.014772 / 96.41 %** — the pinned arm moves
+  marginally *towards* the default.  A pinned base therefore needs one re-record on landing, never a
+  cross-release hash identity claim (`GREEDY-PURITY.md` §44 addendum).
+  (6) **The hc gate's BF16 side copy was dead on RDNA4 and it was 84 MB per call** (`2*T*10240` at `T 4096`):
+  its readers only take it where a graph marks the output BF16-only and every marking pass is
+  `GGML_CUDA_CC_IS_RDNA3_5`-gated, so turning `hc16` off on RDNA4 is output-neutral (`HC16=1` A/B
+  0.000000 / 100.000 %) and worth **+0.4 %** prefill with hipBLASLt **on** (2594 -> 2604 t/s, 3 reps) — the
+  only part of r336 a consumer gets by default.  A dead write is worth removing even when it is only 0.4 %.
+  (7) **The same facts hold on ROCm 10.2, and the effect is larger there**: both builds were remade against
+  `/opt/rocm-10.2.0-gfx120X` (the canonical build's new line), and 10.2-vs-10.2 gives the same coherence hash as
+  10.1 (`7e6229b260f6`), prefill-logit **-0.000000 / 100.000 %**, the same census `0/80/0/0`, and pinned prefill
+  **+33.3 %** (1553/1662/1648 -> 2146/2169/2164 t/s) against +29.9 % on 10.1.  And a *method* fact worth not
+  re-deriving: **a fresh-start arm on the two shapes §44 names is now vacuous by construction**, because
+  `mmf32` (this block, §47) claims the `m <= 256` F32 GDN `ssm_alpha`/`ssm_beta` and router shapes — measured
+  10/10 and 6/6 one class on **both** ROCm lines with hipBLASLt enabled, which is "no spread", i.e. no evidence
+  about the library rather than evidence about it (`TODO` #362 keeps the arm map and names the decisive
+  candidate).
+  Record: `WORKLOG.md` 261121.015, `benchmarks/2026-11-21-mmb-bf16-pinned.md`,
+  `archive/work/mmb-bf16-pinned-r325/`, `ENVIRONMENT.md` §10.2, `patches/README.md` block 06.

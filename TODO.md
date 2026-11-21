@@ -56,11 +56,12 @@ re-entry condition.  A green gate ladder is still not permission to skip a row.
 | **358** | a re-base rung can silently drop a file: block 00's `ggml-alloc.c` half was missing from r328/r329 while its text, docs and its own unit test still described it (issue #345, fixed r331) | tooling / gate (re-base flow) | **OPEN** -- reconcile each rung's changed-file set against the patch it replaces and fail on a file the old patch touched and the new one does not; the 18/18 ladder cannot see it; §358 |
 | **359** | `gate-fusion-alias-copy.sh`'s arm A oracle (`fused == GGML_CUDA_DISABLE_FUSION=1` text at `-ub 14`) broke at the r328 re-base: the UNFUSED chain moved, the fused arm still reproduces the r239 anchor `3fab4da87774` | tooling / gate (issue #287 gate) | **OPEN** -- re-derive the oracle (a logit/KLD compare at that shape rather than text): r329 and r331 both read `a_chain` 194/`dfe59c9c5257` vs `a_fused` 193/`3fab4da87774`, and pinning `GGML_GLU_INPLACE=0` changes neither arm, so neither the r331 restore nor the allocator is the cause; §359 |
 | **361** | the r334 RDNA2 items (PR #338) are validated on the contributor's V620, not on the released tree: blocks 05/08/10 now carry an RDNA2-only FA tile-cap removal, a one-warp narrow `RMS_NORM`, a `H * n_seqs` GDN chunked gate and a rows-abreast MoE K walk, and no RDNA2 device is in the maintainer's fleet | validation / external (delivery) | **WAITING on `@jstamagal`** -- re-run on the r334 tree: full `test-backend-ops` on `gfx1030` at default flags (**especially `FLASH_ATTN_EXT` with the caps gone: the failure mode is `GGML_ASSERT(max_blocks_per_sm > 0)` in `launch_fattn`, not a rate**), `MUL_MAT_ID` with `GGML_CUDA_MOE_ROWS_ABREAST` on and off, `RMS_NORM*` in the default/`NARROW=0`/`VEC=1` arms, a model-level decode+prefill (a GDN model for the chunked gate, a MoE for the K walk) and an MTP-acceptance run; **it should also confirm that PR #339's BF16 `RMS_NORM + MUL (+ ADD)` abort is gone there** (fixed at r328 by the re-base, `archive/work/can-fuse-bf16-rms-norm-r324/` -- `RMS_NORM_MUL_ADD` now includes `type=bf16,type_w=f32` and `type=bf16,type_w=f32,type_add=bf16` arms); §361 |
+| **362** | §44's doctrine rests on a per-start hipBLASLt solution lottery that ROCm 10.2 should no longer have (`c50ea60130f` ships as hipBLASLt 1.5), and the delivery has never verified that on the 10.2 line -- `README.md`, `GREEDY-PURITY.md` §44 and the r336 note all still say "pin below 10.2" without a 10.2 arm | validation (ROCm line) | **OPEN** -- on `/opt/rocm-10.2.0-gfx120X`, run the two documented call sites from §44 (a gemma-4-26B-A4B F32 MoE-router MTP config and the 35B-A3B GDN `ssm_alpha`/`ssm_beta` GEMM) over N fresh starts with hipBLASLt **left enabled**: one logits/greedy class over N (N >= 18 and N >= 8 respectively, the r-2026-10-21 counts) retires the pin from the *tester's* doctrine on that line, and a spread means the fix is not in 10.2 as assumed.  Also decide whether 10.2 becomes a **validated line** (a `baseline`-style note in `BASELINE.md` + a build script sibling of `~/bin/build-llama-rocm`), which is what would let a 10.2 arm be quoted rather than a one-off; §362 |
 
 
 ## Handle numbering
 
-**New handles append after `#361`, the highest issued so far, so the next free handle is `#362`; a number is
+**New handles append after `#362`, the highest issued so far, so the next free handle is `#363`; a number is
 never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
 subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
 
@@ -198,6 +199,43 @@ its size).  Records: `WORKLOG.md` 261108.011, `benchmarks/2026-11-08-host-expert
 arena is now read IN PLACE at any width (`MOE_EXPERT_PREFILL_IN_PLACE`: 1489.6 -> 4033.9 t/s on 3 GPUs
 `-sm tensor`, 3588.8 -> 4072.4 on the pool mirror).  Consolidating the three transports for a **partly resident**
 table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2026-11-10-prefill-in-place.md`.
+
+## 362. Verify (or refute) §44's per-start hipBLASLt lottery on ROCm 10.2, and decide whether 10.2 is a validated line
+
+**Why it matters.**  `GREEDY-PURITY.md` §44 tells every tester to pin `ROCBLAS_USE_HIPBLASLT=0` before comparing
+fresh processes, and `README.md` says the pin is only needed below the `rocm-libraries` fix `c50ea60130f` — which
+ships as hipBLASLt 1.5, i.e. **ROCm 10.2**.  That mapping has never been measured here: the doctrine's numbers
+are ROCm 10.1.0 (and the reporter's Windows/ROCm 10), and `/opt/rocm-10.2.0-gfx120X` is installed but unbuilt.
+
+**What one run would settle it.**  On a 10.2 build, with hipBLASLt **left enabled** (that is the whole point — the
+delivery never pins it itself), repeat §44's two recorded call sites over fresh starts:
+
+* a gemma-4-26B-A4B F32 MoE-router (`ffn_gate_inp`, `m=128 n=375 k=2816 T,N`) MTP config, N >= 18 starts — the
+  r-2026-10-21 arm read **3 logit classes in 18**;
+* the 35B-A3B GDN `ssm_alpha`/`ssm_beta` GEMM (`F32 2048x32 x N`), N >= 8 starts — that arm read **3 in 8**.
+
+**Arms already run (2026-11-21, r336 — do not re-derive).**  With hipBLASLt enabled, the width probe's
+`row0` logits hash read **10/10 identical** on 35B-A3B UD-Q4_K_M at `P=4096` (ROCm 10.1 **and** 10.2) and
+**6/6 identical** on Flash-Next GSQ IQ3_S at `P=4096` with `MOE_EXPERT_HEATMAP=load` (10.1 and 10.2): no
+spread on either line, so those arms are **vacuous** -- §44's own rule is that stability is config-dependent.
+Two reasons, both recorded in `benchmarks/2026-11-21-mmb-bf16-pinned.md` §8.1: (a) a config that does not flip
+says nothing about the mechanism; (b) in the delivery the two call sites below are no longer served by
+hipBLASLt at all -- `mmf32` (block 06, §47) claims the `m <= 256` F32 GDN and router shapes by construction,
+so a fresh-start arm on them cannot flip whatever the library does.  What is still owed is a shape hipBLASLt
+*does* serve and that is known to flip on 10.1: the gemma4-26B-A4B MTP arm recorded in §44 (3 logit classes
+in 18 starts) is the candidate.
+
+**One class over those counts** retires the pin from the *tester's* doctrine on the 10.2 line (the pin stays a
+valid control on 10.1, and r336 makes it nearly free there — `ENVIRONMENT.md` §10.2).  A spread means the fix is
+not in 10.2 as assumed, and §44 and `README.md` both still stand unchanged.
+
+**The second question is a policy one and is the maintainer's.**  A one-off 10.2 arm quotes an unvalidated
+toolchain; quoting it as a *line* needs a build path (`~/bin/build-llama-rocm-102`, `BUILD_DIR=build-rocm-102`, a
+separate base recording per line — `gate-prefill-logits.sh` already refuses a base recorded on another ROCm
+line) and a `BASELINE.md` note saying 10.2 is validated.  Until then a 10.2 result here is one arm on one box.
+
+No emoji, no per-run numbers in this file: the arm and its counts go in the `WORKLOG.md` entry that closes this
+item.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

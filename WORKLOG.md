@@ -1,3 +1,108 @@
+## 261121.015 (r336) -- **RELEASE**: contributor PR #340 folded into **block 06** -- BF16 dense GEMMs take MMB while `ROCBLAS_USE_HIPBLASLT=0` (the §44 pin costs 1-4 % instead of 13-23 %), plus an RDNA4 dead-write removal -- every supported arch's default numerics unchanged
+
+**Block 06 is amended; the base, the block count and the release prefix do not move** (17 official blocks +
+the temporary `0300` = 18 default patches, base `919794500`, tag `v17-919794500-r336`).  The optional
+artifacts `0100`/`0101` are re-cut against the new default tree (both applied **strictly**, no hunks moved).
+`release.json` `.tip` = `fb97954bd`, `.tree` = `213764a779`; `scripts/validate-set.sh` green.
+
+### 1. What the PR is, and the decision
+
+PR #340 (`@briansp2020`, `wip/mmb-bf16-pinned-r325/`, six patches, 648 lines) makes a qwen4exp model's **BF16
+dense GEMMs** (the hyper-connection mixer, the BF16 router, the shared-expert gate -- **484 tensors** on a GSQ
+Flash-Next IQ3_S) take MMB's bf16-WMMA tile **only while rocBLAS is told to keep GEMMs off hipBLASLt**
+(`ROCBLAS_USE_HIPBLASLT=0`, §44's determinism control).  With hipBLASLt off those GEMMs fell back to
+rocBLAS's own Tensile kernels, which cost that model 13-23 % of its prefill -- so the pin, mandatory below the
+`c50ea60130f` fix (hipBLASLt 1.5 = **ROCm 10.2**), was expensive.  The maintainer's decision was to take all
+six, folded into the block that owns `mmb.cu` (r334's precedent for PR #338), with the pinned-mode family
+switch accepted and documented.
+
+### 2. Verified on this box, not taken on trust (full record: `benchmarks/2026-11-21-mmb-bf16-pinned.md`)
+
+gfx1201 / ROCm 10.1, 2-GPU `-sm tensor` (`HIP_VISIBLE_DEVICES=0,2`), Flash-Next GSQ IQ3_S, host experts
+`-ncmoe 47 -lme 47 --load-mode dio`:
+
+* **The mechanism, by census.** `GGML_CUDA_MMB_LOG=1`: **0** BF16 dense launches with hipBLASLt on, **80**
+  (the log's cap) with the pin, **0** with `GGML_CUDA_MMB_BF16_DENSE=0`.  Unreachable by default, kill
+  switch real.
+* **The pin's cost.** 5,246-token prompt, 3 reps: pinned prefill **1691.4 -> 2196.0 t/s (+29.9 %)**, *above*
+  the hipBLASLt-enabled arm (2027.3); decode flat (55.2/55.9 -> 55.0/56.1 t/s); the contributor's 31.5k-token
+  ratio (+29 %) reproduces.
+* **The default path is bit-identical.** prefill-logit gate, Flash-Next point, no pin: **-0.000000 /
+  100.000 %**; greedy text identical (`7e6229b260f6` 4B 3-GPU, `c75182eb1697` Flash-Next).
+* **Prefill-only, proven.** `test-logits-width-probe` on the affected model, pinned, `P=4096`: both arms
+  `width_purity=PASS (worst maxdiff 0)` and every W=1..8 `row0/row1` hash identical to the base build.
+* **Three of the four "bit-identical" claims hold, and the fourth does not claim to.** On the pinned point,
+  `--ab`: `SMALL_TILE=0` **-0.000000 / 100.000 %**, `PRODUCER_BF16=0` **-0.000000 / 100.000 %**, `HC16=1`
+  **-0.000000 / 100.000 %**; `TINY_BF16_XH=0` **0.014143 / 96.402 %** (it rounds the activation -- judged at
+  the logit level, as §44's addendum now says).
+* **`test-backend-ops -o MUL_MAT`** pinned: **2691/2692**, the only failure the pre-existing `f16
+  n=2105344` case (src0 f16 -- not this code).
+* **The pinned family switch is smaller than the library gap it sits inside** -- which is what made it
+  decidable rather than a regression: pinned-vs-r334-pinned **0.013781 / 96.427 %**, while r334's own
+  default-vs-pinned pair is **0.015033 / 96.24 %** and r336's is **0.014772 / 96.41 %**.  A pinned base needs
+  one re-record; its *value* (a determinism control) is unchanged.
+
+### 3. What is actually default-on for a consumer
+
+Only the **`hc16` dead-write removal**: the hc gate's BF16 side copy (`2*T*10240` bytes per call, 84 MB at
+`T 4096`) had readers only where a graph marks the output BF16-only, and every marking pass is
+`GGML_CUDA_CC_IS_RDNA3_5`-gated -- on RDNA4 it was written and never read.  Off on RDNA4: **+0.4 %** prefill
+(2594.0 -> 2603.9 t/s, 15.8k-token prompt, 3 reps, hipBLASLt on), output bit-identical.  Everything else is
+inert unless the user pins, which the delivery never does.
+
+### 4. Why no ROCm-version gate (asked, answered, documented)
+
+The maintainer asked for a "below 10.2" gate.  Recorded position: **the feature's existing gate IS the
+version gate, and a better one.**  `mmb_hipblaslt_off()` keys on the user's actual `ROCBLAS_USE_HIPBLASLT=0`,
+so: a 10.1 user who must pin for determinism gets the speed automatically; a 10.2 user who does not pin pays
+nothing (0 launches); a 10.2 user who pins for another reason (a hipBLASLt OOM at a tight slab headroom --
+`runme`'s own documented workaround) keeps it too.  A ROCm-version check would take the win away from that
+last user, give the first user nothing extra, and mis-model the fix anyway: `c50ea60130f` is a rocm-libraries
+commit, so a nightly can carry it before a release does.  The one gap is the opposite direction (hipBLASLt
+*absent*, so rocBLAS falls back with the variable unset) and it is documented with
+`GGML_CUDA_MMB_BF16_DENSE=1` as the escape hatch.  The honest 10.2 question is whether §44's lottery still
+reproduces at all there -- `TODO` #362, which also asks whether 10.2 becomes a validated line.
+
+### 4b. The ROCm 10.2 line, and the §44 question it raises
+
+The canonical `~/bin/build-llama-rocm` was switched to **ROCm 10.2.0** (`/opt/rocm-10.2.0-gfx120X`) the same
+afternoon, so the release-critical arms were re-run as **10.2 vs 10.2** (`build-rocm/bin-r334-102` and
+`bin-r336-102`; 5m44s cold build, 31 s incremental): coherence `7e6229b260f6` on both builds **and** the same
+hash as the 10.1 line; prefill-logit default point **-0.000000 / 100.000 % PASS** against a base recorded on
+10.2 from the r334 build; the census `0 / 80 / 0 / 0` again; pinned prefill **+33.3 %** (1553/1662/1648 ->
+2146/2169/2164 t/s), i.e. larger than on 10.1 (+29.9 %).
+
+Because 10.2 is the line where §44's pin is *supposed* to become unnecessary (hipBLASLt 1.5 carries
+`c50ea60130f`), `TODO` #362 was attacked with three fresh-start arms with hipBLASLt **enabled**: the width
+probe's `row0` logits hash read **10/10 identical** on 35B-A3B UD-Q4_K_M at `P=4096` on **both** lines and
+**6/6 identical** on Flash-Next GSQ IQ3_S (heat map pinned) on both lines.  **No spread anywhere, so the arms
+are vacuous, not proof of a fix** — §44's own rule is that stability is config-dependent, and in the delivery
+the two documented call sites are no longer hipBLASLt's at all (`mmf32`, block 06, §47, claims the `m <= 256`
+F32 GDN/router shapes by construction).  `TODO` #362 stays OPEN with that arm map and names the decisive
+candidate (the gemma4-26B-A4B MTP arm, 3 classes in 18 starts in the original record); the benchmark record's
+§8.1 carries the numbers so the next session does not re-derive them.
+
+### 5. How it landed (one commit per block, 18 blocks)
+
+The six PR patches apply cleanly on the r334 tip but the delta has to live **inside block 06**, and blocks 10
+and 14 also touch `mmb.cu`, so the fold was a rebase with six conflict resolutions: the arch-defaults block
+(take the new fields, leave block 11's `gatemix` to block 11), the tiny-M kernel template (the PR adds
+`WBF16` alongside block 10's `XBF16`), the F32 tiny-M call site and `mmb_bf16_activation` (keep block 06's
+`g_mmb_slots`/`g_mmb_cache` storage at that layer, add the producer-cache path), and block 10's own hunks that
+the moved plumbing had absorbed.  Net effect on the delivery: **block 06 carries the tiny-M `XBF16`
+activation plumbing that block 10 used to add**, block 10's patch is smaller by those hunks, and the applied
+tree is unchanged.  `patches/README.md` block 06 records it; `make-patches.sh` + `make-release.sh` +
+`validate-set.sh` are the flow.
+
+### 6. Records
+
+`archive/work/mmb-bf16-pinned-r325/` (the contributor's six patches, `README.md` and `logs/ab-r325.log`
+verbatim, plus `RESOLUTION.md`), `benchmarks/2026-11-21-mmb-bf16-pinned.md`, `ENVIRONMENT.md` §10.2 (nine
+variables: seven new, `HC16`'s RDNA4 default, `BF16_MIN_T`), `GREEDY-PURITY.md` §44 addendum, `INVARIANTS.md`
+r336, `patches/README.md` block 06, `TODO` #362.  The contributor's own ROCm 10.2 row is why the series is
+inert on that line -- that is his observation, confirmed here at the mechanism level (0 launches without the
+pin) and documented as the version mapping rather than a version check.
+
 ## 261121.014 (r335) -- PR #339's BF16 `RMS_NORM` + `MUL` (+ `ADD`) abort is a REAL r324-r327 defect that the **r328 re-base already fixed**: archived, no patch, no tag
 
 **No delivery patch, block, `release.json` base/tip/tree or optional artifact changed, and no tag was cut**

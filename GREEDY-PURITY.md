@@ -903,6 +903,27 @@ particular class.
 Record: `archive/work/fix-gemma-4/evidence/MEASUREMENTS-2026-10-21d.md`; discussion #196;
 `archive/work/hipblaslt-bypass/` (§47's mmf32, the in-code alternative).
 
+### §44 addendum (r336, contributor PR #340) — the pin's own cost is now 1-4 %, not 13-23 %
+**The rule is unchanged: the delivery never pins it.**  What changed is what the pin costs when a *user* sets
+it.  On a qwen4exp model the BF16 dense GEMMs (hyper-connection mixer, BF16 router, shared-expert gate — 484
+tensors on a GSQ Flash-Next IQ3_S) left hipBLASLt's fallback to rocBLAS's Tensile kernels at 13-23 % of the
+prefill; with `ROCBLAS_USE_HIPBLASLT=0` they now take MMB's bf16-WMMA tile (block 06, r336) and the pin
+costs 1-4 % — on this box (2x gfx1201, 5.2k-token prompt, 3 reps) **1691 -> 2196 t/s (+29.9 %)**, which is
+*faster* than the hipBLASLt-enabled arm (2027 t/s).
+
+**This moves the pinned arm's numerics, and that is the point to record.**  A pinned run is a *different
+kernel family*, so a base recorded before r336 does not reproduce after it (pinned text `542a82039180` ->
+`880c932888f8` on the 5.2k prose arm; pinned-vs-r334-pinned prefill KLD **0.013781 / 96.427 %**, i.e. a FAIL
+against the 0.005/98 % limits if it is read as a regression).  The calibration that makes it decididable:
+**r334's own default-vs-pinned pair is 0.015033 / 96.24 %**, and with r336 the default-vs-pinned pair is
+**0.014772 / 96.41 %** — the change lands no further from the default than the library already was, and
+marginally closer.  So: re-record a pinned base once when this lands (the pin's *value* is unchanged), and
+never judge a pinned arm by cross-release hash identity.  The delivery's own gates are unaffected because
+every one of them runs with hipBLASLt enabled, where the change is inert (prefill-logit `-0.000000 / 100.000 %`,
+identical text).  The ROCm-version relationship is in `README.md` and `ENVIRONMENT.md` §10.2: the pin is only
+*needed* below hipBLASLt 1.5 (ROCm 10.2), and the feature keys on the user's actual pin rather than on a
+version probe (`INVARIANTS.md` r336).
+
 *Narrative:* `archive/docs/GREEDY-PURITY-FINDINGS.md` §44.
 
 ## 45. A split the op cannot serve locally is a refusal, not an approximation

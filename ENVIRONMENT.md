@@ -1126,6 +1126,51 @@ Scope: F32 weights only, `m <= 256`, `17 <= n <= 65536`, `256 <= k <= 8192`, `ld
 keeps the rocBLAS call.  BF16/f16 prefill (Flash-Next) is untouched, and so is its hipBLASLt advantage; a
 full-F32 model's FFN GEMMs (`m >> 256`) stay on rocBLAS (a recorded limitation).
 
+### 10.2 The BF16 dense GEMMs while hipBLASLt is **off** (block 06, r336 — contributor PR #340)
+
+**The gate is the user's own pin, not a ROCm version.**  Every variable in this subsection is reachable
+only when rocBLAS has been told to keep GEMMs off hipBLASLt — `ROCBLAS_USE_HIPBLASLT=0`, which is §44's
+**determinism control** and is *never* pinned by the delivery (see `README.md`, `GREEDY-PURITY.md` §44).
+With hipBLASLt on, the census reads **0** BF16 launches and the default path is bit-identical (prefill-logit
+`-0.000000 / 100.000 %`, same greedy text); `GGML_CUDA_MMB_BF16_DENSE=1` is the only way to force it on
+there, and it exists for A/B only.
+
+**Why it exists.**  With hipBLASLt off, a qwen4exp model's BF16 dense GEMMs — the hyper-connection mixer,
+the BF16 router and the shared-expert gate, 484 tensors on a GSQ Flash-Next IQ3_S — fall back to rocBLAS's
+own Tensile kernels, which cost that model **13-23 % of the prefill**.  They now take MMB's bf16-WMMA tile
+from 33 tokens instead.  Measured on this box (gfx1201, 2-GPU `-sm tensor`, Flash-Next GSQ IQ3_S,
+host experts `-ncmoe 47 -lme 47`, 5.2k-token prompt, 3 reps), on **both ROCm lines**: pinned prefill
+**1691 -> 2196 t/s (+29.9 %)** on 10.1 and **1553-1662 -> 2146-2169 (+33.3 %)** on **10.2**, i.e. in both cases
+*above* the default (hipBLASLt-enabled) arm; decode flat (55.2/55.9 -> 55.0/56.1 t/s); the W=1..8 width probe
+bit-identical to the base on the same model, so the change is provably prefill-only; and the default path is
+`-0.000000 / 100.000 %` on a base recorded per line.
+
+**The ROCm-version relationship (r336, for the record).**  The pin is only *needed* below the hipBLASLt fix
+(`rocm-libraries` `c50ea60130f`, shipped as hipBLASLt 1.5 = ROCm 10.2).  So: on **ROCm <= 10.1**, where §44
+makes the pin mandatory for reproducible runs, this is what makes that pin **cheap** (1-4 % of the prefill
+instead of 13-23 %); on **ROCm 10.2+** nothing fires unless the user pins for an unrelated reason (e.g. a
+hipBLASLt OOM at a tight slab headroom), in which case they keep the speed too.  A ROCm-version check was
+deliberately NOT added: the fix is a rocm-libraries commit, not a ROCm version (a nightly may carry it
+before a release does), and `ROCBLAS_USE_HIPBLASLT=0` is the ground truth for "is rocBLAS dispatching to
+hipBLASLt" — a version gate would remove the win from a 10.2 user who pinned for an OOM and add nothing for
+a 10.1 user who did not pin (there is no cost to recover when hipBLASLt is doing the work).
+
+| variable | default | kind | notes |
+|---|---|---|---|
+| `GGML_CUDA_MMB_BF16_DENSE` | **on** (RDNA4, and only while `ROCBLAS_USE_HIPBLASLT=0`) | kill-switch (+ force) | `=0` restores the rocBLAS/Tensile path; `=1` forces it on **even with hipBLASLt on** (A/B only — the output then moves).  The arch default is a field of the RDNA4 row, so RDNA3_5/RDNA3_0 keep the pre-r336 behaviour exactly. |
+| `GGML_CUDA_MMB_BF16_MIN_T` | **33** (`MMVF_MAX_BATCH_SIZE_FLAT + 1`) | tuning | the lowest `n_tokens` that may take the BF16 dense tile.  Clamped up to 33 whatever is passed: below that the decode/verify band must stay on MMVF. |
+| `GGML_CUDA_MMB_TINY_M_BF16` | **on** (RDNA4) | kill-switch | BF16 weights with `M <= 8` (the shared-expert gate at `M=1`, the BF16 hc inject at `M=4`) take the warp-per-token kernel instead of padding a 256-row tile.  `=0` = the dense tile. |
+| `GGML_CUDA_MMB_TINY_BF16_XH` | **on** | kill-switch | that kernel reads the **bf16** copy of its activation (bandwidth-bound: 84 MB of F32 at `T 2048`) rather than the F32 tensor.  **Not bit-identical** — it rounds the activation exactly as the dense tile does, so it is part of the pinned-mode family switch (KLD 0.0141 against the F32-read arm): judge it with the prefill-logit gate, never with a text diff alone.  `=0` = F32 read. |
+| `GGML_CUDA_MMB_PRODUCER_BF16` | **on** | kill-switch | take the **RNE bf16 copy the qwen4exp prefill producers already wrote into `bf16_src1_cache`** for the cuBLAS BF16 GEMMs (`hc_combine_norm`'s xn, `dsv4_hc_pre`, the hc_post_rms norm) instead of converting again.  Same rounding (`hc_f2bf32`/`dsv4_f2bf` == `mmb_f2bf`), same key as the cuBLAS lookup, **bit-identical** (`--ab` 0.000000 / 100.000 %).  `=0` = always convert.  Only a BF16 weight routed here takes the producer copy; every other MMB GEMM still inserts its activation into the MMB cache, where the hc gate-mix fusion looks it up. |
+| `GGML_CUDA_MMB_SMALL_TILE` | **on** (RDNA4) | kill-switch | a BF16 weight (no shadow) whose 256x128 grid is below `GGML_CUDA_MMB_SMALL_GRID` takes the first of 128x64 / 64x32 that reaches it, else 64x32 — the hc inject and the router at small prompt widths launch 2x3 = 6 workgroups on 64 CUs otherwise.  Every output still sums K in the same order, so this is **bit-identical** (`--ab` 0.000000 / 100.000 %).  `=0` = off. |
+| `GGML_CUDA_MMB_SMALL_GRID` | **64** | tuning | the workgroup count a tile must reach to be taken; `<= 0` behaves as off. |
+| `GGML_CUDA_MMB_HC16` | on **RDNA3_5**, **off on RDNA4** (r336) | kill-switch | the hc gate's BF16 side copy (slot 1, `2*T*M` bytes per call — ~84 MB at `T 4096`).  Its readers only take it where the graph marks the output BF16-only, and those marking passes are **RDNA3_5-gated**, so on RDNA4 the copy was written and never read; worth **+0.4 %** prefill with hipBLASLt **on** (2594 -> 2604 t/s, output bit-identical), i.e. it is the one part of r336 that is a default-path win.  `=1` restores the write on RDNA4 (which buys nothing — the marks stay off there). |
+
+**Known limitation.**  The switch reads `ROCBLAS_USE_HIPBLASLT` from the environment.  A box where
+hipBLASLt is absent entirely (rocBLAS falls back on its own, the variable unset) is therefore *not*
+detected, and those users pay the Tensile cost with nothing taking over — `GGML_CUDA_MMB_BF16_DENSE=1` is
+the escape hatch.  There is no rocBLAS API that reports the dispatch decision.
+
 ---
 
 ## 11. Diagnostics and profiling
