@@ -40,7 +40,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | R06 | 06 | `f0564df7d` | 2 (2 regions) | D11 | **DONE 2026-11-21** — `ee377ec45`, tree `b5dc56996`; both conflicts are unions (upstream's few-row MMQ keeps precedence, MMB follows; `expert_bounds` re-ported onto the R00 store helper); coherence `1c5d32ac537d`; MUL_MAT_ID 1078/0 (16 dup); MMB default +0.33 % pp2048 / +0.62 % pp16384, MMF32 +0.9 %/+1.0 %; **finding: block 06's MMB cache/slot buffers are pool-unsafe until block 10's `pool_stack` (R06.2)** |
 | R07 | 07 | `f5bdbefda` | 1 (2 regions) | D11 | **DONE 2026-11-21** — `1435e7873`, tree `d3b004581`; both conflicts in `mmvq.cu` are unions (enum `ORIN` + `NAVI21`, `calc_nwarps` both special cases); upstream's RDNA3_5 `ne11` gate adopted (dispatch threshold, not an alternative to our VDR tables, unreachable on gfx1201); coherence `1c5d32ac537d`; MUL_MAT (q6_K/q8_0/q1_0/iq4_xs) 335/0; 27B Q6_K pp2048 1154.5 — the delivery's `MMQ_J_MAX` cap only hurts (64 → 977.5), the grid pad is +1.4 % with identical text |
 | R08 | 08 | `fe283f27c` | 8 (13 regions) | **D4 (resolved: MERGE, no precedence change)**, D3, D11 | **DONE 2026-11-21** — `510769147`, tree `2ed6cb541`; repair list in R08.3 (5 raw warp-mask sites in block 08's own code, the `k_set_rows_q8_0_group` F32-source gate, a `force_tiling`→`has_gate` template-slot artifact, a lost `#if` guard); coherence `1c5d32ac537d` on the default and on all three kill switches; NORM/RMS_NORM/GROUP_NORM/SET_ROWS 368/0; MUL_MAT_ID 1079/0 (16 dup); fusion off costs −5.4 % pp2048 / −18.7 % tg128 with identical text; `DISABLE_NORM_ROWS=1` is **inert** here (its dispatch is block 10's) |
-| R09 | 09 | `123d53419` | 4 | D8, D9 | not started |
+| R09 | 09 | `123d53419` | 4 (7 regions) | D8, D9 (both MERGE) | **DONE 2026-11-21** — `24cecfb51`, tree `b05ee8543`; all four conflicts resolved as merges (the two extracted functions moved to `mmvq.cu` with upstream's two refinements ported in, `seq_rm` adopted, `split_has_nodes` **not** taken — see R09.3); build green, coherence `1c5d32ac537d`, MUL_MAT_ID 1079/0; **finding: the arena-off arm diverges in text, and the cause is block 09's own host-offload relaxation** (control `GGML_MOE_HOST_OFFLOAD=0` restores identity; r327 agrees) |
 | R10 | 10 | `7bbf540d5` | 9 | D8, D12 + **drop block 10's `top_k` hunk (R00.6 obligation 1)** | not started |
 | R11 | 11 | `61168c60b` | 5 | D9, D13 | not started |
 | R12 | 12 | `dad1442b3` | 9 | D5, D6, D7 | not started |
@@ -779,6 +779,94 @@ must show both arms still firing at R18.
 - `norm.cu` now carries three parallel norm surfaces (upstream's fused `norm_f32`, the delivery's `rms_norm_*`
   decode-band fusions, and `norm-gated.cu`'s narrow-row kernel).  R10's dispatcher is where the precedence
   between them lives; do not "simplify" one away without the prefill-logit gate.
+
+---
+
+# R09 — block 09, host-resident MoE (iface, scheduler, Meta, slab and cache engine)  ·  **DONE 2026-11-21** — `24cecfb51`, tree `b05ee8543`
+
+```
+git cherry-pick 123d53419        # 70 files, +18251/-540 (moe-expert-cache, moe-cache iface, loader, bench)
+```
+
+The climb's highest *exposure* (136 upstream commits on the block's files) but only 4 conflicted paths — the
+block adds new TUs rather than rewriting upstream's, so most of the 70 files merged.  The two `DECISIONS.md`
+items (**D8**, **D9**) are both `MERGE` and neither needed a choice.
+
+| exit criterion | result |
+|---|---|
+| conflicts | 4 files / 7 regions (`ggml-backend.cpp`×2, `ggml-cuda/common.cuh`×2, `ggml-cuda/ggml-cuda.cu`, `src/llama-kv-cache.cpp`) |
+| no markers left | yes; no `TODO(rebase)` |
+| build | green, `all` targets, 0 errors, **0** warnings in the touch-path files |
+| coherence 4B | **`100 chars sha=1c5d32ac537d`** — unchanged, and unchanged again after the `ggml-backend.cpp` split-condition change recorded in R09.3 |
+| `test-backend-ops -o MUL_MAT_ID` | **1079 OK / 0 FAIL** |
+| the block's headline arm (35B-A3B Q8_0, 1 GPU, `-ncmoe 20 -c 8192`, VMM build) | arena default **1268.8 / 54.4** `73 chars sha=86b7f9b5aa80`; that hash is **identical to r327's** on the same arm |
+| **one finding** | R09.3: with the arena off (`MOE_EXPERT_CACHE_MIB=0`) this tree reads different text (`34 chars sha=22584470ac60`) where r327 reads the same text as its arena arm; the cause is block 09's **host-offload relaxation**, proven by the `GGML_MOE_HOST_OFFLOAD=0` control |
+
+## R09.1 The four resolutions
+
+| path | upstream | delivery (block 09) | resolution |
+|---|---|---|---|
+| `ggml-backend.cpp` (1) | `bool split_has_nodes = false;` | `int cur_moe_layer = -1;` (+ comment) | **both** |
+| `ggml-backend.cpp` (2) | `… && split_has_nodes` | `… && split->n_inputs > 0` + `int next_moe_layer = -1;` | **the delivery's condition**, plus `next_moe_layer`; upstream's `split_has_nodes` dropped.  Reason: r327 — the validated reference — uses `split->n_inputs > 0`, and the delivery's own note (issue #129, next to this code) says the host-weight pass may only start a new split *once the split already has an input to reuse*.  Upstream's test is true one node earlier (set as soon as a non-view node joins), so it moves the split boundary the host-expert staging keys on.  Measured: the choice does not change the text of either arm (both readings are identical under the two conditions), so this is the conservative, reference-matching choice — see R09.3 for what *did* move the text |
+| `ggml-cuda/common.cuh` (1) | `#include "ggml-common.h"` | two read-once diagnostic-flag helpers | **both** |
+| `ggml-cuda/common.cuh` (2) | `__reduce_add_sync(GGML_CUDA_FULL_THREAD_MASK, x)` | `__reduce_add_sync(0xffffffff, x)` + the `GGML_CUDA_DPP_XOR`/`ggml_cuda_xor_lane` branch | **both**: upstream's typed mask kept, the delivery's DPP butterfly kept as the `#elif` arm (same association order, so same result) |
+| `ggml-cuda/ggml-cuda.cu` | `ggml_cuda_should_fuse_mul_mat_vec_q()` + `ggml_cuda_match_shared_expert()` inline | both **extracted to `mmvq.cu`** | **theirs** (they live in `mmvq.cu`), **but the two functions were then re-ported**: the moved copies predate upstream's `cc < GGML_CUDA_CC_VOLTA` floor (they had `cc <= GGML_CUDA_CC_PASCAL`, which lets Pascal-61 through) and upstream's few-row-MMQ early-out (`#32065`; inert on HIP but needed for cross-backend consistency).  `mmvq.cu` now carries both, plus the `mmq-few.cuh` include |
+| `src/llama-kv-cache.cpp` | `cells.seq_rm(seq_id, p0, p1)` (`#32380`) | a manual scan of `used_min()..used_max_p1()` | **upstream's**: `seq_rm` walks the per-sequence position index `seq_pos[seq_id]`, so it is the same answer for strictly less work, and it is the new API's contract |
+
+## R09.2 D8 and D9 — both MERGE, checked rather than assumed
+
+- **D8 (node budget, `#32648`/`#32636`).**  Upstream's `llama_model::graph_nodes_per_tensor()` and its
+  `res += 32*n_layer_all` MoE-cache reserve merged cleanly alongside the delivery's KV-rotation leaf accounting
+  and the hard "over its node budget" refusal.  Nothing was dropped.  Open question left for R18 (as D8 says):
+  upstream's reserve is sized for *their* `--moe-cache`, so **block 09's arena may need its own term** — check it
+  with `scripts/gate-node-budget.sh` on a `-ncmoe` arm, not on a dense one.
+- **D9 (indexer key rotation, `#32653`).**  `llama_model::lid_k_hdmd()` is in the tree and
+  `llama-kv-cache.cpp`'s architecture list is gone, as upstream intends.  At R11 the check is that qwen4exp's
+  answer is explicit in its model class (not in the cache's list) and that block 11's QSA/indexer work still sits
+  on top; `gate-qwen4exp-quant-coherence.sh` is the gate.
+
+## R09.3 FINDING — the arena-off arm reads different text, and the cause is block 09's own offload relaxation
+
+The block's documented purity property is that the expert cache changes *placement*, not text.  On this tree
+the arena arm reproduces r327 exactly, but turning the arena off does not:
+
+| arm (35B-A3B Q8_0 Q8_0, 1 GPU, `-ncmoe 20 -c 8192 -ub 1024`, 5298-token prompt, `MOE_EXPERT_HEATMAP=load`) | text | prefill / decode |
+|---|---|---|
+| **this rung**, arena default (auto) | `73 chars sha=86b7f9b5aa80` | 1268.8 / 54.4 |
+| **this rung**, `MOE_EXPERT_CACHE_MIB=0` (arena off) | `34 chars sha=22584470ac60` | 1338.0 / 29.0 |
+| **this rung**, `MOE_EXPERT_CACHE_MIB=0` + `GGML_MOE_HOST_OFFLOAD=0` | **`86b7f9b5aa80`** | 1305.2 / 42.6 |
+| r327 (`bin-r327`), arena default | `86b7f9b5aa80` | 2304.7 / 49.7 |
+| r327 (`bin-r327`), `MOE_EXPERT_CACHE_MIB=0` | **`86b7f9b5aa80`** | 1128.3 / 21.2 |
+
+So the divergence is **the host-offload relaxation** (`ggml_cuda_device_offload_op`'s MoE relaxation, which lets a
+`MUL_MAT_ID` whose expert bank is in the host tier run on the GPU) taking a different kernel path when no arena
+is present — the documented class from `GREEDY-PURITY.md` §89 / `AGENTS.md` §5 ("residency selects the MoE kernel
+set and the sets are not bit-identical"), here selected by the *arena* rather than the heatmap.  r327 agrees
+because the offload decision was reworked in later blocks (block 10's `expert_host_src()`/
+`ggml_cuda_device_offload_op` work, block 15's pool) — the same seam `INVARIANTS.md` r305 and the
+`gate-host-pool.sh` offload arm cover.
+
+**Not caused by this rung's merge:** the `split_has_nodes` question was tested both ways and both readings
+reproduce the same two hashes; `-ub 512` reproduces it as well; pinning the heatmap does not change it.
+
+**Owed:**
+1. **R10** — re-run this triple (arena / arena-off / arena-off+`GGML_MOE_HOST_OFFLOAD=0`) and require **all
+   three arms to read one text**, as r327 does.  If block 10's offload-decision rework closes it, record it there
+   and the R18 obligation becomes a gate arm rather than a question.
+2. **R18** — `scripts/gate-host-pool.sh`'s offload arm plus the short-prompt `GGML_SCHED_DEBUG=2` arm (a <= 31
+   token prompt must not place `MUL_MAT_ID` on the CPU, `INVARIANTS.md` r305 items 1-2) is the gate that owns this
+   seam; do not ship while an arena-off arm reads different text from the arena arm on the same prompt.
+
+## R09.4 Notes for later rungs
+
+- The block's `MOE_EXPERT_CACHE_MIB=0` is the arena kill switch (parsed in `parse_env()`); unset means AUTO
+  (size from free VRAM) and an explicit value below 2048 MiB aborts by design.
+- On this box `build-rocm` is `GGML_HIP_NO_VMM=OFF`, so the movable-boundary slab and the arena are armed — the
+  block's commit message warns that a default HIP build (VMM on UPSTREAM's default) declines the arena and streams
+  the experts instead.  Any host-expert measurement at R10+ must stay on the VMM build.
+- The host-expert tier's own numbers at this rung (1268.8 / 54.4) are **not** comparable to r327's (2304.7 / 49.7):
+  blocks 10-17 (the fusion dispatcher, the streamed KV, the pool) are still missing, and block 10 alone is most of
+  the prefill gap.
 
 ---
 

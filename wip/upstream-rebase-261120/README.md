@@ -1,8 +1,8 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: OPEN — 9 of 18 rungs climbed (R00-R08) on 2026-11-21. Nothing is delivery yet.**
+**Status: OPEN — 10 of 18 rungs climbed (R00-R09) on 2026-11-21. Nothing is delivery yet.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
-the final rung (R18).  Ladder branch `rebase-r328` = `510769147` (tree `2ed6cb541`): R00..R08 plus two rung
+the final rung (R18).  Ladder branch `rebase-r328` = `24cecfb51` (tree `b05ee8543`): R00..R09 plus two rung
 repairs (R00's top-k gather, R05's `nb32` widening); every rung is green on build + coherence and each has one
 entry in [`RUNGS.md`](RUNGS.md).
 **The one known-red is closed at R00** (repair `3ea8b0212`): the delivery's required VMM pool refuses
@@ -32,8 +32,14 @@ climb's worst rung: 8 conflicted files / 13 regions, **D4 resolved as MERGE with
 narrow-row matcher already sits ~1000 lines ahead of upstream's generic norm branches, and `#32454` adds the
 layer-norm variant the delivery never claims), plus four forced fixes — including an **auto-merge artifact**
 where upstream's `force_tiling=true` landed in the delivery's `has_gate` template slot and would have
-mis-dispatched silently (`RUNGS.md` R08.3).  Next rung: **R09** (block 09, the host-expert tier — **D8**/**D9**,
-and the 136-commit exposure the conflict map flags as the climb's highest).  Target: the next
+mis-dispatched silently (`RUNGS.md` R08.3).  R09 is done too: the host-expert tier's 70 files merged with only 4
+conflicted paths, **D8** and **D9** both resolved as merges without a choice, and two of the delivery's extracted
+functions had to be re-ported with upstream's later refinements carried in (`cc < GGML_CUDA_CC_VOLTA`, the
+few-row-MMQ early-out) — but it carries a **finding**: with the arena off, this tree reads different text from the
+arena arm where r327 reads one text on both, and the `GGML_MOE_HOST_OFFLOAD=0` control pins the cause on block
+09's own host-offload relaxation (`RUNGS.md` R09.3, owed at R10/R18).  Next rung: **R10** (block 10 — the fusion
+dispatcher and slab, 9 conflicted paths, and it owns the offload-decision rework, the block-06 MMB pool fix and
+the top-k hunk drop).  Target: the next
 release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 

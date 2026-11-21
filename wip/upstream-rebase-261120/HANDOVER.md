@@ -1,6 +1,6 @@
-# HANDOVER — r328 re-base ladder, 9 of 18 rungs climbed, resume at **R09**
+# HANDOVER — r328 re-base ladder, 10 of 18 rungs climbed, resume at **R10**
 
-Written 2026-11-21 (session 2, which climbed R06, R07 and R08).  Read [`README.md`](README.md) §1 (method + traps),
+Written 2026-11-21 (session 2, which climbed R06, R07, R08 and R09).  Read [`README.md`](README.md) §1 (method + traps),
 [`RUNGS.md`](RUNGS.md) (the per-rung ledger and every resolution so far) and [`DECISIONS.md`](DECISIONS.md)
 (the decision log) — this file is the delta: what is done, what is owed, and how to not repeat the mistakes of
 the earlier sessions.
@@ -9,9 +9,9 @@ the earlier sessions.
 
 | item | value |
 |---|---|
-| working branch | **`rebase-r328`** in `~/llama.cpp`, clean, **HEAD = `510769147`** (tree `2ed6cb541`) |
-| rungs done | **R00 … R08** + **two rung repairs** (R00's top-k gather, R05's `nb32` widening) |
-| next rung | **R09** — block 09 (`123d53419`), 70 files, 4 conflicted paths, the climb's **highest upstream exposure** (136 commits / 83 of them behind the churn) and **D8**/**D9** (node budget, indexer key rotation).  Both are `MERGE`, so R09 does not stop for a decision — but it is the rung where the delivery's own allocator/KV work meets upstream's refactors, so expect substantive resolutions rather than unions |
+| working branch | **`rebase-r328`** in `~/llama.cpp`, clean, **HEAD = `24cecfb51`** (tree `b05ee8543`) |
+| rungs done | **R00 … R09** + **two rung repairs** (R00's top-k gather, R05's `nb32` widening) |
+| next rung | **R10** — block 10 (`7bbf540d5`), 87 files, **9 conflicted paths** (the FA family plus `fwht.cu`/`mmvq.cu`/`rope.cu`/`topk-moe.cu`).  It is the block that **owns three open obligations**: the **R06.2** MMB pool fix (`ctx.pool_stack_*`), the **R08.2/D4** placement of the narrow-row norm matcher ahead of upstream's generic norm branches, and — most importantly — the **R09.3** offload-decision rework (`ggml_cuda_device_offload_op`/`GGML_MOE_HOST_OFFLOAD`) that the arena-off text divergence is waiting on.  `D8`/`D12` are `MERGE` |
 | delivery repo | `~/llama-cpp-rdna-boosts` — **`patches/`, `release.json`, `rdna-boosts-all.patch` and the fork are untouched** (that is R18) |
 | target release | next after `v17-4f9dfa0e3-r327`, i.e. **r328**; new fork point **`919794500`** |
 | reference binaries | `~/llama.cpp/build-rocm/bin-r327` (the shipping r327 `bin/`) — **the attribution oracle for any abort** |
@@ -33,9 +33,10 @@ c3860af1e  b52803164  R05 repair: nb32 -> int64_t
 ee377ec45  b5dc56996  block 06: MMB quantized prefill GEMM
 1435e7873  d3b004581  block 07: k-quant boosts (mmvq VDR, Q6_K MMQ, Q1_0, grid pad)
 510769147  2ed6cb541  block 08: fused kernels (fusions + fused MoE + norm-gated + gdn/ple conv)
+24cecfb51  b05ee8543  block 09: host-resident MoE (iface, scheduler, Meta, slab, cache engine)
 ```
 
-## §1 What each rung cost, so R09..R17 can be planned
+## §1 What each rung cost, so R10..R17 can be planned
 
 | rung | conflicts | what it actually took |
 |---|---|---|
@@ -183,13 +184,24 @@ few-row MMQ is HIP-compiled-out) needs no preference at all — keep both, upstr
 
 ```bash
 cd ~/llama.cpp && git status && git branch --show-current      # must be rebase-r328, clean
-git log --oneline -1                                            # expect 510769147
-git cherry-pick 123d53419                                       # R09 = block 09 (70 files, 4 conflicts)
-(cmake --build build-rocm -j 24 > /tmp/r09.log 2>&1; echo "BUILD_RC=$?" >> /tmp/r09.log)
+git log --oneline -1                                            # expect 24cecfb51
+git cherry-pick 7bbf540d5                                       # R10 = block 10 (87 files, 9 conflicts)
+(cmake --build build-rocm -j 24 > /tmp/r10.log 2>&1; echo "BUILD_RC=$?" >> /tmp/r10.log)
 # poll for BUILD_RC, then: coherence -> the block's own switch -> the rung's log in RUNGS.md -> commit
 ```
 
-**R09 is the rung with the most upstream churn** (70 files, 136 upstream commits, 83 behind them) even though the
+**R10 carries three obligations from earlier rungs** — run them as part of its verification, not later:
+(1) `RUNGS.md` **R06.2** — after block 10's `pool_stack` lands, the 27B UD-IQ3_S dense arm (default MMB) must
+prefill instead of aborting at `ggml-cuda.cu:808`, *and* the forced routed arm
+(`GGML_CUDA_MMB_TYPES=q8_0 GGML_CUDA_MMB_ROUTED=1` on 35B-A3B) must read `73 chars sha=86b7f9b5aa80`;
+(2) **R08.2 / D4** — the narrow-row norm matcher must sit **ahead** of upstream's generic norm branches in
+`ggml-cuda-try-fuse.cu`;
+(3) **R09.3** — the triple arena / arena-off / arena-off+`GGML_MOE_HOST_OFFLOAD=0` must read **one** text, as r327
+does (it reads two on the R09 tree).
+Also still owed at R10: **drop block 10's `top_k_gather_rows` hunk** (the R00 repair already put it in the tree —
+resolve that file keep-local and keep block 10's `ggml_cuda_cpy_as_memcpy_2d` guard) and `D8`/`D12`.
+
+**R09 was the rung with the most upstream churn** (70 files, 136 upstream commits, 83 behind them) even though the
 text merge is small (4 paths).  Its two `DECISIONS.md` items are both `MERGE`: **D8** (upstream moved the
 nodes-per-tensor factor into `llama_model::graph_nodes_per_tensor()` and added a `32*n_layer_all` reserve when
 `cparams.moe_cache_size > 0` — keep the virtual, keep the delivery's KV-rotation leaves and the hard "over the node
