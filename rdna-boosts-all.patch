@@ -15614,7 +15614,7 @@ index 101afeba2..8ad5e807d 100644
              ggml_cuda_swap(dst_row[col], dst_row[ixj]);
          }
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 053ed60f7..2f4048ac6 100644
+index 053ed60f7..c44fdc40f 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -40,6 +40,44 @@
@@ -17248,7 +17248,7 @@ index 053ed60f7..2f4048ac6 100644
  };
  struct ggml_cuda_mm_fusion_args_device {
      const void * x_bias = nullptr;
-@@ -1509,12 +2965,63 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -1509,12 +2965,66 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * gate_bias = nullptr;
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;
@@ -17280,6 +17280,9 @@ index 053ed60f7..2f4048ac6 100644
 +    int * red_cnt = nullptr;
 +    // GGML_CUDA_MWR_EXACT=0: the fold's pre-r324 fma-contracted sum (the standalone kernels contract too, one knob)
 +    bool red_contract = false;
++    // RDNA2, mul_mat_vec_q_moe: walk the K-blocks once with the rows of a block side by side instead of one
++    // (row, K-block) item at a time (set by the launch; GGML_CUDA_MOE_ROWS_ABREAST=0: off)
++    bool moe_rows_abreast = false;
 +    // GDN alpha/beta pair in one mmvf launch (ggml_cuda_gate_beta_bf16_try_fuse): rows >= gb_nrows read gb_x2 and
 +    // write gb_dst2; rows below write softplus(v + gb_dt[row]) * gb_a[row].
 +    const void * gb_x2 = nullptr;
@@ -17312,7 +17315,7 @@ index 053ed60f7..2f4048ac6 100644
  };
  
  struct ggml_cuda_kernel_launch_params {
-@@ -1583,3 +3090,49 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+@@ -1583,3 +3093,49 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
      kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
      CUDA_CHECK(cudaGetLastError());
  }
@@ -24088,7 +24091,7 @@ index accef6315..54a08ded6 100644
          default:
              GGML_ABORT("Unsupported head size");
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
-index 177b2f065..18250bb4c 100644
+index 177b2f065..e0778c76b 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cuh
 +++ b/ggml/src/ggml-cuda/fattn-tile.cuh
 @@ -312,8 +312,47 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
@@ -24280,8 +24283,9 @@ index 177b2f065..18250bb4c 100644
 +
 +// BF16->F16 converting tile load for the F16-math fallback (BF16 K/V on targets without
 +// v_dot2_f32_bf16, and the host pass). Compile-only on native-BF16 targets.
-+template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
-+static __device__ __forceinline__ void flash_attn_tile_load_tile(
+ template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
+ static __device__ __forceinline__ void flash_attn_tile_load_tile(
+-        const half2 * const __restrict__ KV, float * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
 +        const nv_bfloat162 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
 +    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
 +    constexpr int cpy_ne = cpy_nb / 4;
@@ -24326,9 +24330,8 @@ index 177b2f065..18250bb4c 100644
 +    ggml_cuda_unroll<7>{}(load);
 +}
 +
- template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
- static __device__ __forceinline__ void flash_attn_tile_load_tile(
--        const half2 * const __restrict__ KV, float * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
++template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
++static __device__ __forceinline__ void flash_attn_tile_load_tile(
 +        const nv_bfloat162 * const __restrict__ KV, nv_bfloat162 * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
 +    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
 +    constexpr int cpy_ne = cpy_nb / 4;
@@ -24567,12 +24570,12 @@ index 177b2f065..18250bb4c 100644
 +            }
 +#pragma unroll
 +            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
++#pragma unroll
++                for (int jc0 = 0; jc0 < cpw; ++jc0) {
  #pragma unroll
 -    for (int k_KQ_1 = 0; k_KQ_1 < nbatch_K/2; k_KQ_1 += cpy_ne) {
 -        __align__(16) half2 K_k[nbatch_fa/(np*warp_size)][cpy_ne];
 -        __align__(16) half2 Q_k[cpw][cpy_ne];
-+                for (int jc0 = 0; jc0 < cpw; ++jc0) {
-+#pragma unroll
 +                    for (int k = 0; k < cpy_ne; ++k) {
 +                        ggml_cuda_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
 +                    }
@@ -24745,14 +24748,14 @@ index 177b2f065..18250bb4c 100644
 +                // Therefore, scale down Q values and apply the inverse scale the FP32 KQ values afterwards again.
 +                KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0] *= 4.0f;
 +#endif // defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
-+
-+                if (use_logit_softcap) {
-+                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = logit_softcap * tanhf(KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0]);
-+                }
  
 -            if (!oob_check || i_KQ < k_VKQ_sup) {
 -                KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
 -                    slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
++                if (use_logit_softcap) {
++                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = logit_softcap * tanhf(KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0]);
++                }
++
 +                if (!oob_check || i_KQ < k_VKQ_sup) {
 +                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
 +                        slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
@@ -25446,7 +25449,7 @@ index 177b2f065..18250bb4c 100644
  
      const int id        = ggml_cuda_get_device();
      const int cc        = ggml_cuda_info().devices[id].cc;
-@@ -1157,15 +1800,53 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1157,15 +1800,47 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
  
      constexpr size_t nbytes_shared = 0;
  
@@ -25471,25 +25474,18 @@ index 177b2f065..18250bb4c 100644
 +        return;
 +    }
 +
-+    // RDNA2 (gfx1030): even at occupancy 1 (see ggml_cuda_fattn_tile_get_config_amd_rdna2),
-+    // some wide-column kernels still fail the occupancy query and abort, so cap cols_per_block:
-+    //   D=512 (Gemma global attention): the ncols2<=2 kernels are not instantiated for
-+    //     DV=512, so cap cols_per_block<=8 to keep the accumulator set in registers.
-+    //   D=128: cols_per_block 16/32/64 need 33-43 KB LDS; cap to <=8 (with ncols2<=2 from
-+    //     switch_ncols2).
-+    //   D=576/DV=512 (DeepSeek MLA): cols_per_block=32 (kernel <512,8,4>) fails; cap to <=16.
-+    //   D=256 MHA/odd GQA (ncols2==1): <256,32,1> fails; cap to <=8. The GQA ncols2>=2 path
-+    //     keeps its working cols_per_block=32 (<256,16,2>) tile.
++    // RDNA2 (gfx1030) took capped cols_per_block values here (D=512 <= 8, D=128 <= 8, D=576 <= 16,
++    // D=256 MHA <= 8) as a workaround for kernels whose occupancy query returned 0 and aborted at the
++    // GGML_ASSERT in launch_fattn.  That assert is now unreachable on RDNA2: launch_fattn computes the
++    // RDNA2 occupancy itself from the kernel's VGPRs and LDS against a WGP (fattn-common.cuh, the
++    // regsPerMultiprocessor = 32768 quirk) and only falls back to HIP's figure when that is larger, so
++    // RDNA2 takes the same 32/64-column prefill tiles every other arch takes (r334, PR #338 -> folded
++    // into block 05).  RDNA3/4 never entered this branch.
 +    const bool rdna2       = GGML_CUDA_CC_IS_RDNA2(cc);
-+    const bool rdna512     = rdna2 && DKQ == 512;
-+    const bool rdna_d128   = rdna2 && DKQ == 128;
-+    const bool rdna576     = rdna2 && DKQ == 576;
-+    const bool rdna256_mha = rdna2 && DKQ == 256 && ncols2 == 1;
 +
  #ifdef GGML_USE_HIP
      if constexpr (DKQ <= 128) {
--        if (Q->ne[1] > 32/ncols2) {
-+        if (!rdna_d128 && Q->ne[1] > 32/ncols2) {
+         if (Q->ne[1] > 32/ncols2) {
              constexpr int cols_per_block = 64;
              const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
              const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -25503,12 +25499,7 @@ index 177b2f065..18250bb4c 100644
              return;
          }
      }
-@@ -1175,25 +1856,29 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
-     if constexpr (DKQ <= 256)
- #endif // GGML_USE_HIP
-     {
--        if (Q->ne[1] > 16/ncols2) {
-+        if (!rdna512 && !rdna_d128 && !rdna576 && !rdna256_mha && Q->ne[1] > 16/ncols2) {
+@@ -1179,9 +1854,11 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              constexpr int cols_per_block = 32;
              const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
              const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -25522,10 +25513,7 @@ index 177b2f065..18250bb4c 100644
              return;
          }
      }
- 
-     if constexpr (ncols2 <= 16) {
--        if (Q->ne[1] > 8/ncols2) {
-+        if (!rdna512 && !rdna_d128 && !rdna256_mha && Q->ne[1] > 8/ncols2) {
+@@ -1191,9 +1868,11 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              constexpr int cols_per_block = 16;
              const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
              const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -25539,7 +25527,7 @@ index 177b2f065..18250bb4c 100644
              return;
          }
      }
-@@ -1203,9 +1888,11 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1203,9 +1882,11 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              constexpr int cols_per_block = 8;
              const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
              const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -25553,7 +25541,7 @@ index 177b2f065..18250bb4c 100644
              return;
          }
      }
-@@ -1215,9 +1902,11 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1215,9 +1896,11 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              constexpr int cols_per_block = 4;
              const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
              const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -25567,7 +25555,7 @@ index 177b2f065..18250bb4c 100644
              return;
          }
      }
-@@ -1226,21 +1915,22 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1226,21 +1909,22 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
          constexpr int cols_per_block = 2;
          const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
          const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -25594,7 +25582,7 @@ index 177b2f065..18250bb4c 100644
  
      float max_bias = 0.0f;
      memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
-@@ -1250,10 +1940,23 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -1250,10 +1934,22 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
  
      // On NVIDIA (Pascal and older) the GQA optimizations seem to be detrimental in some cases.
      // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
@@ -25612,16 +25600,15 @@ index 177b2f065..18250bb4c 100644
 +    const bool use_gqa_opt = ggml_cuda_flash_attn_ext_has_mask(KQV) && (mask == nullptr || mask->ne[2] == 1) &&
 +        max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
 +
-+    // RDNA2 (gfx1030): cap ncols2<=2 for D=128. D=256 was capped on the belief that the wider
-+    // variants overflow the register file (occupancy 0 -> abort), but measured 4x8 D=256 launches
-+    // run fine -- the manual occupancy fallback keeps >=1 block resident even when the kernel
-+    // spills some scratch -- and they beat the 16x2 shape, so the cap is lifted for DKQ == 256.
-+    // Wave64 GCN fits the wider kernels, and RDNA3/4 keep upstream's selection.
-+    const bool rdna_cap_ncols2 = GGML_CUDA_CC_IS_RDNA2(device_cc) && DKQ == 128;
++    // RDNA2 (gfx1030) capped ncols2 <= 2 for D=128 (and, earlier, D=256) on the belief that the wider
++    // GQA variants overflow the register file and abort; measured 4x8 launches run fine -- the manual
++    // occupancy fallback keeps >= 1 block resident even when the kernel spills scratch -- and a GQA-8
++    // D=128 decode was re-reading the KV cache 4x for it.  The cap is lifted (r334, PR #338 -> folded
++    // into block 05), so RDNA2 takes the same ncols2 the rest of the archs do.
  
      if constexpr (DKQ == 320) {
          // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
-@@ -1262,12 +1965,12 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -1262,12 +1958,12 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
          // Therefore, use a GQA ratio of 16 with 16 columns / block to stay below 48 kiB of SRAM / block.
  #ifdef GGML_USE_HIP
          if (use_gqa_opt && gqa_ratio % 32 == 0) {
@@ -25636,7 +25623,7 @@ index 177b2f065..18250bb4c 100644
              return;
          }
  #endif // GGML_USE_HIP
-@@ -1276,11 +1979,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -1276,11 +1972,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
  
      if constexpr (DKQ == 576) {
          if (use_gqa_opt && gqa_ratio % 16 == 0) {
@@ -25650,7 +25637,7 @@ index 177b2f065..18250bb4c 100644
              return;
          }
      }
-@@ -1288,71 +1991,102 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -1288,11 +1984,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
      if constexpr (DKQ == 192) {
          // MiMo-V2.5 / V2.5-Pro / V2-Flash: gqa_ratio is 8 (SWA) or 16 (full attn)
          if (use_gqa_opt && gqa_ratio % 16 == 0) {
@@ -25664,19 +25651,17 @@ index 177b2f065..18250bb4c 100644
              return;
          }
          GGML_ABORT("flash-attn tile (192/128): expected GQA ratio multiple of 8");
-     }
+@@ -1300,59 +1996,90 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
  
      if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
--        if (use_gqa_opt && gqa_ratio % 8 == 0) {
+         if (use_gqa_opt && gqa_ratio % 8 == 0) {
 -            launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
-+        if (!rdna_cap_ncols2 && use_gqa_opt && gqa_ratio % 8 == 0) {
 +            launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap, type_KV>(ctx, dst);
              return;
          }
  
--        if (use_gqa_opt && gqa_ratio % 4 == 0) {
+         if (use_gqa_opt && gqa_ratio % 4 == 0) {
 -            launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap>(ctx, dst);
-+        if (!rdna_cap_ncols2 && use_gqa_opt && gqa_ratio % 4 == 0) {
 +            launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap, type_KV>(ctx, dst);
              return;
          }
@@ -26556,7 +26541,7 @@ index e7ad53475..44c6bd1c8 100644
 +// (rows of up to 512 elements; dst rows padded to MATRIX_ROW_PADDING are not handled).
 +bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, void * q8_1 = nullptr);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index ae2374cbc..85d1fe6fa 100644
+index ae2374cbc..8ea066fda 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,5 +1,6 @@
@@ -26697,7 +26682,7 @@ index ae2374cbc..85d1fe6fa 100644
      GGML_ASSERT(ggml_is_contiguous_rows(src_q));
      GGML_ASSERT(ggml_is_contiguous_rows(src_k));
      GGML_ASSERT(ggml_is_contiguous_rows(src_v));
-@@ -345,6 +382,196 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -345,6 +382,219 @@ static void ggml_cuda_op_gated_delta_net_impl(
      const int K = ggml_get_op_params_i32(dst, 0);
      const bool keep_rs = K > 1;
  
@@ -26781,10 +26766,33 @@ index ae2374cbc..85d1fe6fa 100644
 +    if (!kda && n_tokens > 1 &&
 +        (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
 +        // read once as a value: a cached getenv() pointer is unsafe on Windows (the CRT buffer is reused)
-+        static const bool chunked_on = [] {
++        // -1 = auto (default), 0 = force sequential, 1 = force chunked
++        static const int chunked_env = [] {
 +            const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
-+            return env == nullptr || strcmp(env, "0") != 0;
++            if (env == nullptr) {
++                return -1;
++            }
++            return strcmp(env, "0") != 0 ? 1 : 0;
 +        }();
++        // RDNA2 ONLY (r334, PR #338 -> folded into block 10): gfx1030 has no BF16 WMMA, so the FP32 chunked
++        // kernel only wins on a low-head long prefill there.  H is the value-head count (nev1) and the state
++        // stride is H * S_v * S_v per sequence, so H * n_seqs is the concurrency the kernel really sees.
++        // Measured on a V620 (Radeon Pro), idle card, sequential / chunked us per call, S_v = 128:
++        //   H=4:  n=64 76/176, n=256 126/150, n=512 299/240, n=1024 589/462   -> chunked above 256 tokens
++        //   H=8:  n=256 147/172, n=512 288/310, n=1024 569/607                -> sequential
++        //   H=4 x 2 seqs: n=512 285/302; H=12: n=512 282/521; H=32: n=512 409/1126
++        //   H=16 with v_repeat=3 (Qwen3.8-27B, H = 48 here): n=512 560/1374   -> sequential
++        // H * n_seqs of 5..7 is unmeasured and takes the sequential kernel.
++        // This does NOT reintroduce the issue-#309 impurity: n_seqs is a property of the batch, not of a
++        // speculator (a draft/verify batch on one sequence keeps n_seqs == 1), and n_rs_batch is not read
++        // here.  What it does do is make a multi-sequence ubatch take the sequential kernel where a
++        // single-sequence one takes chunked -- the same batch-composition split `n_seqs > 1` already has.
++        bool chunked_on = (chunked_env != 0);
++#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
++        if (chunked_env < 0 && GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
++            chunked_on = (H * n_seqs <= 4 && n_tokens > 256);
++        }
++#endif
 +        if (chunked_on) {
 +            // Threshold for the chunked path: a batch above it is chunked on its first
 +            // n_tokens - D tokens and finished by the sequential tail.  D is the snapshot-set
@@ -26894,7 +26902,7 @@ index ae2374cbc..85d1fe6fa 100644
      // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
      float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
      int64_t state_slot_stride = S_v * S_v * H * n_seqs;
-@@ -364,21 +591,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -364,21 +614,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
          if (keep_rs) {
              launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                  S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
@@ -26920,7 +26928,7 @@ index ae2374cbc..85d1fe6fa 100644
          }
      }
  }
-@@ -391,3 +618,123 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
+@@ -391,3 +641,123 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
          ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
      ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
  }
@@ -65269,10 +65277,10 @@ index 000000000..9cb9f8b8c
 +    }
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
 new file mode 100644
-index 000000000..334018588
+index 000000000..b9781da1b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
-@@ -0,0 +1,471 @@
+@@ -0,0 +1,529 @@
 +#include "mmvq-moe.cuh"
 +#include "mmvq-vecdot.cuh"
 +#include "mmvq.cuh"
@@ -65412,6 +65420,58 @@ index 000000000..334018588
 +    const int n_items    = rows_valid * blocks_per_row_x;
 +    const int n_groups = warp_size / (qi/vdr);
 +    const int kqs      = vdr * (threadIdx.x % (qi/vdr));
++#if defined(RDNA2)
++    // RDNA2: the item loop below costs a divide per (row, K-block) item and keeps one dot product in flight.
++    // Walk the K-blocks with the rows of the block side by side instead.  A thread group g takes the items
++    // it == g (mod n_groups), so in row i it takes the K-blocks kbx == g - i*blocks_per_row_x (mod n_groups), in
++    // rising order: each row's partial sum is built from the same K-blocks in the same order as the item loop
++    // builds it, so the result is bit-identical.  GGML_CUDA_MOE_ROWS_ABREAST=0: off.
++    const bool rows_abreast = fusion.moe_rows_abreast;
++#else
++    constexpr bool rows_abreast = false;
++#endif
++    static_assert((n_groups & (n_groups - 1)) == 0, "the thread group count must be a power of two");
++    if (rows_abreast && blocks_per_row_x % n_groups == 0) {
++        // every row keeps the same K-blocks: one y block serves all rows
++        for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += n_groups) {
++            const int kby = kbx * (qk/QK8_1);
++#pragma unroll
++            for (int i = 0; i < c_rows_per_block; ++i) {
++                if (i < rows_valid) {
++                    tmp[i] += vec_dot_q_cuda(vx_use, &y[kby], kbx_offset + i*stride_row_x_use + kbx, kqs);
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            tmp_gate[i] += vec_dot_q_cuda(vgate_use, &y[kby], kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
++                        }
++                    }
++                }
++            }
++        }
++    } else if (rows_abreast && type != GGML_TYPE_IQ2_XS) {
++        // the group's first K-block shifts from row to row; a row past the last valid one gets none
++        // (IQ2_XS stays on the item loop here: its two items in flight are faster, k=2560 n=1 15.6 vs 16.5 us)
++        const int g = threadIdx.x / (qi/vdr);
++        int kb0[c_rows_per_block];
++#pragma unroll
++        for (int i = 0; i < c_rows_per_block; ++i) {
++            kb0[i] = i < rows_valid ? ((g - i*blocks_per_row_x) & (n_groups - 1)) : blocks_per_row_x;
++        }
++        for (int k0 = 0; k0 < blocks_per_row_x; k0 += n_groups) {
++#pragma unroll
++            for (int i = 0; i < c_rows_per_block; ++i) {
++                const int kbx = kb0[i] + k0;
++                if (kbx < blocks_per_row_x) {
++                    const int kby = kbx * (qk/QK8_1);
++                    tmp[i] += vec_dot_q_cuda(vx_use, &y[kby], kbx_offset + i*stride_row_x_use + kbx, kqs);
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            tmp_gate[i] += vec_dot_q_cuda(vgate_use, &y[kby], kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
++                        }
++                    }
++                }
++            }
++        }
++    } else {
 +    // IQ2_XS is ALU/latency bound here: two items in flight per thread (-9 %); the other types lose from it
 +#pragma unroll type == GGML_TYPE_IQ2_XS ? 2 : 1
 +    for (int it = threadIdx.x / (qi/vdr); it < n_items; it += n_groups) {
@@ -65424,6 +65484,7 @@ index 000000000..334018588
 +                tmp_gate[i] += vec_dot_q_cuda(vgate_use, &y[kby], kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
 +            }
 +        }
++    }
 +    }
 +
 +    ggml_cuda_pdl_lc();
@@ -65686,11 +65747,16 @@ index 000000000..334018588
 +                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
 +                            fusion.red_dst != nullptr;
 +
++    // RDNA2: rows side by side in the kernel's K loop (see mul_mat_vec_q_moe).  GGML_CUDA_MOE_ROWS_ABREAST=0: off.
++    static const bool rows_abreast_on = [] { const char * e = getenv("GGML_CUDA_MOE_ROWS_ABREAST"); return e == nullptr || atoi(e) != 0; }();
++    ggml_cuda_mm_fusion_args_device fusion_k = fusion;
++    fusion_k.moe_rows_abreast = rows_abreast_on && GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[dev].cc);
++
 +    const auto launch = [&](auto rpb_c, auto fusion_c) {
 +        constexpr int  RPB   = decltype(rpb_c)::value;
 +        constexpr bool CFUSE = decltype(fusion_c)::value;
 +        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, RPB, CFUSE>, launch_params,
-+            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
++            vx, vy, ids, fusion_k, dst, ncols_x, nchannels_y, nrows_x,
 +            stride_row_x, stride_col_y, stride_col_dst,
 +            stride_channel_x, stride_channel_y, stride_channel_dst,
 +            ncols_dst, ids_stride, nchannels_dst,
@@ -85170,7 +85236,7 @@ index 000000000..a753d3e76
 +void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m);
 +int  ggml_cuda_norm_rows_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index 95c3b0a0e..7434c5091 100644
+index 95c3b0a0e..63d7b361e 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -1,7 +1,17 @@
@@ -85191,6 +85257,15 @@ index 95c3b0a0e..7434c5091 100644
  template <int block_size, bool do_multiply = false, bool do_add = false>
  static __global__ void norm_f32(const float * x,
                                  float *       dst,
+@@ -123,7 +133,7 @@ static __device__ __forceinline__ void rms_norm_store4(T * dst, const int i, con
+ }
+ 
+ // x and dst are float or nv_bfloat16, mul is float, add is float or the type of x
+-template <typename T, int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, typename T_add = float>
++template <typename T, int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, typename T_add = float, bool has_dst16 = false>
+ static __global__ void rms_norm_f32(const T *     x,
+                                     T *           dst,
+                                     const int     ncols,
 @@ -149,7 +159,9 @@ static __global__ void rms_norm_f32(const T *     x,
                                      const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
                                      const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
@@ -85202,39 +85277,133 @@ index 95c3b0a0e..7434c5091 100644
      ggml_cuda_pdl_lc();
      const int nrows = gridDim.x;
      const int row   = blockIdx.x;
-@@ -184,6 +196,14 @@ static __global__ void rms_norm_f32(const T *     x,
+@@ -184,6 +196,16 @@ static __global__ void rms_norm_f32(const T *     x,
                  addc = add + add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
              }
  
 +            // MMB BF16 streams (block 08): the norm may write a bf16 copy in place of / next to the
-+            // f32 output (dst16 + store_f32).  Both branches below honour it; the default is
-+            // store_f32 = true, dst16 = nullptr, i.e. exactly the upstream behaviour.
-+            uint16_t * dst16c = nullptr;
-+            if (dst16 != nullptr) {
-+                dst16c = dst16 + ((sample*nchannels + channel)*nrows + row)*ncols;
++            // f32 output (dst16 + store_f32).  Specialized via has_dst16 so the standard path
++            // (dst16 == nullptr && store_f32) compiles with zero extra branch/VGPR overhead.
++            [[maybe_unused]] uint16_t * dst16c = nullptr;
++            if constexpr (has_dst16) {
++                if (dst16 != nullptr) {
++                    dst16c = dst16 + ((sample*nchannels + channel)*nrows + row)*ncols;
++                }
 +            }
 +
              if constexpr (do_vec) {
                  const int      ncols4 = ncols / 4;
                  const float4 * mul4   = (const float4 *) mulc;
-@@ -227,7 +247,15 @@ static __global__ void rms_norm_f32(const T *     x,
+@@ -227,10 +249,106 @@ static __global__ void rms_norm_f32(const T *     x,
                              r.z *= scale_out;
                              r.w *= scale_out;
                          }
 -                        rms_norm_store4(dstc, i, r);
-+                        if (store_f32) {
++                        if constexpr (has_dst16) {
++                            if (store_f32) {
++                                rms_norm_store4(dstc, i, r);
++                            }
++                            if (dst16c != nullptr) {
++                                dst16c[4*i + 0] = norm_f2bf(r.x);
++                                dst16c[4*i + 1] = norm_f2bf(r.y);
++                                dst16c[4*i + 2] = norm_f2bf(r.z);
++                                dst16c[4*i + 3] = norm_f2bf(r.w);
++                            }
++                        } else {
 +                            rms_norm_store4(dstc, i, r);
 +                        }
-+                        if (dst16c != nullptr) {
-+                            dst16c[4*i + 0] = norm_f2bf(r.x);
-+                            dst16c[4*i + 1] = norm_f2bf(r.y);
-+                            dst16c[4*i + 2] = norm_f2bf(r.z);
-+                            dst16c[4*i + 3] = norm_f2bf(r.w);
++                    }
++                }
++            }
++#if defined(RDNA2)
++            else if constexpr (vpt > 1) {
++                float tmp = 0.0f;
++
++                // RDNA2 ONLY: this whole branch is compiled in the RDNA2 device pass and nowhere else, so
++                // no other arch can reach it even by accident (the host dispatch below is what arms it,
++                // and that asks GGML_CUDA_CC_IS_RDNA2 at run time).  ncols <= vpt*WARP_SIZE is the caller's
++                // contract: the only launch that reaches here is RMS_NORM_LAUNCH(32, 4, false), and
++                // rms_norm_f32_dispatch only takes it for ncols <= 128.
++                //
++                // Narrow form of the strided scalar reduction for ncols <= vpt*WARP_SIZE: one warp stands in
++                // for the vpt warps of a (vpt*WARP_SIZE)-thread launch.  Lane `tid` owns the threads
++                // tid + k*WARP_SIZE of that launch, each of which holds at most one column.  Every stand-in
++                // warp is reduced with the same butterfly, and the per-warp sums are then added in the order
++                // block_reduce's cross-warp butterfly adds them (the 5-step warp butterfly over lanes 0..31,
++                // of which only xor 2 and xor 1 carry a non-zero term -- every higher lane holds +0), i.e.
++                // (s0+s2)+(s1+s3).  The result is bit-identical to RMS_NORM_LAUNCH(128, 1, false) and
++                // RMS_NORM_LAUNCH(256, 1, false) at these widths, so the default grouping
++                // (ggml_cuda_rms_norm_vec() in common.cuh) is unchanged.  The lane keeps its columns in
++                // registers, so the row is read once.
++                // The match was checked byte-for-byte on gfx1030 (ROCm 7.14), f32 and bf16, ncols 1..128.
++                // It relies on the compiler contracting `x*x` into the first butterfly add exactly as it
++                // does in the wide form: writing the square as fmaf(x, x, 0.0f) changes the output bits.
++                // Re-check after touching the next two loops or the compiler.
++                static_assert(block_size == WARP_SIZE && vpt == 4, "narrow scalar rms_norm is one warp standing in for four");
++
++                // one output column: v from the row's scale and the column's input, then the store(s);
++                // the same expressions as the wide form's loop below
++                const auto emit = [&](const int col, const float xi, const float scale) {
++                    float v;
++                    if constexpr (do_multiply && do_add) {
++                        const int mul_col = fastmodulo(col, mul_ncols_packed);
++                        const int add_col = fastmodulo(col, add_ncols_packed);
++                        v = scale * xi * mulc[mul_col] + ggml_cuda_cast<float>(addc[add_col]);
++                    } else if constexpr (do_multiply) {
++                        const int mul_col = fastmodulo(col, mul_ncols_packed);
++                        v = scale * xi * mulc[mul_col];
++                    } else if constexpr (do_scale) {
++                        v = scale_out * (scale * xi);
++                    } else {
++                        v = scale * xi;
++                    }
++                    if constexpr (has_dst16) {
++                        if (store_f32) {
++                            dstc[col] = ggml_cuda_cast<T>(v);
 +                        }
++                        if (dst16c != nullptr) {
++                            dst16c[col] = norm_f2bf(v);
++                        }
++                    } else {
++                        dstc[col] = ggml_cuda_cast<T>(v);
++                    }
++                };
++                float xk[4];
++                float part[4];
++#pragma unroll
++                for (int k = 0; k < 4; k++) {
++                    const int col = tid + k*WARP_SIZE;
++                    xk[k]   = 0.0f;
++                    part[k] = 0.0f;
++                    if (col < ncols) {
++                        xk[k]   = ggml_cuda_cast<float>(xc[col]);
++                        part[k] = xk[k] * xk[k];
++                    }
++                }
++#pragma unroll
++                for (int k = 0; k < 4; k++) {
++                    part[k] = warp_reduce_sum(part[k]);
++                }
++                tmp = (part[0] + part[2]) + (part[1] + part[3]);
++
++                // same two statements as the wide form
++                const float mean = tmp / ncols;
++                const float scale = rsqrtf(mean + eps);
++#pragma unroll
++                for (int k = 0; k < 4; k++) {
++                    const int col = tid + k*WARP_SIZE;
++                    if (col < ncols) {
++                        emit(col, xk[k], scale);
                      }
                  }
-             } else {
-@@ -246,17 +274,24 @@ static __global__ void rms_norm_f32(const T *     x,
+-            } else {
++            }
++#endif // defined(RDNA2)
++            else {
+                 float tmp = 0.0f; // partial sum for thread in warp
+ 
+                 for (int col = tid; col < ncols; col += block_size) {
+@@ -246,17 +364,28 @@ static __global__ void rms_norm_f32(const T *     x,
  
                  for (int col = tid; col < ncols; col += block_size) {
                      const float xi = ggml_cuda_cast<float>(xc[col]);
@@ -85251,19 +85420,23 @@ index 95c3b0a0e..7434c5091 100644
                      } else if constexpr (do_scale) {
 -                        dstc[col] = ggml_cuda_cast<T>(scale_out * (scale * xi));
 +                        v = scale_out * (scale * xi);
-                     } else {
--                        dstc[col] = ggml_cuda_cast<T>(scale * xi);
++                    } else {
 +                        v = scale * xi;
 +                    }
-+                    if (store_f32) {
++                    if constexpr (has_dst16) {
++                        if (store_f32) {
++                            dstc[col] = ggml_cuda_cast<T>(v);
++                        }
++                        if (dst16c != nullptr) {
++                            dst16c[col] = norm_f2bf(v);
++                        }
+                     } else {
+-                        dstc[col] = ggml_cuda_cast<T>(scale * xi);
 +                        dstc[col] = ggml_cuda_cast<T>(v);
-+                    }
-+                    if (dst16c != nullptr) {
-+                        dst16c[col] = norm_f2bf(v);
                      }
                  }
              }
-@@ -269,6 +304,96 @@ static __global__ void rms_norm_f32(const T *     x,
+@@ -269,6 +398,96 @@ static __global__ void rms_norm_f32(const T *     x,
      }
  }
  
@@ -85360,16 +85533,35 @@ index 95c3b0a0e..7434c5091 100644
  template <int block_size>
  static __global__ void rms_norm_back_f32(
          const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
-@@ -449,7 +574,7 @@ static void group_norm_f32_cuda(
-             mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
-             mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
-             add, add_stride_row, add_stride_channel, add_stride_sample, \
+@@ -444,12 +663,21 @@ static void group_norm_f32_cuda(
+     do { \
+         const dim3 block_dims(BLOCK_SIZE, 1, 1); \
+         const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream }; \
+-        ggml_cuda_kernel_launch(rms_norm_f32<T, BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, T_add>, launch_params, \
+-            x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, \
+-            mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
+-            mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
+-            add, add_stride_row, add_stride_channel, add_stride_sample, \
 -            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out); \
-+            add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, dst16, store_f32); \
++        if (rdna2_plain && dst16 == nullptr && store_f32) { \
++            ggml_cuda_kernel_launch(rms_norm_f32<T, BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, T_add, false>, launch_params, \
++                x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, \
++                mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
++                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
++                add, add_stride_row, add_stride_channel, add_stride_sample, \
++                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, dst16, store_f32); \
++        } else { \
++            ggml_cuda_kernel_launch(rms_norm_f32<T, BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, T_add, true>, launch_params, \
++                x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, \
++                mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
++                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
++                add, add_stride_row, add_stride_channel, add_stride_sample, \
++                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, dst16, store_f32); \
++        } \
      } while (0)
  
  template <bool do_multiply, bool do_add, bool do_scale, typename T_add = float, typename T>
-@@ -461,7 +586,8 @@ static void rms_norm_f32_dispatch(
+@@ -461,7 +689,8 @@ static void rms_norm_f32_dispatch(
          const uint3    mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
          const ggml_tensor * add_t, const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
          const uint3    add_ncols_packed, const uint3 add_nrows_packed, const uint3 add_nchannels_packed, const uint3 add_nsamples_packed,
@@ -85379,12 +85571,19 @@ index 95c3b0a0e..7434c5091 100644
      static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
      static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
  
-@@ -469,8 +595,12 @@ static void rms_norm_f32_dispatch(
+@@ -469,8 +698,19 @@ static void rms_norm_f32_dispatch(
      const float * mul = mul_t ? (const float *) mul_t->data : nullptr;
      const T_add * add = add_t ? (const T_add *) add_t->data : nullptr;
  
 -    // dst is written at row * ncols, i.e. always at a multiple of ncols, so only its base needs checking here
 -    bool vec = ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst % (4*sizeof(T))) == 0;
++    // RDNA2 only (r334, PR #338 -> folded into block 08): the kernel specialization without the dst16
++    // branch, and the one-warp launch for ncols <= 128.  Every other arch takes exactly the launches it
++    // took before -- the narrow kernel branch is compiled only in the RDNA2 device pass, and this flag is
++    // once per launch (the same device query the FA launchers make).  gfx1030 is the only arch the narrow
++    // form was byte-compared on, so nothing else is allowed near it.
++    const bool rdna2_plain = GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
++
 +    // dst is written at row * ncols, i.e. always at a multiple of ncols, so only its base needs checking here.
 +    // `vec` is the float4 grouping ggml-org/llama.cpp#29720 introduced; it is opt-in (issue #229) so that the
 +    // delivery's default reduction stays the one every MTP number and every fused norm kernel is built on --
@@ -85394,7 +85593,26 @@ index 95c3b0a0e..7434c5091 100644
      vec = vec && ggml_cuda_is_aligned(x_t, 4*sizeof(T));
      if constexpr (do_multiply) {
          vec = vec && mul_ncols_packed.z == (uint32_t) ncols
-@@ -510,13 +640,13 @@ template <bool do_scale = false, typename T>
+@@ -498,6 +738,18 @@ static void rms_norm_f32_dispatch(
+         } else {
+             RMS_NORM_LAUNCH(1024, 1, false);
+         }
++    } else if (rdna2_plain && ncols <= 128) {
++        // one warp per row, same reduction tree as the 128- and 256-thread launches (see the kernel);
++        // GGML_CUDA_RMS_NORM_NARROW=0 is the A/B switch back to the 128-thread launch
++        static const bool narrow = [] {
++            const char * e = getenv("GGML_CUDA_RMS_NORM_NARROW");
++            return e == nullptr || atoi(e) != 0;
++        }();
++        if (narrow) {
++            RMS_NORM_LAUNCH(32,   4, false);
++        } else {
++            RMS_NORM_LAUNCH(128,  1, false);
++        }
+     } else if (ncols < 1024) {
+         RMS_NORM_LAUNCH(256,  1, false);
+     } else {
+@@ -510,13 +762,13 @@ template <bool do_scale = false, typename T>
  static void rms_norm_f32_cuda(
          const ggml_tensor * x_t, T * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
          const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream,
@@ -85410,7 +85628,7 @@ index 95c3b0a0e..7434c5091 100644
  }
  
  template <typename T>
-@@ -546,10 +676,12 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
+@@ -546,10 +798,12 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
                                    const uint32_t add_nchannels,
                                    const uint32_t add_nsamples,
                                    const float    eps,
@@ -85425,7 +85643,7 @@ index 95c3b0a0e..7434c5091 100644
          return;
      }
      const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
-@@ -563,7 +695,7 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
+@@ -563,7 +817,7 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
              blocks_num, x_t, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
              mul_t, mul_stride_row, mul_stride_channel, mul_stride_sample,
              mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
@@ -85434,7 +85652,7 @@ index 95c3b0a0e..7434c5091 100644
      } else {
          const uint3 add_ncols_packed     = init_fastdiv_values(add_ncols);
          const uint3 add_nrows_packed     = init_fastdiv_values(add_nrows);
-@@ -576,14 +708,14 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
+@@ -576,14 +830,14 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
                  mul_t, mul_stride_row, mul_stride_channel, mul_stride_sample,
                  mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                  add_t, add_stride_row, add_stride_channel, add_stride_sample,
@@ -85451,7 +85669,7 @@ index 95c3b0a0e..7434c5091 100644
          }
      }
  }
-@@ -623,6 +755,58 @@ static void l2_norm_f32_cuda(
+@@ -623,6 +877,58 @@ static void l2_norm_f32_cuda(
      }
  }
  
@@ -85510,7 +85728,7 @@ index 95c3b0a0e..7434c5091 100644
  void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul, ggml_tensor * add) {
      const ggml_tensor * src0 = dst->src[0];
      const float * src0_d = (const float *) src0->data;
-@@ -659,6 +843,29 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_
+@@ -659,6 +965,29 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_
      }
  }
  
@@ -85540,7 +85758,7 @@ index 95c3b0a0e..7434c5091 100644
  void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0 = dst->src[0];
      const float * src0_d = (const float *)src0->data;
-@@ -678,6 +885,204 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+@@ -678,6 +1007,204 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
      group_norm_f32_cuda(src0_d, dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
  }
  
@@ -85745,7 +85963,7 @@ index 95c3b0a0e..7434c5091 100644
  void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0 = dst->src[0];
      cudaStream_t stream = ctx.stream();
-@@ -728,6 +1133,39 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
+@@ -728,6 +1255,39 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
      rms_norm_f32_cuda<true>(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
  }
  
@@ -85785,7 +86003,7 @@ index 95c3b0a0e..7434c5091 100644
  void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
      const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
      float eps = 0.0f;
-@@ -752,6 +1190,19 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -752,6 +1312,19 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
      GGML_ASSERT(mul_src->type == GGML_TYPE_F32);
      GGML_ASSERT(eps >= 0.0f);
  
@@ -85805,7 +86023,7 @@ index 95c3b0a0e..7434c5091 100644
      const int64_t ne00 = rms_norm_src->ne[0];
      const int64_t ne01 = rms_norm_src->ne[1];
      const int64_t ne02 = rms_norm_src->ne[2];
-@@ -782,7 +1233,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -782,7 +1355,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
                                mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
                                /*add_s00*/ 0, 0, 0,
                                0, 0, 0, 0,
@@ -85814,7 +86032,7 @@ index 95c3b0a0e..7434c5091 100644
      });
  }
  
-@@ -919,3 +1370,218 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -919,3 +1492,218 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
  
      l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
  }
@@ -114627,7 +114845,7 @@ index 36624ba86..e4c0e5990 100644
      assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
      assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 11bfa42a9..84644e71c 100644
+index 11bfa42a9..8bab1a9d7 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -87,7 +87,13 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
@@ -115948,7 +116166,23 @@ index 11bfa42a9..84644e71c 100644
      // sparse decode at long context
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,    0));
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
-@@ -14392,6 +15303,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -14376,6 +15287,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
++    // The edge of the RDNA2 chunked-prefill gate (GGML_CUDA_GDN_CHUNKED auto: H * n_seqs <= 4 takes the
++    // chunked kernel above 256 tokens, everything else takes the sequential one).  H * n_seqs = 8 and 12
++    // are the shapes that must stand down; 4h x 2 seqs is the n_seqs term.
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 256, 1));  // 8h PP-256
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 512, 1));  // 8h PP-512
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 1024, 1)); // 8h PP-1024
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 512, 1)); // 12h PP-512
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 1024, 1)); // 12h PP-1024
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 2));  // 4h x 2 seqs PP-512
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1, 1, false, true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 1, false, true));
+@@ -14392,6 +15312,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 20, 128, 1536, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 20, 128, 2048, 1));
  

@@ -1,5 +1,41 @@
 # The delivery patches — what each block is and what it does
 
+> **r334: three RDNA2 (`gfx1030`) items from contributor PR #338, folded into the blocks that own the code —
+> blocks 05, 08 and 10 — each compile-gated to the RDNA2 device pass and armed at run time from the device's
+> `cc`, so gfx1201/gfx1151/gfx1100 keep their numerics (verified: byte-identical greedy text on three models,
+> `gate-prefill-logits.sh` 0.000000 / 100.000 %, and the op suites `RMS_NORM*`+`GATED_DELTA_NET` 75/75,
+> `MUL_MAT_ID` 1077/1077, `FLASH_ATTN_EXT` 7429/7429).**
+> **Block 05 — the RDNA2 caps are gone.**  The r76-era `cols_per_block` caps (D=512 <= 8, D=128 <= 8, D=576 <= 16,
+> D=256 MHA <= 8) and the `ncols2 <= 2` cap for D=128 existed because some wide-column kernels' occupancy query
+> returned 0 on RDNA2 and `launch_fattn`'s `GGML_ASSERT(max_blocks_per_sm > 0)` aborted.  That assert is now
+> unreachable on RDNA2: `launch_fattn` computes the RDNA2 occupancy itself from the kernel's VGPRs and LDS against
+> a WGP (the `regsPerMultiprocessor = 32768` quirk) and the manual figure only replaces HIP's when it is larger.
+> So RDNA2 takes the same 32/64-column prefill tiles and the same `ncols2` every other arch takes (contributor:
+> D=128 f16 prefill 1.88x, D=512 2.15x, D=576 1.33x, and a GQA-8 D=128 decode no longer re-reads the KV cache 4x;
+> `FLASH_ATTN_EXT` 7405/7405 with the caps gone).  **This is the one piece with no run-time gate to hide behind —
+> it is an RDNA2-only deletion — so a stale cap would have been a silent RDNA2 perf loss, and a still-live abort
+> would be a hard failure; the contributor's full FA suite is the only evidence, and no RDNA2 device is in the
+> maintainer's fleet.**
+> **Block 08 — a one-warp narrow `RMS_NORM`.**  For `ncols <= 128`, RDNA2 launches one warp per row
+> (`rms_norm_f32<.., 32, 4, ..>`) whose lane keeps its four strided columns in registers, and the per-warp sums are
+> added in the order `block_reduce`'s cross-warp butterfly adds them (only xor 2 and xor 1 carry a non-zero term,
+> i.e. `(s0+s2)+(s1+s3)`), so the row is read once and the result is bit-identical to the 128- and 256-thread
+> launches.  A `has_dst16 = false` specialization drops the `dst16` branch for the plain path.  The narrow kernel
+> branch is inside `#if defined(RDNA2)`, so it is compiled in the RDNA2 device pass and nowhere else;
+> `GGML_CUDA_RMS_NORM_NARROW=0` is the A/B arm back to the 128-thread launch.  Contributor: `RMS_NORM`
+> `[128,16384]` 79.3 -> 25.5 us f32 / 77.8 -> 16.6 us bf16 on a V620.
+> **Block 10 — the GDN chunked gate and the MoE rows-abreast K walk.**  With `GGML_CUDA_GDN_CHUNKED` unset, RDNA2
+> (no BF16 WMMA) takes the FP32 chunked GDN prefill only for `H * n_seqs <= 4 && n_tokens > 256` and the sequential
+> kernel otherwise (`=0`/`=1` still force either); this does not reintroduce the issue-#309 impurity, because
+> `n_seqs` is a property of the batch and `n_rs_batch` is still not a kernel-selection input.  And
+> `mul_mat_vec_q_moe` walks the K-blocks once with the rows of a block side by side — each thread group takes the
+> same items in the same per-row order, so the output is bit-identical; the new loop is compiled only in the RDNA2
+> device pass and armed per launch, `GGML_CUDA_MOE_ROWS_ABREAST=0` restores the item loop.  Contributor: quantized
+> `MUL_MAT_ID` 1.26-1.32x at `n = 1..8` (0.83x -> 1.07x against upstream at `n = 4`), 175 byte-compared cases with
+> 0 differences.
+> Both RDNA2 switches are catalogued in `ENVIRONMENT.md` §7.4; the engineering facts are `INVARIANTS.md` r334;
+> the record is `WORKLOG.md` 261121.013.
+
 > **r331: the r328 re-base had silently dropped block 00's `ggml-alloc.c` content (and two block-10 port details); both are restored — an amendment to blocks 00 and 10 (GitHub issue #345, `@briansp2020`).**
 > Block 00 has always carried `ggml/src/ggml-alloc.c` (+121/−2): `GGML_GLU_INPLACE` with the `n_src_inplace`
 > gate-only rule, the W4 unused-view release in `ggml_gallocr_alloc_graph_impl()`, and the `layout_fp` graph
@@ -1127,6 +1163,21 @@ almost all of them `template-instances/*.cu`.
 
 **Contents.**
 
+* **The RDNA2 caps are LIFTED (r334, contributor PR #338).**  `launch_fattn_tile_switch_ncols1()`'s four
+  `cols_per_block` caps (D=512 <= 8, D=128 <= 8, D=576 <= 16, D=256 MHA <= 8) and
+  `switch_ncols2()`'s `rdna_cap_ncols2` (D=128 <= 2) were r76 workarounds for wide-column kernels whose
+  occupancy query returned 0 on gfx1030, aborting at `launch_fattn`'s `GGML_ASSERT(max_blocks_per_sm > 0)`.
+  `launch_fattn` now computes the RDNA2 occupancy from the kernel's VGPRs and LDS against a WGP itself, and
+  only replaces HIP's figure when its own is larger, so the assert is unreachable on RDNA2 and the caps were
+  pure loss: RDNA2 took 8-column prefill tiles where every other arch took 32/64, and a GQA-8 D=128 decode
+  re-read the KV cache 4x.  Deleted outright (not kept as `false` constants) — they were `false` on every
+  non-RDNA2 arch anyway, so the deletion cannot change any other arch's selection.  Contributor, gfx1030:
+  D=128 f16 prefill 1.88x, D=512 f16 2.15x, D=576 f16 1.33x, D=128 f16 decode 1.21x, `FLASH_ATTN_EXT`
+  7405/7405 with the caps gone and no FA case below 0.95x.  **The residual risk is the abort the caps were
+  there for**: the manual RDNA2 figure is `0` for a kernel so wide that `4 * waves_per_simd <
+  waves_per_block`, in which case the assert still fires — the contributor's full FA suite is the only
+  evidence, and there is no RDNA2 device in the maintainer's fleet.
+
 * **The decode/verify KV split is a RUN CONSTANT, not a function of the padded KV extent (r319, GitHub issue
   #330).**  The **tile** launcher's `parallel_blocks` (`gridDim.y`) is the reduction's association: block b owns
   KV iterations b, b+P, b+2P, … and `flash_attn_combine_results` adds the P partials in block order.  It was chosen
@@ -1675,6 +1726,21 @@ must be **bit-identical** to what it replaces at the widths it serves.
 
 **Contents.**
 
+* **A one-warp narrow `RMS_NORM` for RDNA2 (r334, contributor PR #338).**  `norm.cu`: for `ncols <= 128` the
+  plain (non-`vec`) path launches **one warp per row** (`rms_norm_f32<.., 32, 4, ..>`) instead of 128/256
+  threads; lane `tid` owns the columns `tid + k*WARP_SIZE` (k = 0..3), keeps them in registers so the row is
+  read once, and adds the four warp sums in the order `block_reduce`'s cross-warp butterfly adds them (the
+  5-step warp butterfly over lanes 0..31, of which only xor 2 and xor 1 carry a non-zero term, i.e.
+  `(s0+s2)+(s1+s3)`; with a 256-thread launch warps 4..7 are exactly `+0` at these widths) — so the result is
+  bit-identical to both wide launches and the default grouping is unchanged.  The narrow branch lives inside
+  `#if defined(RDNA2)` (compiled in the RDNA2 device pass only) and the dispatch asks
+  `GGML_CUDA_CC_IS_RDNA2(cc)`, so no other arch can reach it; `GGML_CUDA_RMS_NORM_NARROW=0` is the A/B arm.
+  A `has_dst16 = false` specialization also drops the `dst16` branch for the plain `(dst16 == nullptr &&
+  store_f32)` launch.  Contributor, Radeon Pro V620: `RMS_NORM` `[128,16384]` 79.3 -> 25.5 us f32,
+  77.8 -> 16.6 us bf16; `test-backend-ops RMS_NORM*` 234/234 in the default, `NARROW=0` and `VEC=1` arms.
+  The identity relies on the compiler contracting `x*x` into the first butterfly add exactly as it does in
+  the wide form (writing the square as `fmaf(x, x, 0.0f)` changes the bits) — re-check the bytes after
+  touching those loops or the toolchain.  `ENVIRONMENT.md` §7.4.
 * `mmvq.cu`: the dense `ncols == 1` K-split alignment, the fused dense gate+up+GLU, and (r93) the
   **RDNA3_0 per-shape `nwarps`** (`Q4_0/Q4_1/Q5_0/Q5_1` narrow at every row count, `Q8_0` narrow for
   `2048 <= M <= 8192`), forwarded to every fusion that reproduces a dense weight launch
@@ -2641,6 +2707,26 @@ next item) and the census to expect is `direct` ~= 0 with `properties_changed` i
 
 ## Block 10 — the slab, the fusion dispatcher, the async input ring (infrastructure)
 
+> **r334 amendments (contributor PR #338): the RDNA2 GDN chunked gate and the rows-abreast MoE K walk.**
+> Both are RDNA2-only, both are compiled out of every other device pass, and both are armed at run time from
+> the device's `cc`, so gfx1201/gfx1151/gfx1100 keep the kernel set they had.
+> (a) **GDN.**  With `GGML_CUDA_GDN_CHUNKED` unset, `gated_delta_net.cu` now takes the FP32 chunked prefill on
+> RDNA2 only for `H * n_seqs <= 4 && n_tokens > 256` (gfx1030 has no BF16 WMMA, so chunked only wins on a
+> low-head long prefill: measured H=4 n=256 126/150, n=512 299/240, n=1024 589/462 us; H=8, H=12, H=32 and
+> Qwen3.8-27B's H=48 all lose).  `=0`/`=1` still force either kernel and `H * n_seqs` of 5..7 takes the
+> sequential one.  It does not reintroduce the issue-#309 impurity: `n_seqs` is a batch property (a draft/verify
+> batch on one sequence stays at 1) and `n_rs_batch` is still not a kernel-selection input; what it does add is
+> a batch-composition split, which `n_seqs > 1` already had.
+> (b) **MoE GEMV.**  `mul_mat_vec_q_moe` takes one `(row, K-block)` item at a time (a divide and a modulo per
+> item).  On RDNA2 it walks the K-blocks once with the rows of a block side by side: group `g` takes the items
+> `it == g (mod n_groups)`, so in row `i` it takes `kbx == g - i*blocks_per_row (mod n_groups)` in rising order —
+> the same K-blocks in the same order, so every partial sum is built identically and the output is
+> **bit-identical** (175 byte-compared cases / 0 differences, contributor).  `blocks_per_row % n_groups == 0`
+> lets one K-block serve every row; otherwise each row starts at its own offset and IQ2_XS keeps the item loop.
+> The new loop is inside `#if defined(RDNA2)`; `GGML_CUDA_MOE_ROWS_ABREAST=0` restores the item loop.
+> Contributor, V620: quantized `MUL_MAT_ID` geomean 1.26-1.32x at `n = 1..8`, 1.00x at `n >= 32` (that width does
+> not run this kernel); 0.83x -> 1.07x against upstream at `n = 4`.  `ENVIRONMENT.md` §7.4.
+>
 > **r331 port repairs (r328 re-base): the GB10 prefetch guard's constant and one lost kill switch.**
 > `mmvq-ksplit-body.inc` tested `#if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK`; upstream renamed that constant to
 > `GGML_CUDA_CC_GB10` (`common.cuh`, 1210) at this base, so the name was undefined and the preprocessor read it as

@@ -1,3 +1,86 @@
+## 261121.013 (r334) -- **RELEASE**: three RDNA2 (`gfx1030`) items from contributor PR #338 (`@jstamagal`), folded into blocks 05/08/10 as RDNA2-gated code -- every supported arch's numerics unchanged
+
+**Blocks 05, 08 and 10 are amended; the base, the block count and the release prefix do not move** (17 official
+blocks + the temporary `0300` = 18 default patches, base `919794500`).  The optional artifacts `0100`/`0101` are
+re-cut against the new default tree, `0101` with a two-line merge (see 5 below).
+
+### 1. Why the PR was not taken as three optional blocks
+
+PR #338 (`@jstamagal`, first-time contributor) shipped the work as `optional/rdna2-norm-gdn/`,
+`optional/rdna2-fattn-tile-caps/` and `optional/rdna2-moe-rows-abreast/` (blocks `0102`-`0104`), cut against the
+**r327** tree, with `release.json` hand-edited.  The maintainer's decision was to fold them into the blocks that
+own the code instead, with a hard architecture gate, because each item is a small change to a file a block
+already owns rather than a feature that needs a separate artifact -- and because an optional artifact is not
+covered by the delivery's gates, so a stale one is only found later.  The hand-edited `release.json` and the
+malformed `optional/README.md` table in the PR were not taken (`make-release.sh` owns the hashes); the `0102`'s
+and `0103`'s hunks also no longer applied (r327 -> r333 moved the `test-backend-ops` perf list and the r268
+`use_gqa_opt` comment the `rdna_cap_ncols2` hunk used as context), so all three were re-cut against `919794500`.
+
+### 2. What was integrated, and where
+
+| item | block | the change |
+|---|---|---|
+| `0103` FA tile caps | **05** | the r76-era RDNA2 `cols_per_block` caps (D=512 <= 8, D=128 <= 8, D=576 <= 16, D=256 MHA <= 8) and `rdna_cap_ncols2` (D=128 <= 2) are **deleted**, not kept as `false` constants: `launch_fattn` computes the RDNA2 occupancy itself from the kernel's VGPRs and LDS against a WGP and only replaces HIP's 0 when its own figure is larger, so the caps were pure loss (8-column prefill tiles where every other arch takes 32/64, and a GQA-8 D=128 decode re-reading the KV cache 4x) |
+| `0102` RMS_NORM + `dst16` | **08** | for `ncols <= 128`, one warp per row whose lane keeps its four strided columns in registers; a `has_dst16 = false` kernel specialization drops the `dst16` branch on the plain `(dst16 == nullptr && store_f32)` path |
+| `0102` GDN gate | **10** | with `GGML_CUDA_GDN_CHUNKED` unset, RDNA2 takes the FP32 chunked prefill only for `H * n_seqs <= 4 && n_tokens > 256` (no BF16 WMMA on gfx1030, so chunked only wins on a low-head long prefill) |
+| `0104` MoE rows abreast | **10** | `mul_mat_vec_q_moe` walks the K-blocks once with the rows of a block side by side instead of one `(row, K-block)` item at a time; each group takes the same items in the same per-row order, so the output is bit-identical |
+| the six GDN perf cases | **10** | `test-backend-ops perf` shapes at the gate edge (8h/12h, and 4h x 2 seqs) |
+
+### 3. The architecture gate (the maintainer's requirement)
+
+Every piece is **compile-gated to the RDNA2 device pass** and **armed at run time** from the device's `cc`, so a
+gfx1201/gfx1151/gfx1100 build does not contain the code and cannot take it:
+
+| item | device-side | host-side |
+|---|---|---|
+| narrow `RMS_NORM` | the `else if constexpr (vpt > 1)` branch is inside `#if defined(RDNA2)` | `GGML_CUDA_CC_IS_RDNA2(cc)` selects the launch |
+| MoE rows abreast | the new loops are inside `#if defined(RDNA2)`; `rows_abreast` is `constexpr false` elsewhere | `GGML_CUDA_CC_IS_RDNA2(cc)` per launch |
+| GDN chunked gate | -- (host dispatch) | `#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)` + `GGML_CUDA_CC_IS_RDNA2(cc)` |
+| FA tile caps | -- (an RDNA2-only deletion; the removed terms were `false` on every other arch) | -- |
+
+**Proved, not assumed**: with a deliberate `#error` placed inside each `#if defined(RDNA2)` region, the gfx1201
+build succeeds (the region is excluded) and the gfx1030 build fails (the region is compiled).  This matters
+because the default `GPU_TARGETS=gfx1201` **never compiles the RDNA2 device pass at all** (`RDNA2` comes from
+`__gfx1030__` in `vendors/hip.h`), so a normal `all` build cannot see this code (`INVARIANTS.md` r334).
+
+### 4. Verification (gfx1201; the RDNA2 arms are the contributor's)
+
+| gate | result |
+|---|---|
+| `all` build at the applied tip | PASS (358 s cold) |
+| second configure with `GPU_TARGETS=gfx1030` | PASS (286 s) -- the RDNA2 device passes compile |
+| architecture-gate probe (`#error` inside each `#if defined(RDNA2)`) | PASS both directions |
+| same-seed greedy text vs the r333 build: 4B dense `1c5d32ac537d`, 27B GDN `da2e2d192e21`, 35B-A3B `-ncmoe 48` `627b2ebd7792` | **byte-identical** in all three |
+| `test-backend-ops` `RMS_NORM*`+`GATED_DELTA_NET` / `MUL_MAT_ID` / `FLASH_ATTN_EXT` | **75/75** / **1077/1077** / **7429/7429** |
+| `scripts/gate-prefill-logits.sh` | **0.000000 KLD / 100.000 % top-p**, GPU faults clean |
+| `scripts/validate-set.sh` | GREEN (strict apply, checksums, trees, Windows checks) |
+
+Contributor's RDNA2 numbers (Radeon Pro V620, gfx1030) are in the three table rows of 2 above and in
+`patches/README.md`; the MTP four-axis protocol was **not** run because no gfx1201 kernel changed (the
+maintainer's call: local architecture patches unchanged, and the byte-identical text + 0.000000 KLD + the op
+suites are a stronger statement for a non-change; `INVARIANTS.md` r334).
+
+### 5. Doc and artifact consequences
+
+* `ENVIRONMENT.md` §7.4: two new rows, `GGML_CUDA_RMS_NORM_NARROW` and `GGML_CUDA_MOE_ROWS_ABREAST` (both
+  RDNA2-only kill switches; a beneficial feature is on by default, so the variable disables).
+* `INVARIANTS.md` r334: the three facts that cost a wrong conclusion (an RDNA2-only change is invisible to the
+  default build; the narrow form's bit-identity is a statement about `block_reduce`'s butterfly; the FA caps
+  guarded an assert that is only unreachable while the manual occupancy figure is non-zero).
+* `MANIFESTS.md`: three per-block rows for blocks 05/08/10 that say plainly that there is **no in-fleet gate**
+  for these, what was run instead, and what the deciding instrument is.
+* `README.md`: `@jstamagal` added to Community Acknowledgements and to the RDNA2 paragraph of Supported
+  architectures.
+* `optional/`: `0100` and `0101` re-cut against the new default tree (trees `d6e1ae8a4` / `40f410ca7`, cumulative
+  `ffb271162` in `release.json`).  **`0101` no longer applied strictly**: its two `!rdna_cap_ncols2` conditions
+  live on the lines block 05 deleted, so the merge keeps the `type_V` argument and drops the prefix -- the
+  mixed-KV matcher is unchanged, and this is the one cost of deleting the caps rather than leaving `false`
+  constants (which is why the PR kept them that way).
+* `TODO.md`: one waiting-on-someone item for the contributor's validation of the released tree (the release
+  cannot validate `gfx1030` itself).
+
+---
+
 ## 261121.012 (r333) -- **RELEASE**: `TODO` #349 was the rulebook's own §38 (the gate asserted a concurrent text hash under a unified KV cache), `#351`/`#353` retired, and the `radiance` worker's silent checkout drift found and fixed
 
 **No delivery patch, block, `release.json` base/tip/tree or optional artifact changed.**  The set is r331's

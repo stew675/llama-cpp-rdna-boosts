@@ -55,11 +55,12 @@ re-entry condition.  A green gate ladder is still not permission to skip a row.
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **358** | a re-base rung can silently drop a file: block 00's `ggml-alloc.c` half was missing from r328/r329 while its text, docs and its own unit test still described it (issue #345, fixed r331) | tooling / gate (re-base flow) | **OPEN** -- reconcile each rung's changed-file set against the patch it replaces and fail on a file the old patch touched and the new one does not; the 18/18 ladder cannot see it; §358 |
 | **359** | `gate-fusion-alias-copy.sh`'s arm A oracle (`fused == GGML_CUDA_DISABLE_FUSION=1` text at `-ub 14`) broke at the r328 re-base: the UNFUSED chain moved, the fused arm still reproduces the r239 anchor `3fab4da87774` | tooling / gate (issue #287 gate) | **OPEN** -- re-derive the oracle (a logit/KLD compare at that shape rather than text): r329 and r331 both read `a_chain` 194/`dfe59c9c5257` vs `a_fused` 193/`3fab4da87774`, and pinning `GGML_GLU_INPLACE=0` changes neither arm, so neither the r331 restore nor the allocator is the cause; §359 |
+| **361** | the r334 RDNA2 items (PR #338) are validated on the contributor's V620, not on the released tree: blocks 05/08/10 now carry an RDNA2-only FA tile-cap removal, a one-warp narrow `RMS_NORM`, a `H * n_seqs` GDN chunked gate and a rows-abreast MoE K walk, and no RDNA2 device is in the maintainer's fleet | validation / external (delivery) | **WAITING on `@jstamagal`** -- re-run on the r334 tree: full `test-backend-ops` on `gfx1030` at default flags (**especially `FLASH_ATTN_EXT` with the caps gone: the failure mode is `GGML_ASSERT(max_blocks_per_sm > 0)` in `launch_fattn`, not a rate**), `MUL_MAT_ID` with `GGML_CUDA_MOE_ROWS_ABREAST` on and off, `RMS_NORM*` in the default/`NARROW=0`/`VEC=1` arms, a model-level decode+prefill (a GDN model for the chunked gate, a MoE for the K walk) and an MTP-acceptance run; §361 |
 
 
 ## Handle numbering
 
-**New handles append after `#359`, the highest issued so far, so the next free handle is `#360`; a number is
+**New handles append after `#361`, the highest issued so far, so the next free handle is `#362`; a number is
 never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
 subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
 

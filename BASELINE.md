@@ -24,7 +24,13 @@ W4's unused-view release and the issue-#183 `layout_fp` guard) is **restored** a
 `GGML_CUDA_CC_DGX_SPARK` to upstream's `GGML_CUDA_CC_GB10` and restores the `GGML_CUDA_DISABLE_ROPE_SET_ROWS`
 bisect switch.  `v17-919794500-r332` retired the per-block build ladder (policy only, no patch change) and
 `v17-919794500-r333` is the tooling/records revision on the same tree (`TODO` #349 closed, `scripts/gate-server-arms.sh`
-re-anchored under `--no-kv-unified`; no fork point, block or artifact change).  The re-base itself replayed the set
+re-anchored under `--no-kv-unified`; no fork point, block or artifact change), and `v17-919794500-r334` amends
+blocks 05, 08 and 10 on it with three RDNA2 (`gfx1030`) items from contributor PR #338 — the FA tile caps
+lifted (block 05), the one-warp narrow `RMS_NORM` (block 08), and the GDN chunked gate plus the rows-abreast
+MoE K walk (block 10).  Every piece is compiled only in the RDNA2 device pass and armed at run time from the
+device's `cc`, so no supported arch's numerics move; the optional artifacts `0100`/`0101` are re-cut against
+the new default tree (they are rebased on every release) and `0101` needed a two-line merge for the deleted
+caps.  The re-base itself replayed the set
 from `4f9dfa0e3` onto **`919794500`** — 228 upstream commits, 1944 files, +147 k / −41 k — as a **ladder climb**
 (one rung per block, each resolved, built and coherent before the next), with the three rung repairs squashed
 into their owning blocks (00's top-k gather, 05's `nb32`, 16's sign-compare).  The ladder, the per-rung conflict

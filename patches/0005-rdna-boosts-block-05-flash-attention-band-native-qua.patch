@@ -1,4 +1,4 @@
-From c13c703007d9b418840fa19d2db7f5ae57563036 Mon Sep 17 00:00:00 2001
+From 6be589b8a6c3ffe01db1c3afe272279061479f0c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 12 Nov 2026 08:22:10 -0600
 Subject: [PATCH 05/17] rdna-boosts: block 05: flash-attention band, native
@@ -231,7 +231,7 @@ f16 KV is a wash, as expected -- staging only costs anything for a quantized cac
  ggml/src/ggml-cuda/fattn-mma-f16.cuh          | 1256 ++++++++++++++---
  ggml/src/ggml-cuda/fattn-rdna.cuh             |  620 ++++++++
  ggml/src/ggml-cuda/fattn-tile.cu              |   44 +-
- ggml/src/ggml-cuda/fattn-tile.cuh             |  616 ++++++--
+ ggml/src/ggml-cuda/fattn-tile.cuh             |  599 +++++++-
  ggml/src/ggml-cuda/fattn-vec.cuh              |   14 +-
  ggml/src/ggml-cuda/fattn.cu                   |  233 ++-
  ggml/src/ggml-cuda/ggml-cuda.cu               |   82 ++
@@ -559,7 +559,7 @@ f16 KV is a wash, as expected -- staging only costs anything for a quantized cac
  src/llama-kv-cache.h                          |   23 +
  src/llama-kv-cells.h                          |   53 +
  tests/test-backend-ops.cpp                    |  220 ++-
- 341 files changed, 6394 insertions(+), 754 deletions(-)
+ 341 files changed, 6382 insertions(+), 749 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-rdna.cuh
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_4-ncols2_8-dkq256-dv256.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-band-fetch-ahead-ncols1_8-ncols2_8-dkq256-dv256.cu
@@ -4701,7 +4701,7 @@ index 96c73f268..54a08ded6 100644
  
  void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
-index bac70cad5..a0482c87e 100644
+index bac70cad5..ce0f4a622 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cuh
 +++ b/ggml/src/ggml-cuda/fattn-tile.cuh
 @@ -312,8 +312,47 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
@@ -5022,17 +5022,17 @@ index bac70cad5..a0482c87e 100644
 +                const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
 +                ggml_cuda_memcpy_1<cpy_nb>(&K_k[i_KQ_0/(np*warp_size)], &KV_tmp[i_KQ*(nbatch_K/2 + cpy_ne) + k_KQ_1]);
 +            }
-+#pragma unroll
+ #pragma unroll
+-    for (int k_KQ_1 = 0; k_KQ_1 < nbatch_K/2; k_KQ_1 += cpy_ne) {
+-        __align__(16) T_fast K_k[nbatch_fa/(np*warp_size)][cpy_ne];
+-        __align__(16) T_fast Q_k[cpw][cpy_ne];
 +            for (int jc0 = 0; jc0 < cpw; ++jc0) {
 +                const int jc = jc0 + (threadIdx.y / np)*cpw;
 +                ggml_cuda_memcpy_1<cpy_nb>(&Q_k[jc0], &Q_tmp[jc*(DKQ/2) + k_KQ_0/2 + k_KQ_1]);
 +            }
 +#pragma unroll
 +            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
- #pragma unroll
--    for (int k_KQ_1 = 0; k_KQ_1 < nbatch_K/2; k_KQ_1 += cpy_ne) {
--        __align__(16) T_fast K_k[nbatch_fa/(np*warp_size)][cpy_ne];
--        __align__(16) T_fast Q_k[cpw][cpy_ne];
++#pragma unroll
 +                for (int jc0 = 0; jc0 < cpw; ++jc0) {
 +#pragma unroll
 +                    for (int k = 0; k < cpy_ne; ++k) {
@@ -5427,7 +5427,7 @@ index bac70cad5..a0482c87e 100644
          ne00, ne01, ne02, ne03,
                nb01, nb02, nb03,
          ne10, ne11, ne12, ne13,
-@@ -1416,22 +1782,68 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1416,12 +1782,51 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
      const bool need_f16_K = K->type != type_KV;
      const bool need_f16_V = V->type != type_KV;
  
@@ -5467,28 +5467,19 @@ index bac70cad5..a0482c87e 100644
 +        return;
 +    }
 +
-+    // RDNA2 (gfx1030): even at occupancy 1 (see ggml_cuda_fattn_tile_get_config_amd_rdna2),
-+    // some wide-column kernels still fail the occupancy query and abort, so cap cols_per_block:
-+    //   D=512 (Gemma global attention): the ncols2<=2 kernels are not instantiated for
-+    //     DV=512, so cap cols_per_block<=8 to keep the accumulator set in registers.
-+    //   D=128: cols_per_block 16/32/64 need 33-43 KB LDS; cap to <=8 (with ncols2<=2 from
-+    //     switch_ncols2).
-+    //   D=576/DV=512 (DeepSeek MLA): cols_per_block=32 (kernel <512,8,4>) fails; cap to <=16.
-+    //   D=256 MHA/odd GQA (ncols2==1): <256,32,1> fails; cap to <=8. The GQA ncols2>=2 path
-+    //     keeps its working cols_per_block=32 (<256,16,2>) tile.
++    // RDNA2 (gfx1030) took capped cols_per_block values here (D=512 <= 8, D=128 <= 8, D=576 <= 16,
++    // D=256 MHA <= 8) as a workaround for kernels whose occupancy query returned 0 and aborted at the
++    // GGML_ASSERT in launch_fattn.  That assert is now unreachable on RDNA2: launch_fattn computes the
++    // RDNA2 occupancy itself from the kernel's VGPRs and LDS against a WGP (fattn-common.cuh, the
++    // regsPerMultiprocessor = 32768 quirk) and only falls back to HIP's figure when that is larger, so
++    // RDNA2 takes the same 32/64-column prefill tiles every other arch takes (r334, PR #338 -> folded
++    // into block 05).  RDNA3/4 never entered this branch.
 +    const bool rdna2       = GGML_CUDA_CC_IS_RDNA2(cc);
-+    const bool rdna512     = rdna2 && DKQ == 512;
-+    const bool rdna_d128   = rdna2 && DKQ == 128;
-+    const bool rdna576     = rdna2 && DKQ == 576;
-+    const bool rdna256_mha = rdna2 && DKQ == 256 && ncols2 == 1;
 +
  #ifdef GGML_USE_HIP
      if constexpr (DKQ <= 128) {
--        if (Q->ne[1] > 32/ncols2) {
-+        if (!rdna_d128 && Q->ne[1] > 32/ncols2) {
-             constexpr int cols_per_block = 64;
-             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
-             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+         if (Q->ne[1] > 32/ncols2) {
+@@ -1431,7 +1836,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
@@ -5498,15 +5489,7 @@ index bac70cad5..a0482c87e 100644
              return;
          }
      }
-@@ -1441,27 +1853,29 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
-     if constexpr (DKQ <= 256)
- #endif // GGML_USE_HIP
-     {
--        if (Q->ne[1] > 16/ncols2) {
-+        if (!rdna512 && !rdna_d128 && !rdna576 && !rdna256_mha && Q->ne[1] > 16/ncols2) {
-             constexpr int cols_per_block = 32;
-             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
-             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+@@ -1448,7 +1854,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
@@ -5516,13 +5499,7 @@ index bac70cad5..a0482c87e 100644
              return;
          }
      }
- 
-     if constexpr (ncols2 <= 16) {
--        if (Q->ne[1] > 8/ncols2) {
-+        if (!rdna512 && !rdna_d128 && !rdna256_mha && Q->ne[1] > 8/ncols2) {
-             constexpr int cols_per_block = 16;
-             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
-             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+@@ -1461,7 +1868,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
@@ -5532,7 +5509,7 @@ index bac70cad5..a0482c87e 100644
              return;
          }
      }
-@@ -1474,7 +1888,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1474,7 +1882,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
@@ -5542,7 +5519,7 @@ index bac70cad5..a0482c87e 100644
              return;
          }
      }
-@@ -1487,7 +1902,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1487,7 +1896,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
@@ -5552,7 +5529,7 @@ index bac70cad5..a0482c87e 100644
              return;
          }
      }
-@@ -1499,7 +1915,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1499,7 +1909,8 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
          fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
          launch_fattn<DV, cols_per_block/ncols2, ncols2>
              (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
@@ -5562,7 +5539,7 @@ index bac70cad5..a0482c87e 100644
          return;
      }
  
-@@ -1511,7 +1928,6 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -1511,7 +1922,6 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
      const ggml_tensor * KQV  = dst;
      const ggml_tensor * Q    = dst->src[0];
      const ggml_tensor * K    = dst->src[1];
@@ -5570,7 +5547,7 @@ index bac70cad5..a0482c87e 100644
  
      float max_bias = 0.0f;
      memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
-@@ -1521,10 +1937,23 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -1521,10 +1931,22 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
  
      // On NVIDIA (Pascal and older) the GQA optimizations seem to be detrimental in some cases.
      // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
@@ -5588,31 +5565,15 @@ index bac70cad5..a0482c87e 100644
 +    const bool use_gqa_opt = ggml_cuda_flash_attn_ext_has_mask(KQV) && (mask == nullptr || mask->ne[2] == 1) &&
 +        max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
 +
-+    // RDNA2 (gfx1030): cap ncols2<=2 for D=128. D=256 was capped on the belief that the wider
-+    // variants overflow the register file (occupancy 0 -> abort), but measured 4x8 D=256 launches
-+    // run fine -- the manual occupancy fallback keeps >=1 block resident even when the kernel
-+    // spills some scratch -- and they beat the 16x2 shape, so the cap is lifted for DKQ == 256.
-+    // Wave64 GCN fits the wider kernels, and RDNA3/4 keep upstream's selection.
-+    const bool rdna_cap_ncols2 = GGML_CUDA_CC_IS_RDNA2(device_cc) && DKQ == 128;
++    // RDNA2 (gfx1030) capped ncols2 <= 2 for D=128 (and, earlier, D=256) on the belief that the wider
++    // GQA variants overflow the register file and abort; measured 4x8 launches run fine -- the manual
++    // occupancy fallback keeps >= 1 block resident even when the kernel spills scratch -- and a GQA-8
++    // D=128 decode was re-reading the KV cache 4x for it.  The cap is lifted (r334, PR #338 -> folded
++    // into block 05), so RDNA2 takes the same ncols2 the rest of the archs do.
  
      if constexpr (DKQ == 320) {
          // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
-@@ -1570,12 +1999,12 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
-     }
- 
-     if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
--        if (use_gqa_opt && gqa_ratio % 8 == 0) {
-+        if (!rdna_cap_ncols2 && use_gqa_opt && gqa_ratio % 8 == 0) {
-             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap, type_KV>(ctx, dst);
-             return;
-         }
- 
--        if (use_gqa_opt && gqa_ratio % 4 == 0) {
-+        if (!rdna_cap_ncols2 && use_gqa_opt && gqa_ratio % 4 == 0) {
-             launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap, type_KV>(ctx, dst);
-             return;
-         }
-@@ -1610,18 +2039,41 @@ void ggml_cuda_flash_attn_ext_tile_case(ggml_backend_cuda_context & ctx, ggml_te
+@@ -1610,18 +2032,41 @@ void ggml_cuda_flash_attn_ext_tile_case(ggml_backend_cuda_context & ctx, ggml_te
  void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
  
  // Explicit instantiations, used by the autogenerated template-instances/fattn-tile-*.cu.

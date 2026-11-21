@@ -1,4 +1,4 @@
-From a0f1fd15ed9b59a7e832f6dfc38491a9a237f873 Mon Sep 17 00:00:00 2001
+From b2375eeae8d4cad326dc69d8721cbb9e8a333133 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/17] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -160,7 +160,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  ggml/src/ggml-backend.cpp                     |   92 +-
  ggml/src/ggml-cuda/allreduce-hip.cu           |    3 +
  ggml/src/ggml-cuda/allreduce.cu               |    3 +
- ggml/src/ggml-cuda/common.cuh                 |  802 ++-
+ ggml/src/ggml-cuda/common.cuh                 |  805 ++-
  ggml/src/ggml-cuda/concat.cu                  |   82 +
  ggml/src/ggml-cuda/cpy-batch.cu               |   15 +-
  ggml/src/ggml-cuda/cpy-batch.cuh              |    1 +
@@ -174,7 +174,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  ggml/src/ggml-cuda/fattn.cuh                  |   19 +
  ggml/src/ggml-cuda/fwht.cu                    |   83 +-
  ggml/src/ggml-cuda/fwht.cuh                   |   49 +-
- ggml/src/ggml-cuda/gated_delta_net.cu         |  350 +-
+ ggml/src/ggml-cuda/gated_delta_net.cu         |  373 +-
  ggml/src/ggml-cuda/gated_delta_net.cuh        |    8 +
  ggml/src/ggml-cuda/gated_delta_net_chunked.cu |   11 +-
  .../ggml-cuda/gated_delta_net_chunked_bf16.cu |    5 +-
@@ -200,7 +200,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  ggml/src/ggml-cuda/mmvf.cu                    |  452 +-
  ggml/src/ggml-cuda/mmvf.cuh                   |   11 +-
  ggml/src/ggml-cuda/mmvq-ksplit-body.inc       |  366 +
- ggml/src/ggml-cuda/mmvq-moe.cu                |  471 ++
+ ggml/src/ggml-cuda/mmvq-moe.cu                |  529 ++
  ggml/src/ggml-cuda/mmvq-moe.cuh               |   14 +
  ggml/src/ggml-cuda/mmvq-vecdot.cuh            |   96 +
  ggml/src/ggml-cuda/mmvq.cu                    | 1756 +++--
@@ -235,11 +235,11 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  src/llama-graph.h                             |    5 +
  src/llama-model.cpp                           |   88 +-
  src/llama-model.h                             |    7 +-
- tests/test-backend-ops.cpp                    |   60 +-
+ tests/test-backend-ops.cpp                    |   69 +-
  tests/test-fusion-gate-beta-multiseq.cpp      |  321 +
  tests/test-logits-width-probe.cpp             |  234 +-
  tools/server/server-context.cpp               |   30 +-
- 87 files changed, 17893 insertions(+), 5678 deletions(-)
+ 87 files changed, 17986 insertions(+), 5678 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -1035,7 +1035,7 @@ index fbbe48432..a5e3a3a44 100644
              bf16_tmp[i].alloc(ne);
              ggml_cuda_set_device(p->devices[i]);
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index d0a8f47d5..919874d31 100644
+index d0a8f47d5..530f91749 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -132,6 +132,7 @@ static inline bool ggml_cuda_rms_norm_vec() {
@@ -1958,7 +1958,7 @@ index d0a8f47d5..919874d31 100644
  };
  struct ggml_cuda_mm_fusion_args_device {
      const void * x_bias = nullptr;
-@@ -2421,6 +2938,52 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -2421,6 +2938,55 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * shared_gate = nullptr;
      float * shared_dst = nullptr;
      uint32_t shared_stride_col_dst = 0;
@@ -1979,6 +1979,9 @@ index d0a8f47d5..919874d31 100644
 +    int * red_cnt = nullptr;
 +    // GGML_CUDA_MWR_EXACT=0: the fold's pre-r324 fma-contracted sum (the standalone kernels contract too, one knob)
 +    bool red_contract = false;
++    // RDNA2, mul_mat_vec_q_moe: walk the K-blocks once with the rows of a block side by side instead of one
++    // (row, K-block) item at a time (set by the launch; GGML_CUDA_MOE_ROWS_ABREAST=0: off)
++    bool moe_rows_abreast = false;
 +    // GDN alpha/beta pair in one mmvf launch (ggml_cuda_gate_beta_bf16_try_fuse): rows >= gb_nrows read gb_x2 and
 +    // write gb_dst2; rows below write softplus(v + gb_dt[row]) * gb_a[row].
 +    const void * gb_x2 = nullptr;
@@ -2011,7 +2014,7 @@ index d0a8f47d5..919874d31 100644
  };
  
  struct ggml_cuda_kernel_launch_params {
-@@ -2490,5 +3053,48 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+@@ -2490,5 +3056,48 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
      CUDA_CHECK(cudaGetLastError());
  }
  
@@ -3618,7 +3621,7 @@ index f46f5b1cd..608dde6d5 100644
  
  
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
-index a0482c87e..18250bb4c 100644
+index ce0f4a622..e0778c76b 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cuh
 +++ b/ggml/src/ggml-cuda/fattn-tile.cuh
 @@ -1327,7 +1327,10 @@ static __global__ void flash_attn_tile(
@@ -4036,7 +4039,7 @@ index e7ad53475..44c6bd1c8 100644
 +// (rows of up to 512 elements; dst rows padded to MATRIX_ROW_PADDING are not handled).
 +bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, void * q8_1 = nullptr);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index a3e4d4065..85d1fe6fa 100644
+index a3e4d4065..8ea066fda 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -33,7 +33,10 @@ gated_delta_net_cuda(const float * q,
@@ -4235,6 +4238,13 @@ index a3e4d4065..85d1fe6fa 100644
 +    // `n_rs_batch` keeps its real jobs: it is op param 1 here for the census, the invariant the
 +    // llama_memory_recurrent seq_rm guard checks, and the value the slab's narrow (decode/verify)
 +    // reserve is sized from (`llama_context::verify_batch_width()`).
++    //
++    // What this does NOT claim: a verify batch WIDER than the threshold takes the chunked path, so
++    // its rows are computed with a different reduction order than a W = 1 decode and a greedy
++    // near-tie can flip inside that band.  That is the same documented trade as a verify above 8
++    // rows (`GREEDY-PURITY.md` 11/19) and it is bounded by the draft width the user configured,
++    // not by an unrelated knob.  The state itself is exact: the tail writes the slots, and rs_max
++    // bounds what may be read.
      //
 -    // The alignment is done by giving BOTH paths the SAME call -- chunk the whole batch, exactly
 -    // what K == 1 does -- rather than by sharing a sequential tail.  A batch with more tokens than
@@ -4246,23 +4256,16 @@ index a3e4d4065..85d1fe6fa 100644
 -    // sequential kernel below, which writes the K snapshots the spec rollback actually reads.
 -    // (Verified: over llama-cli draft-mtp and llama-server with --cache-reuse, every partial
 -    // rollback was preceded by a batch of exactly K or fewer tokens.)
-+    // What this does NOT claim: a verify batch WIDER than the threshold takes the chunked path, so
-+    // its rows are computed with a different reduction order than a W = 1 decode and a greedy
-+    // near-tie can flip inside that band.  That is the same documented trade as a verify above 8
-+    // rows (`GREEDY-PURITY.md` 11/19) and it is bounded by the draft width the user configured,
-+    // not by an unrelated knob.  The state itself is exact: the tail writes the slots, and rs_max
-+    // bounds what may be read.
-     //
--    // The threshold must be a constant for K <= 16 or the two paths diverge again on short prompts;
--    // 16 covers K <= 16 (n_max <= 15, including adaptive MTP's recommended n_max = 12).  The floor
--    // at K keeps verify batches sequential for deeper drafts, so those keep the K-dependent
--    // boundary and stay correct-but-not-bit-identical, exactly as before.
 +    // The tail also covers the non-speculator rewind case (server cancel / --cache-reuse into a
 +    // prefill batch) -- without it that case would read an unwritten slot.  Cost stays bounded: D
 +    // tokens per batch, not per token, no extra memory, no extra graph and no ubatch split (which
 +    // measured -13.7 % pp512; see archive/work/rs-rollback-boundary/).  GGML_CUDA_GDN_TAIL=0
 +    // restores whole-batch chunking.
-+    //
+     //
+-    // The threshold must be a constant for K <= 16 or the two paths diverge again on short prompts;
+-    // 16 covers K <= 16 (n_max <= 15, including adaptive MTP's recommended n_max = 12).  The floor
+-    // at K keeps verify batches sequential for deeper drafts, so those keep the K-dependent
+-    // boundary and stay correct-but-not-bit-identical, exactly as before.
 +    // D must be a CONSTANT for K <= 16 or the two paths diverge again on short prompts; 16 covers
 +    // K <= 16 (n_max <= 15, including adaptive MTP's recommended n_max = 12).  K > 16 is only
 +    // reachable with LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0, and then D = K keeps a rollback-able batch at
@@ -4270,7 +4273,7 @@ index a3e4d4065..85d1fe6fa 100644
      //
      // The fused GDN->cpy (cache != nullptr) is still honoured: the chunked kernel writes the new
      // state (slot 0) straight into the cache slot, so the cpy node can be skipped.  n_seqs > 1
-@@ -390,12 +461,17 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -390,12 +461,40 @@ static void ggml_cuda_op_gated_delta_net_impl(
      // async fault inside a launched kernel is NOT caught here and surfaces at the next sync point.
      if (!kda && n_tokens > 1 &&
          (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
@@ -4281,10 +4284,33 @@ index a3e4d4065..85d1fe6fa 100644
 -            // possible verify batch on the sequential kernel, which writes the rollback snapshots.
 -            const int64_t GDN_CHUNKED_MIN_TOKENS = std::max<int64_t>(K > 16 ? (int64_t) K : 16, n_rs_batch);
 +        // read once as a value: a cached getenv() pointer is unsafe on Windows (the CRT buffer is reused)
-+        static const bool chunked_on = [] {
++        // -1 = auto (default), 0 = force sequential, 1 = force chunked
++        static const int chunked_env = [] {
 +            const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
-+            return env == nullptr || strcmp(env, "0") != 0;
++            if (env == nullptr) {
++                return -1;
++            }
++            return strcmp(env, "0") != 0 ? 1 : 0;
 +        }();
++        // RDNA2 ONLY (r334, PR #338 -> folded into block 10): gfx1030 has no BF16 WMMA, so the FP32 chunked
++        // kernel only wins on a low-head long prefill there.  H is the value-head count (nev1) and the state
++        // stride is H * S_v * S_v per sequence, so H * n_seqs is the concurrency the kernel really sees.
++        // Measured on a V620 (Radeon Pro), idle card, sequential / chunked us per call, S_v = 128:
++        //   H=4:  n=64 76/176, n=256 126/150, n=512 299/240, n=1024 589/462   -> chunked above 256 tokens
++        //   H=8:  n=256 147/172, n=512 288/310, n=1024 569/607                -> sequential
++        //   H=4 x 2 seqs: n=512 285/302; H=12: n=512 282/521; H=32: n=512 409/1126
++        //   H=16 with v_repeat=3 (Qwen3.8-27B, H = 48 here): n=512 560/1374   -> sequential
++        // H * n_seqs of 5..7 is unmeasured and takes the sequential kernel.
++        // This does NOT reintroduce the issue-#309 impurity: n_seqs is a property of the batch, not of a
++        // speculator (a draft/verify batch on one sequence keeps n_seqs == 1), and n_rs_batch is not read
++        // here.  What it does do is make a multi-sequence ubatch take the sequential kernel where a
++        // single-sequence one takes chunked -- the same batch-composition split `n_seqs > 1` already has.
++        bool chunked_on = (chunked_env != 0);
++#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
++        if (chunked_env < 0 && GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
++            chunked_on = (H * n_seqs <= 4 && n_tokens > 256);
++        }
++#endif
 +        if (chunked_on) {
 +            // Threshold for the chunked path: a batch above it is chunked on its first
 +            // n_tokens - D tokens and finished by the sequential tail.  D is the snapshot-set
@@ -4294,7 +4320,7 @@ index a3e4d4065..85d1fe6fa 100644
              // GGML_CUDA_GDN_CHUNKED_BF16 / arch selection: the bf16/WMMA chunked kernel is the
              // DEFAULT for S_v == 128 prefill on RDNA3/RDNA4 (opt out with `=0`).  It is
              // near-lossless, NOT bit-exact (bf16 operands, fp32 accumulation, ~1e-5 op NMSE);
-@@ -407,9 +483,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -407,9 +506,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
  #if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
                  const int cc_c = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
                  const bool bf16_rdna_c = GGML_CUDA_CC_IS_RDNA4(cc_c) || GGML_CUDA_CC_IS_RDNA3(cc_c);
@@ -4309,7 +4335,7 @@ index a3e4d4065..85d1fe6fa 100644
                  if (want_bf16_c) {
                      if (GGML_CUDA_CC_IS_RDNA4(cc_c)) {
                          return ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext, n_tokens_limit);
-@@ -422,13 +500,57 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -422,13 +523,57 @@ static void ggml_cuda_op_gated_delta_net_impl(
  
              if (n_seqs == 1) {
                  if (n_tokens > GDN_CHUNKED_MIN_TOKENS) {
@@ -4371,7 +4397,7 @@ index a3e4d4065..85d1fe6fa 100644
                              logged_free = true;
                          }
                          return;
-@@ -469,21 +591,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -469,21 +614,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
          if (keep_rs) {
              launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                  S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
@@ -4397,7 +4423,7 @@ index a3e4d4065..85d1fe6fa 100644
          }
      }
  }
-@@ -496,3 +618,123 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
+@@ -496,3 +641,123 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
          ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
      ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
  }
@@ -20894,10 +20920,10 @@ index 000000000..9cb9f8b8c
 +    }
 diff --git a/ggml/src/ggml-cuda/mmvq-moe.cu b/ggml/src/ggml-cuda/mmvq-moe.cu
 new file mode 100644
-index 000000000..334018588
+index 000000000..b9781da1b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmvq-moe.cu
-@@ -0,0 +1,471 @@
+@@ -0,0 +1,529 @@
 +#include "mmvq-moe.cuh"
 +#include "mmvq-vecdot.cuh"
 +#include "mmvq.cuh"
@@ -21037,6 +21063,58 @@ index 000000000..334018588
 +    const int n_items    = rows_valid * blocks_per_row_x;
 +    const int n_groups = warp_size / (qi/vdr);
 +    const int kqs      = vdr * (threadIdx.x % (qi/vdr));
++#if defined(RDNA2)
++    // RDNA2: the item loop below costs a divide per (row, K-block) item and keeps one dot product in flight.
++    // Walk the K-blocks with the rows of the block side by side instead.  A thread group g takes the items
++    // it == g (mod n_groups), so in row i it takes the K-blocks kbx == g - i*blocks_per_row_x (mod n_groups), in
++    // rising order: each row's partial sum is built from the same K-blocks in the same order as the item loop
++    // builds it, so the result is bit-identical.  GGML_CUDA_MOE_ROWS_ABREAST=0: off.
++    const bool rows_abreast = fusion.moe_rows_abreast;
++#else
++    constexpr bool rows_abreast = false;
++#endif
++    static_assert((n_groups & (n_groups - 1)) == 0, "the thread group count must be a power of two");
++    if (rows_abreast && blocks_per_row_x % n_groups == 0) {
++        // every row keeps the same K-blocks: one y block serves all rows
++        for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += n_groups) {
++            const int kby = kbx * (qk/QK8_1);
++#pragma unroll
++            for (int i = 0; i < c_rows_per_block; ++i) {
++                if (i < rows_valid) {
++                    tmp[i] += vec_dot_q_cuda(vx_use, &y[kby], kbx_offset + i*stride_row_x_use + kbx, kqs);
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            tmp_gate[i] += vec_dot_q_cuda(vgate_use, &y[kby], kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
++                        }
++                    }
++                }
++            }
++        }
++    } else if (rows_abreast && type != GGML_TYPE_IQ2_XS) {
++        // the group's first K-block shifts from row to row; a row past the last valid one gets none
++        // (IQ2_XS stays on the item loop here: its two items in flight are faster, k=2560 n=1 15.6 vs 16.5 us)
++        const int g = threadIdx.x / (qi/vdr);
++        int kb0[c_rows_per_block];
++#pragma unroll
++        for (int i = 0; i < c_rows_per_block; ++i) {
++            kb0[i] = i < rows_valid ? ((g - i*blocks_per_row_x) & (n_groups - 1)) : blocks_per_row_x;
++        }
++        for (int k0 = 0; k0 < blocks_per_row_x; k0 += n_groups) {
++#pragma unroll
++            for (int i = 0; i < c_rows_per_block; ++i) {
++                const int kbx = kb0[i] + k0;
++                if (kbx < blocks_per_row_x) {
++                    const int kby = kbx * (qk/QK8_1);
++                    tmp[i] += vec_dot_q_cuda(vx_use, &y[kby], kbx_offset + i*stride_row_x_use + kbx, kqs);
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            tmp_gate[i] += vec_dot_q_cuda(vgate_use, &y[kby], kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
++                        }
++                    }
++                }
++            }
++        }
++    } else {
 +    // IQ2_XS is ALU/latency bound here: two items in flight per thread (-9 %); the other types lose from it
 +#pragma unroll type == GGML_TYPE_IQ2_XS ? 2 : 1
 +    for (int it = threadIdx.x / (qi/vdr); it < n_items; it += n_groups) {
@@ -21049,6 +21127,7 @@ index 000000000..334018588
 +                tmp_gate[i] += vec_dot_q_cuda(vgate_use, &y[kby], kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
 +            }
 +        }
++    }
 +    }
 +
 +    ggml_cuda_pdl_lc();
@@ -21311,11 +21390,16 @@ index 000000000..334018588
 +                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
 +                            fusion.red_dst != nullptr;
 +
++    // RDNA2: rows side by side in the kernel's K loop (see mul_mat_vec_q_moe).  GGML_CUDA_MOE_ROWS_ABREAST=0: off.
++    static const bool rows_abreast_on = [] { const char * e = getenv("GGML_CUDA_MOE_ROWS_ABREAST"); return e == nullptr || atoi(e) != 0; }();
++    ggml_cuda_mm_fusion_args_device fusion_k = fusion;
++    fusion_k.moe_rows_abreast = rows_abreast_on && GGML_CUDA_CC_IS_RDNA2(ggml_cuda_info().devices[dev].cc);
++
 +    const auto launch = [&](auto rpb_c, auto fusion_c) {
 +        constexpr int  RPB   = decltype(rpb_c)::value;
 +        constexpr bool CFUSE = decltype(fusion_c)::value;
 +        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, RPB, CFUSE>, launch_params,
-+            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
++            vx, vy, ids, fusion_k, dst, ncols_x, nchannels_y, nrows_x,
 +            stride_row_x, stride_col_y, stride_col_dst,
 +            stride_channel_x, stride_channel_y, stride_channel_dst,
 +            ncols_dst, ids_stride, nchannels_dst,
@@ -24579,7 +24663,7 @@ index e8b5888dc..a753d3e76 100644
  void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m);
 +int  ggml_cuda_norm_rows_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index ca5ba8df9..35ea6c908 100644
+index b9eab34a3..3d045aaeb 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -1,6 +1,7 @@
@@ -24590,7 +24674,7 @@ index ca5ba8df9..35ea6c908 100644
  #include <cstdint>
  
  // RNE f32 -> bf16, bit-identical to mmb.cu's mmb_f2bf (used to emit the HC normalized stream's
-@@ -303,6 +304,57 @@ static __global__ void rms_norm_f32(const T *     x,
+@@ -397,6 +398,57 @@ static __global__ void rms_norm_f32(const T *     x,
      }
  }
  
@@ -24648,7 +24732,7 @@ index ca5ba8df9..35ea6c908 100644
  // rms_norm followed by ggml_scale (build_gdn_l2_norm: the GDN q/k l2 norm).  The norm output is
  // rounded exactly as rms_norm_f32 writes it, and the scale is applied as scale_f32 does
  // (s * v + b), so the result is bit-identical to the two kernels it replaces.
-@@ -1081,6 +1133,39 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
+@@ -1203,6 +1255,39 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
      rms_norm_f32_cuda<true>(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
  }
  
@@ -24688,7 +24772,7 @@ index ca5ba8df9..35ea6c908 100644
  void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
      const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
      float eps = 0.0f;
-@@ -1105,10 +1190,18 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -1227,10 +1312,18 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
      GGML_ASSERT(mul_src->type == GGML_TYPE_F32);
      GGML_ASSERT(eps >= 0.0f);
  
@@ -24709,7 +24793,7 @@ index ca5ba8df9..35ea6c908 100644
  
      const int64_t ne00 = rms_norm_src->ne[0];
      const int64_t ne01 = rms_norm_src->ne[1];
-@@ -1277,11 +1370,78 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -1399,11 +1492,78 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
  
      l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
  }
@@ -27809,7 +27893,7 @@ index a6fac6f8d..d9bd3b56c 100644
      // TODO #135: a load-time guard against a degenerate `-sm tensor` device count.  It refuses (throws) a
      // split whose granularity-rounded per-device share of a HOST-RESIDENT expert table leaves a device with
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index c4c7699a8..e05feffc0 100644
+index c4c7699a8..0aec64f09 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -87,7 +87,13 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
@@ -27965,6 +28049,22 @@ index c4c7699a8..e05feffc0 100644
      // Flash attention perf: head 256 (default-on WMMA) vs 512/320/576 (DKQ != DV).
      // A/B with GGML_CUDA_FA_WMMA_256=0 (forces the tile kernel for head > 128 on RDNA4).
      for (const auto & fa : {std::tuple<int,int,int,int,int>{256, 256, 8, 4, 256},
+@@ -14742,6 +14784,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
++    // The edge of the RDNA2 chunked-prefill gate (GGML_CUDA_GDN_CHUNKED auto: H * n_seqs <= 4 takes the
++    // chunked kernel above 256 tokens, everything else takes the sequential one).  H * n_seqs = 8 and 12
++    // are the shapes that must stand down; 4h x 2 seqs is the n_seqs term.
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 256, 1));  // 8h PP-256
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 512, 1));  // 8h PP-512
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 1024, 1)); // 8h PP-1024
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 512, 1)); // 12h PP-512
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 1024, 1)); // 12h PP-1024
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 2));  // 4h x 2 seqs PP-512
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1, 1, false, true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 1, false, true));
 diff --git a/tests/test-fusion-gate-beta-multiseq.cpp b/tests/test-fusion-gate-beta-multiseq.cpp
 new file mode 100644
 index 000000000..69c0e1420

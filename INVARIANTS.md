@@ -1572,3 +1572,27 @@ Record: `WORKLOG.md` 261121.007, `archive/work/r328-followups/` (§3 rows and `l
   tree uncompilable while the tip compiles is no longer detected by construction (the r305-r307 class); a bisect
   that needs it runs the walker on demand.  Record: `WORKLOG.md` 261121.011, `MANIFESTS.md` gate 5, `AGENTS.md`
   -> *Build the fork*.
+
+
+* **An RDNA2-only change is INVISIBLE to this box's default build, and the narrow `RMS_NORM` is bit-identical by
+  reduction order, not by luck (r334, contributor PR #338 → blocks 05/08/10).**  Three facts, each of which cost a
+  wrong conclusion before it was written down:
+  (1) **`GPU_TARGETS=gfx1201` does not compile the RDNA2 device pass at all.**  `RDNA2` is `#define`d in
+  `ggml-cuda/vendors/hip.h` from `__gfx1030__`, so `#if defined(RDNA2)` code is excluded from every gfx1201 code
+  object — a normal `all` build proves nothing about it (it will happily accept a `#error` inside such a block).  A
+  change that lives in one therefore needs a second configure with `gfx1030` in the target list, and the
+  gate itself is proved by putting a `#error` inside it and checking the two builds disagree (done here for both
+  `norm.cu`'s narrow branch and `mmvq-moe.cu`'s rows-abreast loop).
+  (2) **The one-warp narrow `RMS_NORM` reproduces the wide launch's bits because `block_reduce`'s multi-warp path
+  is a 5-step warp butterfly with `+0` in the upper lanes, not a pairwise tree over the warp sums.**  Warp `w`'s
+  sum lands in lane `w`, lanes `n_warps..31` hold `+0`, and the butterfly over 32 lanes therefore collapses to
+  `(s0+s2)+(s1+s3)` — for 4 warps and for 8 warps (warps 4..7 are exactly `+0` at `ncols <= 128`, and adding
+  `+0` is exact).  Any change to `block_reduce` or `warp_reduce_sum` breaks the identity; so does writing the
+  square as `fmaf(x, x, 0.0f)` instead of `x*x`, because the compiler's contraction into the first butterfly add is
+  part of the order.
+  (3) **The RDNA2 FA tile caps were a workaround for `launch_fattn`'s `GGML_ASSERT(max_blocks_per_sm > 0)`, and
+  that assert is only unreachable while the manual RDNA2 occupancy figure is non-zero.**  `launch_fattn` computes
+  it as `4*waves_per_simd/waves_per_block` (integer division) and only replaces HIP's 0 when its own value is
+  larger, so a kernel wide enough that `4*waves_per_simd < waves_per_block` still aborts.  The caps were removed
+  on the contributor's full `FLASH_ATTN_EXT` suite; that suite, not the removal, is the fact.
+  Record: `WORKLOG.md` 261121.013, `patches/README.md` blocks 05/08/10, `ENVIRONMENT.md` §7.4.
