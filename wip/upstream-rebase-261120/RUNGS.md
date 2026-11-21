@@ -1499,3 +1499,71 @@ the rung's commit id.
    build (`CONTAINERS.md`).
 7. `WORKLOG.md` entry (the release narrative), `patches/README.md` per-block notes, `INVARIANTS.md` for any
    fact the re-base changes, `TODO.md` for anything deferred.
+
+---
+
+# R18 — the release (in progress, 2026-11-21)
+
+Order of work is `NEXT-SESSION-PROMPT.md`; the obligation table is `COLD-START.md` §8.  Steps land here as they
+finish, newest first inside each step.
+
+## R18.2 The per-block ladder (step 2) — **18/18 rungs build the `all` target**
+
+```bash
+./scripts/gate-per-block-build.sh --base 919794500 --tip rebase-r328 --all --jobs 24
+#   ==> result: 18/18 built, 0 failed in 1081s (build dir wiped per commit)
+```
+
+The `--all` profile is the re-base profile (`AGENTS.md` → *Build the fork*): every rung configures fresh with
+`LLAMA_USE_PREBUILT_UI=OFF` and builds **every** target, so the test/example/tool binaries compile in each
+intermediate tree — the claim `--fast` deliberately does not make.  18 minutes rather than the ~35-55 the cost
+note warns about, because the pre-squash ladder had already put these trees in ccache.
+
+**Coherence, at the squashed tip** (`HIP_VISIBLE_DEVICES=0`, `-sm layer`, the §2 arm): `100 chars
+sha=1c5d32ac537d` — identical to every rung, as it must be (the final tree is byte-identical to the pre-squash
+tip).  `scripts/check-gpu-faults.sh --since "20 min ago" --log /tmp/coh-tip.log`: kernel journal clean, log clean.
+
+The block-owned gates follow in R18.3.
+
+## R18.1 The squash (step 4b) — 21 commits → 18, **final tree unchanged**
+
+```
+git rebase -i 919794500      # three `fixup`s, moved next to the block that owns each repair
+```
+
+| repair | was at | folded into | tree effect |
+|---|---|---|---|
+| `3ea8b0212` (R00's `top_k_gather_rows`, D15) | after block 01 | **block 00** (`e46488ed5`) | block 00's and block 01's trees gain the +32/−2 in `top-k.cu`; **block 02 onward unchanged** (the repair's content already sat below them) |
+| `c3860af1e` (R05's `nb32` → `int64_t`) | after block 05 | **block 05** (`b2818148a`) | only block 05's tree changes (+4/−4 across the four `fattn-*` headers); block 06 onward unchanged |
+| `dd4fa5e22` (R16's `-Wsign-compare`) | after `0300` | **block 16** (`808da67a6`) | block 16's and `0300`'s trees gain the one cast; the ladder's final tree is **unchanged** |
+
+**Result: 18 commits** (17 official + `0300`), **tip `8406cbd86`, tree
+`4e222b2ecba3b05e5e35484a328ae3f35842772b`** — byte-identical to the pre-squash tip `dd4fa5e22`, so nothing needs
+re-verifying for correctness.  Every block's own tree was compared against its pre-squash counterpart: the seven
+`same`s and the four intended `DIFF`s are exactly the rows above (`git rev-parse <c>^{tree}` per block).  The old
+chain is kept as branch **`backup-pre-squash-r328`** (`dd4fa5e22`) until the fork refresh, for the record.
+
+Because `scripts/apply-all.sh` renders commits deterministically from the patch series' author/date stamps, **the
+SHA map below is superseded by whatever `apply-all.sh` prints at R18.5** — the *trees* are the contract
+(`AGENTS.md` → *Pushing policy*), and they are unchanged.
+
+| block | pre-squash | post-squash |
+|---|---|---|
+| 00 | `4cba0ad32` | `e46488ed5` |
+| 01 | `14a0414bb` | `65a855dad` |
+| 02 | `3941bad4e` | `ae9ca2f9d` |
+| 03 | `e612388ba` | `3cab012de` |
+| 04 | `768d27561` | `be26fea43` |
+| 05 | `1c9bfa37c` | `b2818148a` |
+| 06 | `ee377ec45` | `aa8eae2a8` |
+| 07 | `1435e7873` | `9b0363249` |
+| 08 | `510769147` | `72518501d` |
+| 09 | `24cecfb51` | `ffd0f2216` |
+| 10 | `f5a090a31` | `7b88cb68b` |
+| 11 | `dbe4fdd40` | `e3ddba37c` |
+| 12 | `a9d8e1a96` | `a878c9591` |
+| 13 | `81523fda6` | `e96da1748` |
+| 14 | `9f8c11782` | `9d0768a49` |
+| 15 | `07b293a7b` | `27dba0d2b` |
+| 16 | `71ce858ca` | `808da67a6` |
+| `0300` | `ee502d397` | `8406cbd86` |

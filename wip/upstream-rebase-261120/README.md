@@ -2,9 +2,10 @@
 
 **Status: LADDER COMPLETE — all 18 blocks landed (R00-R17); nothing is delivery yet; R18 (the release) is next.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
-the final rung (R18).  Ladder branch `rebase-r328` = `dd4fa5e22` (tree
-`4e222b2ecba3b05e5e35484a328ae3f35842772b`): all 18 blocks plus three rung repairs (R00's top-k gather, R05's `nb32`
-widening, R16's `dd4fa5e22` sign-compare) — all three wait for the R18 squash; every rung is green on build + coherence and each has one entry in [`RUNGS.md`](RUNGS.md).
+the final rung (R18).  Ladder branch `rebase-r328` = `8406cbd86` (tree
+`4e222b2ecba3b05e5e35484a328ae3f35842772b`): all 18 blocks, the three rung repairs squashed into their owning
+blocks at R18 (`RUNGS.md` §R18.1, final tree unchanged); every rung is green on build + coherence and each has
+one entry in [`RUNGS.md`](RUNGS.md).
 **The one known-red is closed at R00** (repair `3ea8b0212`): the delivery's required VMM pool refuses
 upstream's strided 2-D indexer top-k copy, and it reproduces on the pristine base with *only* the `#30542`
 revert, so the fix (block 10's `top_k_gather_rows`, moved down — [`DECISIONS.md`](DECISIONS.md) D15) lives in

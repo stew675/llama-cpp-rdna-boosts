@@ -1,8 +1,46 @@
+## 261121.002 (r328 prep) -- the ladder squashes to 18 commits (final tree unchanged), and the rebase sequence now names the two other arches (`halo`, `fingon`)
+
+**No delivery patch changed, no block created, split or renumbered, no release.**  R18's step 4b and the
+three-arch validation plan.  Ladder detail: `wip/upstream-rebase-261120/RUNGS.md` §R18.1 and
+[`REMOTE-VALIDATION.md`](wip/upstream-rebase-261120/REMOTE-VALIDATION.md).
+
+### 1. The squash — 21 commits to 18, and the final tree is byte-identical
+
+`git rebase -i 919794500` with three `fixup`s, each repair moved next to the block that owns it: R00's
+`3ea8b0212` (the top-k gather, D15) into **block 00**, R05's `c3860af1e` (`nb32` → `int64_t`) into **block 05**,
+R16's `dd4fa5e22` (`-Wsign-compare`) into **block 16**.  Tip `dd4fa5e22` → **`8406cbd86`**, tree
+**`4e222b2ecba3b05e5e35484a328ae3f35842772b` unchanged**, so no rung needs re-verifying; the old chain is kept
+as branch `backup-pre-squash-r328`.
+
+The per-block trees were compared one by one, and the pattern is the useful part: only the *owning* block's tree
+changes (block 00 and 01 for the top-k fold, block 05, block 16 and `0300`), because each repair's content already
+sat below every later block in the pre-squash chain.  The full old→new SHA map is in `RUNGS.md` §R18.1; it is
+superseded by whatever `apply-all.sh` prints at R18.5, since the *trees* are the contract.
+
+### 2. The other two arches are now part of the sequence (`TODO` #354)
+
+The ladder was climbed on **gfx1201 only**, while the scope policy covers gfx1151 and gfx1100 too — and two of
+the delivery's code paths are unreachable on gfx1201 at all: block 03's **gfx11 GDN kernel file** (a separate
+file the gfx12 dispatch never launches) and **block 15's APU tier** (inert on a discrete GPU *by design*).  Both
+boxes are reachable and were inventoried today:
+
+| | `halo` | `fingon` |
+|---|---|---|
+| GPU | gfx1151 APU (RDNA3_5), 123 GiB unified | RX 7900 XTX, gfx1100 (RDNA3), 24.5 GiB |
+| checkout | `~/llama.cpp` on `rdna-boosts` = **r327** → its own attribution oracle | same |
+| models that decide gates | **the 122B-A10B Q8_0 (>RAM)** for `gate-prefill-server-slots.sh`, Flash-Next, 35B-A3B | **`GSQ-IQ3_XXS`** for `gate-hc-fusions.sh`, 27B UD-IQ3_S (the dense MMB arm), 35B-A3B Q8_0 |
+| owns | block 15's APU gates (`gate-uma-experts.sh`, the two-slot `>RAM` server arm), gfx11/RDNA3_5 paths | the arch oracle (op matrix, `test-llama-archs`), the **gfx11 GDN kernel file**, a second data point for R11.2's red `gate-hc-fusions`, the pooled-MoE shape on a 24 GiB card |
+
+Neither box has phi-4, so `gate-node-budget.sh` stays owed on all three.  The sessions run **after R18**, one per
+box, so both apply the *released* patch set on a clean `919794500` — which re-verifies `apply-all.sh` +
+`release.json` on two more machines, the method the r138 record used.  Flow, per-box arm list and the rules that
+bite there: `wip/upstream-rebase-261120/REMOTE-VALIDATION.md`; the handle is `TODO` #354.
+
 ## 261121.001 (r328 prep) -- the libr4d/radiance Apache-2.0 attribution lands, `TODO` #352's container UI stage moves to `ui/apps/chat`, and an offered patch set is assessed (two repo-level fixes; no delivery patch changed)
 
-**No delivery patch changed, no block created, split or renumbered, no release.**  The r328 ladder is still
-`dd4fa5e22` (tree `4e222b2ecba3b05e5e35484a328ae3f35842772b`) and `patches/`, `release.json`,
-`rdna-boosts-all.patch` and the fork remain untouched until R18.  This entry covers two external inputs that
+**No delivery patch changed, no block created, split or renumbered, no release.**  The r328 ladder's tree is
+`4e222b2ecba3b05e5e35484a328ae3f35842772b` (squashed to 18 commits the same day: tip `8406cbd86`, `261121.002`
+below), and `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork remain untouched until R18.  This entry covers two external inputs that
 arrived while R18 was being set up; the assessment lives in
 [`wip/upstream-rebase-261120/EXTERNAL-ANALYSES.md`](wip/upstream-rebase-261120/EXTERNAL-ANALYSES.md).
 

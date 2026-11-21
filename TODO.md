@@ -49,6 +49,7 @@ left in this file.  The r236 re-base
 | **351** | does upstream now support `-sm tensor` for `flint`?  If it does, the temporary block `0300` (`-sm relaxed-tensor`) can be dropped -- upstream's per-architecture refusal is the only reason the block exists | delivery structure / temporary block `0300` | **OPEN** -- re-tested at R17 of the r328 re-base (`wip/upstream-rebase-261120/`), on the real model this box has; §351 |
 | **352** | `.devops/rdna-rocm.Dockerfile`'s UI `web` stage targeted the pre-r328 `tools/ui/` layout; the file now builds `ui/apps/chat` (+ `ui/lib/ui`, `ui/lib/voice`) and copies `ui/apps/chat/dist`, matching llama.cpp `919794500` — what is left is the **r328 image smoke build** that proves the embedded UI is served | release tooling (container build) | **OPEN (fixed at R18, unverified)** -- the Dockerfile change is made; the image is built off-host after the r328 tag, and `TODO` #352's own verification (`--targets server`, `index.html` served) runs with it; §352 |
 | **353** | no Inkling-2 model loads at `919794500`: the looped family needs support this snapshot lacks — Unsloth's file is `arch = inkling2` with 24 physical blocks but `block_count = 48` + `num_loops = 3` (the loader has no loop, so it asks for `blk.24.*`), and **GGML's reference file is `arch = inkling2_loop`, which this tree does not know at all** | upstream model support / validation target | **OPEN (waiting on upstream)** -- the pristine base repeats both failures and r327 knows neither arch, so no delivery change is involved; it blocks the only local validation of upstream's per-head FA mask (`#32217`) and of the `nb32` widening; §353 |
+| **354** | the r328 set is gated on **gfx1201 only**: the delivery's scope policy covers three arches, and the gfx11 chunked-GDN kernel file is code gfx1201 never runs; block 15's APU claims are undecidable there too (the GTT store is inert on a discrete GPU by design) | validation / three-arch coverage | **OPEN** -- one session each on `ssh halo` (gfx1151 APU) and `ssh fingon` (gfx1100), after R18, applying the **released** set; the 122B-A10B `>RAM` model for `gate-prefill-server-slots.sh` is on `halo`; §354 |
 
 ## Handle numbering
 
@@ -306,6 +307,29 @@ tensors, graph, the loop gates and `attn_res`), which is a feature campaign with
 `inkling2_loop.block_count = 24`, `expert_count = 128`, `expert_used_count = 8`, `head_count` 24 /
 `head_count_kv` 8.  The `dspark-Inkling-2-Mini-Q8_0.gguf` draft and `mmproj-F16.gguf` beside the Unsloth file
 load nothing either, for the same reason.
+
+## 354. The r328 set is gated on gfx1201 only — gfx1151 and gfx1100 are owed, one session each
+
+**Open** (2026-11-21, flagged by the maintainer while R18 was being set up).  The whole r328 ladder was climbed
+on **gfx1201**, and this repo's scope policy covers three arches: gfx1201 (RDNA4), gfx1151 (RDNA3_5) and gfx1100
+(RDNA3).  Two of the delivery's code paths are unreachable on the primary box at all:
+
+* **block 03's gfx11 file** (`gated_delta_net_chunked_bf16_gfx11.cu`) is a separate kernel file the gfx12 dispatch
+  never launches, so no gfx1201 run exercises it;
+* **block 15's APU tier** is inert on a discrete GPU *by design* (`prop.integrated` gates its hooks,
+  `RUNGS.md` §R15.2), so `gate-uma-experts.sh`'s census arms and `gate-prefill-server-slots.sh` cannot be run
+  here — and the `>RAM` 122B-A10B Q8_0 that the latter needs is on `halo`, not here.
+
+Both boxes are reachable (`ssh halo` = gfx1151 APU, 123 GiB unified; `ssh fingon` = gfx1100, 24.5 GiB), each has
+the delivery repo + a llama.cpp checkout sitting on **r327** (so it is its own attribution oracle), `/llm/models`,
+`~/bin/build-llama-rocm` and a warm ccache.  `halo` also has Flash-Next and the 122B; `fingon` has the
+`GSQ-IQ3_XXS` class `gate-hc-fusions.sh` uses, and the 27B UD-IQ3_S dense-MMB arm.  **Neither box has phi-4**, so
+`gate-node-budget.sh` stays owed everywhere.
+
+**The two sessions run after R18, not as rungs:** they apply the *released* patch set on a clean `919794500`,
+which re-verifies `scripts/apply-all.sh` + `release.json` on two more machines (the r138 record's method).  Flow,
+inventory, the per-box arm list and the rules that bite there: `wip/upstream-rebase-261120/REMOTE-VALIDATION.md`.
+A finding that would change a block stops and asks first.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

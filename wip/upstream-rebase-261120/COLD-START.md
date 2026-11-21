@@ -23,16 +23,17 @@ Nothing in `patches/`, `release.json`, `rdna-boosts-all.patch` or the fork is to
 cd ~/llama.cpp && git status --short && git branch --show-current && git log --oneline -1
 ```
 
-Expect: **clean**, branch `rebase-r328`, `dd4fa5e22 rdna-boosts: R16 repair: ...` (tree
-`4e222b2ecba3b05e5e35484a328ae3f35842772b`).  The ladder is **complete**: 18 block commits (`0000`..`0016` +
+Expect: **clean**, branch `rebase-r328`, `8406cbd86 rdna-boosts: block 0300: ...` (tree
+`4e222b2ecba3b05e5e35484a328ae3f35842772b`) — **18 commits**, the three rung repairs already squashed
+(`RUNGS.md` §R18.1).  The ladder is **complete**: 18 block commits (`0000`..`0016` +
 `0300`) plus two rung repairs.
 
 | item | value |
 |---|---|
 | rungs landed | **R00 … R17 — all 18 blocks**, 2026-11-20, + 2 rung repairs |
-| ladder tip | **`dd4fa5e22`**, tree `4e222b2ecba3b05e5e35484a328ae3f35842772b` (last block commit `ee502d397`, tree `86780474f4…`; the repair only casts a comparison in block 16) |
+| ladder tip | **`8406cbd86`** (post-squash), tree `4e222b2ecba3b05e5e35484a328ae3f35842772b` — byte-identical to the pre-squash tip `dd4fa5e22` |
 | next | **R18 — the release**, not a rung (see `RUNGS.md` R18 + §8 below) |
-| outstanding repairs to squash at R18 | **three**: R00's `3ea8b0212` (the VMM top-k workaround, D15), R05's `c3860af1e` (`nb32` → `int64_t`), R16's `dd4fa5e22` (`-Wsign-compare`).  21 commits = 18 blocks + 3 repairs |
+| repairs | **squashed 2026-11-21** (`RUNGS.md` §R18.1): R00's `3ea8b0212` → block 00, R05's `c3860af1e` → block 05, R16's `dd4fa5e22` → block 16.  18 commits = the 17 official blocks + `0300`, final tree unchanged |
 | delivery repo | docs-only commits so far (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched until R18) |
 | new fork point | `919794500` |
 | build | `cd ~/llama.cpp && ~/bin/build-llama-rocm`, then `cmake --build build-rocm -j 24` for the per-rung loop (`build-rocm`: `GGML_HIP_NO_VMM=OFF`, `GGML_CUDA_FA_QUANTS` includes `iq4_nl-iq4_nl`, `LLAMA_USE_PREBUILT_UI=OFF`) |
@@ -134,7 +135,7 @@ Note: **no `-lv`** on a text arm (it corrupts the stream). A census arm is a sep
 * **R16** (`71ce858ca` + repair `dd4fa5e22`) — server prompt admission: fair share, `-ib`, skew, duty cycle.
   `gate-prefill-fairness` PASS on dense / `draft-mtp` / streamed-host-expert shapes plus `--self-test`, and
   `gate-prefill-duty` PASS dense and with `draft-mtp`.
-* **R17** (`ee502d397`, ladder tip `dd4fa5e22`) — block `0300`.  **`TODO` #351 is answered: `0300` cannot be
+* **R17** (`ee502d397`; post-squash `8406cbd86`) — block `0300`.  **`TODO` #351 is answered: `0300` cannot be
   dropped** — flint still refuses `-sm tensor` at this base with the block's own message, while
   `-sm relaxed-tensor` is byte-identical to `-sm layer` (`8ec5510e801e`) and a non-amax arch is unchanged
   (`86b7f9b5aa80` both ways).
@@ -168,12 +169,13 @@ decision: `DECISIONS.md` D17; rung log: `RUNGS.md` §R12.4.  What a later sessio
 | **R10.3** | the host-expert arena arm's decode (54.4 → 20.4 t/s at R10) | **CLOSED at R15**: 51.2 / 49.9 / 49.2 t/s, median 49.9, against r327's 49.7, text `86b7f9b5aa80`.  Nothing to fix — record it as closed |
 | **R11.2** | `gate-hc-fusions.sh` **still RED at the completed tree, with the R11 numbers exactly** (`mix_op` `3f049f67781c`, `dsv4_pre_op`/`ops_no_post` `c8db61d5dcc8`, `dsv4_post_op`/`all_ops` `6a102dbc62d6`, chain `a512ee68c4b3`) | **a maintainer decision before shipping**: the HC chain itself moved with the re-base (not a later-block interaction), so either the planted anchors are re-anchored arm by arm, or the fused mixer does **not** ship default-on.  Nothing else in the gate is red (no fault, combine op exact) |
 | **R06.2 (routed half)** | the forced routed MMB arm (`GGML_CUDA_MMB_TYPES=q8_0 GGML_CUDA_MMB_ROUTED=1`, 35B-A3B) still aborts on the pool LIFO assert where r327 reads `86b7f9b5aa80` | an A/B override, never a shipped default (RDNA4: `routed=0`).  Owed as a measurement, not a blocker |
-| **block 15's APU gates** | `gate-uma-experts.sh` (17/17 arms text-identical but its census arms cannot fire on gfx1201) and `gate-prefill-server-slots.sh` (needs the >RAM 122B model) | **owed on the `halo` (gfx1151) box** — the discrete side is `gate-host-pool.sh`, 59/59 PASS.  r328 may ship with this recorded as an APU-unvalidated state (`AGENTS.md` allows a documented unvalidated state) |
-| **`gate-node-budget.sh`** | needs phi-4's tight shape; **no phi-4 on this box**, and the only candidate (`Inkling-2-Mini`) fails to load on the pristine base too (`blk.24.attn_q.weight`) | owed at R18 (fetch phi-4 IQ4_XS, or accept it as a documented gap) |
+| **block 15's APU gates** | `gate-uma-experts.sh` (17/17 arms text-identical but its census arms cannot fire on gfx1201) and `gate-prefill-server-slots.sh` (needs the >RAM 122B model) | **owed on the `halo` (gfx1151) box** — the discrete side is `gate-host-pool.sh`, 59/59 PASS.  The 122B-A10B Q8_0 **is on `halo`**, so the `>RAM` shape is not missing, only mis-located: the gate belongs on the box where the GTT store is not inert.  r328 may ship with this recorded as an APU-unvalidated state (`AGENTS.md` allows a documented unvalidated state).  Flow: [`REMOTE-VALIDATION.md`](REMOTE-VALIDATION.md) |
+| **gfx1151 + gfx1100 arch validation** | the whole ladder was climbed on **gfx1201 only**; the delivery's scope policy covers three arches, and the gfx11 chunked-GDN kernel file (`gated_delta_net_chunked_bf16_gfx11.cu`) is code gfx1201 **never runs** | **owed: one session per box, after R18** — `ssh halo` (gfx1151 APU) and `ssh fingon` (gfx1100), both reachable, both carrying r327 as their own attribution oracle.  Inventory, what each box owns and the exact flow: [`REMOTE-VALIDATION.md`](REMOTE-VALIDATION.md).  They apply the **released** set, which also re-verifies `apply-all.sh` + `release.json` on two more machines (what r138 did) |
+| **`gate-node-budget.sh`** | needs phi-4's tight shape; **no phi-4 on this box**, and the only candidate (`Inkling-2-Mini`) fails to load on the pristine base too (`blk.24.attn_q.weight`) — *and none on `halo` or `fingon` either* | owed at R18 (fetch phi-4 IQ4_XS, or accept it as a documented gap) |
 | **`gate-spec-align.sh` / `gate-spec-ckpt-device.sh` / `gate-spec-width-band.sh`** | block 12/14 speculator paths | **not yet run on the completed tree** — R18's gate sweep |
 | **the prefill-logit base** | `gate-seqpar.sh --record` refreshed it at R12, i.e. on an **intermediate** tree | **R18 must `--record` again on the final tree**, then run the gate |
 | **`-Wdeprecated-declarations`** | `tests/test-logits-width-probe.cpp` (4), `tests/test-mtp-draft-vocab.cpp` (3) still use `llama_batch_init`/`llama_decode` | cosmetic; a `TODO` (D6's ext-batch migration of two test TUs), never a blocker |
-| **repairs to squash** | R00 `3ea8b0212` (D15's VMM top-k), R05 `c3860af1e` (`nb32` widening), R16 `dd4fa5e22` (sign-compare) | R18 step 4b |
+| ~~repairs to squash~~ | **DONE** 2026-11-21 (`RUNGS.md` §R18.1) — all three folded, final tree unchanged | R18 step 4b |
 | **R18 (delivery repo)** | `TODO` #352 (container `web` stage), regenerate the generated docs + assert no drift, the full quant-coherence + QSA section E, `gate-norm-rows-alias.sh`, `MMB_J_MAX=8`'s floor, `make-patches.sh` / `make-release.sh` / `validate-set.sh`, `fork-refresh.sh --build --gates --push`, the worker container build, the `WORKLOG.md` release entry | see `RUNGS.md` R18 |
 
 ## §9 Recipes
@@ -213,7 +215,7 @@ only.
 | R12 (landed) | `RUNGS.md` §R12; its evidence patch is `r12-wip/r12-resolved-but-unbuildable.diff` (historical) |
 | R11.2's open decision | `RUNGS.md` §R11.2 (the anchors) + the ladder-complete block at the end of `RUNGS.md` |
 | the DFlash decision + its numbers | `DECISIONS.md` D17, `benchmarks/2026-11-20-r328-r12-dflash-merge.md` |
-| the ladder's tip | `dd4fa5e22`, tree `4e222b2ecba3b05e5e35484a328ae3f35842772b` (block commit `ee502d397`) |
+| the ladder's tip | `8406cbd86`, tree `4e222b2ecba3b05e5e35484a328ae3f35842772b` (pre-squash `dd4fa5e22`, kept as `backup-pre-squash-r328`; block `0300`) |
 | the R18 gate sweep's cost model | `MANIFESTS.md` → Release gates (gate 5) and `scripts/gate-per-block-build.sh`'s header |
 | the delivery's DFlash2 record | `archive/work/qwen4exp-dflash2/README.md`, `archive/work/dflash2-draft-sched2/README.md` |
 | env knobs (incl. `LLAMA_DFLASH_*`) | `~/llama-cpp-rdna-boosts/ENVIRONMENT.md` |

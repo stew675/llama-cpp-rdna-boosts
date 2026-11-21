@@ -3,8 +3,9 @@
 > Do the r328 release from the completed ladder in `~/llama-cpp-rdna-boosts/wip/upstream-rebase-261120/`.
 >
 > **First, read `COLD-START.md` top to bottom**, then verify its state: `cd ~/llama.cpp && git status --short &&
-> git branch --show-current && git log --oneline -1` — expect clean, `rebase-r328`, `dd4fa5e22`, tree
-> `4e222b2ecba3b05e5e35484a328ae3f35842772b`.  All 18 blocks (R00-R17) are landed and each rung's log is in
+> git branch --show-current && git log --oneline -1` — expect clean, `rebase-r328`, `8406cbd86`, tree
+> `4e222b2ecba3b05e5e35484a328ae3f35842772b`, **18 commits** (the three rung repairs are squashed, `RUNGS.md`
+> §R18.1).  All 18 blocks (R00-R17) are landed and each rung's log is in
 > `RUNGS.md`; the release checklist is `RUNGS.md` → R18 and the pre-release obligation table is
 > `COLD-START.md` §8.
 >
@@ -19,9 +20,9 @@
 >    discrete side is green (`gate-host-pool.sh` 59/59).  Ship with that recorded as a documented
 >    unvalidated state, or run them on the `halo` (gfx1151) box first.
 >
-> **R18's order of work** (`RUNGS.md` R18 is the contract): `TODO` #352 (the container `web` stage moved to
-> `ui/apps/chat`) → squash the three rung repairs into their blocks (R00's `3ea8b0212`, R05's `c3860af1e`, R16's `dd4fa5e22`) →
-> `scripts/gate-per-block-build.sh --all` + `scripts/check-gpu-faults.sh` → the block-owned gates the re-base
+> **R18's order of work** (`RUNGS.md` R18 is the contract).  **Already done 2026-11-21:** `TODO` #352 (the
+> container `web` stage → `ui/apps/chat`) and the squash of the three rung repairs (`RUNGS.md` §R18.1).  Left: 
+> `scripts/gate-per-block-build.sh --base 919794500 --tip rebase-r328 --all` (running) + `scripts/check-gpu-faults.sh` → the block-owned gates the re-base
 > touched, including the ones R12-R17 did not run (`gate-spec-align.sh`, `gate-spec-ckpt-device.sh`,
 > `gate-spec-width-band.sh`, `gate-norm-rows-alias.sh`, and `gate-node-budget.sh` **if a phi-4 file is fetched** —
 > it is not on this box) → `scripts/gate-prefill-logits.sh --record` on the **final** tree, then the gate itself
