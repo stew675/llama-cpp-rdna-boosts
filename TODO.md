@@ -298,8 +298,10 @@ as a per-head-mask probe.
 (`RUNGS.md` R05.3 item 1).  Without a loadable model of this class, "the type is correct" rests on matching
 upstream's change, not on a run.
 
-**Re-entry condition.**  A later upstream snapshot that knows `inkling2_loop` (and/or implements the loop in
-`inkling2`) — then re-test **both** files and run the per-head-mask arms.  Porting it ourselves is **not** a
+**Re-entry condition: upstream PR [#32695](https://github.com/ggml-org/llama.cpp/pull/32695) — unmerged as of
+2026-11-20.**  That PR is the Inkling-2 support both files need; the maintainer confirmed it by digging into the
+model pages (`TODO` #353, 2026-11-20).  When it merges, take it at the next re-base and then re-test **both**
+files and run the per-head-mask arms.  Porting it ourselves is **not** a
 re-base activity: the reference model is a different arch, so it means writing a whole model class (hparams,
 tensors, graph, the loop gates and `attn_res`), which is a feature campaign with its own gates, not a rung.
 
