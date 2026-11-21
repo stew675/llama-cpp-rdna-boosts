@@ -1,8 +1,8 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: OPEN — 8 of 18 rungs climbed (R00-R07) on 2026-11-21. Nothing is delivery yet.**
+**Status: OPEN — 9 of 18 rungs climbed (R00-R08) on 2026-11-21. Nothing is delivery yet.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
-the final rung (R18).  Ladder branch `rebase-r328` = `1435e7873` (tree `d3b004581`): R00..R07 plus two rung
+the final rung (R18).  Ladder branch `rebase-r328` = `510769147` (tree `2ed6cb541`): R00..R08 plus two rung
 repairs (R00's top-k gather, R05's `nb32` widening); every rung is green on build + coherence and each has one
 entry in [`RUNGS.md`](RUNGS.md).
 **The one known-red is closed at R00** (repair `3ea8b0212`): the delivery's required VMM pool refuses
@@ -27,9 +27,13 @@ too: both conflicts were in `mmvq.cu` and both unions (upstream's Jetson-`ORIN` 
 RDNA2-`NAVI21` id, and the two `calc_nwarps` special cases side by side), the RDNA3_5 `ne11` gate is adopted as a
 dispatch threshold rather than a competitor to the delivery's VDR tables, and D11's knobs came out "mixed, per
 knob" as predicted: the grid-stall pad is +1.37 % pp2048 with identical text, while capping the MMQ tile width
-(`MMQ_J_MAX=64`) costs 15.3 % — so the delivery's own cap stays at its default.  Next rung: **R08** (block 08,
-narrow-row norm + `GGML_CUDA_DISABLE_NORM_ROWS`, the worst conflict ratio of the climb — 9 paths, and **D4**
-opens there).  Target: the next
+(`MMQ_J_MAX=64`) costs 15.3 % — so the delivery's own cap stays at its default.  R08 is done, and it was the
+climb's worst rung: 8 conflicted files / 13 regions, **D4 resolved as MERGE without a choice** (the delivery's
+narrow-row matcher already sits ~1000 lines ahead of upstream's generic norm branches, and `#32454` adds the
+layer-norm variant the delivery never claims), plus four forced fixes — including an **auto-merge artifact**
+where upstream's `force_tiling=true` landed in the delivery's `has_gate` template slot and would have
+mis-dispatched silently (`RUNGS.md` R08.3).  Next rung: **R09** (block 09, the host-expert tier — **D8**/**D9**,
+and the 136-commit exposure the conflict map flags as the climb's highest).  Target: the next
 release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 

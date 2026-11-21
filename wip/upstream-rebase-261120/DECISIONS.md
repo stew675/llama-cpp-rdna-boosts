@@ -135,7 +135,7 @@ lands on the same assertion (`src0 F32 -> dst F16 **or BF16**`) in `rope.cu`.
 
 ---
 
-## D4 — `#32454` CUDA NORM + MUL (+ ADD) fusion vs block 08's `norm-gated.cu`  ·  **OPEN**
+## D4 — `#32454` CUDA NORM + MUL (+ ADD) fusion vs block 08's `norm-gated.cu`  ·  **RESOLVED at R08: MERGE — additive, no precedence change, nothing dropped**
 
 **Claim.** Upstream now ships a NORM+MUL(+ADD) fusion in `norm.cu` + a `ggml-cuda.cu` dispatch decision.
 Block 08 ships `norm-gated.cu` — a narrow-row (ncols ≤ 256) wave-per-row RMS norm with an optional sigmoid
@@ -162,6 +162,24 @@ delivery's fusion dispatcher (block 10) still owns the decision.
 3. Drop upstream's fusion on the narrow-row path only.
 
 Measured at R08 before any deletion, with `GGML_CUDA_DISABLE_NORM_ROWS=0/1` and the prefill-logit gate.
+
+**RESOLUTION (R08, 2026-11-21) — option 1, and it was already the shipped arrangement.**  The question turned
+out to be answerable from the r327 tree rather than by choosing:
+
+- The delivery's matcher `ggml_cuda_norm_rows_try_fuse()` is called **~1000 lines ahead** of every generic
+  `ggml_cuda_can_fuse(RMS_NORM, MUL[, ADD])` branch in `ggml-cuda-try-fuse.cu` (line 2199 vs 3314/3319), so
+  where it matches it wins and upstream's branch is the fall-through — exactly option 1, shipped.
+- The claims are disjoint: both delivery matchers bail on `rms->op != GGML_OP_RMS_NORM` and require narrow rows
+  (ncols ≤ 256, ≥ 4096 rows, F32, single-use); `#32454` adds the **layer-norm** `GGML_OP_NORM` variant (never
+  claimed by the delivery) plus a `mul`/`add` epilogue on the general kernel.  Nothing was deleted.
+- At R08 the delivery's matcher is not reachable at all (its dispatch lives in block 10's TU), which is
+  measurable: `GGML_CUDA_DISABLE_NORM_ROWS=1` changes neither the text (`1c5d32ac537d` either way) nor the rate
+  (7409.28 / 7388.04 pp2048, inside noise) on the R08 tree, while the fusion surface as a whole is worth
+  +5.4 % pp2048 / +18.7 % tg128 (`GGML_CUDA_DISABLE_FUSION=1`, identical text).
+
+**Obligation (R10):** block 10 must place the matcher **ahead** of upstream's generic norm branches in
+`ggml-cuda-try-fuse.cu` — that position *is* this resolution — and `scripts/gate-norm-rows-alias.sh` at R18 must
+show both the narrow-row kernel and upstream's fused `NORM`+`MUL` still firing.
 
 ---
 

@@ -39,7 +39,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | R04 | 04 | `cfe40b5f9` | 2 | **D3 (resolved: union + drop upstream's guard)** | **DONE 2026-11-20** — `768d27561`, tree `0866d4229`; 7 rope arms; fusion worth +5.8 % pp / +16.5 % tg at bf16 KV, identical text; ROPE 515/515 || R05 | 05 | `7362b5958` | 7 (22 regions) | **D16 — decided: the delivery's iteration model wins** | **DONE 2026-11-20** — `1c9bfa37c`, tree `13683655d`; FA op matrix 7428/0; native q8_0 K/V +5.6 % decode; rotation not carried, verified absent |
 | R06 | 06 | `f0564df7d` | 2 (2 regions) | D11 | **DONE 2026-11-21** — `ee377ec45`, tree `b5dc56996`; both conflicts are unions (upstream's few-row MMQ keeps precedence, MMB follows; `expert_bounds` re-ported onto the R00 store helper); coherence `1c5d32ac537d`; MUL_MAT_ID 1078/0 (16 dup); MMB default +0.33 % pp2048 / +0.62 % pp16384, MMF32 +0.9 %/+1.0 %; **finding: block 06's MMB cache/slot buffers are pool-unsafe until block 10's `pool_stack` (R06.2)** |
 | R07 | 07 | `f5bdbefda` | 1 (2 regions) | D11 | **DONE 2026-11-21** — `1435e7873`, tree `d3b004581`; both conflicts in `mmvq.cu` are unions (enum `ORIN` + `NAVI21`, `calc_nwarps` both special cases); upstream's RDNA3_5 `ne11` gate adopted (dispatch threshold, not an alternative to our VDR tables, unreachable on gfx1201); coherence `1c5d32ac537d`; MUL_MAT (q6_K/q8_0/q1_0/iq4_xs) 335/0; 27B Q6_K pp2048 1154.5 — the delivery's `MMQ_J_MAX` cap only hurts (64 → 977.5), the grid pad is +1.4 % with identical text |
-| R08 | 08 | `fe283f27c` | 9 | **D4**, D3, D11 | not started |
+| R08 | 08 | `fe283f27c` | 8 (13 regions) | **D4 (resolved: MERGE, no precedence change)**, D3, D11 | **DONE 2026-11-21** — `510769147`, tree `2ed6cb541`; repair list in R08.3 (5 raw warp-mask sites in block 08's own code, the `k_set_rows_q8_0_group` F32-source gate, a `force_tiling`→`has_gate` template-slot artifact, a lost `#if` guard); coherence `1c5d32ac537d` on the default and on all three kill switches; NORM/RMS_NORM/GROUP_NORM/SET_ROWS 368/0; MUL_MAT_ID 1079/0 (16 dup); fusion off costs −5.4 % pp2048 / −18.7 % tg128 with identical text; `DISABLE_NORM_ROWS=1` is **inert** here (its dispatch is block 10's) |
 | R09 | 09 | `123d53419` | 4 | D8, D9 | not started |
 | R10 | 10 | `7bbf540d5` | 9 | D8, D12 + **drop block 10's `top_k` hunk (R00.6 obligation 1)** | not started |
 | R11 | 11 | `61168c60b` | 5 | D9, D13 | not started |
@@ -687,6 +687,97 @@ abort happens at r327** (`bin-r327`, same arm, `mmq.cu:615`) — so it is the kn
 **usable values are ≥ 16** on gfx1201/Q6_K.  Recorded because `ENVIRONMENT.md` documents the knob as "a value
 < 8 is ignored", which is true but unhelpful: 8 is accepted and then asserts.  Not fixed here (that would be a
 delivery change mid-climb); it is a candidate for a one-line clamp at R18 if the maintainer wants it.
+
+---
+
+# R08 — block 08, fused kernels (old-08 fusions + old-13 fused MoE + old-15 PR57/63)  ·  **DONE 2026-11-21** — `510769147`, tree `2ed6cb541`
+
+```
+git cherry-pick fe283f27c        # 38 files, +3.0k/-… (norm-gated 128, gdn-conv, ple-conv, mmvq-rdna new)
+```
+
+The climb's worst rung (9 of 38 paths in the probe; 8 conflicted files, 13 regions) plus **three** fixes the
+compiler forced and **one** auto-merge artifact that would have compiled and mis-dispatched silently.
+
+| exit criterion | result |
+|---|---|
+| conflicts | 8 files / 13 regions (`common.cuh`, `mmf.cuh`, `mmq.cuh`×4, `norm.cu`×2, `quantize.cu`×2, `set-rows.cu`, `topk-moe.cu`×7, `tests/test-backend-ops.cpp`×2) |
+| no markers left | yes; no `TODO(rebase)`; both `#if`/`#endif` guards in `topk-moe.cu` balanced (see R08.3) |
+| build | green, `all` targets, 0 errors, **0** warnings in the touch-path files |
+| coherence 4B | **`100 chars sha=1c5d32ac537d`** — unchanged, and **identical** with `GGML_CUDA_DISABLE_FUSION=1`, `GGML_CUDA_DISABLE_NORM_ROWS=1` and `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1` |
+| `test-backend-ops -o NORM,RMS_NORM,GROUP_NORM,SET_ROWS` | **368 OK / 0 FAIL** — the norm epilogue union and the `SET_ROWS` q8_0 group kernel |
+| `test-backend-ops -o MUL_MAT_ID` | **1079 OK / 0 FAIL**, 16 `dup=1` |
+| the block's own surface | 4B Q8_0, `llama-bench -p 2048 -n 128 -r 3`: default **7409.28 / 97.67**; `DISABLE_FUSION=1` **7027.45 / 82.26** (−5.4 % pp, −18.7 % tg) — the fusion surface is live and worth having, text unchanged |
+| `GGML_CUDA_DISABLE_NORM_ROWS=1` | **7388.04 / 97.48** — inside the arm's noise, i.e. **the switch is inert at this rung**, exactly as block 08's own commit says ("the norm-rows gates stay inert until block 10's fusion dispatcher exists") |
+
+## R08.1 The eight resolutions
+
+| path | ours (upstream) | theirs (block 08) | resolution |
+|---|---|---|---|
+| `common.cuh` | `#include "ggml-common.h"` | `ggml_cuda_rms_norm_vec()` (the issue-#229 numerics selector) | **both** |
+| `mmf.cuh` | `ncols_case = ids ? 16 : ncols_dst` | `compact_ids ? MMF_IDS_COLS : (ids && ncols_dst > 16) ? 16 : ncols_dst` | **union**: `compact_ids ? MMF_IDS_COLS : (ids ? 16 : ncols_dst)`.  Upstream's rework tiles the whole ids path at 16 and `MMF_IDS_COLS == 16`, so the two agree; the compact branch is kept explicit because its reason is different (one row per (token, slot) occurrence) |
+| `norm.cu` (1) | `norm_f32<block_size, do_multiply, do_add>` + `mul`/`add` params (`#32454`) | plain `norm_f32<block_size>` + `norm_f2bf()` | **both**: upstream's parameterised `norm_f32` kept (the body that follows is the union and uses `do_multiply`/`do_add`) **and** the delivery's `norm_f2bf` helper kept — the merged `rms_norm_f32` body writes the HC stream's BF16 copy through it |
+| `norm.cu` (2) | `ggml_cuda_op_norm(ctx, dst, mul, add)` | `l2_norm_pair_f32` + `_cuda` (the SSM q/k pair) | **both**: the delivery's kernels first, then upstream's 3-arg signature (the merged body is upstream's fused form; `norm.cuh` already defaults `mul`/`add` to `nullptr`, so the 2-arg callers still work) |
+| `quantize.cu` (1) | upstream's pre-restructure body fragment | the chunked/scatter loop header | **theirs** — the body after the header is the union and already carries both (`if constexpr (glu)` + `ggml_cuda_shfl_xor`); this is the same call block 08's own commit recorded at r278 |
+| `quantize.cu` (2) | `quantize_mmq_few_id_q8_1_cuda` (`#32065`) | `quantize_mmq_q8_1_glu_cuda` + `quantize_mmq_q8_1_swiglu` | **both** — different functions, no overlap (upstream's is the NVIDIA few-row quantizer, block 08's is the fused-GLU feed) |
+| `set-rows.cu` | `k_set_rows_quant<src_t, idx_t, ...>` (`src_t` added by `#32387`) | a `block_q8_0` group fast path + the old signature | **both** with the fallback given upstream's `src_t` first argument (R08.3 explains the second half of this fix) |
+| `mmq.cuh` (×4) | `force_tiling` template param, `has_fusion`-only launches | `has_gate` param, the routed-compact dispatch, the fused args | **union**: the template is now `<…, has_fusion, has_gate = false, force_tiling = false>`; the delivery's routed-compact + fused launch is kept with upstream's `rows_innermost`-aware `gridDim.y` clamp |
+| `topk-moe.cu` (×7) | plain `ggml_cuda_shfl_xor` butterflies, plain reduce | `topk_moe_argmax_stage*` (DPP/key sort), bit-exact norm reduce, `calc_experts_per_thread` | **both**: the delivery's bit-identical softmax/argmax/reduce bodies win (that is the delivery's stated contract for this kernel), upstream's `calc_experts_per_thread` is kept (the kernel calls it), and the delivery's key/sort helpers were re-added |
+| `tests/test-backend-ops.cpp` | the duplicate-id cases stay commented | the delivery enables them (`test_mul_mat_id_dup`) | **theirs** — upstream's `#if 0` predates `#32505`; the path is implemented on both sides now, so the delivery's standing oracle stays enabled |
+
+## R08.2 **D4 — resolved as MERGE: the two norm fusions are additive, and the shipped order already decides precedence**
+
+`DECISIONS.md` D4 asked which mechanism owns "norm followed by a MUL".  The answer is in the r327 tree, not in a
+choice: the delivery's narrow-row matcher `ggml_cuda_norm_rows_try_fuse()` sits **~1000 lines ahead** of every
+generic `can_fuse(RMS_NORM, MUL[, ADD])` branch in the dispatcher (line 2199 vs 3314/3319 of
+`ggml-cuda-try-fuse.cu`), so where it matches it wins, and upstream's generic branch is the fall-through.
+
+Both delivery matchers bail on `rms->op != GGML_OP_RMS_NORM` and claim only narrow rows (ncols <= 256,
+>= 4096 rows, F32, single-use).  `#32454` adds (a) the **layer-norm** `GGML_OP_NORM` variant — a node type the
+delivery never claims — and (b) a `mul`/`add` epilogue on the general `norm.cu` kernel.  **Nothing is deleted and
+no precedence changes**; at this rung the delivery's matcher is not even reachable (its dispatch is block 10's
+TU), which is why `GGML_CUDA_DISABLE_NORM_ROWS=1` is inert above.
+
+**Obligation (R10):** when block 10 puts the matcher into `ggml-cuda-try-fuse.cu`, it must stay **ahead** of
+upstream's generic norm branches — that position *is* the D4 resolution — and `scripts/gate-norm-rows-alias.sh`
+must show both arms still firing at R18.
+
+## R08.3 Four fixes the compiler or the merge forced (all recorded, none silent)
+
+1. **The 64-bit warp mask, now inside block 08's own code** (third time in this climb: R01's all-reduce, R05's
+   band code).  Five sites: `set-rows.cu`'s `k_set_rows_q8_0_group`, `quantize.cu`'s chunked q8_1 reductions
+   (×3), `mmvq.cu`'s new kernels (×4), `topk-moe.cu`'s `topk_moe_xor` fallback.  All converted to
+   `ggml_cuda_shfl_xor` / `ggml_cuda_shfl` (same lane mapping, `GGML_CUDA_FULL_THREAD_MASK` default), so no
+   numerics change — confirmed by the unchanged coherence hash and the op matrices.
+2. **`k_set_rows_q8_0_group` needs the F32-source gate.**  `#32387` added **BF16** to `SET_ROWS`, so
+   `set_rows_cuda_quant` is now instantiated with `src_t = nv_bfloat16`; the delivery's group kernel takes
+   `const float *`.  The `if constexpr` now requires `std::is_same_v<block_type, block_q8_0> &&
+   std::is_same_v<src_t, float>`, so a BF16 source keeps the generic kernel (which is what the delivery's own
+   path did).
+3. **An auto-merge artifact that would have mis-dispatched silently.**  In `mmq.cuh` upstream's
+   `mul_mat_q<…, has_fusion, /*force_tiling=*/true>` launch survived the auto-merge **into the delivery's 6th
+   template slot**, which is `has_gate` — i.e. it compiled and would have launched the gated arm with
+   `has_gate=true, force_tiling=false`.  Fixed by giving the template **both** parameters in a documented order
+   and re-pointing that launch at `<…, has_fusion, has_gate, true>`.  **Class of trap:** an auto-merge inside a
+   template *parameter list* re-binds positional bools without any conflict marker — check every instantiation
+   whose argument list is identical in shape but differs in meaning.
+4. **`topk-moe.cu` lost its `#if` guard.**  Block 08 wraps `group_mask_warp_inplace` in
+   `#if !defined(GGML_USE_HIP) || HIP_VERSION >= 60300000`; the merge took the `#endif` (it sat inside the
+   conflicting region) and dropped the `#if` (which sat in common context before it).  Restored before
+   `group_mask_warp_inplace`, with upstream's `calc_experts_per_thread` placed after it (unguarded, as upstream
+   has it).
+
+## R08.4 D11 and later-rung notes
+
+- **The few-row quantizer (`#32065`) is inert on HIP**, exactly like the few-row MMQ it feeds:
+  `ggml_cuda_should_use_mmq_few()` returns `false` for every HIP build, so `quantize_mmq_few_id_q8_1_cuda` is
+  never reached here and block 08's chunked/scatter quantizer is unopposed.  Recorded, not assumed.
+- The routed-compact MoE MMQ dispatch (`GGML_CUDA_DISABLE_MMQ_ROUTED`) and the fused gate arm
+  (`has_gate`) are block 08's own; both are graded by `MUL_MAT_ID` above and by the 35B-A3B arms later.  Their
+  fusion-aliasing gate (`gate-norm-rows-alias.sh`) stays inert until R10, as block 08 says.
+- `norm.cu` now carries three parallel norm surfaces (upstream's fused `norm_f32`, the delivery's `rms_norm_*`
+  decode-band fusions, and `norm-gated.cu`'s narrow-row kernel).  R10's dispatcher is where the precedence
+  between them lives; do not "simplify" one away without the prefill-logit gate.
 
 ---
 

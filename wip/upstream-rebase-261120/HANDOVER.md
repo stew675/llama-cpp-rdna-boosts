@@ -1,6 +1,6 @@
-# HANDOVER — r328 re-base ladder, 8 of 18 rungs climbed, resume at **R08** (stops on **D4**)
+# HANDOVER — r328 re-base ladder, 9 of 18 rungs climbed, resume at **R09**
 
-Written 2026-11-21 (session 2, which climbed R06 and R07).  Read [`README.md`](README.md) §1 (method + traps),
+Written 2026-11-21 (session 2, which climbed R06, R07 and R08).  Read [`README.md`](README.md) §1 (method + traps),
 [`RUNGS.md`](RUNGS.md) (the per-rung ledger and every resolution so far) and [`DECISIONS.md`](DECISIONS.md)
 (the decision log) — this file is the delta: what is done, what is owed, and how to not repeat the mistakes of
 the earlier sessions.
@@ -9,9 +9,9 @@ the earlier sessions.
 
 | item | value |
 |---|---|
-| working branch | **`rebase-r328`** in `~/llama.cpp`, clean, **HEAD = `1435e7873`** (tree `d3b004581`) |
-| rungs done | **R00 … R07** + **two rung repairs** (R00's top-k gather, R05's `nb32` widening) |
-| next rung | **R08** — block 08 (`fe283f27c`), **9 conflicted paths** (the worst of the climb) and **`D4` is OPEN**: upstream's NORM+MUL(+ADD) fusion vs block 08's `norm-gated.cu`.  **Stop at D4 and ask** — but the other 8 paths are ordinary union work, and `D4`'s own text says the call is made *after* measuring `GGML_CUDA_DISABLE_NORM_ROWS=0/1` plus the prefill-logit gate, so the mechanical part can be done first |
+| working branch | **`rebase-r328`** in `~/llama.cpp`, clean, **HEAD = `510769147`** (tree `2ed6cb541`) |
+| rungs done | **R00 … R08** + **two rung repairs** (R00's top-k gather, R05's `nb32` widening) |
+| next rung | **R09** — block 09 (`123d53419`), 70 files, 4 conflicted paths, the climb's **highest upstream exposure** (136 commits / 83 of them behind the churn) and **D8**/**D9** (node budget, indexer key rotation).  Both are `MERGE`, so R09 does not stop for a decision — but it is the rung where the delivery's own allocator/KV work meets upstream's refactors, so expect substantive resolutions rather than unions |
 | delivery repo | `~/llama-cpp-rdna-boosts` — **`patches/`, `release.json`, `rdna-boosts-all.patch` and the fork are untouched** (that is R18) |
 | target release | next after `v17-4f9dfa0e3-r327`, i.e. **r328**; new fork point **`919794500`** |
 | reference binaries | `~/llama.cpp/build-rocm/bin-r327` (the shipping r327 `bin/`) — **the attribution oracle for any abort** |
@@ -32,9 +32,10 @@ e612388ba  971953b99  block 03: chunked GDN prefill
 c3860af1e  b52803164  R05 repair: nb32 -> int64_t
 ee377ec45  b5dc56996  block 06: MMB quantized prefill GEMM
 1435e7873  d3b004581  block 07: k-quant boosts (mmvq VDR, Q6_K MMQ, Q1_0, grid pad)
+510769147  2ed6cb541  block 08: fused kernels (fusions + fused MoE + norm-gated + gdn/ple conv)
 ```
 
-## §1 What each rung cost, so R08..R17 can be planned
+## §1 What each rung cost, so R09..R17 can be planned
 
 | rung | conflicts | what it actually took |
 |---|---|---|
@@ -46,6 +47,7 @@ ee377ec45  b5dc56996  block 06: MMB quantized prefill GEMM
 | R05 | 7 files / **22 regions** | **D16** (maintainer): the delivery's FA band iteration model wins; upstream `#32407`'s rotation **not carried** — and `#32217`'s per-head mask + `#31617`'s typed masks still adopted.  Then the R05 repair: `nb32` -> `int64_t` |
 | R06 | 2 files / 2 regions | both unions: upstream's few-row MMQ (`#32065`) keeps precedence over MMB's MUL_MAT_ID check (**it is compiled out under HIP**, so they are disjoint by backend), and block 06's `expert_bounds` output re-ported onto the R00 store-design helper (`n_dumped`, not `it_compact`).  Plus the **R06.2 finding** (block 06's MMB cache is pool-unsafe until block 10) |
 | R07 | 1 file / 2 regions | both unions in `mmvq.cu`: upstream's Jetson `ORIN` table id + the delivery's RDNA2 `NAVI21` id, and the two `calc_nwarps` special cases side by side.  Upstream's RDNA3_5 `ne11` gate is a *dispatch threshold*, not a competitor to the delivery's VDR tables — adopted, unmeasurable on gfx1201.  D11 measured: grid pad +1.37 % pp2048 (text identical), `MMQ_J_MAX=64` −15.3 % → the delivery's cap stays at its default |
+| R08 | 8 files / **13 regions** | the climb's worst.  Eight resolutions, all unions except two "theirs" (the chunked quantizer body, the enabled duplicate-id tests).  **D4 resolved without a choice** (additive mechanisms; the delivery's matcher is inert until R10).  **Four forced fixes**: five raw warp-mask sites in block 08's own code, the `SET_ROWS` q8_0 group kernel needs an F32-source gate (`#32387` added BF16 sources), a lost `#if` guard in `topk-moe.cu`, and an **auto-merge artifact** — upstream's `force_tiling=true` landed in the delivery's `has_gate` template slot in `mmq.cuh` and would have compiled and mis-dispatched.  Rung repairs are *not* squashed: they live in this commit (unlike R00/R05, which needed their own) |
 
 ## §2 Owed at specific later rungs (these are the ones that will be forgotten)
 
@@ -181,17 +183,18 @@ few-row MMQ is HIP-compiled-out) needs no preference at all — keep both, upstr
 
 ```bash
 cd ~/llama.cpp && git status && git branch --show-current      # must be rebase-r328, clean
-git log --oneline -1                                            # expect 1435e7873
-git cherry-pick fe283f27c                                       # R08 = block 08 (9 conflicted paths)
-# resolve the 8 mechanical/union paths first; the 9th is D4 -- STOP AND ASK before the norm fusion
-(cmake --build build-rocm -j 24 > /tmp/r08.log 2>&1; echo "BUILD_RC=$?" >> /tmp/r08.log)
-# poll for BUILD_RC, then: coherence -> D4's measurement (GGML_CUDA_DISABLE_NORM_ROWS=0/1 + prefill-logit) -> commit
+git log --oneline -1                                            # expect 510769147
+git cherry-pick 123d53419                                       # R09 = block 09 (70 files, 4 conflicts)
+(cmake --build build-rocm -j 24 > /tmp/r09.log 2>&1; echo "BUILD_RC=$?" >> /tmp/r09.log)
+# poll for BUILD_RC, then: coherence -> the block's own switch -> the rung's log in RUNGS.md -> commit
 ```
 
-**R08 is the rung to plan for, not to rush.**  It has the climb's worst conflict ratio (9 of 38 paths, 38 upstream
-commits of churn) and it carries **`D4`** (upstream's `#32454` NORM+MUL(+ADD) fusion vs block 08's
-`norm-gated.cu`), which is `OPEN` and needs the maintainer's word.  D4's shape: the two are *different* wins
-(ours a narrow-row launch shape for ~786 k rows, upstream's a fusion that removes a kernel), so the likely answer
-is "keep both with a documented precedence", but the loud question — **which one owns the fused case, and does the
-delivery's fusion dispatcher still own that decision** — is the maintainer's.  Also in R08: `D3`'s leftover
-(`set-rows.cu`), `D11`'s MMQ/Q6_K knobs and `quantize.cu` (`#32065`).
+**R09 is the rung with the most upstream churn** (70 files, 136 upstream commits, 83 behind them) even though the
+text merge is small (4 paths).  Its two `DECISIONS.md` items are both `MERGE`: **D8** (upstream moved the
+nodes-per-tensor factor into `llama_model::graph_nodes_per_tensor()` and added a `32*n_layer_all` reserve when
+`cparams.moe_cache_size > 0` — keep the virtual, keep the delivery's KV-rotation leaves and the hard "over the node
+budget" refusal, and re-run `scripts/gate-node-budget.sh`) and **D9** (`4783b1145` replaced the architecture list
+in `llama-kv-cache.cpp` with `llama_model::lid_k_hdmd()`; make qwen4exp's answer explicit in its model class
+rather than in the cache's list).  Both are the delivery's *own* subsystems, so resolve them as merges and
+**do not** drop delivery code: `D8`'s note about upstream's MoE-cache reserve says to check whether block 09's
+arena needs its own term.
