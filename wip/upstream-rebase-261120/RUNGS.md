@@ -1507,6 +1507,54 @@ the rung's commit id.
 Order of work is `NEXT-SESSION-PROMPT.md`; the obligation table is `COLD-START.md` §8.  Steps land here as they
 finish, newest first inside each step.
 
+## R18.3 The block-owned gate sweep (step 3) — and **where each fix belongs**
+
+The sweep runs **sequentially** (one GPU workload at a time), against `~/llama.cpp/build-rocm` (the squashed
+tip's tree, which is byte-identical to the verified one).  `HIP_VISIBLE_DEVICES=0,1,2` where the gate does not
+pin its own.
+
+| gate | result at the squashed tip | note |
+|---|---|---|
+| `gate-norm-rows-alias.sh` | **PASS** | A: fused == chain digest `bcc36422f9a120ac`; B: Ling-3.0-tiny **180/180 gated fusions, 0 declined**, text `f476efaac086` == kill-switch arm; C: Qwen3.5-4B **344/344 plain, 0 declined**, `d2ffb97ccb76` == kill-switch arm.  Kernel journal clean. This is the r225/r238 guard on the re-based dispatcher |
+| `gate-spec-ckpt-device.sh` | **PASS** | the device checkpoint restores the same bytes the host path does (text, drafts, accepted counts); `-nkvo` correctly stays host and says why |
+| `gate-spec-width-band.sh` | **PASS** | the 4-slot arm's band really cut (154 align lines, 1 cut); 1/2-slot arms inert |
+| `gate-park-idle-slots.sh` | **PASS** | 6 park / 2 unpark moves traced, and every slot's parked text == the lazy-off text (4 arms) |
+| `gate-spec-align.sh` | **FAIL (1 check)** | `ncmoe` (host-expert, 35B-A3B `-ncmoe 40`) still splits **2 draft-length + 1 single-row** decode step with `LLAMA_SPEC_ALIGN` on, where the check requires `0 + <=2`.  The 2-GPU, 3-GPU, `ncmoe`-throughput and mixed-ngram arms all PASS (+18 %, +28 %, +13.6 %, n-gram chain inert), and both single-slot requests are byte-identical on/off — so this is the alignment's *completeness on the host-expert shape*, not a text or throughput regression.  Attribution run against `bin-r327` is owed before it is called a re-base regression |
+| `gate-hc-fusions.sh` | **FAIL — R11.2, unchanged** | the exact R11 numbers at the squashed tip: `chain_chain a512ee68c4b3`, `mix_op`/`both_ops` `3f049f67781c`, `dsv4_pre_op`/`ops_no_post` `c8db61d5dcc8`, `dsv4_post_op`/`all_ops` `6a102dbc62d6`, `comm_op`/`cuda_fuse_off` exact, **no GPU fault**.  Blocks 12-17 did not move it: the HC chain itself moved with the re-base.  **Still the maintainer's call** (re-anchor arm by arm, or the fused mixer does not ship default-on) |
+| `gate-qwen4exp-quant-coherence.sh` | **ABORTED (machine), partial** | `IQ3_XXS`/`IQ4_XS` have no local model under `/llm/models/Qwen3.8/Flash-Next` (`SKIP`). `IQ4_NL` **PASS** (gather transparent, on == off == `9aa89e25f7a8`); `Q4_K_M`'s first arm had read `e58417e70221` when the run was stopped.  See the **resource note** below — this arm is the one that took the box down, not a gate failure |
+| `gate-prefill-logits.sh` | running | compare against the recorded base, then `--record` on the final tree (R18.4) |
+
+### Resource note — the Flash-Next `-ncmoe 48` arms are the ones that swap this box
+
+Measured while the sweep ran: `gate-qwen4exp-quant-coherence.sh`'s `Q4_K_M -sm tensor -ncmoe 48` arm held **66 GB
+RSS in one `llama-cli`**, filling the 91 GB box's zram swap (8/8 GB) and 21 GB of the NVMe swap partition, with the
+kernel at load 4.3 — i.e. it thrashed the machine while the gate itself was behaving.  The arm is legitimate (the
+sum of the model's shards plus the host-expert pool), so the rule is scheduling, not configuration: **run the
+Flash-Next host-expert quant-coherence and prefill-logit arms one at a time and with nothing else resident** (no
+second gate, no build, no server), and prefer `-ncmoe` values that fit the free RAM with headroom.  The
+`prefill-logits` bases are 5 GB each on disk and the harness holds the arm's model memory for the whole compare.
+
+### The fixup ledger — every correction and the block that must own it
+
+**Nothing here is applied yet.**  The branch is already squashed (`R18.1`), so each fix lands in **one final
+`rebase -i` pass at the very end** (`R18.6`), never as a trailing commit and never inside `0300`:
+
+| # | correction | belongs to | state |
+|---|---|---|---|
+| 1 | R00's `top_k_gather_rows` (D15) | **block 00** | **APPLIED** (R18.1) |
+| 2 | R05's `nb32` → `int64_t` | **block 05** | **APPLIED** (R18.1) |
+| 3 | R16's `-Wsign-compare` | **block 16** | **APPLIED** (R18.1) |
+| 4 | the Apache-2.0 attribution line in the two chunked-GDN headers | **block 03** (`gated_delta_net_chunked_bf16.{,gfx11}cu`) | **PENDING — needs the maintainer's approval** (it is a block amendment; `EXTERNAL-ANALYSES.md` §1.3) |
+| 5 | `gate-spec-align.sh`'s host-expert split steps | **block 02** — and the code says why: `common/speculative.cpp`'s `spec_align_width_band()` deliberately does **not** apply where an MoE expert-cache arena exists, because "the arena's own band replaces it" and that band is derived per step (how many rows the arena serves from VRAM).  So the caps `align_draft_caps()` equalizes are *input* from block 09/15's arena, and a step on which the band moves leaves the per-slot caps unequal → a split.  The fix belongs in **02** (align the band-derived caps in the same call), not in the arena | **OPEN** — confirm on `bin-r327` first (the arm must be re-run there before it is called a re-base regression) |
+| 6 | `gate-hc-fusions.sh`'s three moved arms | **block 11** — *or* a decision that the fused mixer stays off by default | **OPEN — maintainer decision** |
+| 7 | `TODO` #352's container UI stage | *no block* — `.devops/rdna-rocm.Dockerfile` is a delivery-repo file, no patch adds it (verified) | **APPLIED** (repo-level, `WORKLOG` 261121.001) |
+| 8 | the radiance `NOTICE` / `third_party/radiance/` | *no block* — repo-level | **APPLIED** (same entry) |
+
+**R18.6 (planned, unattended-free) is the fixups pass**: one `git rebase -i 919794500` that folds rows 4-6 into
+their owning blocks (a `fixup` per row, exactly as `R18.1` did), re-touched trees re-verified for coherence, then
+`scripts/make-patches.sh`.  Do not start it while a decision row is open — an unfixed row means its block's patch
+must not be cut yet, and a fix folded into the wrong block is the r2 failure this whole gate exists to prevent.
+
 ## R18.2 The per-block ladder (step 2) — **18/18 rungs build the `all` target**
 
 ```bash
