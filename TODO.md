@@ -276,9 +276,22 @@ logical layers over 24 physical blocks with an explicit loop range, which `src/m
 read (`git grep num_loops src/models/inkling2.cpp` is empty; upstream's `nanbeige.cpp` is where that mechanism
 lives).
 
-**Not a delivery defect and not this re-base:** the pristine `919794500` base repeats both failures
-(`build-base-novmm`), and r327 knows neither arch (`unknown model architecture: 'inkling2'` /
-`'inkling2_loop'`).
+**Not a delivery defect, not this re-base, and not a backend issue.**  Both failures reproduce on the pristine
+`919794500` base (`build-base-novmm`); r327 knows neither arch; and both are **loader-level**, before any backend
+is initialised — the same messages appear with `HIP_VISIBLE_DEVICES=` (no GPU exposed) and `-ngl 0`, so no
+Vulkan/ROCm/CUDA choice can change them.  `src/llama-arch.cpp` registers `inkling2` and nothing else, and
+`src/models/inkling2.cpp` reads no loop key.
+
+**The two files are not variants of one layout** — the loop tensors differ by name, so `inkling2_loop` is a
+different architecture and not a rename:
+
+| | Unsloth (`arch = inkling2`) | GGML reference (`arch = inkling2_loop`) |
+|---|---|---|
+| loop tensors | `loop_attn_{down,forget,gain}`, `loop_k_{…}`, `loop_v_{…}`, `loop_mlp_{…}` (12 groups) | `loop_{q,k,v}_ctrl_{…}`, `loop_ffn_ctrl_{…}`, `loop_msg_query` (13 groups) |
+
+That rules out the tempting shortcut of aliasing the arch string to load the reference file locally: the loop
+gates would simply not be found, so the model would run with an un-gated loop and produce nonsense — useless even
+as a per-head-mask probe.
 
 **What it blocks.**  The only local coverage of upstream `#32217`'s **per-head FA mask** (the op matrix sweeps
 `mask_heads = 1` only: `grep -c 'mask_heads=[2-9]'` = 0) and of the **`nb32` widening** that term needs
