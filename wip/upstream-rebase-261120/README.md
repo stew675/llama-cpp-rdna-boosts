@@ -1,8 +1,8 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: OPEN — 7 of 18 rungs climbed (R00-R06) on 2026-11-21. Nothing is delivery yet.**
+**Status: OPEN — 8 of 18 rungs climbed (R00-R07) on 2026-11-21. Nothing is delivery yet.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
-the final rung (R18).  Ladder branch `rebase-r328` = `ee377ec45` (tree `b5dc56996`): R00..R06 plus two rung
+the final rung (R18).  Ladder branch `rebase-r328` = `1435e7873` (tree `d3b004581`): R00..R07 plus two rung
 repairs (R00's top-k gather, R05's `nb32` widening); every rung is green on build + coherence and each has one
 entry in [`RUNGS.md`](RUNGS.md).
 **The one known-red is closed at R00** (repair `3ea8b0212`): the delivery's required VMM pool refuses
@@ -22,8 +22,14 @@ it is compiled out under HIP, and MMB follows it; block 06's `expert_bounds` re-
 helper), coherence unchanged, MUL_MAT_ID 1078/0, MMB +0.33 %/+0.62 % and the F32 skinny GEMM +0.9 %/+1.0 % —
 and one **finding**: block 06's MMB activation cache/slot buffers are freed in an order the VMM pool cannot
 accept, so a default-on RDNA4 *dense* type (IQ3_S) aborts until **block 10's `pool_stack`** lands (r327 is
-clean, this intermediate tree is not — `RUNGS.md` R06.2, with the R10/R18 obligations it creates).  Next rung:
-**R07** (block 07, wide-VDR MoE / Q6_K MMQ), which continues `D11`'s MMQ/MMVQ tuning A/B.  Target: the next
+clean, this intermediate tree is not — `RUNGS.md` R06.2, with the R10/R18 obligations it creates).  R07 is done
+too: both conflicts were in `mmvq.cu` and both unions (upstream's Jetson-`ORIN` id + the delivery's
+RDNA2-`NAVI21` id, and the two `calc_nwarps` special cases side by side), the RDNA3_5 `ne11` gate is adopted as a
+dispatch threshold rather than a competitor to the delivery's VDR tables, and D11's knobs came out "mixed, per
+knob" as predicted: the grid-stall pad is +1.37 % pp2048 with identical text, while capping the MMQ tile width
+(`MMQ_J_MAX=64`) costs 15.3 % — so the delivery's own cap stays at its default.  Next rung: **R08** (block 08,
+narrow-row norm + `GGML_CUDA_DISABLE_NORM_ROWS`, the worst conflict ratio of the climb — 9 paths, and **D4**
+opens there).  Target: the next
 release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 

@@ -1,6 +1,6 @@
-# HANDOVER — r328 re-base ladder, 7 of 18 rungs climbed, resume at **R07**
+# HANDOVER — r328 re-base ladder, 8 of 18 rungs climbed, resume at **R08** (stops on **D4**)
 
-Written 2026-11-21 (session 2, which climbed R06).  Read [`README.md`](README.md) §1 (method + traps),
+Written 2026-11-21 (session 2, which climbed R06 and R07).  Read [`README.md`](README.md) §1 (method + traps),
 [`RUNGS.md`](RUNGS.md) (the per-rung ledger and every resolution so far) and [`DECISIONS.md`](DECISIONS.md)
 (the decision log) — this file is the delta: what is done, what is owed, and how to not repeat the mistakes of
 the earlier sessions.
@@ -9,9 +9,9 @@ the earlier sessions.
 
 | item | value |
 |---|---|
-| working branch | **`rebase-r328`** in `~/llama.cpp`, clean, **HEAD = `ee377ec45`** (tree `b5dc56996`) |
-| rungs done | **R00 … R06** + **two rung repairs** (R00's top-k gather, R05's `nb32` widening) |
-| next rung | **R07** — block 07 (`f5bdbefda`, wide-VDR MoE / Q6_K MMQ), 14 files, 1 conflict (`mmvq.cu`) |
+| working branch | **`rebase-r328`** in `~/llama.cpp`, clean, **HEAD = `1435e7873`** (tree `d3b004581`) |
+| rungs done | **R00 … R07** + **two rung repairs** (R00's top-k gather, R05's `nb32` widening) |
+| next rung | **R08** — block 08 (`fe283f27c`), **9 conflicted paths** (the worst of the climb) and **`D4` is OPEN**: upstream's NORM+MUL(+ADD) fusion vs block 08's `norm-gated.cu`.  **Stop at D4 and ask** — but the other 8 paths are ordinary union work, and `D4`'s own text says the call is made *after* measuring `GGML_CUDA_DISABLE_NORM_ROWS=0/1` plus the prefill-logit gate, so the mechanical part can be done first |
 | delivery repo | `~/llama-cpp-rdna-boosts` — **`patches/`, `release.json`, `rdna-boosts-all.patch` and the fork are untouched** (that is R18) |
 | target release | next after `v17-4f9dfa0e3-r327`, i.e. **r328**; new fork point **`919794500`** |
 | reference binaries | `~/llama.cpp/build-rocm/bin-r327` (the shipping r327 `bin/`) — **the attribution oracle for any abort** |
@@ -31,9 +31,10 @@ e612388ba  971953b99  block 03: chunked GDN prefill
 1c9bfa37c  13683655d  block 05: FA band + native quantized K/V
 c3860af1e  b52803164  R05 repair: nb32 -> int64_t
 ee377ec45  b5dc56996  block 06: MMB quantized prefill GEMM
+1435e7873  d3b004581  block 07: k-quant boosts (mmvq VDR, Q6_K MMQ, Q1_0, grid pad)
 ```
 
-## §1 What each rung cost, so R07..R17 can be planned
+## §1 What each rung cost, so R08..R17 can be planned
 
 | rung | conflicts | what it actually took |
 |---|---|---|
@@ -44,6 +45,7 @@ ee377ec45  b5dc56996  block 06: MMB quantized prefill GEMM
 | R04 | 2 files | **D3**: union of 7 rope arms + **dropped upstream's guard** that refused every non-BF16 rope into a BF16 cache (its own matrix lacked the arm ours supplies) |
 | R05 | 7 files / **22 regions** | **D16** (maintainer): the delivery's FA band iteration model wins; upstream `#32407`'s rotation **not carried** — and `#32217`'s per-head mask + `#31617`'s typed masks still adopted.  Then the R05 repair: `nb32` -> `int64_t` |
 | R06 | 2 files / 2 regions | both unions: upstream's few-row MMQ (`#32065`) keeps precedence over MMB's MUL_MAT_ID check (**it is compiled out under HIP**, so they are disjoint by backend), and block 06's `expert_bounds` output re-ported onto the R00 store-design helper (`n_dumped`, not `it_compact`).  Plus the **R06.2 finding** (block 06's MMB cache is pool-unsafe until block 10) |
+| R07 | 1 file / 2 regions | both unions in `mmvq.cu`: upstream's Jetson `ORIN` table id + the delivery's RDNA2 `NAVI21` id, and the two `calc_nwarps` special cases side by side.  Upstream's RDNA3_5 `ne11` gate is a *dispatch threshold*, not a competitor to the delivery's VDR tables — adopted, unmeasurable on gfx1201.  D11 measured: grid pad +1.37 % pp2048 (text identical), `MMQ_J_MAX=64` −15.3 % → the delivery's cap stays at its default |
 
 ## §2 Owed at specific later rungs (these are the ones that will be forgotten)
 
@@ -85,6 +87,13 @@ ee377ec45  b5dc56996  block 06: MMB quantized prefill GEMM
 9. **`TODO` #353** — Inkling-2 needs upstream [PR #32695](https://github.com/ggml-org/llama.cpp/pull/32695)
    (**unmerged** at 2026-11-20).  Nothing to do until it merges; then it is the local validation for the per-head
    FA mask and for the `nb32` widening.
+10. **R18 — `GGML_CUDA_MMQ_J_MAX`'s usable floor** (`RUNGS.md` R07.3): `=8` aborts on Q6_K/gfx1201
+   (`GGML_ASSERT(J_best > 0)`), *pre-existing at r327*, while `ENVIRONMENT.md` only says "a value < 8 is ignored".
+   Either clamp the knob to ≥ 16 or document the floor; it is a one-line delivery change, the maintainer's call.
+11. **R18 — the verify-band WMMA family's A/B** (`--wmma-verify`, block 07's r290 addition): opt-in and OFF by
+   default, so no rung reaches it.  If it is ever flipped on, it needs the four-axis MTP protocol +
+   `llama-batched-bench`, and its own byte-identity caveat (1 column always keeps the K-split kernel) belongs in
+   `GREEDY-PURITY.md`.
 
 ## §3 The traps that actually bit (all are avoidable)
 
@@ -172,15 +181,17 @@ few-row MMQ is HIP-compiled-out) needs no preference at all — keep both, upstr
 
 ```bash
 cd ~/llama.cpp && git status && git branch --show-current      # must be rebase-r328, clean
-git log --oneline -1                                            # expect ee377ec45
-git cherry-pick f5bdbefda                                       # R07 = block 07
-# conflicts expected: ggml/src/ggml-cuda/mmvq.cu (upstream #32308's ne11 gate) -- 1 file, D11
-(cmake --build build-rocm -j 24 > /tmp/r07.log 2>&1; echo "BUILD_RC=$?" >> /tmp/r07.log)
-# poll for BUILD_RC, then: coherence -> the block's own switch -> the rung's log in RUNGS.md -> commit
+git log --oneline -1                                            # expect 1435e7873
+git cherry-pick fe283f27c                                       # R08 = block 08 (9 conflicted paths)
+# resolve the 8 mechanical/union paths first; the 9th is D4 -- STOP AND ASK before the norm fusion
+(cmake --build build-rocm -j 24 > /tmp/r08.log 2>&1; echo "BUILD_RC=$?" >> /tmp/r08.log)
+# poll for BUILD_RC, then: coherence -> D4's measurement (GGML_CUDA_DISABLE_NORM_ROWS=0/1 + prefill-logit) -> commit
 ```
 
-R07 continues **`D11`**: the delivery's `mmvq.cu` `ne11` gate vs upstream's `c7518dbec`, and the wide-VDR MoE /
-Q6_K MMQ knobs.  The maintainer's instruction stands: **measure both, pick the better of each knob** — the plan
-is the table in `DECISIONS.md` D11, the rule is "per knob, not per file", and a mixed result is expected.  The
-MMQ config table (`mmq-config-gcn.cuh`) collision lands here or at R08 — it is the one knob D11 calls "double
-tuning", so read `mmq.cuh`'s table and upstream's new file side by side before picking.
+**R08 is the rung to plan for, not to rush.**  It has the climb's worst conflict ratio (9 of 38 paths, 38 upstream
+commits of churn) and it carries **`D4`** (upstream's `#32454` NORM+MUL(+ADD) fusion vs block 08's
+`norm-gated.cu`), which is `OPEN` and needs the maintainer's word.  D4's shape: the two are *different* wins
+(ours a narrow-row launch shape for ~786 k rows, upstream's a fusion that removes a kernel), so the likely answer
+is "keep both with a documented precedence", but the loud question — **which one owns the fused case, and does the
+delivery's fusion dispatcher still own that decision** — is the maintainer's.  Also in R08: `D3`'s leftover
+(`set-rows.cu`), `D11`'s MMQ/Q6_K knobs and `quantize.cu` (`#32065`).

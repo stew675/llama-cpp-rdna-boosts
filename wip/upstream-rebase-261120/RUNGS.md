@@ -38,7 +38,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | R03 | 03 | `36da15029` | 1 | — | **DONE 2026-11-20** — `e612388ba`, tree `971953b99`; test-file union; GATED_DELTA_NET 76/76; chunked prefill +8.8 % with identical text |
 | R04 | 04 | `cfe40b5f9` | 2 | **D3 (resolved: union + drop upstream's guard)** | **DONE 2026-11-20** — `768d27561`, tree `0866d4229`; 7 rope arms; fusion worth +5.8 % pp / +16.5 % tg at bf16 KV, identical text; ROPE 515/515 || R05 | 05 | `7362b5958` | 7 (22 regions) | **D16 — decided: the delivery's iteration model wins** | **DONE 2026-11-20** — `1c9bfa37c`, tree `13683655d`; FA op matrix 7428/0; native q8_0 K/V +5.6 % decode; rotation not carried, verified absent |
 | R06 | 06 | `f0564df7d` | 2 (2 regions) | D11 | **DONE 2026-11-21** — `ee377ec45`, tree `b5dc56996`; both conflicts are unions (upstream's few-row MMQ keeps precedence, MMB follows; `expert_bounds` re-ported onto the R00 store helper); coherence `1c5d32ac537d`; MUL_MAT_ID 1078/0 (16 dup); MMB default +0.33 % pp2048 / +0.62 % pp16384, MMF32 +0.9 %/+1.0 %; **finding: block 06's MMB cache/slot buffers are pool-unsafe until block 10's `pool_stack` (R06.2)** |
-| R07 | 07 | `f5bdbefda` | 1 | D11 | not started |
+| R07 | 07 | `f5bdbefda` | 1 (2 regions) | D11 | **DONE 2026-11-21** — `1435e7873`, tree `d3b004581`; both conflicts in `mmvq.cu` are unions (enum `ORIN` + `NAVI21`, `calc_nwarps` both special cases); upstream's RDNA3_5 `ne11` gate adopted (dispatch threshold, not an alternative to our VDR tables, unreachable on gfx1201); coherence `1c5d32ac537d`; MUL_MAT (q6_K/q8_0/q1_0/iq4_xs) 335/0; 27B Q6_K pp2048 1154.5 — the delivery's `MMQ_J_MAX` cap only hurts (64 → 977.5), the grid pad is +1.4 % with identical text |
 | R08 | 08 | `fe283f27c` | 9 | **D4**, D3, D11 | not started |
 | R09 | 09 | `123d53419` | 4 | D8, D9 | not started |
 | R10 | 10 | `7bbf540d5` | 9 | D8, D12 + **drop block 10's `top_k` hunk (R00.6 obligation 1)** | not started |
@@ -633,6 +633,60 @@ fix is a block already in the ladder; (3) a rung is not shippable.  **Owed:**
 - Block 06 also registers MMB in `ggml_backend_cuda_context`'s destructor (`ggml_cuda_mmb_release_all()`) and
   calls `ggml_cuda_mmb_begin_graph()` at the top of `graph_compute`; both merged cleanly and are what R06.2's
   ordering depends on.  When block 10 rewrites them, this rung's comments are the reference for what changed.
+
+---
+
+# R07 — block 07, k-quant boosts (mmvq VDR, Q6_K MMQ, Q1_0, grid pad)  ·  **DONE 2026-11-21** — `1435e7873`, tree `d3b004581`
+
+```
+git cherry-pick f5bdbefda        # 14 files, +1468/-135 (mmvq-wmma.cu 433 lines new, vecdotq.cuh +542/-…)
+```
+
+| exit criterion | result |
+|---|---|
+| conflicts | 1 file / 2 regions (`mmvq.cu`), both unions |
+| no markers left | yes; no `TODO(rebase)` |
+| build | green, `all` targets, 0 errors, **0** warnings in the touch-path files |
+| coherence 4B | **`100 chars sha=1c5d32ac537d`** — unchanged, and **identical with `GGML_CUDA_GRID_STALL_PAD=0`** |
+| `test-backend-ops -o MUL_MAT -p type_a=(q6_K\|q8_0\|q1_0\|iq4_xs)` | **335 OK / 0 FAIL** — the `vec_dot_*` family and the MMQ load tiles this block rewrites |
+| the block's own switch (pad) | 27B Q6_K, `llama-bench -p 2048 -n 128 -r 3`: default **1154.45 / 24.23** vs `GGML_CUDA_GRID_STALL_PAD=0` **1138.75 / 24.18** → the pad is +1.37 % prefill, +0.2 % decode, text identical |
+| the delivery's tile knob | `GGML_CUDA_MMQ_J_MAX=64` → **977.53 / 24.20** (**−15.3 %** prefill): capping the MMQ tile width only hurts at this base, so the default (up to 128) stands |
+
+## R07.1 The two resolutions — both unions in `mmvq.cu`
+
+**Region 1, `mmvq_parameter_table_id`.**  Upstream added `MMVQ_PARAMETERS_ORIN` for Jetson Orin; block 07 adds
+`MMVQ_PARAMETERS_NAVI21` for real RDNA2 (gfx103x).  Both kept, upstream's first.  Nothing indexes the enum
+positionally, so the order is cosmetic; what matters is that `get_device_table_id()` (device and host overloads)
+route to the right id.
+
+**Region 2, `calc_nwarps`.**  Upstream's `ORIN` case (`→ GENERIC`) and the delivery's `NAVI21` case (4 waves at
+`ncols_dst == 1`, 2 at 2-4, 1 above) insert at the same point.  Both kept, back to back — they test different
+ids.
+
+**The table-id split survived the auto-merge and was checked, not assumed.**  The delivery's own split (RDNA3_5
+keeps its own table rather than upstream's "RDNA2 || RDNA3_5 → RDNA2", real RDNA2 gets NAVI21) is in place on
+both paths, and upstream's new `RDNA4_M` family is folded into the NAVI21/RDNA2 table on both.  That ordering is
+sound: `GGML_CUDA_CC_IS_RDNA2(cc)` is `[RDNA2, RDNA3)` and `GGML_CUDA_CC_IS_RDNA4_M(cc)` is `[RDNA4_M, RDNA4)`,
+i.e. disjoint ranges, so neither branch can shadow the other.
+
+## R07.2 D11 — the knobs this rung owns, measured (`per knob, not per file`)
+
+| knob | arms | result |
+|---|---|---|
+| MMVQ `ne11` gate for RDNA3_5 (upstream `c7518dbec`, `Q8_0: ne11 <= 6`) | upstream's vs ours | **adopted, no A/B possible here**: it merged cleanly and sits in `ggml_cuda_should_use_mmvq` *before* the delivery's tables, but it is a **dispatch threshold**, not an alternative to block 07's VDR/`nwarps` tables (which are the kernel shape) — and it is RDNA3_5-only, so gfx1201 never reaches it.  It stays; the gfx1151 box is where it would be measured |
+| MMQ tile width (`GGML_CUDA_MMQ_J_MAX`, block 07's own A/B knob) | default (≤128) vs 64 vs 32 vs 16 | **default wins**: pp2048 1154.45 (128) vs 977.53 (64); the short-prompt arm ranks them the same way (674.25 / 575.58 / 450.77 t/s at pp64).  No delivery override is warranted at this base |
+| grid-stall pad (block 07, default ON under HIP) | default vs `GGML_CUDA_GRID_STALL_PAD=0` | **+1.37 % pp2048**, +0.2 % tg128, text identical → stays on (its own gate is `scripts/gate-grid-stall-pad.sh`, run at R18) |
+| wide-VDR MoE (`vec_dot_*_moe`) | on vs off | **no switch to turn it off** — the MoE VDR is a per-arch default inside the kernel association.  Its own D11 row targets "the 1-GPU host-expert decode on RDNA3_5", which this box cannot measure (gfx1201 uses the dense-VDR association).  Recorded, and graded by the op matrix above |
+| verify-band WMMA iu8 family (r290, `--wmma-verify` / `GGML_CUDA_MMVQ=…`) | — | **opt-in and default OFF** (`common_params::wmma_verify = 0`, `g_min_cols` unresolved → K-split kernel), so nothing on this rung's default path reaches it; with it off the byte-identical contract is unchanged.  Its A/B is the four-axis MTP protocol + `llama-batched-bench`, owed at R18 if the default is ever flipped |
+
+## R07.3 A pre-existing trap in the delivery's own knob (attributed, not a rung regression)
+
+`GGML_CUDA_MMQ_J_MAX=8` **aborts** on a Q6_K model: `GGML_ASSERT(J_best > 0) failed` (`mmq.cu:271`), because no
+`J = 8` config exists for that type at this base (upstream's per-arch `mmq-config-*.cuh` tables).  The **same
+abort happens at r327** (`bin-r327`, same arm, `mmq.cu:615`) — so it is the knob's floor, not this rung:
+**usable values are ≥ 16** on gfx1201/Q6_K.  Recorded because `ENVIRONMENT.md` documents the knob as "a value
+< 8 is ignored", which is true but unhelpful: 8 is accepted and then asserts.  Not fixed here (that would be a
+delivery change mid-climb); it is a candidate for a one-line clamp at R18 if the maintainer wants it.
 
 ---
 
