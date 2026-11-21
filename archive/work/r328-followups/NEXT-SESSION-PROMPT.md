@@ -1,6 +1,10 @@
+> **SPENT — do not run this prompt.**  The session it describes ran on 2026-11-21 and closed every row it
+> names; the outcomes are in the closure banner at the top of `HANDOVER.md` and in `WORKLOG.md` 261121.007.
+> The text below is kept as the record of what a cold start would have been told.
+
 # Paste this into a fresh session
 
-> Work through `~/llama-cpp-rdna-boosts/wip/r328-followups/HANDOVER.md` — read it top to bottom first, then
+> Work through `~/llama-cpp-rdna-boosts/archive/work/r328-followups/HANDOVER.md` — read it top to bottom first, then
 > verify the state before touching anything:
 >
 > ```bash
@@ -62,6 +66,6 @@
 > * **Never run the full container image build on the primary box** — the `radiance` worker watcher does it after
 >   the tag.
 >
-> Evidence for every row is in `wip/r328-followups/logs/` (29 logs) — quote from those instead of re-running a
+> Evidence for every row is in `archive/work/r328-followups/logs/` (29 logs) — quote from those instead of re-running a
 > 20-minute gate to read a number.  If a row turns out to be answered by an existing record, say so and retire it
 > rather than re-measuring.

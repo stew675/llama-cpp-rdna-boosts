@@ -359,7 +359,14 @@ in CI.  The model-level gates are manual:
    slot's verify width, so the two arms are two configs — and per-config determinism is a **single-slot**
    statement (2026-10-28: one unchanged binary lands in two text basins on the two-slot pair at 3 GPUs), so judge
    a change by the split count, the single-slot text identity and the pair's aggregate t/s, never by a two-slot
-   text diff (`GREEDY-PURITY.md` §63).
+   text diff (`GREEDY-PURITY.md` §63).  **Per-box note (r329):** the bound is (a)'s 10 %, calibrated on the
+   multi-device and host-expert shapes where the duplicated pass costs 3-54 %; on `fingon`'s single 24.5 GiB card
+   the pair is memory-bound instead (pair aggregate 100.5 t/s against 228.3 for the same pair at equal length, and
+   the *inert* equal-length arm itself moves +12 % run to run), so that box runs the arm with **`RECOVER=1.05`**
+   and records the number rather than gating a threshold three times its own noise.  The strict parts do not
+   move: the split count (`TAIL_MAX`, `NCMOE_SPLIT_MAX`), the single-slot text identity and the no-regression
+   bound (`REGRESS`).  The host-expert arm's residual 2 splits are **prefill/decode boundary** steps, not an
+   unequal cap (`INVARIANTS.md` r329, `TODO` #356 retired).
 
 12. **Graph replay census** — `GGML_CUDA_GRAPH_TRACE=1` on one decode arm, and read the exit line:
    a healthy decode is `direct` ~= 0, `replay` ~= the call count and `properties_changed` in the tens; a
@@ -745,7 +752,11 @@ in CI.  The model-level gates are manual:
     margin, `test-backend-ops` never builds a llama graph, and the per-block gate only compiles.  Negative-tested
     2026-11-12 on unpatched `a691b2345`: the two quantized arms abort (exit 134), the `f16` and rotation-off arms
     pass.  Required for any change to `graph_max_nodes()`, the scheduler's sizing, a memory module that adds graph
-    nodes/leafs, or anything that changes a graph's node count per layer.
+    nodes/leafs, or anything that changes a graph's node count per layer.  **The tight shape is now on the primary
+    box**: `/llm/models/phi-4/IQ4_XS/phi-4-IQ4_XS.gguf` is the gate's `MODEL` default and all four arms pass
+    (`31 chars sha=a1b7eb2ee7a6`, r328, 2026-11-21) — before that the gate was owed on every box (`TODO` #354's
+    record), and `halo`/`fingon` still lack the file, so a release arm there must say "not runnable, no tight
+    shape" rather than "pass".
 
 28. **The expert cache's alias ROLE and its take-over promise** (r298, `TODO` #335/#336 retired) — the consumer
    resolves a routed expert table from the scheduler's `input_cpy` **address**, and the graph allocator recycles those

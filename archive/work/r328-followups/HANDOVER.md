@@ -1,5 +1,20 @@
 # r328 follow-ups — cold-start handover
 
+> ## CLOSED — 2026-11-21 (r329 follow-up session).  Every row below is closed; this file is the record.
+>
+> | row | outcome |
+> |---|---|
+> | **F1** `TODO` #357 | **not a delivery defect.** Both halo gate runs certified `~/llama-scratch/build-rocm` (the gate's then-default, a 2026-11-12 build of `7efb30ae5`) instead of r328: its `apply_heat_seed_locked` predates r277's transport tail, so the census check read an absence. With `LLAMA_CLI=~/llama.cpp/build-r328/bin/llama-cli`: **49/49**, `120 seed line(s)` on the placement queue. Both gates now default to `~/llama.cpp/build-rocm` and print their binary's `--version` on line 1 (`INVARIANTS.md` r329). Log: `logs/halo-gate-uma-experts-r328.log`. |
+> | **F2** `TODO` #354 | **closed.** `gate-prefill-server-slots.sh` on halo, r328 server, **`LME=85 EXTRA_ARGS='--lazy-mode auto'`: 3 checks / 0 failures** — A identical `ee7c607ad86e`, A 2.28 → 2.47 tok/s, and the in-place band really ran (159 calls × 75 tables, 3351 admissions, 1113 landing / 2238 reclaiming a non-routed resident). The old default `-lme 90` is what killed it: 94 GiB anon on top of a >RAM mapping → server OOM-killed + 7 desktop tasks (`logs/halo-gate-prefill-server-slots-r328-lme60.log`, `…-lme85.log`). Per-box prefill-logit bases recorded from `build 6d9d54238` on **halo** (gfx1151, 27B Q8_0) and **fingon** (gfx1100, 27B Q4_K_M), both `mean KLD 0.000000 / top-p 99.990 %` (`logs/halo-kld-record-r328.log`, `logs/fingon-kld-record-r328.log`). gfx1100's +7.2 %: that box runs the arm with `RECOVER=1.05` and records the number (its pair is memory-bound; the inert arm alone moves +12 %) — `MANIFESTS.md` gate 11. |
+> | **F3** `TODO` #356 | **refuted, no block-02 change.** `-lv 5` shows the caps ARE equalised in the call — `aligned draft depth seq N: 3 -> 5 (width band 16, drafting 2, hard 5)` on every two-drafting call — and on a `-ncmoe` host-pool shape `llama_model_moe_cache_band()` answers 0, so the width band (16) is what applies. The 2 residual splits are **prefill/decode boundary** steps (a last prompt chunk cannot merge with the other slot's verify batch, and padding would advance the recurrent state). `gate-spec-align.sh`'s text corrected; `NCMOE_SPLIT_MAX=2` unchanged (`logs/f3-spec-align-diag-lv5.log`). |
+> | **F4** `TODO` #352 | **closed on the worker's evidence.** `radiance` built and pushed all six r328 images (both ROCm lines × full/light/server) at 07:07; its log shows the `web` stage building `ui/apps/chat` (`vite build` + PWA assets) and `COPY --from=web … ui/apps/chat/dist`. No local image build was run (policy). |
+> | **F5** R06.2 routed half | **closed.** r328 forced routed arm: exit 0 and the control hash `86b7f9b5aa80` (r327 identical), with the routed kernel proven reached (`MMB_GLU fused gate/up+swiglu`, 2 hits). The abort belonged to the intermediate ladder tree (blocks 06+09 without block 10's `pool_stack`) — `logs/f5-mmb-routed-ab.log`, `logs/f5-mmb-routed-census.log`. |
+> | **F6** `gate-node-budget` | **closed.** phi-4 IQ4_XS fetched to `/llm/models/phi-4/IQ4_XS/` (the gate's `MODEL` default); four arms PASS, all `31 chars sha=a1b7eb2ee7a6` (`logs/f6-gate-node-budget-phi4.log`). |
+>
+> Delivery change in this session: **three gate scripts only** (`gate-uma-experts.sh`, `gate-prefill-server-slots.sh`,
+> `gate-spec-align.sh` — binary anchoring + defaults, an `EXTRA_ARGS` passthrough, and F3's corrected text). No patch
+> block changed, no block renumbered; r329 is unblocked.  Full record: `WORKLOG.md` 261121.007.
+
 **Read this top to bottom; it is self-contained.**  It exists because `v17-919794500-r328` was released on
 2026-11-21 **before** two validations the policy asks for (the MTP four-axis protocol and the gfx1151/gfx1100
 arches).  Both have since been run and both pass — see §2 — and what remains is a short, named list.  **A new
@@ -12,7 +27,7 @@ release (`r329`) must not be cut until every row in §3 is closed or explicitly 
 | delivery repo | `~/llama-cpp-rdna-boosts`, `main` at **`ecfce7bd`** or later (pull first) |
 | release record | `WORKLOG.md` 261121.005 (the release) and 261121.006 (the post-release validation) |
 | re-base campaign | `wip/upstream-rebase-261120/` (`RUNGS.md` per rung, `DECISIONS.md`, `REMOTE-VALIDATION.md`) |
-| evidence for this file | `wip/r328-followups/logs/` (29 logs: every gate below, both primary-box and remote) |
+| evidence for this file | `archive/work/r328-followups/logs/` (29 logs: every gate below, both primary-box and remote) |
 | ladder checkout | `~/llama.cpp`: branch `rebase-r328` = `73a74454b` (the pre-cut ladder; `rdna-boosts` is now the re-cut r328 branch), `backup-pre-squash-r328` = the pre-squash tip |
 | remote boxes | `ssh halo` (gfx1151 APU, 123 GiB, 16 threads) · `ssh fingon` (gfx1100, 24.5 GiB, 16 threads) — both hold the r328 tree in `~/llama.cpp/build-r328` and the logs in `~/r328-arch/` |
 
@@ -181,16 +196,16 @@ Order of work for the `r329` session, once the rows are decided:
   per class/state/3-device, so a 1-GPU run has none).
 * **`halo`'s model inventory is not the primary box's**: 27B Q8_0 *is* there, 35B-A3B UD-Q4_K_M is **not**
   (that one is on `fingon`), and the 122B-A10B Q8_0 is `halo`'s.  `REMOTE-VALIDATION.md` has the table.
-* **Evidence travels**: every gate log for this release is in `wip/r328-followups/logs/` — quote from them instead
+* **Evidence travels**: every gate log for this release is in `archive/work/r328-followups/logs/` — quote from them instead
   of re-running a 20-minute gate to read a number.
 
 ## §6 Where things are
 
 | what | where |
 |---|---|
-| this file | `wip/r328-followups/HANDOVER.md` |
-| the next session's prompt | `wip/r328-followups/NEXT-SESSION-PROMPT.md` |
-| every log behind §2/§3 | `wip/r328-followups/logs/` |
+| this file | `archive/work/r328-followups/HANDOVER.md` |
+| the next session's prompt | `archive/work/r328-followups/NEXT-SESSION-PROMPT.md` |
+| every log behind §2/§3 | `archive/work/r328-followups/logs/` |
 | the release + post-release records | `WORKLOG.md` 261121.005 / 261121.006 |
 | the re-base's per-rung record | `wip/upstream-rebase-261120/RUNGS.md` (§R18.1 squash, §R18.3 gate sweep, §R18.4 R11.2 refutation, §R18.5 attribution fixup, §R18.6 tmpfs, §R18.7 spec-align, §R18.8 release) |
 | the arch runbook + box inventory | `wip/upstream-rebase-261120/REMOTE-VALIDATION.md` |

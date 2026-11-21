@@ -1,0 +1,30 @@
+==> slotsgate: /home/stew675/llama.cpp/build-r328/bin/llama-server
+    version: 1.0.0-dev (build 12615, commit 6d9d54238)
+
+==> two-slot decoder vs prefill interference (llama-server -np 2, one GPU)
+==> arm copy (MOE_EXPERT_PREFILL_IN_PLACE=0)
+    A: 160 tok 2.28 tok/s (in B's window 0.00 tok/s, longest gap 303 ms) sha=ee7c607ad86e
+    B: 17 chars in 38.0 s sha=97e3d4f49d85
+==> arm ip (MOE_EXPERT_PREFILL_IN_PLACE=1)
+    A: 160 tok 2.47 tok/s (in B's window 0.00 tok/s, longest gap 253 ms) sha=ee7c607ad86e
+    B: 17 chars in 35.2 s sha=97e3d4f49d85
+
+==> the assertions
+  ok  request A's text is identical in both arms (ee7c607ad86e)
+  ok  request A's decode: 2.4688665546257194 tok/s (ip) vs 2.278411337631366 tok/s (copy), tolerance -3.0%
+  ok  request A's decode INSIDE B's prefill window: 0.0 tok/s vs 0.0 tok/s
+
+==> the mechanism on both arms (from the server's own census)
+  ok  ip: GTT prefill in place: 159 call(s) x 75 table(s), 3351 slot admission(s) (1113 into a landing slot, 2238 reclaiming the coldest NON-routed re
+  ok  ip: the in-place arm ran during the scenario
+  ok  ip: the admission was live under two slots (this is the arm the gate exists for)
+
+==> GPU faults
+check-gpu-faults: kernel (journalctl): clean
+check-gpu-faults: log /tmp/tmp.S3L0FMDQ7Z/copy/server.log: clean (echoed prompt lines filtered)
+check-gpu-faults: log /tmp/tmp.S3L0FMDQ7Z/ip/server.log: clean (echoed prompt lines filtered)
+check-gpu-faults: OK: no GPU faults detected
+  ok  no GPU fault in either arm
+
+3 check(s), 0 failure(s)
+logs: /tmp/tmp.S3L0FMDQ7Z

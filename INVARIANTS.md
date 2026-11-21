@@ -1470,3 +1470,47 @@ Rules:
    minutes of that refuted a carried blocker here.
 
 Record: `RUNGS.md` R18.4, `wip/upstream-rebase-261120/COLD-START.md` §8, `WORKLOG.md` 261121.003.
+
+## r329 — a census assertion cannot fail on a binary that predates it: anchor the binary too
+
+**A gate that asserts a *census line* has no way to go red on a stale binary — it reads a run that never
+emitted the print, and reports the absence as a mechanism defect.**  `gate-uma-experts.sh` and
+`gate-prefill-server-slots.sh` both defaulted to `~/llama-scratch/build-rocm` (the `apu-expert-gtt` campaign
+tree, from before that campaign became block 15), and the 2026-11-21 arch validation on `halo` launched them
+with no `LLAMA_CLI`/`LLAMA_SERVER`.  So the r328 release certified a **2026-11-12** build of `7efb30ae5`:
+`gate-uma-experts` reported 48/49 with `FAIL ref: the GTT sizing fills did not report the placement queue`,
+because that build's `apply_heat_seed_locked` prints `… ranked by the %s band)` and the r277 transport tail
+(`, X MiB in Y ms (Z MiB/s, queue|serial)`) did not exist yet — the `strings` check that "proved" the format was
+present had been run against **the other binary** (`build-r328/bin/libggml-hip.so`), which is the r328 one.  With
+the delivery binary the same gate reads **49/49** and 120 placement-queue seed lines, and the slots gate reads
+3 checks / 0 failures.  Both gates now print `<binary>` + its own `--version` (build + commit) as their first
+line, and default to `~/llama.cpp/build-rocm`.
+
+Rules:
+
+1. **A gate prints the binary it certifies.**  `<path>` and `--version` on line 1, always — a census arm cannot
+   detect a stale anchor for you, and the arm's own numbers look plausible either way.
+2. **`strings`/`nm` evidence is evidence about *that file*.**  A format string found in one build says nothing
+   about the build that produced the log being explained; check the log's own `build NNNNN (sha)` line first
+   (llama-cli/llama-server print one at `-lv 4`, and `--version` prints one cheaply).
+3. **A default that points at a campaign tree outlives the campaign.**  When a campaign is promoted into a block,
+   its gate's default path and its header comment are part of the promotion — this is the delivery-side twin of
+   the `wip/` no-stub rule.
+
+Two facts this session established alongside it:
+
+* **`align_draft_caps()` already equalizes the band-derived caps inside the call.**  `TODO` #356's premise (the
+  arena band replaces the width band, so the caps can differ at a step boundary) is wrong on a `-ncmoe` host-pool
+  shape: `llama_model_moe_cache_band()` answers **0** there (a full-residency pool is not an arena), so
+  `LLAMA_SPEC_ALIGN_WIDTH_BAND` (16) is the bound in force and every two-drafting call logs one width —
+  `aligned draft depth seq N: 3 -> 5 (width band 16, drafting 2, hard 5)`.  The 2 surviving split steps are
+  **prefill/decode boundary** steps (one slot's last prompt chunk cannot merge with the other's verify batch,
+  and padding it would advance the recurrent state), which no cap policy can align.  `NCMOE_SPLIT_MAX=2` stays.
+* **The `>RAM` arena's ceiling on a 123 GiB APU is the budget.**  `gate-prefill-server-slots.sh`'s default
+  `-lme 90` on the 122B-A10B Q8_0 (~200 GB) puts a 90 GiB anonymous store on top of a >RAM mapping: measured
+  94 GiB anon → the kernel OOM-killed `llama-server` and 7 desktop tasks.  At **`-lme 85`** with the default
+  `--lazy-mode auto` both arms complete and the in-place band engages (159 calls × 75 tables, 3351 slot
+  admissions, 1113 landing / 2238 reclaiming a non-routed resident), A's text identical `ee7c607ad86e` and A
+  *faster* with the knob on (2.28 → 2.47 tok/s).
+
+Record: `WORKLOG.md` 261121.007, `archive/work/r328-followups/` (§3 rows and `logs/`).

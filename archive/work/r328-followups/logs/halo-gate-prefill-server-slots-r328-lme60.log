@@ -1,0 +1,27 @@
+
+==> two-slot decoder vs prefill interference (llama-server -np 2, one GPU)
+==> arm copy (MOE_EXPERT_PREFILL_IN_PLACE=0)
+    A: 160 tok 1.54 tok/s (in B's window 0.00 tok/s, longest gap 497 ms) sha=ee7c607ad86e
+    B: 17 chars in 49.0 s sha=97e3d4f49d85
+==> arm ip (MOE_EXPERT_PREFILL_IN_PLACE=1)
+    A: 160 tok 1.61 tok/s (in B's window 0.00 tok/s, longest gap 460 ms) sha=ee7c607ad86e
+    B: 17 chars in 49.4 s sha=97e3d4f49d85
+
+==> the assertions
+  ok  request A's text is identical in both arms (ee7c607ad86e)
+  ok  request A's decode: 1.6080258189355705 tok/s (ip) vs 1.5404538123683533 tok/s (copy), tolerance -3.0%
+  ok  request A's decode INSIDE B's prefill window: 0.0 tok/s vs 0.0 tok/s
+
+==> the mechanism on both arms (from the server's own census)
+  ok  ip: GTT prefill in place: 0 call(s) x 0 table(s), 0 slot admission(s) (0 into a landing slot, 0 reclaiming the coldest NON-routed resident), are
+FAIL  ip: no in-place prefill call happened -- the scenario did not exercise the change
+
+==> GPU faults
+check-gpu-faults: kernel (journalctl): clean
+check-gpu-faults: log /tmp/tmp.dcvarV8qwK/copy/server.log: clean (echoed prompt lines filtered)
+check-gpu-faults: log /tmp/tmp.dcvarV8qwK/ip/server.log: clean (echoed prompt lines filtered)
+check-gpu-faults: OK: no GPU faults detected
+  ok  no GPU fault in either arm
+
+3 check(s), 1 failure(s)
+logs: /tmp/tmp.dcvarV8qwK

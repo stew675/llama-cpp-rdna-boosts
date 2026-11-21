@@ -1,3 +1,118 @@
+## 261121.007 (r329) -- the r328 follow-ups close: both "halo failures" were the wrong binary, one owed row was already fixed, and the rest were environment limits
+
+**No patch block changed, no block renumbered, no tag.**  The delivery change is **three gate scripts** (an anchor
+line, two defaults, one `EXTRA_ARGS` passthrough and one corrected paragraph).  Every row in
+`archive/work/r328-followups/HANDOVER.md` §3 (F1-F6) is closed, so the r329 cut in §4 is unblocked.  Evidence: that
+directory's `logs/` (9 new logs) — the numbers below are quoted from those files.
+
+### 1. `TODO` #357 was not a census defect: the gate certified the wrong binary
+
+`gate-uma-experts.sh` and `gate-prefill-server-slots.sh` still defaulted to `~/llama-scratch/build-rocm` — the
+`apu-expert-gtt` campaign tree, which stopped being the right anchor when that campaign became **block 15** — and the
+r328 arch validation launched both with no `LLAMA_CLI`/`LLAMA_SERVER`.  So `halo` certified a **2026-11-12** build of
+`7efb30ae5`:
+
+```
+strings ~/llama-scratch/build-rocm/bin/libggml-hip.so | grep "persisted map"
+%s: … heat-seeded %d/%d slots from the persisted map (%d experts, ranked by the %s band)        <- pre-r277
+```
+
+That is the 168-byte line the handover puzzled over: the `, X MiB in Y ms (Z MiB/s, placement queue)` tail did not
+exist in that build yet, and the `strings` check that "proved" it did was run against
+`build-r328/bin/libggml-hip.so` — a different file.  A **census assertion cannot fail on a stale binary**: it reads a
+run that never emitted the print and reports the absence as a mechanism defect.  With the r328 binary,
+`LLAMA_CLI=~/llama.cpp/build-r328/bin/llama-cli ./scripts/gate-uma-experts.sh` on `halo` reads **49 checks, 0
+failures**, including `ref: the arena sizing fills ran on the placement queue (120 seed line(s))`, and a minimal arm
+prints `heat-seeded … 38.5 MiB in 13 ms (3014 MiB/s, placement queue)`.
+
+Both gates now default to `~/llama.cpp/build-rocm` and print their binary's path + its own `--version`
+(`build 12615, commit 6d9d54238`) as the first line of the run.
+
+### 2. `TODO` #354 closes: the `>RAM` two-slot arm runs, and the ceiling is the budget
+
+`gate-prefill-server-slots.sh` on `halo` with the **r328** server, `LME=85 EXTRA_ARGS='--lazy-mode auto'`:
+**3 checks, 0 failures**.
+
+| arm | A (decode) | A inside B's prefill window | B |
+|---|---|---|---|
+| `copy` (`MOE_EXPERT_PREFILL_IN_PLACE=0`) | 160 tok, **2.28 tok/s**, `ee7c607ad86e` | 0.0 tok/s, longest gap 303 ms | 17 chars in 38.0 s |
+| `ip` (`…=1`) | 160 tok, **2.47 tok/s**, `ee7c607ad86e` | 0.0 tok/s, longest gap 253 ms | 17 chars in 35.2 s |
+
+and the in-place band really ran: `GTT prefill in place: 159 call(s) x 75 table(s), 3351 slot admission(s) (1113 into
+a landing slot, 2238 reclaiming the coldest NON-routed resident)`.  The gate's default `-lme 90` is what killed the
+earlier attempt: **94 GiB anonymous** on top of a >RAM mapping OOM-killed `llama-server` and seven desktop tasks on
+the 123 GiB box, so 60..85 is the holdable range (at 60 the 122B pass routes more experts than the arena has slots
+and the band declines — an honest but vacuous arm).
+
+**Per-box prefill-logit bases** are now recorded where the gate needs them, both from `build 6d9d54238`:
+`halo` (gfx1151, 27B Q8_0) and `fingon` (gfx1100, 27B Q4_K_M), each self-testing at `mean KLD = 0.000000`, `same top
+p = 99.990 %`.
+
+**gfx1100's `gate-spec-align` now PASSES**, with `RECOVER=1.05` and the reason recorded rather than a threshold bent
+silently: on a single 24.5 GiB card the pair is memory-bound (pair aggregate 101.2 against 255.6 for the same pair at
+equal length, and the *inert* arm alone moves +13.5 % run to run), so the 10 % recovery bound — calibrated on
+multi-device shapes where the duplicated pass costs 3-54 % — is inside that box's own noise.  The strict parts did not
+move: splits `44+1 -> 2+1`, single-slot text identical `18f00253a900`, equal-length arm inert, 1-GPU pair 105.6 ->
+**126.7 t/s (+20 %)**, host-expert pair 93.7 -> **101.2 (+8.0 %)**.
+
+### 3. `TODO` #356 is REFUTED: the caps are aligned, the residual is a boundary step
+
+The row asked for block 02 to "equalize the band-derived caps in the same call".  `-lv 5` on the host-expert arm says
+they already are:
+
+```
+aligned draft depth seq 0: 3 -> 5 (width band 16, drafting 2, hard 5)        (every one of 44 two-drafting calls)
+```
+
+`width band 16` is also the answer to the premise: on a `-ncmoe` host-pool shape `llama_model_moe_cache_band()`
+answers **0** (a 100 %-residency pool is not an arena), so `LLAMA_SPEC_ALIGN_WIDTH_BAND` is the bound in force and
+`align_draft_caps()` applies it to every drafting sequence.  The 2 surviving splits are **prefill/decode boundary**
+steps — one slot's last 4-token prompt chunk cannot merge with the other slot's 6-row verify batch (measured: the very
+step before `id 0 | n_gen = 1`), and padding a prompt chunk to the other slot's width would advance the recurrent
+state.  No cap policy can fix that, so **block 02 is untouched**; the gate's NOTE/FAIL text now says what the residual
+is instead of naming a fix that would not work.  `NCMOE_SPLIT_MAX=2` stays as the honest bound (a growth still fails).
+
+### 4. R06.2's routed half closes: the abort was the pre-block-10 ladder tree
+
+`GGML_CUDA_MMB_TYPES=q8_0 GGML_CUDA_MMB_ROUTED=1` on 35B-A3B Q8_0, 2 devices `-sm tensor`, the 5298-token prompt:
+
+| build | result |
+|---|---|
+| r328 (`build-rocm`) | exit 0, **73 chars `86b7f9b5aa80`** — the `GGML_CUDA_MMB=0` control hash |
+| r328 + `GGML_CUDA_MMB_LOG=2` | same text, and the routed kernel is proven **reached**: `MMB_GLU fused gate/up+swiglu: M=256 K=2048 rows=8192` ×2 (that launch is gated on `mmb_routed_flag()`) |
+| r327 (`bin-r327`) | exit 0, the same `86b7f9b5aa80` |
+
+So the pool-LIFO abort was the intermediate ladder tree (blocks 06+09 with block 10's `pool_stack` absent), never the
+delivery — and R06's `expert_bounds` re-port is now covered by a real run instead of an owed one.  RDNA4 still ships
+`routed=0`: this is an override arm, not a default.
+
+### 5. `gate-node-budget` is no longer owed: phi-4 fetched, 4/4 arms pass
+
+There was no phi-4 (or equivalent tight shape) on any of the three boxes, and the gate exists for that shape's tight
+margin.  Fetched `bartowski/phi-4-GGUF`'s `phi-4-IQ4_XS.gguf` (7.9 GB) to `/llm/models/phi-4/IQ4_XS/` — the gate's
+`MODEL` default — and ran it on r328: `q8_0 -ub 2048`, `q8_0 -ub 512`, `f16 -ub 2048` and `q8_0 rot disabled` all
+generate and read the same `31 chars sha=a1b7eb2ee7a6`, with no "over its node budget" line.  `halo` and `fingon`
+still lack the file, so a release arm there must say "not runnable, no tight shape", not "pass" (`MANIFESTS.md` gate
+27).
+
+### 6. The r328 container images are published, which closes `TODO` #352
+
+The `radiance` worker watcher picked the tag up at 05:10, built and pushed all six images at 07:07 (both ROCm lines ×
+`full`/`light`/`server`, `latest` moved to 10.1) and pruned 12 versions.  Its log shows the `web` stage doing what
+#352 changed: `COPY ui/apps/chat/ ./` + `npm run build` → `vite build` with the PWA assets, then
+`COPY --from=web /app/ui/apps/chat/dist ui/apps/chat/dist` into the build tree.  No local image build was run (policy:
+never the full two-line build on the primary box during a release; a smoke was judged redundant against a green
+worker build of the same Dockerfile).
+
+### 7. What changed in the delivery, and what did not
+
+* `scripts/gate-uma-experts.sh`, `scripts/gate-prefill-server-slots.sh`: the anchor line + the delivery-tree default;
+  the slots gate also gains `EXTRA_ARGS` (it had no passthrough) and a header that names the `>RAM` ceiling.
+* `scripts/gate-spec-align.sh`: F3's corrected text (three places) — no behaviour change.
+* **No `patches/` change, no block amendment, no `release.json` change, no tag.**  `TODO` #352/#354/#356/#357 are
+  retired (their records are this entry and `archive/work/r328-followups/`), and the `wip/` entry is gone rather than
+  left as a stub.
+
 ## 261121.006 (r328) -- the two gaps the release carried are now closed on paper and mostly on hardware: the four-axis MTP protocol PASSES on both cache types, and gfx1151/gfx1100 are validated against the released set
 
 **No delivery patch changed, no block touched, no new release.**  Two post-release validations, run because the

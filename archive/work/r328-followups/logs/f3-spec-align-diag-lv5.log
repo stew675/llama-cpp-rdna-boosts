@@ -1,0 +1,30 @@
+==> speculative verify-batch alignment gate (draft-mtp-adaptive n_max 5, -sm tensor, -n 400, GPUs: 2)
+    model: Qwen3.8-27B-UD-Q4_K_XL.gguf
+    host-expert arm: Qwen3.6-35B-A3B-UD-Q4_K_M.gguf -ncmoe 40
+    knob: LLAMA_SPEC_ALIGN (on by default; the 'off' arms set it to 0)
+
+--> n_seq == 1 arm (llama-cli, one sequence)
+
+arm            aloneA             pair      agg same-agg  split steps (full+tail)
+off-2gpu        160.4        88.9/67.1    126.5    198.6  48+0
+on-2gpu         160.4       120.5/80.4    149.4    195.3  0+0
+off-ncmoe       276.8      147.4/131.2    150.9    365.2  46+1
+on-ncmoe        276.2      189.5/165.9    171.7    370.7  2+1
+
+PASS  2gpu: diverging pair 126.5 -> 149.4 t/s (+18 %)
+PASS  2gpu: equal-length arm 198.6 -> 195.3 t/s (-1.7 %, inert)
+PASS  2gpu: the control arm split 48 decode step(s) (0 of them single-row), the knob-on arm split 0 draft-length steps and 0 single-row step(s) (<= TAIL_MAX=2: the deliberate residual, the step on which a slot runs out of draft budget)
+PASS  2gpu: both single-slot requests are byte-identical on/off
+INFO  2gpu: pair[1] text diverges on/off at char 673 of 1202/1317 (a verify-width near-tie, see the header)
+PASS  ncmoe: diverging pair 150.9 -> 171.7 t/s (+14 %)
+PASS  ncmoe: equal-length arm 365.2 -> 370.7 t/s (+1.5 %, inert)
+PASS  ncmoe: the control arm split 46 decode step(s) (1 of them single-row), the knob-on arm split 0 draft-length steps and 1 single-row step(s) (<= TAIL_MAX=2: the deliberate residual, the step on which a slot runs out of draft budget)
+PASS  ncmoe: both single-slot requests are byte-identical on/off
+INFO  ncmoe: pair[1] text diverges on/off at char 196 of 1169/1165 (a verify-width near-tie, see the header)
+PASS  ncmoe: host-expert pair 150.9 -> 171.7 t/s (+13.8 %): split steps 46+1 -> 2+1
+NOTE  ncmoe: the aligned host-expert pair split 2+1, within NCMOE_SPLIT_MAX=2 (the arena band replaces LLAMA_SPEC_ALIGN_WIDTH_BAND here, so the caps can still differ at a step boundary; TODO #356)
+PASS  ncmoe: both single-slot requests are byte-identical on/off
+PASS  n_seq==1: single-sequence greedy text is byte-identical on/off (b8775233a93a)
+
+
+==> PASS; logs in /tmp/sa-diag

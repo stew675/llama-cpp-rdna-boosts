@@ -798,7 +798,9 @@ staging arena (`GGML_CUDA_FA_STAGE_CHUNK=<rows>` and `GGML_CUDA_FA_STAGE_PREALLO
 `TODO` #113).  Their records now live under `archive/work/fa-stage-chunking/` and
 `archive/work/fa-stage-peak/`; the one piece of the beta that did not survive (`DRAFT_MB`, which was not a
 cap) was dropped rather than shipped.  See `WORKLOG.md` 261027.011 (r159).
-
-* `r328-followups/` — **the r328 release's remaining work** (`HANDOVER.md` §3 rows F1-F6,
-  `NEXT-SESSION-PROMPT.md`, 29 evidence logs).  Open rows: `TODO` #357 (gfx1151 census), #354 remainder (the
-  `>RAM` two-slot arm, per-box KLD bases), #356 (host-expert caps), #352 (image smoke), R06.2, phi-4.
+**Closed (r329, 2026-11-21).**  `r328-followups/` — the r328 release's six follow-up rows (`TODO` #352, #354,
+#356, #357, R06.2's routed half and the phi-4 gate) — is done: `gate-uma-experts` **49/49** on gfx1151 after the
+stale-binary anchor was found, the `>RAM` two-slot arm **3/0** at `-lme 85`, per-box prefill-logit bases recorded
+on both gfx11 boxes, `gate-spec-align` PASS on gfx1100, `gate-node-budget` PASS on a freshly fetched phi-4, and
+the routed-MMB A/B reads the control hash.  The record moved to `archive/work/r328-followups/` (its `HANDOVER.md`
+carries a closure banner per row); the `wip/` entry was deleted with no stub.  See `WORKLOG.md` 261121.007.
