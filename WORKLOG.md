@@ -1,3 +1,59 @@
+## 261121.014 (r335) -- PR #339's BF16 `RMS_NORM` + `MUL` (+ `ADD`) abort is a REAL r324-r327 defect that the **r328 re-base already fixed**: archived, no patch, no tag
+
+**No delivery patch, block, `release.json` base/tip/tree or optional artifact changed, and no tag was cut**
+(the r330/r332 precedent for records-only work).  `main` gains one closed record,
+`archive/work/can-fuse-bf16-rms-norm-r324/`.
+
+### 1. The report was right — for the revision it was cut against
+
+PR #339 (`@jstamagal`, `wip/can-fuse-bf16-rms-norm-r324/`) says `ggml_cuda_can_fuse` (block 10,
+`ggml-cuda-try-fuse.cu`) asserts an F32 norm before the `RMS_NORM + MUL (+ ADD)` matcher, so a BF16 norm
+aborts instead of fusing, and that `RMS_NORM + SCALE` asserts where the fork point declines.  Both hold on
+**r324-r327**: `patches/0010-…patch` at `v17-4f9dfa0e3-r320` … `-r327` carries the two `GGML_ASSERT(rms_norm…`
+pairs (4 occurrences) and requires **both** `mul` operands to be F32, while each of those releases' own fork
+point (`4f9dfa0e3`) accepts an F32 **or** BF16 norm.
+
+The cause is upstream `31953bcf7` (*"ggml : add BF16 support to RMS_NORM (CPU, CUDA)"*, #32135), which
+relaxed those checks **in `ggml-cuda.cu`**.  Block 10 splits the dispatcher out of that hub into its own TU,
+so the delivery carries a **copy**, and the copy was taken from a pre-`31953bcf7` base.  The block's removal
+hunk in `ggml-cuda.cu` kept applying across the r320-r327 re-cuts, so no re-base noticed that the new TU's
+body had fallen behind the hub's — and no gate here could: there is no RDNA2 device in the fleet, the
+assert is on **every** HIP/CUDA device but only a BF16-norm graph reaches it, and the release gates' text
+arms use F32 norms.
+
+### 2. It was fixed at r328, by the re-base, not by a patch
+
+`v17-919794500-r328` … `-r334` carry **0** occurrences: the re-base onto `919794500` refreshed block 10's
+moved TU.  On the current release (`v17-919794500-r334`, tree `0ba731781`):
+
+* no `GGML_ASSERT(rms_norm…` anywhere in `ggml-cuda-try-fuse.cu` (the only F32/BF16 asserts left are
+  `norm.cu:1309`/`:1393`, in the fused kernels themselves);
+* the `RMS_NORM + MUL (+ ADD)` branch **and** the `RMS_NORM + SCALE` arm are **byte-identical** (2944 bytes
+  each) to `919794500:ggml/src/ggml-cuda/ggml-cuda.cu` — i.e. both hunks the PR proposes are already there;
+* `RMS_NORM + MUL + ROPE` is still F32-only on both, so there is no third divergence;
+* `git apply --check` of the PR's patch against the r334 tree fails on the assert context.
+
+Arms, gfx1201 / ROCm 10.1, default flags, `HIP_VISIBLE_DEVICES=0`: `test-backend-ops -b ROCm0 -o
+RMS_NORM_MUL_ADD` **124/124** (including `type=bf16,type_w=f32` and `type=bf16,type_w=f32,type_add=bf16` —
+the exact shapes the PR's conditions cover) and `-o RMS_NORM` **121/121**.  The contributor's r324 abort and
+his `113/113` were **not** re-run here (no gfx1030 device); the r324 state is read from the source at that
+tag and is not disputed.
+
+### 3. The decision, the records and what was asked of the contributor
+
+Nothing is folded in: the defect is already gone, so a patch would be a no-op that does not even apply.  The
+report is kept rather than dropped, because the *class* of bug — a block's moved copy of an upstream matcher
+drifting from its own fork point, invisible to every gate in the fleet — is new (`INVARIANTS.md` r335).
+
+Asked of the contributor in the PR reply: cut `wip/`/`beta/`/`optional/` artefacts against the **current**
+release tree, re-run the repro **before** offering the fix, and name the release revision — a re-base can fix
+a default-set bug with no patch at all.  `TODO` #361 (his V620 re-run on the r334 RDNA2 items) is the more
+valuable arm and now names the BF16 `RMS_NORM` shapes explicitly, so one run closes both.
+
+Records: `archive/work/can-fuse-bf16-rms-norm-r324/{README.md,0001-*.patch,RESOLUTION.md}` (the
+contributor's two files landed verbatim as his commit, the resolution as the maintainer's), `INVARIANTS.md`
+r335, `TODO.md` #361, `archive/README.md`.  PR #339 is answered and closed.
+
 ## 261121.013 (r334) -- **RELEASE**: three RDNA2 (`gfx1030`) items from contributor PR #338 (`@jstamagal`), folded into blocks 05/08/10 as RDNA2-gated code -- every supported arch's numerics unchanged
 
 **Blocks 05, 08 and 10 are amended; the base, the block count and the release prefix do not move** (17 official

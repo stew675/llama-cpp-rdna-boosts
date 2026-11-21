@@ -1596,3 +1596,24 @@ Record: `WORKLOG.md` 261121.007, `archive/work/r328-followups/` (§3 rows and `l
   larger, so a kernel wide enough that `4*waves_per_simd < waves_per_block` still aborts.  The caps were removed
   on the contributor's full `FLASH_ATTN_EXT` suite; that suite, not the removal, is the fact.
   Record: `WORKLOG.md` 261121.013, `patches/README.md` blocks 05/08/10, `ENVIRONMENT.md` §7.4.
+
+
+* **A block's MOVED COPY of an upstream function can drift from its own fork point, and no build or gate here
+  sees it: the next re-base is what reconciles it (r335, contributor PR #339).**  Block 10 splits the fusion
+  dispatcher out of `ggml-cuda.cu` into `ggml-cuda-try-fuse.cu`, so the delivery carries a *copy* of
+  `ggml_cuda_can_fuse`.  Upstream `31953bcf7` ("ggml : add BF16 support to RMS_NORM (CPU, CUDA)", #32135)
+  relaxed that matcher's `RMS_NORM` type checks **in the hub**, and the block's copy was taken before it, so on
+  **r324-r327** a BF16 `RMS_NORM` + `MUL` graph hit `GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32)` -- an
+  abort on **every** HIP/CUDA device -- while each of those releases' own base accepted an F32 or BF16 norm.  The
+  block's *removal* hunk in `ggml-cuda.cu` kept applying across the re-cuts, so nothing flagged it, and every
+  gate in the fleet is blind to it (no RDNA2/`gfx1030` device; the text arms use F32 norms; the code is
+  reachable on any device only from a BF16-norm graph).  Two consequences worth keeping:
+  (1) **a default-set defect can be introduced by an upstream commit between re-bases and removed by the next
+  re-base with no patch at all**, so a repro against a stale tree is a report about the past -- re-run it on the
+  current release before cutting a fix, and name the release revision;  (2) the check is cheap and should be part
+  of a re-base's reconciliation alongside the file-set rule (r331): for each region a block *moved* rather than
+  edited, diff the block's copy against `git show <base>:<upstream-file>` and treat a difference as a defect
+  until a decision row explains it.  On r334 the `RMS_NORM + MUL (+ ADD)` branch and the `RMS_NORM + SCALE` arm
+  are byte-identical (2944 bytes) to `919794500:ggml/src/ggml-cuda/ggml-cuda.cu`, `RMS_NORM + MUL + ROPE` is
+  F32-only on both, and `test-backend-ops -o RMS_NORM_MUL_ADD` reads 124/124 with the BF16 and BF16-residual
+  arms passing (gfx1201).  Record: `WORKLOG.md` 261121.014, `archive/work/can-fuse-bf16-rms-norm-r324/`.

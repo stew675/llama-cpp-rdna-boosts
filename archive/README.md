@@ -16,6 +16,7 @@ current; history is archived, not deleted).
 | `work/mmb-general/` | the **former top-level `beta/` record** of the `mmb`/`qsa3`/indexer campaign (the 28 patches are folded into the 16 delivery blocks; `apply-beta.sh` removed), moved here **2026-09-26** so `main`'s top level no longer carries a `beta/` directory |
 | `work/wip-archive/` | the older `wip/archive/` group (hybrid-allreduce, managed-ngrams, qwen35moe-prefill, qwen4exp), preserved with its original grouping |
 | `work/server-park-idle-slots/` | PR #225 (`@overdoingism`) promoted into block 12 as **r136**: idle-slot parking for the unified server KV cache (`RESOLUTION.md`, the original `README.md` and patch, `EVIDENCE-2026-10-25.md`) |
+| `work/can-fuse-bf16-rms-norm-r324/` | PR #339 (`@jstamagal`) **closed at r335 as already fixed**: the BF16 `RMS_NORM` + `MUL` (+ `ADD`) abort is real on r324-r327 and was removed by the r328 re-base onto `919794500` (no patch carried; `RESOLUTION.md` + the original `README.md`/patch) |
 
 **2026-09-12 consolidation:** the completed `wip/` trees and the promoted block-15 beta record were
 moved here; `wip/` now holds only the active `wip/iq4nl-prefill/` handoff.  Cross-references in the

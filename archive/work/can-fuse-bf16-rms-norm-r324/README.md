@@ -1,5 +1,13 @@
 # can-fuse-bf16-rms-norm-r324: BF16 RMS_NORM + MUL (+ ADD) aborts the fusion check
 
+**Status: CLOSED at r335 (PR #339).** The report is accurate for **r324-r327** and was **already fixed at
+r328** by the re-base onto `919794500`, which refreshed block 10's moved copy of `ggml_cuda_can_fuse` from
+the fork point (upstream `31953bcf7` relaxed these checks in `ggml-cuda.cu`, and the block's copy predated
+it). Nothing is folded in, the `0001-*.patch` below is **not** applied, and it no longer applies to the
+current release tree. See [`RESOLUTION.md`](RESOLUTION.md) for the evidence, `WORKLOG.md` 261121.014 and
+`INVARIANTS.md` r335 for the rule this taught. Kept as the campaign's original brief (verbatim from PR #339
+below the status header); it is not work in flight.
+
 A crash fix for default-set code, offered for folding into block 10 if it is useful. It is not RDNA2-specific:
 the check runs on every HIP/CUDA device.
 
