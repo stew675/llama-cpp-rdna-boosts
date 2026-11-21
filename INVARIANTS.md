@@ -1664,3 +1664,39 @@ Record: `WORKLOG.md` 261121.007, `archive/work/r328-followups/` (§3 rows and `l
   candidate).
   Record: `WORKLOG.md` 261121.015, `benchmarks/2026-11-21-mmb-bf16-pinned.md`,
   `archive/work/mmb-bf16-pinned-r325/`, `ENVIRONMENT.md` §10.2, `patches/README.md` block 06.
+
+
+* **A tier's own hole set is not the only way its master can be mapping-backed: an arm that is REFUSED a plan
+  still has to declare its holes (r337, GitHub issue #347, block 15).**  Since r294 the host experts' master is
+  the read-only model mapping whenever the tier has holes (`host_expert_master_mapped()`), and `--load-mode` has
+  no say in it.  The APU GTT **arena** arm is the counter-example that rule did not cover: it records
+  `host_experts_store_arena` and deliberately leaves `host_experts_plan_done` false (it has no pinned tier to
+  balance, so `-lme`'s hole set is not its plan), so the predicate read "not mapped" and `llama-model.cpp`
+  allocated a **pageable full copy of the whole expert set**, on every `--load-mode`, from r294 to r336.
+  Numbers (gfx1151 `halo`, 35B-A3B Q4_K_M, `-lme 4`, 18 662.5 MiB expert set): one `ROCm_HostMap` buffer of
+  **18 662.00 MiB** and peak `RssAnon` **23 649 MiB** before, per-range host-pointer buffers over the mapping
+  (176/144 MiB) and **4 987 MiB** after -- text identical (`627b2ebd7792`) either way; the reporter's Flash-Next
+  set (40 925.6 MiB, `-lme 28`) was a **46 800 MiB** copy on a 780M.  Rules:
+  (1) **A predicate that answers "is this tier mapping-backed" must be satisfied by EVERY arm that keeps
+  tensors in the mapping**, including one that has no plan; the arena now records its tables in
+  `host_experts_holes` and the predicate accepts `host_experts_store_arena` as a hole source, so there is still
+  exactly one decision.
+  (2) **An `mlock` must not pin a tier's fill source** (TODO #333's rule) -- the arena's holes are now
+  `host_expert_is_hole()`s too, so `--load-mode mlock|mmap+mlock` skips them and counts the bytes instead of
+  sweeping the whole set.
+  (3) **`use_mmap` is not a storage decision, and neither is a plan.**  r294's rule was "the load mode does not
+  decide where the master lives"; its twin is that the master predicate has to be keyed on the TIER, and the
+  arena tier's forced mapping was necessary but never sufficient (the arm's own comment claimed the copy was
+  avoided; it was not).
+  (4) **The tier's census must not name the other tier**: on the arena the pageable-master line said
+  "pool-backed `--host-experts pool`" and a `host pool PLACEMENT reads` line was printed where the preflight
+  says the pool does not apply.  Both now say the arena / stay silent.
+  Gates: `gate-uma-experts.sh` **49/0** (12 arms one text, `pfverify` spans still equal to the mapping, the
+  `>RAM` arm 85 861.7 MiB / 2 919 evictions), `gate-prefill-server-slots.sh` **3/3** (159 in-place calls at
+  `LME=85`; also 120 at `LME=60 -ub 512`), prefill-logit **-0.000000 / 100.000 %** on the arena arm and
+  **0.000000 / 99.990 %** on the default point (bases from the pre-fix build, same ROCm line), coherence 4B
+  `7e6229b260f6`.  The discrete host pool is unaffected by construction (an `IGPU`-only flag).  The slots gate's
+  other fact: at a tight budget its `ip` arm fails as "the scenario did not exercise the change" because the
+  in-place admission's bound is `|used| <= slots` and a ~3548-token ubatch routes nearly every expert
+  (`LME=60` default ubatch = 564 declines / 0 calls against 120 calls at `-ub 512`), so `LME=85` is the arm to
+  run.  Record: `WORKLOG.md` 261121.016, `patches/README.md` block 15.

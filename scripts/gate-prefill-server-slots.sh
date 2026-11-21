@@ -38,6 +38,18 @@
 #   memory on top of a >RAM mapping: on a 123 GiB box it OOM-kills the server (measured: 94 GiB anon, plus 8
 #   kernel OOM kills), so `LME=60..85` is the range that box can hold.  `EXTRA_ARGS` is how an arm reaches for
 #   anything else, e.g. `EXTRA_ARGS='--lazy-mode auto'`.
+#
+#   On that box `LME=85` is the arm the r329 record used and it is the one to run (both arms complete, the
+#   in-place band engages).  At a TIGHTER budget the `ip` arm also needs a smaller prefill ubatch
+#   (`LME=60 EXTRA_ARGS='-ub 512 -b 512'`): the in-place admission has a documented hard bound -- one routed pass
+#   must fit the arena's slots for the tables it touches (`|used| <= slots`) -- and the server's own ~3548-token
+#   prefill ubatch routes (nearly) every one of the 122B's 256 experts per table, so the whole pass declines to
+#   the per-expert copy and the run fails with "no in-place prefill call happened -- the scenario did not
+#   exercise the change", which is a config limit, not a defect.  Measured 2026-11-21 on `halo` (gfx1151,
+#   123 GiB): `LME=60` at the default ubatch = 564 declines / 0 calls; `LME=60 EXTRA_ARGS='-ub 512 -b 512'` =
+#   120 calls x 117 tables, 3384 slot admissions, both arms' text identical, A's decode 1.23 against 1.17 t/s
+#   (`ip` against `copy`); `LME=85` at the default ubatch = 159 calls x 75 tables, 3351 slot admissions, A 3.24
+#   against 3.01 t/s.
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

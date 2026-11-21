@@ -1,3 +1,95 @@
+## 261121.016 (r337) -- **RELEASE**: GitHub issue #347 -- the APU GTT arena MATERIALISED the whole expert set as a pageable copy, because the arena makes holes but no plan; the arena's hole set is now a hole set like any other
+
+**`release.json` changed: release `v17-919794500-r336` -> `-r337`, tip `fb97954bd` -> `ccd813376`, tree
+`213764a779` -> `d5961692a`; base, block count and the release prefix do not move** (17 official blocks + the
+temporary `0300` = 18 default patches, base `919794500`).  **Block 15 is amended**; blocks 00-14 are
+byte-identical and `0300`'s id moves only through its parent.  The optional `0100`/`0101` are re-cut against the
+new tree (alone -> `2cdedbfb4` / `5eeb6f693`, cumulative `55d07c2fc`), both apply **strictly**.
+`scripts/validate-set.sh` green.
+
+### 1. The report, reproduced on this box
+
+`@tazmaniax` (issue #347) ran Flash-Next Q2_K on a Radeon 780M (`gfx1103`, `HSA_OVERRIDE_GFX_VERSION=11.0.0`):
+on **r279** the native GTT arena worked with a 28 GiB budget; from **r294** (and still at r333) the loader built
+the 28 GiB arena and then allocated a **46 800 MiB pageable `ROCm_HostMap` buffer** for the same expert set,
+which his memory floor stopped before the server became ready.  His source diagnosis -- `host_expert_master_mapped()`
+requires `host_experts_plan_done`, and the APU branch clears it after planning the store -- is exactly right.
+
+Reproduced here (`halo` / gfx1151, 35B-A3B Q4_K_M, `-lme 4 --load-mode mmap`, an 18 662.5 MiB expert set):
+
+| arm | peak `RssAnon` | `ROCm_HostMap` buffers | the WARN | greedy text |
+|---|---|---|---|---|
+| r336 (pre-fix) | **23 649 MiB** | one **18 662.00 MiB** allocation | `host expert master is not file-mapped` **with `--load-mode mmap`** | `89 chars sha=627b2ebd7792` |
+| r337 | **4 987 MiB** | one host-pointer buffer per mapping range (176/144 MiB) | absent | `89 chars sha=627b2ebd7792` |
+
+The reporter's own shape (Flash-Next GSQ-IQ3_XXS, a **40 925.6 MiB** expert set, `-lme 28 --load-mode mmap
+--lazy-mode on --fit off`) now loads at **29 542 MiB** peak `RssAnon` = the 28 672 MiB arena + ~870 MiB, text
+`91 chars sha=ffed60de47ae`; the AUTO load mode (the iGPU default resolves to `none`) reads the same 4 987 MiB
+and the same text, because the arena forces the mapping either way.
+
+### 2. The mechanism, and why r279 worked
+
+`plan_gtt_expert_store()`'s ARENA arm sets `host_experts_store_arena` and returns with
+`host_experts_plan_done = false` -- deliberately, because the arena has no PINNED tier to balance and `-lme`'s
+hole set is the pool's plan.  But `llama-model.cpp` decides "is the expert master the read-only model mapping"
+with `host_expert_master_mapped()`, which required `host_experts_plan_done && !holes.empty()`.  False, so the
+context took the allocating branch (`ggml_backend_alloc_ctx_tensors_from_buft`) and the tensors were a pageable
+copy **inside the mapping's place**: the arena's own forced `use_mmap` could not help, because since r294 a load
+mode only decides how bytes are READ.  r279 worked because the test then WAS `use_mmap`.  (The arena arm's
+comment already claimed a "pageable full copy of the set" was avoided; it was not, and r294 is what made the
+claim false.  Its measured `+18 662 MiB` is the same figure, now actually fixed.)
+
+### 3. The fix (block 15, three files)
+
+* `src/llama-model-loader.cpp` -- the ARENA arm records every expert table (trunk + the MTP/nextn head) in
+  `host_experts_holes`.  A hole is a hole: the arena holds SLOTS, not tensors, so all of them stay in the
+  mapping.
+* `src/llama-model-loader.h` -- `host_expert_master_mapped()` and `host_expert_is_hole()` accept
+  `host_experts_store_arena` as a source of holes alongside a plan.  One predicate stays the source of truth,
+  and the `mlock` exemption (TODO #333) follows for free: a `--load-mode mlock`/`mmap+mlock` run must not pin
+  the arena's fill source, exactly as it must not pin a `-lme` hole.
+* `ggml/src/ggml-cuda/moe-expert-cache.cu` -- two census lines named the DISCRETE tier on an APU: the
+  pageable-master line (`pool-backed --host-experts pool`) now says the GTT arena's fill source, and the
+  `host pool PLACEMENT reads` line is not printed on a tier whose preflight says the pool does not apply.
+
+Not a r294 revert: the storage/transport split stands (`--load-mode` still owns the demand transport), the
+arena just has to SAY it has holes.  `MOE_EXPERT_GTT=0`, a declined arena and whole-tensor placement are all
+untouched (no `host_experts_store_arena`, no holes, today's behaviour byte for byte).
+
+### 4. Gates (r337 tree `d5961692a`, gfx1151 / ROCm 10.2, the delivery build)
+
+* `validate-set.sh` green (checksums, fresh-tarball strict 18/18, both optional artifacts + the cumulative tree,
+  the Windows lints).  `fork-refresh.sh` re-cut reproduces tip `ccd813376` / tree `d5961692a`.
+* `gate-uma-experts.sh` **full: 49 checks, 0 failures** (all 12 text arms `4f29f1e4a4d6`; `pfverify` every
+  coalesced span still equals the mapping; the `>RAM` arm 85 861.7 MiB / 2 919 evictions; the lock clamp and the
+  `-lme` refusal arms unchanged).
+* `gate-prefill-server-slots.sh` **3/3** twice: the documented `LME=85` arm (159 in-place calls x 75 tables,
+  3 351 admissions, A's text `ee7c607ad86e` in both arms, 3.24 vs 3.01 t/s) and a tighter `LME=60
+  EXTRA_ARGS='-ub 512 -b 512'` arm (120 calls x 117 tables, 3 384 admissions, `357874018286` in both).
+* `gate-prefill-logits.sh` **PASS** on both points, against bases recorded from the pre-fix build on the same
+  ROCm line: the 35B **arena** arm (`-lme 4 --fit off`, `MOE_EXPERT_HEATMAP=load`) **-0.000000 / 100.000 %** and
+  the default 27B point **0.000000 / 99.990 %** -- i.e. r336's block 06 and this fix are both numerically inert
+  here.
+* Coherence: 4B 1 GPU `7e6229b260f6` (the r336 record's hash), no GPU fault in any gate's window.
+* Not run here: `gate-host-pool.sh` (the DISCRETE host pool -- this box has no discrete GPU; the fix is
+  unreachable there by construction: `host_experts_store_arena` is only ever set by `plan_gtt_expert_store`,
+  which only runs for an integrated device).
+
+### 5. Found alongside
+
+`gate-prefill-server-slots.sh`'s `ip` arm can fail as "the scenario did not exercise the change" at a tight
+budget: the in-place admission's hard bound is `|used| <= slots` per table, and the server's ~3548-token prefill
+ubatch routes nearly every expert of the 122B, so at `LME=60` the whole pass declines (564 declines / 0 calls).
+The gate header now names the canonical `LME=85` arm and `LME=60 EXTRA_ARGS='-ub 512 -b 512'` as the fallback,
+with the measured counts (`INVARIANTS.md` r337).
+
+### 6. Records and issue handling
+
+`patches/README.md` block 15 (the r337 amendment), `INVARIANTS.md` r337.  Replied to `@tazmaniax` with the
+mechanism, the before/after numbers, what the fixed loader does now (and that it does not need any setting), and
+closed the issue as fixed.  Containers: the release tag is picked up by the worker watcher
+(`scripts/container-watch.sh` on `radiance`), nothing was built on this box.
+
 ## 261121.015 (r336) -- **RELEASE**: contributor PR #340 folded into **block 06** -- BF16 dense GEMMs take MMB while `ROCBLAS_USE_HIPBLASLT=0` (the §44 pin costs 1-4 % instead of 13-23 %), plus an RDNA4 dead-write removal -- every supported arch's default numerics unchanged
 
 **Block 06 is amended; the base, the block count and the release prefix do not move** (17 official blocks +
