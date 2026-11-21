@@ -1,0 +1,57 @@
+==> norm-rows fusion aliasing gate (issue #276)
+    build=/home/stew675/llama.cpp/build-rocm
+    src=/home/stew675/llama.cpp
+    logs=/tmp/tmp.7qeb3Vrv1I
+
+==> A. the aliasing guard, driven without a scheduler (no alloc deps at all)
+    backend=-lggml-hip
+    arm set: fused (exit 0)
+      RESULT PASS
+    arm set: nofuse (exit 0)
+      RESULT PASS
+    fused ref digest=bcc36422f9a120ac  chain ref digest=bcc36422f9a120ac
+
+==> B. the delivery path on a real GGUF (the scheduler's alloc deps must still hold)
+    model=/llm/models/Ling/3.0-tiny/IQ4_NL/Ling-3.0-tiny-IQ4_NL.gguf
+    prompt=/home/stew675/llama-cpp-rdna-boosts/prompts/prose-rdna-boosts.txt ctx=8192 ngen=32 extra='-ngl 99'
+    fused: exit 0
+    chain: exit 0
+    probe: exit 0
+    probe_off: exit 0
+    probe: 180 decisions (180 of them the gated form), 0 declined
+    probe with the kill switch: 0 fusion lines
+    fused: 172 chars sha=f476efaac086   chain: 172 chars sha=f476efaac086
+
+==> C. the PLAIN form on a SILU-gated hybrid (issue #285: a declined gated match must leave no
+       gate index behind for the plain match)
+    model=/llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf
+    prompt=/home/stew675/llama-cpp-rdna-boosts/prompts/prose-rdna-boosts.txt ctx=8192 ngen=32 extra='-ngl 99'
+    silu_fused: exit 0
+    silu_chain: exit 0
+    silu_probe: exit 0
+    silu_probe_off: exit 0
+    probe: 344 decisions (344 plain, 0 gated), 0 declined 
+    probe with the kill switch: 0 fusion lines
+    fused: 139 chars sha=d2ffb97ccb76   chain: 139 chars sha=d2ffb97ccb76
+
+==> GPU faults (since 2026-11-21 03:09:44)
+    check-gpu-faults: kernel (journalctl since '2026-11-21 03:09:44'): clean
+    check-gpu-faults: log /tmp/tmp.7qeb3Vrv1I/chain.log: clean (echoed prompt lines filtered)
+    check-gpu-faults: log /tmp/tmp.7qeb3Vrv1I/compile.log: clean (echoed prompt lines filtered)
+    check-gpu-faults: log /tmp/tmp.7qeb3Vrv1I/drv_fused.log: clean (echoed prompt lines filtered)
+    check-gpu-faults: log /tmp/tmp.7qeb3Vrv1I/drv_nofuse.log: clean (echoed prompt lines filtered)
+    check-gpu-faults: log /tmp/tmp.7qeb3Vrv1I/fused.log: clean (echoed prompt lines filtered)
+    check-gpu-faults: log /tmp/tmp.7qeb3Vrv1I/probe.log: clean (echoed prompt lines filtered)
+    check-gpu-faults: log /tmp/tmp.7qeb3Vrv1I/probe_off.log: clean (echoed prompt lines filtered)
+    check-gpu-faults: log /tmp/tmp.7qeb3Vrv1I/silu_chain.log: clean (echoed prompt lines filtered)
+    check-gpu-faults: log /tmp/tmp.7qeb3Vrv1I/silu_fused.log: clean (echoed prompt lines filtered)
+    check-gpu-faults: log /tmp/tmp.7qeb3Vrv1I/silu_probe.log: clean (echoed prompt lines filtered)
+    check-gpu-faults: log /tmp/tmp.7qeb3Vrv1I/silu_probe_off.log: clean (echoed prompt lines filtered)
+    check-gpu-faults: OK: no GPU faults detected
+
+PASS: the norm-rows fusion declines every unsafe alias, keeps the benign one, and reproduces the
+      unfused chain byte for byte.
+      On the real gated GGUF it still fused every node with nothing declined (the scheduler's
+      alloc deps hold) and its text equals the kill-switch arm.
+      On the SILU-gated hybrid the PLAIN form fused with nothing declined (issue #285: no stale
+      gate index reached it) and its text equals the kill-switch arm.

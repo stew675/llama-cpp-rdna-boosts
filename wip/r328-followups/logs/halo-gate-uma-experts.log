@@ -1,0 +1,100 @@
+==> arm off (MOE_EXPERT_GTT=0)
+==> arm ref (MOE_EXPERT_GTT_ARENA=1)
+==> arm resident (MOE_EXPERT_GTT_ARENA=1)
+==> arm lock (MOE_EXPERT_GTT_ARENA=1)
+==> arm budget (MOE_EXPERT_GTT_ARENA=1)
+==> arm lmeauto (MOE_EXPERT_GTT_ARENA=1)
+==> arm touch1 (MOE_EXPERT_GTT_ARENA=1 MOE_EXPERT_CACHE_TOUCH=1)
+==> arm touch2 (MOE_EXPERT_GTT_ARENA=1 MOE_EXPERT_CACHE_TOUCH=2)
+==> arm touch3 (MOE_EXPERT_GTT_ARENA=1 MOE_EXPERT_CACHE_TOUCH=3)
+==> arm fault (MOE_EXPERT_GTT_ARENA=1 MOE_HOST_POOL_FILL_FAULT=1 MOE_EXPERT_GTT_PREFILL_FAULT=1)
+==> arm pfverify (MOE_EXPERT_GTT_ARENA=1 MOE_EXPERT_GTT_PREFILL_VERIFY=1)
+==> arm nohb (MOE_EXPERT_GTT_ARENA=1 GGML_FORCE_NO_INTEGRATED=1)
+==> arm cold (MOE_EXPERT_GTT_ARENA=1)
+==> arm shapefit
+==> arm pfoff (MOE_EXPERT_GTT_ARENA=1 MOE_EXPERT_GTT_PREFILL=0)
+==> arm pfcp (MOE_EXPERT_GTT_ARENA=1 MOE_EXPERT_PREFILL_IN_PLACE=0)
+==> arm inplace (MOE_EXPERT_GTT_ARENA=1 MOE_EXPERT_PREFILL_IN_PLACE=1)
+==> arm nolme (expected to REFUSE)
+==> arm ram
+
+==> text identity (every arm must match the delivery's own behaviour, arm 'off')
+    off      575 chars sha=4f29f1e4a4d6
+  ok  the reference arm produced a hash
+  ok  ref: 575 chars sha=4f29f1e4a4d6
+  ok  resident: 575 chars sha=4f29f1e4a4d6
+  ok  budget: 575 chars sha=4f29f1e4a4d6
+  ok  lmeauto: 575 chars sha=4f29f1e4a4d6
+  ok  lock: 575 chars sha=4f29f1e4a4d6
+  ok  pfoff: 575 chars sha=4f29f1e4a4d6
+  ok  pfcp: 575 chars sha=4f29f1e4a4d6
+  ok  inplace: 575 chars sha=4f29f1e4a4d6
+  ok  shapefit: 575 chars sha=4f29f1e4a4d6
+  ok  cold: 575 chars sha=4f29f1e4a4d6
+  ok  fault: 575 chars sha=4f29f1e4a4d6
+  ok  nohb: 575 chars sha=4f29f1e4a4d6
+  ok  touch1: 575 chars sha=4f29f1e4a4d6
+  ok  touch2: 575 chars sha=4f29f1e4a4d6
+  ok  touch3: 575 chars sha=4f29f1e4a4d6
+  ok  pfverify: 575 chars sha=4f29f1e4a4d6
+  ok  ram: 570 chars sha=4cc5ad1b40a4 (a >RAM model completes)
+
+==> the arena is real (arm 'ref' must not be vacuous)
+  ok  ref: 120 table(s) resident
+  ok  ref: 0 arena releases (a steady-state residency arm never hands a slot back)
+  ok  ref: 6648 eviction(s) -- the config really evicts
+  ok  ref: cache tables=120
+  ok  ref: extent budget 4096.0 MiB for a 18662.5 MiB expert set
+
+==> the budget arms
+  ok  budget: extent 6144.0 MiB <= -lme 6 GiB +- one slot
+  ok  resident: 0 evictions (-lme 20 holds the whole set)
+  ok  lmeauto: 0 evictions (auto in the fitting band is the whole set)
+
+==> the kill switch (arm 'off')
+  ok  MOE_EXPERT_GTT=0: no GTT arena census, i.e. the tier is not in play
+  ok  MOE_EXPERT_GTT=0: the host-expert tier is still refused and the cache holds tables=0
+  ok  lock: an 1 GiB RLIMIT_MEMLOCK CLAMPS the store and the log says so (the lock policy is real)
+
+==> the fault arm (a failed fill must DECLINE, and must never corrupt)
+  ok  fault: (no per-fill line; the decline census below is the assertion)
+  ok  fault: 117 prefill fill(s) declined, the per-expert source served them
+
+==> P5 prefill streaming (arm 'pfcp': MOE_EXPERT_PREFILL_IN_PLACE=0, the r265 copy path)
+  ok  pfcp: read 9451.6 MiB of 12809.2 MiB used (73.8 %) -- the residents are NOT re-read
+  ok  pfcp: 7246 coalesced span(s)
+  ok  pfoff: 11608.1 MiB served per-expert vs 9451.6 MiB streamed (81.4 % of the per-expert traffic)
+
+==> TODO #317: the prefill band served IN PLACE (arm 'inplace', -lme 16)
+  ok  inplace: 108 table call(s) served in place over 108 table(s)
+  ok  inplace: 1603 slot admission(s) (829 landing, 774 reclaiming a non-routed resident)
+  ok  inplace: arena D2D 1194.4 MiB vs pfcp's 3357.6 MiB at the SAME per-table slots
+  ok  inplace: read 971.7 MiB of 11446.2 MiB used (8.5 %)
+  ok  inplace: 9 table call(s) declined (named: 'no room without evicting a routed expert' / short read) -- the staging arm served them
+  ok  inplace: arena D2D 1198.4 MiB vs pfcp's 3359.6 MiB (<= half)
+  ok  ref: no demand fill waited >= 1 ms -- P4e's answer (no fill worker) holds
+  ok  pfverify: every coalesced span equals the model mapping
+
+==> admission is a documented NO-OP on this tier (arms touch1/2/3 must be identical)
+  ok  touch 1/2/3: the same residency (6648 evictions) -- MOE_EXPERT_CACHE_TOUCH is inert here, as the tier documents
+FAIL  ref: the GTT sizing fills did not report the placement queue (the batch path declined silently)
+      0.00.632.859 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_down_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+      0.00.640.110 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_gate_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+      0.00.642.753 I apply_heat_seed_locked: layer=31 role=blk.31.ffn_up_exps.weight heat-seeded 56/56 slots from the persisted map (256 experts, ranked by the DECODE band)
+  ok  ref: no sizing fill fell back to the serial arm
+
+==> the DEFAULT SHAPE follows -lme: a cap below the set -> arena; a budget that covers it -> placement
+  ok  shapefit: -lme 4 against 4096 MiB of store -> the ARENA, and the census names the cap
+  ok  resident: -lme 20 covers the whole set -> PLACEMENT (nothing to stream, nothing evicted)
+  ok  ram: a >RAM model gets the arena with the env UNSET, and the census names the cap it asked for
+  ok  nolme: a >RAM model with no -lme is REFUSED at load, and the message says streaming is opted in by -lme
+
+==> the >RAM arm (arm 'ram')
+  ok  ram: 84618.6 MiB used, 3267 evictions
+  ok  ram: the arena tier is in play
+
+==> GPU faults and aborts
+  ok  no arm logged a GPU fault, an abort or an assert
+  ok  (KLD gate skipped: pass --kld.  It is MANDATORY for a release: this is a prefill-path change)
+
+49 check(s), 1 failure(s).  Logs: /tmp/tmp.PeTe4stoUv

@@ -41,6 +41,10 @@ left in this file.  The r236 re-base
 
 ## The open list
 
+**`r329` gate (2026-11-21, set by the r328 release):** a new release is not cut until **every row below** is
+closed — or parked with a reason the maintainer agreed to — and `wip/r328-followups/HANDOVER.md` §3/§4 is the
+checklist that goes with it.  A green gate ladder is not permission to skip a row.
+
 | # | subject | kind | status |
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |

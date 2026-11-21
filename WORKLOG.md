@@ -22,6 +22,13 @@ pairs) — the purity property a decode/verify regression breaks first, holding 
 is 0.761-0.984 against a ~0.45 floor (nowhere near the 2026-09-02 `0.000` collapse), and MTP is 1.97-4.42× plain
 everywhere, including prose where the rule only asks for parity within 10 %.
 
+**And the dedicated purity gate passes too.**  `gate-spec-purity.sh` (issue #330's own gate, which the four-axis
+protocol only partially covers) on the released tree at 3-device `-sm tensor`: manifest A (q8_0/prose) identical
+`c1f9d0b3f5b6` at 41.3 → 99.1 t/s, manifest B (bf16/reasoning) identical `2fbc183348a8` at 42.3 → 99.7, the four
+axes on both caches all identical, and the width probe's flat **and 256-cell-boundary** arms run.  **Purity is
+verified, not merely un-broken** — the non-vacuity check (draft ≥ 1.2× plain) is enforced by the gate and read
+1.87×-2.98×.
+
 ### 2. gfx1151 and gfx1100, from a fresh apply of the RELEASED set
 
 Both boxes drove `scripts/apply-all.sh` at `919794500`: strict **18/18**, tree

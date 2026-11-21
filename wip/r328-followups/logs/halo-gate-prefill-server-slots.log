@@ -1,0 +1,60 @@
+
+==> two-slot decoder vs prefill interference (llama-server -np 2, one GPU)
+==> arm copy (MOE_EXPERT_PREFILL_IN_PLACE=0)
+    A: 160 tok 3.76 tok/s (in B's window 0.49 tok/s, longest gap 511 ms) sha=3c2245a89587
+    B: 17 chars in 18.4 s sha=97e3d4f49d85
+==> arm ip (MOE_EXPERT_PREFILL_IN_PLACE=1)
+Traceback (most recent call last):
+  File "/home/stew675/llama-cpp-rdna-boosts/scripts/gate-prefill-server-slots.py", line 119, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/home/stew675/llama-cpp-rdna-boosts/scripts/gate-prefill-server-slots.py", line 94, in main
+    b_text, b_stamps, b_t0, b_t1 = stream_completion(a.port, prompt_b, a.n_predict_b)
+                                   ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/stew675/llama-cpp-rdna-boosts/scripts/gate-prefill-server-slots.py", line 44, in stream_completion
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib64/python3.14/urllib/request.py", line 187, in urlopen
+    return opener.open(url, data, timeout)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib64/python3.14/urllib/request.py", line 487, in open
+    response = self._open(req, data)
+  File "/usr/lib64/python3.14/urllib/request.py", line 504, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+                              '_open', req)
+  File "/usr/lib64/python3.14/urllib/request.py", line 464, in _call_chain
+    result = func(*args)
+  File "/usr/lib64/python3.14/urllib/request.py", line 1362, in http_open
+    return self.do_open(http.client.HTTPConnection, req)
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib64/python3.14/urllib/request.py", line 1337, in do_open
+    r = h.getresponse()
+  File "/usr/lib64/python3.14/http/client.py", line 1478, in getresponse
+    response.begin()
+    ~~~~~~~~~~~~~~^^
+  File "/usr/lib64/python3.14/http/client.py", line 343, in begin
+    version, status, reason = self._read_status()
+                              ~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib64/python3.14/http/client.py", line 312, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+                             " response")
+http.client.RemoteDisconnected: Remote end closed connection without response
+FAIL  ip: the two-slot scenario failed (rc=1)
+
+==> the assertions
+FAIL  request A's text differs: copy=3c2245a89587 ip= (a placement policy must not change the bytes)
+FAIL  request A's decode was disturbed: ip= vs copy=3.759657199698907 tok/s (tolerance -3.0%)
+FAIL  request A stalled while B prefilled: ip= vs copy=0.4902512986703976 tok/s in the window
+
+==> the mechanism on both arms (from the server's own census)
+FAIL  ip: no in-place prefill call happened -- the scenario did not exercise the change
+
+==> GPU faults
+check-gpu-faults: kernel (journalctl): clean
+check-gpu-faults: log /tmp/tmp.yRAGp1GAlM/copy/server.log: clean (echoed prompt lines filtered)
+check-gpu-faults: log /tmp/tmp.yRAGp1GAlM/ip/server.log: clean (echoed prompt lines filtered)
+check-gpu-faults: OK: no GPU faults detected
+  ok  no GPU fault in either arm
+
+3 check(s), 5 failure(s)
+logs: /tmp/tmp.yRAGp1GAlM

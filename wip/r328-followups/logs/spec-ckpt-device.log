@@ -1,0 +1,18 @@
+==> speculative-checkpoint location gate (layer, 1 GPU, -ncmoe 0, ctx 16384)
+    model /llm/models/Qwen3.8/27B/Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf
+    copy request input: /home/stew675/llama-cpp-rdna-boosts/scripts/cleanup-ghcr.py (a67aa6337550d8da...)
+
+PASS  kill switch: host arm 100 % host memory, device arm on the device path (1 slot decision(s))
+PASS  -nkvo: host path, and it says why (the state is not offloaded)
+INFO  speculative checkpoints: device arm 18 created / 5 restored, host arm 18 / 5
+
+  request   host t/s   device t/s   delta      draft/acc (host vs device)   text
+  copy         132.7        135.0    +1.7%  1120/967 vs 1120/967   == host/device
+  prose         31.8         31.8    +0.1%  None/None vs None/None   == host/device
+
+  resident host memory at the end: host 1980 MiB, device 1830 MiB (-150 MiB: the state is in VRAM, not RSS)
+PASS  no GPU fault in the kernel journal or the device arm's log
+
+==> PASS: the device checkpoint restores the same bytes the host path does (text, drafts and accepted
+    tokens identical), the kill switch keeps the host path, and -nkvo stays on it with its own reason.
+    logs kept in /tmp/tmp.DeKPYePvUr

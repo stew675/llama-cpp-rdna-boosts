@@ -1,0 +1,32 @@
+==> qwen4exp hyper-connection fusion-equivalence gate
+    cli=/home/stew675/llama.cpp/build-r328/bin/llama-cli
+    model=/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
+    blk.0.hc_attn_down.weight          BF16
+    blk.0.hc_attn_inject.weight        BF16
+    blk.0.hc_attn_norm.weight          F32
+    blk.0.hc_attn_up.weight            BF16
+    class: FUSED mixer (BF16 hc_attn_down)
+    ctx=8192 ngen=96 extra='-ngl 99 -fa on -ncmoe 40'
+    ROCBLAS_USE_HIPBLASLT=0 MOE_EXPERT_HEATMAP=load
+    LLAMA_HC_BLK16=0 LLAMA_HC_RES16=0 GGML_CUDA_MMB_DOWN16=0
+    prompt sha256=18147e48a7f465d67520a7852f1966b4a988f57b5db93f937109d8f9917f19f0  (extractor: scripts/extract-generated.py)
+    logs: /tmp/tmp.ezsUsKVU3b
+
+    mixer: fused (the model builds GGML_OP_HC_MIX in the decode band)
+    split state: local (dsv4_hc_post auto=OFF)
+    numeric-arm anchors: none
+
+arm            rc        chars            sha  verdict
+chain_chain    0           447   3f049f67781c  reference (true chain)
+mix_op         0           449   6a102dbc62d6  reported (numeric arm, differs -- no anchor recorded for this class/state)
+comb_op        0           447   3f049f67781c  ok
+both_ops       0           449   6a102dbc62d6  ok (== mix_op: the combine op is exact with the fused mixer on)
+cuda_fuse_off  0           447   3f049f67781c  ok
+dsv4_pre_op    0           444   a512ee68c4b3  reported (numeric arm, differs -- no anchor recorded for this class/state)
+dsv4_post_op   0           449   6a102dbc62d6  reported (numeric arm, differs -- no anchor recorded for this class/state)
+all_ops        0           449   6a102dbc62d6  reported (numeric arm, differs -- no anchor recorded for this class/state)
+ops_no_post    0           444   a512ee68c4b3  reported (numeric arm, differs -- no anchor recorded for this class/state)
+defaults       0           444   a512ee68c4b3  ok (== ops_no_post: dsv4_hc_post auto=OFF)
+
+PASS: no GPU fault in the kernel journal (since 2026-11-21 06:41:05) or the arm logs
+PASS: every hard arm is byte-identical to the arm it is graded against (true chain: 447 chars, sha 3f049f67781c), the shipping default matches an explicit state, and 5 numeric arm(s) differ from the chain as documented and match their anchors

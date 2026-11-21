@@ -1,0 +1,44 @@
+==> speculative verify-width band gate (draft-mtp-adaptive n_max 7, -sm tensor, -n 300, GPUs: 0,1,2)
+    model: Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (band-0: no host-resident experts)
+    knob: LLAMA_SPEC_ALIGN_WIDTH_BAND (default 16; the 'off' arms set it to 0)
+
+--> s1-off (slots=1, width band=0)
+--> s1-on (slots=1, width band=default)
+--> s2-off (slots=2, width band=0)
+--> s2-on (slots=2, width band=default)
+--> s4-off (slots=4, width band=0)
+--> s4-on (slots=4, width band=default)
+
+PASS  GPU faults: kernel journal and every arm log clean
+arm         agg t/s   tokens  bound (from->to, band) per-slot t/s
+s1-off        218.6      300  -                      [218.6]
+s1-on         219.7      300  -                      [219.7]
+s2-off        270.4      600  -                      [135.2, 175.0]
+s2-on         272.9      600  -                      [136.5, 176.6]
+s4-off        353.0     1200  -                      [88.3, 114.2, 94.4, 97.3]
+s4-on         413.4     1200  cut to 3 (band 16)     [125.5, 103.3, 115.9, 111.8]
+
+PASS  the 4-slot arm's log carries the width-band cut (154 align lines, 1 cuts)
+PASS  every band in play on the 4-slot arm is the width band 16
+PASS  the 4-slot aligned depth is cut to 3 (16 / 4 - 1)
+PASS  the 4-slot arm with the knob off is never width-cut
+PASS  s1-on is inert at that slot count (16 / 1 - 1 >= n_max)
+PASS  s1-off is inert at that slot count (16 / 1 - 1 >= n_max)
+PASS  s2-on is inert at that slot count (16 / 2 - 1 >= n_max)
+PASS  s2-off is inert at that slot count (16 / 2 - 1 >= n_max)
+PASS  4 slots: 353.0 -> 413.4 t/s = x1.171 (>= x1.10)
+PASS  1 slot(s): text byte-identical on/off (f8ac5d69ebcf)
+PASS  1 slot(s): same lengths on/off ([1523])
+PASS  1 slot(s): aggregate 218.6 vs 219.7 t/s (within 3 %)
+PASS  2 slot(s): text byte-identical on/off (bdfd2d858cfa,49c86f3cfb33)
+PASS  2 slot(s): same lengths on/off ([1506, 1428])
+PASS  2 slot(s): aggregate 270.4 vs 272.9 t/s (within 3 %)
+PASS  s1-off arm generated 300/300 tokens
+PASS  s1-on arm generated 300/300 tokens
+PASS  s2-off arm generated 600/600 tokens
+PASS  s2-on arm generated 600/600 tokens
+PASS  s4-off arm generated 1200/1200 tokens
+PASS  s4-on arm generated 1200/1200 tokens
+
+RESULT: PASS
+(logs: /tmp/tmp.xD1uNblfRb -- pass --keep to keep them)

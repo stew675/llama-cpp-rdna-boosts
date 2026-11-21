@@ -1,0 +1,28 @@
+==> qwen4exp quant-coherence gate
+    cli=/home/stew675/llama.cpp/build-rocm/bin/llama-cli
+    sm=tensor ncmoe=48 ctx=8192 ngen=32 gpus=0,1 strict=0
+    prompt sha256=bbaff4d2ecd5892d4a442b0f53131641bf6e6f284761dd20fc0664bc97145762  (extractor: scripts/extract-generated.py)
+    logs: /tmp/qc-r328
+      IQ4_NL gather=1 rc=0 slashruns=0 hash=df389355f5e8
+      IQ4_NL gather=0 rc=0 slashruns=0 hash=df389355f5e8
+PASS  IQ4_NL: gather transparent (on == off == df389355f5e8)
+      Q4_K_M gather=1 rc=0 slashruns=0 hash=e58417e70221
+      Q4_K_M gather=0 rc=0 slashruns=0 hash=e58417e70221
+PASS  Q4_K_M: gather transparent (on == off == e58417e70221)
+
+==> E. the sparse QSA decode arm (LLAMA_QSA_DENSE_DECODE_UNTIL=0)
+      sparse rc=0 fused-census=4 slashruns=0 hash=487888b20ddb
+      chain rc=0 fused-census=0 slashruns=0 hash=487888b20ddb
+      dense rc=0 fused-census=0 slashruns=0 hash=97a8c2a4929b
+      census: sparse=4 chain=0 dense=0
+        indexer-score: fused-score launched name=indexer_score-3 dst=[1344,1,1] ktype=2 derived-cache
+        indexer-score: fused-score launched name=indexer_score-7 dst=[1344,1,1] ktype=2 derived-cache
+PASS  E: the sparse arm launched the fused indexer-score op (4 census line(s))
+PASS  E: the census is sensitive - 0 lines with the fused op off and on the dense arm
+PASS  E: fused == chain on the sparse arm (487888b20ddb)
+PASS  E: the sparse arm differs from the dense arm (487888b20ddb vs 97a8c2a4929b), so it is not vacuous
+
+PASS  GPU faults: kernel journal (since 2026-11-21 04:14:37) and every arm log clean
+==> PASS: every measured qwen4exp quant produced a coherent (0 '////') gather-ON output
+    and the sparse QSA decode arm launched the fused indexer score, byte-identical to the chain
+    logs kept in /tmp/qc-r328
