@@ -1,9 +1,9 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: OPEN — 13 of 18 rungs climbed (R00-R12); nothing is delivery yet.**
+**Status: OPEN — 14 of 18 rungs climbed (R00-R13); nothing is delivery yet.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
-the final rung (R18).  Ladder branch `rebase-r328` = `a9d8e1a96` (tree
-`f0f9db34b1c3ae8a93f834e5c2fad472113a1af9`): R00..R12 plus two rung repairs (R00's top-k gather, R05's `nb32`
+the final rung (R18).  Ladder branch `rebase-r328` = `81523fda6` (tree
+`080d7ecea198417011ca068916c5deafa9f4ce14`): R00..R13 plus two rung repairs (R00's top-k gather, R05's `nb32`
 widening); every rung is green on build + coherence and each has one entry in [`RUNGS.md`](RUNGS.md).
 **The one known-red is closed at R00** (repair `3ea8b0212`): the delivery's required VMM pool refuses
 upstream's strided 2-D indexer top-k copy, and it reproduces on the pristine base with *only* the `#30542`
@@ -58,7 +58,9 @@ stays** (ingest tail +29.8 % pp at 26K on a 2-GPU 35B, +11.7 % on 3-GPU Flash-Ne
 `-sm layer` cell; F1 +6-7 % pp on the dense 27B and inert on both MoE heads; text and acceptance identical in
 every pair; the pristine base still aborts DFlash under `-sm tensor`).  Numbers:
 [`../../benchmarks/2026-11-20-r328-r12-dflash-merge.md`](../../benchmarks/2026-11-20-r328-r12-dflash-merge.md).
-Six gates green.  Target: the next
+Six gates green.  R13 is done as well (`81523fda6`): the MTP draft vocabulary subset applied clean,
+its own test passes (subset logits == the full-vocab reference, six cases) and `--spec-draft-mtp-vocab 65536`
+is +7.6 % decode at identical text.  Target: the next
 release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 

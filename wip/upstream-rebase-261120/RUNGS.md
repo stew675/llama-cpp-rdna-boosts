@@ -44,7 +44,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | R10 | 10 | `7bbf540d5` | 7 (4+3+2+1 regions) | D8, D12 + the four carried obligations | **DONE 2026-11-21** — `f5a090a31`, tree `394e0b708`; the dispatcher reconciled into **one** TU (upstream's two `#32454` NORM+MUL arms ported in = D4's arm), `top_k_gather_rows` de-duplicated by construction; **R06.2 dense half CLOSED** (27B IQ3_S prefills, `ebf2a5a9b00a` = r327) and **R09.3 CLOSED** (arena == arena-off now); a `needs_sync`-vs-dispatch mismatch my own union created was caught by the op test and fixed; **new finding**: the arena arm's decode fell 54.4 -> 20.4 t/s and no switch recovers it (owned by blocks 14/15) |
 | R11 | 11 | `61168c60b` | 5 | D9, D13 (both MERGE, carried) | **DONE 2026-11-21** — `dbe4fdd40`, tree `2b6aec1f0`; op count 100+6=106 (rpc patch 7), `has_recr && n_pos == 1` union, qwen4exp union carries upstream's FP8 PLE scale *and* the lazy reader, 4th 64-bit-mask recurrence (fattn-qsa/indexer-score/hc-mix); coherence `1c5d32ac537d`, quant-coherence PASS (Q4_K_M gather transparent, no `////`); **`gate-hc-fusions.sh` RED** — 3 numeric arms left their anchors (see R11.2) |
 | R12 | 12 | `dad1442b3` | 10 | D5, D6, D7, **D17 (the DFlash decision — the delivery's feature set kept, measured)** | **DONE 2026-11-20** — `a9d8e1a96`, tree `f0f9db34b1c3ae8a93f834e5c2fad472113a1af9`; the paused session's ten resolutions applied, then `common_speculative_impl_draft_dflash` merged onto upstream's `init(opt)` seam (207 diff lines from upstream, all the delivery's feature; the base loses only the pre-split duplicate state), two splice-orphaned server features restored (`prompt_load_with_room` had no caller; `load()`'s lost locals) and one upstream-constness collision decided (R12.3); build green 0 warnings, coherence `1c5d32ac537d`, MUL_MAT_ID 1077/0 == the base's own count; **PASS**: `gate-spec-reuse-window`, `gate-seqpar --record`, `gate-state-pipe`, `gate-ckpt-reuse`, `gate-park-idle-slots`, `gate-mtp-dev-rows`; DFlash A/B (3 targets, 4 arms): text + acceptance identical everywhere, tail **+29.8 % pp** at 26K on 2-GPU 35B and +11.7 % on 3-GPU Flash-Next, F1 +6-7 % pp on the dense 27B, decode flat; the pristine base still aborts DFlash under `-sm tensor` (R12.5) |
-| R13 | 13 | `1014e6bf5` | 0 | — | not started |
+| R13 | 13 | `1014e6bf5` | 0 | — | **DONE 2026-11-20** — `81523fda6`, tree `080d7ecea198417011ca068916c5deafa9f4ce14`; clean apply (19 files, +588), one rung repair (the meta device iface's missing trailing initializers — an R12 leftover warning, inert); coherence `1c5d32ac537d`; the block's own test `test-mtp-draft-vocab` **PASS** (vocab-subset logits == the full-vocab reference in sequential, concurrent and freed-then-recreated contexts, every context at 0 mismatches / max |diff| 0); `--spec-draft-mtp-vocab 65536` +7.6 % decode over plain MTP at identical text (`bbb051e2aeab` on plain/MTP/subset alike) |
 | R14 | 14 | `e88d45d9e` | 3 | — | not started |
 | R15 | 15 | `35a9ae985` | 0 | — | not started |
 | R16 | 16 | `286191b31` | 0 | D7 | not started |
@@ -1246,6 +1246,62 @@ is not optional and why this rung could not simply take upstream's selector.
   server-context.cpp` +333.  Both are where the next rung's merge noise will land.
 - The `-lv 4`-to-stderr trick (generated text on stdout, every census on stderr) makes a single run serve as both
   the text arm and the census arm — use it for the remaining DFlash/MTP arms instead of two runs.
+
+---
+
+# R13 — block 13, MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`)  ·  **DONE 2026-11-20** — `81523fda6`, tree `080d7ecea198417011ca068916c5deafa9f4ce14`
+
+```
+git cherry-pick 1014e6bf5        # 19 files, +575/-8  ->  lands as 19 files, +588/-8
+```
+
+| exit criterion | result |
+|---|---|
+| conflicts | **0** (auto-merged `tests/CMakeLists.txt` only) |
+| no markers left | yes; no `TODO(rebase)` |
+| build | green, all targets, 0 errors; the only warnings left are `-Wdeprecated-declarations` in two **test** TUs (see R13.2) |
+| coherence 4B | **`100 chars sha=1c5d32ac537d`** — unchanged |
+| the block's own test | `test-mtp-draft-vocab -m Qwen3.5-4B-Q8_0` → **PASS**.  Six cases (N then 0, 0 then N, N1 then N2, two contexts with the same N, one freed with its last context and requested again, and a concurrent create), every context `0 mismatches, max |diff| 0` against its own full-vocabulary logits, and 0 non-finite inside / 0 finite outside the draftable mask |
+| the block's own switch | 4B Q8_0 + `--spec-type draft-mtp --spec-draft-n-max 3`, `-n 128`, prose prompt: plain **100.9 t/s** / MTP **184.2** / MTP + `--spec-draft-mtp-vocab 65536` **198.2** (+7.6 % over plain MTP), **text identical** (`bbb051e2aeab`, 593 chars) in all three arms |
+
+## R13.1 What the block does (unchanged by the re-base)
+
+The MTP draft head scores only the LM-head rows for token ids `< N` plus every control/user-defined id, then
+scatters them into a full-vocabulary `-inf` row, so the speculator still sees a full-vocab row and the target's
+verification is untouched: the trim can only lose proposals, never change an accepted token.  Opt-in, default
+off (0 = no subset, no extra graph node).  The re-base needed no change to any of it — upstream's
+`llama_context_params`/batch-ext migration had already been carried by blocks 02/12, and the model graphs
+(`qwen35`, `qwen35moe`, `qwen4exp`, `gemma4-assistant` incl. the shared-NextN sidecar path) all still hook
+`mtp_draft_vocab` at the same place.
+
+## R13.2 Rung repair + one recorded warning
+
+1. **`ggml/src/ggml-backend-meta.cpp`**: the meta **device** iface listed its initializers up to
+   `slab_ring_slots` and stopped, so the seven host-tier hooks upstream/the delivery appended after it
+   (`moe_host_master_buft`, `moe_cache_band`, `moe_cache_forget`, `moe_cache_set_host_pool_budget`,
+   `moe_heat_open`, `moe_heat_score`, `moe_cache_set_host_fill_mode`) were value-initialized silently — which is
+   what the compiler's `-Wmissing-field-initializers` warning was pointing at (`build-rocm` flagged it after R12).
+   They are now listed explicitly as `nullptr` **with the reason** (the meta device owns no host master and no
+   heat prior; the meta *backend* forwards `moe_cache_band` itself).  Inert by construction — the previous value
+   was already zero.
+   **Open question for the owed `-sm tensor` arms of `gate-host-pool.sh`:** whether a tensor split needs any of
+   them forwarded.  A forwarded hook has to pick one simple device, so it is not a blind forward; recorded here
+   and in `COLD-START.md` §8 rather than decided.
+2. **Recorded, not fixed:** `tests/test-logits-width-probe.cpp` (an earlier block's TU) and block 13's new
+   `tests/test-mtp-draft-vocab.cpp` build a batch with the deprecated
+   `llama_batch_init`/`llama_decode`/`llama_batch_free` (D6 renamed them to `llama_batch_ext_*`/`llama_process`).
+   They work — the old entry points are wrappers — but they warn.  Migrating them is a real rewrite (the ext
+   batch is context-owned and built through `llama_batch_ext_add_*`), so it is a `TODO` for R18, not a rung
+   blocker: no shipped path changes either way.
+
+## R13.3 Notes for later rungs
+
+- Block 13 is self-contained in `src/` + `common/` argument plumbing; nothing in it interacts with the KV /
+  fusion / MoE blocks, which is why the rung is one commit with no census work of its own beyond the test.
+- The MTP stats line is `SPC_TRC` → **`-lv 4`**, and — as in R12 — the generated text stays on **stdout** while
+  the census goes to **stderr**, so one run serves both arms.
+- R10.3 (arena decode, a release blocker) and R11.2 (`gate-hc-fusions.sh` red) are still open; they are next
+  at R14/R15 per `COLD-START.md` §8.
 
 ---
 

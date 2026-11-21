@@ -23,17 +23,17 @@ Nothing in `patches/`, `release.json`, `rdna-boosts-all.patch` or the fork is to
 cd ~/llama.cpp && git status --short && git branch --show-current && git log --oneline -1
 ```
 
-Expect: **clean**, branch `rebase-r328`, `a9d8e1a96 rdna-boosts: block 12: campaign remainder ...` (tree
-`f0f9db34b1c3ae8a93f834e5c2fad472113a1af9`).  If a cherry-pick is mid-flight (`git status` shows unmerged
+Expect: **clean**, branch `rebase-r328`, `81523fda6 rdna-boosts: block 13: MTP draft vocabulary subset ...` (tree
+`080d7ecea198417011ca068916c5deafa9f4ce14`).  If a cherry-pick is mid-flight (`git status` shows unmerged
 paths), the previous session stopped inside a conflict: finish it or `git cherry-pick --abort` and redo that rung.
 
 | item | value |
 |---|---|
-| rungs landed | **R00 … R12** (13 of 18) + 2 rung repairs |
-| rung in progress | **none — R12 landed 2026-11-20** (`a9d8e1a96`, tree `f0f9db34b1c3ae8a93f834e5c2fad472113a1af9`) |
-| next rung | **R13** (block 13, `git cherry-pick 1014e6bf5`) |
-| remaining | R13, R14, R15, R16, R17 (block `0300`), R18 (release) |
-| delivery repo tip | `8fb8e43f` (docs only; `patches/`/`release.json` untouched) |
+| rungs landed | **R00 … R13** (14 of 18) + 2 rung repairs (R00's top-k gather, R05's `nb32` widening) |
+| rung in progress | **none — R13 landed 2026-11-20** (`81523fda6`, tree `080d7ecea198417011ca068916c5deafa9f4ce14`) |
+| next rung | **R14** (block 14, `git cherry-pick e88d45d9e`, 3 conflicts expected) |
+| remaining | R14, R15, R16, R17 (block `0300`), R18 (release) |
+| delivery repo | docs-only commits so far (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched until R18) |
 | new fork point | `919794500` |
 | build | `cd ~/llama.cpp && ~/bin/build-llama-rocm`, then `cmake --build build-rocm -j 24` for the per-rung loop (`build-rocm`: `GGML_HIP_NO_VMM=OFF`, `GGML_CUDA_FA_QUANTS` includes `iq4_nl-iq4_nl`, `LLAMA_USE_PREBUILT_UI=OFF`) |
 | the shipping reference | `~/llama.cpp/build-rocm/bin-r327` (the r327 `bin/`) — **the attribution oracle for any abort** |
@@ -110,7 +110,8 @@ Note: **no `-lv`** on a text arm (it corrupts the stream). A census arm is a sep
 | R10 | 10 slab + **single fusion dispatcher** | done — the dispatcher reconciled into `ggml-cuda-try-fuse.cu`; R06.2 dense half + R09.3 closed; **R10.3 decode regression opened (§8)** |
 | R11 | 11 qwen4exp/QSA | done — D13 carried; `gate-hc-fusions.sh` **RED** (R11.2) |
 | R12 | 12 DFlash/CPU wins/server cache/seqpar | **DONE 2026-11-20** — `a9d8e1a96`; the speculator class merged onto upstream's `init(opt)` seam (D17: the delivery's feature set kept, measured); six gates PASS (`spec-reuse-window`, `seqpar --record`, `state-pipe`, `ckpt-reuse`, `park-idle-slots`, `mtp-dev-rows`) |
-| R13–R17 | 13..0300 | not started |
+| R13 | 13 MTP draft vocab subset | **DONE 2026-11-20** — `81523fda6`; clean apply, one rung repair (the meta device iface's missing trailing initializers), `test-mtp-draft-vocab` PASS, `--spec-draft-mtp-vocab` +7.6 % decode at identical text |
+| R14–R17 | 14..0300 | not started |
 | R18 | release | not started (a long checklist, `RUNGS.md` R18) |
 
 ## §6 R12 — landed; what it cost, and what to do first in R13
@@ -133,7 +134,7 @@ short version a fresh session needs:
 * **D17** — the DFlash decision, resolved by measurement in the maintainer's direction: the delivery's feature
   set stays on upstream's seam.  Numbers: `benchmarks/2026-11-20-r328-r12-dflash-merge.md`.
 
-**First thing in R13:** re-run `scripts/gate-hc-fusions.sh` (R11.2 is still red and block 12's `hc`/`mmb` knobs
+**First thing in R14:** re-run `scripts/gate-hc-fusions.sh` (R11.2 is still red and block 12's `hc`/`mmb` knobs
 may be what restores the `mix_op` anchor) and keep R10.3 (the host-expert arena decode, 54.4 → 20.4 t/s, a
 release blocker) in view for R15.
 
@@ -141,7 +142,6 @@ release blocker) in view for R15.
 
 | rung | block | source commit |
 |---|---|---|
-| R13 | 13 | `1014e6bf5` |
 | R14 | 14 | `e88d45d9e` (streamed KV window + attendance pool + MTP draft ring, 3 conflicts) |
 | R15 | 15 | `35a9ae985` (UMA GTT expert store — **R10.3 is owed here**) |
 | R16 | 16 | `286191b31` (server prompt admission, D7) |

@@ -4,7 +4,7 @@
 >
 > **First, read `COLD-START.md` in that directory top to bottom** — it is self-contained. Then verify the state it
 > claims (`cd ~/llama.cpp && git status --short && git branch --show-current && git log --oneline -1`: expect
-> clean, `rebase-r328`, `a9d8e1a96`, tree `f0f9db34b1c3ae8a93f834e5c2fad472113a1af9`). Read `RUNGS.md` §R12
+> clean, `rebase-r328`, `81523fda6`, tree `080d7ecea198417011ca068916c5deafa9f4ce14`). Read `RUNGS.md` §R12
 > (what the last rung cost and what it left open), then the ledger rows for R13-R17 and `DECISIONS.md`'s live
 > items (D4, D8, D9, D12, D13, **D17**).
 >
@@ -18,8 +18,12 @@
 > (`gate-spec-reuse-window`, `gate-seqpar --record`, `gate-state-pipe`, `gate-ckpt-reuse`, `gate-park-idle-slots`,
 > `gate-mtp-dev-rows`) plus coherence `1c5d32ac537d` and `MUL_MAT_ID` 1077/0 (== the base's own count).
 >
-> **Job 1 — R13** (`git cherry-pick 1014e6bf5`, 0 conflicts expected). Build, coherence, the block's own census /
-> kill-switch arm, then the rung log in `RUNGS.md`.
+> **Job 1 — R14** (`git cherry-pick e88d45d9e`, 3 conflicts expected; block 14 = the streamed KV window +
+> attendance pool + MTP draft ring). Build, coherence, then block 14's own gates: `gate-kv-residency.sh`,
+> `gate-spec-draft-window.sh`, `gate-node-budget.sh` (the KV rotation adds graph nodes), and the rung log in
+> `RUNGS.md`.  R13 landed 2026-11-20 (`81523fda6`): clean apply, `test-mtp-draft-vocab` PASS, `--spec-draft-mtp-vocab`
+> +7.6 % decode at identical text, one rung repair (the meta device iface's missing trailing initializers — an
+> R12 leftover warning).
 >
 > **Job 2 — the two carried obligations, in this order.** (a) **R11.2**: `scripts/gate-hc-fusions.sh` is still RED
 > (`mix_op`, `dsv4_pre_op`, `ops_no_post` left their r327 anchors). Block 12's `hc`/`mmb` knob path is now in the
