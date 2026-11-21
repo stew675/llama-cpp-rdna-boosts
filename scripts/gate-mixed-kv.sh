@@ -34,8 +34,12 @@
 #      KV cache).
 #   4. The refusals: the same mixed pair on a model whose heads are not 256-wide, and on a qwen4exp
 #      model (its QSA op asserts K->type == V->type), must fail at context creation with the
-#      "models require the same K and V cache types" message.  Pass --other-model / --qsa-model;
-#      a refusal that does not fire is a FAIL, not a skip.
+#      "models require the same K and V cache types" message.  a refusal that does not fire is a FAIL.
+#      **Both arms ALWAYS run**: the two models are defaulted (override with --other-model /
+#      --qsa-model), a MISSING file is a FAIL, and --no-refusals is the only way to skip them --
+#      which counts them as SKIPPED and denies the run a clean "N/N PASS" verdict (see the summary).
+#      Before r330 the two arms were opt-in and an unpassed model was a silent no-op that was not
+#      counted, so a run could report 12/12 with arm 4 never exercised (r328's own record did).
 #   5. check-gpu-faults.sh over the gate's own window.
 #
 # USAGE:
@@ -45,8 +49,12 @@
 #     --device LIST      HIP_VISIBLE_DEVICES for the width/text arms (default: 0,1,2)
 #     --split MODE       0 = none, otherwise SPLIT=<MODE> for the probe and -sm MODE (default: tensor)
 #     --p N / --ub N     width-probe prompt / ubatch (default: 1500 / 512)
-#     --other-model FILE a model with mixed head sizes, for the refusal arm (optional)
-#     --qsa-model FILE   a qwen4exp model, for the QSA refusal arm (optional)
+#     --other-model FILE a model whose attention heads are NOT all 256-wide, for the refusal arm
+#                        (default: the Ling-3.0-tiny on this box)
+#     --qsa-model FILE   a qwen4exp model, for the QSA refusal arm (default: Qwen3.8-Flash-Next
+#                        GSQ-RCO-IQ3_XXS)
+#     --no-refusals      skip both refusal arms on purpose; they are counted as SKIPPED and the
+#                        verdict is printed as PASS (INCOMPLETE)
 #     --quick            skip 1's staged arms and 2's individual pairs (the fast smoke)
 #     --no-faults        skip the kernel-journal check (a box with no readable journal)
 #   Environment: BUILD (default ~/llama.cpp/build-rocm), ROCM_DIR, JOBS are not used here.
@@ -62,10 +70,15 @@ DEVICE="${DEVICE:-0,1,2}"
 SPLIT="${SPLIT:-tensor}"
 P="${P:-1500}"
 UB="${UB:-512}"
-OTHER_MODEL="${OTHER_MODEL:-}"
-QSA_MODEL="${QSA_MODEL:-}"
+# The two REFUSAL models are DEFAULTED, not opt-in: an unpassed model used to make the arm a silent
+# no-op that was not counted, so a run could print "N/N PASS" without ever exercising arm 4 (r328's
+# record reads 12/12 for exactly that reason).  A missing file FAILS; --no-refusals is the explicit
+# opt-out and it is counted, so the verdict says INCOMPLETE instead of N/N.
+OTHER_MODEL="${OTHER_MODEL:-/llm/models/Ling/3.0-tiny/IQ4_NL/Ling-3.0-tiny-IQ4_NL.gguf}"
+QSA_MODEL="${QSA_MODEL:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}"
 QUICK=0
 FAULTS=1
+NO_REFUSALS=0
 
 usage() { sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \?//; /^set -uo/d'; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
@@ -79,6 +92,7 @@ while [ $# -gt 0 ]; do
         --other-model) OTHER_MODEL="$2"; shift 2 ;;
         --qsa-model)   QSA_MODEL="$2"; shift 2 ;;
         --quick)       QUICK=1; shift ;;
+        --no-refusals) NO_REFUSALS=1; shift ;;
         --no-faults)   FAULTS=0; shift ;;
         -h|--help)     usage 0 ;;
         *) echo "gate-mixed-kv: unknown argument '$1'" >&2; usage 2 ;;
@@ -99,8 +113,10 @@ FIRST_DEV="${DEVICE%%,*}"
 T0="$(date '+%Y-%m-%d %H:%M:%S')"
 FAIL=0
 CHECKS=0
+SKIPPED=0
 pass() { CHECKS=$((CHECKS+1)); printf '  PASS  %s\n' "$*"; }
 fail() { CHECKS=$((CHECKS+1)); FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$*" >&2; }
+skip() { CHECKS=$((CHECKS+1)); SKIPPED=$((SKIPPED+1)); printf '  SKIP  %s\n' "$*"; }
 
 echo "==> mixed K/V gate (optional block 0101 -- run on the OPTIONAL-applied build)"
 echo "    build=$BUILD"
@@ -182,7 +198,10 @@ done
 # ---- 4. the refusals that must still fire ------------------------------------
 refusal() {
     local model="$1" why="$2"
-    [ -f "$model" ] || { echo "  SKIP  refusal ($why): no model $model"; return; }
+    if [ ! -f "$model" ]; then
+        fail "refusal ($why): no model $model -- pass --other-model / --qsa-model, or --no-refusals to skip this arm on purpose"
+        return
+    fi
     log="$(mktemp)"
     HIP_VISIBLE_DEVICES="$FIRST_DEV" timeout 300 "$CLI" -m "$model" -ngl 99 -fa on \
         --cache-type-k q8_0 --cache-type-v q5_1 -c 4096 -p "hi" -n 1 --temp 0 \
@@ -194,8 +213,13 @@ refusal() {
     fi
     rm -f "$log"
 }
-[ -n "$OTHER_MODEL" ] && refusal "$OTHER_MODEL" "heads not 256-wide"
-[ -n "$QSA_MODEL" ]   && refusal "$QSA_MODEL"   "qwen4exp QSA"
+if [ "$NO_REFUSALS" = 1 ]; then
+    skip "refusal (heads not 256-wide) -- --no-refusals"
+    skip "refusal (qwen4exp QSA) -- --no-refusals"
+else
+    refusal "$OTHER_MODEL" "heads not 256-wide"
+    refusal "$QSA_MODEL"   "qwen4exp QSA"
+fi
 
 # ---- 5. the kernel journal ---------------------------------------------------
 if [ "$FAULTS" = 1 ] && [ -x "$REPO_DIR/scripts/check-gpu-faults.sh" ]; then
@@ -208,8 +232,16 @@ fi
 
 echo
 if [ "$FAIL" = 0 ]; then
-    echo "==> PASS: $CHECKS/$CHECKS checks"
+    if [ "$SKIPPED" -gt 0 ]; then
+        echo "==> PASS (INCOMPLETE): $CHECKS checks, $SKIPPED SKIPPED -- this is NOT a full gate run"
+    else
+        echo "==> PASS: $CHECKS/$CHECKS checks"
+    fi
     exit 0
 fi
-echo "==> FAIL: $FAIL of $CHECKS checks failed" >&2
+if [ "$SKIPPED" -gt 0 ]; then
+    echo "==> FAIL: $FAIL of $CHECKS checks failed ($SKIPPED skipped)" >&2
+else
+    echo "==> FAIL: $FAIL of $CHECKS checks failed" >&2
+fi
 exit 1

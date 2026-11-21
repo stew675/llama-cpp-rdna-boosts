@@ -8,9 +8,20 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `9dc88d433b8949fd0c5646e314a9276f997931a2c2bce60204efef9e960cd7c8` (the r327 cut -- every re-cut moves the exported commit
+  `b4a5b11f4e09ef6fcf601bff06a21755a5106cc7ebcf75ce350d9c1b5fd74f63` (the r329 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
-* **r329 re-cut verification (current)**: applies strictly at the r329 default tree `63195b0ceb8dd9dea206a6a92b9bcd4a52e494e6` (sha256 `b4a5b11f4e09ef6fcf601bff06a21755a5106cc7ebcf75ce350d9c1b5fd74f63`), producing tree `7b9702682a3bb9f3cad22ee6887d10b9c1b6ef7e`; with the other optional artifact on top, the cumulative tree is `d8deaa13e8f5dd3ea0db0edb31050c33cdf1317c`.  **This one touches an amended file**: the artifact patches `tests/test-logits-width-probe.cpp` for its mixed-pair probe arms, and r329 migrated that TU to the ext batch API, so the hunk was re-anchored -- it still applies **strictly** (`git am`, not `-3`) and the artifact's own mechanisms are unchanged.  `validate-set.sh` check 8 verifies all three trees on every run; the gate is `scripts/gate-mixed-kv.sh` on the optional-applied build.
+* **r329-tree port verification (current)**: the artifact is not merely *applied* on r329, it is
+  **exercised** there.  Built on one optional-applied tree (r329 chain tip `f8df8a484`, `build-opt`), its own gate
+  `scripts/gate-mixed-kv.sh` reads **14/14 PASS**: `test-backend-ops -o FLASH_ATTN_EXT` **7453/7453** in the
+  default, `GGML_CUDA_FA_KV_MIXED=0` and `GGML_CUDA_FA_KV_NATIVE=0` arms (the same case count as r328), width
+  purity W=1..8 with `maxdiff 0` for q8_0/q8_0 and all three pairs at the 3-device `-sm tensor` split, a 32-token
+  greedy decode per pair, **and both refusal arms** -- Ling-3.0-tiny (heads not 256-wide) and
+  Qwen3.8-Flash-Next GSQ-RCO-IQ3_XXS (QSA), each still refused with the "models require the same K and V cache
+  types" text.  The refusal arms are new coverage: no earlier run on this box exercised them (r328's "12/12"
+  predates the r330 gate fix that defaults the two models, FAILs on a missing one and counts a skip).
+  `check-gpu-faults.sh` clean.  This is also the first run of the artifact's `tests/test-logits-width-probe.cpp`
+  hunk since r329 migrated that TU to the ext batch API -- the re-anchored hunk reproduces the width-purity verdict.
+* **r329 re-cut verification**: applies strictly at the r329 default tree `63195b0ceb8dd9dea206a6a92b9bcd4a52e494e6` (sha256 `b4a5b11f4e09ef6fcf601bff06a21755a5106cc7ebcf75ce350d9c1b5fd74f63`), producing tree `7b9702682a3bb9f3cad22ee6887d10b9c1b6ef7e`; with the other optional artifact on top, the cumulative tree is `d8deaa13e8f5dd3ea0db0edb31050c33cdf1317c`.  **This one touches an amended file**: the artifact patches `tests/test-logits-width-probe.cpp` for its mixed-pair probe arms, and r329 migrated that TU to the ext batch API, so the hunk was re-anchored -- it still applies **strictly** (`git am`, not `-3`) and the artifact's own mechanisms are unchanged.  `validate-set.sh` check 8 verifies all three trees on every run; the gate is `scripts/gate-mixed-kv.sh` on the optional-applied build.
 * **r327 re-cut verification**: applies strictly at the r327 default tree `4792f98b82a4c6433bf11c629fdf01c21a143ce9` (sha256
   `9dc88d433b8949fd0c5646e314a9276f997931a2c2bce60204efef9e960cd7c8`), producing tree `4a6da1ba3d5799e6983116fb22ff3be7869ef31e`; with the other optional artifact on top, the cumulative tree is
   `8c1e74631c653862c3f2da5968042ec0cbba99f0`.  r327 amends **block 10** with one packed FA KV-group bitmap per graph evaluation
@@ -136,7 +147,9 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
   `310386642121ffd22eb74268a6446b31433aada0`.  The default tree moved by block 12's r291 amendment
   (sequence parallelism), not by anything this artifact owns.
 * **its own gate is `scripts/gate-mixed-kv.sh`**, run on the **optional-applied build**; it is **not** a
-  default release gate any more, and the delivery's own gates do not cover a mixed pair.
+  default release gate any more, and the delivery's own gates do not cover a mixed pair.  Since r330 the two
+  refusal arms are defaulted (not opt-in) and counted, so the gate cannot report a complete pass with an arm
+  it never ran.
 
 ## What it is
 

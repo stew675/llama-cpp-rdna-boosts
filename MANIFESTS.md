@@ -246,10 +246,14 @@ in CI.  The model-level gates are manual:
 6. **GPU faults** — `scripts/check-gpu-faults.sh` on the run's journal + log (never grep a log by hand).
 7. **The mixed K/V cache (OPTIONAL block `0101`, NOT a default release gate)** — `scripts/gate-mixed-kv.sh`
    runs on the **optional-applied build** (`apply-all.sh --include-optional-all`, then build that checkout):
-   `test-backend-ops -o FLASH_ATTN_EXT`
-   **7021/7021** in the default, `GGML_CUDA_FA_KV_MIXED=0` and `GGML_CUDA_FA_KV_NATIVE=0` arms; W=1..8 width
-   purity **maxdiff 0** for q8_0/q8_0 and the three mixed pairs at the requested split; a real load + greedy
-   decode per pair; and the non-256-head and qwen4exp refusals (a mixed pair that loads on those is a FAIL).
+   `test-backend-ops -o FLASH_ATTN_EXT` in the default, `GGML_CUDA_FA_KV_MIXED=0` and `GGML_CUDA_FA_KV_NATIVE=0`
+   arms (a clean N/N, no FAIL/NaN -- the count moves when upstream adds op cases: 7021 at r287, 7453 at r329);
+   W=1..8 width purity **maxdiff 0** for q8_0/q8_0 and the three mixed pairs at the requested split; a real
+   load + greedy decode per pair; and the non-256-head and qwen4exp refusals (a mixed pair that loads on those
+   is a FAIL).  **The two refusal arms always run** since r330: their models are defaulted (Ling-3.0-tiny and
+   Qwen3.8-Flash-Next GSQ-RCO-IQ3_XXS on this box, overridable with `--other-model`/`--qsa-model`), a missing
+   file is a FAIL, and `--no-refusals` is the only opt-out -- it counts the arms as SKIPPED and prints
+   `PASS (INCOMPLETE)`, so a run cannot report `N/N` with an arm it did not exercise.
    It is a new kernel family, so a change to the tile `type_V`, `ggml_cuda_fattn_tile_type_V()`, the mixed
    instance list or the band predicate re-runs it, and the artifact must be re-cut onto the current default
    tree (`optional/mixed-kv/README.md`).  `validate-set.sh` check 8 is what keeps that artifact applicable;

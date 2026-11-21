@@ -24,9 +24,30 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `1ffa60a9d2f8165ab1457bd85be50c51f7f8c190339a6c4b1d574e5f904b0945` (the r327 cut -- every re-cut moves the exported commit
+  `4d802e697473e8039d72c5c00440dba48075ef5b16a5cc2f0696ad837e3be341` (the r329 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
-* **r329 re-cut verification (current)**: applies strictly at the r329 default tree `63195b0ceb8dd9dea206a6a92b9bcd4a52e494e6` (sha256 `4d802e697473e8039d72c5c00440dba48075ef5b16a5cc2f0696ad837e3be341`), producing tree `7e9008463b1ce49e6fc6d32aabf24bdb312f6bac`; with the other optional artifact on top, the cumulative tree is `d8deaa13e8f5dd3ea0db0edb31050c33cdf1317c`.  The re-cut is **mechanical**: the patch applied cleanly on the r329 default tree (whose only change from r328 is block 10's width-probe TU, block 13's MTP-vocab TU and block 16's regenerated help docs -- none of them this artifact's files), so its own mechanisms are unchanged and the r327 numbers below stand.  `validate-set.sh` check 8 verifies the strict apply of all three trees on every run.
+* **r329-tree port verification (current)**: built and **measured** on the r329 tree (3 x R9700 gfx1201, ROCm
+  10.1.0, `prompts/prose-rdna-boosts.txt`), not merely applied to it.
+  * **Default path inert**: `-sm tensor` (3 GPUs) 4B Q8_0 greedy text is `1c5d32ac537d` for lanes unset, `1` and
+    `2`, and the arm gate fires -- `LLAMA_PREFILL_LANES ignored (n_gpu = 1, pipeline_parallel = 0, draft = 0)`.
+    `scripts/gate-prefill-logits.sh` on the optional-applied build reads **mean KLD 0.000000 / same-top-p
+    100.000 %** against the r328-recorded base -- bit-inert on the default path.
+  * **The reachable layout still engages and still wins**: `-sm layer -ts 1,1,1 -ot
+    'blk\.0\.attn_q\.weight=ROCm0' -b 2048 -ub 2048`, 35B-A3B Q8_0: the `-lv 4` census shows `two-lane prefill
+    enabled`, 3 x `pair decided: splits a=4 b=4, interleaved=1`, and the lane-2 compute buffers
+    (`458.80 + 430.34 + 430.34` MiB device + `65.11` MiB host = **1384.6 MiB**).  Prefill
+    (A B B A, `-n 0`): 5806.2 / 5793.9 t/s at one lane vs **6879.3 / 6883.2 t/s at two (+18.6 %)**; decode on the
+    same shape is 72.7 / 73.4 / 72.7 t/s (nil); greedy text is `e2dde701fc04` for lanes unset / 1 / 2.
+  * **The MTP target pairs again on the rebased tree** (the r246 feature, not re-run since r259): 27B
+    `GSQ-RCO-IQ3_S-mtp` in the same layout, `--spec-draft-n-max 3` -- 3 pairs logged, both draft contexts refuse
+    with `LLAMA_PREFILL_LANES ignored (n_gpu = 3, pipeline_parallel = 0, draft = 1)`, greedy text
+    `a4a403d64c40` in **all four** arms (lanes 1/2 x `--spec-type none`/`draft-mtp`), prefill
+    **1072.3 -> 1449.7 t/s (+35.2 %)** plain and **1040.0 -> 1364.1 t/s (+31.2 %)** on the MTP target; decode
+    28.3/28.1 and 56.1/55.9 t/s (nil).
+  * **The host-expert tier still runs and still loses at a wide ubatch** (the r259 abort fix holds): `-ncmoe 40`,
+    `-b 2048 -ub 2048`, no assert, prefill 5230.4 -> 4465.7 t/s (**-14.6 %**), greedy text `49bf8044ec4b` for
+    both lanes -- the artifact's own anchor for that arm.  `check-gpu-faults.sh` clean over every arm.
+* **r329 re-cut verification**: applies strictly at the r329 default tree `63195b0ceb8dd9dea206a6a92b9bcd4a52e494e6` (sha256 `4d802e697473e8039d72c5c00440dba48075ef5b16a5cc2f0696ad837e3be341`), producing tree `7e9008463b1ce49e6fc6d32aabf24bdb312f6bac`; with the other optional artifact on top, the cumulative tree is `d8deaa13e8f5dd3ea0db0edb31050c33cdf1317c`.  The re-cut is **mechanical**: the patch applied cleanly on the r329 default tree (whose only change from r328 is block 10's width-probe TU, block 13's MTP-vocab TU and block 16's regenerated help docs -- none of them this artifact's files), so its own mechanisms are unchanged; the numbers of record are the r329-tree port verification above.  `validate-set.sh` check 8 verifies the strict apply of all three trees on every run.
 * **r327 re-cut verification**: applies strictly at the r327 default tree `4792f98b82a4c6433bf11c629fdf01c21a143ce9` (sha256
   `1ffa60a9d2f8165ab1457bd85be50c51f7f8c190339a6c4b1d574e5f904b0945`), producing tree `410b6f1b16926d53a6a95f340bfb876cb2411a19`; with the other optional artifact on top, the cumulative tree is
   `8c1e74631c653862c3f2da5968042ec0cbba99f0`.  r327 amends **block 10** with one packed FA KV-group bitmap per graph evaluation

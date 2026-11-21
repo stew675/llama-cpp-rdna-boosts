@@ -1,3 +1,80 @@
+## 261121.009 (r330) -- the optional artifacts are verified **on** the r329 tree rather than merely applied to it, and `gate-mixed-kv.sh` can no longer call a run complete with a refusal arm it never ran (tooling + records only: no delivery patch changed, **no tag**)
+
+**Nothing in `patches/`, `release.json` (base/tip/tree) or the block structure changed**, so there is no release
+for this session: it is one gate script, the two optional artifacts' current-state records, `MANIFESTS.md` gate 7
+and this entry, following the `261121.007` precedent (a tooling-only session cuts no tag).
+
+### 1. What "porting the optional artifacts to the re-base" still owed: behaviour, not applies
+
+r328 re-cut both artifacts mechanically against the new default tree and recorded that each **built** and that
+`0101` went through its own gate; r329 re-cut them again after amending blocks 10/13/16 and recorded only that
+`0101` still applied **strictly** (its `tests/test-logits-width-probe.cpp` hunk was re-anchored under the batch-API
+migration).  What was therefore still owed was not an apply and not a build -- it was **behaviour on the rebased
+tree**:
+
+* `0100` had not run a single arm since the re-base (its numbers of record were r285's), and two of its structural
+  features sit on code the re-base rewrote: the MTP **target** pairing (r246) and the host-expert abort fix (r259).
+* `scripts/gate-mixed-kv.sh` had never exercised its own **refusal** arms on this box: both are opt-in
+  (`--other-model` / `--qsa-model`), a missing model was a silent no-op that was not counted, and r328's record
+  therefore reads "12/12 PASS" with arm 4 never having run (the record notes the SKIP without noticing that the
+  total hid it -- the "a check that cannot fail is not a check" shape again).
+
+Both are closed by measurement below.  One optional-applied tree was used throughout: the r329 chain tip
+`f8df8a484` (`bbd08a300` + `0100` + `0101`), built into `~/llama.cpp/build-opt`; both artifacts applied
+**strictly** (`git am`, no `-3`) and produced exactly the trees `release.json` records (`7e9008463` /
+`7b9702682`, cumulative `d8deaa13e8`).
+
+### 2. `0100` two-lane prefill on the r329 tree (3 x R9700 gfx1201, ROCm 10.1.0, `prompts/prose-rdna-boosts.txt`)
+
+| arm | lanes 1 | lanes 2 | verdict |
+|---|---|---|---|
+| **default path inert**, 4B Q8_0 `-sm tensor`, greedy 20 tok | `1c5d32ac537d` | `1c5d32ac537d` | identical to the release anchor; arm gate fires `ignored (n_gpu = 1, pipeline_parallel = 0, draft = 0)` |
+| `gate-prefill-logits.sh` on the optional-applied build | — | — | **mean KLD 0.000000 / same-top-p 100.000 %** vs the r328-recorded base |
+| 35B-A3B Q8_0, `-sm layer -ot`, prefill A B B A | 5806.2 / 5793.9 t/s | **6879.3 / 6883.2 t/s** | **+18.6 %**; `two-lane prefill enabled`, 3 x `pair decided: splits a=4 b=4`, lane-2 buffers 1384.6 MiB |
+| the same, decode / greedy text | 72.7 t/s | 73.4 / 72.7 t/s | nil; text `e2dde701fc04` for lanes unset / 1 / 2 |
+| **MTP target** (27B `GSQ-RCO-IQ3_S-mtp`, `--spec-draft-n-max 3`) prefill | 1040.0 t/s | **1364.1 t/s** | **+31.2 %**; 3 pairs, both drafts refused `draft = 1`; plain `--spec-type none` 1072.3 -> **1449.7** (**+35.2 %**) |
+| the same, decode / greedy text | 56.1 t/s | 55.9 t/s | nil; `a4a403d64c40` in all four arms |
+| **host-expert tier** `-ncmoe 40`, wide ubatch | 5230.4 t/s | 4465.7 t/s | **-14.6 %**, the documented cost; **no abort** (r259 fix holds); text `49bf8044ec4b` both lanes |
+
+So the artifact's own mechanisms survived the re-base unchanged: the arm gate, the pair count, the per-lane output
+extraction (identical text on every arm), the MTP-target pairing and the host-expert guard.  `check-gpu-faults.sh`
+is clean over every arm above.
+
+### 3. `0101` mixed K/V on the r329 tree
+
+`scripts/gate-mixed-kv.sh` (27B Q4_K_M, 3-device `-sm tensor`, the r329 build): **14/14 PASS**.
+`test-backend-ops -o FLASH_ATTN_EXT` **7453/7453** in the default, `GGML_CUDA_FA_KV_MIXED=0` and
+`GGML_CUDA_FA_KV_NATIVE=0` arms (the r328 case count); width purity W=1..8 **maxdiff 0** for q8_0/q8_0 and all
+three pairs; a 32-token greedy decode per pair; **both refusals** (Ling-3.0-tiny, and Qwen3.8-Flash-Next
+GSQ-RCO-IQ3_XXS for QSA) fire with the "models require the same K and V cache types" text.  This is also the
+first execution of the artifact's `test-logits-width-probe.cpp` hunk since r329 migrated that TU to the ext batch
+API, so the re-anchored hunk is proven, not just applicable.
+
+### 4. Findings (reported before the commit; the maintainer approved both fixes and no tag)
+
+* **F1 -- `gate-mixed-kv.sh` could print a complete pass with arm 4 never run** (real, tooling only).  Fixed: the
+two refusal models are **defaulted** (Ling-3.0-tiny; Qwen3.8-Flash-Next GSQ-RCO-IQ3_XXS), a **missing file is a
+FAIL** instead of a silent no-op, `--no-refusals` is the only opt-out, and a skipped arm is **counted** -- the
+verdict becomes `PASS (INCOMPLETE): N checks, K SKIPPED -- this is NOT a full gate run`.  Verified in all three
+states on the optional build: defaults -> `PASS: 5/5` with both refusals; `--no-refusals` -> `PASS (INCOMPLETE)`,
+2 SKIPPED; `--other-model /nonexistent` -> `FAIL: 1 of 5 checks failed`.
+* **F2 -- both optional READMEs' artifact bullets still headlined the r327 sha256** and their current bullet said
+"the r327 numbers stand".  Fixed: the headline sha256s are the r329 cuts (`4d802e69…` / `b4a5b11f…`), each artifact
+carries a "r329-tree port verification (current)" bullet with the numbers above, and `MANIFESTS.md` gate 7 no
+longer quotes the stale `7021/7021` (it now states a clean N/N and the count's two observed values) and documents
+the refusal arms' defaulted/counted rule.
+* **F3 -- no action.**  The only compiler warning in an optional build is
+`tests/test-backend-ops.cpp:9500 -Wreorder-ctor` (`mask_hole` after `mask_heads`), which is **upstream's** own
+field order from the base commit (`#32217`, Inkling-2 support), present in the r329 default tree and not
+introduced by either artifact.
+
+### 5. State
+
+`release.json` unchanged (`v17-919794500-r329`, base `919794500`, tip `bbd08a300`, tree `63195b0ce6`,
+`optional_tree` `d8deaa13e8`); no tag, no fork refresh, no container rebuild (nothing a consumer applies has
+changed).  The optional-applied verification tree (`opt-r329-verify`, tip `f8df8a484`) stays in `~/llama.cpp` as
+the arm record; it is not a delivery branch.
+
 ## 261121.008 (r329) -- the delivery's generated docs were stale and two test TUs were on the deprecated batch API: three block amendments, and a check so the docs cannot silently drift again
 
 **The set changes: blocks 10, 13 and 16 amended, no new block, no renumbering.**  Both items came out of the
