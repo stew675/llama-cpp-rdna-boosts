@@ -1,3 +1,62 @@
+## 261121.001 (r328 prep) -- the libr4d/radiance Apache-2.0 attribution lands, `TODO` #352's container UI stage moves to `ui/apps/chat`, and an offered patch set is assessed (two repo-level fixes; no delivery patch changed)
+
+**No delivery patch changed, no block created, split or renumbered, no release.**  The r328 ladder is still
+`dd4fa5e22` (tree `4e222b2ecba3b05e5e35484a328ae3f35842772b`) and `patches/`, `release.json`,
+`rdna-boosts-all.patch` and the fork remain untouched until R18.  This entry covers two external inputs that
+arrived while R18 was being set up; the assessment lives in
+[`wip/upstream-rebase-261120/EXTERNAL-ANALYSES.md`](wip/upstream-rebase-261120/EXTERNAL-ANALYSES.md).
+
+### 1. `NOTICE` + `third_party/radiance/` — the delivery now carries its own attribution
+
+Reported by `@overdoingism`: block 03's two chunked-GDN kernel files are **ports of libr4d kernels**, and
+libr4d now ships inside [radiance](https://codeberg.org/StillDeadcode/radiance) under **Apache-2.0**, whose
+`NOTICE` must travel with a derivative (§4(d)).  The claim is not an inference — the files state it in their
+own headers (`r4d_gdn_kkt_solve_k128_c64`, `r4d_gdn_chunk_scan_k128_v128_c64`, the fragment helpers of
+`r4d_gdn_wmma.h`), and a `git grep` over the ladder tree finds no other libr4d-derived file.  Block 01's
+all-reduce only *cites* radiance's fence discipline (an idea, not copied code) and needs no licence file.
+Before this, the repo carried only its own MIT `LICENSE` and **no `NOTICE` at all**.
+
+Added (nothing in `patches/` touched):
+
+| path | what |
+|---|---|
+| `third_party/radiance/LICENSE`, `NOTICE` | radiance's files **verbatim**, pinned at `04247d1125` (`main`, 2026-11-21); sha256s recorded in that directory's `README.md`. Never edited — a new pin replaces them whole |
+| `third_party/radiance/README.md` | the pin, why they are here, the two affected files, and "no radiance source is vendored" |
+| `NOTICE` (root) | the scope statement: MIT except those two files, which stay Apache-2.0; what a redistributor of the applied tree must carry |
+| `README.md` (License), `patches/README.md` (Block 03), `AGENTS.md` (layout) | the pointer in each place a reader would look |
+
+**Still owed (needs the maintainer — it is a block amendment):** a one-line `// Licence: Apache-2.0, derived
+from radiance/libr4d (see NOTICE)` header comment in each of the two files, applied when R18 regenerates the
+patch set (step 5), not as a commit of its own.
+
+### 2. `TODO` #352 — the container `web` stage moved to `ui/apps/chat`
+
+`.devops/rdna-rocm.Dockerfile` still built `tools/ui/`, which does not exist at `919794500`; a relaxed path
+would have shipped an image with no embedded UI and a silent HuggingFace fallback.  The `web` stage now mirrors
+upstream's `.devops/cuda.Dockerfile`: `WORKDIR /app/ui/apps/chat`, `npm ci`, `COPY ui/apps/chat/ ./`, then
+`ui/lib/ui/package.json`, `ui/lib/ui/src/lib/` and `ui/lib/voice/src/` into `/app/ui/lib/...`, and
+`COPY --from=web /app/ui/apps/chat/dist ui/apps/chat/dist` in the build stage.  All five source paths verified
+present at the base commit.  **A container build of a pre-r328 tree is no longer supported by that file**
+(stated in its comment); #352 stays open only for the r328 image smoke build that proves `index.html` is served,
+which runs off-host with the release images.
+
+### 3. An offered patch set, assessed — nothing taken
+
+`@overdoingism` offered `llama-Frankenstein` (MIT, some parts Apache-2.0, tracking r327) together with a
+warning that upstream now covers DFlash, the server's slot scheduling and NORM+MUL fusion.  The warning is
+already answered by the ladder — DFlash was decided by measurement at R12 (**D17**), upstream's two `#32454`
+NORM+MUL arms were the only arms the delivery's dispatcher was missing and R10.1 added them in r327's position,
+and block 16/block 12 were resolved against upstream's current `tools/server/` with `gate-prefill-fairness`/
+`gate-prefill-duty` green — so **nothing changes for the re-base**.  Of the seven offered groups, two are worth
+a future campaign (J1's batch-invariant decode/verify attention, which targets the split-point weakness
+`INVARIANTS.md` r315 documents; and J3's GDN draft-verification anchor+replay against block 03's
+`n_rs_seq + 1` snapshot planes), three are already covered here (J5 -> block 02 + `LLAMA_SPEC_ALIGN` + upstream's
+n-gram drafts; J7 -> the pinned pipelined `state_stage`; J5's other levers), and J4 is common/ chat behaviour
+outside RDNA scope.  Every patch in it is cut against r327's tree and the ladder moved exactly the seams it
+sits on (speculator class split, FA band work gates, `GGML_OP_COUNT` 109, the fusion dispatcher TU), so "take
+anything" means a re-port onto this base — a campaign per group, never an R18 item.  Their numbers are
+single-GPU; ours are judged at 2-3 devices.
+
 ## 261120.006 (r327) -- the HF-UI asset cache is retired: no delivery build fetches a UI bundle any more, and `TODO` #342 closes with it (no delivery change)
 
 **No delivery patch changed, no block created, split or renumbered, no release.**  This entry retires the

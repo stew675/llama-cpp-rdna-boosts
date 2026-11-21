@@ -743,4 +743,9 @@ Many thanks to the llama.cpp team
 
 ## License
 
-Same as llama.cpp (MIT).
+Same as llama.cpp (MIT), with one documented exception: block 03's chunked Gated DeltaNet kernels
+(`gated_delta_net_chunked_bf16.cu`, `gated_delta_net_chunked_bf16_gfx11.cu`) are ports of libr4d kernels,
+and libr4d ships inside [radiance](https://codeberg.org/StillDeadcode/radiance) under **Apache-2.0**.  Those
+parts stay Apache-2.0; radiance's `LICENSE` and `NOTICE` are reproduced unchanged in
+[`third_party/radiance/`](third_party/radiance/).  See [`NOTICE`](NOTICE) for the exact scope — it matters
+if you redistribute the applied tree.

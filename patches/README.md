@@ -1014,6 +1014,17 @@ enabled speculator (`common_speculative_n_max() + 1`, every draft *and* ngram ty
 never take the chunked path (`GREEDY-PURITY.md` §27).  The BF16 chunked path was the issue-#113 prefill-logit
 regression: **run `scripts/gate-prefill-logits.sh` on any change here.**
 
+**Provenance / licence.**  Both kernel files are **ports of libr4d kernels** — their own headers say so: the
+RDNA4 file from `r4d_gdn_kkt_solve_k128_c64` and `r4d_gdn_chunk_scan_k128_v128_c64`, with the WMMA fragment
+helpers of `r4d_gdn_wmma.h`; the gfx11 file is the same two kernels re-validated on the first-gen fragment
+layouts.  libr4d now ships inside [radiance](https://codeberg.org/StillDeadcode/radiance) under
+**Apache-2.0**, so those parts are Apache-2.0 and the rest of the delivery stays MIT.  radiance's `LICENSE`
+and `NOTICE` are reproduced unchanged in the delivery repo's `third_party/radiance/` (pinned at radiance
+`04247d1125`), and the repo-root `NOTICE` states the scope — Apache-2.0 §4(d) requires the NOTICE to travel
+with a redistribution of the applied tree.  Do not "clean up" those two files' provenance comments: they are
+the attribution.  Block 01's all-reduce only **cites** radiance's fence discipline (an idea, not copied
+code) and needs no licence file.
+
 **Gates.**  `test-backend-ops -o GATED_DELTA_NET`, `test-recurrent-state-depth` (**Phase C since r195**
 is the moved-cell gate: 15/15 arms differ by 2.94-9.64 logits before the fold and by 0 after, on one GPU
 and with `-sm tensor` on three), `test-recurrent-state-rollback` (compare the per-arm FAIL/PASS *set*,

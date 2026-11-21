@@ -1,0 +1,33 @@
+rdna-boosts — llama.cpp RDNA/ROCm delivery patch set
+Copyright (c) 2026 stew675 and the rdna-boosts contributors
+
+The patches in this repository are under the MIT License (see LICENSE), except as noted below.
+
+The delivery's chunked Gated DeltaNet kernels (block 03) are ports of libr4d kernels, and libr4d now
+ships inside radiance:
+
+    radiance, https://codeberg.org/StillDeadcode/radiance
+    Copyright 2026 Deadcode and the radiance contributors
+    Licensed under the Apache License, Version 2.0
+
+Those parts stay under the Apache License 2.0; they are not relicensed by inclusion in this MIT-licensed
+repository.  radiance's Apache-2.0 LICENSE and its NOTICE (which §4(d) of that licence requires to travel
+with a derivative) are reproduced unchanged in third_party/radiance/, pinned at radiance commit
+04247d11253321f0bce34218c2951302ca3207b8.
+
+The affected files, both added by block 03
+(0003-rdna-boosts-block-03-chunked-gated-delta-net-prefill.patch):
+
+  * ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu (gfx12 / RDNA4)
+      ported from libr4d's r4d_gdn_kkt_solve_k128_c64 and r4d_gdn_chunk_scan_k128_v128_c64, with the
+      WMMA fragment helpers of r4d_gdn_wmma.h; adapted to llama.cpp (fp32 tensor I/O converted to bf16 on
+      the fly, llama.cpp layouts, the h % H_k GQA mapping, a compact bf16 A scratch, the delivery's own
+      runtime-cc dispatch).
+  * ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu (gfx11 / RDNA3, RDNA3.5)
+      the same two kernels, re-validated on the first-gen WMMA fragment layouts.
+
+No other file in the delivery derives from radiance.  Block 01's hybrid all-reduce cites radiance's fence
+discipline for fine-grained peer VRAM (an idea, not copied code) and is credited in patches/README.md.
+
+Consumers of the patch set: applying the patches to a llama.cpp checkout reproduces the derivation above,
+so a redistribution of the applied tree carries this NOTICE and third_party/radiance/ with it.

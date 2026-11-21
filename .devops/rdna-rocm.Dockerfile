@@ -52,12 +52,22 @@ FROM docker.io/node:$NODE_VERSION AS web
 
 ARG APP_VERSION
 
-WORKDIR /app/tools/ui
+# UI layout: pre-r328 trees had `tools/ui/` (one directory); from r328 (llama.cpp
+# `919794500`) the embedded UI is `ui/apps/chat` (the app) plus `ui/lib/ui` and
+# `ui/lib/voice` (the sources it compiles), copying upstream's own
+# `.devops/cuda.Dockerfile` web stage.  The output stays `ui/apps/chat/dist`, which
+# is `scripts/ui-assets.cmake`'s Priority-1 pre-built path; a container built from
+# a pre-r328 tree is not supported by this file (`TODO` #352).
+WORKDIR /app/ui/apps/chat
 
-COPY tools/ui/package.json tools/ui/package-lock.json ./
+COPY ui/apps/chat/package.json ui/apps/chat/package-lock.json ./
 RUN npm ci
 
-COPY tools/ui/ ./
+COPY ui/apps/chat/ ./
+# the app compiles Llama UI and Llama Voice from their sources next to it
+COPY ui/lib/ui/package.json /app/ui/lib/ui/package.json
+COPY ui/lib/ui/src/lib/ /app/ui/lib/ui/src/lib/
+COPY ui/lib/voice/src/ /app/ui/lib/voice/src/
 RUN LLAMA_BUILD_NUMBER="$APP_VERSION" npm run build
 
 ### Build image
@@ -111,7 +121,7 @@ WORKDIR /app
 
 COPY . .
 
-COPY --from=web /app/tools/ui/dist tools/ui/dist
+COPY --from=web /app/ui/apps/chat/dist ui/apps/chat/dist
 
 # Build.  GGML_HIP_RCCL turns block 12's hybrid all-reduce on for non-RDNA4
 # pairs and needs librccl from the base image (find_package(rccl REQUIRED)).

@@ -77,6 +77,14 @@ shipping.  Target: the next
 release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 
+**Two external analyses arrived 2026-11-21 and are assessed in [`EXTERNAL-ANALYSES.md`](EXTERNAL-ANALYSES.md):** (a) a
+licensing obligation — block 03's two chunked-GDN kernel files are libr4d ports, and libr4d now ships inside
+`radiance` under Apache-2.0 — **fixed at the repo level** (root `NOTICE` + `third_party/radiance/`), with one
+one-line in-patch attribution still needing the maintainer's approval; and (b) an offered patch set
+(`llama-Frankenstein`, cut against r327) mapped group by group onto what the delivery already ships — **nothing is
+taken into r328**, and the three upstream overlaps it warns about (DFlash, NORM+MUL, server slot scheduling) were
+already resolved at R12/R10.1/R16.
+
 This is a **ladder climb, not a single rebase**: one rung per delivery block, each rung ending in a resolved
 commit, a green build and a coherence run, so a session can stop after any rung and the next one resumes with
 `git cherry-pick <next block>`.  A rung that reaches a **critical decision point** (upstream has implemented,

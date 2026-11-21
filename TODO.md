@@ -47,7 +47,7 @@ left in this file.  The r236 re-base
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **349** | `scripts/gate-server-arms.sh`'s `35b10` arm is not bit-reproducible on its **second slot** even with both of r324's fixes (a `MOE_EXPERT_HEATMAP=load` pin and a fixed-order admission): slot 0 is stable, slot 1 reads three different texts at three acceptances, because a 0.5 s stagger lands at a *variable* point in slot 0's prefill | tooling / gate (`TODO` #295's gate, gate 24 step 5c) | **OPEN** -- admit slot 1 on slot 0's first STREAMED TOKEN instead of on a clock; until then that arm's text is reported, not asserted (its acceptance checks stay hard, which is the collapse detector the arm exists for); §349 |
 | **351** | does upstream now support `-sm tensor` for `flint`?  If it does, the temporary block `0300` (`-sm relaxed-tensor`) can be dropped -- upstream's per-architecture refusal is the only reason the block exists | delivery structure / temporary block `0300` | **OPEN** -- re-tested at R17 of the r328 re-base (`wip/upstream-rebase-261120/`), on the real model this box has; §351 |
-| **352** | `.devops/rdna-rocm.Dockerfile`'s UI `web` stage still targets the pre-r328 `tools/ui/` layout; after the re-base it must build and copy `ui/apps/chat` (+ `ui/lib/ui`, `ui/lib/voice`) or the container silently loses its embedded UI and falls through to a HuggingFace fetch | release tooling (container build) | **OPEN** -- R18 of the r328 re-base, cannot be done before the tree moves; §352 |
+| **352** | `.devops/rdna-rocm.Dockerfile`'s UI `web` stage targeted the pre-r328 `tools/ui/` layout; the file now builds `ui/apps/chat` (+ `ui/lib/ui`, `ui/lib/voice`) and copies `ui/apps/chat/dist`, matching llama.cpp `919794500` — what is left is the **r328 image smoke build** that proves the embedded UI is served | release tooling (container build) | **OPEN (fixed at R18, unverified)** -- the Dockerfile change is made; the image is built off-host after the r328 tag, and `TODO` #352's own verification (`--targets server`, `index.html` served) runs with it; §352 |
 | **353** | no Inkling-2 model loads at `919794500`: the looped family needs support this snapshot lacks — Unsloth's file is `arch = inkling2` with 24 physical blocks but `block_count = 48` + `num_loops = 3` (the loader has no loop, so it asks for `blk.24.*`), and **GGML's reference file is `arch = inkling2_loop`, which this tree does not know at all** | upstream model support / validation target | **OPEN (waiting on upstream)** -- the pristine base repeats both failures and r327 knows neither arch, so no delivery change is involved; it blocks the only local validation of upstream's per-head FA mask (`#32217`) and of the `nb32` widening; §353 |
 
 ## Handle numbering
@@ -238,26 +238,22 @@ that the two are linked, the test above is what settles it: it runs with the rev
 
 ## 352. The container `web` stage still targets the pre-r328 UI layout
 
-**Open** (2026-11-20, found while retiring the HF-UI asset cache at the start of the r328 re-base).  Upstream
-moved the embedded UI from `tools/ui/` to `ui/apps/chat` (the app) plus `ui/lib/ui` and `ui/lib/voice` (the
-sources the app compiles), and `scripts/ui-assets.cmake`'s Priority-1 pre-built path moved with it
-(`SRC_DIST_DIR = ui/apps/chat/dist`).
+**Fixed at R18 (2026-11-21), verification pending** (found 2026-11-20, while retiring the HF-UI asset cache at
+the start of the r328 re-base).  Upstream moved the embedded UI from `tools/ui/` to `ui/apps/chat` (the app)
+plus `ui/lib/ui` and `ui/lib/voice` (the sources the app compiles), and `scripts/ui-assets.cmake`'s Priority-1
+pre-built path moved with it (`SRC_DIST_DIR = ui/apps/chat/dist`).
 
-`.devops/rdna-rocm.Dockerfile`'s `web` stage still does `WORKDIR /app/tools/ui`, `COPY tools/ui/ ./`, `npm ci`,
-`npm run build`, and the build stage copies
-`COPY --from=web /app/tools/ui/dist tools/ui/dist`.  On a post-r328 tree those COPYs fail (the directory does
-not exist); if they were merely relaxed, the assets would land where `ui-assets.cmake` no longer looks, so the
-container would fall through to a HuggingFace fetch -- exactly what the `web` stage exists to prevent.
+`.devops/rdna-rocm.Dockerfile`'s `web` stage now does `WORKDIR /app/ui/apps/chat`,
+`COPY ui/apps/chat/package*.json ./`, `npm ci`, `COPY ui/apps/chat/ ./`, then `ui/lib/ui/package.json`,
+`ui/lib/ui/src/lib/` and `ui/lib/voice/src/` into `/app/ui/lib/...`, `npm run build`, and the build stage does
+`COPY --from=web /app/ui/apps/chat/dist ui/apps/chat/dist` — upstream's own shape (`.devops/cuda.Dockerfile` at
+`919794500`), and all five source paths exist at that commit.  A container build of a **pre-r328** tree is no
+longer supported by that file (the layout does not exist there); that is recorded in the Dockerfile's comment.
 
-**Do it at R18 of the r328 re-base**, copying upstream's own shape (`.devops/cuda.Dockerfile` at `919794500`):
-`WORKDIR /app/ui/apps/chat`, `COPY ui/apps/chat/package*.json ./`, `npm ci`, `COPY ui/apps/chat/ ./`, then
-`ui/lib/ui/package.json`, `ui/lib/ui/src/lib/` and `ui/lib/voice/src/` into `/app/ui/lib/...`, `npm run build`,
-and in the build stage `COPY --from=web /app/ui/apps/chat/dist ui/apps/chat/dist`.
-
-It cannot be done earlier: the current release tree (`4f9dfa0e3`..r327) still has `tools/ui/`, so changing the
-Dockerfile now would break a container build of *that* tree.  Verify with
+**What is left** is the verification the item always named, which needs the r328 tree after the tag:
 `scripts/build-containers.sh --rocm 10.1 --arch gfx1201 --targets server` (a local smoke, no `--push`) and
-confirm the image's `llama-server` serves `index.html`.
+confirm the image's `llama-server` serves `index.html`.  The release images are built off-host by the worker
+watcher (`CONTAINERS.md`), so this runs there or as a one-target smoke here — never the full two-line build.
 
 
 ## 353. No Inkling-2 model loads at `919794500`: the looped family needs support this snapshot lacks
