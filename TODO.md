@@ -48,7 +48,7 @@ left in this file.  The r236 re-base
 | **349** | `scripts/gate-server-arms.sh`'s `35b10` arm is not bit-reproducible on its **second slot** even with both of r324's fixes (a `MOE_EXPERT_HEATMAP=load` pin and a fixed-order admission): slot 0 is stable, slot 1 reads three different texts at three acceptances, because a 0.5 s stagger lands at a *variable* point in slot 0's prefill | tooling / gate (`TODO` #295's gate, gate 24 step 5c) | **OPEN** -- admit slot 1 on slot 0's first STREAMED TOKEN instead of on a clock; until then that arm's text is reported, not asserted (its acceptance checks stay hard, which is the collapse detector the arm exists for); §349 |
 | **351** | does upstream now support `-sm tensor` for `flint`?  If it does, the temporary block `0300` (`-sm relaxed-tensor`) can be dropped -- upstream's per-architecture refusal is the only reason the block exists | delivery structure / temporary block `0300` | **OPEN** -- re-tested at R17 of the r328 re-base (`wip/upstream-rebase-261120/`), on the real model this box has; §351 |
 | **352** | `.devops/rdna-rocm.Dockerfile`'s UI `web` stage still targets the pre-r328 `tools/ui/` layout; after the re-base it must build and copy `ui/apps/chat` (+ `ui/lib/ui`, `ui/lib/voice`) or the container silently loses its embedded UI and falls through to a HuggingFace fetch | release tooling (container build) | **OPEN** -- R18 of the r328 re-base, cannot be done before the tree moves; §352 |
-| **353** | `Inkling-2-Mini` cannot load at `919794500`: the GGUF declares `block_count = 48` but ships **24 physical blocks** plus `loop.core_start = 6`, `loop.core_end = 18`, `num_loops = 3`, and upstream's `src/models/inkling2.cpp` implements no loop at all, so it asks for `blk.24..47.*` ("check_tensor_dims: tensor 'blk.24.attn_q.weight' not found") | upstream model support / validation target | **OPEN (upstream)** -- the pristine base fails identically and r327 does not know the arch, so no delivery change is involved; it blocks the only local validation of upstream's per-head FA mask (`#32217`) and of the `nb32` widening; §353 |
+| **353** | no Inkling-2 model loads at `919794500`: the looped family needs support this snapshot lacks — Unsloth's file is `arch = inkling2` with 24 physical blocks but `block_count = 48` + `num_loops = 3` (the loader has no loop, so it asks for `blk.24.*`), and **GGML's reference file is `arch = inkling2_loop`, which this tree does not know at all** | upstream model support / validation target | **OPEN (waiting on upstream)** -- the pristine base repeats both failures and r327 knows neither arch, so no delivery change is involved; it blocks the only local validation of upstream's per-head FA mask (`#32217`) and of the `nb32` widening; §353 |
 
 ## Handle numbering
 
@@ -260,41 +260,41 @@ Dockerfile now would break a container build of *that* tree.  Verify with
 confirm the image's `llama-server` serves `index.html`.
 
 
-## 353. `Inkling-2-Mini` needs inkling2 loop support that upstream does not have
+## 353. No Inkling-2 model loads at `919794500`: the looped family needs support this snapshot lacks
 
-**Open, waiting on upstream** (2026-11-20, found when the maintainer placed the model on the box to validate the per-head FA mask).
+**Open, waiting on upstream** (2026-11-20, found when the maintainer placed two Inkling-2-Mini files on the box
+to validate the per-head FA mask).  Two files, two different failures, one conclusion.
 
-`/llm/models/Inkling-2-Mini/Q8_K_XL/Inkling-2-Mini-UD-Q8_K_XL.gguf` (22.8 GB, `arch = inkling2`, 128 experts x 8 used, 24 heads /
-8 KV heads) declares **`block_count = 48`** but stores **24 physical blocks** (`blk.0`..`blk.23`), and carries
-`loop.core_start = 6`, `loop.core_end = 18`, `num_loops = 3` plus 12 `loop_attn_{down,forget,gain}` and 12
-`loop_k_{down,forget,gain}` tensors.  The physical layout is therefore 6 pre + 12 core x 3 loops + 6 post = 48 logical layers.
+| file | arch | physical blocks | metadata | result at this base |
+|---|---|---|---|---|
+| `/llm/models/Inkling-2-Mini/Q8_K_XL/Inkling-2-Mini-UD-Q8_K_XL.gguf` (Unsloth, 22.8 GB) | `inkling2` | 24 (`blk.0..23`) | `block_count = 48`, `loop.core_start = 6`, `loop.core_end = 18`, `num_loops = 3`, 12 `loop_attn_*` + 12 `loop_k_*` | **known arch, load fails:** `check_tensor_dims: tensor 'blk.24.attn_q.weight' not found` |
+| `/llm/models/Inkling-2-Mini/Q8_0/Inkling-2-Mini-Q8_0.gguf` (GGML reference, 27.8 GB) | **`inkling2_loop`** | 24 (`blk.0..23`), 704 tensors | `inkling2_loop.block_count = 24`, no `num_loops`/`loop.core_*` | **unknown arch:** `unknown model architecture: 'inkling2_loop'` |
 
-`src/models/inkling2.cpp` in this snapshot reads none of that: no `LLM_KV_NUM_LOOPS`, no core range, no
-logical->physical mapping — it calls `create_tensor(..., i)` for `i` in `[0, n_layer)`, so it asks for
-`blk.24.*` and the load dies with
+So the family is split in two upstream: `inkling2` (which `#32217` supports, non-looped) and a **separate
+`inkling2_loop` arch** that this tree has never heard of.  The Unsloth file compounds it by *declaring* 48
+logical layers over 24 physical blocks with an explicit loop range, which `src/models/inkling2.cpp` does not
+read (`git grep num_loops src/models/inkling2.cpp` is empty; upstream's `nanbeige.cpp` is where that mechanism
+lives).
 
-```
-llama_model_load: error loading model: check_tensor_dims: tensor 'blk.24.attn_q.weight' not found
-```
+**Not a delivery defect and not this re-base:** the pristine `919794500` base repeats both failures
+(`build-base-novmm`), and r327 knows neither arch (`unknown model architecture: 'inkling2'` /
+`'inkling2_loop'`).
 
-**Not a delivery defect and not this re-base:** the pristine `919794500` base fails identically
-(`build-base-novmm`), and r327 (old base) does not know the architecture at all (`unknown model architecture:
-'inkling2'`).  Upstream *has* the mechanism — `src/models/nanbeige.cpp` implements `n_loops` /
-`n_layer_phys` / `skip_loop_final_norm` — it is simply not applied to inkling2 yet.
+**What it blocks.**  The only local coverage of upstream `#32217`'s **per-head FA mask** (the op matrix sweeps
+`mask_heads = 1` only: `grep -c 'mask_heads=[2-9]'` = 0) and of the **`nb32` widening** that term needs
+(`RUNGS.md` R05.3 item 1).  Without a loadable model of this class, "the type is correct" rests on matching
+upstream's change, not on a run.
 
-**What it blocks.**  Two things that otherwise have no local coverage: upstream `#32217`'s **per-head FA mask**
-(the op matrix sweeps `mask_heads = 1` only, `grep -c 'mask_heads=[2-9]'` = 0) and the **`nb32` widening** the
-per-head term needs (`RUNGS.md` R05.3 item 1).  Without this class of model, the claim "the type is correct"
-rests on matching upstream's change, not on a run.
+**Re-entry condition.**  A later upstream snapshot that knows `inkling2_loop` (and/or implements the loop in
+`inkling2`) — then re-test **both** files and run the per-head-mask arms.  Porting it ourselves is **not** a
+re-base activity: the reference model is a different arch, so it means writing a whole model class (hparams,
+tensors, graph, the loop gates and `attn_res`), which is a feature campaign with its own gates, not a rung.
 
-**Re-entry conditions.**  (a) a later upstream snapshot implements the inkling2 loop — re-test this exact file
-and then run the per-head-mask arms; or (b) the maintainer decides to port `nanbeige`'s loop mechanism into
-`inkling2.cpp`, which is delivery code for an upstream feature and a scope decision, not a gate outcome.
-
-**Diagnostics that established this** (`gguf-py`, the file itself): 734 tensors; block count 24; per-suffix
-counts show `attn_q/k/v/...` = 24 each, `ffn_gate_up_exps`/`ffn_down_exps` = 44 each, `loop_*` = 12 each,
-`attn_res_query` = 23.  The `dspark-Inkling-2-Mini-Q8_0.gguf` draft and `mmproj-F16.gguf` beside it load nothing
-either, for the same reason.
+**Diagnostics** (`gguf-py` against the two files): Unsloth — 734 tensors, `blk.0..23`, `attn_q/k/v` 24 each,
+`ffn_*_exps` 44 each, `loop_*` 12 each, `attn_res_query` 23; GGML reference — 704 tensors, `blk.0..23`,
+`inkling2_loop.block_count = 24`, `expert_count = 128`, `expert_used_count = 8`, `head_count` 24 /
+`head_count_kv` 8.  The `dspark-Inkling-2-Mini-Q8_0.gguf` draft and `mmproj-F16.gguf` beside the Unsloth file
+load nothing either, for the same reason.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

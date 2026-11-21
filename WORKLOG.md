@@ -87,6 +87,13 @@ applied it to inkling2.  Tracked as `TODO` #353, which also records what it bloc
 `#32217`'s per-head mask (the op matrix sweeps `mask_heads = 1` only) and of the `nb32` widening that term
 needs.
 
+Two files, two failures, one conclusion: Unsloth's `inkling2` file declares 48 logical layers over 24 physical
+blocks with an explicit `num_loops`/`loop.core_*` range that the loader does not read, and **GGML's own
+reference model is a different arch string altogether (`inkling2_loop`) that this tree has never heard of**
+(`unknown model architecture: 'inkling2_loop'`).  So the looped family arrives upstream as *new* arch support,
+not as a fix to `inkling2.cpp` — a snapshot gap, and porting it would be a feature campaign rather than a
+re-base rung.
+
 ---
 
 ## 261120.005 (r327) -- re-base campaign opened: 18 blocks `4f9dfa0e3` -> `919794500`, measured conflict map, 14 decision points, and the r278 base blocker is still live (no delivery change)
