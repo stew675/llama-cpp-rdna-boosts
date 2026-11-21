@@ -1,4 +1,4 @@
-# COLD START — r328 upstream re-base, R12 landed, resume R13
+# COLD START — r328 upstream re-base, **all 18 rungs landed (R00-R17)**, resume for R18
 
 **Read this file top to bottom before touching anything.** It is self-contained: a fresh session should not need
 the campaign's history, only this, then the two files it names in §3.
@@ -23,16 +23,16 @@ Nothing in `patches/`, `release.json`, `rdna-boosts-all.patch` or the fork is to
 cd ~/llama.cpp && git status --short && git branch --show-current && git log --oneline -1
 ```
 
-Expect: **clean**, branch `rebase-r328`, `81523fda6 rdna-boosts: block 13: MTP draft vocabulary subset ...` (tree
-`080d7ecea198417011ca068916c5deafa9f4ce14`).  If a cherry-pick is mid-flight (`git status` shows unmerged
-paths), the previous session stopped inside a conflict: finish it or `git cherry-pick --abort` and redo that rung.
+Expect: **clean**, branch `rebase-r328`, `dd4fa5e22 rdna-boosts: R16 repair: ...` (tree
+`4e222b2ecba3b05e5e35484a328ae3f35842772b`).  The ladder is **complete**: 18 block commits (`0000`..`0016` +
+`0300`) plus two rung repairs.
 
 | item | value |
 |---|---|
-| rungs landed | **R00 … R13** (14 of 18) + 2 rung repairs (R00's top-k gather, R05's `nb32` widening) |
-| rung in progress | **none — R13 landed 2026-11-20** (`81523fda6`, tree `080d7ecea198417011ca068916c5deafa9f4ce14`) |
-| next rung | **R14** (block 14, `git cherry-pick e88d45d9e`, 3 conflicts expected) |
-| remaining | R14, R15, R16, R17 (block `0300`), R18 (release) |
+| rungs landed | **R00 … R17 — all 18 blocks**, 2026-11-20, + 2 rung repairs |
+| ladder tip | **`dd4fa5e22`**, tree `4e222b2ecba3b05e5e35484a328ae3f35842772b` (last block commit `ee502d397`, tree `86780474f4…`; the repair only casts a comparison in block 16) |
+| next | **R18 — the release**, not a rung (see `RUNGS.md` R18 + §8 below) |
+| outstanding repairs to squash at R18 | **three**: R00's `3ea8b0212` (the VMM top-k workaround, D15), R05's `c3860af1e` (`nb32` → `int64_t`), R16's `dd4fa5e22` (`-Wsign-compare`).  21 commits = 18 blocks + 3 repairs |
 | delivery repo | docs-only commits so far (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched until R18) |
 | new fork point | `919794500` |
 | build | `cd ~/llama.cpp && ~/bin/build-llama-rocm`, then `cmake --build build-rocm -j 24` for the per-rung loop (`build-rocm`: `GGML_HIP_NO_VMM=OFF`, `GGML_CUDA_FA_QUANTS` includes `iq4_nl-iq4_nl`, `LLAMA_USE_PREBUILT_UI=OFF`) |
@@ -64,14 +64,15 @@ Note: **no `-lv`** on a text arm (it corrupts the stream). A census arm is a sep
 ## §3 Read order (in this order, only what you need)
 
 1. **This file** (§0–§9).
-2. `RUNGS.md` — the per-rung ledger: every conflict and its resolution, plus each rung's findings. Read the last
-   landed rung (R11) and skim the headers of R06–R10 (they carry obligations that are still open).
-3. `DECISIONS.md` — the decision log. Only **D4** (resolved, additive), **D8**, **D9**, **D12**, **D13** are still
-   live references; everything else is closed.
+2. `RUNGS.md` — the per-rung ledger: every conflict and its resolution, plus each rung's findings (the last four
+   are R14-R17; §R14.1 is the op-count trap and §R15.2 is why block 15's gate is an APU gate).
+3. `DECISIONS.md` — the decision log. **D17** (the DFlash choice) is the only one this ladder decided on
+   measurement; D4/D8/D9/D10/D12/D13 are the merge-shaped ones a later reader may need.
 4. `~/llama-cpp-rdna-boosts/AGENTS.md` — the policy layer (apply with `scripts/apply-all.sh`, `-lv` rules,
    goldens, push policy). Its *Verify* table is what a rung's exit criteria come from.
-5. For R12 (landed): `RUNGS.md` §R12 (esp. §R12.3, the two splice-orphaned server features, and §R12.4, the
-   DFlash decision).  `r12-wip/` is the paused session's evidence and is no longer an entry point.
+5. For the completed ladder: `RUNGS.md`'s ledger (one row per rung) and the four newest sections (R14-R17).  The
+   two that decide R18's shape are §R14.1 (the `GGML_OP_COUNT` trap) and §R15.2 (why block 15's gate is an APU
+   gate).  `r12-wip/` is the paused session's evidence and is no longer an entry point.
 
 `HANDOVER.md` is session-2/3's delta and is now partly historical; this file supersedes it as the entry point.
 
@@ -111,42 +112,32 @@ Note: **no `-lv`** on a text arm (it corrupts the stream). A census arm is a sep
 | R11 | 11 qwen4exp/QSA | done — D13 carried; `gate-hc-fusions.sh` **RED** (R11.2) |
 | R12 | 12 DFlash/CPU wins/server cache/seqpar | **DONE 2026-11-20** — `a9d8e1a96`; the speculator class merged onto upstream's `init(opt)` seam (D17: the delivery's feature set kept, measured); six gates PASS (`spec-reuse-window`, `seqpar --record`, `state-pipe`, `ckpt-reuse`, `park-idle-slots`, `mtp-dev-rows`) |
 | R13 | 13 MTP draft vocab subset | **DONE 2026-11-20** — `81523fda6`; clean apply, one rung repair (the meta device iface's missing trailing initializers), `test-mtp-draft-vocab` PASS, `--spec-draft-mtp-vocab` +7.6 % decode at identical text |
-| R14–R17 | 14..0300 | not started |
-| R18 | release | not started (a long checklist, `RUNGS.md` R18) |
+| R14 | 14 streamed KV (window + pool + draft ring) | **DONE 2026-11-20** — `9f8c11782`; op count recounted to **109** (patch 10), `gate-kv-residency` + `gate-spec-draft-window` PASS; `gate-node-budget` owed (no phi-4) |
+| R15 | 15 UMA GTT expert store | **DONE 2026-11-20** — `07b293a7b`; **R10.3 CLOSED** (49.9 t/s median vs r327's 49.7), `gate-host-pool` **59/59** incl. the `-sm tensor` arms owed from R12; the GTT gate is an APU gate (inert on gfx1201 **by design**) |
+| R16 | 16 server prompt admission | **DONE 2026-11-20** — `71ce858ca` (+ repair `dd4fa5e22`); `gate-prefill-fairness` PASS on three shapes + `--self-test`, `gate-prefill-duty` PASS dense and with `draft-mtp` |
+| R17 | `0300` relaxed-tensor | **DONE 2026-11-20** — `ee502d397`; **`TODO` #351 answered: `0300` cannot be dropped** (flint still refuses `-sm tensor`), flint `relaxed-tensor` == `layer` byte-identical, the no-op arm holds on 35B-A3B |
+| R18 | release | **not started — this is the next session's whole job** (a long checklist, `RUNGS.md` R18) |
 
-## §6 R12 — landed; what it cost, and what to do first in R13
+## §6 The ladder's last four rungs, in one paragraph each (R12-R17 are all in `RUNGS.md`)
 
-R12 is in (`a9d8e1a96`, tree `f0f9db34b1c3ae8a93f834e5c2fad472113a1af9`).  The full log is `RUNGS.md` §R12; the
-short version a fresh session needs:
-
-* The paused session's ten resolutions were applied from `r12-wip/r12-resolved-but-unbuildable.diff`, then
-  `common_speculative_impl_draft_dflash` was merged onto upstream `#32016`'s `dflash_options` + `init(opt)` seam
-  (upstream's split classes, the delivery's features as state `init()` sets — `is_mrope`/`strict_pos`, the
-  `LLAMA_DFLASH_INGEST_TAIL` window + `set_prompt_end`, the ingest filter and `spec_draft_align_cache()`, and
-  `opt.dev_features` instead of the old `!is_lilicorr` guard).  The merged class now differs from upstream by
-  exactly the delivery's 207 lines.
-* Two features the splice had orphaned in `tools/server/` were restored: `prompt_load_with_room()` had **no
-  caller** (so the parked-slot restore retry was dead code) and `server_prompt_cache::load()` read three
-  locals that had moved into `find()`.
-* `ckpt_recycle()` needed a deliberate `std::const_pointer_cast` against upstream's new
-  `shared_ptr<const common_prompt_checkpoint>` immutability rule; the guard (`use_count() == 1`) is what makes
-  it safe and `gate-ckpt-reuse.sh` is the oracle.
-* **D17** — the DFlash decision, resolved by measurement in the maintainer's direction: the delivery's feature
-  set stays on upstream's seam.  Numbers: `benchmarks/2026-11-20-r328-r12-dflash-merge.md`.
-
-**First thing in R14:** re-run `scripts/gate-hc-fusions.sh` (R11.2 is still red and block 12's `hc`/`mmb` knobs
-may be what restores the `mix_op` anchor) and keep R10.3 (the host-expert arena decode, 54.4 → 20.4 t/s, a
-release blocker) in view for R15.
-
-## §6b The rungs left (one line each)
-
-| rung | block | source commit |
-|---|---|---|
-| R14 | 14 | `e88d45d9e` (streamed KV window + attendance pool + MTP draft ring, 3 conflicts) |
-| R15 | 15 | `35a9ae985` (UMA GTT expert store — **R10.3 is owed here**) |
-| R16 | 16 | `286191b31` (server prompt admission, D7) |
-| R17 | `0300` | `e159adfc2` (`-sm relaxed-tensor` + `TODO` #351, the flint re-test) |
-| R18 | — | the release checklist at the end of `RUNGS.md` |
+* **R12** (`a9d8e1a96`) — the paused speculator-class merge finished on upstream's `dflash_options`/`init(opt)`
+  seam, two splice-orphaned server features restored, **D17** decided by measurement (the delivery's DFlash
+  feature set stays).  Six gates green.
+* **R13** (`81523fda6`) — MTP draft vocabulary subset, clean apply, its own test PASS, +7.6 % decode.
+* **R14** (`9f8c11782`) — the streamed KV.  The one trap: `GGML_OP_COUNT` moved to **109** and every
+  `static_assert` was merge *context*, so it had to be recounted (patch 10).  `gate-kv-residency` and
+  `gate-spec-draft-window` PASS; `gate-node-budget` is owed (no phi-4 on this box — see §8).
+* **R15** (`07b293a7b`) — the UMA GTT expert store.  **R10.3 is CLOSED** (arena decode 49.9 t/s median against
+  r327's 49.7, text unchanged) and `gate-host-pool.sh` is **59/59**, including the `-sm tensor` arms owed from
+  R12.  The GTT gate itself is an **APU gate**: on gfx1201 the tier is inert *by design* (the open/arena hooks
+  return null unless `prop.integrated`), so its claims stay owed on the `halo` box.
+* **R16** (`71ce858ca` + repair `dd4fa5e22`) — server prompt admission: fair share, `-ib`, skew, duty cycle.
+  `gate-prefill-fairness` PASS on dense / `draft-mtp` / streamed-host-expert shapes plus `--self-test`, and
+  `gate-prefill-duty` PASS dense and with `draft-mtp`.
+* **R17** (`ee502d397`, ladder tip `dd4fa5e22`) — block `0300`.  **`TODO` #351 is answered: `0300` cannot be
+  dropped** — flint still refuses `-sm tensor` at this base with the block's own message, while
+  `-sm relaxed-tensor` is byte-identical to `-sm layer` (`8ec5510e801e`) and a non-amax arch is unchanged
+  (`86b7f9b5aa80` both ways).
 
 ## §7 The DFlash decision — **RESOLVED (D17): the delivery's feature set stays**, measured
 
@@ -170,15 +161,20 @@ decision: `DECISIONS.md` D17; rung log: `RUNGS.md` §R12.4.  What a later sessio
   r130 record says the same); **F1 is +6-7 % pp on the dense 27B and inert on both MoE heads** (their draft
   contexts fail `llama_supports_embd_row()` and log "host copies"); decode is flat everywhere.
 
-## §8 Open obligations carried into the next session (do not lose these)
+## §8 Open obligations carried into R18 (this is the pre-release list)
 
 | # | item | state |
 |---|---|---|
-| **R10.3 — RELEASE BLOCKER** | the host-expert arena arm's decode: 35B-A3B Q8_0, 1 GPU, `-ncmoe 20 -c 8192 -ub 1024`, `MOE_EXPERT_HEATMAP=load` → **R09 54.4 t/s, R10 20.4 t/s**, reproducible, text unchanged, and **no switch recovers it** (`DISABLE_FUSION=1` 18.5, `SLAB=0` 13.8; r327 reads 49.7) | maintainer, 2026-11-21: *"the decode regression must be fixed before we release; that can happen later."* Re-check at **R15**; if still open, bisect from `pool_stack` / `mmb_yield_caches` / the MMB slot lifetime. **r328 does not ship with it open.** |
-| **R11.2** | `gate-hc-fusions.sh` **RED**: `mix_op`, `dsv4_pre_op`, `ops_no_post` left their r327 anchors (comm_op is exact; the chain itself moved). Half was predicted by block 11's own commit message; the fused **mixer** arm moving is new | re-run at **R13/R14/R17**; if `mix_op` still differs, the fused mixer must not ship default-on. Re-anchoring planted values is a **maintainer decision**, arm by arm |
-| **R06.2 (routed half)** | the forced routed MMB arm (`GGML_CUDA_MMB_TYPES=q8_0 GGML_CUDA_MMB_ROUTED=1`, 35B-A3B) still aborts on the pool LIFO assert where r327 reads `86b7f9b5aa80` | owed at **R15**/R18; it is an A/B override, not a shipped default (RDNA4: `routed=0`, Q8_0 not in the mask) |
-| **R12-owed gates** | the gates for block 12 that R12 did **not** run: `gate-spec-align.sh` (`LLAMA_SPEC_ALIGN`), `gate-spec-ckpt-device.sh` (`LLAMA_SERVER_SPEC_CKPT_DEVICE`), `gate-spec-width-band.sh`, and the `-sm tensor` arms of `gate-host-pool.sh` / `gate-prefill-logits.sh` for block 09's Meta split-state cache (which D7/R12 edits) | run at **R13**/R18; `gate-seqpar.sh --record` was refreshed at R12, so R18 must re-record the prefill-logit base on the final tree |
-| **R18 (delivery repo)** | drop block 10's `top_k` hunk is DONE (de-duplicated by construction at R10); still owed: squash `3ea8b0212` into block 00, re-measure `mm_ids_helper_512_10`, regenerate the generated docs and assert no drift, `TODO` #352 (container `web` stage), `TODO` #351 (the flint `-sm tensor` re-test, at R17), the full quant-coherence + QSA section E, `gate-norm-rows-alias.sh`, `MMB_J_MAX=8`'s floor | see `RUNGS.md` R18 and `HANDOVER.md` §2 for the full list |
+| **R10.3** | the host-expert arena arm's decode (54.4 → 20.4 t/s at R10) | **CLOSED at R15**: 51.2 / 49.9 / 49.2 t/s, median 49.9, against r327's 49.7, text `86b7f9b5aa80`.  Nothing to fix — record it as closed |
+| **R11.2** | `gate-hc-fusions.sh` **still RED at the completed tree, with the R11 numbers exactly** (`mix_op` `3f049f67781c`, `dsv4_pre_op`/`ops_no_post` `c8db61d5dcc8`, `dsv4_post_op`/`all_ops` `6a102dbc62d6`, chain `a512ee68c4b3`) | **a maintainer decision before shipping**: the HC chain itself moved with the re-base (not a later-block interaction), so either the planted anchors are re-anchored arm by arm, or the fused mixer does **not** ship default-on.  Nothing else in the gate is red (no fault, combine op exact) |
+| **R06.2 (routed half)** | the forced routed MMB arm (`GGML_CUDA_MMB_TYPES=q8_0 GGML_CUDA_MMB_ROUTED=1`, 35B-A3B) still aborts on the pool LIFO assert where r327 reads `86b7f9b5aa80` | an A/B override, never a shipped default (RDNA4: `routed=0`).  Owed as a measurement, not a blocker |
+| **block 15's APU gates** | `gate-uma-experts.sh` (17/17 arms text-identical but its census arms cannot fire on gfx1201) and `gate-prefill-server-slots.sh` (needs the >RAM 122B model) | **owed on the `halo` (gfx1151) box** — the discrete side is `gate-host-pool.sh`, 59/59 PASS.  r328 may ship with this recorded as an APU-unvalidated state (`AGENTS.md` allows a documented unvalidated state) |
+| **`gate-node-budget.sh`** | needs phi-4's tight shape; **no phi-4 on this box**, and the only candidate (`Inkling-2-Mini`) fails to load on the pristine base too (`blk.24.attn_q.weight`) | owed at R18 (fetch phi-4 IQ4_XS, or accept it as a documented gap) |
+| **`gate-spec-align.sh` / `gate-spec-ckpt-device.sh` / `gate-spec-width-band.sh`** | block 12/14 speculator paths | **not yet run on the completed tree** — R18's gate sweep |
+| **the prefill-logit base** | `gate-seqpar.sh --record` refreshed it at R12, i.e. on an **intermediate** tree | **R18 must `--record` again on the final tree**, then run the gate |
+| **`-Wdeprecated-declarations`** | `tests/test-logits-width-probe.cpp` (4), `tests/test-mtp-draft-vocab.cpp` (3) still use `llama_batch_init`/`llama_decode` | cosmetic; a `TODO` (D6's ext-batch migration of two test TUs), never a blocker |
+| **repairs to squash** | R00 `3ea8b0212` (D15's VMM top-k), R05 `c3860af1e` (`nb32` widening), R16 `dd4fa5e22` (sign-compare) | R18 step 4b |
+| **R18 (delivery repo)** | `TODO` #352 (container `web` stage), regenerate the generated docs + assert no drift, the full quant-coherence + QSA section E, `gate-norm-rows-alias.sh`, `MMB_J_MAX=8`'s floor, `make-patches.sh` / `make-release.sh` / `validate-set.sh`, `fork-refresh.sh --build --gates --push`, the worker container build, the `WORKLOG.md` release entry | see `RUNGS.md` R18 |
 
 ## §9 Recipes
 
@@ -213,9 +209,12 @@ only.
 | what | where |
 |---|---|
 | the ladder, per-rung detail | `RUNGS.md` (this dir) |
-| live decision items | `DECISIONS.md` (this dir) — D4/D8/D9/D12/D13 |
+| live decision items | `DECISIONS.md` (this dir) — D17, and the merge-shaped records D4/D8/D9/D10/D12/D13 |
 | R12 (landed) | `RUNGS.md` §R12; its evidence patch is `r12-wip/r12-resolved-but-unbuildable.diff` (historical) |
+| R11.2's open decision | `RUNGS.md` §R11.2 (the anchors) + the ladder-complete block at the end of `RUNGS.md` |
 | the DFlash decision + its numbers | `DECISIONS.md` D17, `benchmarks/2026-11-20-r328-r12-dflash-merge.md` |
+| the ladder's tip | `dd4fa5e22`, tree `4e222b2ecba3b05e5e35484a328ae3f35842772b` (block commit `ee502d397`) |
+| the R18 gate sweep's cost model | `MANIFESTS.md` → Release gates (gate 5) and `scripts/gate-per-block-build.sh`'s header |
 | the delivery's DFlash2 record | `archive/work/qwen4exp-dflash2/README.md`, `archive/work/dflash2-draft-sched2/README.md` |
 | env knobs (incl. `LLAMA_DFLASH_*`) | `~/llama-cpp-rdna-boosts/ENVIRONMENT.md` |
 | delivery policy | `~/llama-cpp-rdna-boosts/AGENTS.md` |

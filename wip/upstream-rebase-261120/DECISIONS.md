@@ -462,3 +462,19 @@ tail default-on (`LLAMA_DFLASH_INGEST_TAIL=0` kills it), F1 default-on (`LLAMA_D
 all-gather, DFlash2's selector/probabilistic paths and DSpark's anchor layout as upstream now has them.  No
 number anywhere argued for dropping a delivery feature; the only thing dropped is the build's second,
 pre-split copy of the class.  Recorded at R12 (`RUNGS.md` §R12.4).
+
+## D10 addendum (2026-11-20, R17) — verified at the completed ladder
+
+Upstream `#31435` (`--tensor-split` up to `llama_max_devices()`) merged structurally with block `0300`; nothing in
+the rung needed a choice.  The verification is the block's own two arms on this base: **flint Q8_0, 3 GPU,
+`-sm relaxed-tensor` == `-sm layer` byte-identical** (`8ec5510e801e`, 85 chars) — the amax arch the mode exists
+for — and **35B-A3B Q8_0, 3 GPU, `-sm tensor` == `-sm relaxed-tensor`** (`86b7f9b5aa80`) — the mode is inert for a
+non-amax arch.  Both run through the split path `#31435` touches.
+
+## `TODO` #351 addendum (2026-11-20, R17) — **`0300` cannot be dropped yet**
+
+The re-test `0300` awaited: on `919794500` **flint still refuses `-sm tensor` at load** —
+`LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'flint'; this arch's MoE amax rescale needs
+'-sm relaxed-tensor'` (upstream's `#31081` deny with the block's own pointer).  So upstream has **not** landed a
+real per-device amax fix, the temporary block stays in the default apply for r328, and `-sm tensor` keeps
+upstream's strict behaviour.  Re-test again at the next re-base, not before.

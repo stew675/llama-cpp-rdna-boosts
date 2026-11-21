@@ -45,10 +45,10 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | R11 | 11 | `61168c60b` | 5 | D9, D13 (both MERGE, carried) | **DONE 2026-11-21** — `dbe4fdd40`, tree `2b6aec1f0`; op count 100+6=106 (rpc patch 7), `has_recr && n_pos == 1` union, qwen4exp union carries upstream's FP8 PLE scale *and* the lazy reader, 4th 64-bit-mask recurrence (fattn-qsa/indexer-score/hc-mix); coherence `1c5d32ac537d`, quant-coherence PASS (Q4_K_M gather transparent, no `////`); **`gate-hc-fusions.sh` RED** — 3 numeric arms left their anchors (see R11.2) |
 | R12 | 12 | `dad1442b3` | 10 | D5, D6, D7, **D17 (the DFlash decision — the delivery's feature set kept, measured)** | **DONE 2026-11-20** — `a9d8e1a96`, tree `f0f9db34b1c3ae8a93f834e5c2fad472113a1af9`; the paused session's ten resolutions applied, then `common_speculative_impl_draft_dflash` merged onto upstream's `init(opt)` seam (207 diff lines from upstream, all the delivery's feature; the base loses only the pre-split duplicate state), two splice-orphaned server features restored (`prompt_load_with_room` had no caller; `load()`'s lost locals) and one upstream-constness collision decided (R12.3); build green 0 warnings, coherence `1c5d32ac537d`, MUL_MAT_ID 1077/0 == the base's own count; **PASS**: `gate-spec-reuse-window`, `gate-seqpar --record`, `gate-state-pipe`, `gate-ckpt-reuse`, `gate-park-idle-slots`, `gate-mtp-dev-rows`; DFlash A/B (3 targets, 4 arms): text + acceptance identical everywhere, tail **+29.8 % pp** at 26K on 2-GPU 35B and +11.7 % on 3-GPU Flash-Next, F1 +6-7 % pp on the dense 27B, decode flat; the pristine base still aborts DFlash under `-sm tensor` (R12.5) |
 | R13 | 13 | `1014e6bf5` | 0 | — | **DONE 2026-11-20** — `81523fda6`, tree `080d7ecea198417011ca068916c5deafa9f4ce14`; clean apply (19 files, +588), one rung repair (the meta device iface's missing trailing initializers — an R12 leftover warning, inert); coherence `1c5d32ac537d`; the block's own test `test-mtp-draft-vocab` **PASS** (vocab-subset logits == the full-vocab reference in sequential, concurrent and freed-then-recreated contexts, every context at 0 mismatches / max |diff| 0); `--spec-draft-mtp-vocab 65536` +7.6 % decode over plain MTP at identical text (`bbb051e2aeab` on plain/MTP/subset alike) |
-| R14 | 14 | `e88d45d9e` | 3 | — | not started |
-| R15 | 15 | `35a9ae985` | 0 | — | not started |
-| R16 | 16 | `286191b31` | 0 | D7 | not started |
-| R17 | T | `e159adfc2` | 0 | D10, **`TODO` #351 (the flint `-sm tensor` re-test)** | not started |
+| R14 | 14 | `e88d45d9e` | 2 (the third, `qwen4exp.cpp`, auto-merged) | D12, D13 (re-derived, see the block's own message) | **DONE 2026-11-20** — `9f8c11782`, tree `83f4b8023004befc010746d42552bd2dd6b49928`; `GGML_OP_KV_POOL` needed the **op count recounted to 109** (patch 10) because the merge had left all three `static_assert`s at 108 as context — the R14.1 trap; coherence `1c5d32ac537d`; `gate-kv-residency.sh` **PASS** (window 0 flips resident vs 16 flips / 64 MiB spilling; pool 4104 pages, 204.40 MiB device / 408.00 MiB host mirror, 228 resolves, bad 0, hits 88.18/88.21 %; multi-device 2 counter blocks), `gate-spec-draft-window.sh` **PASS** (all six requests across both slots byte-identical, acceptance identical, auto-policy arms, default 0 under both `-sm layer` and tensor); `gate-node-budget.sh` **not runnable non-vacuously here** (no phi-4) |
+| R15 | 15 | `35a9ae985` | 1 | — | **DONE 2026-11-20** — `07b293a7b`, tree `1351c477480dd784a76f49f522afe3696d7f0f02`; the one conflict is the meta device iface (R13's note vs block 15's list + 5 `gtt_store_*` hooks) → one explicit list of 13 trailing hooks; coherence `1c5d32ac537d`; **R10.3 CLOSED** (arena arm 51.2/49.9/49.2 t/s, median 49.9, text `86b7f9b5aa80` — r327 reads 49.7, R10 read 20.4); `gate-host-pool.sh` **59/59** including the `tsplit`/`tsplitnosink` `-sm tensor` arms owed from R12; `gate-uma-experts.sh` is an **APU gate** — on gfx1201 17/17 arms read one text `4f29f1e4a4d6` with no abort/fault but its census arms cannot fire (the store is inert off an APU **by design**, `gtt_store_open`/`arena` return null unless `prop.integrated`), so the APU claims stay owed on the `halo` box |
+| R16 | 16 | `286191b31` | 0 | D7 | **DONE 2026-11-20** — `71ce858ca`, tree `d4867ede55376c4daef2e3e3c2b5f17bd61c75a1`; clean apply (3 files, +367); coherence `1c5d32ac537d`; `gate-prefill-fairness.sh` **PASS on three shapes** (dense 4B 1.92→0.878 s, ITL max 322→85 ms, lone prefill −1.0 %; 4B+draft-mtp 2.13→0.968 s, −0.2 %, acceptance 0.989→0.993; 35B-A3B host-expert `-ncmoe 20` 2.81→1.29 s, −0.6 %) + **`--self-test` PASS** (rejects the unfixed arm); `gate-prefill-duty.sh` **PASS** dense (decode burst 9.0x, prefill stretch 2.14x ≤ 2.5x) and with `--spec-args draft-mtp`; + repair `dd4fa5e22` (`-Wsign-compare` in block 16's own `prefill_step_prev`) |
+| R17 | T | `e159adfc2` | 1 | D10, **`TODO` #351 — ANSWERED: `0300` cannot be dropped yet** | **DONE 2026-11-20** — `ee502d397`, tree `86780474f44800de8d3796dde96332d2265cf600` (ladder tip after the R16 repair: `dd4fa5e22`, tree `4e222b2ecba3b05e5e35484a328ae3f35842772b`); the one conflict is `src/models/dflash.cpp`, because block 0300's two-line change lives *inside* `build_dflash2_selector`, which R12 moved to `src/models/dflash2.cpp` — resolved by keeping `dflash.cpp` and applying the change in `dflash2.cpp`; coherence `1c5d32ac537d`; flint Q8_0 3 GPU `-sm relaxed-tensor` == `-sm layer` byte-identical (`8ec5510e801e`), 35B-A3B `-sm tensor` == `-sm relaxed-tensor` (`86b7f9b5aa80`); **`-sm tensor` still refuses flint** (upstream has no real fix at this base), so `0300` stays |
 | R18 | — | release | — | **`TODO` #352 (container `web` stage)** | not started |
 
 ---
@@ -1302,6 +1302,174 @@ off (0 = no subset, no extra graph node).  The re-base needed no change to any o
   the census goes to **stderr**, so one run serves both arms.
 - R10.3 (arena decode, a release blocker) and R11.2 (`gate-hc-fusions.sh` red) are still open; they are next
   at R14/R15 per `COLD-START.md` §8.
+
+---
+
+# R14 — block 14, the streamed KV (window Goal A + attendance pool Goal B + the MTP draft ring)  ·  **DONE 2026-11-20** — `9f8c11782`, tree `83f4b8023004befc010746d42552bd2dd6b49928`
+
+```
+git cherry-pick e88d45d9e        # 51 files, +8003/-971  ->  lands as-is (2 conflicts)
+```
+
+| exit criterion | result |
+|---|---|
+| conflicts | **2**: `ggml/include/ggml-rpc.h`, `src/llama-ext.h` (the ledger's third, `src/models/qwen4exp.cpp`, auto-merged) |
+| no markers left | yes; no `TODO(rebase)` |
+| build | green, all targets, 0 errors; the only warnings are the pre-existing `-Wmissing-field-initializers` on `ggml-cpu.cpp`/`ggml-rpc.cpp` (see R14.3) |
+| coherence 4B | **`100 chars sha=1c5d32ac537d`** |
+| `gate-kv-residency.sh` | **PASS** — window: `wref == wres == wspill` (`be904e86f248`), `wres` 0 flips / 0 MiB host-backed vs `wspill` 16 flips / 64 MiB; pool: `pref == pres == pfloor` (`f260d1824ab3`), 4104 pages x 4 cells, 204.40 MiB device pool + 408.00 MiB pinned host mirror, 228 resolves, `bad 0`, hits 88.18 % (single) / 88.64 % (multi); `plegacy` (the r246 spelling, a numeric size) builds **the same** pool as `pres`; multi-device (`-sm layer 0,1`) `pmref == pmres == pmlegacy`, one mirror/pool block per device and 2 counter blocks summed |
+| `gate-spec-draft-window.sh` | **PASS** — `LLAMA_SPEC_DRAFT_WINDOW=1024` gives "1024 cells per sequence", all six requests across both slots byte-identical to win 0 with identical acceptance; the multimodal arm took the ring fallback (issue #297); `auto` declines at 131072x2 and grants at 67584x1; the default is 0 under `-sm layer` **and** under `-sm tensor` |
+| `gate-node-budget.sh` | **NOT RUN — cannot be non-vacuous on this box** (R14.4) |
+
+## R14.1 The trap: `GGML_OP_COUNT` moved but every `static_assert` was merge *context*
+
+Block 14 adds `GGML_OP_KV_POOL`, so the merged enum is **109** = upstream's 100 + block 11's 6 + block 12's 2 +
+block 14's 1 — but because the delivery's own literal was also 108 (its base had 107 and block 14 added one),
+git showed all three `static_assert`s as unchanged context and left them at 108.  Left alone, the tree does not
+compile (`ggml.c`, twice, and `ggml-rpc.h`); worse, a resolution that "fixes" only the assert would leave the RPC
+patch version stale.  Resolved by recounting the enum from `ggml/include/ggml.h` (`awk` over `enum ggml_op` →
+110 enumerators including `GGML_OP_COUNT`, i.e. 109) and setting `GGML_OP_COUNT == 109` in all three places plus
+`RPC_PROTO_PATCH_VERSION 10`.  **The rule for the rest of the climb: never accept a merge-context
+`static_assert` on an enum both sides touched — recount.**
+
+## R14.2 The two resolutions
+
+| path | resolution |
+|---|---|
+| `ggml/include/ggml-rpc.h` | union of both comments (block 11's 6 + block 12's 2 + block 14's `KV_POOL`), `RPC_PROTO_PATCH_VERSION 10`, `GGML_OP_COUNT == 109` |
+| `src/llama-ext.h` | both additions: HEAD's `llama_memory_get_tensors()` and block 14's `llama_get_kv_pool_bytes()` (the attendance pool's device/host footprint for `--fit`) |
+
+`ggml/src/ggml.c`'s two `static_assert`s were then set to 109 (they are outside the conflicted diff).
+
+## R14.3 Audit: the backend/device interface tables (a latent class, not an R14 defect)
+
+The build warned `missing field 'moe_cache_pool_backed' initializer` (`ggml-cpu.cpp`, `ggml-rpc.cpp`) — these are
+delivery fields appended to `ggml_backend_i`/`ggml_backend_device_i`, and a backend that lists fewer initializers
+than the struct has fields is zero-filled.  Because a **middle** insertion would silently alias unrelated hooks
+(the R08.3 class), all **19** interface initializers in the tree were audited mechanically (field order from
+`ggml-backend-impl.h` vs the `/* .name = */` comments): **zero order mismatches**, only missing trailing fields.
+So the positional lists are safe and the warnings are cosmetic; the two compiled ones are left as-is rather than
+editing upstream's other backends.
+
+## R14.4 Owed: `gate-node-budget.sh` needs the phi-4 shape
+
+The gate exists for phi-4's tight margin (40 layers, 243 tensors, 2062 entries against a 2053-entry table) and
+runs both KV types.  **There is no phi-4 (or equivalent tight-shape model) on this box.**  The nearest candidate,
+`Inkling-2-Mini-UD-Q8_K_XL`, cannot load anywhere on this base: the **pristine base** fails the same way
+(`check_tensor_dims: tensor 'blk.24.attn_q.weight' not found`) and r327 does not know arch `inkling2` at all — so
+it is an upstream/model-file mismatch, not a re-base regression, and it cannot stand in for phi-4.  Owed at R18
+(needs phi-4).
+
+---
+
+# R15 — block 15, the UMA GTT expert store (`-lme` in both tiers)  ·  **DONE 2026-11-20** — `07b293a7b`, tree `1351c477480dd784a76f49f522afe3696d7f0f02`
+
+```
+git cherry-pick 35a9ae985        # 41 files, +6k  ->  lands with 1 conflict
+```
+
+| exit criterion | result |
+|---|---|
+| conflicts | **1**: `ggml/ggml/src/ggml-backend-meta.cpp` (the meta **device** iface: R13's explicit list vs block 15's list + 5 new `gtt_store_*` hooks) |
+| build | green, 0 errors; the same two cosmetic `-Wmissing-field-initializers` |
+| coherence 4B | **`100 chars sha=1c5d32ac537d`** |
+| **R10.3 (the release blocker)** | **CLOSED** — 35B-A3B Q8_0, 1 GPU, `-ncmoe 20 -c 8192 -ub 1024`, `MOE_EXPERT_HEATMAP=load`: **51.2 / 49.9 / 49.2 t/s** (median 49.9) against **R09 54.4, R10 20.4, r327 49.7**, text `86b7f9b5aa80` unchanged.  The collapse was the intermediate tree (blocks 09/10 without 14/15's arena path), and the finished ladder reads the shipping level.  **Reported to the maintainer as closed.** |
+| `gate-host-pool.sh` (the discrete side) | **59/59 PASS**, including the `tsplit` / `tsplitnosink` **`-sm tensor`** arms owed from R12 — so the meta device's `nullptr` host-tier hooks (R13) are correct for the pool path, and that open question is closed |
+| `gate-uma-experts.sh` (the APU side) | **not applicable on gfx1201** — see R15.2 |
+| `gate-prefill-server-slots.sh` | **not runnable here** (needs the >RAM 122B model and the APU box) — owed with the gate above |
+
+## R15.1 The one resolution
+
+`ggml_backend_meta_device_iface` now lists **all 13** trailing hooks explicitly as `nullptr`: the 7 host-tier ones
+from R13 plus block 15's `gtt_store_open`/`_report`/`_lockable`/`_arena`/`_free_bytes`/`_arena_min`, with one
+comment replacing R13's: the meta device owns no host master, no heat prior and no GTT store (host experts are
+backed by the simple devices' buffer types, the meta **backend** forwards `moe_cache_band` itself, and the GTT
+store is an APU feature a device implements or not).  A hook that ever *must* forward has to pick one simple
+device, which is a decision, not a default — and `gate-host-pool.sh`'s tensor arms now show the pool path does not
+need one.
+
+## R15.2 The GTT gate is an APU gate, and that is now proven from the code
+
+`gate-uma-experts.sh` on gfx1201: **17/17 arms read the identical text `4f29f1e4a4d6`** (including `-lme` 4/6/16/20,
+`auto`, `fault`, `touch1-3`, `pfoff`, `pfcp`, `inplace`, `cold`, `nohb`, `pfverify`), no abort, no GPU fault — but
+its census arms fail (18 checks), because the mechanism they assert never engages.  That is **by design**:
+`ggml_backend_cuda_device_gtt_store_open()` / `..._arena()` return `nullptr` / `false` unless
+`ggml_cuda_info().devices[dev].integrated`, i.e. "the GTT store must be provably inert on every non-APU device"
+(its own comment).  The file's own NOT-COVERED list says the same.  **So block 15's APU-side claims are not
+re-validated on this base and stay owed on the `halo` (gfx1151) box** — the discrete-side obligation (`-lme` as
+the host-expert budget, the pool path) is the 59/59 above.
+
+---
+
+# R16 — block 16, the server's prompt admission policy  ·  **DONE 2026-11-20** — `71ce858ca`, tree `d4867ede55376c4daef2e3e3c2b5f17bd61c75a1` (+ repair `dd4fa5e22`)
+
+```
+git cherry-pick 286191b31        # 3 files, +367/-2  ->  0 conflicts (server-context.cpp auto-merged)
+```
+
+| exit criterion | result |
+|---|---|
+| conflicts | **0** |
+| build | green |
+| coherence 4B | **`100 chars sha=1c5d32ac537d`** |
+| `gate-prefill-fairness.sh` dense 4B | **PASS** — short-prompt TTFT **1.920 → 0.878 s** (2.2x), decoder ITL max **322 → 85 ms**, lone prefill 6994 → 6922 t/s (−1.0 %), single-request text identical, census `('on','512','1','16')` |
+| `gate-prefill-fairness.sh` 4B + `draft-mtp` | **PASS** — 2.128 → 0.968 s, ITL max 362 → 85 ms, −0.2 %, spec acceptance 0.989 → 0.993 (judged for collapse, §63), aggregate decode 383 → 398 t/s |
+| `gate-prefill-fairness.sh` streamed host-expert (35B-A3B UD-Q4_K_M `-ncmoe 20`) | **PASS** — 2.808 → 1.288 s, ITL max 467 → 151 ms, lone prefill −0.6 % |
+| `--self-test` | **PASS** — run as the baseline the candidate reads 1.929 → 1.930 s and the fairness check **FAILS** as required, i.e. the gate can still reject the unfixed build |
+| `gate-prefill-duty.sh` dense | **PASS** — decode burst 15 → 135 tokens during the other slot's prefill (9.0x, need 3.0x), prefill stretch 2.14x (bound 2.5x), lone prefill −0.6 %, no empty batch, contended width 0 > chunk |
+| `gate-prefill-duty.sh` + `--spec-args draft-mtp` | **PASS** — acceptance 0.89623 both arms, the gain holds under the drafter |
+
+## R16.1 The repair (`dd4fa5e22`)
+
+`-Wsign-compare` in block 16's own `prefill_step_prev = prefill_now && batch.size() > n_batch_decode;` — an
+int32_t batch size against a size_t decode count.  Fixed with `(size_t) batch.size()` (a count against a count,
+never negative).  Because this predicate *is* the duty cycle's stretch budget, both duty arms and the coherence
+arm were re-run after the repair: all PASS.  Squash this into block 16 at R18, with R00's `3ea8b0212`.
+
+---
+
+# R17 — block `0300`, relaxed-tensor split mode (TEMPORARY)  ·  **DONE 2026-11-20** — `ee502d397`, tree `86780474f44800de8d3796dde96332d2265cf600`
+
+```
+git cherry-pick e159adfc2        # 11 files, +130/-16  ->  1 conflict
+```
+
+| exit criterion | result |
+|---|---|
+| conflicts | **1**: `src/models/dflash.cpp` — block 0300's two-line change lives *inside* `build_dflash2_selector`, which **R12 moved** to upstream's `src/models/dflash2.cpp`, so the delivery's side of the merge showed up as adding the whole function.  Resolved by keeping `dflash.cpp` as HEAD (no function there) and applying the change in `dflash2.cpp`: `model.split_mode() == LLAMA_SPLIT_MODE_TENSOR` → `llm_split_mode_is_tensor_like(model.split_mode())` |
+| build | green |
+| coherence 4B | **`100 chars sha=1c5d32ac537d`**; `-sm relaxed-tensor` is in `--help` |
+| **`TODO` #351 — can `0300` be dropped?** | **NO.** flint Q8_0, 3 GPU, `-sm tensor`: `llama_model_load: error loading model: LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'flint'; this arch's MoE amax rescale needs '-sm relaxed-tensor'` — upstream has **not** landed a real amax-split fix at `919794500`, and the block's own error text is what still fires.  `0300` stays for r328 |
+| the block's own claim (amax arch) | flint Q8_0 3 GPU, `-sm relaxed-tensor` **== `-sm layer` byte-identical** (`8ec5510e801e`, 85 chars) |
+| the no-op arm (non-amax arch) | 35B-A3B Q8_0 3 GPU: `-sm tensor` **==** `-sm relaxed-tensor` (`86b7f9b5aa80`) |
+| D10 (`--tensor-split` up to `llama_max_devices()`, `#31435`) | merged structurally; the 3-GPU arms above are the split path it touches |
+
+## R17.1 Notes
+
+- The `PER_DEVICE` split state (`GGML_BACKEND_SPLIT_AXIS_PER_DEVICE = 12`) and the `-sm relaxed-tensor` plumbing
+  auto-merged; only the dflash selector's "is this a tensor-like split?" predicate needed the resolution, which is
+  the same site R12's all-gather port added — so the two rungs meet in exactly one line.
+- `0300` remains **temporary** and still not counted in `v<N>`; dropping it is a maintainer decision and it now has
+  a dated answer: not yet.
+
+---
+
+# The ladder is complete (R00 – R17 + `0300`)
+
+Tip `dd4fa5e22`, tree `4e222b2ecba3b05e5e35484a328ae3f35842772b`; every rung green on build + coherence, all 18
+delivery blocks landed, three rung repairs outstanding for the R18 squash (R00's `3ea8b0212`, R05's `c3860af1e`, R16's `dd4fa5e22`) —
+21 commits on top of `919794500` = 18 blocks + 3 repairs.
+What is still owed is **R18's release work** (`RUNGS.md` R18 + `COLD-START.md` §8), and the carried red/owed items:
+
+* **R11.2 — `gate-hc-fusions.sh` is still RED at the completed tree**, with *exactly* the R11 numbers
+  (`mix_op` `3f049f67781c`, `dsv4_pre_op`/`ops_no_post` `c8db61d5dcc8`, `dsv4_post_op`/`all_ops` `6a102dbc62d6`,
+  chain_chain `a512ee68c4b3`).  Blocks 12-17 did not restore the anchors, so it is not a later-block interaction:
+  the HC chain itself moved with the re-base, as block 11's commit message predicted.  **The fused mixer must not
+  ship default-on unless the maintainer re-anchors arm by arm** (or the divergence is explained) — a maintainer
+  decision, unchanged from R11.
+* **R10.3 — CLOSED** (R15, above).
+* **R06.2 (routed half)** — the forced routed MMB arm still owes an A/B; it has never been a shipped default.
+* Block 15's APU-side gates and `gate-node-budget.sh` (phi-4) — owed, with the reason recorded in R15.2/R14.4.
 
 ---
 

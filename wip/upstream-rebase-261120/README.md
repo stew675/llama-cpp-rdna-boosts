@@ -1,10 +1,10 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: OPEN — 14 of 18 rungs climbed (R00-R13); nothing is delivery yet.**
+**Status: LADDER COMPLETE — all 18 blocks landed (R00-R17); nothing is delivery yet; R18 (the release) is next.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
-the final rung (R18).  Ladder branch `rebase-r328` = `81523fda6` (tree
-`080d7ecea198417011ca068916c5deafa9f4ce14`): R00..R13 plus two rung repairs (R00's top-k gather, R05's `nb32`
-widening); every rung is green on build + coherence and each has one entry in [`RUNGS.md`](RUNGS.md).
+the final rung (R18).  Ladder branch `rebase-r328` = `dd4fa5e22` (tree
+`4e222b2ecba3b05e5e35484a328ae3f35842772b`): all 18 blocks plus three rung repairs (R00's top-k gather, R05's `nb32`
+widening, R16's `dd4fa5e22` sign-compare) — all three wait for the R18 squash; every rung is green on build + coherence and each has one entry in [`RUNGS.md`](RUNGS.md).
 **The one known-red is closed at R00** (repair `3ea8b0212`): the delivery's required VMM pool refuses
 upstream's strided 2-D indexer top-k copy, and it reproduces on the pristine base with *only* the `#30542`
 revert, so the fix (block 10's `top_k_gather_rows`, moved down — [`DECISIONS.md`](DECISIONS.md) D15) lives in
@@ -60,7 +60,20 @@ every pair; the pristine base still aborts DFlash under `-sm tensor`).  Numbers:
 [`../../benchmarks/2026-11-20-r328-r12-dflash-merge.md`](../../benchmarks/2026-11-20-r328-r12-dflash-merge.md).
 Six gates green.  R13 is done as well (`81523fda6`): the MTP draft vocabulary subset applied clean,
 its own test passes (subset logits == the full-vocab reference, six cases) and `--spec-draft-mtp-vocab 65536`
-is +7.6 % decode at identical text.  Target: the next
+is +7.6 % decode at identical text.  R14 landed (`9f8c11782`): the streamed KV, with the one real trap of the
+climb — `GGML_OP_COUNT` grew to **109** while every `static_assert` was merge *context*, so it had to be recounted
+(patch 10); `gate-kv-residency` and `gate-spec-draft-window` are green, and `gate-node-budget` is owed (no phi-4 on
+this box).  R15 landed (`07b293a7b`): the UMA GTT expert store, and with it the climb's **release blocker is
+closed — R10.3's arena decode reads 49.9 t/s median (r327: 49.7) with the text unchanged**; `gate-host-pool.sh` is
+**59/59**, including the `-sm tensor` arms owed from R12, and the GTT gate itself turned out to be an **APU gate**
+(on gfx1201 the tier is inert *by design*), so its claims stay owed on the `halo` box.  R16 landed
+(`71ce858ca` + repair `dd4fa5e22`): the server's prompt admission policy, green on `gate-prefill-fairness` (dense,
+`draft-mtp`, and a streamed host-expert shape, plus `--self-test`) and `gate-prefill-duty` (dense and
+`draft-mtp`).  R17 landed (`ee502d397`): block `0300`, and **`TODO` #351 is answered — `0300` cannot be dropped**,
+because flint still refuses `-sm tensor` at this base with the block's own message, while `-sm relaxed-tensor` is
+byte-identical to `-sm layer` and a non-amax arch is unchanged both ways.  **One red remains: R11.2**
+(`gate-hc-fusions.sh`), still reading the R11 numbers at the completed tree — a maintainer decision before
+shipping.  Target: the next
 release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 
@@ -75,7 +88,7 @@ The method, the exit criteria and the traps are the ones proved by
 re-base, 17 blocks from `a691b2345` onto `4f9dfa0e3`) and `../../archive/work/upstream-rebase-261108/` (the
 r236 re-base).  Read the r278 record's §1 before starting a session; nothing in it has stopped being true.
 
-**A fresh session starts at [`COLD-START.md`](COLD-START.md)** (self-contained state, anchors, the R13 plan,
+**A fresh session starts at [`COLD-START.md`](COLD-START.md)** (self-contained state, anchors, the R18 plan,
 the DFlash measurement mandate and the carried obligations); the prompt to paste is
 [`NEXT-SESSION-PROMPT.md`](NEXT-SESSION-PROMPT.md).  `HANDOVER.md` is the previous sessions' delta.
 
