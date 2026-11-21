@@ -355,6 +355,24 @@ META="$BASE.meta"
 CONTROL_BASE="${BASE%.kld}-control-ub${CONTROL_UB}.kld"
 CONTROL_META="$CONTROL_BASE.meta"
 
+# A base is 1-5 GiB on disk and BOTH it and its control can be live at once, so a base on a RAM-backed
+# filesystem costs RAM, not disk -- and `/tmp` IS tmpfs on the maintainer's boxes (46 GiB, shared with the
+# model's page cache).  Recorded 2026-11-21 while a Flash-Next host-expert arm took a 91 GiB box into swap:
+# the kld files were never the problem, but a `BASE_DIR` under `/tmp` would have been.  Refuse it rather than
+# discover it under memory pressure, and say how to get past it deliberately.
+fs_type_of() { # $1 = dir that exists
+    df --output=fstype "$1" 2>/dev/null | tail -1 | tr -d ' '
+}
+base_fs="$(fs_type_of "$(dirname "$BASE")" 2>/dev/null || true)"
+case "$base_fs" in
+    tmpfs|ramfs)
+        if [ "${ALLOW_TMPFS_BASE:-0}" != "1" ]; then
+            die "the prefill-logit base would live on '$base_fs' ($(dirname "$BASE")).  A base is 1-5 GiB and the control adds another, so that is RAM on this box (/tmp is tmpfs), not disk.  Point BASE_DIR at a disk path (default: ~/.cache/rdna-boosts/gates), or set ALLOW_TMPFS_BASE=1 if you really mean to spend the RAM."
+        fi
+        echo "WARNING: the prefill-logit base is on '$base_fs' ($(dirname "$BASE")) -- 1-5 GiB of RAM, ALLOW_TMPFS_BASE=1 was set" >&2
+        ;;
+esac
+
 CORPUS_SHA="$(sha256sum "$CORPUS" | awk '{print $1}')"
 
 if [ "$RECORD" -eq 0 ] && [ ! -f "$BASE" ]; then

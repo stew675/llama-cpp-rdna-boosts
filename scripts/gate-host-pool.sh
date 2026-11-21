@@ -334,13 +334,18 @@ gt0() { [ -n "${1:-}" ] && awk "BEGIN{exit !(${1} + 0 > 0)}"; }
 # is what `MANIFESTS.md` forbids.
 KLD_MEAN_MAX="${KLD_MEAN_MAX:-0.005}"     # the delivery's mean-KLD limit
 KLD_TOPP_MIN="${KLD_TOPP_MIN:-98.0}"      # ... and its same-top-p limit (%)
+# The KLD base is `ctx x chunks` logit vectors -- ~0.6 GiB at the default -c 512 --chunks 2 on a 151k vocab,
+# i.e. RAM when KEEPOUT is under `/tmp` (which IS tmpfs on the maintainer's boxes, 46 GiB shared with the model's
+# page cache; recorded 2026-11-21).  It therefore goes to a DISK path by default, never into KEEPOUT.
+KLD_REF="${KLD_REF:-$HOME/.cache/rdna-boosts/gates/hostpool-kld-ref.bin}"
 kld_run() {
     local mode="$1"; shift   # record | compare
     local log="$KEEPOUT/kld-$mode.log"
+    mkdir -p "$(dirname "$KLD_REF")" 2>/dev/null || true
     local args=(-m "$MODEL" -f "$CORPUS" --fit off -ngl all --n-cpu-moe "$NCMOE"
                 --load-mode mmap --lazy-mode on -c "$KLD_CTX" --chunks "$KLD_CHUNKS"
                 -fa on -ctk q8_0 -ctv q8_0 -b "$UB" -ub "$UB" -t 8
-                --kl-divergence-base "$KEEPOUT/kld-ref.bin")
+                --kl-divergence-base "$KLD_REF")
     [ "$mode" = compare ] && args+=(--kl-divergence)
     echo "==> KLD $mode (llama-perplexity), log: $log"
     env "$@" HIP_VISIBLE_DEVICES="$GPU" ROCBLAS_USE_HIPBLASLT=0 MOE_HOST_LIMIT_FRAC="$LIMIT_FRAC" \

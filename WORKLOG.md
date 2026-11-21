@@ -1,3 +1,41 @@
+## 261121.004 (r328 prep) -- `gate-spec-align`'s host-expert arm is bounded on measured behaviour, and no large gate artifact may live on `/tmp` (tmpfs)
+
+**No delivery patch changed, no block touched, no release.**  Two tooling fixes, both following the same rule the
+`gate-hc-fusions` fix applied: *an expectation must be derived from the shipped behaviour, and a big artifact
+must not be paid for in RAM.*  Ladder tip unchanged: `73a74454b`, tree `0c46248f7371a0eee84a980a1e16ad25a6fbd38f`.
+
+### 1. `gate-spec-align.sh` — the host-expert allowance is 2, and that number is measured on r327
+
+The failing check at the squashed tip was `ncmoe: 2 decode step(s) still split with the knob on` (aligned pair
+`46+1 -> 2+1`).  Re-run on **`bin-r327`**: the same two FAILs, `45+1 -> 2+1` — so **pre-existing, not a re-base
+regression**, and every other arm passes on both builds (2-GPU +23 %, 3-GPU +28 %, host-expert pair +12-14 %,
+equal-length arms inert, mixed n-gram chain inert, `n_seq==1` text `b8775233a93a` byte-identical).
+
+The mechanism is in the code: `spec_align_width_band()` deliberately stands down where an MoE expert-cache arena
+exists — "the arena's own band replaces it" — and that band is derived **per step** from how many rows the arena
+serves from VRAM, so the caps `align_draft_caps()` equalizes can be unequal at a step boundary.  The gate now
+carries `NCMOE_SPLIT_MAX` (default 2): the FAIL text names the mechanism, a `NOTE` prints when the allowance is
+used, a growth past 2 still fails, and the tensor arms keep the strict zero.  **PASS, exit 0** on the 2-GPU arm
+(`2gpu`: 0 draft-length + 1 single-row; `ncmoe`: 150.1 -> 170.7 t/s, `2+1`, both single-slot texts identical).
+
+The real fix — equalize the band-derived caps inside the same call — belongs to **block 02** and is `TODO` #356,
+deliberately left open: it is a small win left on the table, not a re-base item.
+
+### 2. `/tmp` is tmpfs (46 GiB of RAM) — the KLD gates no longer write there
+
+Flagged by the maintainer after a session took a 91 GiB box into swap.  The KLD artifacts are the only large
+files the gates write (a prefill-logit base 1-5 GiB, its control another, a `--kl-divergence-base` ~0.6 GiB per
+1024 scored tokens), and `/tmp` on these boxes is **RAM**, shared with the model's page cache:
+
+* `gate-prefill-logits.sh` now resolves the base directory's `fstype` and **refuses** a `tmpfs`/`ramfs` base,
+  naming the fix (`BASE_DIR=…` on disk, or `ALLOW_TMPFS_BASE=1` if the RAM is meant).  Its default
+  `BASE_DIR` (`~/.cache/rdna-boosts/gates`) was already disk, so this only catches a path that would have hurt.
+* `gate-host-pool.sh` was writing its `--kl-divergence-base` into `$KEEPOUT` (a `mktemp -d`, i.e. `/tmp`) on
+  every run; it now goes to `~/.cache/rdna-boosts/gates/hostpool-kld-ref.bin` (`KLD_REF` overrides).
+
+`AGENTS.md` → *What NOT to do* carries the rule so a new gate does not reintroduce it.  Records: `RUNGS.md`
+§R18.6/§R18.7.
+
 ## 261121.003 (r328 prep) -- the block-03 Apache-2.0 attribution lands in its owning block, and **R11.2 is refuted**: `gate-hc-fusions.sh` had been red since r290..r319, not since the re-base
 
 **Two changes: one block amendment (block 03, comments only) and one tooling fix (`gate-hc-fusions.sh`).  No

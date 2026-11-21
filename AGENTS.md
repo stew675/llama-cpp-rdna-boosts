@@ -457,6 +457,10 @@ gates stay on the primary box. A fast smoke: `scripts/build-containers.sh --rocm
 
 ## What NOT to do
 
+- Do not point a **large artifact** at `/tmp` — it is **tmpfs** on every box here (46 GiB of RAM, shared with the
+  model's page cache).  A prefill-logit base is 1-5 GiB and its control is another, a `--kl-divergence-base`
+  is ~0.6 GiB per 1024 scored tokens, so those go to `~/.cache/rdna-boosts/gates` (the gate's default) and
+  `gate-prefill-logits.sh` now REFUSES a base that resolves onto tmpfs (`ALLOW_TMPFS_BASE=1` overrides).
 - Do not `git apply` the concatenated block series (drops hunks); use `scripts/apply-all.sh`.
 - Do not hand-edit the committed patches as a permanent drift fix — regenerate and re-verify.
 - Do not mix the historical `baseline/*` branches or `block/*` tags with the current `patches/`.

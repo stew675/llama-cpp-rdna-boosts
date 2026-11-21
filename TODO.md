@@ -49,6 +49,7 @@ left in this file.  The r236 re-base
 | **351** | does upstream now support `-sm tensor` for `flint`?  If it does, the temporary block `0300` (`-sm relaxed-tensor`) can be dropped -- upstream's per-architecture refusal is the only reason the block exists | delivery structure / temporary block `0300` | **OPEN** -- re-tested at R17 of the r328 re-base (`wip/upstream-rebase-261120/`), on the real model this box has; §351 |
 | **352** | `.devops/rdna-rocm.Dockerfile`'s UI `web` stage targeted the pre-r328 `tools/ui/` layout; the file now builds `ui/apps/chat` (+ `ui/lib/ui`, `ui/lib/voice`) and copies `ui/apps/chat/dist`, matching llama.cpp `919794500` — what is left is the **r328 image smoke build** that proves the embedded UI is served | release tooling (container build) | **OPEN (fixed at R18, unverified)** -- the Dockerfile change is made; the image is built off-host after the r328 tag, and `TODO` #352's own verification (`--targets server`, `index.html` served) runs with it; §352 |
 | **353** | no Inkling-2 model loads at `919794500`: the looped family needs support this snapshot lacks — Unsloth's file is `arch = inkling2` with 24 physical blocks but `block_count = 48` + `num_loops = 3` (the loader has no loop, so it asks for `blk.24.*`), and **GGML's reference file is `arch = inkling2_loop`, which this tree does not know at all** | upstream model support / validation target | **OPEN (waiting on upstream)** -- the pristine base repeats both failures and r327 knows neither arch, so no delivery change is involved; it blocks the only local validation of upstream's per-head FA mask (`#32217`) and of the `nb32` widening; §353 |
+| **356** | the aligned host-expert pair still splits **2 draft-length** decode steps with `LLAMA_SPEC_ALIGN` on: `spec_align_width_band()` stands down where an MoE expert-cache arena exists ("the arena's own band replaces it"), so the caps `align_draft_caps()` equalizes come from the arena and can differ at a step boundary | correctness/tuning (block 02, `common/speculative.cpp`) | **OPEN** -- measured identically on the RELEASED r327 (`45+1 -> 2+1`) and on the r328 tree (`46+1 -> 2+1`), so it is not this re-base; `scripts/gate-spec-align.sh` now bounds it (`NCMOE_SPLIT_MAX=2`) and prints a `NOTE` with the reason, so a growth still fails.  The fix is to align the band-derived caps in the same call; §356 |
 | **354** | the r328 set is gated on **gfx1201 only**: the delivery's scope policy covers three arches, and the gfx11 chunked-GDN kernel file is code gfx1201 never runs; block 15's APU claims are undecidable there too (the GTT store is inert on a discrete GPU by design) | validation / three-arch coverage | **OPEN** -- one session each on `ssh halo` (gfx1151 APU) and `ssh fingon` (gfx1100), after R18, applying the **released** set; the 122B-A10B `>RAM` model for `gate-prefill-server-slots.sh` is on `halo`; §354 |
 
 ## Handle numbering
@@ -330,6 +331,29 @@ the delivery repo + a llama.cpp checkout sitting on **r327** (so it is its own a
 which re-verifies `scripts/apply-all.sh` + `release.json` on two more machines (the r138 record's method).  Flow,
 inventory, the per-box arm list and the rules that bite there: `wip/upstream-rebase-261120/REMOTE-VALIDATION.md`.
 A finding that would change a block stops and asks first.
+
+## 356. The host-expert arm's aligned pair leaves 2 draft-length splits — the arena band replaces the width band
+
+**Open** (2026-11-21, R18 of the r328 re-base; found by `gate-spec-align.sh`, and reproduced on r327's released
+binaries, so it is **not** a re-base finding).
+
+`LLAMA_SPEC_ALIGN` aligns a drafter's per-sequence caps so two slots verify the same width.  On a host-expert
+(`-ncmoe` / `-lme`) config the row bound comes from the **expert-cache arena's own band** instead of
+`spec_align_width_band()` — the code says so and says why ("the arena's own band replaces it", which answers a
+different question: how many rows the arena serves from VRAM) — and that band is derived per step.  So a step
+boundary can leave two slots' caps unequal, and the pair splits: `2+1` at the gate's default pair, **on r327 and
+on r328 identically** (r327: `45+1 -> 2+1`, r328: `46+1 -> 2+1`, both at +12-14 % for the pair).
+
+The gain is real and the text is clean (both single-slot requests are byte-identical on/off); what is incomplete
+is the alignment itself.  The fix belongs in **block 02** (`common/speculative.cpp`): equalize the caps a
+band-derived bound produces inside the same call, rather than only the ones `spec_align_width_band()` produces.
+
+`scripts/gate-spec-align.sh` now carries `NCMOE_SPLIT_MAX` (default 2, the measured shipped residual) with the
+mechanism in its FAIL text and a `NOTE` line, so the arm is honest about the shipped behaviour and a *growth*
+still fails; the tensor arms keep the strict zero.
+
+**Re-entry condition:** any change to `align_draft_caps()`, the arena band, or the host-expert draft scheduler —
+and it is the first thing to re-measure if the host-expert pair's gain changes.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 
