@@ -49,8 +49,9 @@ left in this file.  The r236 re-base
 | **351** | does upstream now support `-sm tensor` for `flint`?  If it does, the temporary block `0300` (`-sm relaxed-tensor`) can be dropped -- upstream's per-architecture refusal is the only reason the block exists | delivery structure / temporary block `0300` | **OPEN, ANSWERED for r328** -- re-tested at R17 of the re-base on the real model this box has: **it cannot be dropped** (flint still refuses `-sm tensor` at `919794500`, while `-sm relaxed-tensor` is byte-identical to `-sm layer`); re-test at the next re-base; §351 |
 | **352** | `.devops/rdna-rocm.Dockerfile`'s UI `web` stage targeted the pre-r328 `tools/ui/` layout; the file now builds `ui/apps/chat` (+ `ui/lib/ui`, `ui/lib/voice`) and copies `ui/apps/chat/dist`, matching llama.cpp `919794500` — what is left is the **r328 image smoke build** that proves the embedded UI is served | release tooling (container build) | **OPEN (fixed at R18, unverified)** -- the Dockerfile change is made; the image is built off-host after the r328 tag, and `TODO` #352's own verification (`--targets server`, `index.html` served) runs with it; §352 |
 | **353** | no Inkling-2 model loads at `919794500`: the looped family needs support this snapshot lacks — Unsloth's file is `arch = inkling2` with 24 physical blocks but `block_count = 48` + `num_loops = 3` (the loader has no loop, so it asks for `blk.24.*`), and **GGML's reference file is `arch = inkling2_loop`, which this tree does not know at all** | upstream model support / validation target | **OPEN (waiting on upstream)** -- the pristine base repeats both failures and r327 knows neither arch, so no delivery change is involved; it blocks the only local validation of upstream's per-head FA mask (`#32217`) and of the `nb32` widening; §353 |
+| **357** | on gfx1151 the GTT store's sizing-fill census does not report the placement queue: `gate-uma-experts.sh`'s `ref` arm logs `heat-seeded 56/56 slots ... (ranked by the DECODE band)` with **no** MiB/ms/transport suffix, while the binary carries the full format (`… (%.0f MiB/s, %s)` plus one `serial fills` string) | diagnostic / gate (`gate-uma-experts.sh` check 456, `moe-expert-cache.cu`'s `apply_heat_seed_locked`) | **OPEN** -- found 2026-11-21 on `halo` (gfx1151), the first box where this check is not vacuous (the store is inert on a discrete GPU).  48/49 other checks pass, so this is a **census/instrument** question first and a transport question only if the queue really is declined; it does not touch the shipped gfx1201 behaviour; §357 |
 | **356** | the aligned host-expert pair still splits **2 draft-length** decode steps with `LLAMA_SPEC_ALIGN` on: `spec_align_width_band()` stands down where an MoE expert-cache arena exists ("the arena's own band replaces it"), so the caps `align_draft_caps()` equalizes come from the arena and can differ at a step boundary | correctness/tuning (block 02, `common/speculative.cpp`) | **OPEN** -- measured identically on the RELEASED r327 (`45+1 -> 2+1`) and on the r328 tree (`46+1 -> 2+1`), so it is not this re-base; `scripts/gate-spec-align.sh` now bounds it (`NCMOE_SPLIT_MAX=2`) and prints a `NOTE` with the reason, so a growth still fails.  The fix is to align the band-derived caps in the same call; §356 |
-| **354** | the r328 set is gated on **gfx1201 only**: the delivery's scope policy covers three arches, and the gfx11 chunked-GDN kernel file is code gfx1201 never runs; block 15's APU claims are undecidable there too (the GTT store is inert on a discrete GPU by design) | validation / three-arch coverage | **OPEN** -- one session each on `ssh halo` (gfx1151 APU) and `ssh fingon` (gfx1100), after R18, applying the **released** set; the 122B-A10B `>RAM` model for `gate-prefill-server-slots.sh` is on `halo`; §354 |
+| **354** | the r328 set was gated on **gfx1201 only**: the delivery's scope policy covers three arches, and the gfx11 chunked-GDN kernel file is code gfx1201 never runs; block 15's APU claims are undecidable there too (the GTT store is inert on a discrete GPU by design) | validation / three-arch coverage | **OPEN, mostly closed 2026-11-21**: both boxes ran the released set (apply 18/18, tree+tip match, build, coherence r327==r328 on each, full op matrix green, `gate-hc-fusions` PASS on gfx1100, `gate-uma-experts` 48/49 on gfx1151) -- `benchmarks/2026-11-21-r328-arch-validation.md`.  **Still owed:** `gate-prefill-server-slots.sh` on `halo` (its harness aborted: the 122B `>RAM` arena arm ran at 3.76 tok/s and the second arm timed out), a prefill-logit base recorded **per box**, and the spec-align host-expert arm on gfx1100; §354 |
 
 ## Handle numbering
 
@@ -354,6 +355,38 @@ still fails; the tensor arms keep the strict zero.
 
 **Re-entry condition:** any change to `align_draft_caps()`, the arena band, or the host-expert draft scheduler —
 and it is the first thing to re-measure if the host-expert pair's gain changes.
+
+## 357. gfx1151: the GTT sizing fill does not report its transport (the placement queue census is blind)
+
+**Open** (2026-11-21, the `halo` arch-validation session).  `scripts/gate-uma-experts.sh`'s HARD check (line 456,
+r277) requires the arena's **sizing** fills to run through the placement read queue:
+
+```sh
+grep -qE "heat-seeded [0-9]+/[0-9]+ slots .*placement queue" "$KEEPOUT/ref/err.txt"
+```
+
+On gfx1201 that check has always been vacuous (the store's hooks need `prop.integrated`, `RUNGS.md` §R15.2), so
+**`halo` is the first box where it fires — and it fails.**  The ref arm's stderr carries, per table:
+
+```
+I apply_heat_seed_locked: layer=31 role=blk.31.ffn_down_exps.weight heat-seeded 56/56 slots
+  from the persisted map (256 experts, ranked by the DECODE band)
+```
+
+— i.e. it stops at `)`, with no `, X MiB in Y ms (Z MiB/s, placement queue)` and no `serial fills` either.  The
+line is 168 bytes in `err.txt`, and `strings build-r328/bin/libggml-hip.so` *does* carry the full format
+(`… (%.0f MiB/s, %s)`) and exactly one `serial fills`.  The rest of that gate is green (48/49): the placement-vs-
+arena switch by `-lme`, the `nolme` refusal, the `ram` arena arm (84618.6 MiB, 3267 evictions), the in-place band
+(arena D2D 1194.4 vs 3358 MiB, 8.5 % read), the admission no-op, `pfverify`, and 17/17 text identity.
+
+So the first question is **instrumentation, not transport**: something between the kernel-side `GGML_LOG_INFO`
+call and `err.txt` drops the tail (a logger line bound, a formatting path the GTT store's own logger takes, or a
+second emitter with a shorter message).  Only if the line is genuinely never produced does this become "the queue
+is declined on gfx1151", which would be a real `-lme`-tier finding for that arch.
+
+**Re-entry condition:** the next `halo` session (or any gfx1151 work on the GTT store) — reproduce with a minimal
+two-line arm and `cat -A` on the captured stderr, then either fix the emitter or re-scope the check to the
+transport the RDNA3_5 ladder actually starts at (the buffered arm).
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

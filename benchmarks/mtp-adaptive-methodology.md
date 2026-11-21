@@ -16,6 +16,11 @@ post-fix). All runs on 3x R9700 (gfx1201), ROCm 7.14
 (GOLDEN RULE 1: without the pin llama.cpp layer-splits and decode drops
 ~97 -> ~81 t/s on the MoE model).
 
+> **2026-11-21 (r328): the four-axis protocol was run on 3 devices `-sm tensor` on BOTH cache types, after the
+> release** (the gap the r328 release entry records).  `draft-mtp` 1.97x-4.42x plain, pos-1 acceptance
+> 0.761-0.984, and `none == draft-mtp` **byte-identical on all four axes on both caches** at the delivery default
+> `--spec-draft-n-max 7`.  Table: [`2026-11-21-r328-mtp-4axis.md`](2026-11-21-r328-mtp-4axis.md).
+
 > **Sibling gate (2026-10-08, issue #113):** this gate only covers decode/MTP shapes.  A uniform
 > **prefill-logit** shift is invisible here and to the same-seed coherence gate; run
 > [`prefill-logit-methodology.md`](prefill-logit-methodology.md) before shipping any prefill-kernel or

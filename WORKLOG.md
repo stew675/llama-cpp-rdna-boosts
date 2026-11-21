@@ -1,3 +1,54 @@
+## 261121.006 (r328) -- the two gaps the release carried are now closed on paper and mostly on hardware: the four-axis MTP protocol PASSES on both cache types, and gfx1151/gfx1100 are validated against the released set
+
+**No delivery patch changed, no block touched, no new release.**  Two post-release validations, run because the
+`v17-919794500-r328` tag went out with them owed (the release entry says so): the **MTP four-axis protocol** and
+the **three-arch** coverage.  Records: `benchmarks/2026-11-21-r328-mtp-4axis.md`,
+`benchmarks/2026-11-21-r328-arch-validation.md`.
+
+### 1. Four-axis adaptive-MTP protocol: **PASS**, 3 devices `-sm tensor`, both cache types
+
+Run at the shape the methodology's r319 note makes mandatory for a re-base, with the delivery's default ceiling
+(`--spec-draft-n-max 7`), `-n 3000`, greedy, `--reasoning on` only on the R axis.  27B Q8_0, embedded MTP head.
+
+| axis | f16 KV `none` → `draft-mtp` | q8_0 KV `none` → `draft-mtp` | pos-1 acceptance (f16 / q8_0) |
+|---|---|---|---|
+| R reasoning | 42.4 → **83.6** (1.97×) | 41.8 → **83.3** (1.99×) | 0.761 / 0.784 |
+| K recall | 42.6 → **187.1** (4.39×) | 42.2 → **186.4** (4.42×) | 0.984 / 0.984 |
+| P prose | 41.6 → **127.7** (3.07×) | 41.4 → **117.9** (2.85×) | 0.927 / 0.895 |
+| C code | 42.4 → **148.0** (3.49×) | 41.8 → **146.7** (3.51×) | 0.963 / 0.961 |
+
+**`--spec-type none` and `draft-mtp` produced byte-identical text on all four axes on both cache types** (eight
+pairs) — the purity property a decode/verify regression breaks first, holding at the strictest shape.  Acceptance
+is 0.761-0.984 against a ~0.45 floor (nowhere near the 2026-09-02 `0.000` collapse), and MTP is 1.97-4.42× plain
+everywhere, including prose where the rule only asks for parity within 10 %.
+
+### 2. gfx1151 and gfx1100, from a fresh apply of the RELEASED set
+
+Both boxes drove `scripts/apply-all.sh` at `919794500`: strict **18/18**, tree
+`0c46248f…` == `release.json.tree`, tip **`6d9d54238`** == `.tip` (the deterministic re-cut) — so `release.json`
+and the apply flow are now re-verified on three machines.  Each built (`BUILD_RC=0`) and each reads its **own**
+coherence text identically on r327 and r328: halo `da2e2d192e21` → `da2e2d192e21`, fingon `2f7f092f2383` →
+`2f7f092f2383`.
+
+Op oracles, all green on both: `FLASH_ATTN_EXT` 7429/7429, `GATED_DELTA_NET` **75/75** on **gfx1100** (the first
+real gfx11 run of `gated_delta_net_chunked_bf16_gfx11.cu`, a file gfx1201 never launches), `FLASH_ATTN_QSA` 26/26
+(halo) / 23/23 (fingon, the arch-gated case list), `MUL_MAT` 2692, `MUL_MAT_ID` 1077, `TOP_K_MASK` 38, `HC_MIX` 30.
+
+**Block 15 on the box where it is not inert** (`halo`, gfx1151): `gate-uma-experts.sh` **48/49**, with the checks
+that were vacuous on gfx1201 now real — the placement-vs-arena switch by `-lme` (`-lme 4` under a 4096 MiB store →
+ARENA with the cap named; `-lme 20` covering the set → PLACEMENT), the `nolme` >RAM **refusal at load**, the `ram`
+arena arm (84618.6 MiB, 3267 evictions), the in-place band (arena D2D **1194.4 vs 3358 MiB**, 8.5 % read), the
+admission no-op, `pfverify`, and 17/17 text identity.  The one failure is a **census** finding, `TODO` #357: the
+sizing fill's log line loses its transport suffix on this box while the binary carries the full format string.
+
+Also: `gate-hc-fusions.sh` **PASS on gfx1100** (its `GSQ-IQ3_XXS` class; hard arms byte-identical, defaults == an
+explicit state) — the first run of that gate on another arch since the r328 anchor fix.
+
+**Still owed** (all named in `TODO` #354): `gate-prefill-server-slots.sh` on `halo` — the harness aborted there
+(the 122B `>RAM` arena arm ran at 3.76 tok/s and the second arm timed out, an environment limit, not a verdict);
+a prefill-logit base recorded **per box** (the gfx1201 base is refused by design on another ROCm line); the
+spec-align host-expert arm on gfx1100 (in flight when this entry was written).
+
 ## 261121.005 (r328) -- **RELEASE: the delivery is re-based onto `919794500`**, 18 default blocks, tree `0c46248f…`; `validate-set` green, `fork-refresh` re-cut + build + gates green, both optional artifacts re-cut
 
 **Delivery change: the whole set, re-expressed on a new base.  No block's feature set changed, no block was
