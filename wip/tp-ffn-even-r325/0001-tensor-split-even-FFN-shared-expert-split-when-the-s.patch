@@ -1,0 +1,92 @@
+From 53fc3371ff1ac0185ca50522675cb5f2621f3df4 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 20 Nov 2026 20:28:07 +0000
+Subject: [PATCH] tensor split: even FFN / shared-expert split when the size
+ divides evenly
+
+With -sm tensor, FFN and shared-expert tensors split with granularity
+lcm(blck_size, 128).  Flash-Next's experts and shared expert are 640 wide;
+with a 32-wide down type (IQ4_NL / Q5_0 / Q8_0) the 320-row share per GPU
+rounds to 256, so every MoE layer splits 256 / 384 (the heavier GPU
+alternating by layer), and the lighter GPU waits in each all-reduce.
+
+With no -ts (or an equal one) and a size that divides by the device count,
+the granularity now halves from lcm(blck_size, 128) until each share is a
+multiple of it, never below lcm(blck_size, 64) (MMB needs K % 64 on the
+down).  Gate, up and down take blck_size from the down, so their
+boundaries stay identical.  The split state is the single source, so the
+host-expert slices follow.  One WARN line per model load reports it.
+
+LLAMA_TP_FFN_EVEN=0: lcm(blck_size, 128) as before (outputs identical to
+stock).
+---
+ src/llama-model.cpp | 32 +++++++++++++++++++++++++++++++-
+ src/llama-model.h   |  2 ++
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 50c89460db..cc0d530281 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -990,6 +990,36 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+             const int64_t blck_size_perf = std::lcm(blck_size, 128);
+             GGML_ASSERT(segments.size() == 1);
++            // Even FFN split: with no -ts (or equal -ts) and a size that divides evenly, lower the
++            // granularity until each device's share is a multiple of it, but never below lcm(blck_size, 64) (MMB needs
++            // K % 64 on the down).  Flash-Next's 640-wide experts / shared expert otherwise split 256 / 384, and the
++            // light GPU waits in every MoE layer's all-reduce.  Gate, up and down all take blck_size from the down
++            // (tensor_axis_0), so their boundaries stay identical.  LLAMA_TP_FFN_EVEN=0: lcm(blck_size, 128) as before.
++            static const bool ffn_even = [] { const char * e = getenv("LLAMA_TP_FFN_EVEN"); return e == nullptr || atoi(e) != 0; }();
++            if (ffn_even) {
++                const float * ts = ud->model->tensor_split();
++                bool equal_ts = true;
++                for (size_t j = 1; ts != nullptr && j < ud->n_devices; j++) {
++                    equal_ts = equal_ts && ts[j] == ts[0];
++                }
++                const int64_t ne_s = segments[0].first;
++                if (equal_ts && ud->n_devices > 1 && ne_s % (int64_t) ud->n_devices == 0) {
++                    const int64_t share = ne_s / (int64_t) ud->n_devices;
++                    const int64_t g_min = std::lcm(blck_size, (int64_t) 64);
++                    int64_t g = blck_size_perf;
++                    while (g > g_min && share % g != 0) {
++                        g /= 2;
++                    }
++                    if (g != blck_size_perf && g % blck_size == 0 && share % g == 0) {
++                        if (!ud->ffn_even_logged) {
++                            ud->ffn_even_logged = true;
++                            LLAMA_LOG_WARN("%s: tensor split: FFN granularity %lld -> %lld so %s splits %lld / device (LLAMA_TP_FFN_EVEN=0: off)\n",
++                                    __func__, (long long) blck_size_perf, (long long) g, tensor_name.c_str(), (long long) share);
++                        }
++                        return {g};
++                    }
++                }
++            }
+             return {blck_size_perf};
+         }
+ 
+@@ -5006,7 +5036,7 @@ void llama_model::check_host_expert_split_shares() const {
+             if (!zero_at.empty()) {
+                 n_bad++;
+                 if (worst.empty()) {
+-                    worst = format("%s (axis %d: %lld columns over %zu devices, granularity %lld) -> device %s holds 0",
++                    worst = format("%s (axis %d: %lld columns over %zu devices, granularity <= %lld) -> device %s holds 0",
+                             t->name, (int) ss.axis, (long long) t->ne[ss.axis], n_devs,
+                             (long long) std::lcm((int64_t) ggml_blck_size(t->type), (int64_t) 128), zero_at.c_str());
+                 }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index dc6b8b4b9c..2a2a382eb9 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -697,6 +697,8 @@ struct llama_meta_device_get_split_state_userdata {
+     // dereferences `model` through this struct.
+     size_t                     n_devices = 0;
+     const struct llama_model * model     = nullptr;
++    // once per model: the fitting pass loads its own model with logging silenced, so a process-wide flag hid the line
++    mutable bool               ffn_even_logged = false;
+ };
+ 
+ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
+-- 
+2.53.0
+

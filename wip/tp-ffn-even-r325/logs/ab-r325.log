@@ -1,0 +1,62 @@
+# A/B: stock r325 (st), patched (pr), patched + LLAMA_TP_FFN_EVEN=0 (pr0); then KLD vs stock
+### prevab325 3:23 PM stock 78fecc486 PR 7c6590a9a
+=== st 3:23 PM
+   smallpf: 8 prompts, 3092 tok in 6013 ms = 514.2 t/s (751.7 ms each)
+   first prefill 31537 tok in 12.8 s = 2458.3 t/s
+   greedy: sha c74123bcb468 114.6 t/s draft 259/417
+   pdecs fresh: 512 tok, windows of 64 (t/s): 139 131 119 143 129 134 139 | first 64 tok 0.66 s | server 127.9 t/s | sha ded2b2ae08d7
+   midpf: 4363 tok prompts, prompt 2113 t/s, decode 109.0 t/s, wall 31.0 s, sha e1e5389cebb9
+   prefill 31537 tok in 12.9 s = 2436.9 t/s
+   depth prevab325-st n=650: prompt 30297 tok, gen 256, sha 54163e6a54e5
+   long: prompt 259620 tok in 111 s (2329 t/s), gen 85 @ 88.8 t/s: There are 6,358 buildings mentioned (buildings 0 through 6357).
+   faults 0
+=== pr 3:28 PM
+   smallpf: 8 prompts, 3092 tok in 4862 ms = 635.9 t/s (607.8 ms each)
+   first prefill 31537 tok in 12.8 s = 2458.7 t/s
+   greedy: sha ada4d8943c88 113.3 t/s draft 258/417
+   pdecs fresh: 512 tok, windows of 64 (t/s): 152 125 145 145 158 131 132 | first 64 tok 0.65 s | server 133.0 t/s | sha 7308bf75524d
+   midpf: 4363 tok prompts, prompt 2178 t/s, decode 116.9 t/s, wall 25.1 s, sha 014d3688171a
+   prefill 31537 tok in 12.9 s = 2446.4 t/s
+   depth prevab325-pr n=650: prompt 30297 tok, gen 256, sha 54163e6a54e5
+   long: prompt 259620 tok in 112 s (2328 t/s), gen 85 @ 91.5 t/s: There are 6,358 buildings mentioned (buildings 0 through 6357).
+   faults 0
+=== pr0 3:32 PM
+   smallpf: 8 prompts, 3092 tok in 6195 ms = 499.1 t/s (774.4 ms each)
+   first prefill 31537 tok in 13.0 s = 2432.6 t/s
+   greedy: sha c74123bcb468 114.5 t/s draft 259/417
+   pdecs fresh: 512 tok, windows of 64 (t/s): 140 130 118 142 129 134 139 | first 64 tok 0.67 s | server 127.3 t/s | sha ded2b2ae08d7
+   midpf: 4363 tok prompts, prompt 2105 t/s, decode 109.0 t/s, wall 26.2 s, sha e1e5389cebb9
+   prefill 31537 tok in 13.0 s = 2421.9 t/s
+   depth prevab325-pr0 n=650: prompt 30297 tok, gen 256, sha 54163e6a54e5
+   long: prompt 259620 tok in 112 s (2326 t/s), gen 85 @ 90.9 t/s: There are 6,358 buildings mentioned (buildings 0 through 6357).
+   faults 0
+### prevab325 DONE 3:36 PM
+### kprev325 3:36 PM
+base ub 4096: 3.18.348.835 I Final estimate: PPL = 2.7181 +/- 0.04605 0 errors
+pr ub 4096:  | chunk PPL ln(PPL(Q)/PPL(base)) KL Divergence Δp RMS Same top p Mean PPL(Q) : 2.733833 ± 0.046705 Mean PPL(base) : 2.717874 ± 0.046028 Mean ln(PPL(Q)/PPL(base)) : 0.005855 ± 0.001854 Mean PPL(Q)/PPL(base) : 1.005872 ± 0.001864 Mean PPL(Q)-PPL(base) : 0.015960 ± 0.005082 Mean KLD: 0.013897 ± 0.000441 Same top p: 96.565 ± 0.164 %  0 errors
+base ub 256: 5.14.829.181 I Final estimate: PPL = 2.7136 +/- 0.04604 0 errors
+pr ub 256:  | chunk PPL ln(PPL(Q)/PPL(base)) KL Divergence Δp RMS Same top p Mean PPL(Q) : 2.722016 ± 0.046381 Mean PPL(base) : 2.713343 ± 0.046017 Mean ln(PPL(Q)/PPL(base)) : 0.003191 ± 0.001837 Mean PPL(Q)/PPL(base) : 1.003196 ± 0.001843 Mean PPL(Q)-PPL(base) : 0.008673 ± 0.005001 Mean KLD: 0.013137 ± 0.000377 Same top p: 96.760 ± 0.160 %  0 errors
+### chain DONE 3:56 PM
+
+## KLD -ub 4096
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)                   :   2.733833 ±   0.046705
+Mean PPL(base)                :   2.717874 ±   0.046028
+Mean PPL(Q)/PPL(base)         :   1.005872 ±   0.001864
+Mean PPL(Q)-PPL(base)         :   0.015960 ±   0.005082
+Mean    KLD:   0.013897 ±   0.000441
+Maximum KLD:   1.535064
+Same top p: 96.565 ± 0.164 %
+## KLD -ub 256
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+Mean PPL(Q)                   :   2.722016 ±   0.046381
+Mean PPL(base)                :   2.713343 ±   0.046017
+Mean PPL(Q)/PPL(base)         :   1.003196 ±   0.001843
+Mean PPL(Q)-PPL(base)         :   0.008673 ±   0.005001
+Mean    KLD:   0.013137 ±   0.000377
+Maximum KLD:   0.764663
+Same top p: 96.760 ± 0.160 %
+
+## patched start after the log-once fix (3:57 PM)
+   greedy: sha ada4d8943c88 119.0 t/s draft 260/411
+0.00.966.926 W operator(): tensor split: FFN granularity 128 -> 64 so blk.0.ffn_down_exps.weight splits 320 / device (LLAMA_TP_FFN_EVEN=0: off)
