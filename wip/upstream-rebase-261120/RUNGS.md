@@ -709,6 +709,7 @@ compiler forced and **one** auto-merge artifact that would have compiled and mis
 | `test-backend-ops -o MUL_MAT_ID` | **1079 OK / 0 FAIL**, 16 `dup=1` |
 | the block's own surface | 4B Q8_0, `llama-bench -p 2048 -n 128 -r 3`: default **7409.28 / 97.67**; `DISABLE_FUSION=1` **7027.45 / 82.26** (−5.4 % pp, −18.7 % tg) — the fusion surface is live and worth having, text unchanged |
 | `GGML_CUDA_DISABLE_NORM_ROWS=1` | **7388.04 / 97.48** — inside the arm's noise, i.e. **the switch is inert at this rung**, exactly as block 08's own commit says ("the norm-rows gates stay inert until block 10's fusion dispatcher exists") |
+| **the block's headline path** (fused routed gate/up+GLU, 35B-A3B Q8_0, 2 dev `-sm tensor`, 5298-token prompt) | default **4850.8 / 80.6** `73 chars sha=86b7f9b5aa80`; `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1` **4731.2 / 81.1**, **same hash**; `GGML_CUDA_DISABLE_FUSION=1` **4508.9 / 62.2**, **same hash** — the fused MoE is ~+2.5 % prefill and the whole fusion surface +29 % decode, and all three arms are **bit-identical to each other *and* to R06's** `86b7f9b5aa80` (the fusion is exact, not approximate) |
 
 ## R08.1 The eight resolutions
 
