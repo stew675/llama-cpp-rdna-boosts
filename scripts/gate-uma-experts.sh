@@ -85,8 +85,12 @@
 #   ./gate-uma-experts.sh [--keep] [--quick] [--kld] [--no-ram]
 #
 # Environment:
-#   LLAMA_CLI   (default: ~/llama-scratch/build-rocm/bin/llama-cli -- the campaign tree; the delivery's gates
-#                default to ~/llama.cpp/build-rocm, which does NOT contain this campaign's patch)
+#   LLAMA_CLI   (default: ~/llama.cpp/build-rocm/bin/llama-cli -- the DELIVERY tree; the campaign this gate
+#                was written for is now block 15, so the scratch tree is no longer the right anchor.  Point this
+#                at the build you mean to certify: the gate prints the binary's own `--version` (build + commit)
+#                at the top, because a census check cannot fail on a stale binary -- it silently reads a run
+#                that predates the print it is asserting (2026-11-21: `halo` failed this gate's r277 check
+#                because the default then resolved to a 2026-11-12 campaign build, TODO #357).)
 #   MODEL       (default Qwen3.6-35B-A3B Q4_K_M: an 18.2 GiB expert set against a 4 GiB store)
 #   MODEL_RAM   (default the 122B-A10B Q8_0 shard 1: 123.4 GiB of weights on a 123 GiB box)
 #   LME         (default 4: GiB of GTT store, small enough that the arena really evicts)
@@ -99,7 +103,7 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LLAMA_CLI="${LLAMA_CLI:-$HOME/llama-scratch/build-rocm/bin/llama-cli}"
+LLAMA_CLI="${LLAMA_CLI:-$HOME/llama.cpp/build-rocm/bin/llama-cli}"
 MODEL="${MODEL:-/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf}"
 MODEL_RAM="${MODEL_RAM:-/llm/models/Qwen3.5/122B-A10B/Q8_0/Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf}"
 LME="${LME:-4}"
@@ -127,13 +131,18 @@ for a in "$@"; do
     esac
 done
 
-[ -x "$LLAMA_CLI" ]     || { echo "ERROR: no llama-cli at $LLAMA_CLI (set LLAMA_CLI; this gate needs the tree WITH the campaign patch)" >&2; exit 2; }
+[ -x "$LLAMA_CLI" ]     || { echo "ERROR: no llama-cli at $LLAMA_CLI (set LLAMA_CLI; this gate needs the tree WITH the block-15 GTT store)" >&2; exit 2; }
 [ -f "$MODEL" ]         || { echo "ERROR: no model at $MODEL" >&2; exit 2; }
 [ -f "$PROMPT_FILE" ]   || { echo "ERROR: no prompt file at $PROMPT_FILE" >&2; exit 2; }
 case "$AS_KB" in ''|*[!0-9]*) echo "ERROR: AS_KB must be '0' or a number of KiB" >&2; exit 2 ;; esac
 
 GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 export LD_LIBRARY_PATH="/opt/rocm-10.1.0-gfx1151/lib:${LD_LIBRARY_PATH:-}"
+
+# The ANCHOR: which binary this run certifies.  A census assertion cannot fail on a stale build -- it reads a
+# run that predates the print it asserts and reports it as a mechanism defect -- so the binary names itself.
+echo "==> umagate: $LLAMA_CLI"
+echo "    $("$LLAMA_CLI" --version 2>&1 | head -1)"
 
 CHECKS=0
 FAILED=0

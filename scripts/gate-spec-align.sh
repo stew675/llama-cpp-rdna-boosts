@@ -110,7 +110,11 @@
 #   RECOVER       min aggregate gain of the diverging pair (default: 1.10)
 #   REGRESS       max aggregate loss of the equal-length arm (default: 0.98)
 #   NCMOE_SPLIT_MAX  max DRAFT-LENGTH split steps on the host-expert arm (default 2, the measured
-#                shipped residual: the arena band replaces the width band there, TODO #356).  The tensor
+#                shipped residual).  The caps ARE equalised inside the call (verified with `-lv 5`: `aligned
+#                draft depth seq N: 3 -> 5 (width band 16, drafting 2, hard 5)` on every two-drafting call;
+#                on a `-ncmoe` host-pool shape the arena band is 0, so `LLAMA_SPEC_ALIGN_WIDTH_BAND` is what
+#                applies).  What survives are boundary steps: one slot's last prompt chunk cannot merge with
+#                the other's verify batch, so two preps are issued for one step.  The tensor
 #                arms keep the strict 0.
 #   TAIL_MAX      max single-row split decode steps per arm (default 2).  One per response boundary is the
 #                 deliberate TODO #111 residual; the count is reported and bounded, never required to be 0
@@ -150,7 +154,7 @@ REGRESS="${REGRESS:-0.90}"
 REGRESS_MIXED="${REGRESS_MIXED:-0.98}"
 REF_HASH="${REF_HASH:-}"
 TAIL_MAX="${TAIL_MAX:-2}"
-NCMOE_SPLIT_MAX="${NCMOE_SPLIT_MAX:-2}"   # see the ncmoe arm: the arena band replaces the width band there
+NCMOE_SPLIT_MAX="${NCMOE_SPLIT_MAX:-2}"   # see the ncmoe arm: a prefill/decode boundary step cannot merge
 PORT="${PORT:-18301}"
 EXTRA_ARGS="${EXTRA_ARGS:--fa on}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
@@ -359,8 +363,10 @@ for ngpu in $NGPU; do
     ARMS="$ARMS $tag"
 done
 
-# the host-expert arm: on a -ncmoe config the aligned verify batch must stay inside the expert cache's band
-# (`band / n_drafting - 1` rows per sequence), so this is the arm that exercises that bound
+# the host-expert arm: on a -ncmoe host-pool config the alignment runs the same way (verified: the caps come
+# from `LLAMA_SPEC_ALIGN_WIDTH_BAND`, because `llama_model_moe_cache_band()` answers 0 when no arena is in
+# force), so this arm measures the host-expert shape rather than a different bound; the residual split count is
+# a prefill/decode boundary step (see NCMOE_SPLIT_MAX)
 if [ "$NCMOE_ARM" -eq 1 ]; then
     run_arm "off-ncmoe" 0,2 "$NCMOE_MODEL" "$NCMOE" "$SPEC" "$NMAX" "$PROMPT_A" "$PROMPT_B_NCMOE" "" "" env LLAMA_SPEC_ALIGN=0 \
         || { echo "==> FAIL: the knob-off host-expert arm did not run"; exit 1; }
@@ -594,20 +600,25 @@ if off and on and not off.get("error") and not on.get("error"):
     # replaces it" -- and that band is derived per step from how many rows the arena serves from VRAM, so the
     # caps `align_draft_caps()` equalizes can be unequal at a step boundary.  Measured 2026-11-21 on the
     # RELEASED r327 binaries and on the r328 tree, identically: 45+1 -> 2+1 splits (r327) and 46+1 -> 2+1
-    # (r328), i.e. two draft-length steps survive on BOTH, so a zero requirement would have been red on r327
-    # too and is an aspiration, not the shipped behaviour (`TODO` #356 tracks the block-02 fix: align the
-    # band-derived caps in the same call).  The bound still catches a regression: 2 is the shipped number and
-    # any growth fails, with the reason printed.
+    # (r328), i.e. two draft-length steps survive on BOTH.  r328's own `-lv 5` trace says why, and it is NOT
+    # an unequal cap: `align_draft_caps()` raises every drafting sequence to ONE width on every two-drafting
+    # call (`aligned draft depth seq N: 3 -> 5 (width band 16, drafting 2, hard 5)`), and on a `-ncmoe`
+    # host-pool shape the arena band answers 0, so `LLAMA_SPEC_ALIGN_WIDTH_BAND` is the bound in force.  The
+    # survivors are BOUNDARY steps -- one slot's last prompt chunk (4 rows) cannot merge with the other
+    # slot's verify batch (6 rows), so the scheduler issues two preps for one step -- which no cap policy can
+    # align (padding a prompt chunk to the other slot's width would advance the recurrent state).  So a zero
+    # requirement would be red on r327 too and is an aspiration, not the shipped behaviour.  The bound still
+    # catches a regression: 2 is the shipped number and any growth fails, with the reason printed.
     ncmoe_split_max = int(os.environ.get("NCMOE_SPLIT_MAX", "2"))
     if splits("on-ncmoe")[0] > ncmoe_split_max or splits("on-ncmoe")[1] > tail_max:
         print("FAIL  ncmoe: the aligned host-expert pair split %s (draft-length steps <= NCMOE_SPLIT_MAX=%d -- "
-              "the arena band replaces the width band on this shape, TODO #356 -- and single-row steps <= "
+              "a prefill/decode boundary step cannot merge, see the ncmoe comment -- and single-row steps <= "
               "TAIL_MAX=%d)" % (split_str(splits("on-ncmoe")), ncmoe_split_max, tail_max))
         fails += 1
     elif splits("on-ncmoe")[0] > 0:
-        print("NOTE  ncmoe: the aligned host-expert pair split %s, within NCMOE_SPLIT_MAX=%d (the arena band "
-              "replaces LLAMA_SPEC_ALIGN_WIDTH_BAND here, so the caps can still differ at a step boundary; "
-              "TODO #356)" % (split_str(splits("on-ncmoe")), ncmoe_split_max))
+        print("NOTE  ncmoe: the aligned host-expert pair split %s, within NCMOE_SPLIT_MAX=%d (the caps are "
+              "equalised inside the call; what survives is a prefill/decode BOUNDARY step, which cannot merge)"
+              % (split_str(splits("on-ncmoe")), ncmoe_split_max))
     if text_of(off, "alone_a") != text_of(on, "alone_a") or text_of(off, "alone_b") != text_of(on, "alone_b"):
         print("FAIL  ncmoe: a single-slot request's greedy text differs on/off")
         fails += 1
