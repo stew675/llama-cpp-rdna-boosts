@@ -695,7 +695,12 @@ in CI.  The model-level gates are manual:
     sequence, so a draft regression on a `-ncmoe` multi-slot run is silent (acceptance -> ~0 while the text
     stays correct); that is the guard R13 dropped, and this is its detector.  HARD: the server comes up, both
     slots draft, per-slot acceptance is not a collapse (`ACC_FLOOR`, default 0.5 x baseline) and has not drifted
-    past `ACC_TOL` (default 0.10), and the two generated texts match the recorded hash set.  R13's own numbers
+    past `ACC_TOL` (default 0.10), and the two generated texts match the recorded hash set.  **The text is a
+    legitimate oracle only because the server runs `--no-kv-unified` with a deterministic admission** (pinned
+    `id_slot` plus a warm-up request on a third slot, so both real requests are queued before either is batched);
+    `GREEDY-PURITY.md` §38 forbids a concurrent two-slot text hash under a UNIFIED KV cache, which this arm used to
+    do — that is what `TODO` #349 was, and §103 is the rule that replaced it (`WORKLOG.md` 261121.012).  `-c` is
+    per slot, i.e. three slots means `3 x CTX`.  R13's own numbers
     (0.53793/0.51678 etc.) are **not** the criterion: its invocation was never recorded and they do not
     reproduce, so the baselines are measured at r236 and reproduce to the digit (0.72269/0.74359 on Flash-Next
     at both `-ncmoe` levels, 0.44720/0.59124 on 35B-A3B).

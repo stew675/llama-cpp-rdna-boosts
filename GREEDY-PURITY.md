@@ -173,6 +173,7 @@ is worth keeping moves it to that archive under its own number rather than growi
 | **§100** | **a fold's overlap test must test the buffers the kernel READS, not the nodes it was handed — a deferred gather makes the state node dead**: `gdn_conv_norm_match()` writes the GDN q/k norm outputs while the direct conv still streams `x`/state/`w`, so it refuses a SCALE output that overlaps them.  When the conv-state `GET_ROWS` is a **deferred** gather the kernel reads the cache row through the gather's row id and never touches `m.state->data`, so the allocator legitimately places the q output over that dead node — and the spans collide for any verify width >= 6 (`128*nk*T` against `3*C`; 27B: 20 480 B per row against 122 880 B), costing one norm launch per GDN layer per step.  Test `root->src[0]` (the cache tensor) in that case instead of dropping the test: the contributor form simply skipped it.  The reach is the CPY-snapshot verify shape ONLY — the rollback `SET_ROWS` store owns the DFlash2/MTP band and never enters the matcher — and the measured value there is **0.02 %** (38 692.4 -> 38 685.6 ms over 2048 tokens, 5 interleaved pairs, against 39 262.4 ms with the fold off), i.e. a correctness fix, not a decode win.  Because the decision moves no hash, the width-probe arm is vacuous without a matcher census (`deferred=1 base=overlap_state` -> `folded`) | doctrine + fix (r320, block 10, PR #316; `INVARIANTS.md` r320; `test-logits-width-probe KV=q8_0` `W=6..8`) |
 | **§102** | **a "same arithmetic" claim about a fold is a claim about the ROUNDING MODE, not the expression — and the two implementations that replace each other must be switched together**: the MoE expert weighted sum exists twice (`moe_weighted_reduction_f32_vec4`/`_f32` in the standalone kernel, and `mul_mat_vec_q_moe`'s `fusion.red_dst` fold), both accumulating `sum + (x * scale) * w`.  Written identically and compiled by HIP clang, BOTH contract that into `v_fmac_f32`; no unfused graph does, so the delivery's MoE decode text was **not** the `MUL`/`VIEW`/`ADD` chain's text on qwen35moe, qwen3moe and gemma4, and the `-ub 512` prefill point read mean KLD **0.006613 / 96.627 %** against the fully unfused graph on r323.  `__fmul_rn`/`__fadd_rn` do not fix it (HIP lowers them to plain ops and contracts them anyway); `#pragma clang fp contract(off)` at the head of a compound statement does, and it survives `__forceinline__` template instantiation (verified in the emitted ISA).  With it the same point reads **0.000000 / 100.000 %** and the greedy text EQUALS the unfused chain on all three families.  Three consequences: **(a)** ONE knob for both paths (`GGML_CUDA_MWR_EXACT`) — they replace each other at the same node, so an arm where only one is exact compares two arithmetics and a bisect blames the wrong one, and the `ENVIRONMENT.md` wording must say "own order *and expression*"; **(b)** a fold that displaces another fold must displace it only where it can SERVE it, so the serve predicate lives in one function enforced at the ARMING site (`ggml_cuda_mwr_fold_serve_ok()`), never duplicated at the stand-aside site; **(c)** the wrong instrument for this class is a short `-ub 1` KLD window (it reads ~0 on the broken build — 512 sequential steps do not accumulate what 256 greedy tokens do), and the right ones are the greedy text and a CENSUS (`MWR FOLD` / `MWR FOLD ASIDE` / `MWR FOLD DECLINE`) | doctrine + fix (r324, block 10, contributor PR #335; `INVARIANTS.md` r324; `scripts/gate-mwr-exact.sh`; `benchmarks/2026-11-19-mwr-exact.md`) |
 | **§101** | **a fused launch's STAGED answer is a PLACEMENT, not a stand-down -- and it owes the broken-promise repair**: `moe_cache_fusion_serve()` is asked per lane, and five call sites pass `gate == nullptr` (the decode MoE down fold, the three single-lane routed bias/scale folds, the RDNA3_5 MMQ `swiglu -> down` fold); written as `gate == nullptr || lane_serves(gate)` the gate term is vacuously TRUE, so a fully STAGED single-lane caller answered `MOE_CACHE_SERVE_MIXED` ("one lane served, one not") and every gate-less fusion stood itself down for as long as its table was staged -- residency selected the kernel set again, the impurity `TODO` #327 removed for the gated sites (issue #332, found by reading the code; the reporter's own Flash-Next `-sm tensor` shape reads `mixed_lanes=0` because flat staging is not the reach, "neither in place nor slot-remapped" is).  Census, r320 -> r321: 35B-A3B UD-Q3_K_M 1 GPU `-ncmoe 24` `mmvq_glu=166/0 mixed_lanes=112` -> `166/112 mixed_lanes=0` (text `ba65a38cf871` either way), the 5 246-token prose arm `121/0 mixed_lanes=80` -> `121/80 mixed_lanes=0` (`cd5e36218bd2`), and with every promise broken (`MOE_EXPERT_TAKEOVER_FAULT=1`) `mixed_lanes=200` -> `0` with `broken=216 repaired=216` and the same text.  Two consequences the fix must carry: the STAGED answer is where a broken take-over promise is re-filled (`moe_cache_repair_copy`), because a fused launch never passes the per-op dispatch that repairs -- putting it in the serve query instead of at each site is what covers the pair/MMB/triple arms that had no repair at all, and `gate-moe-promise.sh` still reads `repaired == broken` with unchanged text; and the newly fused launches must be **bit-identical** to the chain they replace (MTP acceptance identical to the digit on all four axes, prefill KLD 0.000000 / 100.000 %), which is the evidence that a fold's epilogue is the same arithmetic, not merely within tolerance | doctrine + fix (r321, block 10, issue #332; `INVARIANTS.md` r321; `scripts/gate-moe-promise.sh`) |
+| **§103** | **a concurrent two-slot text hash is not an oracle under a UNIFIED KV cache (§38), and the arm that wants one must fix the ADMISSION, not the delay**: `gate-server-arms.sh` asserted its two-slot texts while running `--kv-unified`, where a sequence's KV cells' tile indices follow the CO-RESIDENT session's allocation history, so the second sequence's arrival point re-rolls near ties (the item read 35b10's slot 1 as three texts at three acceptance values).  Every client-side way of choosing a *delay* was measured and fails -- a 0.5 s stagger (35b10: 3 texts in 3 runs), "release slot 1 on slot 0's first streamed token" (fn24: 4 runs, 4 text pairs -- the item's own prescribed fix, refuted), `id_slot`-pinned simultaneous firing (fn24: 1 flip in 4) -- and the fix is two-part: `--no-kv-unified`, plus a WARM-UP request on a spare slot whose first streamed token releases the pair so both real requests are queued before either is batched (3 fresh servers, 3 identical fn24 pairs).  With a non-unified cache `-c` is PER SLOT (3 slots = 3 x CTX), and the acceptance checks stay hard because a collapse to ~0 draft acceptance on a host-resident expert tier with two sequences in one decode step is what the arm exists for | doctrine + fix (r333, `TODO` #349 retired; `scripts/gate-server-arms.sh`; `WORKLOG.md` 261121.012; §38 is the rule it applies, §82 its oracle clause) |
 
 ---
 
@@ -2928,3 +2929,46 @@ flat on gemma4 (which already took the larger fold); pp512 flat everywhere.
 **Record.**  This entry; `INVARIANTS.md` r324; `benchmarks/2026-11-19-mwr-exact.md`; `scripts/gate-mwr-exact.sh`
 (MANIFESTS gate 37 — 9 checks fail on the r323 build); `ENVIRONMENT.md` (`GGML_CUDA_MWR_EXACT`,
 `GGML_CUDA_MWR_FOLD_FIRST`, `GGML_CUDA_MWR_DEBUG`); `WORKLOG.md` 261119.008; `patches/README.md` block 10.
+
+## 103. A concurrent two-slot text hash is not an oracle under a UNIFIED KV cache — and the arm that wants one must fix the ADMISSION, not the delay (r333, `TODO` #349 retired)
+
+**Claim.**  `scripts/gate-server-arms.sh` asserts the two texts of its two-slot arms, and it ran the server with
+`--kv-unified` — the configuration §38 forbids for exactly this purpose.  Under a unified cache a sequence's result
+is a function of its KV cells' tile indices **modulo the per-launch KV-split period**, and the residue follows the
+**co-resident session's allocation history**, so a second sequence's *arrival point* re-rolls near ties.  That is
+what `TODO` #349 recorded (35b10's slot 1 reading three texts at three acceptances) and it is not a defect in the
+arm's subject.
+
+**What was measured, in order** (3 x R9700 gfx1201, `N=128`, prose prompt, one fresh server per arm):
+
+| admission scheme, `--kv-unified` | fn24 | 35b10 |
+|---|---|---|
+| 0.5 s stagger (r324) | stable | **3 texts in 3 runs** — the item |
+| slot 1 released on slot 0's **first streamed token** (what #349 prescribed) | **4 runs, 4 text pairs** (refuted) | 3 of 4 one state |
+| `id_slot`-pinned, fired simultaneously | 1 flip in 4 | 4 of 4 one state |
+| pinned + a **warm-up request on a third slot** holding the scheduler | 3 of 3 one state | — |
+
+So every client-side way of *choosing the delay* leaves the pairing to arrival timing; the only deterministic form
+is that **both requests are queued before the scheduler builds a batch**.
+
+**Rule (doctrine).**
+
+1. **An arm that asserts a concurrent two-slot text hash runs `--no-kv-unified`.**  With a unified cache the text
+   is reported, and the gate's oracles are the things §38 still allows: per-slot acceptance, a *sequentially*
+   driven two-slot run, single-sequence arms and the prefill-logit gate.
+2. **"Make the delay deterministic" is not an admission fix.**  A stagger, a first-token trigger and a
+   simultaneous+`id_slot` pin all leave it to wall-clock; a warm-up request on a spare slot (whose first streamed
+   token releases the pair) makes the two real requests queue behind it, so they are co-batched from step 0.
+3. **With a non-unified cache `-c` is PER SLOT**: three slots means `-c 3 x CTX`, and the slot count is part of
+   the invocation that the anchor belongs to.
+4. **The acceptance checks stay hard** — the arm exists for a collapse to ~0 draft acceptance on a host-resident
+   expert tier with two sequences in one decode step, and serialising the requests would destroy that shape.
+
+**Numbers** (r331 build, the gate's own invocation: `--parallel 3 --no-kv-unified -c 49152`, pinned `id_slot`,
+warm-up on slot 2): fn24/fn10 `594368935245` / `b337648c3ef9` at acceptance **0.59259 / 0.77193**, and 35b10
+`50f29e574939` / `a56117e02dcf` at **0.60741 / 0.69106**; three fresh servers reproduced fn24's pair to the digit
+and the gate reproduced all three arms on repeat runs.  The r324 / r330 anchors recorded under `--kv-unified` are
+retired (they were per-placement coin flips, not baselines).
+
+**Record.**  This entry; `scripts/gate-server-arms.sh` (header + invocation); `TODO` #349 retired;
+`WORKLOG.md` 261121.012; §38 (the rule this applies) and §82 (its oracle clause).

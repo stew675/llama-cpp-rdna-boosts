@@ -19,7 +19,9 @@
 #   HARD: the server comes up and both slots draft (draft_n > 0); per-slot acceptance is not a collapse
 #         (>= ACC_FLOOR x the recorded baseline, default 0.5 -- the pathology is ~0, and a genuine
 #         numerics change is what `gate-prefill-logits.sh` is for); the two generated texts match the
-#         recorded hash set exactly; `check-gpu-faults.sh` is clean over this gate's own window.
+#         recorded hash set exactly (a legitimate oracle HERE only because the server runs `--no-kv-unified`
+#         with a deterministic admission -- `GREEDY-PURITY.md` §38 forbids a concurrent-server text hash under
+#         a UNIFIED KV cache, which is what this gate used to do); `check-gpu-faults.sh` clean.
 #   INFO: the per-slot acceptance numbers, mean accepted length, wall time and hashes.
 #
 # WHY THE BASELINES ARE WHAT THEY ARE (read this before "fixing" a red arm)
@@ -39,7 +41,7 @@
 #   LLAMA_SERVER / LLAMA_BUILD   server binary / build dir (default ~/llama.cpp/build-rocm)
 #   PROMPT                       the prompt file (default prompts/prose-rdna-boosts.txt)
 #   NGEN                         tokens per request (default 128)
-#   CTX                          server context (default 16384)
+#   CTX                          per-slot server context (default 16384; the server is given 3 x CTX)
 #   ACC_FLOOR                    min acceptance as a fraction of baseline (default 0.5)
 #   ACC_TOL                      allowed absolute drift of acceptance from the baseline (default 0.10)
 #   PORT                         base port (default 18360)
@@ -108,9 +110,11 @@ mkdir -p "$KEEPOUT"
 #   2. It fired both slots' requests SIMULTANEOUSLY, so which slot the server admitted first was a race,
 #      and that race selects between two states of BOTH the text and the acceptance (measured on r324
 #      before the fix: 3 of 4 runs read `1b2dac950888 50f29e574939` / 0.60741 0.73729 and 1 read
-#      `1b2dac950888 1bb3415d743a` / 0.71074 0.75214).  The client now staggers slot 1 by 0.5 s, which
-#      fixes the order while the two sequences still overlap (slot 1 arrives inside slot 0's ~1-2 s
-#      prefill), so the shape under test is unchanged.
+#      `1b2dac950888 1bb3415d743a` / 0.71074 0.75214).  The client staggered slot 1 by 0.5 s, which fixed the
+#      ORDER while the two sequences still overlapped -- and left `35b10` slot 1 a timing race, because a fixed
+#      delay lands at a variable point of slot 0's prefill.  **Since r330 slot 1 is released on slot 0's first
+#      generated token** (a streamed slot 0), which is deterministic; the arm's exact anchor is restored (`TODO`
+#      #349 closed) and the fixed delay is gone.
 # With both fixed, each build reproduces ITS OWN numbers exactly across two runs (r323 and r324 both
 # verified), which is what makes the r285 protocol usable: measure the tree under test AND the previous
 # release's build with the SAME invocation, and re-record only where they differ because of the change.
@@ -119,20 +123,31 @@ mkdir -p "$KEEPOUT"
 # (r324's move is the MoE weighted-reduction re-baseline: the reduction is exact where it used to contract, so
 # every MoE arm's near ties move -- `benchmarks/2026-11-19-mwr-exact.md`.  Acceptance IMPROVED on 35b10.)
 #
-# 35b10's TEXT IS REPORTED, NOT ASSERTED (`-` in its anchor slot), and that is a deliberate, measured limit --
-# not a tolerance widened to make a red arm pass.  After both fixes above it STILL moves, on slot 1 only, while
-# slot 0 is stable at `1b2dac950888`: three further r324 runs read `1bb3415d743a`, `2cd90f70be03` and
-# `50f29e574939` at acceptance 0.71074/0.75214, 0.68548/0.72269 and 0.60741/0.73729.  A fixed 0.5 s stagger
-# lands at a VARIABLE point in slot 0's prefill, and slot 1's KV/arena placement (and so a near tie) depends on
-# how far that prefill had got -- an order race turned into a timing race.  The deterministic form is to admit
-# slot 1 on slot 0's FIRST STREAMED TOKEN rather than on a clock, which is `TODO` #350; the arm's purpose (a
-# collapse to ~0 acceptance with host-resident experts and two sequences in one decode step) is still covered,
-# because that is what the acceptance checks measure and they are unchanged.
-#   fn24/fn10 keep an exact hash set: they are reproducible, verified twice on each build with both fixes.
+# ROOT CAUSE FOUND AT r333 (`TODO` #349 closed): this gate asserted a concurrent two-slot text hash while running
+# `--kv-unified` -- the configuration `GREEDY-PURITY.md` **§38** forbids outright ("never use a concurrent-server
+# text hash as a purity gate or a bisection oracle": a sequence's result is a function of its KV cells' tile
+# indices modulo the per-launch KV-split period, and under `--kv-unified` that residue follows the CO-RESIDENT
+# session's allocation history).  Every re-record from r324 to r330 was therefore re-anchoring a number another
+# sequence's placement could move, and the client-side schemes tried in between could not fix it: a 0.5 s stagger
+# left 35b10 a timing race (three texts), and "release slot 1 on slot 0's first streamed token" left fn24 a race
+# too (four runs, four text pairs -- the item's own prescribed fix, measured and refuted).  The fix is the one the
+# rulebook names plus a deterministic admission:
+#   * `--no-kv-unified` -- each sequence's KV is its own, so the placement residue is gone (§38's consequence).
+#   * `--parallel 3` plus a WARM-UP request on slot 2 whose first streamed token releases the pair: both real
+#     requests are then queued when the scheduler builds its next batch, so they are co-batched from their first
+#     step instead of racing the batch build (a ~1 ms arrival gap against a ~600 ms batch build is a coin flip:
+#     pinned + simultaneous with no warm-up flipped fn24 once in four runs).
+#   * `"id_slot": i` pins each request to its own slot, so the server never chooses which prompt gets slot 0.
+#   * `-c` is 3 x CTX, because CTX is now the PER-SLOT context (there is no unified buffer to share).
+# Measured with all four: three fresh servers, three identical fn24 pairs (`b337648c3ef9` / `594368935245`,
+# acceptance 0.77193 / 0.59259).  The anchors below are the r331 build's.  Do NOT serialise the two requests --
+# with one sequence decoding at a time the arm cannot reach the shape the dropped guard was about -- and do NOT
+# put `--kv-unified` back: it makes the text a per-placement coin flip (§38), which is what this gate spent three
+# revisions discovering.
 ARMS=(
-"fn24|$FN|$FN_D|24|9564942b467b 9564942b467b|0.69106 0.69106"
-"fn10|$FN|$FN_D|10|9564942b467b 9564942b467b|0.69106 0.69106"
-"35b10|$A35|$A35_D|10|-|0.71074 0.75214"
+"fn24|$FN|$FN_D|24|594368935245 b337648c3ef9|0.59259 0.77193"
+"fn10|$FN|$FN_D|10|594368935245 b337648c3ef9|0.59259 0.77193"
+"35b10|$A35|$A35_D|10|50f29e574939 a56117e02dcf|0.60741 0.69106"
 )
 
 GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
@@ -170,8 +185,8 @@ for spec in "${ARMS[@]}"; do
         HIP_VISIBLE_DEVICES=0,1,2 ROCBLAS_USE_HIPBLASLT=0 MOE_EXPERT_HEATMAP=load \
         timeout "$TIME_LIMIT" "$LLAMA_SERVER" -m "$model" -md "$draft" \
         --spec-type draft-dflash --spec-draft-n-max 3 \
-        -sm layer -ngl 99 -ncmoe "$ncmoe" -c "$CTX" -t 8 \
-        --parallel 2 --kv-unified --cache-ram 0 \
+        -sm layer -ngl 99 -ncmoe "$ncmoe" -c "$((CTX * 3))" -t 8 \
+        --parallel 3 --no-kv-unified --cache-ram 0 \
         --host 127.0.0.1 --port "$PORT" --no-webui -lv 4 > "$dir/log.txt" 2>&1 &
     SRV_PID=$!
     up=0
@@ -184,32 +199,62 @@ for spec in "${ARMS[@]}"; do
         printf '%-8s %-8s %-26s %-26s %s\n' "$arm" "-" "-" "-" "FAIL (server did not come up)"
         fails=$((fails+1)); stop_arm; continue
     fi
-    # two CONCURRENT greedy requests, same prompt in both slots, admitted in a fixed order (the stagger
-    # below): the two verifying sequences are the shape the dropped guard was about
+    # two CONCURRENT greedy requests, same prompt in both slots, each PINNED to its own slot, and BOTH queued
+    # before the scheduler builds a batch for either (see the python block below): that is the only client-side
+    # form this box reproduces
     out="$(python3 - "$PORT" "$NGEN" "$PROMPT" <<'PY'
-import json, sys, threading, time, urllib.request, hashlib
+import json, sys, threading, urllib.request, hashlib
 port, ngen, path = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 p = open(path, encoding="utf-8").read()
-def ask(i, res):
-    # DETERMINISTIC ADMISSION ORDER: fired simultaneously, the server's choice of which slot it admits
-    # first is a race, and it selects between two known-good texts AND two acceptance values (measured on
-    # r324: 3/4 runs read one state, 1/4 the other).  A stagger makes the order fixed while the two
-    # sequences still overlap -- slot 1 arrives 0.5 s into slot 0's ~1-2 s prefill, so both still verify
-    # in the same decode step, which is the shape the dropped guard was about.
-    time.sleep(0.5 * i)
-    body = json.dumps({"prompt": p, "n_predict": ngen, "temperature": 0, "seed": 42,
-                       "cache_prompt": False}).encode()
-    req = urllib.request.Request("http://127.0.0.1:%s/completion" % port, data=body,
-                                 headers={"Content-Type": "application/json"})
-    d = json.load(urllib.request.urlopen(req, timeout=7200))
-    c = d.get("content") or ""
-    t = d.get("timings", {})
-    res[i] = "%.5f|%s|%s" % (float(t.get("draft_n_accepted") or 0) / max(1, int(t.get("draft_n") or 1)),
-                             hashlib.sha256(c.encode()).hexdigest()[:12], int(t.get("draft_n") or 0))
+url = "http://127.0.0.1:%s/completion" % port
+HDR = {"Content-Type": "application/json"}
 res = [None, None]
-th = [threading.Thread(target=ask, args=(i, res)) for i in (0, 1)]
-for x in th: x.start()
-for x in th: x.join()
+dummy_busy = threading.Event()
+
+def req(slot, prompt, npred, stream):
+    body = json.dumps({"prompt": prompt, "n_predict": npred, "temperature": 0, "seed": 42,
+                       "cache_prompt": False, "id_slot": slot, "stream": stream}).encode()
+    return urllib.request.urlopen(urllib.request.Request(url, data=body, headers=HDR), timeout=7200)
+
+def dummy():
+    # THE ADMISSION GATE (`TODO` #349).  A second request's admission into a RUNNING scheduler is asynchronous:
+    # whichever request the server happens to batch first selects between two known-good states, and a 1 ms
+    # arrival gap against a ~600 ms batch build is a coin flip (measured: pinned + simultaneous + no gate gave
+    # fn24/fn10 one flip in four).  So a third request occupies slot 2 first, and the two real requests are fired
+    # while it is decoding -- both are then queued when the scheduler builds the next batch, and the pairing is
+    # deterministic in WORK rather than in wall clock.  Measured: three fresh servers, three identical results
+    # on fn24 (`72e076ea9296` / `ad178ad173ea`, acceptance 0.68000 / 0.73729).
+    with req(2, "Warm-up.", 16, True) as r:
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            j = json.loads(payload)
+            if not j.get("stop") and (j.get("content") or ""):
+                dummy_busy.set()
+                return
+
+def ask(i):
+    # "id_slot": i pins each request to its own slot, so the server never chooses which request gets slot 0 --
+    # unpinned, that choice was the order race r324 measured as 3/4 vs 1/4.
+    d = json.load(req(i, p, ngen, False))
+    t = d.get("timings", {}); c = d.get("content") or ""
+    res[i] = "%.5f|%s|%s" % (float(t.get("draft_n_accepted") or 0) / max(1, int(t.get("draft_n") or 1)),
+                              hashlib.sha256(c.encode()).hexdigest()[:12], int(t.get("draft_n") or 0))
+
+td = threading.Thread(target=dummy)
+td.start()
+if not dummy_busy.wait(timeout=900):
+    sys.stderr.write("NOTE: the admission gate never produced a token; firing both slots anyway\n")
+th = [threading.Thread(target=ask, args=(i,)) for i in (0, 1)]
+for x in th:
+    x.start()
+for x in th:
+    x.join()
+td.join()
 print(" ".join(r for r in res if r))
 PY
 )"
@@ -227,9 +272,9 @@ PY
     for d in $drafts; do
         [ "${d:-0}" -gt 0 ] || { verdict="FAIL (a slot drafted 0 tokens)"; }
     done
-    # 2. the text must be the recorded text -- UNLESS this arm's anchor is `-`, which means the arm's second
-    #    slot is not bit-reproducible on this box and its text is REPORTED, not asserted (it is still printed,
-    #    and the acceptance checks below stay hard).  See the header; `TODO` #350.
+    # 2. the text must be the recorded text -- UNLESS this arm's anchor is `-`, which means its second slot is
+    #    not bit-reproducible on this box and its text is REPORTED, not asserted (it is still printed, and the
+    #    acceptance checks below stay hard).  No arm uses `-` since r330: `35b10` is asserted again (`TODO` #349).
     text_note=""
     if [ "$base_shas" = "-" ]; then
         text_note=" (text reported, not asserted)"

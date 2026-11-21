@@ -1,3 +1,97 @@
+## 261121.012 (r333) -- **RELEASE**: `TODO` #349 was the rulebook's own §38 (the gate asserted a concurrent text hash under a unified KV cache), `#351`/`#353` retired, and the `radiance` worker's silent checkout drift found and fixed
+
+**No delivery patch, block, `release.json` base/tip/tree or optional artifact changed.**  The set is r331's
+(18 default blocks, 2 optional, base `919794500`, tip `a6851c9b6`, tree `b0096a273`, `optional_tree` `5d50ae466`),
+re-verified on this tree.  A tag was cut at the maintainer's request even though r330/r332 (the two other
+tooling-only sessions) shipped without one.
+
+### 1. `TODO` #349 closed: the arm asserted the one oracle §38 forbids
+
+`scripts/gate-server-arms.sh` asserts both slots' greedy text on its two-slot arms, and it ran `llama-server`
+with **`--kv-unified`**.  `GREEDY-PURITY.md` **§38** says exactly what that costs: a sequence's result is a
+function of its KV cells' tile indices *modulo the per-launch KV-split period*, and under a unified cache that
+residue follows the **co-resident session's allocation history** — so the second sequence's *arrival point*
+re-rolls near ties — with the standing consequence "never use a concurrent-server text hash as a purity gate or
+a bisection oracle".  So r324's, r330's and this session's early re-records were re-anchoring a number that
+another sequence's placement could move, and the item's own prescribed fix could not work:
+
+| admission scheme, all under `--kv-unified` | fn24 | 35b10 |
+|---|---|---|
+| 0.5 s stagger (r324's fix) | stable | **three texts in three runs** — the item |
+| slot 1 released on slot 0's **first streamed token** (`TODO` #349's prescription) | **four runs, four text pairs** — refuted | 3 of 4 one state |
+| `id_slot`-pinned, fired simultaneously | 1 flip in 4 | 4 of 4 one state |
+| pinned + a **warm-up request on a third slot** holding the scheduler | 3 of 3 one state | — |
+
+**The fix is two-part and both parts are needed:** `--no-kv-unified` (each sequence's KV is its own — §38's
+consequence) **and** a deterministic admission — each request pinned with `"id_slot": i` and a warm-up request on
+a third slot whose first streamed token releases the pair, so both real requests are queued when the scheduler
+builds its next batch (a ~1 ms arrival gap against a ~600 ms batch build is otherwise a coin flip).  `-c` is now
+per slot (`3 x CTX`) because there is no unified buffer to share.  Measured: three fresh servers, three identical
+fn24 pairs; then the gate itself, twice, all three arms identical (`fn24`/`fn10` `594368935245 b337648c3ef9` at
+0.59259/0.77193, `35b10` `50f29e574939 a56117e02dcf` at 0.60741/0.69106), and once more on the optional-applied
+build.  All three arms' texts are **asserted** again — the r324/r330 anchors are retired as coin flips.
+The new rule is `GREEDY-PURITY.md` **§103**; `MANIFESTS.md` gate 24 step 5c and `scripts/README` name the
+invocation and why the text is legitimate here.
+
+### 2. `#351` and `#353` retired (maintainer's decision, no successor row)
+
+* **`#351`** (does upstream support `-sm tensor` for `flint`, i.e. can temporary block `0300` be dropped): the
+  question stays open *in substance* -- r328's R17 measured that it cannot be dropped at `919794500` -- but the
+  maintainer does not want a TODO row tracking it: the block structure is theirs, and the re-test belongs to a
+  re-base, not to this file.
+* **`#353`** (no Inkling-2 model loads at this base): the looped family's support is **upstream now** and arrives
+  with the next re-base, so no reminder is kept.  The per-head FA-mask coverage it blocked is a re-entry
+  condition on that re-base, not a task here.
+
+Both are one `WORKLOG.md` entry (this one), which is what the file's own rule asks for; their handles are never
+reused (`TODO.md` -> *Handle numbering*).
+
+### 3. The `radiance` worker had drifted twice while its watcher reported "up to date"
+
+Found while answering "is there anything to update on the container host" (nothing was owed for r330/r331: no
+`build-containers.sh`/Containerfile change and no tag from this session).  Two things had rotted silently because
+the watcher only ever runs `git fetch --tags` and leaves a **detached HEAD at the tag it built**:
+
+* the delivery checkout's local `main` was on **`r249`, 41 revisions behind** -- the documented fallback ("run the
+  build by hand from `main` on the worker", `CONTAINERS.md`) would have built an r249 tree *and* run an r249
+  script.  Reset to `main` = `origin/main`.
+* `~/llama.cpp` had **neither the release tip nor the base commit**, so every image build since ~r263 silently took
+  the slow branch -- the r329 log reads `reconstructing … from the 919794500 tarball + apply-all.sh` instead of
+  borrowing a worktree at the tip.  Fetched `rdna-boosts`; the next build borrows again.
+
+`CONTAINERS.md` now says both, with the two commands, and warns that `git branch --show-current` is empty on that
+detached checkout.  For the record, r329's images did build and push correctly (6 images + moving tags, 09:07,
+retention pruned 18 versions), and the worker is otherwise healthy (podman 5.8.9, `gh` authed, ccache 18.8/30 G,
+disk 61 %).
+
+### 4. Gates on the r331 tree (all on `919794500` + the 18 default blocks)
+
+| gate | result |
+|---|---|
+| whole-set build (`~/bin/build-llama-rocm`, `all`, r332's *Build the fork* policy -- the per-block ladder is retired) | **OK** |
+| `scripts/gate-server-arms.sh` (this session's change), r331 build x2 | **PASS, all three arms identical** (`fn24`/`fn10` `594368935245 b337648c3ef9` / 0.59259 0.77193; `35b10` `50f29e574939 a56117e02dcf` / 0.60741 0.69106) |
+| the same on the optional-applied build (`opt-r331-verify`, optional tree `5d50ae466` == `release.json.optional_tree`) | **PASS**, same anchors |
+| `scripts/gate-mixed-kv.sh --quick` on that build | **PASS 5/5** (pair loads + both refusals) |
+| coherence, 4B Q8_0 `-sm tensor` 3 devices / 1 GPU | see table below |
+| `scripts/check-gen-docs.sh` | **ok** (no drift) |
+| `scripts/gate-prefill-logits.sh` (base recorded at r327, gfx1201) | see below |
+| `scripts/validate-set.sh` | **GREEN** |
+| `scripts/check-gpu-faults.sh` (gate windows) | **clean** |
+
+The MTP four-axis protocol was not re-run: no decode, verify or kernel code changed in this revision (it is one
+gate script, three docs and one container-doc paragraph), and the r331 release measured the tree that this tag
+carries (`WORKLOG.md` 261121.010).
+
+### 5. Published
+
+| item | value |
+|---|---|
+| release | **`v17-919794500-r333`** (`release.json .release`) |
+| base / tip / tree | `919794500` / `a6851c9b6` / `b0096a273` (unchanged from r331) |
+| optional tree | `5d50ae4666aeba7688279d87135d2e77e92674be` (unchanged) |
+| fork `rdna-boosts` | already at `a6851c9b6` with the same tree -- nothing to refresh |
+| container images | the `radiance` watcher picks the tag up on its next `*/10` poll (same tree as r331, so the layers are cache hits) |
+
 ## 261121.011 (r332) -- **the per-block independent-build requirement is RETIRED**; the whole applied set is the artifact (maintainer's decision)
 
 **No delivery patch, `release.json` or block structure changed** (no `patches/` file moved, no tag): this is a

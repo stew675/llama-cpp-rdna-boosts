@@ -41,20 +41,18 @@ left in this file.  The r236 re-base
 
 ## The open list
 
-**`r329` gate (2026-11-21, set by the r328 release):** the six follow-up rows it named (`#352`, `#354`, `#356`,
-`#357` and the two owed measurements) are **all closed** — `WORKLOG.md` 261121.007, evidence in
-`archive/work/r328-followups/logs/` — so the r329 cut is unblocked and `archive/work/r328-followups/HANDOVER.md` §4 is its
-sequence.  The rows that remain in the table below are the standing pre-existing items (`#116` parked, `#273`,
-`#349`, `#351` answered for this base, `#353` waiting on upstream): each carries its own re-entry condition, and
-none is an r329 deliverable.  A green gate ladder is still not permission to skip a row.
+**`r333` housekeeping (2026-11-21):** three rows left the list at r333 and none is tracked any more -- `#349`
+(gate-server-arms' two-slot text was a `--kv-unified` artifact, `GREEDY-PURITY.md` §38; fixed and its anchor
+restored), `#351` (the `flint` / `-sm tensor` question: **retired by the maintainer's decision**, the temporary
+block `0300` and its drop condition are theirs to re-test at a re-base, and no TODO row is owed for it) and
+`#353` (Inkling-2: the support is upstream now and is picked up at the next re-base, so no reminder is kept).
+The rows that remain are the standing items (`#116` parked, `#273`, `#358`, `#359`): each carries its own
+re-entry condition.  A green gate ladder is still not permission to skip a row.
 
 | # | subject | kind | status |
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
-| **349** | `scripts/gate-server-arms.sh`'s `35b10` arm is not bit-reproducible on its **second slot** even with both of r324's fixes (a `MOE_EXPERT_HEATMAP=load` pin and a fixed-order admission): slot 0 is stable, slot 1 reads three different texts at three acceptances, because a 0.5 s stagger lands at a *variable* point in slot 0's prefill | tooling / gate (`TODO` #295's gate, gate 24 step 5c) | **OPEN** -- admit slot 1 on slot 0's first STREAMED TOKEN instead of on a clock; until then that arm's text is reported, not asserted (its acceptance checks stay hard, which is the collapse detector the arm exists for); §349 |
-| **351** | does upstream now support `-sm tensor` for `flint`?  If it does, the temporary block `0300` (`-sm relaxed-tensor`) can be dropped -- upstream's per-architecture refusal is the only reason the block exists | delivery structure / temporary block `0300` | **OPEN, ANSWERED for r328** -- re-tested at R17 of the re-base on the real model this box has: **it cannot be dropped** (flint still refuses `-sm tensor` at `919794500`, while `-sm relaxed-tensor` is byte-identical to `-sm layer`); re-test at the next re-base; §351 |
-| **353** | no Inkling-2 model loads at `919794500`: the looped family needs support this snapshot lacks — Unsloth's file is `arch = inkling2` with 24 physical blocks but `block_count = 48` + `num_loops = 3` (the loader has no loop, so it asks for `blk.24.*`), and **GGML's reference file is `arch = inkling2_loop`, which this tree does not know at all** | upstream model support / validation target | **OPEN (waiting on upstream)** -- the pristine base repeats both failures and r327 knows neither arch, so no delivery change is involved; it blocks the only local validation of upstream's per-head FA mask (`#32217`) and of the `nb32` widening; §353 |
 | **358** | a re-base rung can silently drop a file: block 00's `ggml-alloc.c` half was missing from r328/r329 while its text, docs and its own unit test still described it (issue #345, fixed r331) | tooling / gate (re-base flow) | **OPEN** -- reconcile each rung's changed-file set against the patch it replaces and fail on a file the old patch touched and the new one does not; the 18/18 ladder cannot see it; §358 |
 | **359** | `gate-fusion-alias-copy.sh`'s arm A oracle (`fused == GGML_CUDA_DISABLE_FUSION=1` text at `-ub 14`) broke at the r328 re-base: the UNFUSED chain moved, the fused arm still reproduces the r239 anchor `3fab4da87774` | tooling / gate (issue #287 gate) | **OPEN** -- re-derive the oracle (a logit/KLD compare at that shape rather than text): r329 and r331 both read `a_chain` 194/`dfe59c9c5257` vs `a_fused` 193/`3fab4da87774`, and pinning `GGML_GLU_INPLACE=0` changes neither arm, so neither the r331 restore nor the allocator is the cause; §359 |
 
@@ -83,6 +81,13 @@ subject after that item has closed and left this file.  The recent ones, so the 
 * **`#338`-`#340`** retired at r301, **`#341`** (issued r303) retired at r309 (`WORKLOG.md` 261117.008).
 * **`#335`/`#336`** retired at r298 — an alias ROLE gap in the expert cache, `WORKLOG.md` 261116.005;
   **`#282`** at r299 — the mid-run latch's mixture is gated on the logits, `WORKLOG.md` 261116.006.
+* **`#349`** retired at **r333** (`WORKLOG.md` 261121.012): the arm was asserting a concurrent two-slot text
+  hash under `--kv-unified`, which `GREEDY-PURITY.md` **§38** forbids; the fix is `--no-kv-unified` plus a
+  deterministic admission (pinned `id_slot` + a warm-up request that holds the scheduler while both real
+  requests queue), and the item's own prescribed fix (release slot 1 on slot 0's first streamed token) was
+  implemented and **refuted by measurement** first.  `#351` and `#353` were retired at the same time (no
+  reminder owed for either: the `flint`/`0300` question is a maintainer call at each re-base, and Inkling-2
+  support is upstream and arrives with the next re-base).
 * **`#342`** (r303) and **`#343`** (r304) are the newest still tracked; `#342` is WAITING on upstream, `#343`
   is an accepted limitation.
 
@@ -192,153 +197,6 @@ its size).  Records: `WORKLOG.md` 261108.011, `benchmarks/2026-11-08-host-expert
 arena is now read IN PLACE at any width (`MOE_EXPERT_PREFILL_IN_PLACE`: 1489.6 -> 4033.9 t/s on 3 GPUs
 `-sm tensor`, 3588.8 -> 4072.4 on the pool mirror).  Consolidating the three transports for a **partly resident**
 table is the whole of this item.  Record: `WORKLOG.md` 261110.014, `benchmarks/2026-11-10-prefill-in-place.md`.
-
-## 349. `gate-server-arms.sh`'s `35b10` arm: slot 1 is not bit-reproducible
-
-**Open** (r324, found while re-recording the gate's anchors for the MoE reduction re-baseline).  The arm's
-purpose (R13's silent failure: with host-resident experts and two sequences in one decode step, draft
-acceptance collapses to ~0 while the text stays correct) is still covered -- that is what the acceptance
-checks measure and they are unchanged -- but its **text** check cannot be a fixed hash set for this arm today.
-
-Two defects were fixed on the way, both verified: the gate never pinned `MOE_EXPERT_HEATMAP`, so each run
-started from the prior the *previous* run wrote back into the model directory's `.moe-heatmap` (r323 unpinned
-read `9e1a1221c30d e29d01e5edca` against its recorded `b337648c3ef9 b73aa781bca5`); and it fired both slots'
-requests **simultaneously**, so the server's admission order was a race that selected between two states of
-both the text and the acceptance (r324 before the fix: 3 of 4 runs one state, 1 the other).  With
-`MOE_EXPERT_HEATMAP=load` and a 0.5 s stagger, `fn24`/`fn10` are reproducible (verified twice on each of r323
-and r324) and are now exact anchors.
-
-`35b10` still moves, slot 1 only (slot 0 is stable at `1b2dac950888`): three further r324 runs read
-`1bb3415d743a`, `2cd90f70be03` and `50f29e574939` at acceptance 0.71074/0.75214, 0.68548/0.72269 and
-0.60741/0.73729.  **Cause**: a fixed-*time* stagger is a fixed point in a *variable* process -- slot 1 arrives
-somewhere inside slot 0's ~1-2 s prefill, and its KV/arena cell placement (hence a near tie) depends on how far
-that got.  An order race became a timing race.
-
-**What it needs**: admit slot 1 on slot 0's **first streamed token** (request slot 0 with `"stream": true`,
-release slot 1 on the first chunk) instead of on the clock; verify two runs on each of two builds reproduce;
-then restore an exact anchor.  Do not serialise the two requests -- with one sequence decoding at a time the
-arm cannot reach the shape it exists for.
-
-## 351. Does upstream now support `-sm tensor` for `flint`?  (block `0300`'s drop condition)
-
-**Open** (2026-11-20, opened by the maintainer at the start of the r328 re-base; the block-structure half is
-the maintainer's call).  The temporary block **`0300`** exists for one reason: upstream refuses `-sm tensor`
-for `flint` / `mellum` / `mistral4` because that architecture's MoE amax rescale needs a per-device scalar, and
-the delivery's `-sm relaxed-tensor` is the escape hatch.  The block is only kept while upstream refuses.
-
-**The test, on the model this box actually has** (`/llm/models/RecursiveAI/Flint/Q8_0/flint-Q8_0.gguf`,
-3 x R9700, `HIP_VISIBLE_DEVICES=0,1,2`):
-
-1. `-sm tensor` -- if it loads and decodes, upstream has grown support and `0300` can be retired.
-2. The refusal arm must still print upstream's own message and exit 1 on the r328 tree (`0300` only adds the
-   pointer to `-sm relaxed-tensor`).
-3. `-sm layer` vs `-sm relaxed-tensor` text identity (`--seed 42 --temp 0 -n 20`, hashed with
-   `scripts/extract-generated.py`): the r278 climb measured `103 chars sha=cc4fbc3e8367` both ways, so a
-   difference here is a defect, not a re-baseline.
-
-**Dropping `0300` is a maintainer decision, not a gate outcome** (`AGENTS.md` -> report findings before
-shipping): it changes the default apply set from 18 patches to 17.
-
-**Kept separate on purpose:** the `#30542` HIP-VMM revert is carried in block 00 for the **VMM pool** (the
-host-expert arena needs VMM; the reachable base hangs without the revert --
-`archive/work/upstream-rebase-261120/BASE-BLOCKER.md`), not for tensor-split support.  If the maintainer's intent was
-that the two are linked, the test above is what settles it: it runs with the revert in place, so a passing
-`-sm tensor` for `flint` cannot be an artifact of the revert's absence.
-
-## 353. No Inkling-2 model loads at `919794500`: the looped family needs support this snapshot lacks
-
-**Open, waiting on upstream** (2026-11-20, found when the maintainer placed two Inkling-2-Mini files on the box
-to validate the per-head FA mask).  Two files, two different failures, one conclusion.
-
-| file | arch | physical blocks | metadata | result at this base |
-|---|---|---|---|---|
-| `/llm/models/Inkling-2-Mini/Q8_K_XL/Inkling-2-Mini-UD-Q8_K_XL.gguf` (Unsloth, 22.8 GB) | `inkling2` | 24 (`blk.0..23`) | `block_count = 48`, `loop.core_start = 6`, `loop.core_end = 18`, `num_loops = 3`, 12 `loop_attn_*` + 12 `loop_k_*` | **known arch, load fails:** `check_tensor_dims: tensor 'blk.24.attn_q.weight' not found` |
-| `/llm/models/Inkling-2-Mini/Q8_0/Inkling-2-Mini-Q8_0.gguf` (GGML reference, 27.8 GB) | **`inkling2_loop`** | 24 (`blk.0..23`), 704 tensors | `inkling2_loop.block_count = 24`, no `num_loops`/`loop.core_*` | **unknown arch:** `unknown model architecture: 'inkling2_loop'` |
-
-So the family is split in two upstream: `inkling2` (which `#32217` supports, non-looped) and a **separate
-`inkling2_loop` arch** that this tree has never heard of.  The Unsloth file compounds it by *declaring* 48
-logical layers over 24 physical blocks with an explicit loop range, which `src/models/inkling2.cpp` does not
-read (`git grep num_loops src/models/inkling2.cpp` is empty; upstream's `nanbeige.cpp` is where that mechanism
-lives).
-
-**Not a delivery defect, not this re-base, and not a backend issue.**  Both failures reproduce on the pristine
-`919794500` base (`build-base-novmm`); r327 knows neither arch; and both are **loader-level**, before any backend
-is initialised — the same messages appear with `HIP_VISIBLE_DEVICES=` (no GPU exposed) and `-ngl 0`, so no
-Vulkan/ROCm/CUDA choice can change them.  `src/llama-arch.cpp` registers `inkling2` and nothing else, and
-`src/models/inkling2.cpp` reads no loop key.
-
-**The two files are not variants of one layout** — the loop tensors differ by name, so `inkling2_loop` is a
-different architecture and not a rename:
-
-| | Unsloth (`arch = inkling2`) | GGML reference (`arch = inkling2_loop`) |
-|---|---|---|
-| loop tensors | `loop_attn_{down,forget,gain}`, `loop_k_{…}`, `loop_v_{…}`, `loop_mlp_{…}` (12 groups) | `loop_{q,k,v}_ctrl_{…}`, `loop_ffn_ctrl_{…}`, `loop_msg_query` (13 groups) |
-
-That rules out the tempting shortcut of aliasing the arch string to load the reference file locally: the loop
-gates would simply not be found, so the model would run with an un-gated loop and produce nonsense — useless even
-as a per-head-mask probe.
-
-**What it blocks.**  The only local coverage of upstream `#32217`'s **per-head FA mask** (the op matrix sweeps
-`mask_heads = 1` only: `grep -c 'mask_heads=[2-9]'` = 0) and of the **`nb32` widening** that term needs
-(`RUNGS.md` R05.3 item 1).  Without a loadable model of this class, "the type is correct" rests on matching
-upstream's change, not on a run.
-
-**Re-entry condition: upstream PR [#32695](https://github.com/ggml-org/llama.cpp/pull/32695) — unmerged as of
-2026-11-20.**  That PR is the Inkling-2 support both files need; the maintainer confirmed it by digging into the
-model pages (`TODO` #353, 2026-11-20).  When it merges, take it at the next re-base and then re-test **both**
-files and run the per-head-mask arms.  Porting it ourselves is **not** a
-re-base activity: the reference model is a different arch, so it means writing a whole model class (hparams,
-tensors, graph, the loop gates and `attn_res`), which is a feature campaign with its own gates, not a rung.
-
-**Diagnostics** (`gguf-py` against the two files): Unsloth — 734 tensors, `blk.0..23`, `attn_q/k/v` 24 each,
-`ffn_*_exps` 44 each, `loop_*` 12 each, `attn_res_query` 23; GGML reference — 704 tensors, `blk.0..23`,
-`inkling2_loop.block_count = 24`, `expert_count = 128`, `expert_used_count = 8`, `head_count` 24 /
-`head_count_kv` 8.  The `dspark-Inkling-2-Mini-Q8_0.gguf` draft and `mmproj-F16.gguf` beside the Unsloth file
-load nothing either, for the same reason.
-
-## 358. A re-base rung can silently drop a file, and the ladder cannot see it
-
-The r328 re-base re-expressed block 00 on `919794500` as a cherry-pick from `de99fa2d0`.  Its R00 record says the
-pick went from `37 files, +1145/-358` to `34 files, +916/-260`: two of the three missing files were the D1
-decision (`mmf.cu`/`mmf.cuh`, retired because upstream `#32505` supplies the implementation), and the third,
-`ggml/src/ggml-alloc.c`, was **silent** — no decision row, no fixup-ledger row.  r328 and r329 shipped without
-it (issue #345), the block's own text in `patches/README.md`, `ENVIRONMENT.md` §1.1b, `MANIFESTS.md` gate 00 and
-`tests/test-alloc.cpp`'s `test_glu_inplace` all still described it, and both releases' gate tables omitted
-`gate-glu-inplace.sh`, so nothing ran the rule.
-
-What makes it a class rather than a mistake: **`scripts/gate-per-block-build.sh` proves a rung compiles, and a
-missing file's hunks live inside other files, so every rung compiled.**  The only instruments that could have
-seen it are the block's own behavioural gate (a test the code no longer satisfies) and a file-set comparison
-against the previous release.
-
-Owed: a mechanical check in the re-base flow — for each rung, compare `git diff-tree --name-only` against the
-file set of the patch it replaces (same subject, previous release's chain) and fail on a file the old patch
-touched and the new one does not, with an explicit allow-list for a retirement that a decision row names (D1's
-`mmf.cu`/`mmf.cuh`).  The natural home is **`scripts/validate-set.sh`** — it already applies the series in CI on every push and knows
-the previous release's `release.json`, so it can compare each block's changed-file set against the patch with the
-same subject in the previous release and fail on a shrink that no decision names (no GPU, no build, ~1 s).  The
-per-block build walker is a bisection tool since r332, so it is the wrong place for a repo-level check.  Record:
-`WORKLOG.md` 261121.010, `INVARIANTS.md` r331.
-
-## 359. `gate-fusion-alias-copy.sh`'s fused-vs-chain text oracle does not survive the r328 base
-
-The gate (issue #287) asserts that the fused `MUL_MAT_ID(gate) MUL_MAT_ID(up) GLU` launch produces the same text
-as the `GGML_CUDA_DISABLE_FUSION=1` chain at `-ub 14`, `GGML_OP_OFFLOAD_MIN_BATCH=9`, expert cache off — true when
-it was written (r239, re-affirmed r323).  At r329 and r331 it reads **`a_chain` 194 chars `dfe59c9c5257`** against
-**`a_fused` 193 chars `3fab4da87774`**, so the check fails on both releases; `a_no_moe_band` follows `a_chain`.
-
-Attribution measured: pinning `GGML_GLU_INPLACE=0` changes neither arm, and an r329 build (no block-00 restore)
-reproduces both hashes exactly, so the r331 restore is not involved.  The **fused** arm still reproduces the r239
-anchor, i.e. what moved is the unfused chain — an r328 base change to the non-fused path.  The gate was last run at
-r323, so it could not have noticed.
-
-The protection is not idle: the `GGML_GLU_INPLACE=0` trace arms still decline a leaf-copy class (1 on the repro
-arm, 1 on the production arm), and the fused arm is not degenerate.  What is lost is only the *text* oracle.
-
-Owed: a re-derived oracle — most likely a prefill-logit/KLD compare at that shape (`--kl-divergence-base` per 1024
-scored tokens) instead of a greedy-text equality, since a 1-char difference at 193 chars is a near-tie and not
-evidence of corruption either way.  Do not "fix" it by widening the tolerance on the text.  Record: `WORKLOG.md`
-261121.010.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

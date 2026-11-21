@@ -461,6 +461,24 @@ store (bounded at `CCACHE_MAXSIZE=20G`) are deliberately kept.  A `flock` serial
 builds; the log is `~/.cache/rdna-containers/build-<tag>.log`.  `FORCE_TAG=<tag>` and
 `BUILD_EXTRA=--no-cleanup` (or the other envs in the script header) override behaviour.
 
+**The watcher never refreshes the checkout, and both halves of that bite (r333).**  It runs from
+`~/bin/rdna-container-watch.sh`, leaves the delivery repo on a **detached HEAD at the tag it built**, and only ever
+runs `git fetch --tags`; `~/llama.cpp` is never fetched either.  So on a long-lived worker the local `main` rots
+(the `radiance` box was found on **`r249` — 41 revisions behind** while its watcher was healthy and reporting
+`up to date`), and `~/llama.cpp` never gains the new release tips, which makes `build-containers.sh` take the slow
+branch on **every** build (`reconstructing … from the <base> tarball + apply-all.sh` instead of borrowing a
+git worktree at the tip).  Both matter the moment you build by hand from `main` there — the documented fallback
+builds a stale tree *and* runs a stale script.  Refresh them when you touch the box:
+
+```bash
+git -C ~/llama-cpp-rdna-boosts fetch origin && git -C ~/llama-cpp-rdna-boosts checkout main \
+  && git -C ~/llama-cpp-rdna-boosts reset --hard origin/main
+git -C ~/llama.cpp fetch origin rdna-boosts      # so build-containers.sh can borrow the tip's worktree
+```
+
+(`git branch --show-current` is empty on a detached checkout, so "the worker is on `main`" is not something to
+assume — check it.)
+
 **Failure handling (r138, 2026-10-25).**  Three things the unattended path must get right:
 
 * **A tag is never retried forever.**  The watcher records the attempt count in
