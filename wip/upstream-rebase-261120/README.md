@@ -1,8 +1,8 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: OPEN — 11 of 18 rungs climbed (R00-R10) on 2026-11-21. Nothing is delivery yet.**
+**Status: OPEN — 12 of 18 rungs climbed (R00-R11) on 2026-11-21. Nothing is delivery yet.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
-the final rung (R18).  Ladder branch `rebase-r328` = `f5a090a31` (tree `394e0b708`): R00..R10 plus two rung
+the final rung (R18).  Ladder branch `rebase-r328` = `dbe4fdd40` (tree `2b6aec1f0`): R00..R11 plus two rung
 repairs (R00's top-k gather, R05's `nb32` widening); every rung is green on build + coherence and each has one
 entry in [`RUNGS.md`](RUNGS.md).
 **The one known-red is closed at R00** (repair `3ea8b0212`): the delivery's required VMM pool refuses
@@ -43,8 +43,12 @@ forward to this base — upstream's two `#32454` NORM+MUL arms were the only mis
 the `top_k_gather_rows` hunk de-duplicated by construction, **R06.2's dense half closed** (27B UD-IQ3_S now
 prefills and reads r327's exact hash) and **R09.3 closed** (arena and arena-off now read one text).  It also
 produced a new finding: the arena arm's decode dropped 54.4 -> 20.4 t/s and no kill switch recovers it
-(`RUNGS.md` R10.3, owned by blocks 14/15).  Next rung: **R11** (block 11, qwen4exp/QSA and the indexer — D9 and
-D13).  Target: the next
+(`RUNGS.md` R10.3, owned by blocks 14/15) and is a **release blocker**.  R11 is done: the qwen4exp block merged with
+5 conflicts, D9 and D13 were carried (upstream's FP8 PLE scale *and* the delivery's lazy reader coexist), and both
+block gates ran — quant-coherence PASS, but **`gate-hc-fusions.sh` is RED**: the fused *mixer* arm and the two
+dsv4 pre/post arms left their r327 anchors while the combine arm is exact (`RUNGS.md` R11.2, owed at R13/R14/R17
+and needing a maintainer call on re-anchoring).  Next rung: **R12** (block 12, DFlash spec + idle-slot parking,
+9 conflicted paths — the `llama_batch_ext` migration `D6` starts there).  Target: the next
 release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 

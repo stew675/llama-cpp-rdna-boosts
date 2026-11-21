@@ -1,4 +1,4 @@
-# HANDOVER — r328 re-base ladder, 11 of 18 rungs climbed, resume at **R11**
+# HANDOVER — r328 re-base ladder, 12 of 18 rungs climbed, resume at **R12**
 
 Written 2026-11-21 (session 2/3, which climbed R06, R07, R08, R09 and R10).  Read [`README.md`](README.md) §1 (method + traps),
 [`RUNGS.md`](RUNGS.md) (the per-rung ledger and every resolution so far) and [`DECISIONS.md`](DECISIONS.md)
@@ -9,9 +9,9 @@ the earlier sessions.
 
 | item | value |
 |---|---|
-| working branch | **`rebase-r328`** in `~/llama.cpp`, clean, **HEAD = `f5a090a31`** (tree `394e0b708`) |
-| rungs done | **R00 … R10** + **two rung repairs** (R00's top-k gather, R05's `nb32` widening) |
-| next rung | **R11** — block 11 (`61168c60b`), 52 files, **5 conflicted paths**, `src/models/qwen4exp.cpp` among them.  `D9` (indexer key rotation) and `D13` (upstream's qwen4exp fixes) are both `MERGE`: take upstream's fixes, keep the delivery's QSA/indexer/lazy-reader additions on top, and re-run `gate-qwen4exp-quant-coherence.sh` |
+| working branch | **`rebase-r328`** in `~/llama.cpp`, clean, **HEAD = `dbe4fdd40`** (tree `2b6aec1f0`) |
+| rungs done | **R00 … R11** + **two rung repairs** (R00's top-k gather, R05's `nb32` widening) |
+| next rung | **R12** — block 12 (`dad1442b3`), 64 files, **9 conflicted paths** (the climb's broadest: `speculative.cpp`, `ggml.h`, x86 quants, `dflash.cpp`, `server-context.cpp`).  `D5` (DFlash refactor, already MERGE at R02), `D6` (**`llama_batch_ext`**, the big mechanical migration) and `D7` (the `slot_sched` refactor) all land here; `D7`'s three checks are in `DECISIONS.md` |
 | delivery repo | `~/llama-cpp-rdna-boosts` — **`patches/`, `release.json`, `rdna-boosts-all.patch` and the fork are untouched** (that is R18) |
 | target release | next after `v17-4f9dfa0e3-r327`, i.e. **r328**; new fork point **`919794500`** |
 | reference binaries | `~/llama.cpp/build-rocm/bin-r327` (the shipping r327 `bin/`) — **the attribution oracle for any abort** |
@@ -35,9 +35,10 @@ ee377ec45  b5dc56996  block 06: MMB quantized prefill GEMM
 510769147  2ed6cb541  block 08: fused kernels (fusions + fused MoE + norm-gated + gdn/ple conv)
 24cecfb51  b05ee8543  block 09: host-resident MoE (iface, scheduler, Meta, slab, cache engine)
 f5a090a31  394e0b708  block 10: slab, fusion dispatcher and async input ring
+dbe4fdd40  2b6aec1f0  block 11: qwen4exp (model, hyper-connections, lazy reader, QSA/indexer)
 ```
 
-## §1 What each rung cost, so R11..R17 can be planned
+## §1 What each rung cost, so R12..R17 can be planned
 
 | rung | conflicts | what it actually took |
 |---|---|---|
@@ -185,9 +186,9 @@ few-row MMQ is HIP-compiled-out) needs no preference at all — keep both, upstr
 
 ```bash
 cd ~/llama.cpp && git status && git branch --show-current      # must be rebase-r328, clean
-git log --oneline -1                                            # expect f5a090a31
-git cherry-pick 61168c60b                                       # R11 = block 11 (52 files, 5 conflicts)
-(cmake --build build-rocm -j 24 > /tmp/r11.log 2>&1; echo "BUILD_RC=$?" >> /tmp/r11.log)
+git log --oneline -1                                            # expect dbe4fdd40
+git cherry-pick dad1442b3                                       # R12 = block 12 (64 files, 9 conflicts)
+(cmake --build build-rocm -j 24 > /tmp/r12.log 2>&1; echo "BUILD_RC=$?" >> /tmp/r12.log)
 # poll for BUILD_RC, then: coherence -> the block's own switch -> the rung's log in RUNGS.md -> commit
 ```
 

@@ -42,7 +42,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | R08 | 08 | `fe283f27c` | 8 (13 regions) | **D4 (resolved: MERGE, no precedence change)**, D3, D11 | **DONE 2026-11-21** — `510769147`, tree `2ed6cb541`; repair list in R08.3 (5 raw warp-mask sites in block 08's own code, the `k_set_rows_q8_0_group` F32-source gate, a `force_tiling`→`has_gate` template-slot artifact, a lost `#if` guard); coherence `1c5d32ac537d` on the default and on all three kill switches; NORM/RMS_NORM/GROUP_NORM/SET_ROWS 368/0; MUL_MAT_ID 1079/0 (16 dup); fusion off costs −5.4 % pp2048 / −18.7 % tg128 with identical text; `DISABLE_NORM_ROWS=1` is **inert** here (its dispatch is block 10's) |
 | R09 | 09 | `123d53419` | 4 (7 regions) | D8, D9 (both MERGE) | **DONE 2026-11-21** — `24cecfb51`, tree `b05ee8543`; all four conflicts resolved as merges (the two extracted functions moved to `mmvq.cu` with upstream's two refinements ported in, `seq_rm` adopted, `split_has_nodes` **not** taken — see R09.3); build green, coherence `1c5d32ac537d`, MUL_MAT_ID 1079/0; **finding: the arena-off arm diverges in text, and the cause is block 09's own host-offload relaxation** (control `GGML_MOE_HOST_OFFLOAD=0` restores identity; r327 agrees) |
 | R10 | 10 | `7bbf540d5` | 7 (4+3+2+1 regions) | D8, D12 + the four carried obligations | **DONE 2026-11-21** — `f5a090a31`, tree `394e0b708`; the dispatcher reconciled into **one** TU (upstream's two `#32454` NORM+MUL arms ported in = D4's arm), `top_k_gather_rows` de-duplicated by construction; **R06.2 dense half CLOSED** (27B IQ3_S prefills, `ebf2a5a9b00a` = r327) and **R09.3 CLOSED** (arena == arena-off now); a `needs_sync`-vs-dispatch mismatch my own union created was caught by the op test and fixed; **new finding**: the arena arm's decode fell 54.4 -> 20.4 t/s and no switch recovers it (owned by blocks 14/15) |
-| R11 | 11 | `61168c60b` | 5 | D9, D13 | not started |
+| R11 | 11 | `61168c60b` | 5 | D9, D13 (both MERGE, carried) | **DONE 2026-11-21** — `dbe4fdd40`, tree `2b6aec1f0`; op count 100+6=106 (rpc patch 7), `has_recr && n_pos == 1` union, qwen4exp union carries upstream's FP8 PLE scale *and* the lazy reader, 4th 64-bit-mask recurrence (fattn-qsa/indexer-score/hc-mix); coherence `1c5d32ac537d`, quant-coherence PASS (Q4_K_M gather transparent, no `////`); **`gate-hc-fusions.sh` RED** — 3 numeric arms left their anchors (see R11.2) |
 | R12 | 12 | `dad1442b3` | 9 | D5, D6, D7 | not started |
 | R13 | 13 | `1014e6bf5` | 0 | — | not started |
 | R14 | 14 | `e88d45d9e` | 3 | — | not started |
@@ -967,6 +967,90 @@ reads ~50 t/s decode again on this config.**  A green ladder is not permission t
 - The async input ring (`GGML_CUDA_ASYNC_INPUT*`) and the slab (`GGML_CUDA_SLAB*`) are block 10's and stay
   default-on; R18's gates are `gate-node-budget.sh` (block 10 owns the budget's other half, **D8**) and
   `gate-fusion-alias-copy.sh` / `gate-lora-fusion.sh` for the dispatcher.
+
+---
+
+# R11 — block 11, qwen4exp (model, hyper-connections, lazy reader, QSA/indexer)  ·  **DONE 2026-11-21** — `dbe4fdd40`, tree `2b6aec1f0`
+
+```
+git cherry-pick 61168c60b        # 52 files, +6.5k/-… (qwen4exp.cpp +2530, ggml.c +450, lazy reader new)
+```
+
+| exit criterion | result |
+|---|---|
+| conflicts | 5 files / 6 regions (`ggml-rpc.h`, `ggml.c`×2, `llama-memory-recurrent.cpp`, `models/qwen4exp.cpp`, `tests/test-backend-ops.cpp`) |
+| no markers left | yes; no `TODO(rebase)` |
+| build | green, `all` targets, 0 errors, **0** warnings in the touch-path files |
+| coherence 4B | **`100 chars sha=1c5d32ac537d`** — unchanged |
+| `gate-qwen4exp-quant-coherence.sh` | **PASS** (reduced run: `QUANTS="IQ3_XXS Q4_K_M"`, `QSA_ARM=0`) — Q4_K_M gather on == off == `e58417e70221`, 0 `////`, no GPU faults.  The IQ3_XXS dir is `GSQ-IQ3_XXS` on this box, so that quant SKIPs by name; section E (the sparse QSA arm) was **not** run this session — owed at R18 |
+| **`gate-hc-fusions.sh`** | **RED — 3 numeric arms left their anchors** (R11.2).  The HARD arms are clean (no corruption, no GPU fault); the failures are byte-identity anchors, on the class whose header says byte-identity IS expected |
+| D13 (upstream's qwen4exp fixes) | **carried, verified**: `llama-model.cpp`'s read-once of `per_layer_tok_embd_scale` and the `llama-model.h` member came in by auto-merge, and the graph's `ggml_scale` application was already in the delivery's builder; this rung's union supplied the missing piece — the **scale tensor creation + F32 validation** in the PLE table setup |
+| D9 (indexer key rotation) | **carried**: `llama_model::lid_k_hdmd()` is the cache's answer and qwen4exp's own class provides it; no architecture list came back |
+
+## R11.1 The five resolutions
+
+| path | resolution |
+|---|---|
+| `ggml-rpc.h` | `RPC_PROTO_PATCH_VERSION 7` (the fork's table diverges, so a peer must refuse a mismatch) and `GGML_OP_COUNT == 106` — upstream's 100 at this base **+ the delivery's 6**, recounted from `enum ggml_op` (107 entries including `GGML_OP_COUNT`) rather than trusting either side's number |
+| `ggml.c` (×2) | the same `GGML_OP_COUNT == 106` in both static_asserts |
+| `llama-memory-recurrent.cpp` | **both** guards: `has_recr && ubatch.n_pos == 1 && …` — the delivery's `has_recr` (a context whose recurrent filter matches nothing, i.e. qwen4exp's MTP context, must not spam the warning; issue #273) and upstream's `ubatch.n_pos == 1` (the warning is only meaningful on that path) |
+| `models/qwen4exp.cpp` | the PLE table setup: **the delivery's lazy-reader managed path** (the `#if LLAMA_LAZY_READER_POSIX` block that keeps only metadata and `pread`s rows on demand) **plus upstream's FP8 scale**: `per_layer_tok_embd_s = create_tensor(…, TENSOR_NOT_REQUIRED)` and its F32 check, created after the `if/else` so both paths get it |
+| `tests/test-backend-ops.cpp` | **both**: upstream's wide-table `F8_E4M3` get_rows case and the delivery's `IQ4_NL` sub-block widths (32/128/160/224 — the qwen4exp indexer key row is 128) |
+
+Then one compiler-driven fix: the graph-input classes (`llm_graph_input_qsa`) are not `llm_graph_context`, so
+`params.hparams` (upstream's pre-#31733 spelling) and bare `hparams`/`model` are both wrong there — the surviving
+spelling at this base is **`params.model->hparams`**, since #31733 made `model` a member of `llm_graph_params`.
+
+## R11.2 FINDING — `gate-hc-fusions.sh` is red: 3 numeric arms left their anchors
+
+`MODEL=GSQ-IQ3_XXS` (the BF16-hc class), `-ngl 99 -fa on`, 1 GPU, the gate's own anchors:
+
+| arm | chars | sha | verdict |
+|---|---|---|---|
+| `chain_chain` | 444 | `a512ee68c4b3` | reference (true chain) |
+| `mix_op` | 447 | `3f049f67781c` | **FAIL** — anchor `6a102dbc62d6` |
+| `comm_op` | 444 | `a512ee68c4b3` | ok (exact) |
+| `both_ops` | 447 | `3f049f67781c` | ok (== `mix_op`: the combine is exact with the fused mixer on) |
+| `cuda_fuse_off` | 444 | `a512ee68c4b3` | ok |
+| `dsv4_pre_op` | 443 | `c8db61d5dcc8` | **FAIL** — anchor `a512ee68c4b3` |
+| `dsv4_post_op` | 449 | `6a102dbc62d6` | reported (anchor unchanged) |
+| `all_ops` | 449 | `6a102dbc62d6` | reported |
+| `ops_no_post` | 443 | `c8db61d5dcc8` | **FAIL** — anchor `a512ee68c4b3` |
+| `defaults` | 443 | `c8db61d5dcc8` | ok (== `ops_no_post`: `dsv4_hc_post auto=OFF`) |
+
+Reading: the **combine** op is exact (`comm_op == chain`), the **pre** op and the fused-mixer arm are not, and the
+chain itself now reads `a512ee68c4b3` where r327's chain read `6a102dbc62d6` — so the *whole* HC chain moved
+between r327 and this base, not just the fused arms.
+
+**Half of this was predicted by the block itself.**  Block 11's own commit message (from the r278 campaign) says:
+*"Known drift to record at R17: on this tree the two REPORTED dsv4_pre/post arms no longer agree with the chain on
+the BF16-hc class … the HC chain itself moved with the re-base while the fused pre/post ops still reproduce the
+old one.  The gate reports (does not fail) them, and its header says byte-identity IS expected on this class — the
+soft-arm expectation needs a decision."*  What is **not** predicted is `mix_op` failing: that is the fused
+**mixer**, and at r327 (all 18 blocks) the equivalent arm agreed.  So either the mixer's fused op is sensitive to
+something a later block restores (block 14/15's BF16 producer cache, block 10's MMB down16 knobs — the gate pins
+`LLAMA_HC_BLK16=0 LLAMA_HC_RES16=0 GGML_CUDA_MMB_DOWN16=0`), or this rung's tree has a real mixer divergence.
+
+**Owed (blocking, and it needs the maintainer's call on the anchors):**
+1. **R13/R14/R17** — re-run this gate once the tree is complete.  If `mix_op` still differs from `chain_chain`, the
+   delivery's HC-purity claim is unproven on this base and the fused mixer must not ship default-on; the bisect
+   starts at the mixer's own `hc16`/`blk16`/`res16` knobs (the gate pins them off, so a re-anchor to the r327
+   values is the first thing to try).
+2. **R18** — the anchors are *planted values from r327*; re-anchoring them on the finished tree is a maintainer
+   decision (the gate's header says byte-identity is expected on the BF16-hc class, so a re-anchor must be
+   justified arm by arm, not wholesale).
+3. **R18** — run the full quant-coherence gate (all four quants + `QSA_ARM=1`); this session ran 2 quants and
+   skipped section E for time.
+
+## R11.3 Notes for later rungs
+
+- 64-bit warp-mask recurrence **#4**: `fattn-qsa.cu` (×2), `indexer-score.cu`, `hc-mix.cu` — block 11's new TUs
+  were written against the pre-`#31617` API, same repair as R01/R05/R08/R10.
+- `LLAMA_LAZY_READER_POSIX` + `llama-lazy-reader.{cpp,h}` are new TUs; the PLE table is the only consumer so far
+  and its `TENSOR_SKIP_MANAGED` path must stay out of the load-time WILLNEED prefetch.
+- Block 11's `qwen4exp.cpp` (2530 lines) is the delivery's implementation, not upstream's; D13's two upstream
+  fixes were carried into it rather than replacing it.  Upstream's own qwen4exp (1514 lines, `build_qsa_sel`
+  additive mask, plain-op indexer) remains unmerged by design.
 
 ---
 
