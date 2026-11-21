@@ -1,9 +1,10 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: OPEN — 6 of 18 rungs climbed (R00-R05) on 2026-11-20. Nothing is delivery yet.**
+**Status: OPEN — 7 of 18 rungs climbed (R00-R06) on 2026-11-21. Nothing is delivery yet.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
-the final rung (R18).  Ladder branch `rebase-r328` = `1c9bfa37c` (tree `13683655d`): R00..R05 and one R00
-rung repair; every rung is green on build + coherence and each has one entry in [`RUNGS.md`](RUNGS.md).
+the final rung (R18).  Ladder branch `rebase-r328` = `ee377ec45` (tree `b5dc56996`): R00..R06 plus two rung
+repairs (R00's top-k gather, R05's `nb32` widening); every rung is green on build + coherence and each has one
+entry in [`RUNGS.md`](RUNGS.md).
 **The one known-red is closed at R00** (repair `3ea8b0212`): the delivery's required VMM pool refuses
 upstream's strided 2-D indexer top-k copy, and it reproduces on the pristine base with *only* the `#30542`
 revert, so the fix (block 10's `top_k_gather_rows`, moved down — [`DECISIONS.md`](DECISIONS.md) D15) lives in
@@ -16,8 +17,14 @@ block's switch moves its own measurement -- chunked prefill +8.8 % with identica
 unioning seven rope arms and dropping upstream's blanket guard (which the delivery's own kernels invalidate),
 worth +5.8 % prefill / +16.5 % decode at bf16 KV with identical text.  R05 is done: `D16` decided the delivery's FA
 iteration model wins over upstream's `#32407` rotation (verified absent, FA matrix 7428/0, native q8_0 K/V
-+5.6 % decode).  Next rung: **R06** (block 06, MMB quantized prefill GEMM), where `D11`'s MMQ/MMVQ tuning A/B
-begins.  Target: the next release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
++5.6 % decode).  R06 is done too: both conflicts were unions (upstream's few-row MMQ keeps precedence because
+it is compiled out under HIP, and MMB follows it; block 06's `expert_bounds` re-ported onto the R00 store
+helper), coherence unchanged, MUL_MAT_ID 1078/0, MMB +0.33 %/+0.62 % and the F32 skinny GEMM +0.9 %/+1.0 % —
+and one **finding**: block 06's MMB activation cache/slot buffers are freed in an order the VMM pool cannot
+accept, so a default-on RDNA4 *dense* type (IQ3_S) aborts until **block 10's `pool_stack`** lands (r327 is
+clean, this intermediate tree is not — `RUNGS.md` R06.2, with the R10/R18 obligations it creates).  Next rung:
+**R07** (block 07, wide-VDR MoE / Q6_K MMQ), which continues `D11`'s MMQ/MMVQ tuning A/B.  Target: the next
+release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 
 This is a **ladder climb, not a single rebase**: one rung per delivery block, each rung ending in a resolved

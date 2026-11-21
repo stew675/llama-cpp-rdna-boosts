@@ -37,7 +37,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | R02 | 02 | `cef19b032` | 5 | D5 (**resolved: MERGE**, no code dropped) | **DONE 2026-11-20** — `3941bad4e`, tree `0799ebfad`; all 5 conflicts are unions; adaptive arm 29.3 -> 65.2 t/s with identical text; enum count 13 -> 14 |
 | R03 | 03 | `36da15029` | 1 | — | **DONE 2026-11-20** — `e612388ba`, tree `971953b99`; test-file union; GATED_DELTA_NET 76/76; chunked prefill +8.8 % with identical text |
 | R04 | 04 | `cfe40b5f9` | 2 | **D3 (resolved: union + drop upstream's guard)** | **DONE 2026-11-20** — `768d27561`, tree `0866d4229`; 7 rope arms; fusion worth +5.8 % pp / +16.5 % tg at bf16 KV, identical text; ROPE 515/515 || R05 | 05 | `7362b5958` | 7 (22 regions) | **D16 — decided: the delivery's iteration model wins** | **DONE 2026-11-20** — `1c9bfa37c`, tree `13683655d`; FA op matrix 7428/0; native q8_0 K/V +5.6 % decode; rotation not carried, verified absent |
-| R06 | 06 | `f0564df7d` | 2 | D11 | not started |
+| R06 | 06 | `f0564df7d` | 2 (2 regions) | D11 | **DONE 2026-11-21** — `ee377ec45`, tree `b5dc56996`; both conflicts are unions (upstream's few-row MMQ keeps precedence, MMB follows; `expert_bounds` re-ported onto the R00 store helper); coherence `1c5d32ac537d`; MUL_MAT_ID 1078/0 (16 dup); MMB default +0.33 % pp2048 / +0.62 % pp16384, MMF32 +0.9 %/+1.0 %; **finding: block 06's MMB cache/slot buffers are pool-unsafe until block 10's `pool_stack` (R06.2)** |
 | R07 | 07 | `f5bdbefda` | 1 | D11 | not started |
 | R08 | 08 | `fe283f27c` | 9 | **D4**, D3, D11 | not started |
 | R09 | 09 | `123d53419` | 4 | D8, D9 | not started |
@@ -539,6 +539,100 @@ its parameter list are byte-identical between block 05's commit and the merged t
   sweep.
 - `-fa on` is required for the native-K/V arms; with FA off the cache type is not used by the attention kernel
   and both arms collapse to the same path.
+
+---
+
+# R06 — block 06, MMB quantized prefill GEMM  ·  **DONE 2026-11-21** — `ee377ec45`, tree `b5dc56996`
+
+```
+git cherry-pick f0564df7d        # 11 files, +3000/-16 (mmb.cu 2436 lines, mmf32.cu 201, a new test)
+```
+
+| exit criterion | result |
+|---|---|
+| conflicts | 2 files / 2 regions (`ggml-cuda.cu`, `mmid.cu`) — both unions, no delivery code dropped |
+| no markers left | yes (the `git grep` hits are the binary vocab files, as at R00) |
+| build | green, `all` targets, 0 errors; the only warning in a touch-path file is block 06's own `cudaFree` nodiscard at `mmb.cu:1953-1954`, **pre-existing** (identical lines at r327) |
+| coherence 4B | **`100 chars sha=1c5d32ac537d`** — unchanged |
+| `test-backend-ops -o MUL_MAT_ID` | **1078 OK / 0 FAIL**, 16 `dup=1` — the compaction whose signature this rung changes |
+| the block's own switch | MMB default vs `GGML_CUDA_MMB=0` on 4B Q8_0: pp2048 7793.1 vs 7767.3 (**+0.33 %**), pp16384 6768.4 vs 6727.0 (**+0.62 %**); the F32 part alone (`GGML_CUDA_MMF32=0`) is 7722.9 / 6699.9 (**+0.9 % / +1.0 %**) |
+| text identity | 35B-A3B Q8_0, 2 devices `-sm tensor`, 5298-token prompt: default `73 chars sha=86b7f9b5aa80`, `GGML_CUDA_MMB=0` **the same** `86b7f9b5aa80` |
+| **one finding** | R06.2: block 06's MMB activation cache is not pool-safe; block 10's `pool_stack` is the fix.  Inert on the default RDNA4 *routed* arm (`routed=0`), reachable on a default *dense* type (IQ3_S) |
+
+## R06.1 The two resolutions (both unions)
+
+**`ggml-cuda.cu` — `ggml_cuda_mul_mat_id`, the dispatch after the MMVQ band.**  Upstream `#32065` added
+`use_mmq_few` → `ggml_cuda_mul_mat_q_few()` at exactly the point block 06 inserts its MMB check.  Resolution:
+**keep both, upstream's first**, because they are disjoint by *backend* and by *shape*: `mmq-few.cu` is
+compiled out under HIP (`ggml_cuda_should_use_mmq_few()` returns `false` unconditionally on HIP/MUSA), and
+MMB is RDNA-only and needs `T >= mmb_min_t()` (512) while few-row MMQ claims 2-24 columns.  So the NVIDIA
+path keeps upstream's dispatch untouched and AMD reaches MMB exactly as before.
+
+**`mmid.cu` — `ggml_cuda_launch_mm_ids_helper` gained `int32_t * expert_bounds`** (block 06's second reader of
+the same compaction: MMQ/MMF consume `tile_spec`, MMB consumes per-expert bounds).  The rung has to re-port
+it onto the R00 tree, where the helper is **upstream `#32505`'s store design** (`check_experts`/`dump_store`/
+`ne_store`) plus our `mm_ids_helper_512_10`, not the pre-rebase body block 06's diff assumes.  Three places:
+
+| site | resolution |
+|---|---|
+| `mm_ids_helper` signature + tail | add the parameter; after `mm_ids_write_tile_spec` write `expert_bounds[expert] = nex_prev` and, in the block whose `expert == gridDim.x - 1`, `expert_bounds[gridDim.x] = nex_prev + n_dumped` (**`n_dumped`**, upstream's running total — block 06's pre-rebase body used `it_compact`, which the store design resets at every dump) |
+| `mm_ids_helper_512_10` tail | add `expert_bounds[tid] = counts[tid]` under `tid < n_experts` and `expert_bounds[n_experts] = counts[n_experts-1] + cursors[n_experts-1]` from the last thread (`counts[]` holds the compact-row start after the in-place cumulative pass, `cursors[]` the occurrence count) |
+| `launch_mm_ids_helper` / `ggml_cuda_launch_mm_ids_helper` | thread the parameter through both, keep the **R00 store launch** (`nbytes_shared`/`ne_store`) and the **R00 512/10 fast path** with its `GGML_CUDA_DISABLE_MMID_512` switch.  The whole pre-rebase `mm_ids_helper` body that block 06's diff carries inside the conflict region is **dropped** (upstream's store version is already above it in the file — keeping both would duplicate the kernel) |
+
+The `mmq.cu` / `mmf.cu` call sites are auto-merged to pass `nullptr`, which is what they carry at r327 too.
+`mmid.cuh`'s declaration merged cleanly.  Bounds semantics are bit-for-bit block 06's (`mmb_build_desc2`
+reads `bounds[e]`/`bounds[e+1]`, which consecutive blocks fill).
+
+## R06.2 FINDING — block 06's MMB scratch buffers are not pool-safe until block 10's `pool_stack`
+
+Block 06 keeps its BF16-activation cache and its pinned producer slots in process-wide globals
+(`g_mmb_cache`, `g_mmb_slots[]`, `g_mmb_slot_cap[]`) and **frees them in an order the delivery's VMM pool
+cannot accept**: `mmb_cache_insert()` deletes the *oldest* entry (`delete g_mmb_cache.front().buf`) and
+`ggml_cuda_mmb_slot_reserve()` deletes on growth (`delete e.buf`), while the VMM pool is a strict stack
+(`ggml-cuda.cu:808`: `GGML_ASSERT(ptr == (char *) pool_addr + pool_used)`).  Block 10 is what makes this
+legal — `7bbf540d5` rewrote exactly these functions onto `ctx.pool_stack_push`/`pool_stack_kill` with the
+comment *"these buffers are evicted, grown and replaced in an order the pool cannot accept"*.  So the defect
+is the **block-06-without-block-10 intermediate tree**, not a resolution of this rung:
+
+| arm (this rung's build unless named) | result |
+|---|---|
+| 27B **UD-IQ3_S** (a default-on RDNA4 dense type), 1 GPU, 6 k-token prompt, MMB default | **ABORT** at `ggml-cuda.cu:808` after 6 `MMB_DENSE` lines |
+| same model, `GGML_CUDA_MMB=0` | OK — prefill **1175.9** / gen 32.9 t/s |
+| same model, **r327** (`bin-r327`, all 18 blocks) | OK — prefill **1162.4** / gen 37.8, `50 chars sha=ebf2a5a9b00a` |
+| 35B-A3B Q8_0, 2 dev `-sm tensor`, `GGML_CUDA_MMB_TYPES=q8_0` (dense forced on), routed off | OK — 80 `MMB_DENSE` hits, prefill 4915.1 t/s |
+| 35B-A3B Q8_0, `…_TYPES=q8_0 …_ROUTED=1` (routed forced on) | **ABORT** — backtrace: `ggml_cuda_pool_vmm::free` ← `ggml_cuda_mul_mat_id_mmb_glu` (sometimes the non-GLU `…_id_mmb`) |
+| the same, `GGML_CUDA_MMB_GLU=0` / `…_CACHE=1` / `GGML_CUDA_POOL_DEBUG=1` | still aborts (or dies on `invalid resource handle` for the debug pool) |
+
+**Why the rung still passes:** (1) the *shipped default* on this box is `routed=0`, and the RDNA4 dense set is
+`{IQ3_S, Q4_1, Q5_0}` — a Q8_0 model is untouched, which is what the coherence/text arms measure; (2) the
+fix is a block already in the ladder; (3) a rung is not shippable.  **Owed:**
+
+1. **R10** — after block 10 lands, re-run the 27B IQ3_S arm (must prefill, not abort) **and** the forced
+   routed arm (`GGML_CUDA_MMB_TYPES=q8_0 GGML_CUDA_MMB_ROUTED=1`, 35B-A3B, 5298-token prompt) and require the
+   text to equal the `GGML_CUDA_MMB=0` hash.  That arm is also the **only** coverage of this rung's
+   `expert_bounds` re-port, so it must be run before R18.
+2. **R18** — nothing to add to the gates beyond that: the block-06 arm in the release ladder is the default
+   RDNA4 config, which is clean here.
+
+## R06.3 D11, the knobs that belong to this rung
+
+`DECISIONS.md` D11 asks for "the better of each knob", measured on one tree.  What R06 owns:
+
+| knob | arms | result |
+|---|---|---|
+| MMB (block 06 itself) | default vs `GGML_CUDA_MMB=0`, 4B Q8_0, `llama-bench -p 2048,16384 -r 3` | **7793.1 / 6768.4 vs 7767.3 / 6727.0** → MMB stays, +0.33 % / +0.62 % (pp16384 repeatability ±0.15 %, so the direction is real and the size is small on this model because Q8_0 is *not* in the RDNA4 dense set — only the F32 router/HC paths fire) |
+| F32 skinny prefill GEMM (block 06's `mmf32.cu`) | default vs `GGML_CUDA_MMF32=0` | **7722.9 / 6699.9** → +0.9 % / +1.0 %, i.e. most of the default arm's gain is this kernel, not the quantized dense tile |
+| few-row MMQ for `MUL_MAT_ID` (upstream `#32065`) | upstream's dispatch vs ours | **no AMD A/B exists**: `ggml_cuda_should_use_mmq_few()` is `false` for every HIP build, so upstream's new path is inert here and our dispatch is unopposed.  Recorded, not assumed |
+| MMQ config table (`mmq-config-gcn.cuh`) vs the delivery's table | upstream's vs ours | **not this rung** — block 06 touches `mmq.cu` only to pass `expert_bounds=nullptr`; the table collision is R07/R08's |
+
+## R06.4 Notes for later rungs
+
+- `GGML_CUDA_FA_QUANTS` still carries `iq4_nl-iq4_nl` from R05 — no configure change needed here.
+- The new `tests/test-logits-width-probe.cpp` is added to `tests/CMakeLists.txt`; the incremental build
+  compiles it, so a later `--fast` ladder rung will not be surprised by it.
+- Block 06 also registers MMB in `ggml_backend_cuda_context`'s destructor (`ggml_cuda_mmb_release_all()`) and
+  calls `ggml_cuda_mmb_begin_graph()` at the top of `graph_compute`; both merged cleanly and are what R06.2's
+  ordering depends on.  When block 10 rewrites them, this rung's comments are the reference for what changed.
 
 ---
 
