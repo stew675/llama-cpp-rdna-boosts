@@ -261,7 +261,7 @@ trap 'cleanup_gate; exit 130' INT TERM HUP
 # any more -- the previous `scripts/ui-dist-cache.sh` mirror existed only to stop each rung (whose build dir
 # this gate wipes) refetching the bundle inside its compile time, and a gate arm that wants the embedded UI
 # is not one of the things this gate measures (TODO #342; the retired cache is recorded in WORKLOG.md).
-echo "==> per-block build gate: $BASE..$TIP in $REPO (targets: $TARGETS)"
+echo "==> per-block build walker (bisect tool, NOT a release gate): $BASE..$TIP in $REPO (targets: $TARGETS)"
 echo "    logs: $LOG_DIR   build dir: $REPO/$BUILD_DIR   jobs: $JOBS"
 echo "    progress: a heartbeat every ${PROGRESS_SECS}s while a rung CONFIGURES or compiles (PROGRESS_SECS=0 disables)"
 echo "    ui assets: embedded UI off -- no HuggingFace fetch, no npm, no asset cache (LLAMA_USE_PREBUILT_UI=OFF)"
