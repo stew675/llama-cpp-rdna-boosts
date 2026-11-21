@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 20 Nov 2026 06:02:34 +0000
+Subject: [PATCH 6/6] mmb: smaller BF16 dense tiles when the RDNA4 256x128 grid
+ is small (GGML_CUDA_MMB_SMALL_TILE=0: off)
+
+At small prompt widths the BF16 dense GEMMs launched tiny grids of the
+256x128 tile -- the hc inject [10240 -> 320] and the router [2560 -> 512] at
+T ~360 per GPU were 2x3 = 6 workgroups on 64 CUs (172 ms per GPU over a
+small-prompt window, against ~45 ms on hipBLASLt). A BF16 weight (no shadow)
+whose 256x128 grid is below GGML_CUDA_MMB_SMALL_GRID (default 64) now takes
+the first of 128x64 / 64x32 that reaches it, else 64x32. Every output still
+accumulates over K in the same order, so this is bit-identical.
+
+IQ3_S Flash-Next, 2 x R9700, one run (every hash equal): smallpf 835 -> 864,
+midpf prompt 3131 -> 3185, pf31k 4003 -> 4027, needle prefill 3578 -> 3585.
+---
+ ggml/src/ggml-cuda/mmb.cu | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 8cfb477aa3..62f6c3a191 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1544,6 +1544,8 @@ struct mmb_arch_cfg {
+     int  bf16_dense     = 0;     // BF16 dense weights take MMB even where mmb_dense_flag() is off (see mmb_bf16_dense)
+     int  bf16_min_t     = 512;   // n_tokens >= this may take the BF16 dense tile (see mmb_bf16_min_t)
+     int  tiny_m_bf16    = 0;     // the tiny-M warp-per-token kernel for BF16 weights with M <= 8 (see mmb_tiny_m_bf16_ok)
++    int  small_tile     = 0;     // BF16 dense on the R4 path: smaller tiles when the 256x128 grid is small (see mmb_small_tile_grid)
++    int  small_grid     = 64;    // ... the workgroup count a tile must reach to be taken
+     int  routed         = 1;     // the routed MoE (MUL_MAT_ID) path + its fused GLU
+     int  dense_geom     = MMB_GEOM_GFX11_SPLIT;  // see mmb_geom_id
+     int  big_q4k_only   = 0;     // 128x256 dense tile only for Q4_K weights (others take 128x128)
+@@ -1589,6 +1591,7 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+         // never read.  Off: IQ3_S pf31k +2 %, every hash identical.  GGML_CUDA_MMB_HC16=1 restores it.
+         c.hc16         = 0;
+         c.tiny_m_bf16  = 1;
++        c.small_tile   = 1;
+         // gatemix: the kernel's arch-aware `mmb_frag_t`/`mmb_wmma_bf16`/`MMB_ACC_M` shim runs on
+         // gfx12 too, and the fusion is bit-identical to the GEMM+sigmoid+mix chain.  Ported to RDNA4
+         // 2026-09-24 (gfx1201): +5.8 %/+5.4 %/+5.3 % qwen4exp IQ4_NL prefill at pp8192/32768/65536,
+@@ -1915,6 +1918,16 @@ bool mmb_tiny_m_f32_ok(const int64_t K, const int64_t M) {
+ int mmb_tiny_m_f32_tt() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_TINY_TT"); return e ? atoi(e) : mmb_cfg_for_device(d).tiny_tt; }); }
+ // tiny-M BF16 weights: M <= 8 BF16 dense weights that reach MMB take the warp-per-token kernel
+ // instead of the dense tile.  GGML_CUDA_MMB_TINY_M_BF16=0: the dense tile (kill switch).
++// Small-T BF16 dense GEMMs (hc inject [10240 -> 320], router [2560 -> 512] at T ~360 per GPU) launched
++// 2x3 = 6 workgroups of the 256x128 tile on 64 CUs.  Smaller tiles accumulate every output over K in the same order
++// (geometry is numerics-neutral, see the R4 dispatch), so this is bit-identical.  0 = off (GGML_CUDA_MMB_SMALL_TILE),
++// else the grid threshold (GGML_CUDA_MMB_SMALL_GRID).
++static int mmb_small_tile_grid() {
++    const int on = mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_SMALL_TILE"); return e ? atoi(e) : mmb_cfg_for_device(d).small_tile; });
++    if (on == 0) return 0;
++    const int g = mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_SMALL_GRID"); return e ? atoi(e) : mmb_cfg_for_device(d).small_grid; });
++    return g > 0 ? g : 0;
++}
+ static bool mmb_tiny_m_bf16_ok(const int64_t K, const int64_t M) {
+     const int v = mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_TINY_M_BF16"); return e ? atoi(e) : mmb_cfg_for_device(d).tiny_m_bf16; });
+     return v != 0 && M >= 1 && M <= 8 && K % 4 == 0;
+@@ -2403,6 +2416,19 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     const ggml_type wtype = shadow ? GGML_TYPE_BF16 : src0->type;
+     if (mmb_cfg().dense_geom == MMB_GEOM_R4_256x128) {
+         dim3 grid4((M + 255) / 256, (T + 127) / 128);
++        // small BF16 grids: the first of 128x64 / 64x32 whose grid reaches the threshold, else 64x32
++        const int sg = (src0->type == GGML_TYPE_BF16 && !shadow) ? mmb_small_tile_grid() : 0;
++        if (sg > 0 && (int) (grid4.x * grid4.y) < sg) {
++            const dim3 g128((M + 127) / 128, (T + 63) / 64);
++            if ((int) (g128.x * g128.y) >= sg) {
++                mmb_dense_kernel<128, 64, 32, 32, 2><<<g128, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++            } else {
++                const dim3 g64((M + 63) / 64, (T + 31) / 32);
++                mmb_dense_kernel<64, 32, 16, 16, 2><<<g64, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++            }
++            CUDA_CHECK(cudaGetLastError());
++            return;
++        }
+         mmb_dense_launch_t<256, 128, 64, 64>(wtype, grid4, stream, shadow ? (const uint8_t *) shadow : W, xhp, D, Dh, store_f32, M, K, T);
+         CUDA_CHECK(cudaGetLastError());
+         return;
+-- 
+2.53.0
+

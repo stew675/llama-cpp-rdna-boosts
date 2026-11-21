@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 20 Nov 2026 04:50:22 +0000
+Subject: [PATCH 3/6] mmb: tiny-M kernel for BF16 weights with M <= 8 on RDNA4
+ (GGML_CUDA_MMB_TINY_M_BF16=0: dense tile)
+
+The warp-per-token tiny-M kernel gains a BF16-weight variant (four values per
+8-byte load, widened to F32, the same F32 accumulation); its dispatch moves
+into a shared launcher, unchanged for the F32 weight. BF16 dense weights with
+M 1..8 that reach MMB (the shared-expert gate M=1, the BF16 hc inject M=4 of
+a GSQ IQ3_S Flash-Next) take it instead of padding the 256-row dense tile, and
+read the F32 activation rather than its bf16 rounding.
+
+IQ3_S, 2 x R9700, one run each (off / on): smallpf 802 -> 826, pf31k 3903 ->
+3898, midpf prompt 3054 -> 3070, needle prefill 3488 -> 3485 t/s. =0
+reproduces the previous hashes; the production model (UD IQ4_XS) has no such
+weight and every hash is identical either way.
+---
+ ggml/src/ggml-cuda/mmb.cu | 83 ++++++++++++++++++++++++++++-----------
+ 1 file changed, 59 insertions(+), 24 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 43c59f0173..99794a0122 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1281,9 +1281,12 @@ __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo
+ // measured *worse* (pp8192 954.8 / 952.3 vs 957.4 at TT=1), so L2 serves the W panels well enough
+ // that the extra live registers and reduced block count cost more than the traffic saved.  Kept as
+ // a knob because the balance is a property of this cache, not of the algorithm.
+-template<int MMAX, int TT, bool XBF16 = false>
++// WBF16: W is a BF16 [M][K] weight -- four values per 8-byte load, widened to F32, the same F32
++// accumulation and reduction as the F32 weight (the shared-expert gate M=1 and the BF16 hc inject M=4 of a GSQ
++// IQ3_S Flash-Next otherwise pad the 256-row dense tile).
++template<int MMAX, int TT, bool XBF16 = false, bool WBF16 = false>
+ __global__ void __launch_bounds__(MMB_NT)
+-mmb_tiny_m_f32_kernel(const float * __restrict__ W, const float * __restrict__ X,
++mmb_tiny_m_f32_kernel(const void * __restrict__ Wv, const float * __restrict__ X,
+                       float * __restrict__ D, const int M, const int K, const int T) {
+     constexpr int NWARPS = MMB_NT / 32;
+     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+@@ -1322,7 +1325,16 @@ mmb_tiny_m_f32_kernel(const float * __restrict__ W, const float * __restrict__ X
+             }
+         }
+ #pragma unroll
+-        for (int m = 0; m < MMAX; ++m) wv[m] = (m < M) ? *(const float4 *) (W + (size_t) m * K + k) : make_float4(0.f, 0.f, 0.f, 0.f);
++        for (int m = 0; m < MMAX; ++m) {
++            if (m >= M) { wv[m] = make_float4(0.f, 0.f, 0.f, 0.f); continue; }
++            if constexpr (WBF16) {
++                const uint2 p = *(const uint2 *) ((const uint16_t *) Wv + (size_t) m * K + k);   // K % 4 == 0: 8-byte aligned
++                wv[m] = make_float4(gm_bf2f((uint16_t) p.x), gm_bf2f((uint16_t) (p.x >> 16)),
++                                    gm_bf2f((uint16_t) p.y), gm_bf2f((uint16_t) (p.y >> 16)));
++            } else {
++                wv[m] = *(const float4 *) ((const float *) Wv + (size_t) m * K + k);
++            }
++        }
+ #pragma unroll
+         for (int i = 0; i < TT; ++i)
+ #pragma unroll
+@@ -1346,6 +1358,30 @@ mmb_tiny_m_f32_kernel(const float * __restrict__ W, const float * __restrict__ X
+         }
+     }
+ }
++// The tiny-M dispatch (TT / MMAX / bf16-activation variants), shared by the F32 and the BF16 weight.
++template <bool WBF16>
++static void mmb_tiny_m_launch(const void * W, const float * Xf, const bool xh, float * Df, const int M, const int K, const int T,
++                              const int tt, cudaStream_t stream) {
++    constexpr int NWARPS = MMB_NT / 32;
++    const bool wide = M > 4;   // M <= 4 fits TT accumulators with MMAX=4; above that, one token
++    const int eff  = wide ? 1 : (tt >= 4 ? 4 : (tt == 2 ? 2 : 1));
++    dim3 tg((T + NWARPS * eff - 1) / (NWARPS * eff));
++    if (wide) {
++        if (xh)  mmb_tiny_m_f32_kernel<8, 1, true,  WBF16><<<tg, MMB_NT, 0, stream>>>(W, Xf, Df, M, K, T);
++        else     mmb_tiny_m_f32_kernel<8, 1, false, WBF16><<<tg, MMB_NT, 0, stream>>>(W, Xf, Df, M, K, T);
++    } else if (eff == 4) {
++        if (xh)  mmb_tiny_m_f32_kernel<4, 4, true,  WBF16><<<tg, MMB_NT, 0, stream>>>(W, Xf, Df, M, K, T);
++        else     mmb_tiny_m_f32_kernel<4, 4, false, WBF16><<<tg, MMB_NT, 0, stream>>>(W, Xf, Df, M, K, T);
++    } else if (eff == 2) {
++        if (xh)  mmb_tiny_m_f32_kernel<4, 2, true,  WBF16><<<tg, MMB_NT, 0, stream>>>(W, Xf, Df, M, K, T);
++        else     mmb_tiny_m_f32_kernel<4, 2, false, WBF16><<<tg, MMB_NT, 0, stream>>>(W, Xf, Df, M, K, T);
++    } else {
++        if (xh)  mmb_tiny_m_f32_kernel<4, 1, true,  WBF16><<<tg, MMB_NT, 0, stream>>>(W, Xf, Df, M, K, T);
++        else     mmb_tiny_m_f32_kernel<4, 1, false, WBF16><<<tg, MMB_NT, 0, stream>>>(W, Xf, Df, M, K, T);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ template <int BM, int BN, int WTM, int WTN, bool TWO>
+ __global__ void __launch_bounds__(MMB_NT, 2)
+ mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X, float * __restrict__ D, const int M, const int K, const int T) {
+@@ -1507,6 +1543,7 @@ struct mmb_arch_cfg {
+     int  bf16w          = 1;     // BF16 dense weights
+     int  bf16_dense     = 0;     // BF16 dense weights take MMB even where mmb_dense_flag() is off (see mmb_bf16_dense)
+     int  bf16_min_t     = 512;   // n_tokens >= this may take the BF16 dense tile (see mmb_bf16_min_t)
++    int  tiny_m_bf16    = 0;     // the tiny-M warp-per-token kernel for BF16 weights with M <= 8 (see mmb_tiny_m_bf16_ok)
+     int  routed         = 1;     // the routed MoE (MUL_MAT_ID) path + its fused GLU
+     int  dense_geom     = MMB_GEOM_GFX11_SPLIT;  // see mmb_geom_id
+     int  big_q4k_only   = 0;     // 128x256 dense tile only for Q4_K weights (others take 128x128)
+@@ -1551,6 +1588,7 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+         // graph marks the output BF16-only, and those marking passes are RDNA3_5-only -- on RDNA4 it was written and
+         // never read.  Off: IQ3_S pf31k +2 %, every hash identical.  GGML_CUDA_MMB_HC16=1 restores it.
+         c.hc16         = 0;
++        c.tiny_m_bf16  = 1;
+         // gatemix: the kernel's arch-aware `mmb_frag_t`/`mmb_wmma_bf16`/`MMB_ACC_M` shim runs on
+         // gfx12 too, and the fusion is bit-identical to the GEMM+sigmoid+mix chain.  Ported to RDNA4
+         // 2026-09-24 (gfx1201): +5.8 %/+5.4 %/+5.3 % qwen4exp IQ4_NL prefill at pp8192/32768/65536,
+@@ -1860,6 +1898,12 @@ bool mmb_tiny_m_f32_ok(const int64_t K, const int64_t M) {
+     return v != 0 && M >= 1 && M <= 8 && K % 4 == 0;
+ }
+ int mmb_tiny_m_f32_tt() { return mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_TINY_TT"); return e ? atoi(e) : mmb_cfg_for_device(d).tiny_tt; }); }
++// tiny-M BF16 weights: M <= 8 BF16 dense weights that reach MMB take the warp-per-token kernel
++// instead of the dense tile.  GGML_CUDA_MMB_TINY_M_BF16=0: the dense tile (kill switch).
++static bool mmb_tiny_m_bf16_ok(const int64_t K, const int64_t M) {
++    const int v = mmb_policy<int>([](int d) { const char * e = getenv("GGML_CUDA_MMB_TINY_M_BF16"); return e ? atoi(e) : mmb_cfg_for_device(d).tiny_m_bf16; });
++    return v != 0 && M >= 1 && M <= 8 && K % 4 == 0;
++}
+ // True when rocBLAS was told to keep GEMMs off hipBLASLt (ROCBLAS_USE_HIPBLASLT=0, the determinism control).
+ static bool mmb_hipblaslt_off() {
+ #if defined(GGML_USE_HIP)
+@@ -2270,12 +2314,6 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+         // wide margin -- see the mmb_tiny_m_f32_kernel comment.  Wide-M F32 (the MoE router,
+         // M=512) keeps the WMMA f16-split tile, which is 2.4x faster than rocBLAS there.
+         if (mmb_tiny_m_f32_ok(K, M)) {
+-            constexpr int NWARPS = MMB_NT / 32;
+-            const int tt = mmb_tiny_m_f32_tt();
+-            const bool wide = M > 4;   // M <= 4 fits TT accumulators with MMAX=4; above that, one token
+-            const int eff  = wide ? 1 : (tt >= 4 ? 4 : (tt == 2 ? 2 : 1));
+-            dim3 tg((T + NWARPS * eff - 1) / (NWARPS * eff));
+-            const float * Wf = (const float *) src0->data;
+             // HC16: if the producer marked this activation BF16-only, the F32 tensor was never
+             // written; read the bf16 copy out of the activation cache instead.  Walk the whole view
+             // chain: the mark is on the fully-rooted producer output.
+@@ -2283,21 +2321,8 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+             while (x_root->view_src) x_root = x_root->view_src;
+             const uint16_t * Xh = ggml_cuda_mmb_is_bf16_only(x_root) ? ggml_cuda_mmb_cache_lookup(x_root) : nullptr;
+             const float * Xf = Xh ? (const float *) Xh : (const float *) src1->data;
+-            float * Df = (float *) dst->data;
+-            if (wide) {
+-                if (Xh)  mmb_tiny_m_f32_kernel<8, 1, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+-                else     mmb_tiny_m_f32_kernel<8, 1, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+-            } else if (eff == 4) {
+-                if (Xh)  mmb_tiny_m_f32_kernel<4, 4, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+-                else     mmb_tiny_m_f32_kernel<4, 4, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+-            } else if (eff == 2) {
+-                if (Xh)  mmb_tiny_m_f32_kernel<4, 2, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+-                else     mmb_tiny_m_f32_kernel<4, 2, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+-            } else {
+-                if (Xh)  mmb_tiny_m_f32_kernel<4, 1, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+-                else     mmb_tiny_m_f32_kernel<4, 1, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+-            }
+-            CUDA_CHECK(cudaGetLastError()); return;
++            mmb_tiny_m_launch<false>(src0->data, Xf, Xh != nullptr, (float *) dst->data, M, K, T, mmb_tiny_m_f32_tt(), stream);
++            return;
+         }
+         dim3 grid((M + 127) / 128, (T + 127) / 128);
+         static const bool two = [] { const char * e = getenv("LLAMA_MMB_F32SPLIT"); return e && atoi(e) >= 2; }();
+@@ -2305,6 +2330,16 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+         else     mmb_f32split_kernel<128, 128, 32, 64, false><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
+         CUDA_CHECK(cudaGetLastError()); return;
+     }
++    if (src0->type == GGML_TYPE_BF16 && mmb_tiny_m_bf16_ok(K, M)) {
++        // tiny-M BF16 weight: the warp-per-token kernel instead of padding the dense tile; reads the
++        // F32 activation (or its bf16 copy when marked BF16-only, as for the F32 weight).
++        const ggml_tensor * x_root = src1;
++        while (x_root->view_src) x_root = x_root->view_src;
++        const uint16_t * Xh = ggml_cuda_mmb_is_bf16_only(x_root) ? ggml_cuda_mmb_cache_lookup(x_root) : nullptr;
++        const float * Xf = Xh ? (const float *) Xh : (const float *) src1->data;
++        mmb_tiny_m_launch<true>(src0->data, Xf, Xh != nullptr, (float *) dst->data, M, K, T, mmb_tiny_m_f32_tt(), stream);
++        return;
++    }
+     const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
+     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data;
+     // The tall tile is a 384-row panel, so an M below this wastes most of it.  The model emits an M=4
+-- 
+2.53.0
+

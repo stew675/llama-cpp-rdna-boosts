@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Fri, 20 Nov 2026 04:17:02 +0000
+Subject: [PATCH 2/6] mmb: no unread BF16 side copy of the hc gate on RDNA4
+ (GGML_CUDA_MMB_HC16=1: old)
+
+The hc gate GEMM (K 320, M 10240) also stored a BF16 copy of its output into
+MMB slot 1 whenever mmb_hc16() was on (the default), 2*T*M bytes per call.
+Its only readers take it when the graph marks the output BF16-only, and the
+marking passes run on RDNA3_5 only, so on RDNA4 the copy was written and never
+read. RDNA4 now defaults hc16 off.
+
+IQ3_S Flash-Next, 2 x R9700, one run each (on / off): pf31k 3800 -> 3877,
+needle prefill 3406 -> 3478, smallpf 792 -> 803 t/s; every hash identical.
+---
+ ggml/src/ggml-cuda/mmb.cu | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index eca9b36cd7..43c59f0173 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1547,6 +1547,10 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+         // while hipBLASLt is off (mmb_bf16_dense).  Floor 33 = above the MMVF band.
+         c.bf16_dense   = 1;
+         c.bf16_min_t   = MMVF_MAX_BATCH_SIZE_FLAT + 1;
++        // The hc gate's BF16 side copy (slot 1, 2*T*M bytes, ~84 MB at T 4096) is only read where the
++        // graph marks the output BF16-only, and those marking passes are RDNA3_5-only -- on RDNA4 it was written and
++        // never read.  Off: IQ3_S pf31k +2 %, every hash identical.  GGML_CUDA_MMB_HC16=1 restores it.
++        c.hc16         = 0;
+         // gatemix: the kernel's arch-aware `mmb_frag_t`/`mmb_wmma_bf16`/`MMB_ACC_M` shim runs on
+         // gfx12 too, and the fusion is bit-identical to the GEMM+sigmoid+mix chain.  Ported to RDNA4
+         // 2026-09-24 (gfx1201): +5.8 %/+5.4 %/+5.3 % qwen4exp IQ4_NL prefill at pp8192/32768/65536,
+-- 
+2.53.0
+
