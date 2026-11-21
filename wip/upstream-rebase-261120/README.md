@@ -1,6 +1,6 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: OPEN — 12 of 18 rungs climbed (R00-R11) on 2026-11-21. Nothing is delivery yet.**
+**Status: OPEN — 12 of 18 rungs climbed (R00-R11) on 2026-11-21; R12 is paused mid-rung (see below). Nothing is delivery yet.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
 the final rung (R18).  Ladder branch `rebase-r328` = `dbe4fdd40` (tree `2b6aec1f0`): R00..R11 plus two rung
 repairs (R00's top-k gather, R05's `nb32` widening); every rung is green on build + coherence and each has one
@@ -47,8 +47,12 @@ produced a new finding: the arena arm's decode dropped 54.4 -> 20.4 t/s and no k
 5 conflicts, D9 and D13 were carried (upstream's FP8 PLE scale *and* the delivery's lazy reader coexist), and both
 block gates ran — quant-coherence PASS, but **`gate-hc-fusions.sh` is RED**: the fused *mixer* arm and the two
 dsv4 pre/post arms left their r327 anchors while the combine arm is exact (`RUNGS.md` R11.2, owed at R13/R14/R17
-and needing a maintainer call on re-anchoring).  Next rung: **R12** (block 12, DFlash spec + idle-slot parking,
-9 conflicted paths — the `llama_batch_ext` migration `D6` starts there).  Target: the next
+and needing a maintainer call on re-anchoring).  **R12 is paused, not landed**: its ten conflicts were resolved
+and captured in [`r12-wip/`](r12-wip/README.md), but `common_speculative_impl_draft_dflash` turned out to be **two
+implementations of one class** (upstream's `#32016` `dflash_options`/`init()` seam against block 12's inline ctor
+plus the DSpark/DFlash2/LiliCorr/ingest state and methods), which is a merge that needs its own session and the MTP
+four-axis protocol as its oracle.  The ladder was reverted to `dbe4fdd40` (R11) rather than commit a tree that does
+not build.  Target: the next
 release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 

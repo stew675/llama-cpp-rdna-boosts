@@ -1,4 +1,4 @@
-# HANDOVER — r328 re-base ladder, 12 of 18 rungs climbed, resume at **R12**
+# HANDOVER — r328 re-base ladder, 12 of 18 rungs climbed, resume at **R12 (paused mid-rung)**
 
 Written 2026-11-21 (session 2/3, which climbed R06, R07, R08, R09 and R10).  Read [`README.md`](README.md) §1 (method + traps),
 [`RUNGS.md`](RUNGS.md) (the per-rung ledger and every resolution so far) and [`DECISIONS.md`](DECISIONS.md)
@@ -11,7 +11,7 @@ the earlier sessions.
 |---|---|
 | working branch | **`rebase-r328`** in `~/llama.cpp`, clean, **HEAD = `dbe4fdd40`** (tree `2b6aec1f0`) |
 | rungs done | **R00 … R11** + **two rung repairs** (R00's top-k gather, R05's `nb32` widening) |
-| next rung | **R12** — block 12 (`dad1442b3`), 64 files, **9 conflicted paths** (the climb's broadest: `speculative.cpp`, `ggml.h`, x86 quants, `dflash.cpp`, `server-context.cpp`).  `D5` (DFlash refactor, already MERGE at R02), `D6` (**`llama_batch_ext`**, the big mechanical migration) and `D7` (the `slot_sched` refactor) all land here; `D7`'s three checks are in `DECISIONS.md` |
+| next rung | **R12 — PAUSED, resume it first** — block 12 (`dad1442b3`), 64 files, 10 conflicted paths.  Ten of them are resolved and captured in [`r12-wip/r12-resolved-but-unbuildable.diff`](r12-wip/r12-resolved-but-unbuildable.diff); the rung is blocked on **`common_speculative_impl_draft_dflash`**, which is two implementations of one class (upstream `#32016`'s `dflash_options`/`init()` seam vs block 12's inline ctor + DSpark/DFlash2/LiliCorr/ingest state).  **Read `r12-wip/README.md` first** — it lists what is settled and what is not.  Oracle: `benchmarks/mtp-adaptive-methodology.md` (four axes), not text |
 | delivery repo | `~/llama-cpp-rdna-boosts` — **`patches/`, `release.json`, `rdna-boosts-all.patch` and the fork are untouched** (that is R18) |
 | target release | next after `v17-4f9dfa0e3-r327`, i.e. **r328**; new fork point **`919794500`** |
 | reference binaries | `~/llama.cpp/build-rocm/bin-r327` (the shipping r327 `bin/`) — **the attribution oracle for any abort** |
