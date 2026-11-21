@@ -1,3 +1,87 @@
+## 261121.005 (r328) -- **RELEASE: the delivery is re-based onto `919794500`**, 18 default blocks, tree `0c46248f…`; `validate-set` green, `fork-refresh` re-cut + build + gates green, both optional artifacts re-cut
+
+**Delivery change: the whole set, re-expressed on a new base.  No block's feature set changed, no block was
+added, split or renumbered, and block `0300` is still temporary.**  Release **`v17-919794500-r328`**, base
+**`919794500`** (2026-11-20 upstream master), canonical tip **`6d9d54238`**, tree
+**`0c46248f7371a0eee84a980a1e16ad25a6fbd38f`**, `optional_tree` **`fd9d60abd5…`**.  `release.json` is the source of
+truth; the campaign records are `wip/upstream-rebase-261120/` (`RUNGS.md` per rung, `DECISIONS.md`,
+`EXTERNAL-ANALYSES.md`, `REMOTE-VALIDATION.md`), and the per-block shape of the re-base is the r328 note at the
+top of `patches/README.md`.
+
+### Why this release exists
+
+The 2026-11-13 r278 base (`4f9dfa0e3`) was ~230 commits behind.  The new base is **228 upstream commits, 1944
+files, +147 k / −41 k**, and it took the ground the delivery had been holding by hand in four places: upstream
+now ships **DFlash** (`src/models/dflash{,2}.cpp`), its own **server slot/prompt scheduling**, its own
+**`{NORM,MUL}` fusion arms**, and `#32217`'s `nb32` widening.  Every one of those was resolved as a *choice*,
+not a merge: D16 (the delivery's FA iteration model), D17 (the delivery's DFlash feature set, decided by
+measurement), D4/D13 (both sides kept), and the `{NORM,MUL}` pair became D4's arm inside the delivery's single
+dispatcher TU.
+
+### How it was cut
+
+A **ladder climb**: one `git cherry-pick` per delivery block (R00..R17), each rung resolved by hand, built and
+coherence-checked before the next, then squashed into 18 commits with the three rung repairs in their **owning
+blocks** (`RUNGS.md` §R18.1): block 00's `top_k_gather_rows` (D15), block 05's `nb32` → `int64_t`, block 16's
+`-Wsign-compare`.  The final tree differs from the pre-squash ladder only by the +10-line Apache-2.0 attribution
+in block 03's two chunked-GDN headers (`261121.003`).
+
+### Gates (all on the final tree)
+
+| gate | result |
+|---|---|
+| `scripts/gate-per-block-build.sh --base 919794500 --tip rebase-r328 --all` | **18/18** rungs build the `all` target, 0 failed (1081 s) |
+| coherence (4B Q8_0, `-sm layer`, `-p "The capital of France is" -n 20 --seed 42 --temp 0`) | `100 chars sha=1c5d32ac537d` — identical at every rung and to r327 |
+| `scripts/gate-prefill-logits.sh` vs a base **recorded from r327's own binaries** | **mean KLD 0.000000 / same-top-p 100.000 %** (27B Q8_0, `--device 0`, 40×512 wikitext); `--record` re-pinned on the final tree (`build=73a74454b`, base PPL 5.9325) |
+| `scripts/gate-norm-rows-alias.sh` | PASS — Ling-3.0-tiny 180/180 gated fusions **0 declined** (`f476efaac086` == kill switch), Qwen3.5-4B 344/344 plain **0 declined** (`d2ffb97ccb76` == kill switch) |
+| `scripts/gate-spec-ckpt-device.sh` | PASS — the device checkpoint restores the same bytes as the host path; `-nkvo` stays host |
+| `scripts/gate-spec-width-band.sh` | PASS — the 4-slot band really cut (154 align lines, 1 cut); 1/2 slots inert |
+| `scripts/gate-park-idle-slots.sh` | PASS — 6 park / 2 unpark moves traced, every parked slot == lazy-off text (4 arms) |
+| `scripts/gate-hc-fusions.sh` | **PASS, exit 0, both states** (`local` 3-device and `meta` `-sm tensor`) — see `261121.003`; **R11.2 was refuted**, r327 reads the same numbers byte for byte |
+| `scripts/gate-spec-align.sh` | PASS — 2-GPU +18 %, host-expert pair +13.7 %, equal-length arms inert, `n_seq==1` text `b8775233a93a`; the host-expert residual is bounded at the measured 2 (`TODO` #356) |
+| `scripts/gate-qwen4exp-quant-coherence.sh` (`IQ4_NL`, `Q4_K_M`; `IQ3_XXS`/`IQ4_XS` are not on this box) | PASS — gather transparent on both, **and section E**: the sparse QSA arm launches the fused indexer score (4 census lines), `fused == chain` `487888b20ddb`, and it differs from dense `97a8c2a4929b` (non-vacuous) |
+| `scripts/gate-mixed-kv.sh` (optional `0101` on the optional-applied build) | **12/12 PASS** — `FLASH_ATTN_EXT` 7453/7453 in three arms, width purity W=1..8 for q8_0/q8_0 + all three mixed pairs, text per pair |
+| `scripts/validate-set.sh` | **GREEN** — 18 default patches apply strictly at `919794500`, tree `0c46248f…`, both optional artifacts alone and cumulatively, 515 added files pass the Windows portability scan |
+| `scripts/fork-refresh.sh --build --gates` | re-cut tree == `release.json.tree`, tip **`6d9d54238`** == `.tip`, build OK, coherence OK, prefill-logit KLD 0.000000 / 100 % |
+| `scripts/check-gpu-faults.sh` | clean at every gate's own window |
+
+### Numbers (decode/prefill, before the tag)
+
+| arm | r327 | r328 | text |
+|---|---|---|---|
+| 27B UD-Q4_K_M 1 GPU `llama-bench -p 512 -n 128` | pp512 **1485.14** / tg128 **33.96** | pp512 **1484.22** / tg128 **33.90** | — |
+| host-expert arena, 35B-A3B Q8_0, **1 GPU** `-ncmoe 20`, 3 runs | 48.3 / 48.7 / 50.2 (median 48.7) | **50.8 / 50.7 / 50.3** (median 50.7) | `86b7f9b5aa80` both |
+| same arm, **2 GPU** `-sm tensor`, 3 runs | — | 89.1 / 89.8 / 86.9 | `86b7f9b5aa80` |
+
+**Parity** on the dense arm (both readings inside run-to-run spread), and the arena arm is at the R15 record's
+level (49.9 median at block 15) with the text unchanged.  The **MTP four-axis protocol** was not re-run for this
+release: the re-base keeps every decode kernel's decisions (the tree is the delivery re-expressed), the arena
+arm above is the decode floor it guards, and `TODO` #349's `35b10` arm already reports rather than asserts its
+text — still, a future decode/fusion change needs it (`benchmarks/mtp-adaptive-methodology.md`).
+
+### Optional artifacts and containers
+
+Both optional artifacts were **re-cut mechanically** against the new default tree (`0100` → `931a0f8b8`, `0101` →
+`83477d27`, cumulative `fd9d60abd5`): each applied with `git apply -3` and nothing to reconcile, each built, `0101`
+through its own gate (12/12).  `TODO` #352 landed earlier (`261121.001`): the container `web` stage now builds
+`ui/apps/chat`.  **The images are built and pushed off-host by the worker watcher** after the tag — never on the
+primary box.
+
+### What this release leaves owed (all named, none blocking a gfx1201 shipment)
+
+* **gfx1151 + gfx1100 validation** — the ladder was gated on gfx1201 only.  `TODO` #354: one session per box
+  (`ssh halo` for block 15's APU gates incl. the 122B `>RAM` server arm; `ssh fingon` for the gfx11 GDN file, the
+  arch oracle, and the `GSQ-IQ3_XXS` class).  Both apply the *released* set, which re-verifies `apply-all.sh` +
+  `release.json` on two more machines.  Per-box model inventory: `wip/upstream-rebase-261120/REMOTE-VALIDATION.md`.
+* **block 15's APU claims** stay unvalidated until the `halo` session — the store is inert on a discrete GPU by
+  design, so `gate-uma-experts.sh`'s census arms and `gate-prefill-server-slots.sh` cannot run here.
+* **`gate-node-budget.sh`** — no phi-4 on any of the three boxes; owed (`RUNGS.md` §R14.4).
+* **R06.2's forced routed-MMB arm** — an A/B override, never a shipped default.
+* **`TODO` #356** — the host-expert aligned pair leaves 2 draft-length splits (block 02 could align the
+  arena-band caps); bounded in the gate, measured on r327 as well, so not this release's regression.
+* **`TODO` #352** — the r328 image smoke build (`--targets server`, `index.html` served) runs with the worker.
+* **`TODO` #353** — no Inkling-2 model loads at this base (upstream support, waiting).
+
 ## 261121.004 (r328 prep) -- `gate-spec-align`'s host-expert arm is bounded on measured behaviour, and no large gate artifact may live on `/tmp` (tmpfs)
 
 **No delivery patch changed, no block touched, no release.**  Two tooling fixes, both following the same rule the

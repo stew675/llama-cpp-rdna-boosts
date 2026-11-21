@@ -7,10 +7,20 @@ the two follow-up sessions, one per box: the inventory (verified 2026-11-21), wh
 — which is the same flow the r138 re-base used (`benchmarks/2026-10-25-r138-arch-validation.md`), so the
 records stay comparable.
 
-**Neither box is part of R18 and neither is a rung.**  R18 (the release) runs on the primary box; these two
-sessions run **after** it, so both apply the *released* patch set and thereby re-verify
-`scripts/apply-all.sh` + `release.json` on a second and a third machine — that is the point of doing them last,
-and it is what r138 did.
+**Neither box is part of R18 and neither is a rung, and their ORDER is fixed: after the release tag.**  R18 runs
+on the primary box; these two sessions then apply the *released* patch set, which re-verifies
+`scripts/apply-all.sh` + `release.json` on a second and a third machine — the point of doing them last, and what
+r138 did.  Prerequisites, all verified 2026-11-21:
+
+| | halo | fingon |
+|---|---|---|
+| `ssh -o BatchMode=yes` | works | works |
+| `~/llama-cpp-rdna-boosts` origin | `git@github.com:stew675/llama-cpp-rdna-boosts.git` (needs the release push first, then `git pull`) | same |
+| `~/llama.cpp` | on branch `rdna-boosts` = **r327** (its own oracle: capture the text hashes BEFORE switching) | same |
+| ROCm | `/opt/rocm-10.1.0-gfx1151` | `/opt/rocm-10.1.0-gfx1100` |
+| ccache | 20 GB max, 8.7 GB warm | 20 GB max, 7.4 GB warm |
+| free disk | 335 G | 86 G (KLD bases are 5 GB each — fine, but prune if more than a few) |
+| cores / RAM | 16 / 123 GiB unified | 16 / 61 GiB |
 
 ## Inventory (both reachable over `ssh`, `BatchMode` works)
 
@@ -26,15 +36,20 @@ and it is what r138 did.
 | delivery repo | `~/llama-cpp-rdna-boosts`, origin = GitHub, **stale** (`5372fc06`) → `git pull` | same, **stale** (`0382db6f`) → `git pull` |
 | ccache | 46 % hit, warm for r327-era trees | 31 % hit, warm for r327-era trees |
 
-**Models that decide which gate can run where** (`/llm/models`, `find`-verified today):
+**Models that decide which gate can run where** — `find /llm/models -name '*.gguf' -size +1G` on each box,
+2026-11-21.  The paths below are the ones to put in the commands; the canonical gfx1201 point (27B **Q8_0**) and
+the 35B-A3B **UD-Q4_K_M** used on the primary box are **not** on either remote, so each session names its model.
 
-| what a gate needs | halo | fingon |
+| arm / gate | halo (gfx1151) | fingon (gfx1100) |
 |---|---|---|
-| **`Qwen3.5/122B-A10B/Q8_0`** (4-way split, ~130 GB > 123 GiB RAM) — `gate-prefill-server-slots.sh`'s `>RAM` shape | **present** | absent |
-| **`Qwen3.8/Flash-Next/GSQ-IQ3_XXS`** — `gate-hc-fusions.sh`'s `MODEL=GSQ-IQ3_XXS` class | `Flash-Next/` present, check the sub-dir | **present** (`GSQ-IQ3_XXS`, `GSQ-RCO-IQ3_S`) |
-| 35B-A3B Q8_0 — the host-expert / pool / MoE arms | `Qwen3.6/35B-A3B` | `Qwen3.6/35B-A3B/Q8_0` |
-| 27B UD-IQ3_S — the dense MMB arm | (check `Qwen3.8/27B`) | **present** |
-| **phi-4** (tight graph shape) — `gate-node-budget.sh` | **absent** | **absent** |
+| **`gate-prefill-server-slots.sh`'s `>RAM` shape** | `Qwen3.5/122B-A10B/Q8_0` — 4 shards, **~200 GB > 123 GiB RAM** ✔ | — (61 GiB RAM, no such model) |
+| block 15's GTT store (`gate-uma-experts.sh`), MoE arms | `Qwen3.6/35B-A3B/F16` (71 GB), `…/BF16` (49.9 GB), `Qwen3.8/Flash-Next/Q4_K_M` (5 shards), `…/5bpw` (100 GB, `_mtp8` variant) | `Qwen3.6/35B-A3B/Q8_0` (37.8 GB), `…/UD-Q5_K_M`, `…/UD-Q4_K_M` (**22.6 GB — the spec-align host-expert model**), `…/IQ4_NL`, `…/IQ3_S` |
+| `gate-hc-fusions.sh` (`GSQ-IQ3_XXS` class) | `Qwen3.8/Flash-Next/Q4_K_M` or `5bpw` (check `hc_attn_down` type first: `--types`) | **`Qwen3.8/Flash-Next/GSQ-IQ3_XXS`** ✔ (and `GSQ-RCO-IQ3_S`) |
+| `gate-qwen4exp-quant-coherence.sh` | `Flash-Next/Q4_K_M` (+ `QSA_ARM=1` on the same file) | `GSQ-IQ3_XXS`, `GSQ-RCO-IQ3_S` |
+| prefill-logit KLD point (`MODEL=…` **must be explicit** on halo: its APU pool is 123 GiB, so the auto-resolve looks for the missing 27B Q8_0) | `MODEL=/llm/models/Qwen3.6/35B-A3B/F16/…` (or a Flash-Next shard 1) | auto-resolve picks `Qwen3.8/27B/Q4_K_M/Qwen3.8-27B-UD-Q4_K_M.gguf` (16.4 GB, its pool is 24 GiB < 28) ✔ |
+| the dense MMB arm (27B) | — | `Qwen3.8/27B/UD-IQ3_S` (12 GB) ✔ |
+| `flint` / `-sm relaxed-tensor` | — | `Flint/Q5_K_XL/flint-UD-Q5_K_XL.gguf` (29.9 GB) ✔ |
+| **phi-4** (`gate-node-budget.sh`) | absent | absent |
 
 So `COLD-START.md` §8's "`gate-prefill-server-slots.sh` needs the 122B >RAM model" is **only** blocked on
 gfx1201: the model is on `halo`, i.e. on the one box where the GTT store is not inert.  `gate-node-budget.sh`
@@ -53,7 +68,7 @@ where block 15's claims are actually decidable.
 | the GTT **store**: one registered `mlock`ed region sized by `-lme`, the MTP head pinned outside that budget | `scripts/gate-uma-experts.sh` (runs `inplace`/`pfcp` arms; the 17/17 text-identical set was green on the primary, its census arms were vacuous there) | `prop.integrated` |
 | the **arena** tier when the budget is below the set (slot storage + LFRU residency + one `pread` into the vacated slot) | same gate, arena arms | idem |
 | the **prefill stream** / IN-PLACE band / admission ladder, incl. on RDNA3_5 UMA the transport ladder starting at the buffered arm | `gate-uma-experts.sh`, `gate-prefill-logits.sh` on this box's own recorded base | idem |
-| the **server** two-slot shape: one slot decoding while the other prefills, on a model that does not fit VRAM or RAM | `scripts/gate-prefill-server-slots.sh` with the **122B-A10B Q8_0** split | the model is here, and it is >RAM on an APU |
+| the **server** two-slot shape: one slot decoding while the other prefills, on a model that does not fit VRAM or RAM | `scripts/gate-prefill-server-slots.sh` with the **122B-A10B Q8_0** split (`Qwen3.5/122B-A10B/Q8_0`, 4 shards, ~200 GB > 123 GiB) | the model is here, and it is >RAM on an APU |
 | RDNA3_5 paths generally: gfx11 GDN chunked kernel, FA band on gfx11, MMQ `swiglu->down` single-lane fold, MMB on gfx1151 | op oracles + coherence + the r138-style A/B | arch coverage |
 
 ### `fingon` (gfx1100, RDNA3) — the arch oracle
@@ -64,7 +79,7 @@ where block 15's claims are actually decidable.
 | the op matrix (`FLASH_ATTN_EXT`, `GATED_DELTA_NET`, `FLASH_ATTN_QSA`, `MUL_MAT`, `MUL_MAT_ID`, `TOP_K_MASK`, `HC_MIX`) + `test-llama-archs` | r138's arch oracle; the r328 re-base moved every one of those dispatch tables |
 | **a second data point for R11.2** — `gate-hc-fusions.sh` on `GSQ-IQ3_XXS` reads here, where r327 anchors exist as a reference build | the red arms on gfx1201 may be RDNA4-specific; one run on gfx1100 separates "the chain moved with the re-base" from "the mixed hc path moved on RDNA4" |
 | the 27B UD-IQ3_S **dense MMB** arm (R06.2's dense half, the pool-stack fix) | RDNA3 exercises a different MMB instance set |
-| the host-expert **pool** (`-lme`, `-ncmoe`, `gate-host-pool.sh` smoke) on a 24 GiB card | a VRAM-starved discrete GPU is the pool's own shape |
+| the host-expert **pool** (`-lme`, `-ncmoe`, `gate-host-pool.sh` smoke) on a 24 GiB card, and `gate-spec-align.sh`'s host-expert arm (its model, `35B-A3B/UD-Q4_K_M` 22.6 GB, is here and not on the primary box) | a VRAM-starved discrete GPU is the pool's own shape |
 
 ## The flow (per box, one session each)
 

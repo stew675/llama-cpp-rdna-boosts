@@ -1,4 +1,4 @@
-From f5bdbefdaac2e5d3744f208518d41b4e8840d960 Mon Sep 17 00:00:00 2001
+From 2f61ec4d6c34e354f69afb1dc1e7f3c6205aee29 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 07/17] rdna-boosts: block 07: k-quant boosts (mmvq VDR, Q6_K
@@ -76,10 +76,10 @@ Co-authored-by: burnoutIA <72673971+burnoutIA@users.noreply.github.com>
  create mode 100644 ggml/src/ggml-cuda/mmvq-wmma.cuh
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 96331e69a..99e5d713e 100644
+index 8344b8782..65ffbac2b 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2403,6 +2403,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2415,6 +2415,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.no_host = true;
          }
      ).set_env("LLAMA_ARG_NO_HOST"));
@@ -114,10 +114,10 @@ index 96331e69a..99e5d713e 100644
          {"-ctk", "--cache-type-k"}, "TYPE",
          string_format(
 diff --git a/common/common.cpp b/common/common.cpp
-index 6429b0d50..e13669356 100644
+index 073ddda82..b71a0b05e 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1776,9 +1776,38 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
+@@ -1781,9 +1781,38 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
      llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
  }
  
@@ -157,10 +157,10 @@ index 6429b0d50..e13669356 100644
          mparams.devices = params.devices.data();
      }
 diff --git a/common/common.h b/common/common.h
-index 223458973..021421293 100644
+index 76cbd8764..c686d1258 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -629,6 +629,12 @@ struct common_params {
+@@ -633,6 +633,12 @@ struct common_params {
      size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
      float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
  
@@ -174,10 +174,10 @@ index 223458973..021421293 100644
  
      // multimodal models (see tools/mtmd)
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 65c0167fb..a66b330be 100644
+index d9a88a56d..5c40713ed 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1329,6 +1329,64 @@ struct ggml_cuda_device_info {
+@@ -1369,6 +1369,64 @@ struct ggml_cuda_device_info {
  
  const ggml_cuda_device_info & ggml_cuda_info();
  
@@ -243,7 +243,7 @@ index 65c0167fb..a66b330be 100644
  int ggml_cuda_get_device();
  
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index ebda26a87..0a08b27a1 100644
+index 2a257c63c..1474537d2 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -37,6 +37,7 @@
@@ -254,7 +254,7 @@ index ebda26a87..0a08b27a1 100644
  #include "ggml-cuda/moe-weighted-reduction.cuh"
  #include "ggml-cuda/mmf32.cuh"
  #include "ggml-cuda/norm.cuh"
-@@ -6572,13 +6573,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6713,13 +6714,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
  
@@ -272,7 +272,7 @@ index ebda26a87..0a08b27a1 100644
          // graph->uid is set only for a compatible graph (see ggml_cuda_graph_update_required), so a reused graph needs no new check
          const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
          const bool graph_compatible = graph_reused || ggml_cuda_graph_check_compability(cgraph);
-@@ -8022,6 +8026,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -8175,6 +8179,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
          return (void *)ggml_backend_cuda_comm_init_rank;
      }
  #endif // GGML_USE_NCCL
@@ -500,7 +500,7 @@ index a75dd046e..29ebe24fa 100644
              }
          }
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 4409530e4..e0b62f387 100644
+index 27f6cefcb..6065f5886 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -138,7 +138,17 @@ static int ggml_cuda_mmq_get_J_best(
@@ -1285,7 +1285,7 @@ index 000000000..a78472231
 +// K-split kernel).  `GGML_CUDA_WMMA_MMVQ` is the contributor's environment alias and wins when it is set.
 +void ggml_cuda_mmvq_wmma_set_min_cols(int n);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index c6d895db4..220850be0 100644
+index 091fc3071..1c3051edd 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,5 @@
@@ -1372,21 +1372,22 @@ index c6d895db4..220850be0 100644
          case GGML_TYPE_IQ2_XXS: return VDR_IQ2_XXS_Q8_1_MMVQ;
          case GGML_TYPE_IQ2_XS:  return VDR_IQ2_XS_Q8_1_MMVQ;
          case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
-@@ -95,8 +118,12 @@ enum mmvq_parameter_table_id {
+@@ -95,9 +118,13 @@ enum mmvq_parameter_table_id {
      MMVQ_PARAMETERS_GCN,
      MMVQ_PARAMETERS_RDNA2,
      MMVQ_PARAMETERS_RDNA3_0,
 +    MMVQ_PARAMETERS_RDNA3_5,
      MMVQ_PARAMETERS_RDNA4,
--    MMVQ_PARAMETERS_GB10
-+    MMVQ_PARAMETERS_GB10,
-+    // halo-hybrid: real RDNA2 (gfx103x). gfx1151 also uses the RDNA2 table above by default (GGML_CUDA_MMVQ_RDNA35),
+     MMVQ_PARAMETERS_GB10,
+-    MMVQ_PARAMETERS_ORIN
++    MMVQ_PARAMETERS_ORIN,
++    // halo-hybrid: real RDNA2 (gfx103x). gfx1151 also uses the RDNA3_5 table above by default (GGML_CUDA_MMVQ_RDNA35),
 +    // so the Navi21 tuning (llama-navi21-furnace 0aa20a02b, b5f65d215, 05512bb1d) gets its own id
 +    MMVQ_PARAMETERS_NAVI21
  };
  
  static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
-@@ -104,7 +131,11 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+@@ -105,7 +132,11 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
      return MMVQ_PARAMETERS_RDNA4;
  #elif defined(RDNA3_0)
      return MMVQ_PARAMETERS_RDNA3_0;
@@ -1399,7 +1400,7 @@ index c6d895db4..220850be0 100644
      return MMVQ_PARAMETERS_RDNA2;
  #elif defined(GCN) || defined(CDNA)
      return MMVQ_PARAMETERS_GCN;
-@@ -124,7 +155,13 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+@@ -127,7 +158,13 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
      if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
          return MMVQ_PARAMETERS_RDNA3_0;
      }
@@ -1414,7 +1415,7 @@ index c6d895db4..220850be0 100644
          return MMVQ_PARAMETERS_RDNA2;
      }
      if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
-@@ -267,7 +304,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+@@ -273,7 +310,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
          case GGML_TYPE_Q3_K:    return 4;
          case GGML_TYPE_Q4_0:    return 7;
          case GGML_TYPE_Q4_1:    return 7;
@@ -1423,7 +1424,7 @@ index c6d895db4..220850be0 100644
          case GGML_TYPE_Q5_0:    return 7;
          case GGML_TYPE_Q5_1:    return 7;
          case GGML_TYPE_Q5_K:    return 5;
-@@ -524,6 +561,24 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+@@ -538,6 +575,24 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
          }
          return 1;
      }
@@ -1448,9 +1449,9 @@ index c6d895db4..220850be0 100644
      if (table_id == MMVQ_PARAMETERS_TURING) {
          if (ncols_dst == 1) {
              switch (type) {
-@@ -572,6 +627,19 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
-         }
-         return generic;
+@@ -589,6 +644,19 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+     if (table_id == MMVQ_PARAMETERS_ORIN) {
+         return calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
      }
 +    // Navi21 (V620, from llama-navi21-furnace): upstream had no RDNA2 entry, so every dispatch ran as one wave32
 +    // workgroup. ncols_dst == 1 wants 4 waves to keep enough loads in flight; the verify shapes carry ncols_dst
@@ -1468,7 +1469,7 @@ index c6d895db4..220850be0 100644
      return 1;
  }
  
-@@ -590,6 +658,28 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
+@@ -607,6 +675,28 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
  }
  
  static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
@@ -1497,7 +1498,7 @@ index c6d895db4..220850be0 100644
      if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
          switch (ncols_dst) {
              case 1:
-@@ -890,10 +980,10 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -942,10 +1032,10 @@ static __global__ void mul_mat_vec_q_moe(
  
      constexpr int qk  = ggml_cuda_type_traits<type>::qk;
      constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -1510,7 +1511,7 @@ index c6d895db4..220850be0 100644
  
      const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
      if (shared_expert) {
-@@ -1576,6 +1666,18 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1628,6 +1718,18 @@ void ggml_cuda_mul_mat_vec_q(
  
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
@@ -2299,10 +2300,10 @@ index d5ff93b91..b7d3fa221 100644
      const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
      return d * sumi;
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 67e61ccd3..9e96dad43 100644
+index 68504d4c9..171809f02 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -12042,6 +12042,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12225,6 +12225,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
@@ -2315,7 +2316,7 @@ index 67e61ccd3..9e96dad43 100644
  #endif
  
      for (ggml_type type_a : all_types) {
-@@ -14070,9 +14076,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -14380,9 +14386,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -2351,7 +2352,7 @@ index 67e61ccd3..9e96dad43 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -14080,8 +14110,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -14390,8 +14420,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  

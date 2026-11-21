@@ -1,26 +1,40 @@
-From cfe40b5f925717ba8f484665323989657a93edcb Mon Sep 17 00:00:00 2001
+From ce4a33ccc6ec73cbcb0cda99eab4e2b72ea31717 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 04/17] rdna-boosts: block 04: BF16 KV cache and native-BF16
  flash attention
 
 Sources: old 03 (whole block).
+
+(r328 re-base) Two conflicts, both with upstream's #32387 (BF16 ROPE/SET_ROWS):
+
+- `rope.cu` is a UNION of complementary dispatch arms: upstream added BF16->BF16 and BF16->F16, the
+  delivery adds F16->BF16 (its F32->BF16 arm merged cleanly), so `rope_multi_cuda` now has all three
+  source types against all three destinations.  No arm was dropped.
+- `ggml-cuda.cu`'s `ggml_cuda_should_fuse_rope_set_rows()` was a real collision, not a text one: upstream
+  added a guard refusing every non-BF16 rope into a BF16 cache (its own matrix only had BF16->{BF16,F16}),
+  which is exactly the fusion this block exists to provide.  With the arms above present, the guard is what
+  would disable the feature, so it is dropped and the outer cache-type list stays as the test.
+
+Verified: text unchanged at f16 and bf16 KV, `test-backend-ops -o ROPE` 515/515, and the fusion is both
+taken and worth having at a bf16 cache -- `GGML_CUDA_DISABLE_FUSION=0` 6786.5 t/s prefill / 88.8 t/s decode
+against 6417.0 / 76.2 with it off (+5.8 % pp, +16.5 % tg), identical text `71 chars sha=1de99b7e6ee6`.
 ---
  ggml/src/ggml-cuda/common.cuh        |  53 +++
  ggml/src/ggml-cuda/fattn-mma-f16.cuh |  30 ++
  ggml/src/ggml-cuda/fattn-tile.cu     |  41 +-
  ggml/src/ggml-cuda/fattn-tile.cuh    | 623 +++++++++++++++++++--------
  ggml/src/ggml-cuda/fattn.cu          |   9 +-
- ggml/src/ggml-cuda/ggml-cuda.cu      |   2 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu      |  10 +-
  ggml/src/ggml-cuda/rope.cu           |  27 +-
  tests/test-backend-ops.cpp           |   8 +-
- 8 files changed, 602 insertions(+), 191 deletions(-)
+ 8 files changed, 606 insertions(+), 195 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 414177308..65c0167fb 100644
+index 053ed60f7..d9a88a56d 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -799,6 +799,59 @@ static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const half2 v,
+@@ -838,6 +838,59 @@ static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const half2 v,
  #endif // V_DOT2_F32_F16_AVAILABLE
  }
  
@@ -81,10 +95,10 @@ index 414177308..65c0167fb 100644
  #ifdef FAST_FP16_AVAILABLE
      acc += v*u;
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index 07a6db842..33856a38a 100644
+index dea8d2ad3..8c19c6217 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-@@ -1054,6 +1054,36 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+@@ -1055,6 +1055,36 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                      cp_async_wait_all();
                  }
                  __syncthreads();
@@ -213,7 +227,7 @@ index accef6315..96c73f268 100644
          default:
              GGML_ABORT("Unsupported head size");
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
-index ba4628fec..6a1e44149 100644
+index 177b2f065..bac70cad5 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cuh
 +++ b/ggml/src/ggml-cuda/fattn-tile.cuh
 @@ -424,9 +424,109 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
@@ -655,7 +669,7 @@ index ba4628fec..6a1e44149 100644
 +    const T_KV * K_h2 = (const T_KV *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
 +    const T_KV * V_h2 = (const T_KV *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
  
-     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
+     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33) + nb32*(head0 % ne32)) : nullptr;
  
 @@ -884,17 +1111,35 @@ static __global__ void flash_attn_tile(
      // KQ == SRAM buffer to hold KQ fragments between KQ and VKQ matrix multiplications.
@@ -1033,7 +1047,7 @@ index ba4628fec..6a1e44149 100644
  static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * KQV  = dst;
      const ggml_tensor * Q    = dst->src[0];
-@@ -1261,12 +1532,12 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -1262,12 +1533,12 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
          // Therefore, use a GQA ratio of 16 with 16 columns / block to stay below 48 kiB of SRAM / block.
  #ifdef GGML_USE_HIP
          if (use_gqa_opt && gqa_ratio % 32 == 0) {
@@ -1048,7 +1062,7 @@ index ba4628fec..6a1e44149 100644
              return;
          }
  #endif // GGML_USE_HIP
-@@ -1275,11 +1546,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -1276,11 +1547,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
  
      if constexpr (DKQ == 576) {
          if (use_gqa_opt && gqa_ratio % 16 == 0) {
@@ -1062,7 +1076,7 @@ index ba4628fec..6a1e44149 100644
              return;
          }
      }
-@@ -1287,11 +1558,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -1288,11 +1559,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
      if constexpr (DKQ == 192) {
          // MiMo-V2.5 / V2.5-Pro / V2-Flash: gqa_ratio is 8 (SWA) or 16 (full attn)
          if (use_gqa_opt && gqa_ratio % 16 == 0) {
@@ -1076,7 +1090,7 @@ index ba4628fec..6a1e44149 100644
              return;
          }
          GGML_ABORT("flash-attn tile (192/128): expected GQA ratio multiple of 8");
-@@ -1299,59 +1570,67 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -1300,59 +1571,67 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
  
      if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
          if (use_gqa_opt && gqa_ratio % 8 == 0) {
@@ -1171,10 +1185,10 @@ index ba4628fec..6a1e44149 100644
 +EXTERN_DECL_FATTN_TILE_CASES(512, 512);
 +EXTERN_DECL_FATTN_TILE_CASES(576, 512);
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index cf44ab4f5..536c8b956 100644
+index 10aa5af15..69bd72fb9 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -796,7 +796,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -798,7 +798,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
      bool need_f16_V = false;
  
      switch (kernel) {
@@ -1191,23 +1205,35 @@ index cf44ab4f5..536c8b956 100644
              need_f16_K = true;
              need_f16_V = true;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index dd6c0bd3e..535cbfbb6 100644
+index 2bac7baf0..95d3ecdc4 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4405,7 +4405,7 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
+@@ -4514,15 +4514,15 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
          return false;
      }
  
--    if (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16) {
-+    if (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16 && set_rows->type != GGML_TYPE_BF16) {
++    // The cache type must be one the rope dispatch has an arm for.  Since r328 that is every pair of
++    // {F32, F16, BF16}: upstream #32387 supplied BF16->{BF16,F16} and the delivery's block 04 supplies
++    // F32->BF16 and F16->BF16.  Upstream also added a guard refusing every non-BF16 rope into a BF16 cache
++    // (its matrix had no such arm); with the arms present the guard is what would disable the fusion, so
++    // the pair test is the outer list below and nothing more.
+     if (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16 && set_rows->type != GGML_TYPE_BF16) {
          return false;
      }
  
+-    // BF16 rope fuses into an F16 or BF16 cache, other ropes not into a BF16 cache
+-    if (rope->type == GGML_TYPE_BF16 ? set_rows->type == GGML_TYPE_F32 : set_rows->type == GGML_TYPE_BF16) {
+-        return false;
+-    }
+-
+     if (set_rows->src[1]->type != GGML_TYPE_I64) {
+         return false;
+     }
 diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
-index 2604d014f..5be431e53 100644
+index 657b58a4d..0cb4f723a 100644
 --- a/ggml/src/ggml-cuda/rope.cu
 +++ b/ggml/src/ggml-cuda/rope.cu
-@@ -222,6 +222,7 @@ static __global__ void rope_multi(const T *            x,
+@@ -225,6 +225,7 @@ static __global__ void rope_multi(const T *            x,
                                    const int64_t *      row_indices,
                                    const int            set_rows_stride,
                                    const bool           inplace) {
@@ -1215,7 +1241,7 @@ index 2604d014f..5be431e53 100644
      const int i0 = 2 * (blockDim.y * blockIdx.y + threadIdx.y);
  
      if (i0 >= ne00) {
-@@ -237,6 +238,13 @@ static __global__ void rope_multi(const T *            x,
+@@ -240,6 +241,13 @@ static __global__ void rope_multi(const T *            x,
      int       idst = i0 / 2 + i1 * s1  + i2 * s2  + i3 * s3;
      const int ix   = i0 / 2 + i1 * s01 + i2 * s02 + i3 * s03;
  
@@ -1229,7 +1255,7 @@ index 2604d014f..5be431e53 100644
      ggml_cuda_pdl_sync();
  
      // Fusion optimization: ROPE + VIEW + SET_ROWS.
-@@ -493,11 +501,13 @@ static void rope_multi_cuda(const T *            x,
+@@ -496,11 +504,13 @@ static void rope_multi_cuda(const T *            x,
          ggml_cuda_kernel_launch(rope_multi<forward, false, T, D>, launch_params,
              x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, n_offs, pos, freq_scale, ext_factor,
              attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope, row_indices, set_rows_stride, inplace);
@@ -1243,9 +1269,9 @@ index 2604d014f..5be431e53 100644
      }
  }
  
-@@ -572,8 +582,8 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
-     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
-     GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
+@@ -575,8 +585,8 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
+     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
+     GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16 ||  dst->type == GGML_TYPE_BF16);
      // When not fused, src0 and dst types must match
 -    // When fused (ROPE+VIEW+SET_ROWS), src0 may be F32 and dst may be F16
 -    GGML_ASSERT(src0->type == dst->type || (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16));
@@ -1254,7 +1280,7 @@ index 2604d014f..5be431e53 100644
  
      const int64_t ne00 = src0->ne[0]; // head dims
      const int64_t ne01 = src0->ne[1]; // num heads
-@@ -664,16 +674,29 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
+@@ -677,11 +687,18 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
                                                     s03, s1, s2, s3, n_dims, n_offs, nr, pos, freq_scale, freq_base,
                                                     ext_factor, attn_factor, corr_dims, freq_factors, sections, is_imrope,
                                                     row_indices, set_rows_stride, inplace, stream);
@@ -1273,8 +1299,10 @@ index 2604d014f..5be431e53 100644
          } else if (src0->type == GGML_TYPE_F16 && dst_type == GGML_TYPE_F16) {
              rope_multi_cuda<forward, half, half>((const half *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02,
                                                   s03, s1, s2, s3, n_dims, n_offs, nr, pos, freq_scale, freq_base,
-                                                  ext_factor, attn_factor, corr_dims, freq_factors, sections, is_imrope,
-                                                  row_indices, set_rows_stride, inplace, stream);
+@@ -697,6 +714,12 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
+                                                         s03, s1, s2, s3, n_dims, n_offs, nr, pos, freq_scale, freq_base,
+                                                         ext_factor, attn_factor, corr_dims, freq_factors, sections, is_imrope,
+                                                         row_indices, set_rows_stride, inplace, stream);
 +
 +        } else if (src0->type == GGML_TYPE_F16 && dst_type == GGML_TYPE_BF16) {
 +            rope_multi_cuda<forward, half, nv_bfloat16>((const half *) src0_d, (nv_bfloat16 *) dst_d, ne00, ne01, ne02, s01,
@@ -1285,10 +1313,10 @@ index 2604d014f..5be431e53 100644
              GGML_ABORT("fatal error");
          }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index d3e14f455..f3d904a9f 100644
+index 8ab21dff7..5a77c293c 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -13043,8 +13043,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13272,8 +13272,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -1299,7 +1327,7 @@ index d3e14f455..f3d904a9f 100644
              if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
              if (hsk ==  96 && (hsv !=  64 && hsv !=  96)) continue; // MiniCPM3
              if (hsk == 192 && (hsv != 128 && hsv != 192)) continue;
-@@ -13074,7 +13074,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13303,7 +13303,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                  for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_BF16, GGML_PREC_UNDEFINED}) {
                                                      if (hsk != 128 && prec != GGML_PREC_F32) continue;
                                                      for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {

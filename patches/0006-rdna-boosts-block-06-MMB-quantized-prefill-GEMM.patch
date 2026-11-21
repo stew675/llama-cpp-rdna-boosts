@@ -1,4 +1,4 @@
-From f0564df7d29e991dc57653db87e18077fc4184fd Mon Sep 17 00:00:00 2001
+From 3b9f190b64dddf67cbdb10db960b8009fde81940 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 06/17] rdna-boosts: block 06: MMB quantized prefill GEMM
@@ -15,7 +15,7 @@ Validated: build green; MMB_DENSE fires (GGML_CUDA_MMB_LOG=1: `MMB_CFG ... dense
 routed=0 ...`, `MMB_DENSE blk.0.ffn_gate_inp.weight type=f32 M=128 K=2048 T=512`);
 `GGML_CUDA_MMB=0` byte-identical (108 chars, sha d94aef3f5033) on Qwen3-Coder-30B-A3B.
 ---
- ggml/src/ggml-cuda/ggml-cuda.cu   |   55 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu   |   57 +-
  ggml/src/ggml-cuda/mmb.cu         | 2436 +++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/mmb.cuh        |   32 +
  ggml/src/ggml-cuda/mmf.cu         |    2 +-
@@ -26,7 +26,7 @@ routed=0 ...`, `MMB_DENSE blk.0.ffn_gate_inp.weight type=f32 M=128 K=2048 T=512`
  ggml/src/ggml-cuda/mmq.cu         |    2 +-
  tests/CMakeLists.txt              |    1 +
  tests/test-logits-width-probe.cpp |  196 +++
- 11 files changed, 3000 insertions(+), 16 deletions(-)
+ 11 files changed, 3001 insertions(+), 17 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/mmb.cu
  create mode 100644 ggml/src/ggml-cuda/mmb.cuh
  create mode 100644 ggml/src/ggml-cuda/mmf32.cu
@@ -34,7 +34,7 @@ routed=0 ...`, `MMB_DENSE blk.0.ffn_gate_inp.weight type=f32 M=128 K=2048 T=512`
  create mode 100644 tests/test-logits-width-probe.cpp
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 72f3cab87..ebda26a87 100644
+index 7c1ed1032..2a257c63c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -32,11 +32,13 @@
@@ -51,7 +51,7 @@ index 72f3cab87..ebda26a87 100644
  #include "ggml-cuda/norm.cuh"
  #include "ggml-cuda/opt-step-adamw.cuh"
  #include "ggml-cuda/opt-step-sgd.cuh"
-@@ -903,6 +905,7 @@ static std::condition_variable ggml_cuda_lock_cv;
+@@ -979,6 +981,7 @@ static std::condition_variable ggml_cuda_lock_cv;
  static std::atomic<int> ggml_cuda_lock_counter;
  
  ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -59,7 +59,7 @@ index 72f3cab87..ebda26a87 100644
      std::unique_lock<std::mutex> lock(ggml_cuda_lock);
      ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
  
-@@ -2961,6 +2964,18 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -3043,6 +3046,18 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
      // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
      //     probably because the internal kernel selection logic is suboptimal.
      if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
@@ -78,7 +78,7 @@ index 72f3cab87..ebda26a87 100644
          CUBLAS_CHECK(
              cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                      ne01, ne11, ne10,
-@@ -3470,8 +3485,21 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -3560,8 +3575,21 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
      const int cc        = ggml_cuda_info().devices[ctx.device].cc;
      const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
  
@@ -102,8 +102,15 @@ index 72f3cab87..ebda26a87 100644
          // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
          ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
          return;
-@@ -3584,6 +3612,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -3682,11 +3710,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
              }
+         }
+ 
++        // upstream's few-row MMQ (#32065) is NVIDIA-only (mmq-few.cu is compiled out under HIP), and MMB is
++        // RDNA-only, so the two predicates are disjoint by backend; upstream's keeps its precedence.
+         if (use_mmq_few) {
+             ggml_cuda_mul_mat_q_few(ctx, src0, src1, ids, dst);
+             return;
          }
  
 +        if (ggml_cuda_mmb_supported_mmid(src0, src1, ids, dst)) {
@@ -114,7 +121,7 @@ index 72f3cab87..ebda26a87 100644
          if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
              ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
              return;
-@@ -5895,6 +5928,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -6024,6 +6059,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              const ggml_tensor * src1 = up->src[1];
              const ggml_tensor * ids  = up->src[2];
  
@@ -129,7 +136,7 @@ index 72f3cab87..ebda26a87 100644
              if (ggml_cuda_should_fuse_mul_mat_vec_f(up, gate)) {
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate->src[0];
-@@ -6525,6 +6566,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6664,6 +6707,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_set_device(cuda_ctx->device);
  
@@ -138,7 +145,7 @@ index 72f3cab87..ebda26a87 100644
      bool use_cuda_graph             = false;
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
-@@ -6613,6 +6656,14 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+@@ -6752,6 +6797,14 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
  static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
@@ -2634,10 +2641,10 @@ index 000000000..fd8085897
 +void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
 +void ggml_cuda_mmb_release_all();
 diff --git a/ggml/src/ggml-cuda/mmf.cu b/ggml/src/ggml-cuda/mmf.cu
-index e6d89ef53..34c8a6c2e 100644
+index 396ad1c11..be685930a 100644
 --- a/ggml/src/ggml-cuda/mmf.cu
 +++ b/ggml/src/ggml-cuda/mmf.cu
-@@ -86,7 +86,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
+@@ -85,7 +85,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
  
          GGML_ASSERT(sis1 > 0);
  
@@ -2905,99 +2912,93 @@ index 000000000..0f31d5e4f
 +void ggml_cuda_mul_mat_f32_skinny(ggml_backend_cuda_context & ctx, int64_t m, int64_t n, int64_t k,
 +                                  int64_t ldc, const float * x, const float * y, float * dst);
 diff --git a/ggml/src/ggml-cuda/mmid.cu b/ggml/src/ggml-cuda/mmid.cu
-index 82ce457cd..a47019df0 100644
+index 234fcb4ee..be66e8dc1 100644
 --- a/ggml/src/ggml-cuda/mmid.cu
 +++ b/ggml/src/ggml-cuda/mmid.cu
-@@ -41,7 +41,8 @@ __device__ static void mm_ids_write_tile_spec(
- __launch_bounds__(1024, 1)
- static __global__ void mm_ids_helper_512_10(
+@@ -103,8 +103,8 @@ static __device__ __forceinline__ void mm_ids_write_tile_spec(
+ template <int n_expert_used_template>
+ __launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mm_ids_helper(
+-        const int32_t * __restrict__ ids,
+-        int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
++        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
++        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, int32_t * __restrict__ expert_bounds,
+         const int n_tokens, const int n_expert_used_var, const int nchannels_y, const uint3 tile_width,
+         const int si1, const int sis1, const bool write_inverse, const int ne_store) {
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+@@ -246,6 +246,14 @@ static __global__ void mm_ids_helper(
+     }
+ 
+     mm_ids_write_tile_spec(tile_spec, expert, nex_prev, n_dumped, tile_width, n_tokens, n_expert_used);
++    if (expert_bounds) {
++        // block 06 (MMB): per-expert compact-range bounds, [n_experts + 1] int32, a second reader of this
++        // pass so MMQ/MMF (tile_spec) and MMB (bounds) share one compaction.
++        expert_bounds[expert] = nex_prev;
++        if (expert == static_cast<int>(gridDim.x) - 1) {
++            expert_bounds[gridDim.x] = nex_prev + n_dumped;
++        }
++    }
+ }
+ 
+ // Replace the `n_experts` one-warp expert blocks of the helper with ONE 1024-thread block for the
+@@ -258,7 +266,8 @@ static __global__ void mm_ids_helper(
+ // gets its own compact row, which is why the scatter is per (token, iex) slot and not per token.
+ static __global__ void __launch_bounds__(1024) mm_ids_helper_512_10(
          const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
 -        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, const int n_tokens, const int nchannels_y,
 +        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, int32_t * __restrict__ expert_bounds,
 +        const int n_tokens, const int nchannels_y,
          const uint3 tile_width, const int si1, const int sis1, const bool write_inverse) {
-     __shared__ int counts[512];
-     __shared__ int cursors[512];
-@@ -88,6 +89,12 @@ static __global__ void mm_ids_helper_512_10(
+     constexpr int n_experts    = 512;
+     constexpr int n_expert_used = 10;
+@@ -308,13 +317,22 @@ static __global__ void __launch_bounds__(1024) mm_ids_helper_512_10(
  
-     if (tid < 512) {
-         mm_ids_write_tile_spec(tile_spec, tid, counts[tid], cursors[tid], tile_width, n_tokens, 10);
+     if (tid < n_experts) {
+         mm_ids_write_tile_spec(tile_spec, tid, counts[tid], cursors[tid], tile_width, n_tokens, n_expert_used);
 +        if (expert_bounds) {
++            // block 06 (MMB): counts[] holds the compact-row start, cursors[] the occurrence count
 +            expert_bounds[tid] = counts[tid];
-+            if (tid == 511) {
-+                expert_bounds[512] = counts[511] + cursors[511];
++            if (tid == n_experts - 1) {
++                expert_bounds[n_experts] = counts[n_experts - 1] + cursors[n_experts - 1];
 +            }
 +        }
      }
++
  }
  
-@@ -117,7 +124,7 @@ template <int n_expert_used_template>
- __launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
- static __global__ void mm_ids_helper(
-         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
--        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
-+        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, int32_t * __restrict__ expert_bounds,
-         const int n_tokens, const int n_expert_used_var, const int nchannels_y, const uint3 tile_width,
-         const int si1, const int sis1, const bool write_inverse) {
-     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-@@ -167,6 +174,12 @@ static __global__ void mm_ids_helper(
- 
-         if (lane == 0) {
-             mm_ids_write_tile_spec(tile_spec, expert, nex_prev, it_compact, tile_width, n_tokens, n_expert_used);
-+            if (expert_bounds) {
-+                expert_bounds[expert] = nex_prev;
-+                if (expert == static_cast<int>(gridDim.x) - 1) {
-+                    expert_bounds[gridDim.x] = nex_prev + it_compact;
-+                }
-+            }
-         }
-         return;
-     }
-@@ -228,6 +241,12 @@ static __global__ void mm_ids_helper(
- 
-     if (threadIdx.x == 0) {
-         mm_ids_write_tile_spec(tile_spec, expert, nex_prev, it_compact, tile_width, n_tokens, n_expert_used);
-+        if (expert_bounds) {
-+            expert_bounds[expert] = nex_prev;
-+            if (expert == static_cast<int>(gridDim.x) - 1) {
-+                expert_bounds[gridDim.x] = nex_prev + it_compact;
-+            }
-+        }
-     }
- }
- 
-@@ -235,6 +254,7 @@ template <int n_expert_used_template>
+ template <int n_expert_used_template>
  static void launch_mm_ids_helper(
          const int32_t * __restrict__ ids,
          int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
 +        int32_t * __restrict__ expert_bounds,
          const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int tile_width,
          const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
-     GGML_ASSERT((int64_t) n_tokens * n_expert_used_var < (int64_t) 1 << 31);
-@@ -247,11 +267,12 @@ static void launch_mm_ids_helper(
-     const dim3 num_blocks(n_experts, 1, 1);
-     const dim3 block_size(warp_size, 1, 1);
-     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, 0, stream>>>
--        (ids, ids_src1, ids_dst, tile_spec, n_tokens, n_expert_used_var, nchannels_y, tile_width_fd, si1, sis1, write_inverse);
-+        (ids, ids_src1, ids_dst, tile_spec, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, tile_width_fd, si1, sis1, write_inverse);
+     GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
+@@ -334,12 +352,13 @@ static void launch_mm_ids_helper(
+     const size_t nbytes_shared = nbytes_store_core + ne_shared_pad * sizeof(mm_ids_helper_store);
+     const size_t ne_store = nbytes_shared / sizeof(mm_ids_helper_store);
+     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
+-        (ids, ids_src1, ids_dst, tile_spec, n_tokens, n_expert_used_var, nchannels_y, tile_width_fd, si1, sis1, write_inverse, ne_store);
++        (ids, ids_src1, ids_dst, tile_spec, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, tile_width_fd, si1, sis1, write_inverse, ne_store);
  }
  
  void ggml_cuda_launch_mm_ids_helper(
-         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
+         const int32_t * __restrict__ ids,
+         int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
 +        int32_t * __restrict__ expert_bounds,
          const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int tile_width,
          const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
-     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -263,7 +284,7 @@ void ggml_cuda_launch_mm_ids_helper(
-     if ((GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) && n_experts == 512 && n_expert_used == 10 && !mmid_512_disabled) {
-         const uint3 tile_width_fd = init_fastdiv_values(tile_width);
-         mm_ids_helper_512_10<<<1, 1024, 0, stream>>>(
--            ids, ids_src1, ids_dst, tile_spec, n_tokens, nchannels_y, tile_width_fd, si1, sis1, write_inverse);
-+            ids, ids_src1, ids_dst, tile_spec, expert_bounds, n_tokens, nchannels_y, tile_width_fd, si1, sis1, write_inverse);
-         return;
-     }
- 
-@@ -271,35 +292,35 @@ void ggml_cuda_launch_mm_ids_helper(
+     // The 512-expert / 10-used fast path (block 00): one 1024-thread block instead of 512 one-warp expert
+@@ -350,7 +369,7 @@ void ggml_cuda_launch_mm_ids_helper(
+         if (!mmid_512_disabled && (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) &&
+                 n_experts == 512 && n_expert_used == 10) {
+             mm_ids_helper_512_10<<<1, 1024, 0, stream>>>(
+-                ids, ids_src1, ids_dst, tile_spec, n_tokens, nchannels_y, init_fastdiv_values(tile_width),
++                ids, ids_src1, ids_dst, tile_spec, expert_bounds, n_tokens, nchannels_y, init_fastdiv_values(tile_width),
+                 si1, sis1, write_inverse);
+             return;
+         }
+@@ -358,35 +377,35 @@ void ggml_cuda_launch_mm_ids_helper(
  
      switch (n_expert_used) {
          case  2:
@@ -3053,7 +3054,7 @@ index dc878a71c..2524ae403 100644
          const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int tile_width,
          const int si1, const int sis1, const bool write_inverse, cudaStream_t stream);
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 2e6199766..4409530e4 100644
+index c9bcbc2aa..27f6cefcb 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -334,7 +334,7 @@ void ggml_cuda_mul_mat_q(
@@ -3066,7 +3067,7 @@ index 2e6199766..4409530e4 100644
          CUDA_CHECK(cudaGetLastError());
      }
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index b2c99b356..aa3f72882 100644
+index 3c9224104..b18f92a02 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -181,6 +181,7 @@ set(LLAMA_CONTEXT_TEST_SRC

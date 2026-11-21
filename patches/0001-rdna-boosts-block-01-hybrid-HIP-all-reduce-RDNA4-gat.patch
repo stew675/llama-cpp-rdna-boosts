@@ -1,4 +1,4 @@
-From a94e2214c4fa1f7f1a2ab4e3da32ad46cdb4f3e1 Mon Sep 17 00:00:00 2001
+From 65a855dad53b6b412808d6012eca70d38c84e849 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 01/17] rdna-boosts: block 01: hybrid HIP all-reduce
@@ -35,12 +35,18 @@ unknown-value branch, i.e. it silently disabled the comm layer (~5 % of a
 two-phase form.
 
 Co-authored-by: briansp2020 <bsp2020@gmail.com>
+
+(r328 re-base) One rung repair: `ggml_cuda_ce_xor` called `__shfl_xor_sync(0xffffffff, v, m, 32)` directly,
+which no longer compiles on HIP -- upstream #31617 introduced the typed `ggml_cuda_thread_mask_t` and HIP's
+`amd_warp_sync_functions.h` static_asserts a 64-bit mask.  It now calls upstream's `ggml_cuda_shfl_xor(v, m,
+32)`, whose default mask is `GGML_CUDA_FULL_THREAD_MASK` -- the same all-lanes mask at the physical warp size,
+with the same width-32 partition, so the kernel is unchanged in behaviour.
 ---
  ggml/src/ggml-cuda/allreduce-hip.cu | 1795 +++++++++++++++++++++++++++
  ggml/src/ggml-cuda/allreduce.cu     |   27 +-
  ggml/src/ggml-cuda/allreduce.cuh    |   21 +
- ggml/src/ggml-cuda/ggml-cuda.cu     | 1106 ++++++++++++++++-
- 4 files changed, 2900 insertions(+), 49 deletions(-)
+ ggml/src/ggml-cuda/ggml-cuda.cu     | 1107 ++++++++++++++++-
+ 4 files changed, 2901 insertions(+), 49 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/allreduce-hip.cu
 
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
@@ -1924,10 +1930,10 @@ index 76205d323..a2e1f41dd 100644
 +void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
 +                                 const float * data, int64_t count);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 409269f17..3418faf81 100644
+index 62e90f448..dd42b3674 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -1294,26 +1294,149 @@ struct ggml_backend_cuda_comm_context {
+@@ -1375,26 +1375,149 @@ struct ggml_backend_cuda_comm_context {
      // Number of ranks taking part in the reduction. For a communicator from comm_init_rank this is
      // world_size. Otherwise it is the number of backends this process holds. The NCCL reduction
      // uses it to choose the tensor size below which it reduces in F32 rather than converting to
@@ -2079,7 +2085,7 @@ index 409269f17..3418faf81 100644
  // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
  // tensors (bandwidth-bound), then converts back to FP32.
  static bool ggml_backend_cuda_comm_allreduce_nccl(
-@@ -1334,9 +1457,19 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
+@@ -1415,9 +1538,19 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
          GGML_ASSERT(ggml_is_contiguously_allocated(tensors[i]));
      }
  
@@ -2100,7 +2106,7 @@ index 409269f17..3418faf81 100644
          for (size_t i = 0; i < n_backends; ++i) {
              if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                  ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-@@ -1344,12 +1477,18 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
+@@ -1425,12 +1558,18 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
                  CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
              }
          }
@@ -2122,7 +2128,7 @@ index 409269f17..3418faf81 100644
          return true;
      }
  
-@@ -1372,12 +1511,18 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
+@@ -1453,12 +1592,18 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
          CUDA_CHECK(cudaGetLastError());
      }
  
@@ -2144,7 +2150,7 @@ index 409269f17..3418faf81 100644
  
      for (size_t i = 0; i < n_backends; ++i) {
          ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-@@ -1398,7 +1543,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
+@@ -1479,7 +1624,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
      GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
  
      const size_t n_backends = comm_ctx->backends.size();
@@ -2153,7 +2159,7 @@ index 409269f17..3418faf81 100644
      GGML_ASSERT(tensors[0] != nullptr);
  
      const int64_t   ne   = ggml_nelements(tensors[0]);
-@@ -1478,29 +1623,31 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
+@@ -1559,29 +1704,31 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
      ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
  }
  
@@ -2195,7 +2201,7 @@ index 409269f17..3418faf81 100644
      }
  
      const size_t n = ret->dev_ids.size();
-@@ -1508,26 +1655,822 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
+@@ -1589,26 +1736,823 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
      ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
      if (rc == ncclSuccess) {
          ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
@@ -2269,8 +2275,9 @@ index 409269f17..3418faf81 100644
 +    return ggml_cuda_xor_lane<m>(v);
 +#else
 +    // width 32 partitions a wave (32 or 64 lanes) into 32-lane groups, which is the mapping the
-+    // kernels below use: `lane = threadIdx.x % 32`.
-+    return __shfl_xor_sync(0xffffffff, v, m, 32);
++    // kernels below use: `lane = threadIdx.x % 32`.  The mask comes from upstream's typed helper: HIP's
++    // `__shfl_*_sync` now static_asserts a 64-bit mask, so a literal 0xffffffff does not compile (r328).
++    return ggml_cuda_shfl_xor(v, m, 32);
 +#endif
 +}
 +
@@ -2279,8 +2286,7 @@ index 409269f17..3418faf81 100644
 +    const float o = ggml_cuda_ce_xor<m>(v);
 +    return (lane & m) ? (o - v) : (v + o);
 +}
- 
--    ggml_backend_cuda_comm_init_internal(ret);
++
 +// One normalized 32-point Walsh-Hadamard transform, five butterflies.  Its own inverse: each step is an
 +// involution that doubles the value, and 2^5/32 = 1.
 +static __device__ __forceinline__ float ggml_cuda_ce_fwht32(float v, int lane) {
@@ -2290,12 +2296,8 @@ index 409269f17..3418faf81 100644
 +    v = ggml_cuda_ce_fwht_step<8>(v, lane);
 +    v = ggml_cuda_ce_fwht_step<16>(v, lane);
 +    return v * 0.17677669529663687f; // 1/sqrt(32)
- }
- 
--// Top-level init.  Picks one of the three init paths based on
--// GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
--// any fallback.  Unrecognised env values warn and fall through to the
--// platform default.
++}
++
 +// Quantize the 32 values held by one lane group into one q8_0 block, with the scale rounded to fp16
 +// FIRST so that the dequantize side of the same block sees exactly the scale the quantize side used.
 +static __device__ __forceinline__ void ggml_cuda_ce_q8_store(float v, block_q8_0 * __restrict__ dst, int lane) {
@@ -2775,7 +2777,8 @@ index 409269f17..3418faf81 100644
 +        CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_out[i], s));
 +        CUDA_CHECK(cudaGetLastError());
 +    }
-+
+ 
+-    ggml_backend_cuda_comm_init_internal(ret);
 +    return true;
 +}
 +
@@ -2838,8 +2841,12 @@ index 409269f17..3418faf81 100644
 +    }
 +    ret->try_allreduce = ggml_backend_cuda_comm_allreduce_ce;
 +    return true;
-+}
-+
+ }
+ 
+-// Top-level init.  Picks one of the three init paths based on
+-// GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
+-// any fallback.  Unrecognised env values warn and fall through to the
+-// platform default.
 +// Copy-engine first chain (the Linux/HIP default since r165): the internal host-staged pipeline for
 +// latency-bound small tensors plus the copy-engine (SDMA) arm for bandwidth-bound large ones, and
 +// **RCCL is not brought up at all**.  The per-size routing is the same one the hybrid chain uses
@@ -3027,7 +3034,7 @@ index 409269f17..3418faf81 100644
  static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
      for (size_t i = 0; i < n_backends; i++) {
          if (!ggml_backend_is_cuda(backends[i])) {
-@@ -1543,27 +2486,58 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
+@@ -1624,27 +2568,58 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
      }
  
      const char * env = getenv("GGML_CUDA_ALLREDUCE");
@@ -3098,7 +3105,7 @@ index 409269f17..3418faf81 100644
      return ret;
  }
  
-@@ -1651,14 +2625,47 @@ static void * ggml_backend_cuda_comm_init_rank(ggml_backend_t backend, int rank,
+@@ -1732,14 +2707,47 @@ static void * ggml_backend_cuda_comm_init_rank(ggml_backend_t backend, int rank,
  }
  #endif // GGML_USE_NCCL
  
@@ -3148,7 +3155,7 @@ index 409269f17..3418faf81 100644
  }
  
  // host buffer type
-@@ -5371,6 +6378,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5509,6 +6517,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
  #ifdef USE_CUDA_GRAPH
          if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture

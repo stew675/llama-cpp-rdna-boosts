@@ -1,4 +1,4 @@
-From e29d769be11f00ff588321d9b3d093caa35157c8 Mon Sep 17 00:00:00 2001
+From 2136c0914bc25adf4801b6e85811b848f343cfbc Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Mon, 16 Nov 2026 23:43:27 -0600
 Subject: [PATCH 16/17] rdna-boosts: block 16: the server's prompt admission
@@ -42,10 +42,10 @@ is 137 tokens per 2.18 s at -ib 512 against 69 per 1.48 s at -ib 2048 (worst gap
  3 files changed, 367 insertions(+), 2 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 5f4d1eb0e..3289ade67 100644
+index 19f2310c0..42ecb183d 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2628,6 +2628,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2640,6 +2640,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.cont_batching = value;
          }
      ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
@@ -70,10 +70,10 @@ index 5f4d1eb0e..3289ade67 100644
          {"-mm", "--mmproj"}, "FILE",
          "path to a multimodal projector file. see tools/mtmd/README.md\n"
 diff --git a/common/common.h b/common/common.h
-index 732cce56f..6736a6d34 100644
+index f166fe37c..6a49f1017 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -758,6 +758,16 @@ struct common_params {
+@@ -762,6 +762,16 @@ struct common_params {
      int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
      bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
  
@@ -91,10 +91,10 @@ index 732cce56f..6736a6d34 100644
      bool        server_connect      = false;
      std::string server_connect_code = "";
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 53ed1c794..54774f70c 100644
+index b14c0eb37..60d3feec3 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -1146,6 +1146,81 @@ private:
+@@ -1165,6 +1165,81 @@ private:
  
      int n_empty_consecutive = 0;
  
@@ -176,7 +176,7 @@ index 53ed1c794..54774f70c 100644
      std::unique_ptr<server_prompt_cache> prompt_cache;
  
      // LLAMA_SERVER_LAZY_IDLE_SLOTS (on unless 0): with a unified KV cache, an idle slot keeps its context when a new task
-@@ -1396,6 +1471,32 @@ private:
+@@ -1419,6 +1494,32 @@ private:
  
      // load the model and initialize llama_context
      // this may also be called to resume from sleeping state
@@ -209,7 +209,7 @@ index 53ed1c794..54774f70c 100644
      bool load_model(common_params & params) {
          load_progress_data load_progress_text  (this, "text_model");
          load_progress_data load_progress_mmproj(this, "mmproj_model");
-@@ -1408,6 +1509,8 @@ private:
+@@ -1431,6 +1532,8 @@ private:
          params_base.n_outputs_max = output_limits.total;
          params_base.n_outputs_max_per_seq = output_limits.per_seq;
  
@@ -218,7 +218,7 @@ index 53ed1c794..54774f70c 100644
          const bool has_mmproj = !params.mmproj.path.empty();
          const bool has_draft = params.speculative.has_dft() && params.speculative.uses_dft();
          const bool spec_mtp = params_base.speculative.has_mtp();
-@@ -1676,6 +1779,15 @@ private:
+@@ -1704,6 +1807,15 @@ private:
          SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                  params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
  
@@ -234,7 +234,7 @@ index 53ed1c794..54774f70c 100644
          // initialize slots
          for (int i = 0; i < params_base.n_parallel; i++) {
              slots.emplace_back();
-@@ -2177,6 +2289,119 @@ private:
+@@ -2131,6 +2243,119 @@ private:
          }
      }
  
@@ -354,7 +354,7 @@ index 53ed1c794..54774f70c 100644
      // return true if at least one slot has been cleared
      // TODO: improve logic
      //       - smarter decision which slot to clear (LRU or longest prompt?)
-@@ -4325,6 +4550,101 @@ private:
+@@ -4287,6 +4512,101 @@ private:
          auto & alora_scale       = batch.alora_scale;
          auto & alora_disabled_id = batch.alora_disabled_id;
  
@@ -456,7 +456,7 @@ index 53ed1c794..54774f70c 100644
          // next, batch any pending prompts without exceeding n_batch
          if (params_base.cont_batching || batch.size() == 0) {
              bool add_ok = true; // false means the batch is full, skip remaining slots
-@@ -4338,6 +4658,13 @@ private:
+@@ -4300,6 +4620,13 @@ private:
                      return;
                  }
  
@@ -470,7 +470,7 @@ index 53ed1c794..54774f70c 100644
                  // check if we can batch this slot with the previous one
                  if (slot_batched && !slot_batched->can_batch_with(slot)) {
                      return;
-@@ -4827,8 +5154,12 @@ private:
+@@ -4759,8 +5086,12 @@ private:
  
                      const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
  
@@ -485,7 +485,7 @@ index 53ed1c794..54774f70c 100644
                          // get next token to process
                          llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                          if (cur_tok == LLAMA_TOKEN_NULL) {
-@@ -4901,6 +5232,9 @@ private:
+@@ -4836,6 +5167,9 @@ private:
                      // the number of tokens added to the batch for the current slot
                      const auto n_tokens_cur = batch.size() - n_tokens_prev;
  
@@ -495,14 +495,14 @@ index 53ed1c794..54774f70c 100644
                      const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
  
                      const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
-@@ -4960,6 +5294,10 @@ private:
+@@ -4900,6 +5234,10 @@ private:
                  }
              });
          }
 +
 +        // a step counts as a prefill step for the stretch budget only if it really carried prompt tokens: a
 +        // prefill_now step with nothing left to place is a decode-only step and its duration is not a budget
-+        prefill_step_prev = prefill_now && batch.size() > n_batch_decode;
++        prefill_step_prev = prefill_now && (size_t) batch.size() > n_batch_decode;
      }
  
      // see https://github.com/ggml-org/llama.cpp/pull/29969

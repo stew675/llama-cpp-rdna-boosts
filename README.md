@@ -10,8 +10,8 @@ support, and an attention-memory campaign that frees several GiB of VRAM.
 [`ENVIRONMENT.md`](ENVIRONMENT.md) documents every variable the set adds or repoints: its default, and
 whether it is a kill-switch (default-on, set to disable), an opt-in, a tuning value, or a diagnostic.
 
-It ships as **17 default patches** for a clean llama.cpp checkout at the fork point **`4f9dfa0e3`**
-(upstream master): the **17 official supported blocks `0000`-`0016`** plus the **temporary block
+It ships as **18 default patches** for a clean llama.cpp checkout at the fork point **`919794500`**
+(upstream master, the 2026-11-20 re-base): the **17 official supported blocks `0000`-`0016`** plus the **temporary block
 `0300`**, which is applied last.  Each block is one `git am` commit, and the series is linear (a block
 assumes its predecessors), so the set is applied whole.  **Block `0300` is temporary** -- a local
 `-sm relaxed-tensor` relaxation for the MoE amax architectures, kept separate so it can be dropped; see
@@ -20,7 +20,7 @@ and treat it as a stop-gap, not a feature.  Two further blocks are **optional** 
 default set: `0100` (two-lane prefill) and `0101` (mixed K/V cache types), applied only with
 `--include-optional` (see [`optional/README.md`](optional/README.md)).  The release `v<N>-...` prefix is
 the **official** block count (`N` = 17); `0300` and the optional blocks are not counted.  The current
-release is **`v17-4f9dfa0e3-r323`** (read `.release` in `release.json` -- it is the source of truth, not this
+release is **`v17-919794500-r328`** (read `.release` in `release.json` -- it is the source of truth, not this
 line): the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
@@ -29,15 +29,15 @@ not the changelog.
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 4f9dfa0e3
-bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (17 commits)
+git checkout 919794500
+bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts (18 commits)
 
 # OPT-IN, not part of the delivery: optional artifacts on top (NOT the release tree)
 bash <path-to-this-repo>/scripts/apply-all.sh --include-optional .       # asks [y/N] per artifact
 bash <path-to-this-repo>/scripts/apply-all.sh --include-optional-all .   # every artifact, no prompt
 
 # OPT-IN, not part of the delivery: a beta candidate on top (NOT the release tree -- beta testing only)
-bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 17 default blocks + beta/*/*.patch
+bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 18 default blocks + beta/*/*.patch
 ```
 
 - One-line summary of each block: [The blocks](#the-blocks)
@@ -428,7 +428,7 @@ Applying the 17 default patches to the fork point in [`release.json`](release.js
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 4f9dfa0e3          # the base recorded in release.json
+git checkout 919794500          # the base recorded in release.json
 bash <path-to-this-repo>/scripts/apply-all.sh .   # 17/17 strict, tree checked against release.json
 ```
 

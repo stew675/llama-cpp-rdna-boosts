@@ -26,7 +26,8 @@ are in the PRs; this file records what *this repo* verified, what it measures he
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
   `1ffa60a9d2f8165ab1457bd85be50c51f7f8c190339a6c4b1d574e5f904b0945` (the r327 cut -- every re-cut moves the exported commit
   and the hunk offsets, see below; every earlier cut is recorded below)
-* **r327 re-cut verification (current)**: applies strictly at the r327 default tree `4792f98b82a4c6433bf11c629fdf01c21a143ce9` (sha256
+* **r328 re-cut verification (current)**: applies strictly at the r328 default tree `0c46248f7371a0eee84a980a1e16ad25a6fbd38f` (sha256 `e0d090d5c01463385db2bb21838aa504bbf821b0295131eba165a12d8033401a`), producing tree `931a0f8b8bc2ae50fb8328eeac105d1897f5f412`; with the other optional artifact on top, the cumulative tree is `fd9d60abd56d6d8060cd2856ea0d8f30afddf06d`.  The re-cut is **mechanical**: the patch applied with `git apply -3` on the re-based default tree with nothing to reconcile, so the artifact's own mechanisms are unchanged and the r327 numbers below stand.  Verified on the optional-applied build at r328:  it builds, the default path is unchanged (coherence `1c5d32ac537d`), and its lane knob defaults off (`prefill_lanes = 1`).
+* **r327 re-cut verification**: applies strictly at the r327 default tree `4792f98b82a4c6433bf11c629fdf01c21a143ce9` (sha256
   `1ffa60a9d2f8165ab1457bd85be50c51f7f8c190339a6c4b1d574e5f904b0945`), producing tree `410b6f1b16926d53a6a95f340bfb876cb2411a19`; with the other optional artifact on top, the cumulative tree is
   `8c1e74631c653862c3f2da5968042ec0cbba99f0`.  r327 amends **block 10** with one packed FA KV-group bitmap per graph evaluation
   (`GGML_CUDA_FA_KQ_BLOCKS_REUSE`, opt-in; `ggml-cuda.cu` gains two lines in the context destructor and

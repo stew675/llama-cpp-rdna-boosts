@@ -1,4 +1,4 @@
-From de99fa2d03632f49e19e5c088dd944e7f4fefc56 Mon Sep 17 00:00:00 2001
+From e46488ed555ed0d3f2da4af5cc4f0722278e9744 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 19 Nov 2026 18:21:41 -0600
 Subject: [PATCH 00/17] rdna-boosts: block 00: foundation - band-uniformity,
@@ -18,16 +18,16 @@ Groundwork block (multiple base-level concerns, by design):
 Sources: old 00, 05, 07, 09a(compute headroom), 06(readback), 15(W4).
 
 Also carries two generic upstream foundation changes:
-- the upstream MUL_MAT_ID duplicate-ids fix (upstream/UPSTREAM-PR-mul-mat-id-dup.patch,
-  re-cut against the post-#31047 tile_spec grid): mm_ids_helper keeps every occurrence of a
-  repeated expert id as its own compact row.  The compact column count is then exactly
-  n_tokens*n_expert_used, so every column has its own tile_spec entry and upstream's per-tile
-  grid covers the expanded list -- the in-kernel column-tile loop this fix used to need is
-  gone, and upstream's seam writer is reused verbatim (one tile_spec entry per expert against
-  the n_experts trailing slots).  The host sorted fallback emits every match.  Fixes the
-  test-backend-ops MUL_MAT_ID dup=1 failures and the quantize_mmq_q8_1 page fault; validated
-  after the merge with `test-backend-ops -o MUL_MAT_ID` 931/931 on gfx1201.  Applied here so
-  every later MUL_MAT_ID block builds on correct duplicate handling.
+- (r328) the MUL_MAT_ID duplicate-ids support this block used to carry as a PORT of the
+  delivery's own upstream-PR candidate is now upstream's own: `b94959a64` (#32505) implements
+  it in the backend and removes the [TAG_MUL_MAT_ID_DUPLICATE_ID] caveat from ggml.h.  The
+  port is dropped and `upstream/mul-mat-id-dup/` is retired (archive/work/
+  upstream-mul-mat-id-dup-merged/); `test-backend-ops -o MUL_MAT_ID` now runs the dup=1 cases
+  on upstream's path -- 1078/1078 on gfx1201, 16 of them dup=1.  What the delivery still owns
+  here is `mm_ids_helper_512_10`: one 1024-thread block for the 512-experts/10-used shape
+  (RDNA3_5 + RDNA4, +4.5 % pp16384 / +5.2 % pp2048), re-ported at r328 onto upstream's
+  shared-memory `ne_store` helper signature, writing tile_spec through the extracted
+  `mm_ids_write_tile_spec()` both paths share.
 - cache the pre-existing upstream env reads that sit on hot paths in function-local
   statics: GGML_CUDA_CUBLAS_COMPUTE_TYPE (per cuBLAS matmul),
   GGML_CUDA_ENABLE_UNIFIED_MEMORY (per device allocation), GGML_CUDA_REGISTER_HOST,
@@ -81,50 +81,48 @@ required wherever the rule does not apply, and the pinned arm proves it still de
 
 Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
 ---
- common/arg.cpp                                |  23 +-
+ common/arg.cpp                                |  23 ++-
  common/speculative.cpp                        |  10 +-
- ggml/src/ggml-alloc.c                         | 121 ++++++-
- ggml/src/ggml-backend-meta.cpp                | 111 ++++++-
+ ggml/src/ggml-backend-meta.cpp                | 111 +++++++++--
  ggml/src/ggml-cpu/llamafile/sgemm.cpp         |   8 +-
  ggml/src/ggml-cuda/fattn-common.cuh           |  10 +-
- ggml/src/ggml-cuda/ggml-cuda.cu               |  45 ++-
- ggml/src/ggml-cuda/mmf.cu                     |   2 +-
- ggml/src/ggml-cuda/mmf.cuh                    |   7 +-
- ggml/src/ggml-cuda/mmid.cu                    | 307 ++++++++++++------
+ ggml/src/ggml-cuda/ggml-cuda.cu               |  44 ++---
+ ggml/src/ggml-cuda/mmid.cu                    | 111 +++++++++--
+ ggml/src/ggml-cuda/top-k.cu                   |  34 +++-
  ggml/src/ggml-cuda/vendors/hip.h              |   2 -
  ggml/src/ggml-cuda/vendors/musa.h             |   1 -
- .../vulkan-shaders/flash_attn.comp            |  29 +-
- .../vulkan-shaders/flash_attn_cm1.comp        |  49 ++-
+ .../vulkan-shaders/flash_attn.comp            |  29 ++-
+ .../vulkan-shaders/flash_attn_cm1.comp        |  49 ++++-
  include/llama.h                               |  15 +-
- src/CMakeLists.txt                            |  23 ++
- src/llama-batch.cpp                           |  64 ++--
- src/llama-context.cpp                         | 139 +++++---
+ src/CMakeLists.txt                            |  23 +++
+ src/llama-batch.cpp                           |  64 +++---
+ src/llama-context.cpp                         | 139 ++++++++-----
  src/llama-grammar.cpp                         |   6 +-
  src/llama-graph.h                             |   8 +-
  src/llama-memory-recurrent.cpp                |  14 +-
  src/llama-mmap.cpp                            |  20 +-
- src/llama-mmap.h                              |  12 +
- src/llama-model-loader.cpp                    | 183 +++++++++--
- src/llama-model-loader.h                      |  41 ++-
+ src/llama-mmap.h                              |  12 ++
+ src/llama-model-loader.cpp                    | 183 ++++++++++++++++--
+ src/llama-model-loader.h                      |  41 +++-
  src/llama-model.cpp                           |  19 +-
  src/llama-quant.cpp                           |  10 +-
- src/llama-sampler.cpp                         |  60 ++--
+ src/llama-sampler.cpp                         |  60 +++---
  src/llama-vocab.cpp                           |  20 +-
- src/llama.cpp                                 |  40 ++-
+ src/llama.cpp                                 |  40 ++--
  src/models/kimi-linear.cpp                    |   8 +-
  src/models/step35.cpp                         |  16 +-
- tests/test-alloc.cpp                          |  64 ++++
+ tests/test-alloc.cpp                          |  64 ++++++
  tools/cli/README.md                           |   2 +-
  tools/completion/README.md                    |   2 +-
  tools/llama-bench/llama-bench.cpp             |  10 +-
  tools/server/README.md                        |   2 +-
- 37 files changed, 1145 insertions(+), 358 deletions(-)
+ 35 files changed, 948 insertions(+), 262 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 6bf9355fb..34342f2fb 100644
+index a63823767..9e0290dd5 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2674,11 +2674,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2686,11 +2686,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
          "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
          "- auto: on, but only for tensors larger than 4 GiB\n"
@@ -155,10 +153,10 @@ index 6bf9355fb..34342f2fb 100644
          }
      ).set_env("LLAMA_ARG_LAZY_MODE"));
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 63cb5e611..bb487f5ce 100644
+index b40eb5535..77bb6d458 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -1618,7 +1618,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1885,7 +1885,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              }
          }
  
@@ -175,187 +173,6 @@ index 63cb5e611..bb487f5ce 100644
          chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
  
          llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ is_mem_shared);
-diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index 65d2bea27..d7933f00b 100644
---- a/ggml/src/ggml-alloc.c
-+++ b/ggml/src/ggml-alloc.c
-@@ -18,6 +18,27 @@
- //#define AT_PRINTF(...) GGML_LOG_DEBUG(__VA_ARGS__)
- #define AT_PRINTF(...)
- 
-+// GGML_GLU_INPLACE (on unless 0): a GLU may take the memory of its gate, so an FFN's gate, up and GLU output
-+// are not all live at once.  The allocator's own preconditions do the gating -- the parent must have the same
-+// layout (the two-input form: the one-input form halves ne[0] and never qualifies) and exactly one reader with
-+// no views -- so the saving is the gate buffer itself: Qwen3.8-27B UD-Q4_K_XL, 1 GPU, -ub 2048, -fa 1, -c 16384:
-+// 624.97 -> 475.37 MiB of compute buffer, and +7.1 % greedy decode on the 35B-A3B host-expert shape at
-+// -ncmoe 40 --host-experts pool (see WORKLOG.md r323 and benchmarks/2026-11-19-glu-inplace.md).  The kernels
-+// that write a GLU read the element at index i of BOTH operands before writing index i of the output, so
-+// dst == src0 is safe on the CPU (ggml_vec_*glu_*, no restrict), CUDA/HIP (unary_gated_op_kernel), Metal
-+// (kernel_*glu), Vulkan/SYCL/WebGPU/OpenCL (one element per invocation).  Only the GATE is ever taken (see
-+// ggml_gallocr_allocate_node): a backend whose gated GLU is a chain would break on the up operand.
-+// The switch exists for A/B and bisection; text and prefill logits are bit-identical with it on and off
-+// (KLD 0.000000 / same-top-p 100.000 % on the canonical point).
-+static bool ggml_glu_inplace(void) {
-+    static int on = -1;
-+    if (on < 0) {
-+        const char * e = getenv("GGML_GLU_INPLACE");
-+        on = e == NULL || atoi(e) != 0;
-+    }
-+    return on != 0;
-+}
-+
- // ops that return true for this function must not use restrict pointers for their backend implementations
- bool ggml_op_can_inplace(enum ggml_op op) {
-     switch (op) {
-@@ -42,6 +63,9 @@ bool ggml_op_can_inplace(enum ggml_op op) {
-         case GGML_OP_SOFT_MAX_BACK:
-             return true;
- 
-+        case GGML_OP_GLU:
-+            return ggml_glu_inplace();
-+
-         default:
-             return false;
-     }
-@@ -488,6 +512,10 @@ struct ggml_gallocr {
-     struct node_alloc * node_allocs; // [n_nodes]
-     int n_nodes;
- 
-+    // fingerprint of the graph the recorded layout (node_allocs/leaf_allocs) was computed for; see
-+    // ggml_gallocr_graph_fp
-+    uint64_t layout_fp;
-+
-     struct leaf_alloc * leaf_allocs; // [n_leafs]
-     int n_leafs;
- };
-@@ -593,6 +621,42 @@ static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor
-         || ggml_gallocr_is_own(galloc, t); // tensor will be allocated by galloc
- }
- 
-+// FNV-1a over a per-tensor descriptor: a fingerprint of everything the linear-scan layout depends
-+// on -- the node/leaf order, the op (which decides in-place eligibility), the element type and shape
-+// (which decide the sizes) and the input/output/compute flags (outputs are never freed, and inputs
-+// are allocated up front, so both change the plan).  Two graphs with the same fingerprint get the
-+// same layout; a different one must not reuse node_allocs positionally -- that would hand a tensor
-+// the address the plan gave to some unrelated tensor, which may be a block the plan recycles.
-+//
-+// This is not hypothetical: a graph built by ggml_build_forward_select (in-graph sampling, one chain
-+// per sequence x output row) keeps its node count but changes both its node order and which tensors
-+// are outputs when a different chain is selected, e.g. when another sequence starts drafting.
-+static uint64_t ggml_gallocr_graph_fp(const struct ggml_cgraph * graph) {
-+    uint64_t h = 1469598103934665603ull;
-+
-+    const uint32_t flags_mask = GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_COMPUTE;
-+
-+    const int n_tensors = graph->n_nodes + graph->n_leafs;
-+    for (int i = 0; i < n_tensors; ++i) {
-+        const struct ggml_tensor * t = i < graph->n_nodes ? graph->nodes[i] : graph->leafs[i - graph->n_nodes];
-+
-+        uint64_t v = (uint64_t) t->op;
-+        v = v*0x100000001b3ull ^ (uint64_t) t->type;
-+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-+            v = v*0x100000001b3ull ^ (uint64_t) t->ne[d];
-+        }
-+        v = v*0x100000001b3ull ^ (uint64_t) (t->view_src != NULL);
-+        v = v*0x100000001b3ull ^ (uint64_t) (t->flags & flags_mask);
-+
-+        h = (h ^ v) * 1099511628211ull;
-+    }
-+
-+    // the node/leaf split itself is part of the plan
-+    h = (h ^ ((uint64_t) graph->n_nodes << 32 | (uint32_t) graph->n_leafs)) * 1099511628211ull;
-+
-+    return h;
-+}
-+
- // free the extra space at the end if the new tensor is smaller
- static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_tensor * node, struct ggml_tensor * parent) {
-     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
-@@ -627,7 +691,14 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
- 
-         // try to reuse a parent's buffer (inplace)
-         if (ggml_op_can_inplace(node->op)) {
--            for (int i = 0; i < GGML_MAX_SRC; i++) {
-+            // GGML_OP_GLU may take only its FIRST operand (the gate).  The streaming GLU kernels read both
-+            // operands before they write, so either would be safe there, but the gate and the up are symmetric
-+            // in an FFN and a backend whose gated GLU is a chain must not see the up aliased: CANN runs
-+            // `aclnn Silu` into dst and then `aclnnInplaceMul(dst, src1)`, which would multiply the destroyed
-+            // up operand by itself and lose the gate.  dst == src0 there is the in-place UNARY path CANN
-+            // already runs for GGML_OP_UNARY.  See ggml_glu_inplace() above.
-+            const int n_src_inplace = node->op == GGML_OP_GLU ? 1 : GGML_MAX_SRC;
-+            for (int i = 0; i < n_src_inplace; i++) {
-                 struct ggml_tensor * parent = node->src[i];
-                 if (parent == NULL) {
-                     continue;
-@@ -757,6 +828,41 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
-         }
-     }
- 
-+    // a view node that is never used as a source keeps its view source's n_views count elevated
-+    // forever: the free pass below only decrements that count when the view itself is released, which
-+    // never happens for a node with no consumers (e.g. a ggml_cpy expanded into the graph purely for
-+    // its side effect - the "copy into a view of preallocated memory" idiom). The inflated count
-+    // blocks both the view source's release and its in-place reuse, so the buffer grows by the size of
-+    // every such view source. Fold those contributions in here, while the child counts are final.
-+    // Graph outputs are exempt: they are never freed and may alias the view source, which must stay
-+    // allocated for the application to read it.
-+    for (int i = 0; i < graph->n_nodes; i++) {
-+        struct ggml_tensor * node = graph->nodes[i];
-+
-+        if (!ggml_impl_is_view(node) || node->op == GGML_OP_NONE) {
-+            continue;
-+        }
-+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
-+            continue;
-+        }
-+
-+        struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
-+        if (hn->n_children != 0) {
-+            continue;
-+        }
-+
-+        struct ggml_tensor * view_src = node->view_src;
-+        struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
-+        view_src_hn->n_views -= 1;
-+
-+        AT_PRINTF("unused view %s: view_src %s: %d children, %d views\n",
-+            node->name, view_src->name, view_src_hn->n_children, view_src_hn->n_views);
-+
-+        if (view_src_hn->n_views == 0 && view_src_hn->n_children == 0 && view_src_hn->allocated) {
-+            ggml_gallocr_free_node(galloc, view_src);
-+        }
-+    }
-+
-     // allocate tensors
-     for (int i = 0; i < graph->n_nodes; i++) {
-         struct ggml_tensor * node = graph->nodes[i];
-@@ -844,6 +950,10 @@ static bool ggml_gallocr_reserve_n_impl(
-     // allocate in hash table
-     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
- 
-+    // the layout now describes this graph; note the failure case leaves it recorded too, which the
-+    // caller must handle (a failed buffer allocation is reported through the return value)
-+    galloc->layout_fp = ggml_gallocr_graph_fp(graph);
-+
-     // set the node_allocs from the hash table
-     if (galloc->n_nodes < graph->n_nodes) {
-         free(galloc->node_allocs);
-@@ -1018,6 +1128,15 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
-         return true;
-     }
- 
-+    // node_allocs/leaf_allocs are applied positionally, so the layout only holds for a graph with the
-+    // same node order, ops, shapes and output/input markings (see ggml_gallocr_graph_fp)
-+    if (galloc->layout_fp != ggml_gallocr_graph_fp(graph)) {
-+#ifndef NDEBUG
-+        GGML_LOG_DEBUG("%s: graph topology changed (fingerprint mismatch)\n", __func__);
-+#endif
-+        return true;
-+    }
-+
-     for (int i = 0; i < graph->n_nodes; i++) {
-         struct ggml_tensor * node = graph->nodes[i];
-         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
 index 595a5824a..930b58fb4 100644
 --- a/ggml/src/ggml-backend-meta.cpp
@@ -518,10 +335,10 @@ index 595a5824a..930b58fb4 100644
      }
      return meta_buf;
 diff --git a/ggml/src/ggml-cpu/llamafile/sgemm.cpp b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
-index 384f7dbe2..3ce747e40 100644
+index 5d6609113..3afe47f17 100644
 --- a/ggml/src/ggml-cpu/llamafile/sgemm.cpp
 +++ b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
-@@ -3995,8 +3995,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+@@ -4357,8 +4357,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
      assert(params->ith < params->nth);
  
      // only enable sgemm for prompt processing
@@ -538,7 +355,7 @@ index 384f7dbe2..3ce747e40 100644
  #endif
  
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 6667ca400..83a0e2254 100644
+index fc0cc7403..6468c2150 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -1254,13 +1254,21 @@ void launch_fattn(
@@ -565,10 +382,10 @@ index 6667ca400..83a0e2254 100644
              const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
  
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 540c53614..409269f17 100644
+index 3e1f167e9..62e90f448 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -590,7 +590,6 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+@@ -666,7 +666,6 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
      CUdeviceptr pool_addr = 0;
      size_t pool_used = 0;
      size_t pool_size = 0;
@@ -576,7 +393,7 @@ index 540c53614..409269f17 100644
      size_t granularity;
  #if defined(GGML_USE_HIP)
      std::vector<std::pair<CUdeviceptr, size_t>> mappings;
-@@ -612,7 +611,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+@@ -688,7 +687,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
  #else
              CU_CHECK(cuMemUnmap(pool_addr, pool_size));
  #endif
@@ -585,7 +402,7 @@ index 540c53614..409269f17 100644
          }
      }
  
-@@ -628,21 +627,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+@@ -704,21 +703,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
              size_t reserve_size = size - avail;
              reserve_size = granularity * ((reserve_size + granularity - 1) / granularity);
  
@@ -608,7 +425,7 @@ index 540c53614..409269f17 100644
  
              // allocate more physical memory
              CUmemAllocationProp prop = {};
-@@ -652,6 +637,11 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+@@ -728,6 +713,11 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
              CUmemGenericAllocationHandle handle;
              CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
  
@@ -620,7 +437,7 @@ index 540c53614..409269f17 100644
              // map at the end of the pool
              CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
              CU_CHECK(cuMemMap(start_ptr, reserve_size, 0, handle, 0));
-@@ -2064,21 +2054,30 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
+@@ -2148,21 +2138,30 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
          compute_type = GGML_TYPE_F32;
      }
  
@@ -656,7 +473,7 @@ index 540c53614..409269f17 100644
      }
  
      constexpr size_t max_src0_convert_size = 512ull * 1024 * 1024;
-@@ -2624,11 +2623,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -2726,6 +2725,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
              for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                  const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
                  assert(expert_to_use >= 0 && expert_to_use < ne02);
@@ -664,125 +481,95 @@ index 540c53614..409269f17 100644
                  if (expert_to_use == i02) {
                      ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                      ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
-                     tokens_per_expert[i02]++;
--                    break;
-                 }
-             }
-         }
-diff --git a/ggml/src/ggml-cuda/mmf.cu b/ggml/src/ggml-cuda/mmf.cu
-index 040d390e0..e6d89ef53 100644
---- a/ggml/src/ggml-cuda/mmf.cu
-+++ b/ggml/src/ggml-cuda/mmf.cu
-@@ -70,7 +70,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
-         nchannels_y      = ids->ne[0];
-     }
- 
--    if (ids && ncols_dst > 16) {
-+    if (ids) {
-         const int64_t n_expert_used = ids->ne[0];
-         const int64_t n_experts     = ne02;
-         const int64_t n_tokens      = ne12;
-diff --git a/ggml/src/ggml-cuda/mmf.cuh b/ggml/src/ggml-cuda/mmf.cuh
-index c49f6c47a..6deafbae7 100644
---- a/ggml/src/ggml-cuda/mmf.cuh
-+++ b/ggml/src/ggml-cuda/mmf.cuh
-@@ -598,9 +598,10 @@ static inline void mul_mat_f_switch_ids(
-         const mmf_ids_data * ids_data) {
-     const bool has_ids_data = ids_data && ids_data->ids_src_compact;
- 
--    // Use the compact-ids kernel only for larger tiles; for small ncols_dst (< 16)
--    // we prefer the normal mul_mat_f path with has_ids=true.
--    if (has_ids_data && ncols_dst > 16) {
-+    // Use the compact-ids kernel for every MUL_MAT_ID: the non-compact mul_mat_f path keeps a single slot per token,
-+    // so it cannot represent repeated ids within a token's row.  The compact kernel maps every (token, slot) occurrence
-+    // to its own row.  For small ncols_dst the extra tile_spec read is negligible.
-+    if (has_ids_data) {
-         if (ids_data->max_tiles == 0) {
-             return;
-         }
 diff --git a/ggml/src/ggml-cuda/mmid.cu b/ggml/src/ggml-cuda/mmid.cu
-index 64de4fb27..82ce457cd 100644
+index fe9458763..234fcb4ee 100644
 --- a/ggml/src/ggml-cuda/mmid.cu
 +++ b/ggml/src/ggml-cuda/mmid.cu
-@@ -1,23 +1,95 @@
- #include "common.cuh"
- #include "mmid.cuh"
+@@ -68,6 +68,32 @@ static __device__ __forceinline__ void dump_store(
  
--// To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
--struct mm_ids_helper_store {
--    uint32_t data;
+ constexpr int n_unroll = 4; // Manually unroll this many loop iterations for better performance.
+ 
 +// Writes the tile_spec entries of one expert (thread 0 of its block only).
 +//
 +// Upstream (#31047) assigns one MUL_MAT_ID tile per tile_spec entry and launches exactly
 +//     ntj = ceil(n_tokens*n_expert_used / tile_width) + n_experts
-+// blocks in the grid: the entries at < ntj - n_experts are the tile-aligned tiles indexed by their
-+// column position, and the last n_experts entries ("between the seams") hold each expert's remaining
-+// columns.  The compact column count here is exactly n_tokens*n_expert_used -- every (token, iex) pair
-+// has one expert id and every occurrence gets its own compact column -- so every grid index in
-+// [0, ntj) is written exactly once by the n_experts blocks, whatever the duplicate structure of the
-+// ids is.
-+__device__ static void mm_ids_write_tile_spec(
-+        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, const int expert, const int nex_prev, const int it_compact,
++// blocks in the grid: the entries at < ntj - n_experts are the tile-aligned tiles indexed by their column
++// position, and the last n_experts entries ("between the seams") hold each expert's remaining columns.
++static __device__ __forceinline__ void mm_ids_write_tile_spec(
++        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, const int expert, const int nex_prev, const int n_dumped,
 +        const uint3 tile_width, const int n_tokens, const int n_expert_used) {
 +    int col_low  = nex_prev;
-+    int col_high = nex_prev + min(int(tile_width.z), it_compact);
++    int col_high = nex_prev + min(int(tile_width.z), n_dumped);
 +
 +    // The while loop covers all tiles at the seams containing the column with % tile_width == 0.
 +    while (col_high > fastdiv(col_low + tile_width.z - 1, tile_width) * tile_width.z) {
 +        tile_spec[fastdiv(col_low + tile_width.z - 1, tile_width)]
 +            = {expert, col_low, col_high, /*padding =*/ 0};
- 
--    __device__ mm_ids_helper_store(const uint32_t it, const uint32_t iex_used) {
--        data = (it & 0x003FFFFF) | (iex_used << 22);
++
 +        col_low  = col_high;
-+        col_high = min(col_high + int(tile_width.z), nex_prev + it_compact);
-     }
- 
--    __device__ uint32_t it() const {
--        return data & 0x003FFFFF;
++        col_high = min(col_high + int(tile_width.z), nex_prev + n_dumped);
++    }
++
 +    // Finally, at most one extra tile_spec between the seams per expert.
 +    tile_spec[fastdiv(n_tokens*n_expert_used + tile_width.z - 1, tile_width) + expert]
 +        = {expert, col_low, col_high, /*padding =*/ 0};
 +}
 +
-+// Qwen4exp 512-expert / 10-active fast path (ported from the halo-box tree). The generic helper
-+// below launches one warp per expert and every warp scans all token slots (O(n_experts*n_tokens*
-+// n_used)). Here one 1024-thread block histograms the slots, computes the 512 expert offsets, and
-+// scatters the two maps in O(n_tokens*n_used). Row ordering inside an expert is irrelevant:
-+// ids_dst maps every compact MMQ row back to its exact destination and there is no cross-row
-+// reduction, so results are identical to the generic kernel by construction.  Every occurrence of
-+// a repeated id is its own slot here, matching the generic kernel's duplicate handling.
-+__launch_bounds__(1024, 1)
-+static __global__ void mm_ids_helper_512_10(
+ // Helper function for mul_mat_id, converts ids to a more convenient format.
+ // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
+ // ids_dst describes the same mapping but for the dst tensor.
+@@ -219,21 +245,70 @@ static __global__ void mm_ids_helper(
+         return;
+     }
+ 
+-    int col_low  = nex_prev;
+-    int col_high = nex_prev + min(int(tile_width.z), n_dumped);
++    mm_ids_write_tile_spec(tile_spec, expert, nex_prev, n_dumped, tile_width, n_tokens, n_expert_used);
++}
+ 
+-    // The while loop covers all tiles at the seams containing the column with % tile_width == 0.
+-    while (col_high > fastdiv(col_low + tile_width.z - 1, tile_width) * tile_width.z) {
+-        tile_spec[fastdiv(col_low + tile_width.z - 1, tile_width)]
+-            = {expert, col_low, col_high, /*padding =*/ 0};
++// Replace the `n_experts` one-warp expert blocks of the helper with ONE 1024-thread block for the
++// 512-experts / 10-used shape (RDNA3_5 source of record + RDNA4): one bucket-sort pass over
++// n_tokens*n_expert_used slots with per-expert counters in shared memory, then the same tile_spec writer.
++// Measured gfx1201: prefill +4.5 % pp16384 / +5.2 % pp2048, decode unaffected (the helper feeds the mmq
++// prefill path only), same-seed text byte-identical.  Kill switch: GGML_CUDA_DISABLE_MMID_512.
++//
++// An expert id may repeat within a token's row: every occurrence is an independent destination column and
++// gets its own compact row, which is why the scatter is per (token, iex) slot and not per token.
++static __global__ void __launch_bounds__(1024) mm_ids_helper_512_10(
 +        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
 +        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, const int n_tokens, const int nchannels_y,
 +        const uint3 tile_width, const int si1, const int sis1, const bool write_inverse) {
-+    __shared__ int counts[512];
-+    __shared__ int cursors[512];
++    constexpr int n_experts    = 512;
++    constexpr int n_expert_used = 10;
++
++    __shared__ int counts[n_experts];
++    __shared__ int cursors[n_experts];
 +
 +    const int tid = threadIdx.x;
-+    if (tid < 512) {
-+        counts[tid] = 0;
++    if (tid < n_experts) {
++        counts[tid]  = 0;
 +        cursors[tid] = 0;
-     }
++    }
 +    __syncthreads();
  
--    __device__ uint32_t iex_used() const {
--        return data >> 22;
-+    const int n_slots = n_tokens * 10;
+-        col_low  = col_high;
+-        col_high = min(col_high + int(tile_width.z), nex_prev + n_dumped);
++    const int n_slots = n_tokens * n_expert_used;
 +    for (int idx = tid; idx < n_slots; idx += blockDim.x) {
-+        const int token = idx / 10;
-+        const int iex   = idx - token * 10;
++        const int token = idx / n_expert_used;
++        const int iex   = idx - token * n_expert_used;
 +        atomicAdd(&counts[ids[token * si1 + iex]], 1);
-     }
--};
--static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_helper_store");
++    }
 +    __syncthreads();
 +
 +    // The expert offsets are cumulative (thread 0 only: counts[] is read and rewritten in place).
 +    if (tid == 0) {
 +        int nex_prev = 0;
-+        for (int e = 0; e < 512; ++e) {
++        for (int e = 0; e < n_experts; ++e) {
 +            const int c = counts[e];
 +            counts[e] = nex_prev;
 +            nex_prev += c;
@@ -791,299 +578,106 @@ index 64de4fb27..82ce457cd 100644
 +    __syncthreads();
 +
 +    for (int idx = tid; idx < n_slots; idx += blockDim.x) {
-+        const int token = idx / 10;
-+        const int iex   = idx - token * 10;
++        const int token  = idx / n_expert_used;
++        const int iex    = idx - token * n_expert_used;
 +        const int expert = ids[token * si1 + iex];
-+        const int dst = counts[expert] + atomicAdd(&cursors[expert], 1);
++        const int dst    = counts[expert] + atomicAdd(&cursors[expert], 1);
 +        ids_dst[dst] = idx;
 +        if (write_inverse) {
 +            ids_src1[idx] = dst;
 +        } else {
 +            ids_src1[dst] = token * sis1 + iex % nchannels_y;
 +        }
-+    }
+     }
 +    __syncthreads();
-+
-+    if (tid < 512) {
-+        mm_ids_write_tile_spec(tile_spec, tid, counts[tid], cursors[tid], tile_width, n_tokens, 10);
-+    }
-+}
- 
- // the generic path passes 0, which needs no padding since it never groups lanes by token
- template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
-@@ -27,116 +99,136 @@ template <>      struct mm_ids_pow2<0> { static constexpr int value = 1; };
- // Helper function for mul_mat_id, converts ids to a more convenient format.
- // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
- // ids_dst describes the same mapping but for the dst tensor.
--// The first (n_tokens*n_expert_used + J - 1) / tile_width elements of tile_spec contain the specication for
--//   matrix multiplication tiles at token positions which are exactly divided by tile_width.
--// Additionally the following n_expert elements of tile_spec may contain additional tiles that fall between these seams.
-+// The first ceil(n_tokens*n_expert_used / tile_width) elements of tile_spec contain the specification for the
-+//   matrix multiplication tiles at the tile_width seams; the following n_expert elements hold the extra tiles
-+//   that fall between these seams.
-+//
-+// An expert id may repeat within a token's row; every occurrence is an independent destination column and gets its own
-+// compact row (the Vulkan backend handles the same case in its prepass).  The compact columns are written in (token, iex)
-+// order: the offset within an expert is `it_compact (earlier tokens) + tok_base (earlier tokens in this warp iteration) +
-+// rank (this lane's occurrence index within its token)`.
-+//
-+// The common expert counts take the templated fast path: `warp_size/neu_padded` tokens are handled per warp iteration and
-+// the per-token match count / rank come from reductions within the token's padded lane group.  The r66 rewrite of this
-+// helper used one full warp iteration (and two warp reductions) per token; that cost ~20% of the 35B-A3B prefill
-+// (measured gfx1201, `-ncmoe 0 -ub 4096 -fa 1`: 8357 -> 6430 t/s).  The fast path restores the token batching while
-+// keeping every repeated occurrence.  `n_expert_used_template == 0` keeps the generic form as the fallback.
- template <int n_expert_used_template>
- __launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
- static __global__ void mm_ids_helper(
--        const int32_t * __restrict__ ids,
--        int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
-+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
-+        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
-         const int n_tokens, const int n_expert_used_var, const int nchannels_y, const uint3 tile_width,
-         const int si1, const int sis1, const bool write_inverse) {
-     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
-     const int expert = blockIdx.x;
- 
--    extern __shared__ char data_mm_ids_helper[];
--    mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
--
--    int nex_prev   = 0; // Number of columns for experts with a lower index.
--    int it_compact = 0; // Running index for the compact slice of this expert.
--
-     if constexpr (n_expert_used_template == 0) {
--        // Generic implementation:
-+        // Generic implementation: one warp iteration (and two warp reductions) per token.  Kept for
-+        // expert counts without a template instantiation; needs no per-token staging buffer.
-+        const int lane = threadIdx.x;
-+
-+        // Pass 1: number of compact columns for the experts with a lower index.
-+        int nex_prev = 0;
-         for (int it = 0; it < n_tokens; ++it) {
--            int iex_used = -1; // The index at which the expert is used, if any.
--            for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
--                const int expert_used = ids[it*si1 + iex];
--                nex_prev += expert_used < expert;
--                if (expert_used == expert) {
--                    iex_used = iex;
--                }
-+            for (int iex = lane; iex < n_expert_used; iex += warp_size) {
-+                nex_prev += ids[it*si1 + iex] < expert;
-             }
-+        }
-+        nex_prev = warp_reduce_sum<warp_size>(nex_prev);
- 
--            if (iex_used != -1) {
--                store[it_compact] = mm_ids_helper_store(it, iex_used);
-+        // Pass 2: write this expert's columns, one per matching (token, iex) pair, in (token, iex) order.
-+        int it_compact = 0;
-+        for (int it = 0; it < n_tokens; ++it) {
-+            int lane_count = 0;
-+            for (int iex = lane; iex < n_expert_used; iex += warp_size) {
-+                lane_count += ids[it*si1 + iex] == expert;
-             }
-+            const int tok_count = warp_reduce_sum<warp_size>(lane_count);
-+            const int lane_base = warp_prefix_inclusive_sum<int, warp_size>(lane_count) - lane_count;
- 
--            if (warp_reduce_any<warp_size>(iex_used != -1)) {
--                it_compact++;
--            }
--        }
--    } else {
--        // Implementation optimized for specific numbers of experts used:
--        // a warp holds a whole number of token slots, so the slot count is padded to a power of 2
--        constexpr int neu_padded = mm_ids_pow2<n_expert_used_template>::value;
--        static_assert(neu_padded <= warp_size && warp_size % neu_padded == 0, "bad n_expert_used");
--        for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
--            const int it = it0 + threadIdx.x / neu_padded;
--
--            const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
--            const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
--                ids[it*si1 + iex] : INT_MAX;
--            const int iex_used = expert_used == expert ? iex : -1;
--            nex_prev += expert_used < expert;
--
--            // Whether the threads at this token position have used the expert:
--            const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
--
--            // Do a scan over threads at lower token positions in warp to get the correct index for writing data:
--            int it_compact_add_lower = 0;
--#pragma unroll
--            for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
--                const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
--                if (threadIdx.x >= static_cast<unsigned int>(offset)) {
--                    it_compact_add_lower += tmp;
-+            int j = 0;
-+            for (int iex = lane; iex < n_expert_used; iex += warp_size) {
-+                if (ids[it*si1 + iex] == expert) {
-+                    const int pos = nex_prev + it_compact + lane_base + j;
-+                    ids_dst[pos] = it*n_expert_used + iex;
-+                    // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup
-+                    if (write_inverse) {
-+                        ids_src1[it*n_expert_used + iex] = pos;
-+                    } else {
-+                        ids_src1[pos] = it*sis1 + iex % nchannels_y;
-+                    }
-+                    ++j;
-                 }
-             }
--
--            if (iex_used != -1) {
--                store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
--            }
--
--            // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
--            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
-+            it_compact += tok_count;
-         }
--    }
--    nex_prev = warp_reduce_sum<warp_size>(nex_prev);
--    ggml_cuda_syncwarp();
--
--    for (int itc = threadIdx.x; itc < it_compact; itc += warp_size) {
--        const mm_ids_helper_store store_it = store[itc];
--        const int it       = store_it.it();
--        const int iex_used = store_it.iex_used();
--        ids_dst[nex_prev + itc] = it*n_expert_used + iex_used;
--        // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup
--        if (write_inverse) {
--            ids_src1[it*n_expert_used + iex_used] = nex_prev + itc;
--        } else {
--            ids_src1[nex_prev + itc] = it*sis1 + iex_used % nchannels_y;
-+
-+        if (lane == 0) {
-+            mm_ids_write_tile_spec(tile_spec, expert, nex_prev, it_compact, tile_width, n_tokens, n_expert_used);
-         }
-+        return;
-     }
- 
--    if (threadIdx.x != 0) {
--        return;
-+    // Fast implementation for a fixed number of experts used: a warp holds a whole number of token slots,
-+    // so the slot count is padded to a power of 2.
-+    constexpr int neu_padded   = mm_ids_pow2<n_expert_used_template>::value;
-+    constexpr int tok_per_iter = warp_size / neu_padded;
-+    static_assert(neu_padded <= warp_size && warp_size % neu_padded == 0, "bad n_expert_used");
-+
-+    // Pass 1: number of compact columns for the experts with a lower index.
-+    int nex_prev = 0;
-+    for (int it0 = 0; it0 < n_tokens; it0 += tok_per_iter) {
-+        const int it  = it0 + threadIdx.x / neu_padded;
-+        const int iex = threadIdx.x % neu_padded;
-+        const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
-+            ids[it*si1 + iex] : INT_MAX;
-+        nex_prev += expert_used < expert;
-     }
-+    nex_prev = warp_reduce_sum<warp_size>(nex_prev);
- 
--    int col_low  = nex_prev;
--    int col_high = nex_prev + min(int(tile_width.z), it_compact);
-+    // Pass 2: write this expert's columns, one per matching (token, iex) pair, in (token, iex) order.
-+    int it_compact = 0;
-+    for (int it0 = 0; it0 < n_tokens; it0 += tok_per_iter) {
-+        const int it  = it0 + threadIdx.x / neu_padded;
-+        const int iex = threadIdx.x % neu_padded;
-+        const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
-+            ids[it*si1 + iex] : INT_MAX;
-+        const bool match = expert_used == expert;
- 
--    // The while loop covers all tiles at the seams containing the column with % tile_width == 0.
--    while (col_high > fastdiv(col_low + tile_width.z - 1, tile_width) * tile_width.z) {
--        tile_spec[fastdiv(col_low + tile_width.z - 1, tile_width)]
--            = {expert, col_low, col_high, /*padding =*/ 0};
-+        // The number of occurrences of this expert in this token (duplicates allowed) and this lane's rank among them.
-+        const int tok_count = warp_reduce_sum<neu_padded>((int) match);
-+        const int lane_rank = warp_prefix_inclusive_sum<int, neu_padded>((int) match) - (int) match;
- 
--        col_low  = col_high;
--        col_high = min(col_high + int(tile_width.z), nex_prev + it_compact);
-+        // Scan over the tokens at lower positions in the warp for this expert's compact offset.
-+        int tok_base = 0;
-+#pragma unroll
-+        for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
-+            const int tmp = __shfl_up_sync(0xFFFFFFFF, tok_count, offset, warp_size);
-+            if (threadIdx.x >= static_cast<unsigned int>(offset)) {
-+                tok_base += tmp;
-+            }
-+        }
-+
-+        if (match) {
-+            const int pos = nex_prev + it_compact + tok_base + lane_rank;
-+            ids_dst[pos] = it*n_expert_used + iex;
-+            // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup
-+            if (write_inverse) {
-+                ids_src1[it*n_expert_used + iex] = pos;
-+            } else {
-+                ids_src1[pos] = it*sis1 + iex % nchannels_y;
-+            }
-+        }
-+
-+        // The thread with the highest index in the warp has the sum over the whole warp.
-+        it_compact += __shfl_sync(0xFFFFFFFF, tok_base + tok_count, warp_size - 1, warp_size);
-     }
  
 -    // Finally, at most one extra tile_spec between the seams per expert.
 -    tile_spec[fastdiv(n_tokens*n_expert_used + tile_width.z - 1, tile_width) + expert]
 -        = {expert, col_low, col_high, /*padding =*/ 0};
-+    if (threadIdx.x == 0) {
-+        mm_ids_write_tile_spec(tile_spec, expert, nex_prev, it_compact, tile_width, n_tokens, n_expert_used);
++    if (tid < n_experts) {
++        mm_ids_write_tile_spec(tile_spec, tid, counts[tid], cursors[tid], tile_width, n_tokens, n_expert_used);
 +    }
  }
  
  template <int n_expert_used_template>
-@@ -145,29 +237,38 @@ static void launch_mm_ids_helper(
+@@ -267,6 +342,20 @@ void ggml_cuda_launch_mm_ids_helper(
          int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
-         const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int tile_width,
-         const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
--    GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
--    GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mm_ids_helper_store");
-+    GGML_ASSERT((int64_t) n_tokens * n_expert_used_var < (int64_t) 1 << 31);
- 
-     const int id = ggml_cuda_get_device();
-     const int warp_size = ggml_cuda_info().devices[id].warp_size;
--    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
--    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
- 
-     const uint3 tile_width_fd = init_fastdiv_values(tile_width);
- 
-     const dim3 num_blocks(n_experts, 1, 1);
-     const dim3 block_size(warp_size, 1, 1);
--    const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
--    GGML_ASSERT(nbytes_shared <= smpbo);
--    mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
-+    mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, 0, stream>>>
-         (ids, ids_src1, ids_dst, tile_spec, n_tokens, n_expert_used_var, nchannels_y, tile_width_fd, si1, sis1, write_inverse);
- }
- 
- void ggml_cuda_launch_mm_ids_helper(
--        const int32_t * __restrict__ ids,
--        int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
-+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
          const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int tile_width,
          const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
-+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-+    static const bool mmid_512_disabled = getenv("GGML_CUDA_DISABLE_MMID_512") != nullptr;
-+    // mm_ids_helper_512_10: one 1024-thread block replaces the 512 one-warp expert blocks of the
-+    // generic helper for the 512-expert/10-used shape.  RDNA3_5 (source of record) + RDNA4
-+    // (2026-09-06 gfx1201 validation: prefill +4.5% pp16384 / +5.2% pp2048, same-seed text
-+    // byte-identical; decode unaffected - the helper feeds the mmq prefill path only).
-+    if ((GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) && n_experts == 512 && n_expert_used == 10 && !mmid_512_disabled) {
-+        const uint3 tile_width_fd = init_fastdiv_values(tile_width);
-+        mm_ids_helper_512_10<<<1, 1024, 0, stream>>>(
-+            ids, ids_src1, ids_dst, tile_spec, n_tokens, nchannels_y, tile_width_fd, si1, sis1, write_inverse);
-+        return;
++    // The 512-expert / 10-used fast path (block 00): one 1024-thread block instead of 512 one-warp expert
++    // blocks.  RDNA3_5 (source of record) + RDNA4 only -- the shape is a qwen4exp host-expert model's.
++    {
++        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++        static const bool mmid_512_disabled = getenv("GGML_CUDA_DISABLE_MMID_512") != nullptr;
++        if (!mmid_512_disabled && (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) &&
++                n_experts == 512 && n_expert_used == 10) {
++            mm_ids_helper_512_10<<<1, 1024, 0, stream>>>(
++                ids, ids_src1, ids_dst, tile_spec, n_tokens, nchannels_y, init_fastdiv_values(tile_width),
++                si1, sis1, write_inverse);
++            return;
++        }
 +    }
-+
-+    GGML_ASSERT(n_tokens >= 0 && n_expert_used >= 0);
 +
      switch (n_expert_used) {
          case  2:
              launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, tile_spec,
+diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
+index 2639a664d..615ab4fbe 100644
+--- a/ggml/src/ggml-cuda/top-k.cu
++++ b/ggml/src/ggml-cuda/top-k.cu
+@@ -289,6 +289,36 @@ static void top_k_radix_cuda(
+     }
+ }
+ 
++// The sorted indices live in a `ncols`-pitch temporary and only the first k columns of each row are wanted,
++// so getting them out is a strided row copy.  `cudaMemcpy2DAsync` is NOT usable for it: a padded 2-D copy
++// into a VMM-backed destination is refused with "invalid argument" by the driver on this stack -- measured
++// with a build of the PRISTINE UPSTREAM BASE that carries nothing but the delivery's VMM-pool prerequisite,
++// i.e. no delivery source change is involved, and the equal-pitch call (ncols == k) just before it succeeds.
++// The same refusal is what `ggml_cuda_cpy_as_memcpy_2d` guards against and what the windowed KV's 2-D state
++// copy hit (issue #313).  One int per thread, the row taken from the grid with a stride loop, so there is no
++// per-element division and no grid-height limit.
++static __global__ void top_k_gather_rows(const int * GGML_CUDA_RESTRICT src, int * GGML_CUDA_RESTRICT dst,
++        const int64_t ncols, const int64_t k, const int64_t nrows) {
++    const int64_t col = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++
++    if (col >= k) {
++        return;
++    }
++
++    for (int64_t row = blockIdx.y; row < nrows; row += gridDim.y) {
++        dst[row*k     + col] = src[row*ncols + col];
++    }
++}
++
++static void top_k_gather_cuda(const int * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
++    constexpr int BLOCK_SIZE = 256;
++
++    // gridDim.y is bounded (65535); the kernel strides over the rows above that
++    const dim3 grid((k + BLOCK_SIZE - 1) / BLOCK_SIZE, (unsigned) std::min<int64_t>(nrows, 65535));
++
++    top_k_gather_rows<<<grid, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, k, nrows);
++}
++
+ static void top_k_argsort_cuda(
+         ggml_cuda_pool & pool,
+         const float * src, int * dst, int ncols, int64_t nrows, int k, bool use_cub, cudaStream_t stream) {
+@@ -309,8 +339,8 @@ static void top_k_argsort_cuda(
+         } else {
+             argsort_f32_i32_cuda_bitonic(src, tmp, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
+         }
+-        CUDA_CHECK(cudaMemcpy2DAsync(dst, k * sizeof(int), tmp, ncols * sizeof(int), k * sizeof(int), iter_nrows,
+-                                     cudaMemcpyDeviceToDevice, stream));
++        top_k_gather_cuda(tmp, dst, ncols, iter_nrows, k, stream);
++        CUDA_CHECK(cudaGetLastError());
+ 
+         src += (size_t) ncols * iter_nrows;
+         dst += (size_t) k     * iter_nrows;
 diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
-index da159dea1..62be4b361 100644
+index a43814799..b3f468096 100644
 --- a/ggml/src/ggml-cuda/vendors/hip.h
 +++ b/ggml/src/ggml-cuda/vendors/hip.h
-@@ -60,9 +60,7 @@
+@@ -58,9 +58,7 @@ typedef uint64_t ggml_cuda_thread_mask_t;
  #define cudaDeviceProp hipDeviceProp_t
  #define cudaDeviceSynchronize hipDeviceSynchronize
  #define cudaError_t hipError_t
@@ -1094,10 +688,10 @@ index da159dea1..62be4b361 100644
  #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
  #define cudaEventCreateWithFlags hipEventCreateWithFlags
 diff --git a/ggml/src/ggml-cuda/vendors/musa.h b/ggml/src/ggml-cuda/vendors/musa.h
-index ff13fa052..22126decf 100644
+index bfad2a2e6..518b99114 100644
 --- a/ggml/src/ggml-cuda/vendors/musa.h
 +++ b/ggml/src/ggml-cuda/vendors/musa.h
-@@ -129,7 +129,6 @@
+@@ -132,7 +132,6 @@ typedef uint32_t ggml_cuda_thread_mask_t;
  
  // Additional mappings for MUSA graphs
  #define CUDA_SUCCESS MUSA_SUCCESS
@@ -1106,10 +700,10 @@ index ff13fa052..22126decf 100644
  #define cuGetErrorString muGetErrorString
  #define cudaErrorGraphExecUpdateFailure musaErrorGraphExecUpdateFailure
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
-index 2c5e85908..479dd90b2 100644
+index c1e4606cd..e2ab7d5bf 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
-@@ -519,9 +519,26 @@ void main() {
+@@ -521,9 +521,26 @@ void main() {
              }
  
              FLOAT_TYPE Pf[rows_per_thread];
@@ -1136,7 +730,7 @@ index 2c5e85908..479dd90b2 100644
              }
  
              [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-@@ -536,8 +553,16 @@ void main() {
+@@ -538,8 +555,16 @@ void main() {
                  } else {
                      Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + vcol * v_stride / 4 + d * D_split + d_tid]);
                  }
@@ -1156,12 +750,12 @@ index 2c5e85908..479dd90b2 100644
              }
          }
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
-index aa9dd624b..143a25b0f 100644
+index bb9755ab8..ce6597347 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
-@@ -62,6 +62,11 @@ shared O_TYPEV4 pvsh[MatBc * osh_stride];
- 
- shared ACC_TYPE slope[Br];
+@@ -88,6 +88,11 @@ O_TYPEV4 pvsh_load(const uint32_t i) {
+ }
+ #endif
  
 +// Per-column liveness for the current KV tile: col_live[c] is set when at least one
 +// real query row has a nonzero softmax weight (P) for KV column c of this tile. A
@@ -1171,7 +765,7 @@ index aa9dd624b..143a25b0f 100644
  void main() {
  #ifdef NEEDS_INIT_IQ_SHMEM
      if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
-@@ -157,6 +162,10 @@ void main() {
+@@ -221,6 +226,10 @@ void main() {
              mask_cache[idx] = f16vec4(0);
          }
  
@@ -1182,7 +776,7 @@ index aa9dd624b..143a25b0f 100644
          if (MASK_ENABLE) {
              if (USE_MASK_OPT && mask_opt_idx != j / 16) {
                  mask_opt_idx = j / 16;
-@@ -402,6 +411,9 @@ void main() {
+@@ -476,6 +485,9 @@ void main() {
                      const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec));
                      [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
                          Lf[r + vec_idx] += Pf[vec_idx];
@@ -1192,7 +786,7 @@ index aa9dd624b..143a25b0f 100644
                      }
                      Psh[col * psh_stride + row / 4] = Pf;
                  }
-@@ -409,6 +421,8 @@ void main() {
+@@ -483,6 +495,8 @@ void main() {
          }
  
          if (SHMEM_STAGING != 0) {
@@ -1201,7 +795,7 @@ index aa9dd624b..143a25b0f 100644
              [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV_pad / 4; idx += gl_WorkGroupSize.x) {
                  uint32_t d = (idx + tid) % (HSV_pad / 4);
                  uint32_t c = (idx + tid) / (HSV_pad / 4);
-@@ -416,7 +430,7 @@ void main() {
+@@ -490,7 +504,7 @@ void main() {
                      FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
                      uint32_t v_row;
                      bool kv_active = fa_kv_index(j * Bc + c, v_row);
@@ -1210,7 +804,7 @@ index aa9dd624b..143a25b0f 100644
  #if !defined(BFLOAT16)
                          if (USE_DECODE_V) {
                              uint coord = v_row * v_stride * BLOCK_SIZE_V + 4 * d;
-@@ -436,6 +450,27 @@ void main() {
+@@ -510,6 +524,27 @@ void main() {
          }
          barrier();
  
@@ -1238,7 +832,7 @@ index aa9dd624b..143a25b0f 100644
          const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
  
          // Each subgroup handles HSV/4 columns
-@@ -456,7 +491,12 @@ void main() {
+@@ -533,7 +568,12 @@ void main() {
              if (SHMEM_STAGING == 0) {
              // For quants we always preload via kvsh. For f16/bf16 we only preload when
              // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
@@ -1252,7 +846,7 @@ index aa9dd624b..143a25b0f 100644
              if (stage_v) {
                  [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                      const uint idx = i * gl_WorkGroupSize.x + tid;
-@@ -471,7 +511,8 @@ void main() {
+@@ -548,7 +588,8 @@ void main() {
                      const uint ib = coord / BLOCK_SIZE_V;
                      const uint iqs = coord % BLOCK_SIZE_V;
  
@@ -1262,9 +856,9 @@ index aa9dd624b..143a25b0f 100644
  #if !defined(BFLOAT16)
                          if (USE_DECODE_V) {
                              kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
-@@ -495,7 +536,7 @@ void main() {
-                     coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
- 
+@@ -570,7 +611,7 @@ void main() {
+             if (hsv_offset < HSV_pad) {
+                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
                      if (SHMEM_STAGING == 0) {
 -                    if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
 +                    if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE && !tile_has_dead) {
@@ -1272,7 +866,7 @@ index aa9dd624b..143a25b0f 100644
                          const uint v_tile_row = j * Bc + bc_chunk * MatBc;
                          const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
 diff --git a/include/llama.h b/include/llama.h
-index 181d840a6..7c28dbe4c 100644
+index 7122143e5..1be543b2d 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -218,9 +218,18 @@ extern "C" {
@@ -1332,7 +926,7 @@ index 426c48741..7a1464ebd 100644
      set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
      target_compile_definitions(llama PRIVATE LLAMA_BUILD)
 diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
-index 7fce6624f..c3644da17 100644
+index ca3e308f4..2bda61ab2 100644
 --- a/src/llama-batch.cpp
 +++ b/src/llama-batch.cpp
 @@ -13,8 +13,12 @@
@@ -1364,7 +958,7 @@ index 7fce6624f..c3644da17 100644
      this->n_embd       = batch_inp.n_embd > 0 ? batch_inp.n_embd : batch_inp.n_embd_inp;
      this->n_embd_state = batch_inp.n_embd_state;
      this->n_seq_max    = batch_inp.n_seq_max;
-@@ -313,10 +317,10 @@ bool llama_batch_allocr::init(
+@@ -317,10 +321,10 @@ bool llama_batch_allocr::init(
          for (int32_t i = 0; i < batch.n_tokens; ++i) {
              seq_set_t cur;
              for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
@@ -1378,7 +972,7 @@ index 7fce6624f..c3644da17 100644
              }
  
              seq_set.push_back(cur);
-@@ -507,24 +511,24 @@ bool llama_batch_allocr::init(
+@@ -512,24 +516,24 @@ bool llama_batch_allocr::init(
          }
  
          for (int32_t i = 0; i < batch.n_tokens; ++i) {
@@ -1411,7 +1005,7 @@ index 7fce6624f..c3644da17 100644
              }
          }
      }
-@@ -605,12 +609,12 @@ std::vector<int32_t> & llama_batch_allocr::get_out_ids() {
+@@ -611,12 +615,12 @@ std::vector<int32_t> & llama_batch_allocr::get_out_ids() {
      return out_ids;
  }
  
@@ -1428,7 +1022,7 @@ index 7fce6624f..c3644da17 100644
  }
  
  void llama_batch_allocr::split_reset() {
-@@ -986,10 +990,10 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+@@ -997,10 +1001,10 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
          }
  
          for (int s = 0; s < udata->n_seq_id[i]; ++s) {
@@ -1442,7 +1036,7 @@ index 7fce6624f..c3644da17 100644
          }
  
          if (udata->output[i]) {
-@@ -1042,8 +1046,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+@@ -1054,8 +1058,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
      return res;
  }
  
@@ -1453,7 +1047,7 @@ index 7fce6624f..c3644da17 100644
          LLAMA_LOG_DEBUG("%s:   equal_seqs   = %d\n", __func__, ubatch.equal_seqs());
          LLAMA_LOG_DEBUG("%s:   n_tokens     = %d\n", __func__, ubatch.n_tokens);
          LLAMA_LOG_DEBUG("%s:   n_seq_tokens = %d\n", __func__, ubatch.n_seq_tokens);
-@@ -1084,28 +1088,26 @@ void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
+@@ -1096,28 +1100,26 @@ void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
          LLAMA_LOG_DEBUG("%s:   type       = %p\n", __func__, (void *) ubatch.type);
          LLAMA_LOG_DEBUG("%s:   n_outputs  = %d\n", __func__, n_outputs);
  
@@ -1488,10 +1082,10 @@ index 7fce6624f..c3644da17 100644
                      } else {
                          ss << ".";
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 9066e061e..9e220bc6e 100644
+index ea41283f9..6514c0aa1 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -796,7 +796,7 @@ void llama_context::sched_reserve() {
+@@ -805,7 +805,7 @@ void llama_context::sched_reserve() {
  
      synchronize();
  
@@ -1500,7 +1094,7 @@ index 9066e061e..9e220bc6e 100644
  
      const uint32_t n_seqs = cparams.n_seq_max;
      const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
-@@ -830,9 +830,9 @@ void llama_context::sched_reserve() {
+@@ -839,9 +839,9 @@ void llama_context::sched_reserve() {
      }
  
      // avoid reserving graphs with zero outputs - assume one output per sequence
@@ -1512,7 +1106,7 @@ index 9066e061e..9e220bc6e 100644
  
      resolve_fused_ops(mctx.get(), n_seqs);
  
-@@ -949,7 +949,7 @@ void llama_context::sched_reserve() {
+@@ -958,7 +958,7 @@ void llama_context::sched_reserve() {
      const int64_t t_end_us = ggml_time_us();
  
      LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
@@ -1521,7 +1115,7 @@ index 9066e061e..9e220bc6e 100644
  }
  
  void llama_context::synchronize() {
-@@ -1363,12 +1363,12 @@ size_t llama_context::get_sampled_probs_count(int32_t idx) {
+@@ -1372,12 +1372,12 @@ size_t llama_context::get_sampled_probs_count(int32_t idx) {
  
  
  void llama_context::attach_threadpool(
@@ -1538,7 +1132,7 @@ index 9066e061e..9e220bc6e 100644
  }
  
  void llama_context::detach_threadpool() {
-@@ -1385,11 +1385,11 @@ void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
+@@ -1394,11 +1394,11 @@ void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
      cparams.n_threads_batch = n_threads_batch;
  }
  
@@ -1553,7 +1147,7 @@ index 9066e061e..9e220bc6e 100644
  
      for (auto & backend : backends) {
          auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
-@@ -2307,7 +2307,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2320,7 +2320,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      }
  
      int64_t n_outputs_prev = 0;
@@ -1573,7 +1167,7 @@ index 9066e061e..9e220bc6e 100644
  
      // ordering for the layer input device buffer
      llama_context * inject_src     = has_embd_row ? cparams.ctx_other : nullptr;
-@@ -2486,14 +2497,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2499,14 +2510,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
          }
  
          // [TAG_EXTRACT_TARGET_EMBEDDINGS]
@@ -1590,7 +1184,7 @@ index 9066e061e..9e220bc6e 100644
  
              // the device buffer replaces the host extraction, see build_h_nextn_dev()
              if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && !write_h_nextn) {
-@@ -2511,7 +2522,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2524,7 +2535,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
  
          if (extract_all_idxs) {
              GGML_ASSERT(ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens);
@@ -1599,7 +1193,7 @@ index 9066e061e..9e220bc6e 100644
              const auto & batch_idxs = ubatch.data->batch_idxs;
              embd_batch_idxs.insert(embd_batch_idxs.end(), batch_idxs.begin(), batch_idxs.end());
          }
-@@ -2527,8 +2538,42 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2540,8 +2551,42 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
          }
  
          n_outputs_prev += n_outputs;
@@ -1644,7 +1238,7 @@ index 9066e061e..9e220bc6e 100644
  
      if (layer_inp_dev && ev_layer_inp_written) {
          ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
-@@ -2614,11 +2659,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2627,11 +2672,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
  // output
  //
  
@@ -1658,7 +1252,7 @@ index 9066e061e..9e220bc6e 100644
  
      const auto n_batch    = cparams.n_batch;
      const auto n_vocab    = vocab.n_tokens();
-@@ -3009,13 +3054,13 @@ static void ubatch_prepare_reserve(
+@@ -3000,13 +3045,13 @@ static void ubatch_prepare_reserve(
  }
  
  ggml_cgraph * llama_context::graph_reserve(
@@ -1676,7 +1270,7 @@ index 9066e061e..9e220bc6e 100644
      }
  
      ggml_backend_sched_reset(sched.get());
-@@ -3030,12 +3075,12 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -3021,12 +3066,12 @@ ggml_cgraph * llama_context::graph_reserve(
      // TODO: not sure if needed, might simplify in the future by removing this
      const auto save_n_outputs = this->n_outputs;
  
@@ -1693,7 +1287,7 @@ index 9066e061e..9e220bc6e 100644
  
      auto * res = gf_res_reserve.get();
  
-@@ -4187,12 +4232,12 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter
+@@ -4175,12 +4220,12 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter
      ggml_set_param(tensor);
  }
  
@@ -1710,7 +1304,7 @@ index 9066e061e..9e220bc6e 100644
      GGML_ASSERT(n_batch                    % n_ubatch == 0);
  
      if (cparams.flash_attn) {
-@@ -4222,22 +4267,22 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
+@@ -4210,22 +4255,22 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
      void * param_filter_ud              = lopt_params.param_filter_ud;
  
    //llama_set_param(model->tok_embd,        param_filter, param_filter_ud); // FIXME
@@ -1750,10 +1344,10 @@ index 9066e061e..9e220bc6e 100644
              llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
          }
 diff --git a/src/llama-grammar.cpp b/src/llama-grammar.cpp
-index 0ef01dbca..71b6cb783 100644
+index bb853b1e5..657306560 100644
 --- a/src/llama-grammar.cpp
 +++ b/src/llama-grammar.cpp
-@@ -648,9 +648,9 @@ const char * llama_grammar_parser::parse_sequence(
+@@ -650,9 +650,9 @@ const char * llama_grammar_parser::parse_sequence(
                  pos = parse_space(pos + 1, is_nested);
  
                  if (is_digit_char(*pos)) {
@@ -1767,7 +1361,7 @@ index 0ef01dbca..71b6cb783 100644
  
                  if (*pos != '}') {
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 559149508..00647ce8b 100644
+index b5956ead9..8b7fdf618 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -108,8 +108,12 @@ struct llm_graph_params;
@@ -1786,7 +1380,7 @@ index 559149508..00647ce8b 100644
  
      virtual ~llm_graph_input_i() = default;
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
-index 9213ac1dc..f99e7b47d 100644
+index 2bb8ef18c..722ddb6b8 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
 @@ -124,7 +124,7 @@ llama_memory_recurrent::llama_memory_recurrent(
@@ -1835,10 +1429,10 @@ index 9213ac1dc..f99e7b47d 100644
              }
          }
 diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
-index 9688a7ed4..d2ba9d2f4 100644
+index 02e4ede7c..62b662d7b 100644
 --- a/src/llama-mmap.cpp
 +++ b/src/llama-mmap.cpp
-@@ -929,8 +929,8 @@ struct llama_mlock::impl {
+@@ -925,8 +925,8 @@ struct llama_mlock::impl {
          return (size_t) sysconf(_SC_PAGESIZE);
      }
  
@@ -1849,7 +1443,7 @@ index 9688a7ed4..d2ba9d2f4 100644
              return true;
          }
  
-@@ -954,13 +954,13 @@ struct llama_mlock::impl {
+@@ -950,13 +950,13 @@ struct llama_mlock::impl {
          if (suggest && getrlimit(RLIMIT_MEMLOCK, &lock_limit)) {
              suggest = false;
          }
@@ -1865,7 +1459,7 @@ index 9688a7ed4..d2ba9d2f4 100644
          return false;
      }
  
-@@ -1057,6 +1057,18 @@ llama_mlock::~llama_mlock() = default;
+@@ -1053,6 +1053,18 @@ llama_mlock::~llama_mlock() = default;
  
  void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
  void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
@@ -1885,7 +1479,7 @@ index 9688a7ed4..d2ba9d2f4 100644
  #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
  const bool llama_mlock::SUPPORTED = true;
 diff --git a/src/llama-mmap.h b/src/llama-mmap.h
-index 6c6393d57..4f71f49f2 100644
+index 39715bfc3..29231f4d4 100644
 --- a/src/llama-mmap.h
 +++ b/src/llama-mmap.h
 @@ -72,6 +72,18 @@ struct llama_mlock {
@@ -1908,7 +1502,7 @@ index 6c6393d57..4f71f49f2 100644
  
  private:
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 2cbee61d4..4ee2b5ae5 100644
+index 808fb44d8..da4b9d15f 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -98,8 +98,8 @@ static std::vector<std::string> llama_get_list_splits(const std::string & path,
@@ -2161,7 +1755,7 @@ index 2cbee61d4..4ee2b5ae5 100644
  
              auto * event = ggml_backend_event_new(dev);
              if (!event) {
-@@ -1792,7 +1937,7 @@ bool llama_model_loader::load_all_data(
+@@ -1793,7 +1938,7 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -2256,10 +1850,10 @@ index ed59079a4..3c7e1c11b 100644
          }
      };
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 7c75ab55e..a68768e6c 100644
+index ec0820a07..5aeabe551 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1367,6 +1367,10 @@ struct llama_model::impl {
+@@ -1380,6 +1380,10 @@ struct llama_model::impl {
      // objects representing data potentially being locked in memory
      llama_mlocks mlock_bufs;
      llama_mlocks mlock_mmaps;
@@ -2270,7 +1864,7 @@ index 7c75ab55e..a68768e6c 100644
  
      // contexts where the model tensors metadata is stored as well as the corresponding buffers:
      std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
-@@ -2010,6 +2014,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2043,6 +2047,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      prec_policy.load(ml, *this);
  
      ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
@@ -2284,7 +1878,7 @@ index 7c75ab55e..a68768e6c 100644
      pimpl->mappings.reserve(ml.mappings.size());
  
      // create the backend buffers
-@@ -2046,10 +2057,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2079,10 +2090,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
          std::vector<ggml_backend_buffer_ptr> bufs;
  
@@ -2302,10 +1896,10 @@ index 7c75ab55e..a68768e6c 100644
              const size_t max_size = ggml_get_max_tensor_size(ctx);
  
 diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
-index 4ae396101..14d8f9f34 100644
+index 79d964972..be4667360 100644
 --- a/src/llama-quant.cpp
 +++ b/src/llama-quant.cpp
-@@ -514,17 +514,17 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
+@@ -528,17 +528,17 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type
          return i_layer < n_layers/8 || i_layer >= 7*n_layers/8 || (i_layer - n_layers/8)%3 == 2;
      };
      const int n_expert = std::max(1, (int)qs.model.hparams.n_expert);
@@ -2327,7 +1921,7 @@ index 4ae396101..14d8f9f34 100644
              }
          }
          return std::make_pair(i_layer, n_layer);
-@@ -900,7 +900,7 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float *
+@@ -914,7 +914,7 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float *
  
              // validate the quantized data
              if (!ggml_validate_row_data(new_type, this_data, this_size)) {
@@ -2502,7 +2096,7 @@ index d8cd441a5..b12278874 100644
      }
  }
 diff --git a/src/llama-vocab.cpp b/src/llama-vocab.cpp
-index e90f1bd11..a282acb22 100644
+index f3e1d0192..379d4e651 100644
 --- a/src/llama-vocab.cpp
 +++ b/src/llama-vocab.cpp
 @@ -3477,11 +3477,11 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
@@ -2776,7 +2370,7 @@ index 45d9a3eda..c148e2baa 100644
      run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
      run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);
 diff --git a/tools/cli/README.md b/tools/cli/README.md
-index 475becd2e..a6899275d 100644
+index 1dc83ee81..eda880ce9 100644
 --- a/tools/cli/README.md
 +++ b/tools/cli/README.md
 @@ -55,7 +55,7 @@
@@ -2802,7 +2396,7 @@ index cc6aae3d0..72997ba7a 100644
  | `-dev, --device <dev1,dev2,..>` | comma-separated list of devices to use for offloading (none = don't offload)<br/>use --list-devices to see a list of available devices<br/>(env: LLAMA_ARG_DEVICE) |
  | `--list-devices` | print list of available devices and exit |
 diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
-index 5cbdda14c..6d6baf52f 100644
+index 1ddd73ce8..8d11657fb 100644
 --- a/tools/llama-bench/llama-bench.cpp
 +++ b/tools/llama-bench/llama-bench.cpp
 @@ -279,6 +279,10 @@ static const char * lazy_mode_str(llama_lazy_mode mode) {
@@ -2837,7 +2431,7 @@ index 5cbdda14c..6d6baf52f 100644
                          invalid_param = true;
                          break;
 diff --git a/tools/server/README.md b/tools/server/README.md
-index 066ecb4dd..ee7f27eda 100644
+index 1f6553389..27bfc9c2e 100644
 --- a/tools/server/README.md
 +++ b/tools/server/README.md
 @@ -72,7 +72,7 @@ For the full list of features, please refer to [server's changelog](https://gith

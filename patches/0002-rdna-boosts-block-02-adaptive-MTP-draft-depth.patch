@@ -1,4 +1,4 @@
-From cef19b03246e51703295999d0c77364a6a3e0714 Mon Sep 17 00:00:00 2001
+From ae9ca2f9de4e4749b40a7d66833cd7636ea687ad Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 24 Oct 2026 09:35:46 -0500
 Subject: [PATCH 02/17] rdna-boosts: block 02: adaptive MTP draft depth
@@ -93,10 +93,10 @@ stays byte-identical, so it is a pure multi-slot change.  A host-expert config t
 untouched (same code path, verified in the log).  Gate: scripts/gate-spec-width-band.sh.
 ---
  common/arg.cpp                                |  56 +-
- common/common.cpp                             |  96 +++-
- common/common.h                               |  43 +-
+ common/common.cpp                             |  96 ++-
+ common/common.h                               |  46 +-
  common/speculative-adaptive.h                 | 142 +++++
- common/speculative.cpp                        | 502 +++++++++++++++++-
+ common/speculative.cpp                        | 561 ++++++++++++++++--
  common/speculative.h                          |   9 +
  docs/speculative.md                           |   9 +-
  .../speculative-simple/speculative-simple.cpp |   4 +
@@ -110,18 +110,19 @@ untouched (same code path, verified in the log).  Gate: scripts/gate-spec-width-
  src/llama-model.h                             |   3 +
  tests/CMakeLists.txt                          |  23 +
  tests/test-arg-parser.cpp                     |  17 +
- tests/test-recurrent-state-depth.cpp          | 215 ++++++++
- tests/test-speculative-adaptive.cpp           | 237 +++++++++
- tools/cli/README.md                           |   3 +-
- tools/server/README.md                        |   3 +-
+ tests/test-recurrent-state-depth.cpp          | 215 +++++++
+ tests/test-speculative-adaptive.cpp           | 237 ++++++++
+ tools/cli/README.md                           |  12 +-
+ tools/completion/README.md                    |   6 +-
+ tools/server/README.md                        |  12 +-
  tools/server/server-context.cpp               |  15 +-
- 23 files changed, 1406 insertions(+), 66 deletions(-)
+ 24 files changed, 1445 insertions(+), 113 deletions(-)
  create mode 100644 common/speculative-adaptive.h
  create mode 100644 tests/test-recurrent-state-depth.cpp
  create mode 100644 tests/test-speculative-adaptive.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 34342f2fb..96331e69a 100644
+index 9e0290dd5..8344b8782 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -341,9 +341,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -135,7 +136,7 @@ index 34342f2fb..96331e69a 100644
  
      const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                             params.speculative.types.end(),
-@@ -4147,12 +4145,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4167,12 +4165,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          string_format(
              "KV cache data type for K for the draft model\n"
              "allowed values: %s\n"
@@ -153,7 +154,7 @@ index 34342f2fb..96331e69a 100644
          }
      ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
      add_opt(common_arg(
-@@ -4160,12 +4159,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4180,12 +4179,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          string_format(
              "KV cache data type for V for the draft model\n"
              "allowed values: %s\n"
@@ -171,7 +172,7 @@ index 34342f2fb..96331e69a 100644
          }
      ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
      add_opt(common_arg(
-@@ -4194,11 +4194,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4214,11 +4214,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
  
      add_opt(common_arg(
          {"--spec-draft-n-max"}, "N",
@@ -192,7 +193,7 @@ index 34342f2fb..96331e69a 100644
              params.speculative.draft.n_max = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
-@@ -4219,6 +4227,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4239,6 +4247,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_ubatch = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
@@ -224,10 +225,10 @@ index 34342f2fb..96331e69a 100644
          {"--spec-synth-len"}, "L",
          "target mean synthetic acceptance length, including the target token (benchmarking only)",
 diff --git a/common/common.cpp b/common/common.cpp
-index 657dcdbf5..ce504d6e4 100644
+index b009d460d..7ea0efe89 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1383,7 +1383,30 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1388,7 +1388,30 @@ common_init_result::common_init_result(common_params & params, bool model_only)
          cparams.n_samplers = pimpl->samplers_seq_config.size();
      }
  
@@ -258,7 +259,7 @@ index 657dcdbf5..ce504d6e4 100644
      if (lctx == NULL) {
          COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
          return;
-@@ -1430,6 +1453,76 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model
+@@ -1435,6 +1458,76 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model
  }
  
  common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
@@ -335,7 +336,7 @@ index 657dcdbf5..ce504d6e4 100644
      common_init_result_ptr res(new common_init_result(params, model_only));
  
      llama_model * model = res->model();
-@@ -1717,7 +1810,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1722,7 +1815,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.progress_callback           = params.load_progress_callback;
      mparams.progress_callback_user_data = params.load_progress_callback_user_data;
      mparams.no_alloc                    = params.no_alloc;
@@ -346,41 +347,45 @@ index 657dcdbf5..ce504d6e4 100644
      return mparams;
  }
 diff --git a/common/common.h b/common/common.h
-index 6043ab342..223458973 100644
+index a8e89ed2d..76cbd8764 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -174,18 +174,19 @@ enum common_params_sampling_config : uint64_t {
+@@ -174,20 +174,21 @@ enum common_params_sampling_config : uint64_t {
  };
  
  enum common_speculative_type {
--    COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
--    COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
--    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
--    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
--    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
--    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
--    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
--    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
--    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
+-    COMMON_SPECULATIVE_TYPE_NONE,           // no speculative decoding
+-    COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,   // standalone draft model speculative decoding
+-    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,   // Eagle3 speculative decoding
+-    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,      // Multi-token prediction
+-    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,   // DFlash speculative decoding
+-    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,   // DSpark speculative decoding (DFlash + Markov head)
+-    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2,  // DFlash2 speculative decoding (DFlash + selector)
+-    COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR, // LiliCorr speculative decoding (DFlash + scorer)
+-    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,   // simple self-speculative decoding based on n-grams
+-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,    // self-speculative decoding with n-gram keys only
+-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,  // self-speculative decoding with n-gram keys and 4 m-gram values
 +    COMMON_SPECULATIVE_TYPE_NONE,                   // no speculative decoding
 +    COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,            // standalone draft model speculative decoding
 +    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,            // Eagle3 speculative decoding
 +    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,               // Multi-token prediction
-+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE,      // MTP with adaptive draft depth
++    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE,      // MTP with adaptive draft depth (delivery block 02)
 +    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,            // DFlash speculative decoding
 +    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,            // DSpark speculative decoding (DFlash + Markov head)
++    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2,           // DFlash2 speculative decoding (DFlash + selector)
++    COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR,          // LiliCorr speculative decoding (DFlash + scorer)
 +    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,            // simple self-speculative decoding based on n-grams
 +    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,             // self-speculative decoding with n-gram keys only
 +    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,           // self-speculative decoding with n-gram keys and 4 m-gram values
      COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
--    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
--    COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
+-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,    // self-speculative decoding with 3-level n-gram cache
+-    COMMON_SPECULATIVE_TYPE_COUNT           // number of types, unknown type
 +    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,             // self-speculative decoding with 3-level n-gram cache
 +    COMMON_SPECULATIVE_TYPE_COUNT                    // number of types, unknown type
  };
  
  // Grammar type enumeration
-@@ -342,6 +343,8 @@ struct common_params_model {
+@@ -344,6 +345,8 @@ struct common_params_model {
  struct common_params_speculative_draft {
      int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
      int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
@@ -389,7 +394,7 @@ index 6043ab342..223458973 100644
  
      float p_split = 0.1f; // speculative decoding split probability
      float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
-@@ -362,6 +365,12 @@ struct common_params_speculative_draft {
+@@ -364,6 +367,12 @@ struct common_params_speculative_draft {
      ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
      ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
  
@@ -402,7 +407,7 @@ index 6043ab342..223458973 100644
      common_cpu_params cpuparams;
      common_cpu_params cpuparams_batch;
  
-@@ -408,13 +417,21 @@ struct common_params_speculative {
+@@ -410,14 +419,19 @@ struct common_params_speculative {
          return !draft.mparams.empty();
      }
  
@@ -418,14 +423,13 @@ index 6043ab342..223458973 100644
  
      uint32_t need_n_rs_seq() const {
 -        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
--            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP     ||
+-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3  ||
 +        bool needs_rs_seq = has_mtp() || std::any_of(types.begin(), types.end(), [](auto t) {
-+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
-+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
-+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-         });
- 
-         return needs_rs_seq ? draft.n_max : 0u;
++            return t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3  ||
+                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH  ||
+                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK  ||
+                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 ||
 diff --git a/common/speculative-adaptive.h b/common/speculative-adaptive.h
 new file mode 100644
 index 000000000..1f8e8a6b5
@@ -575,7 +579,7 @@ index 000000000..1f8e8a6b5
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index bb487f5ce..276bdb5f3 100644
+index 77bb6d458..7b5a5ecdc 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,9 @@
@@ -636,15 +640,41 @@ index bb487f5ce..276bdb5f3 100644
  // Rebuild seq_id's draft sampler at the target's temperature: rejection weighs q against p, so
  // both have to sample alike. Only temp and seed carry over; the draft keeps its own top_k.
  static void spec_retune(
-@@ -74,6 +118,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
-     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
-     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
-     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+@@ -70,19 +114,20 @@ static void spec_retune(
+ }
+ 
+ const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
+-    {"none",           COMMON_SPECULATIVE_TYPE_NONE},
+-    {"draft-simple",   COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
+-    {"draft-eagle3",   COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
+-    {"draft-mtp",      COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+-    {"draft-dflash",   COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
+-    {"draft-dspark",   COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
+-    {"draft-dflash2",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2},
+-    {"draft-lilicorr", COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR},
+-    {"ngram-simple",   COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
+-    {"ngram-map-k",    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
+-    {"ngram-map-k4v",  COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
+-    {"ngram-mod",      COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
+-    {"ngram-cache",    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
++    {"none",               COMMON_SPECULATIVE_TYPE_NONE},
++    {"draft-simple",       COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
++    {"draft-eagle3",       COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
++    {"draft-mtp",          COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
 +    {"draft-mtp-adaptive", COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE},
-     {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
-     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
-     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
-@@ -170,6 +215,59 @@ bool common_speculative_are_compatible(
++    {"draft-dflash",       COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
++    {"draft-dspark",       COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
++    {"draft-dflash2",      COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2},
++    {"draft-lilicorr",     COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR},
++    {"ngram-simple",       COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
++    {"ngram-map-k",        COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
++    {"ngram-map-k4v",      COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
++    {"ngram-mod",          COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
++    {"ngram-cache",        COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+ };
+ 
+ static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
+@@ -172,6 +217,59 @@ bool common_speculative_are_compatible(
  
  using common_speculative_draft_params_vec = std::vector<common_speculative_draft_params>;
  
@@ -704,7 +734,7 @@ index bb487f5ce..276bdb5f3 100644
  // state of an implementation of speculative decoding
  //
  // each implementation has a unique type and a state that is implementation-specific
-@@ -206,10 +304,17 @@ struct common_speculative_impl {
+@@ -208,10 +306,17 @@ struct common_speculative_impl {
  
      virtual bool process(const common_batch & batch) = 0;
  
@@ -722,7 +752,7 @@ index bb487f5ce..276bdb5f3 100644
      // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
      virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
      virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
-@@ -1523,6 +1628,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+@@ -1790,6 +1895,20 @@ public:
      }
  };
  
@@ -743,7 +773,7 @@ index bb487f5ce..276bdb5f3 100644
  struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
  
-@@ -1544,6 +1663,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1811,6 +1930,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      int32_t n_mtp_layers  = 1;
      bool    is_mem_shared = false;   // gemma4
      bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
@@ -751,7 +781,7 @@ index bb487f5ce..276bdb5f3 100644
  
      // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
      // The last h-row of one process() call needs the first token of the NEXT
-@@ -1568,8 +1688,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1835,8 +1955,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      int32_t n_batch_tgt = 0;
      std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
  
@@ -776,7 +806,7 @@ index bb487f5ce..276bdb5f3 100644
          , params(params.draft)
      {
          auto * ctx_tgt = this->params.ctx_tgt;
-@@ -1581,6 +1715,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1848,6 +1982,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  "MTP input row width must match the target h_nextn width");
          n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
  
@@ -793,7 +823,7 @@ index bb487f5ce..276bdb5f3 100644
          SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
          SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
          SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
-@@ -1628,10 +1772,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1895,10 +2039,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
          is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
          chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
@@ -813,7 +843,7 @@ index bb487f5ce..276bdb5f3 100644
          if (chain_heads) {
              this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
  
-@@ -1642,6 +1795,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1909,6 +2062,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
          this->n_max = this->params.n_max;
  
@@ -848,7 +878,7 @@ index bb487f5ce..276bdb5f3 100644
          pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
  
          i_last.assign(n_seq, -1);
-@@ -1655,7 +1836,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1922,7 +2103,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          verify_row0.assign(n_seq, -1);
  
          // shared memory and chained heads keep the host rows
@@ -857,7 +887,7 @@ index bb487f5ce..276bdb5f3 100644
              dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_ctx_state_src(ctx_dft, ctx_tgt);
              if (!dev_rows) {
                  llama_set_ctx_state_src(ctx_dft, nullptr);
-@@ -1687,6 +1868,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1954,6 +2135,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          // reset here rather than per round, or two identical requests differ
          common_sampler_reset(smpls[seq_id].get());
  
@@ -871,7 +901,7 @@ index bb487f5ce..276bdb5f3 100644
          const int32_t N = (int32_t) prompt.size();
          if (N <= 0) {
              return;
-@@ -1704,6 +1892,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1971,6 +2159,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
      }
  
@@ -920,7 +950,7 @@ index bb487f5ce..276bdb5f3 100644
      bool process(const common_batch & batch_in) override {
          if (batch_in.size() <= 0) {
              return true;
-@@ -1713,6 +1943,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1980,6 +2210,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              return true;
          }
  
@@ -938,7 +968,7 @@ index bb487f5ce..276bdb5f3 100644
          const int32_t n_tokens = batch_in.size();
  
          // remember the first and last batch index for each sequence
-@@ -1756,11 +1997,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -2023,11 +2264,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
              const float * h_tgt = dev_rows ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
  
@@ -964,7 +994,7 @@ index bb487f5ce..276bdb5f3 100644
                  // vision tokens carry an embedding instead of an id
                  const int32_t idx = t.id != LLAMA_TOKEN_NULL
                      ? batch.add(t.id, t.pos[0], seq_id, false)
-@@ -1780,8 +2035,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -2047,8 +2302,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
              auto * mem_dft = llama_get_memory(ctx_dft);
  
@@ -982,7 +1012,7 @@ index bb487f5ce..276bdb5f3 100644
                  if (chain_heads) {
                      // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
                      for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-@@ -1815,19 +2078,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -2082,19 +2345,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
@@ -1033,7 +1063,7 @@ index bb487f5ce..276bdb5f3 100644
              verify_h_rows[seq_id] = h_rows;
  
              if (dev_rows) {
-@@ -1869,6 +2155,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -2136,6 +2422,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
              n_drafting++;
              drafting[seq_id] = true;
@@ -1052,7 +1082,7 @@ index bb487f5ce..276bdb5f3 100644
              // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
              if (!params.probabilistic) {
                  dp.result_q = nullptr;
-@@ -1894,6 +2192,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -2161,6 +2459,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              }
          }
  
@@ -1063,7 +1093,7 @@ index bb487f5ce..276bdb5f3 100644
          int i = 0;
  
          while (n_drafting > 0) {
-@@ -1964,7 +2266,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -2231,7 +2533,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                      dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                  }
  
@@ -1072,7 +1102,7 @@ index bb487f5ce..276bdb5f3 100644
                      drafting[seq_id] = false;
                      n_drafting--;
                      continue;
-@@ -2011,17 +2313,108 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -2278,17 +2580,108 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
@@ -1183,7 +1213,7 @@ index bb487f5ce..276bdb5f3 100644
          const int32_t n_rows = verify_h_rows[seq_id];
          if (n_rows <= 0) {
              return;
-@@ -2061,6 +2454,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -2328,6 +2721,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
          std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
      }
@@ -1201,23 +1231,51 @@ index bb487f5ce..276bdb5f3 100644
  };
  
  // state of self-speculation (simple implementation, not ngram-map)
-@@ -2547,6 +2951,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
-         case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
-         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
-         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
+@@ -2810,20 +3214,21 @@ const char * common_speculative_all_types_str() {
+ 
+ std::string common_speculative_type_to_str(common_speculative_type type) {
+     switch (type) {
+-        case COMMON_SPECULATIVE_TYPE_NONE:           return "none";
+-        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:   return "draft-simple";
+-        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:   return "draft-eagle3";
+-        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:      return "draft-mtp";
+-        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:   return "draft-dflash";
+-        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:   return "draft-dspark";
+-        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2:  return "draft-dflash2";
+-        case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR: return "draft-lilicorr";
+-        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:   return "ngram-simple";
+-        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:    return "ngram-map-k";
+-        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:  return "ngram-map-k4v";
+-        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:      return "ngram-mod";
+-        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:    return "ngram-cache";
+-        default:                                     return "unknown";
++        case COMMON_SPECULATIVE_TYPE_NONE:               return "none";
++        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:       return "draft-simple";
++        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:       return "draft-eagle3";
++        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:          return "draft-mtp";
 +        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE: return "draft-mtp-adaptive";
-         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
-         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
-         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
-@@ -2638,6 +3043,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
++        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:       return "draft-dflash";
++        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:       return "draft-dspark";
++        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2:      return "draft-dflash2";
++        case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR:     return "draft-lilicorr";
++        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:       return "ngram-simple";
++        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:        return "ngram-map-k";
++        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:      return "ngram-map-k4v";
++        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:          return "ngram-mod";
++        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:        return "ngram-cache";
++        default:                                         return "unknown";
+     }
+ }
+ 
+@@ -2905,6 +3310,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
              case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
              case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
 +            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE:
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
              case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
-                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
-@@ -2793,8 +3199,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
+             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2:
+@@ -3062,8 +3468,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
          }
      }
  
@@ -1236,7 +1294,7 @@ index bb487f5ce..276bdb5f3 100644
      result.n_outputs_max = params.n_parallel;
      result.n_outputs_max_per_seq = 1;
  
-@@ -2840,15 +3254,24 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -3112,15 +3526,24 @@ common_speculative_init_result::common_speculative_init_result(
      llama_context * ctx_tgt) :
      pimpl(new impl{}) {
      const bool has_draft = params.speculative.has_dft();
@@ -1264,29 +1322,32 @@ index bb487f5ce..276bdb5f3 100644
      }
  
      // the draft context holds as many tokens per sequence as the target context
-@@ -2934,7 +3357,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3214,7 +3637,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
--        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
-+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
-+
-+        // two MTP implementations would share one ctx_dft and each run process() on
-+        // every batch, so the pair is rejected
-+        if (std::find(params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.types.end() &&
-+            std::find(params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.types.end()) {
-+            throw std::invalid_argument("draft-mtp and draft-mtp-adaptive cannot be enabled together");
-+        }
+-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 13);
++static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 14);
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -2947,12 +3377,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3225,16 +3648,20 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
+ 
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
-         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
-         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
+-        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,   params.draft.ctx_dft != nullptr);
+-        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,      params.draft.ctx_dft != nullptr);
+-        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,   params.draft.ctx_dft != nullptr);
+-        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,   params.draft.ctx_dft != nullptr);
+-        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2,  params.draft.ctx_dft != nullptr);
+-        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR, params.draft.ctx_dft != nullptr);
++        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,       params.draft.ctx_dft != nullptr);
++        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,          params.draft.ctx_dft != nullptr);
 +        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, params.draft.ctx_dft != nullptr);
-         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
-         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
++        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,       params.draft.ctx_dft != nullptr);
++        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,       params.draft.ctx_dft != nullptr);
++        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2,      params.draft.ctx_dft != nullptr);
++        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR,     params.draft.ctx_dft != nullptr);
      }
  
      std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
@@ -1297,7 +1358,7 @@ index bb487f5ce..276bdb5f3 100644
      for (const common_speculative_config & config : configs) {
          switch (config.type) {
              case COMMON_SPECULATIVE_TYPE_NONE:
-@@ -2966,7 +3400,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3248,7 +3675,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -1309,8 +1370,8 @@ index bb487f5ce..276bdb5f3 100644
 +                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq, /*adaptive=*/ true, align));
                  break;
              }
-             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
-@@ -3111,6 +3549,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+@@ -3423,6 +3854,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
      }
  }
  
@@ -1326,7 +1387,7 @@ index bb487f5ce..276bdb5f3 100644
  bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
      bool result = true;
  
-@@ -3251,6 +3698,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+@@ -3563,6 +4003,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
      }
  }
  
@@ -1345,7 +1406,7 @@ index bb487f5ce..276bdb5f3 100644
  bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
      if (spec == nullptr) {
 diff --git a/common/speculative.h b/common/speculative.h
-index 4262327cb..605a847b0 100644
+index 949114f35..370480010 100644
 --- a/common/speculative.h
 +++ b/common/speculative.h
 @@ -89,12 +89,21 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
@@ -1371,19 +1432,19 @@ index 4262327cb..605a847b0 100644
  bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
  void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 diff --git a/docs/speculative.md b/docs/speculative.md
-index 9072eedd3..fa3e6eb90 100644
+index 48e9d757e..e6e428689 100644
 --- a/docs/speculative.md
 +++ b/docs/speculative.md
-@@ -225,7 +225,7 @@ Use exactly one of these options:
+@@ -273,7 +273,7 @@ Use exactly one of these options:
  ### General Speculative Parameters
  
  ```
----spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dspark|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
-+--spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dspark|draft-mtp|draft-mtp-adaptive|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
+---spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dflash2|draft-dspark|draft-lilicorr|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
++--spec-type [none|draft-simple|draft-eagle3|draft-mtp|draft-mtp-adaptive|draft-dflash|draft-dspark|draft-dflash2|draft-lilicorr|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod|ngram-cache]
                                          comma-separated list of types of speculative decoding to use
                                          (default: none)
                                          (env: LLAMA_ARG_SPEC_TYPE)
-@@ -251,6 +251,12 @@ Use exactly one of these options:
+@@ -299,6 +299,12 @@ Use exactly one of these options:
  --spec-draft-n-ubatch                   N
                                          physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)
                                          (env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH)
@@ -1396,19 +1457,19 @@ index 9072eedd3..fa3e6eb90 100644
  --spec-draft-p-split, --draft-p-split   P
                                          speculative decoding split probability (default: 0.10)
                                          (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)
-@@ -371,6 +377,7 @@ Specifies a comma-separated list of speculative decoding types to use.
- | `draft-dflash` | Use a DFlash block-diffusion draft model that emits a block per step |
+@@ -421,6 +427,7 @@ Specifies a comma-separated list of speculative decoding types to use.
  | `draft-dspark` | Use a DSpark draft model (DFlash backbone + semi-autoregressive Markov head) |
+ | `draft-lilicorr` | Use a LiliCorr draft model (DFlash + candidate scorer conditioned on the target's hidden state) |
  | `draft-mtp` | Use Multi Token Prediction (MTP) heads from the main model |
 +| `draft-mtp-adaptive` | Use MTP heads from the main model with an adaptive draft depth that tracks the current acceptance rate |
  | `ngram-cache` | Use n-gram cache lookup |
  | `ngram-simple` | Use simple n-gram pattern matching |
  | `ngram-map-k` | Use n-gram pattern matching with n-gram-keys |
 diff --git a/examples/speculative-simple/speculative-simple.cpp b/examples/speculative-simple/speculative-simple.cpp
-index e4a878b82..cb627129b 100644
+index ec2c03176..d7ef496f0 100644
 --- a/examples/speculative-simple/speculative-simple.cpp
 +++ b/examples/speculative-simple/speculative-simple.cpp
-@@ -266,6 +266,10 @@ int main(int argc, char ** argv) {
+@@ -271,6 +271,10 @@ int main(int argc, char ** argv) {
          if (use_ckpt_tgt && ids.size() - 1 < n_draft) {
              LOG_DBG("partial acceptance: %zu < %zu, restoring checkpoint\n", ids.size() - 1, n_draft);
  
@@ -1420,10 +1481,10 @@ index e4a878b82..cb627129b 100644
  
              {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 3418faf81..dd6c0bd3e 100644
+index dd42b3674..2bac7baf0 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -171,7 +171,7 @@ static bool ggml_cuda_register_host_enabled() {
+@@ -177,7 +177,7 @@ static bool ggml_cuda_register_host_enabled() {
      return enabled;
  }
  
@@ -1433,10 +1494,10 @@ index 3418faf81..dd6c0bd3e 100644
      return disabled;
  }
 diff --git a/include/llama.h b/include/llama.h
-index 7c28dbe4c..4c171aa3d 100644
+index 1be543b2d..dc3d45574 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -379,6 +379,7 @@ extern "C" {
+@@ -389,6 +389,7 @@ extern "C" {
          uint32_t n_ubatch;              // physical maximum batch size
          uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
          uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
@@ -1445,10 +1506,10 @@ index 7c28dbe4c..4c171aa3d 100644
          uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
          int32_t  n_threads;             // number of threads to use for generation
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 9e220bc6e..e00d3c938 100644
+index 6514c0aa1..5ade646a4 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1432,6 +1432,12 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
+@@ -1441,6 +1441,12 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
      }
  }
  
@@ -1461,7 +1522,7 @@ index 9e220bc6e..e00d3c938 100644
  void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
      LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
  
-@@ -2309,6 +2315,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2322,6 +2328,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      int64_t n_outputs_prev = 0;
      int64_t n_tokens_prev_l  = 0;
  
@@ -1477,7 +1538,7 @@ index 9e220bc6e..e00d3c938 100644
      // complete the async device->host readbacks issued for one ubatch
      auto sync_readback = [&](ggml_tensor * t) {
          if (t == nullptr) {
-@@ -2498,6 +2513,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2511,6 +2526,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
  
          // [TAG_EXTRACT_TARGET_EMBEDDINGS]
          bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev_l, ubatch.n_tokens);
@@ -1486,7 +1547,7 @@ index 9e220bc6e..e00d3c938 100644
  
          // extract nextn embeddings before
          // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
-@@ -2505,18 +2522,47 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2518,18 +2535,47 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
              const bool masked    = cparams.embeddings_nextn_masked;
              const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
              const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev_l;
@@ -1543,7 +1604,7 @@ index 9e220bc6e..e00d3c938 100644
              }
          }
  
-@@ -2557,7 +2603,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -2570,7 +2616,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
          // upload waits only for this graph's compute, not for the copies queued after it, and was observed (Windows, ROCm)
          // to overwrite a layer input before its copy had read it.
          static const bool readback_sync = getenv("GGML_READBACK_SYNC") == nullptr || atoi(getenv("GGML_READBACK_SYNC")) != 0;
@@ -1552,7 +1613,7 @@ index 9e220bc6e..e00d3c938 100644
              sync_readback(t_logits);
              sync_readback(t_embd);
              sync_readback(t_h_nextn);
-@@ -4464,6 +4510,7 @@ llama_context_params llama_context_default_params() {
+@@ -4449,6 +4495,7 @@ llama_context_params llama_context_default_params() {
          /*.n_ubatch                    =*/ 512,
          /*.n_seq_max                   =*/ 1,
          /*.n_rs_seq                    =*/ 0,
@@ -1560,7 +1621,7 @@ index 9e220bc6e..e00d3c938 100644
          /*.n_outputs_max               =*/ 0,
          /*.n_outputs_max_per_seq       =*/ 1,
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
-@@ -4765,6 +4812,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
+@@ -4750,6 +4797,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
      return ctx->get_embeddings_seq(seq_id);
  }
  
@@ -1572,7 +1633,7 @@ index 9e220bc6e..e00d3c938 100644
      ctx->set_embeddings_nextn(value, masked);
  }
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 45eca4566..7cbbc73e7 100644
+index 3e3921c7d..1afdc6b93 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -122,6 +122,7 @@ struct llama_context {
@@ -1592,7 +1653,7 @@ index 45eca4566..7cbbc73e7 100644
      // host buffers for output layer input embeddings, per layer
      // populated when cparams.output_layer_inp[il] is true
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index 52c85bdd2..e4d3af94c 100644
+index 1f890d6fa..990693120 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
 @@ -14,6 +14,7 @@ struct llama_cparams {
@@ -1604,10 +1665,10 @@ index 52c85bdd2..e4d3af94c 100644
      uint32_t n_outputs_max_per_seq;
      int32_t  n_threads;       // number of threads to use for generation
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index 3ac617b0f..b6f162e02 100644
+index b8b7fba0b..6409c074e 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
-@@ -123,6 +123,11 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
+@@ -125,6 +125,11 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
  // Useful for testing purposes.
  LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
  
@@ -1619,7 +1680,7 @@ index 3ac617b0f..b6f162e02 100644
  // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
  // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
  // A run of entries with the same value is one span, spans must be separated by entries with value 0
-@@ -144,6 +149,11 @@ LLAMA_API const char * llama_model_decision_label(const struct llama_model * mod
+@@ -150,6 +155,11 @@ LLAMA_API const char * llama_model_decision_label(const struct llama_model * mod
  // model/context data extraction
  //
  
@@ -1632,10 +1693,10 @@ index 3ac617b0f..b6f162e02 100644
  // returns total number of elements or 0 on error
  // if out is nullptr, returns the number of tokens without writing to out
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index a68768e6c..77797bd2d 100644
+index 5aeabe551..3fce131bf 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -4162,6 +4162,14 @@ static void llama_tensor_rows_to_f32(const ggml_tensor * tensor, int64_t row0, i
+@@ -4241,6 +4241,14 @@ static void llama_tensor_rows_to_f32(const ggml_tensor * tensor, int64_t row0, i
      }
  }
  
@@ -1651,10 +1712,10 @@ index a68768e6c..77797bd2d 100644
      if (model->vocab.n_tokens() == 0 || model->tok_embd == nullptr) {
          return 0;
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 1b7ea1ce7..083aff946 100644
+index e86e5e54f..1aa9b1261 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -925,6 +925,9 @@ struct llama_model {
+@@ -971,6 +971,9 @@ struct llama_model {
      // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
      std::vector<int32_t> target_layer_ids;
  
@@ -1665,7 +1726,7 @@ index 1b7ea1ce7..083aff946 100644
  
      //Dense linear projections for SentenceTransformers models like embeddinggemma
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 36e48a0f2..b2c99b356 100644
+index 5b997e91b..3c9224104 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -180,6 +180,7 @@ set(LLAMA_CONTEXT_TEST_SRC
@@ -1713,10 +1774,10 @@ index 36e48a0f2..b2c99b356 100644
  # the test serves its repos from an httplib server, and the library links it privately
  target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 diff --git a/tests/test-arg-parser.cpp b/tests/test-arg-parser.cpp
-index 537c33394..88f424984 100644
+index 36624ba86..e4c0e5990 100644
 --- a/tests/test-arg-parser.cpp
 +++ b/tests/test-arg-parser.cpp
-@@ -304,6 +304,23 @@ static void test(void) {
+@@ -315,6 +315,23 @@ static void test(void) {
          assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
      }
  
@@ -2205,52 +2266,126 @@ index 000000000..a5ae0bc64
 +    return 0;
 +}
 diff --git a/tools/cli/README.md b/tools/cli/README.md
-index a6899275d..67ed50d93 100644
+index eda880ce9..785ebeaab 100644
 --- a/tools/cli/README.md
 +++ b/tools/cli/README.md
-@@ -202,6 +202,7 @@
- | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
+@@ -55,7 +55,7 @@
+ | `-np, --parallel N` | number of parallel sequences to decode (default: 1)<br/>(env: LLAMA_ARG_N_PARALLEL) |
+ | `--rpc SERVERS` | comma-separated list of RPC servers (host:port)<br/>(env: LLAMA_ARG_RPC) |
+ | `-lm, --load-mode MODE` | model loading mode (default: auto)<br/>- auto: mmap, unless a device does not support it<br/>- none: no special loading mode<br/>- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)<br/>- mlock: force system to keep model in RAM rather than swapping or compressing<br/>- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing<br/>- dio: use DirectIO if available<br/><br/>(env: LLAMA_ARG_LOAD_MODE) |
+-| `-lzm, --lazy-mode MODE` | on-demand reading of certain tensors, for example per-layer embeddings (default: auto)<br/>- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)<br/>- auto: on, but only for tensors larger than 4 GiB<br/>- off: always keep them resident, even with a mapped load (--load-mode mmap): the tensors are read into host RAM instead of being served from the mapping<br/>- mlock: on, and every row of such a tensor is also pulled into the page cache and pinned there (mlock) at load, so it can never be reclaimed; the pages are read from the mapping on demand exactly as in on, and the pin is released when the process exits (the pages then go back to being ordinary reclaimable cache)<br/>(env: LLAMA_ARG_LAZY_MODE) |
++| `-lzm, --lazy-mode MODE` | on-demand reading of certain tensors, for example per-layer embeddings (default: auto)<br/>- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)<br/>- auto: on, but only for tensors larger than 4 GiB<br/>- off: always keep them resident, even with a mapped load (--load-mode mmap):<br/>       the tensors are read into host RAM instead of being served from the mapping<br/>- mlock: on, and every row of such a tensor is also pulled into the page cache and<br/>         pinned there (mlock) at load, so it can never be reclaimed; the pages are read<br/>         from the mapping on demand exactly as in on, and the pin is released when the<br/>         process exits (the pages then go back to being ordinary reclaimable cache)<br/>- mlockr: mlock, but the pin is released as soon as loading is done (munlock, nothing is<br/>          dropped): the tables are populated and stay hot in the page cache, and are<br/>          reclaimable again.  Prefer this over mlock when something else also wants the<br/>          RAM during the run -- an auto-sized expert arena, for one, where an unevictable<br/>          multi-GiB table leaves the model mapping as the only memory the kernel can take<br/>          back, so host-expert misses intermittently come from disk<br/>(env: LLAMA_ARG_LAZY_MODE) |
+ | `--numa TYPE` | attempt optimizations that help on some NUMA systems<br/>- distribute: spread execution evenly over all nodes<br/>- isolate: only spawn threads on CPUs on the node that execution started on<br/>- numactl: use the CPU map provided by numactl<br/>if run without this previously, it is recommended to drop the system page cache before using this<br/>see https://github.com/ggml-org/llama.cpp/issues/1437<br/>(env: LLAMA_ARG_NUMA) |
+ | `-dev, --device <dev1,dev2,..>` | comma-separated list of devices to use for offloading (none = don't offload)<br/>use --list-devices to see a list of available devices<br/>(env: LLAMA_ARG_DEVICE) |
+ | `--list-devices` | print list of available devices and exit |
+@@ -96,8 +96,8 @@
+ | `-lv, --verbosity, --log-verbosity N` | Set the verbosity threshold. Messages with a higher verbosity will be ignored. Values:<br/> - 0: generic output<br/> - 1: error<br/> - 2: warning<br/> - 3: info<br/> - 4: trace (more info)<br/> - 5: debug<br/>(default: 3)<br/><br/>(env: LLAMA_ARG_LOG_VERBOSITY) |
+ | `--log-prefix, --no-log-prefix` | Enable prefix in log messages<br/>(env: LLAMA_ARG_LOG_PREFIX) |
+ | `--log-timestamps, --no-log-timestamps` | Enable timestamps in log messages<br/>(env: LLAMA_ARG_LOG_TIMESTAMPS) |
+-| `--spec-draft-type-k, -ctkd, --cache-type-k-draft TYPE` | KV cache data type for K for the draft model<br/>allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K) |
+-| `--spec-draft-type-v, -ctvd, --cache-type-v-draft TYPE` | KV cache data type for V for the draft model<br/>allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V) |
++| `--spec-draft-type-k, -ctkd, --cache-type-k-draft TYPE` | KV cache data type for K for the draft model<br/>allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: follows the main model's --cache-type-k, so lowering the main KV type for VRAM takes the draft with it; set this to pin the draft's own type)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K) |
++| `--spec-draft-type-v, -ctvd, --cache-type-v-draft TYPE` | KV cache data type for V for the draft model<br/>allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: follows the main model's --cache-type-v, so lowering the main KV type for VRAM takes the draft with it; set this to pin the draft's own type)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V) |
+ 
+ 
+ ### Sampling params
+@@ -199,9 +199,11 @@
+ | `--spec-draft-override-tensor, -otd, --override-tensor-draft <tensor name pattern>=<buffer type>,...` | override tensor buffer type for draft model |
+ | `--spec-draft-cpu-moe, -cmoed, --cpu-moe-draft` | keep all Mixture of Experts (MoE) weights in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_CPU_MOE) |
+ | `--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE) |
+-| `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
++| `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3, max: 15)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
  | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
  | `--spec-draft-n-ubatch N` | physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH) |
-+| `--spec-draft-n-min-adaptive N` | minimum adaptive MTP draft depth; the depth starts here and never drops below it (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE) |
++| `--spec-draft-n-min-adaptive N` | minimum adaptive MTP draft depth; the depth never drops below it (the default cold start is three steps below --spec-draft-n-max, bounded by this floor) (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE) |
++| `--spec-draft-n-start N` | initial adaptive MTP draft depth: the first verify round of each generation starts here instead of the default cold start.  Clamped to [--spec-draft-n-min-adaptive, --spec-draft-n-max].  Use it to start deeper when the workload settles high (e.g. verbatim recall) or shallower for a short generation at a deep context, where a wide verify batch costs more.  Unset: three steps below the ceiling, bounded by the floor.<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_START) |
  | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
  | `--spec-synth-rates P0,P1,...` | comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_RATES) |
  | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
-@@ -211,7 +212,7 @@
+@@ -211,7 +213,7 @@
  | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices |
  | `--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
  | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
--| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
-+| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-mtp-adaptive,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
+-| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,draft-dflash2,draft-lilicorr,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
++| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-mtp-adaptive,draft-dflash,draft-dspark,draft-dflash2,draft-lilicorr,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
  | `--spec-ngram-mod-n-min N` | minimum number of ngram tokens to use for ngram-based speculative decoding (default: 48) |
  | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
  | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
+diff --git a/tools/completion/README.md b/tools/completion/README.md
+index 72997ba7a..8c87eeea8 100644
+--- a/tools/completion/README.md
++++ b/tools/completion/README.md
+@@ -138,7 +138,7 @@ llama-completion.exe -m models\gemma-1.1-7b-it.Q4_K_M.gguf --ignore-eos -n -1
+ | `-np, --parallel N` | number of parallel sequences to decode (default: 1)<br/>(env: LLAMA_ARG_N_PARALLEL) |
+ | `--rpc SERVERS` | comma-separated list of RPC servers (host:port)<br/>(env: LLAMA_ARG_RPC) |
+ | `-lm, --load-mode MODE` | model loading mode (default: auto)<br/>- auto: mmap, unless a device does not support it<br/>- none: no special loading mode<br/>- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)<br/>- mlock: force system to keep model in RAM rather than swapping or compressing<br/>- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing<br/>- dio: use DirectIO if available<br/><br/>(env: LLAMA_ARG_LOAD_MODE) |
+-| `-lzm, --lazy-mode MODE` | on-demand reading of certain tensors, for example per-layer embeddings (default: auto)<br/>- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)<br/>- auto: on, but only for tensors larger than 4 GiB<br/>- off: always keep them resident, even with a mapped load (--load-mode mmap): the tensors are read into host RAM instead of being served from the mapping<br/>- mlock: on, and every row of such a tensor is also pulled into the page cache and pinned there (mlock) at load, so it can never be reclaimed; the pages are read from the mapping on demand exactly as in on, and the pin is released when the process exits (the pages then go back to being ordinary reclaimable cache)<br/>(env: LLAMA_ARG_LAZY_MODE) |
++| `-lzm, --lazy-mode MODE` | on-demand reading of certain tensors, for example per-layer embeddings (default: auto)<br/>- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)<br/>- auto: on, but only for tensors larger than 4 GiB<br/>- off: always keep them resident, even with a mapped load (--load-mode mmap):<br/>       the tensors are read into host RAM instead of being served from the mapping<br/>- mlock: on, and every row of such a tensor is also pulled into the page cache and<br/>         pinned there (mlock) at load, so it can never be reclaimed; the pages are read<br/>         from the mapping on demand exactly as in on, and the pin is released when the<br/>         process exits (the pages then go back to being ordinary reclaimable cache)<br/>- mlockr: mlock, but the pin is released as soon as loading is done (munlock, nothing is<br/>          dropped): the tables are populated and stay hot in the page cache, and are<br/>          reclaimable again.  Prefer this over mlock when something else also wants the<br/>          RAM during the run -- an auto-sized expert arena, for one, where an unevictable<br/>          multi-GiB table leaves the model mapping as the only memory the kernel can take<br/>          back, so host-expert misses intermittently come from disk<br/>(env: LLAMA_ARG_LAZY_MODE) |
+ | `--numa TYPE` | attempt optimizations that help on some NUMA systems<br/>- distribute: spread execution evenly over all nodes<br/>- isolate: only spawn threads on CPUs on the node that execution started on<br/>- numactl: use the CPU map provided by numactl<br/>if run without this previously, it is recommended to drop the system page cache before using this<br/>see https://github.com/ggml-org/llama.cpp/issues/1437<br/>(env: LLAMA_ARG_NUMA) |
+ | `-dev, --device <dev1,dev2,..>` | comma-separated list of devices to use for offloading (none = don't offload)<br/>use --list-devices to see a list of available devices<br/>(env: LLAMA_ARG_DEVICE) |
+ | `--list-devices` | print list of available devices and exit |
+@@ -179,8 +179,8 @@ llama-completion.exe -m models\gemma-1.1-7b-it.Q4_K_M.gguf --ignore-eos -n -1
+ | `-lv, --verbosity, --log-verbosity N` | Set the verbosity threshold. Messages with a higher verbosity will be ignored. Values:<br/> - 0: generic output<br/> - 1: error<br/> - 2: warning<br/> - 3: info<br/> - 4: trace (more info)<br/> - 5: debug<br/>(default: 3)<br/><br/>(env: LLAMA_ARG_LOG_VERBOSITY) |
+ | `--log-prefix, --no-log-prefix` | Enable prefix in log messages<br/>(env: LLAMA_ARG_LOG_PREFIX) |
+ | `--log-timestamps, --no-log-timestamps` | Enable timestamps in log messages<br/>(env: LLAMA_ARG_LOG_TIMESTAMPS) |
+-| `--spec-draft-type-k, -ctkd, --cache-type-k-draft TYPE` | KV cache data type for K for the draft model<br/>allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K) |
+-| `--spec-draft-type-v, -ctvd, --cache-type-v-draft TYPE` | KV cache data type for V for the draft model<br/>allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V) |
++| `--spec-draft-type-k, -ctkd, --cache-type-k-draft TYPE` | KV cache data type for K for the draft model<br/>allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: follows the main model's --cache-type-k, so lowering the main KV type for VRAM takes the draft with it; set this to pin the draft's own type)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K) |
++| `--spec-draft-type-v, -ctvd, --cache-type-v-draft TYPE` | KV cache data type for V for the draft model<br/>allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: follows the main model's --cache-type-v, so lowering the main KV type for VRAM takes the draft with it; set this to pin the draft's own type)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V) |
+ 
+ 
+ ### Sampling params
 diff --git a/tools/server/README.md b/tools/server/README.md
-index ee7f27eda..e9bfbfeb8 100644
+index 27bfc9c2e..3c89ff19d 100644
 --- a/tools/server/README.md
 +++ b/tools/server/README.md
-@@ -268,6 +268,7 @@ For the full list of features, please refer to [server's changelog](https://gith
- | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
+@@ -72,7 +72,7 @@ For the full list of features, please refer to [server's changelog](https://gith
+ | `-ctv, --cache-type-v TYPE` | KV cache data type for V<br/>allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_V) |
+ | `--rpc SERVERS` | comma-separated list of RPC servers (host:port)<br/>(env: LLAMA_ARG_RPC) |
+ | `-lm, --load-mode MODE` | model loading mode (default: auto)<br/>- auto: mmap, unless a device does not support it<br/>- none: no special loading mode<br/>- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)<br/>- mlock: force system to keep model in RAM rather than swapping or compressing<br/>- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing<br/>- dio: use DirectIO if available<br/><br/>(env: LLAMA_ARG_LOAD_MODE) |
+-| `-lzm, --lazy-mode MODE` | on-demand reading of certain tensors, for example per-layer embeddings (default: auto)<br/>- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)<br/>- auto: on, but only for tensors larger than 4 GiB<br/>- off: always keep them resident, even with a mapped load (--load-mode mmap): the tensors are read into host RAM instead of being served from the mapping<br/>- mlock: on, and every row of such a tensor is also pulled into the page cache and pinned there (mlock) at load, so it can never be reclaimed; the pages are read from the mapping on demand exactly as in on, and the pin is released when the process exits (the pages then go back to being ordinary reclaimable cache)<br/>(env: LLAMA_ARG_LAZY_MODE) |
++| `-lzm, --lazy-mode MODE` | on-demand reading of certain tensors, for example per-layer embeddings (default: auto)<br/>- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)<br/>- auto: on, but only for tensors larger than 4 GiB<br/>- off: always keep them resident, even with a mapped load (--load-mode mmap):<br/>       the tensors are read into host RAM instead of being served from the mapping<br/>- mlock: on, and every row of such a tensor is also pulled into the page cache and<br/>         pinned there (mlock) at load, so it can never be reclaimed; the pages are read<br/>         from the mapping on demand exactly as in on, and the pin is released when the<br/>         process exits (the pages then go back to being ordinary reclaimable cache)<br/>- mlockr: mlock, but the pin is released as soon as loading is done (munlock, nothing is<br/>          dropped): the tables are populated and stay hot in the page cache, and are<br/>          reclaimable again.  Prefer this over mlock when something else also wants the<br/>          RAM during the run -- an auto-sized expert arena, for one, where an unevictable<br/>          multi-GiB table leaves the model mapping as the only memory the kernel can take<br/>          back, so host-expert misses intermittently come from disk<br/>(env: LLAMA_ARG_LAZY_MODE) |
+ | `--numa TYPE` | attempt optimizations that help on some NUMA systems<br/>- distribute: spread execution evenly over all nodes<br/>- isolate: only spawn threads on CPUs on the node that execution started on<br/>- numactl: use the CPU map provided by numactl<br/>if run without this previously, it is recommended to drop the system page cache before using this<br/>see https://github.com/ggml-org/llama.cpp/issues/1437<br/>(env: LLAMA_ARG_NUMA) |
+ | `-dev, --device <dev1,dev2,..>` | comma-separated list of devices to use for offloading (none = don't offload)<br/>use --list-devices to see a list of available devices<br/>(env: LLAMA_ARG_DEVICE) |
+ | `--list-devices` | print list of available devices and exit |
+@@ -113,8 +113,8 @@ For the full list of features, please refer to [server's changelog](https://gith
+ | `-lv, --verbosity, --log-verbosity N` | Set the verbosity threshold. Messages with a higher verbosity will be ignored. Values:<br/> - 0: generic output<br/> - 1: error<br/> - 2: warning<br/> - 3: info<br/> - 4: trace (more info)<br/> - 5: debug<br/>(default: 3)<br/><br/>(env: LLAMA_ARG_LOG_VERBOSITY) |
+ | `--log-prefix, --no-log-prefix` | Enable prefix in log messages<br/>(env: LLAMA_ARG_LOG_PREFIX) |
+ | `--log-timestamps, --no-log-timestamps` | Enable timestamps in log messages<br/>(env: LLAMA_ARG_LOG_TIMESTAMPS) |
+-| `--spec-draft-type-k, -ctkd, --cache-type-k-draft TYPE` | KV cache data type for K for the draft model<br/>allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K) |
+-| `--spec-draft-type-v, -ctvd, --cache-type-v-draft TYPE` | KV cache data type for V for the draft model<br/>allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V) |
++| `--spec-draft-type-k, -ctkd, --cache-type-k-draft TYPE` | KV cache data type for K for the draft model<br/>allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: follows the main model's --cache-type-k, so lowering the main KV type for VRAM takes the draft with it; set this to pin the draft's own type)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K) |
++| `--spec-draft-type-v, -ctvd, --cache-type-v-draft TYPE` | KV cache data type for V for the draft model<br/>allowed values: f32, f16, bf16, f8_e4m3, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: follows the main model's --cache-type-v, so lowering the main KV type for VRAM takes the draft with it; set this to pin the draft's own type)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V) |
+ 
+ 
+ ### Sampling params
+@@ -266,9 +266,11 @@ For the full list of features, please refer to [server's changelog](https://gith
+ | `--spec-draft-override-tensor, -otd, --override-tensor-draft <tensor name pattern>=<buffer type>,...` | override tensor buffer type for draft model |
+ | `--spec-draft-cpu-moe, -cmoed, --cpu-moe-draft` | keep all Mixture of Experts (MoE) weights in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_CPU_MOE) |
+ | `--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE) |
+-| `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
++| `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3, max: 15)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
  | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
  | `--spec-draft-n-ubatch N` | physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH) |
-+| `--spec-draft-n-min-adaptive N` | minimum adaptive MTP draft depth; the depth starts here and never drops below it (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE) |
++| `--spec-draft-n-min-adaptive N` | minimum adaptive MTP draft depth; the depth never drops below it (the default cold start is three steps below --spec-draft-n-max, bounded by this floor) (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE) |
++| `--spec-draft-n-start N` | initial adaptive MTP draft depth: the first verify round of each generation starts here instead of the default cold start.  Clamped to [--spec-draft-n-min-adaptive, --spec-draft-n-max].  Use it to start deeper when the workload settles high (e.g. verbatim recall) or shallower for a short generation at a deep context, where a wide verify batch costs more.  Unset: three steps below the ceiling, bounded by the floor.<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_START) |
  | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
  | `--spec-synth-rates P0,P1,...` | comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_RATES) |
  | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
-@@ -277,7 +278,7 @@ For the full list of features, please refer to [server's changelog](https://gith
+@@ -278,7 +280,7 @@ For the full list of features, please refer to [server's changelog](https://gith
  | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices |
  | `--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
  | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
--| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
-+| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-mtp-adaptive,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
+-| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,draft-dflash2,draft-lilicorr,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
++| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-mtp-adaptive,draft-dflash,draft-dspark,draft-dflash2,draft-lilicorr,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
  | `--spec-ngram-mod-n-min N` | minimum number of ngram tokens to use for ngram-based speculative decoding (default: 48) |
  | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
  | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a6059ab38..b839c3a2c 100644
+index bfade25d7..60ba5ed61 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -1217,9 +1217,7 @@ private:
+@@ -1235,9 +1235,7 @@ private:
  
          const bool has_mmproj = !params.mmproj.path.empty();
          const bool has_draft = params.speculative.has_dft();
@@ -2261,7 +2396,7 @@ index a6059ab38..b839c3a2c 100644
          const bool has_spec = has_draft || spec_mtp;
  
          if (callback_state) {
-@@ -4036,6 +4034,10 @@ private:
+@@ -3987,6 +3985,10 @@ private:
  
                          slot.state = SLOT_STATE_PROCESSING_PROMPT;
  
@@ -2272,7 +2407,7 @@ index a6059ab38..b839c3a2c 100644
                          SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                  slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
  
-@@ -4994,7 +4996,12 @@ private:
+@@ -4926,7 +4928,12 @@ private:
                              SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                          }
  

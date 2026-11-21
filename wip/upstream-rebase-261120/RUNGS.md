@@ -1524,6 +1524,27 @@ only ones that write big files: a prefill-logit base is 1-5 GiB, its control arm
 
 `AGENTS.md` → *What NOT to do* now carries the rule, so a future gate does not reintroduce it.
 
+## R18.8 **RELEASED** — `v17-919794500-r328`
+
+| item | value |
+|---|---|
+| release | **`v17-919794500-r328`** (`release.json .release`) |
+| base | `919794500`, base tree `916941663346eb86004bed77f74e90fcf9c43126` |
+| canonical tip | **`6d9d54238`** (the `apply-all.sh` re-cut — deterministic, and `fork-refresh.sh` reproduced it) |
+| tree | **`0c46248f7371a0eee84a980a1e16ad25a6fbd38f`** |
+| blocks | 17 official (`0000`-`0016`) + temporary `0300` = **18 default**; 2 optional |
+| optional | `0100` alone → `931a0f8b8`, `0101` alone → `83477d27`, cumulative → **`fd9d60abd5`** (`optional_tree`) |
+
+The cut: `make-patches.sh` from the ladder tip (exports the 18 default + both optional), `make-release.sh` with
+the re-cut tip/trees, `validate-set.sh` **GREEN** (strict apply at `919794500` → tree match, both optional
+artifacts alone and cumulatively, 515 added files through the Windows portability scan), `fork-refresh.sh
+--build --gates` (re-cut tree == `.tree`, tip == `.tip`, build OK, coherence OK, prefill-logit KLD 0.000000 /
+100 % on the re-cut `build=6d9d54238`).  Numbers and the owed list: `WORKLOG.md` 261121.005.
+
+The MTP four-axis protocol was **not** re-run for this release (see the release entry's note): the re-base keeps
+every decode kernel's decisions, the 1-GPU host-expert arena arm reads median 50.7 t/s against r327's 48.7 with
+the text unchanged, and the dense arm is at parity (pp512 1484.22 vs 1485.14, tg128 33.90 vs 33.96).
+
 ## R18.7 `gate-spec-align.sh`: the host-expert allowance, and why it is not zero
 
 Failing arm at the squashed tip: `ncmoe: 2 decode step(s) still split with the knob on`, and the aligned pair

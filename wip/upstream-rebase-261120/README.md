@@ -1,6 +1,6 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: LADDER COMPLETE — all 18 blocks landed (R00-R17); nothing is delivery yet; R18 (the release) is next.**
+**Status: RELEASED — `v17-919794500-r328`** (tip `6d9d54238`, tree `0c46248f7371a0eee84a980a1e16ad25a6fbd38f`; ladder branch `rebase-r328` = `73a74454b`).  R00-R17 landed, R18 cut the set.  What is left is the **gfx1151 + gfx1100 validation** (`TODO` #354, [`REMOTE-VALIDATION.md`](REMOTE-VALIDATION.md)) — the ladder itself is closed.
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
 the final rung (R18).  Ladder branch `rebase-r328` = `73a74454b` (tree
 `0c46248f7371a0eee84a980a1e16ad25a6fbd38f`): all 18 blocks, the three rung repairs squashed into their owning

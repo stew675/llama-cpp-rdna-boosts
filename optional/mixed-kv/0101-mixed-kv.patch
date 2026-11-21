@@ -1,8 +1,8 @@
-From 9eec086ca540d31e14fbbdadc0a3ec7f0a5dca07 Mon Sep 17 00:00:00 2001
+From aff4b0460173b99c59c1d72e68e7ca99178a24a3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
-Date: Thu, 19 Nov 2026 09:05:55 -0600
-Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types (optional): K
- q8_0 with V q4_0/q5_0/q5_1
+Date: Sat, 21 Nov 2026 04:34:34 -0600
+Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types (q8_0 K with
+ q4_0/q5_0/q5_1 V) -- OPTIONAL
 
 ---
  ggml/src/ggml-cuda/fattn-rdna.cuh             | 34 +++++++-
@@ -121,7 +121,7 @@ index 54a08ded6..b04f8f7b3 100644
          case GGML_TYPE_BF16:
              // BF16 K/V is read natively and accumulated in FP32 (native-BF16 hardware only).
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
-index 3072e9b61..69119f1e1 100644
+index 18250bb4c..a3ca6f3c3 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cuh
 +++ b/ggml/src/ggml-cuda/fattn-tile.cuh
 @@ -927,7 +927,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
@@ -169,7 +169,7 @@ index 3072e9b61..69119f1e1 100644
 +        kv_native_self_V,
      };
  
-     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
+     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33) + nb32*(head0 % ne32)) : nullptr;
 @@ -1568,14 +1571,14 @@ static __global__ void flash_attn_tile(
                  continue;
              }
@@ -298,7 +298,7 @@ index 3072e9b61..69119f1e1 100644
  static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * KQV  = dst;
      const ggml_tensor * Q    = dst->src[0];
-@@ -1962,12 +1966,12 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -1965,12 +1969,12 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
          // Therefore, use a GQA ratio of 16 with 16 columns / block to stay below 48 kiB of SRAM / block.
  #ifdef GGML_USE_HIP
          if (use_gqa_opt && gqa_ratio % 32 == 0) {
@@ -313,7 +313,7 @@ index 3072e9b61..69119f1e1 100644
              return;
          }
  #endif // GGML_USE_HIP
-@@ -1976,11 +1980,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -1979,11 +1983,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
  
      if constexpr (DKQ == 576) {
          if (use_gqa_opt && gqa_ratio % 16 == 0) {
@@ -327,7 +327,7 @@ index 3072e9b61..69119f1e1 100644
              return;
          }
      }
-@@ -1988,11 +1992,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -1991,11 +1995,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
      if constexpr (DKQ == 192) {
          // MiMo-V2.5 / V2.5-Pro / V2-Flash: gqa_ratio is 8 (SWA) or 16 (full attn)
          if (use_gqa_opt && gqa_ratio % 16 == 0) {
@@ -341,7 +341,7 @@ index 3072e9b61..69119f1e1 100644
              return;
          }
          GGML_ABORT("flash-attn tile (192/128): expected GQA ratio multiple of 8");
-@@ -2000,39 +2004,39 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -2003,39 +2007,39 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
  
      if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
          if (!rdna_cap_ncols2 && use_gqa_opt && gqa_ratio % 8 == 0) {
@@ -388,7 +388,7 @@ index 3072e9b61..69119f1e1 100644
      }
  }
  
-@@ -2075,6 +2079,19 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor
+@@ -2078,6 +2082,19 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor
      EXTERN_DECL_FATTN_TILE_CASE_TYPE(DKQ, DV, GGML_TYPE_Q5_1);            \
      EXTERN_DECL_FATTN_TILE_CASE_TYPE(DKQ, DV, GGML_TYPE_IQ4_NL)
  
@@ -409,10 +409,10 @@ index 3072e9b61..69119f1e1 100644
  EXTERN_DECL_FATTN_TILE_CASES( 64,  64);
  EXTERN_DECL_FATTN_TILE_CASES( 72,  72);
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index c87ecd030..65d9dba37 100644
+index 227c79024..ffef4c0c0 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -937,7 +937,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -943,7 +943,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
              // into the neighbouring buffer).
              const ggml_type tile_type = ggml_cuda_fattn_tile_type(K, V, ggml_cuda_info().devices[device].cc);
              need_f16_K = K->type != tile_type;
@@ -485,10 +485,10 @@ index 64dcacf05..7b4bf9077 100755
      for type_v in TYPES_KV:
          with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 9a98670fd..551b03ff1 100644
+index 8518e09fe..1955de59a 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -6633,9 +6633,28 @@ llama_context * llama_init_from_model(
+@@ -6618,9 +6618,28 @@ llama_context * llama_init_from_model(
      // split/flash-attention one - assumes type_k == type_v, so a mixed configuration is rejected
      // rather than accepted as a slow-but-valid one.  Both types default to f16, so only an explicit
      // --cache-type-k (or --cache-type-v) can trigger this.
@@ -520,10 +520,10 @@ index 9a98670fd..551b03ff1 100644
          return nullptr;
      }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 63bb2de9e..560a5aff8 100644
+index 84644e71c..9fbbc5e2a 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -13604,6 +13604,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13836,6 +13836,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
