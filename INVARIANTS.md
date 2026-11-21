@@ -1444,3 +1444,29 @@ Record: `WORKLOG.md` 261120.003, `benchmarks/2026-11-20-graph-replay-16-tokens.m
    captured 16-layer step reports `built=1 reused=15`, not one per step.
 
 Record: `WORKLOG.md` 261120.004, `patches/README.md` block 10, `ENVIRONMENT.md` §7.4, `MANIFESTS.md` gate 10.
+
+## r328 — an anchor row is only as good as the arm it calls "the reference"
+
+**An HC-class generated text is not portable across a numerics change, and a gate that does not anchor its
+reference arm cannot tell a moved chain from a moved fused op.**  `gate-hc-fusions.sh` graded `chain_chain`
+as "the true chain" and anchored only the five numeric arms; the two `fusedmixer` rows were recorded at r308.
+The class's text then moved for *every* arm somewhere in **r290..r319** (`bin-r289` still reads the r308 row,
+`bin-r320` already reads the current one), so the numeric arms' anchors went stale and the gate went red — on
+the released r327 exactly as on the r328 tree, with byte-identical numbers (`local`: chain 444
+`a512ee68c4b3`, pre 443 `c8db61d5dcc8`, post 449 `6a102dbc62d6`; `meta`: chain 449 `6a102dbc62d6`, pre 444
+`a512ee68c4b3`).  With no anchor on the chain the only visible symptom was "three numeric arms left their
+anchors", which reads exactly like "the re-base moved the HC chain" — and that is how R11.2 came to be
+carried as a release blocker for a whole rung, and then to be blamed on the re-base.
+
+Rules:
+
+1. **Anchor the reference arm.**  A row of anchors is a *relative* statement; the reference is the absolute
+   one, and it is the one that tells you the row is stale.  A gate that leaves its reference unanchored can
+   only report "an arm moved", never "the world moved".
+2. **Re-derive a row together.**  Re-anchoring one arm to the current text is how a real move gets erased;
+   re-anchoring the whole row (chain included) is a dated statement of the shipped behaviour.
+3. **Suspect the gate before the re-base.**  A red gate on a re-based tree needs the previous release's own
+   binaries run on the same arm set *first* — `LLAMA_CLI=…/bin-r327/llama-cli ./scripts/gate-….sh`.  Two
+   minutes of that refuted a carried blocker here.
+
+Record: `RUNGS.md` R18.4, `wip/upstream-rebase-261120/COLD-START.md` §8, `WORKLOG.md` 261121.003.

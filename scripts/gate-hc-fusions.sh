@@ -352,6 +352,23 @@ unset n sw arm
 #     `-sm layer` : true chain 453 f242246a382b | the four hard arms all 453 (identical)
 #                   dsv4_pre_op 453 f242246a382b | dsv4_post_op 444 7ea23f309705
 #                   all_ops 459 9f8819c4c2c5 | ops_no_post 453 f242246a382b
+# RE-ANCHORED 2026-11-21 (r328) -- read this before re-anchoring anything again.
+# The two `fusedmixer` rows above were recorded on r308 and had gone stale underneath a r290..r319 change, so
+# this gate was RED on the RELEASED r327 already: r327's own binaries read exactly the r328 numbers
+#   local: chain 444 a512ee68c4b3 | mix 447 3f049f67781c | pre 443 c8db61d5dcc8 | post 449 6a102dbc62d6
+#   meta : chain 449 6a102dbc62d6 | mix 449 6a102dbc62d6   | pre 444 a512ee68c4b3 | post 447 3f049f67781c
+# (measured with `LLAMA_CLI=~/llama.cpp/build-rocm/bin-r327/llama-cli`; the whole gate run against that build
+# reproduces the same three FAILs), i.e. the r328 re-base moved NOTHING here and there is no HC-purity defect
+# to fix.  What moved is the class's TEXT: every arm (chain included) shifted inside r290..r319 -- `bin-r289`
+# still reads the r308 row, `bin-r320` already reads the current one -- so the rows above are re-derived from
+# the shipped behaviour and a further move still fails.
+# The lesson, and the reason this note exists: an HC-class generated text is NOT portable across a numerics
+# change, and this gate used to leave the REFERENCE arm unanchored.  With no anchor on the chain, a moved
+# chain silently turns every other arm's anchor into a statement about a text nobody re-measured, and the only
+# visible symptom is "numeric arms left their anchors" -- which is exactly how the r328 re-base came to be
+# blamed for it (`RUNGS.md` R18.4).  `chain_chain` is anchored from here on, and a moved reference arm fails
+# as a moved reference arm.  Re-derive a row TOGETHER, never one arm at a time.
+#
 # `SOFT_EXPECT="arm=sha ..."` replaces the selected set (another model, another device count); an empty
 # value disables anchoring for a class that has none recorded.
 HC_TYPE="$(types_of "$MODEL" | sed -n 's/^blk\.0\.hc_attn_down\.weight[[:space:]]*//p' | head -1)"
@@ -371,8 +388,10 @@ case "$HC_TYPE" in
 esac
 anchors_for() { # $1 = hc class, $2 = split state (meta|local)
     case "$1/$2" in
-        fusedmixer/meta)  echo "mix_op=6a102dbc62d6 dsv4_pre_op=6a102dbc62d6 dsv4_post_op=3f049f67781c all_ops=6a102dbc62d6 ops_no_post=6a102dbc62d6" ;;
-        fusedmixer/local) echo "mix_op=6a102dbc62d6 dsv4_pre_op=a512ee68c4b3 dsv4_post_op=6a102dbc62d6 all_ops=6a102dbc62d6 ops_no_post=a512ee68c4b3" ;;
+        # re-derived 2026-11-21 (r328) from the RELEASED r327 binaries, which read these values byte for
+        # byte -- see the "RE-ANCHORED" note in the header.  `chain_chain` is anchored as well now.
+        fusedmixer/meta)  echo "chain_chain=6a102dbc62d6 mix_op=6a102dbc62d6 dsv4_pre_op=a512ee68c4b3 dsv4_post_op=3f049f67781c all_ops=6a102dbc62d6 ops_no_post=a512ee68c4b3" ;;
+        fusedmixer/local) echo "chain_chain=a512ee68c4b3 mix_op=3f049f67781c dsv4_pre_op=c8db61d5dcc8 dsv4_post_op=6a102dbc62d6 all_ops=6a102dbc62d6 ops_no_post=c8db61d5dcc8" ;;
         iq4nl/meta)       echo "dsv4_pre_op=7ea23f309705 dsv4_post_op=9b4b033b33f7 all_ops=a5d0ec7b809d ops_no_post=7ea23f309705" ;;
         iq4nl/local)      echo "dsv4_pre_op=f242246a382b dsv4_post_op=7ea23f309705 all_ops=9f8819c4c2c5 ops_no_post=f242246a382b" ;;
         *)                echo "" ;;
@@ -451,10 +470,18 @@ for arm in "${ARMS[@]}"; do
     if [ "$rc" -ne 0 ]; then
         verdict="FAIL (exit $rc)"
     elif [ "$name" = "chain_chain" ]; then
+        # THE REFERENCE ARM IS ANCHORED TOO (r328, 2026-11-21).  It was not, and that hole is exactly what
+        # made the r328 re-base mis-read a PRE-EXISTING chain move as "the numeric arms left their
+        # anchors": with no anchor on the chain, every other arm's anchor silently became a statement about
+        # a text nobody re-measured.  A moved reference arm must fail HERE and say so, because it makes
+        # every other anchor stale at once -- re-derive the whole row together, never one arm at a time.
+        exp="${ANCHOR_MAP[chain_chain]:-}"
         if [ "$chars" -lt "$MIN_CHARS" ]; then
             verdict="FAIL (reference arm generated $chars < $MIN_CHARS chars)"
         elif grep -q '////' "$log"; then
             verdict="FAIL (reference arm shows the '////' corruption)"
+        elif [ -n "$exp" ] && [ "$sha" != "$exp" ]; then
+            verdict="FAIL (the REFERENCE arm moved: $chars chars $sha, anchor $exp -- every anchor in this row is stale; re-derive them together, see the header)"
         else
             verdict="reference (true chain)"
         fi

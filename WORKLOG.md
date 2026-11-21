@@ -1,3 +1,54 @@
+## 261121.003 (r328 prep) -- the block-03 Apache-2.0 attribution lands in its owning block, and **R11.2 is refuted**: `gate-hc-fusions.sh` had been red since r290..r319, not since the re-base
+
+**Two changes: one block amendment (block 03, comments only) and one tooling fix (`gate-hc-fusions.sh`).  No
+other delivery patch changed, no block created, split or renumbered, no release.**  Ladder tip `73a74454b`, tree
+`0c46248f7371a0eee84a980a1e16ad25a6fbd38f` (the pre-squash tree `4e222b2e…` plus ten comment lines).  Record:
+`wip/upstream-rebase-261120/RUNGS.md` §R18.4/§R18.5.
+
+### 1. Block 03 now carries the radiance/libr4d attribution (maintainer-approved)
+
+The two chunked-GDN kernel files state in their own headers that they are ports of libr4d's kernels, and libr4d
+ships inside radiance under Apache-2.0.  A four-line `// Licence: Apache-2.0` block now sits after each file's
+`#if defined(GGML_USE_HIP)` guard, naming radiance/libr4d, pointing at the delivery repo's
+`third_party/radiance/`, and stating that the surrounding llama.cpp code stays MIT.  It was folded into **block
+03** with a `fixup` (`f3e8fdc5c`), i.e. the block that owns the files — not as a trailing commit and not in a
+later block.  Diff against the previous tip: exactly those ten lines.  Rebuild clean, coherence
+`1c5d32ac537d` unchanged, kernel journal clean.  The repo-level half (root `NOTICE` + `third_party/radiance/`)
+landed earlier: `261121.001`.
+
+### 2. R11.2 is refuted — and the reason matters more than the verdict
+
+`COLD-START.md` §8 carried `gate-hc-fusions.sh` as a **release blocker**: "the HC chain itself moved with the
+re-base", with three numeric arms reading the same numbers as at R11.  Measured against **r327's own released
+binaries**, same model, arms and env, the two trees are byte-identical on every arm probed:
+
+| arm | r327 (`build-rocm/bin-r327`) | r328 tree |
+|---|---|---|
+| `chain_chain` | 444 `a512ee68c4b3` | 444 `a512ee68c4b3` |
+| `dsv4_hc_pre=1` | 443 `c8db61d5dcc8` | 443 `c8db61d5dcc8` |
+| `hc_mix=1` | 447 `3f049f67781c` | 447 `3f049f67781c` |
+| `dsv4_hc_post=1` | 449 `6a102dbc62d6` | 449 `6a102dbc62d6` |
+
+and the *whole gate* fails identically on r327.  So the re-base moved nothing, and there is **no HC-purity
+defect**: the `dsv4_hc_pre`/`_post` arms were never byte-identical to the chain (r236: KLD 0.013217 / same-top-p
+96.392 % for pre) — they are numeric arms whose text is anchored per (class, split state), and the four HARD
+arms still satisfy their contracts (`comm_op == chain`, `cuda_fuse_off == chain`, `both_ops == mix_op`,
+`defaults` == one explicit state).
+
+What actually happened: the class's **text** moved for every arm somewhere in **r290..r319** (`bin-r289` reads
+the r308 row exactly, `bin-r320` reads the current one), which made the r308 anchor rows stale; and because the
+gate grades `chain_chain` as "the true chain" **without anchoring it**, a moved chain has no verdict of its own
+— the only visible symptom is "three numeric arms left their anchors", which reads exactly like "the re-base
+moved the chain".  That is how a carried blocker was born, and it was carried across five rungs.
+
+**The fix** (tooling, no delivery code): the reference arm is anchored and graded with its own FAIL text ("the
+REFERENCE arm moved — every anchor in this row is stale; re-derive them together"), both `fusedmixer` rows are
+re-derived from the **released r327** measurement (so the rows encode shipped behaviour and a *further* move
+still fails), and the header carries a RE-ANCHORED block with the drift window, the r327==r328 evidence and the
+rule that a row is re-derived together, never one arm at a time.  `gate-hc-fusions.sh` now **PASSES, exit 0, in
+both states** (`local`: 9 arms, 5 numeric arms anchored; `meta` via `EXTRA_ARGS='-ngl 99 -fa on -sm tensor'`,
+where `dsv4_hc_post` auto-enables), kernel journal clean.  `INVARIANTS.md` records the general rule (r328).
+
 ## 261121.002 (r328 prep) -- the ladder squashes to 18 commits (final tree unchanged), and the rebase sequence now names the two other arches (`halo`, `fingon`)
 
 **No delivery patch changed, no block created, split or renumbered, no release.**  R18's step 4b and the

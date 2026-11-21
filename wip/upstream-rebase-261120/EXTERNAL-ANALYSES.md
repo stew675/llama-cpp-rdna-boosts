@@ -56,7 +56,7 @@ Two things I chose deliberately, against the contributor's own shape:
   contributors; if the maintainer prefers to pin to `769b4c64a` (byte-identical to theirs) that is a
   one-command swap and the sha256s in `third_party/radiance/README.md` move with it.
 
-### 1.3 Still owed, and it needs the maintainer (a block amendment)
+### 1.3 The in-file attribution — **applied 2026-11-21** (was: needed the maintainer)
 
 The applied tree's own headers should point at the licence, so a consumer who only has the patch set knows.
 Proposed (one added line per file, inside block 03):
@@ -66,11 +66,14 @@ Proposed (one added line per file, inside block 03):
  // third_party/radiance/); the rest of this file's surrounding code is MIT.
 ```
 
-That is a **one-line amendment to an existing block's files**, i.e. a delivery change — reported here rather
-than made.  If approved it lands with R18's patch regeneration (step 5), not as its own commit.  The
-alternative (shipping `NOTICE` + `third_party/radiance/` *inside* the patch, so the llama.cpp checkout
-carries them) is more invasive and I do not recommend it: upstream llama.cpp's tree would grow delivery
-files, and the fork branch re-cut is meant to be llama.cpp + the blocks only.
+**Approved by the maintainer and applied** as a `fixup` into **block 03** (`f3e8fdc5c`, ladder tip
+`73a74454b`, tree `0c46248f7371a0eee84a980a1e16ad25a6fbd38f`): a four-line `// Licence: Apache-2.0 …` block
+after each file's `#if defined(GGML_USE_HIP)` guard, naming radiance/libr4d, pointing at
+`third_party/radiance/`, and stating that the surrounding llama.cpp code stays MIT.  The diff against the
+previous tip is exactly those ten comment lines; the rebuild is clean, coherence is `1c5d32ac537d` (unchanged)
+and the kernel journal is clean.  The alternative — shipping `NOTICE` + `third_party/radiance/` *inside* the
+patch so the llama.cpp checkout carries them — stays rejected: upstream's tree would grow delivery files, and
+the fork branch re-cut is meant to be llama.cpp plus the blocks only.
 
 ---
 

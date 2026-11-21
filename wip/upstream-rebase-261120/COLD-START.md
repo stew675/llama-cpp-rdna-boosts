@@ -23,15 +23,15 @@ Nothing in `patches/`, `release.json`, `rdna-boosts-all.patch` or the fork is to
 cd ~/llama.cpp && git status --short && git branch --show-current && git log --oneline -1
 ```
 
-Expect: **clean**, branch `rebase-r328`, `8406cbd86 rdna-boosts: block 0300: ...` (tree
-`4e222b2ecba3b05e5e35484a328ae3f35842772b`) — **18 commits**, the three rung repairs already squashed
-(`RUNGS.md` §R18.1).  The ladder is **complete**: 18 block commits (`0000`..`0016` +
+Expect: **clean**, branch `rebase-r328`, `73a74454b rdna-boosts: block 0300: ...` (tree
+`0c46248f7371a0eee84a980a1e16ad25a6fbd38f`) — **18 commits**, the three rung repairs squashed (§R18.1) and the
+block-03 radiance attribution folded in (§R18.5).  The ladder is **complete**: 18 block commits (`0000`..`0016` +
 `0300`) plus two rung repairs.
 
 | item | value |
 |---|---|
 | rungs landed | **R00 … R17 — all 18 blocks**, 2026-11-20, + 2 rung repairs |
-| ladder tip | **`8406cbd86`** (post-squash), tree `4e222b2ecba3b05e5e35484a328ae3f35842772b` — byte-identical to the pre-squash tip `dd4fa5e22` |
+| ladder tip | **`73a74454b`**, tree `0c46248f7371a0eee84a980a1e16ad25a6fbd38f` — the pre-squash tree `4e222b2e…` **plus** the +10-line Apache-2.0 attribution in block 03's two chunked-GDN headers (comments only) |
 | next | **R18 — the release**, not a rung (see `RUNGS.md` R18 + §8 below) |
 | repairs | **squashed 2026-11-21** (`RUNGS.md` §R18.1): R00's `3ea8b0212` → block 00, R05's `c3860af1e` → block 05, R16's `dd4fa5e22` → block 16.  18 commits = the 17 official blocks + `0300`, final tree unchanged |
 | delivery repo | docs-only commits so far (`patches/`, `release.json`, `rdna-boosts-all.patch` untouched until R18) |
@@ -167,7 +167,7 @@ decision: `DECISIONS.md` D17; rung log: `RUNGS.md` §R12.4.  What a later sessio
 | # | item | state |
 |---|---|---|
 | **R10.3** | the host-expert arena arm's decode (54.4 → 20.4 t/s at R10) | **CLOSED at R15**: 51.2 / 49.9 / 49.2 t/s, median 49.9, against r327's 49.7, text `86b7f9b5aa80`.  Nothing to fix — record it as closed |
-| **R11.2** | `gate-hc-fusions.sh` **still RED at the completed tree, with the R11 numbers exactly** (`mix_op` `3f049f67781c`, `dsv4_pre_op`/`ops_no_post` `c8db61d5dcc8`, `dsv4_post_op`/`all_ops` `6a102dbc62d6`, chain `a512ee68c4b3`) | **a maintainer decision before shipping**: the HC chain itself moved with the re-base (not a later-block interaction), so either the planted anchors are re-anchored arm by arm, or the fused mixer does **not** ship default-on.  Nothing else in the gate is red (no fault, combine op exact) |
+| ~~**R11.2**~~ | **REFUTED 2026-11-21 (`RUNGS.md` R18.4)**: r327's own released binaries read the r328 numbers byte for byte on every arm, and the whole gate is red the same way on r327 — so the re-base moved NOTHING.  The gate's anchors were stale underneath a r290..r319 numerics change and the **reference arm was unanchored**, which is what made it read as "the chain moved".  The gate now anchors `chain_chain` too and its rows are re-derived from r327: **`local` and `meta` both PASS**, no delivery defect found | **CLOSED** — no maintainer decision needed; the fused mixer ships as before |
 | **R06.2 (routed half)** | the forced routed MMB arm (`GGML_CUDA_MMB_TYPES=q8_0 GGML_CUDA_MMB_ROUTED=1`, 35B-A3B) still aborts on the pool LIFO assert where r327 reads `86b7f9b5aa80` | an A/B override, never a shipped default (RDNA4: `routed=0`).  Owed as a measurement, not a blocker |
 | **block 15's APU gates** | `gate-uma-experts.sh` (17/17 arms text-identical but its census arms cannot fire on gfx1201) and `gate-prefill-server-slots.sh` (needs the >RAM 122B model) | **owed on the `halo` (gfx1151) box** — the discrete side is `gate-host-pool.sh`, 59/59 PASS.  The 122B-A10B Q8_0 **is on `halo`**, so the `>RAM` shape is not missing, only mis-located: the gate belongs on the box where the GTT store is not inert.  r328 may ship with this recorded as an APU-unvalidated state (`AGENTS.md` allows a documented unvalidated state).  Flow: [`REMOTE-VALIDATION.md`](REMOTE-VALIDATION.md) |
 | **gfx1151 + gfx1100 arch validation** | the whole ladder was climbed on **gfx1201 only**; the delivery's scope policy covers three arches, and the gfx11 chunked-GDN kernel file (`gated_delta_net_chunked_bf16_gfx11.cu`) is code gfx1201 **never runs** | **owed: one session per box, after R18** — `ssh halo` (gfx1151 APU) and `ssh fingon` (gfx1100), both reachable, both carrying r327 as their own attribution oracle.  Inventory, what each box owns and the exact flow: [`REMOTE-VALIDATION.md`](REMOTE-VALIDATION.md).  They apply the **released** set, which also re-verifies `apply-all.sh` + `release.json` on two more machines (what r138 did) |
@@ -215,7 +215,7 @@ only.
 | R12 (landed) | `RUNGS.md` §R12; its evidence patch is `r12-wip/r12-resolved-but-unbuildable.diff` (historical) |
 | R11.2's open decision | `RUNGS.md` §R11.2 (the anchors) + the ladder-complete block at the end of `RUNGS.md` |
 | the DFlash decision + its numbers | `DECISIONS.md` D17, `benchmarks/2026-11-20-r328-r12-dflash-merge.md` |
-| the ladder's tip | `8406cbd86`, tree `4e222b2ecba3b05e5e35484a328ae3f35842772b` (pre-squash `dd4fa5e22`, kept as `backup-pre-squash-r328`; block `0300`) |
+| the ladder's tip | `73a74454b`, tree `0c46248f7371a0eee84a980a1e16ad25a6fbd38f` (pre-squash `dd4fa5e22`, kept as `backup-pre-squash-r328`; blocks `0300` + the block-03 attribution fixup) |
 | the R18 gate sweep's cost model | `MANIFESTS.md` → Release gates (gate 5) and `scripts/gate-per-block-build.sh`'s header |
 | the delivery's DFlash2 record | `archive/work/qwen4exp-dflash2/README.md`, `archive/work/dflash2-draft-sched2/README.md` |
 | env knobs (incl. `LLAMA_DFLASH_*`) | `~/llama-cpp-rdna-boosts/ENVIRONMENT.md` |

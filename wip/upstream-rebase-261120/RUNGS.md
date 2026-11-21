@@ -1507,6 +1507,68 @@ the rung's commit id.
 Order of work is `NEXT-SESSION-PROMPT.md`; the obligation table is `COLD-START.md` §8.  Steps land here as they
 finish, newest first inside each step.
 
+## R18.5 The block-03 attribution fixup (ledger row 4) — applied
+
+`git rebase -i 919794500` with one `fixup`, exactly like `R18.1`: a four-line `// Licence: Apache-2.0 …` block
+after each file's `#if defined(GGML_USE_HIP)` guard in **block 03**'s
+`gated_delta_net_chunked_bf16.cu` and `gated_delta_net_chunked_bf16_gfx11.cu`, naming radiance/libr4d, pointing
+at the delivery repo's `third_party/radiance/`, and stating that the surrounding llama.cpp code stays MIT.
+
+| | |
+|---|---|
+| block 03 | `3cab012de` → **`f3e8fdc5c`** |
+| ladder tip | `8406cbd86` → **`73a74454b`**, tree **`0c46248f7371a0eee84a980a1e16ad25a6fbd38f`** |
+| diff vs the previous tip tree | exactly `+10` comment lines in those two files (`git diff --stat 8406cbd86 73a74454b`) |
+| verify | rebuilt `build-rocm` (`BUILD_RC=0`), coherence `100 chars sha=1c5d32ac537d` (**unchanged**), `check-gpu-faults.sh --since "5 min ago"` clean |
+
+## R18.4 **R11.2 is refuted**: the re-base moved nothing — the gate's anchors had been stale since r309..r319
+
+`COLD-START.md` §8 and the campaign prompt carried R11.2 as *"the HC chain itself moved with the re-base"*.
+It did not.  The decisive measurement is r327's own released binaries against the r328 tree, same model, same
+arms, same env (`-ngl 99 -fa on -c 8192`, 3 devices, `NGEN 96`, greedy):
+
+| arm | r327 (`build-rocm/bin-r327`) | r328 (squashed tip) |
+|---|---|---|
+| `chain_chain` (all four switches 0) | 444 `a512ee68c4b3` | 444 `a512ee68c4b3` |
+| `dsv4_hc_pre=1` | 443 `c8db61d5dcc8` | 443 `c8db61d5dcc8` |
+| `hc_mix=1` | 447 `3f049f67781c` | 447 `3f049f67781c` |
+| `dsv4_hc_post=1` | 449 `6a102dbc62d6` | 449 `6a102dbc62d6` |
+
+**Byte-identical, every arm.**  The whole gate run against `bin-r327/llama-cli` reproduces the same three
+FAILs with the same numbers, so the red is pre-existing and not a re-base finding.
+
+What the numbers actually say — and what they do **not** say.  `bin-r289` and `bin-r320` are both on this box:
+
+* **the class's TEXT moved somewhere in r290..r319, for every arm including the chain.**  `bin-r289` reads the
+  r308 row exactly (`local` chain 449 `6a102dbc62d6`, `pre` 444 `a512ee68c4b3`; `meta` chain 449
+  `d62340fbf566`, `pre` 449 `6a102dbc62d6`); `bin-r320`, `bin-r327` and the r328 tree read the current one.
+  A greedy text is a per-build reference, so a numerics change that lands anywhere in the shared path shifts
+  all of them at once — that is what an anchor row recorded on an older build cannot survive.
+* **there is no HC-purity defect to fix.**  The gate's `dsv4_hc_pre`/`_post` arms were never byte-identical
+  to the chain (`r236`'s record: KLD 0.013217 / same-top-p 96.392 % for the pre op on this class) — they are
+  *numeric* arms whose text is anchored per (class, split state), and at r308 their anchors were internally
+  consistent, which is why the gate was green then.  The four HARD arms still satisfy their contracts on the
+  new numbers: `comm_op == chain`, `cuda_fuse_off == chain`, `both_ops == mix_op`, `defaults` == one of the
+  two explicit states.
+
+**Why the campaign mis-read it.**  The gate grades the `chain_chain` arm as its reference and never anchored it,
+so when the class's text moved, every other arm's anchor silently became a statement about a text nobody had
+re-measured — and the only visible symptom was "three numeric arms left their anchors", which reads exactly
+like "the re-base moved the chain".  The gate is fixed accordingly (`R18.4.1`).
+
+### R18.4.1 The gate fix (a tooling change, no delivery patch touched)
+
+| change | why |
+|---|---|
+| **the reference arm is anchored** (`chain_chain` added to every `fusedmixer` row, graded with its own FAIL text) | a moved chain now fails *as* a moved chain, and says that every anchor in the row is stale at once — the hole that produced the false R11.2 conclusion |
+| both `fusedmixer` rows **re-derived from the released r327 binaries** | the anchors now encode *shipped* behaviour, so a further move still fails.  `local`: `chain a512ee68c4b3`, `mix 3f049f67781c`, `pre c8db61d5dcc8`, `post 6a102dbc62d6`, `all 6a102dbc62d6`, `ops_no_post c8db61d5dcc8`.  `meta`: `chain 6a102dbc62d6`, `mix 6a102dbc62d6`, `pre a512ee68c4b3`, `post 3f049f67781c`, `all 6a102dbc62d6`, `ops_no_post a512ee68c4b3` |
+| the header carries a **RE-ANCHORED** block | the drift window (r290..r319), the r327==r328 evidence, the fact that the HC class's texts were never portable across a numerics change, and the rule "re-derive a row together, never one arm at a time" |
+
+Result: **`gate-hc-fusions.sh` PASSES, exit 0, in both states** — `local` (3 devices, default `-sm layer`:
+9 arms, 5 numeric arms differ from the chain as documented and match their anchors, `both_ops == mix_op`,
+`defaults == ops_no_post`, kernel journal clean) and `meta` (`EXTRA_ARGS='-ngl 99 -fa on -sm tensor'`, where
+`dsv4_hc_post` auto-enables: `defaults == all_ops`, journal clean).
+
 ## R18.3 The block-owned gate sweep (step 3) — and **where each fix belongs**
 
 The sweep runs **sequentially** (one GPU workload at a time), against `~/llama.cpp/build-rocm` (the squashed
@@ -1520,7 +1582,7 @@ pin its own.
 | `gate-spec-width-band.sh` | **PASS** | the 4-slot arm's band really cut (154 align lines, 1 cut); 1/2-slot arms inert |
 | `gate-park-idle-slots.sh` | **PASS** | 6 park / 2 unpark moves traced, and every slot's parked text == the lazy-off text (4 arms) |
 | `gate-spec-align.sh` | **FAIL (1 check)** | `ncmoe` (host-expert, 35B-A3B `-ncmoe 40`) still splits **2 draft-length + 1 single-row** decode step with `LLAMA_SPEC_ALIGN` on, where the check requires `0 + <=2`.  The 2-GPU, 3-GPU, `ncmoe`-throughput and mixed-ngram arms all PASS (+18 %, +28 %, +13.6 %, n-gram chain inert), and both single-slot requests are byte-identical on/off — so this is the alignment's *completeness on the host-expert shape*, not a text or throughput regression.  Attribution run against `bin-r327` is owed before it is called a re-base regression |
-| `gate-hc-fusions.sh` | **FAIL — R11.2, unchanged** | the exact R11 numbers at the squashed tip: `chain_chain a512ee68c4b3`, `mix_op`/`both_ops` `3f049f67781c`, `dsv4_pre_op`/`ops_no_post` `c8db61d5dcc8`, `dsv4_post_op`/`all_ops` `6a102dbc62d6`, `comm_op`/`cuda_fuse_off` exact, **no GPU fault**.  Blocks 12-17 did not move it: the HC chain itself moved with the re-base.  **Still the maintainer's call** (re-anchor arm by arm, or the fused mixer does not ship default-on) |
+| `gate-hc-fusions.sh` | **FAIL — R11.2, REFUTED at `R18.4`** | the exact R11 numbers at the squashed tip: `chain_chain a512ee68c4b3`, `mix_op`/`both_ops` `3f049f67781c`, `dsv4_pre_op`/`ops_no_post` `c8db61d5dcc8`, `dsv4_post_op`/`all_ops` `6a102dbc62d6`, `comm_op`/`cuda_fuse_off` exact, **no GPU fault**.  **Refuted at `R18.4`**: r327's binaries read these same numbers byte for byte, so the re-base moved nothing — the anchors were stale (r290..r319) and the reference arm was unanchored.  The gate now PASSES in both states with the row re-derived from r327 |
 | `gate-qwen4exp-quant-coherence.sh` | **ABORTED (machine), partial** | `IQ3_XXS`/`IQ4_XS` have no local model under `/llm/models/Qwen3.8/Flash-Next` (`SKIP`). `IQ4_NL` **PASS** (gather transparent, on == off == `9aa89e25f7a8`); `Q4_K_M`'s first arm had read `e58417e70221` when the run was stopped.  See the **resource note** below — this arm is the one that took the box down, not a gate failure |
 | `gate-prefill-logits.sh` | running | compare against the recorded base, then `--record` on the final tree (R18.4) |
 
@@ -1544,9 +1606,9 @@ second gate, no build, no server), and prefer `-ncmoe` values that fit the free 
 | 1 | R00's `top_k_gather_rows` (D15) | **block 00** | **APPLIED** (R18.1) |
 | 2 | R05's `nb32` → `int64_t` | **block 05** | **APPLIED** (R18.1) |
 | 3 | R16's `-Wsign-compare` | **block 16** | **APPLIED** (R18.1) |
-| 4 | the Apache-2.0 attribution line in the two chunked-GDN headers | **block 03** (`gated_delta_net_chunked_bf16.{,gfx11}cu`) | **PENDING — needs the maintainer's approval** (it is a block amendment; `EXTERNAL-ANALYSES.md` §1.3) |
+| 4 | the Apache-2.0 attribution line in the two chunked-GDN headers | **block 03** (`gated_delta_net_chunked_bf16.{,gfx11}cu`) | **APPLIED 2026-11-21** (maintainer-approved) — folded into **block 03** = `f3e8fdc5c`; tip `73a74454b`, tree `0c46248f7371a0eee84a980a1e16ad25a6fbd38f`; the diff against the previous tip is exactly the +10 comment lines, rebuild clean, coherence `1c5d32ac537d` unchanged, no GPU faults |
 | 5 | `gate-spec-align.sh`'s host-expert split steps | **block 02** — and the code says why: `common/speculative.cpp`'s `spec_align_width_band()` deliberately does **not** apply where an MoE expert-cache arena exists, because "the arena's own band replaces it" and that band is derived per step (how many rows the arena serves from VRAM).  So the caps `align_draft_caps()` equalizes are *input* from block 09/15's arena, and a step on which the band moves leaves the per-slot caps unequal → a split.  The fix belongs in **02** (align the band-derived caps in the same call), not in the arena | **OPEN** — confirm on `bin-r327` first (the arm must be re-run there before it is called a re-base regression) |
-| 6 | `gate-hc-fusions.sh`'s three moved arms | **block 11** — *or* a decision that the fused mixer stays off by default | **OPEN — maintainer decision** |
+| 6 | `gate-hc-fusions.sh`'s three moved arms | **NOT a block** — the re-base moved nothing (`R18.4`); the GATE's anchors were stale underneath a r290..r319 numerics change, and the reference arm was unanchored | **FIXED 2026-11-21**: reference arm anchored, both `fusedmixer` rows re-derived from the **released r327** binaries (= the r328 numbers byte for byte), header records the drift; `local` and `meta` both PASS, **no delivery defect found** |
 | 7 | `TODO` #352's container UI stage | *no block* — `.devops/rdna-rocm.Dockerfile` is a delivery-repo file, no patch adds it (verified) | **APPLIED** (repo-level, `WORKLOG` 261121.001) |
 | 8 | the radiance `NOTICE` / `third_party/radiance/` | *no block* — repo-level | **APPLIED** (same entry) |
 
