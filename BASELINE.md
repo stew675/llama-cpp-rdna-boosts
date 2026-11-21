@@ -16,7 +16,8 @@ upstream moves.  It is not a changelog — the current release, tip/tree and per
 | canonical chain | `release.json .tip` / `.tree` |
 | release identity | `release.json .release` (`v<blocks>-<base>-r<N>`) |
 
-**The base is fixed by a re-base.**  The last one is **`v17-919794500-r328`** (2026-11-21): it replayed the set
+**The base is fixed by a re-base.**  The last re-base is **`v17-919794500-r328`** (2026-11-21);
+`v17-919794500-r329` amends three blocks on that same base and moves no fork point: it replayed the set
 from `4f9dfa0e3` onto **`919794500`** — 228 upstream commits, 1944 files, +147 k / −41 k — as a **ladder climb**
 (one rung per block, each resolved, built and coherent before the next), with the three rung repairs squashed
 into their owning blocks (00's top-k gather, 05's `nb32`, 16's sign-compare).  The ladder, the per-rung conflict

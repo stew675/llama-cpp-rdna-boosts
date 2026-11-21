@@ -76,6 +76,19 @@ three generated documents), and the same kernels read the *same* purity manifest
 `0101` patches `tests/test-logits-width-probe.cpp` for its mixed-pair probe arms, so its hunk was re-anchored
 against the migrated TU — it still applies strictly, which `validate-set.sh` check 8 verifies.
 
+### 5. Published
+
+| item | value |
+|---|---|
+| release | **`v17-919794500-r329`** (`release.json .release`) |
+| delivery `main` | `d5bb66e6` |
+| tag | `v17-919794500-r329` (annotated, pushed — the Release workflow attaches the assets) |
+| fork `rdna-boosts` | force-with-lease → **`bbd08a300`**, tree == `release.json.tree`, tip == `.tip` |
+| container images | the `radiance` worker watcher picks the tag up on its next `*/10` poll and builds both ROCm lines off-host (`CONTAINERS.md`) |
+
+`README.md`'s "current release" line and `BASELINE.md` (which now says the last *re-base* is r328, this being a
+patch amendment on the same fork point) were updated in the same commit.
+
 ## 261121.007 (r329) -- the r328 follow-ups close: both "halo failures" were the wrong binary, one owed row was already fixed, and the rest were environment limits -- plus one obligation the re-base never closed (the generated docs)
 
 **No patch block changed, no block renumbered, no tag.**  The delivery change is **three gate scripts** (an anchor
