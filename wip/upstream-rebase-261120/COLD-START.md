@@ -1,4 +1,4 @@
-# COLD START — r328 upstream re-base, resume R12
+# COLD START — r328 upstream re-base, R12 landed, resume R13
 
 **Read this file top to bottom before touching anything.** It is self-contained: a fresh session should not need
 the campaign's history, only this, then the two files it names in §3.
@@ -23,15 +23,16 @@ Nothing in `patches/`, `release.json`, `rdna-boosts-all.patch` or the fork is to
 cd ~/llama.cpp && git status --short && git branch --show-current && git log --oneline -1
 ```
 
-Expect: **clean**, branch `rebase-r328`, `dbe4fdd40 rdna-boosts: block 11: qwen4exp ...` (tree `2b6aec1f0`).
-If a cherry-pick is mid-flight (`git status` shows unmerged paths), the previous session stopped inside a conflict:
-finish it or `git cherry-pick --abort` and redo that rung.
+Expect: **clean**, branch `rebase-r328`, `a9d8e1a96 rdna-boosts: block 12: campaign remainder ...` (tree
+`f0f9db34b1c3ae8a93f834e5c2fad472113a1af9`).  If a cherry-pick is mid-flight (`git status` shows unmerged
+paths), the previous session stopped inside a conflict: finish it or `git cherry-pick --abort` and redo that rung.
 
 | item | value |
 |---|---|
-| rungs landed | **R00 … R11** (12 of 18) + 2 rung repairs |
-| rung in progress | **R12 — paused, not landed** (§6) |
-| remaining after R12 | R13, R14, R15, R16, R17 (block `0300`), R18 (release) |
+| rungs landed | **R00 … R12** (13 of 18) + 2 rung repairs |
+| rung in progress | **none — R12 landed 2026-11-20** (`a9d8e1a96`, tree `f0f9db34b1c3ae8a93f834e5c2fad472113a1af9`) |
+| next rung | **R13** (block 13, `git cherry-pick 1014e6bf5`) |
+| remaining | R13, R14, R15, R16, R17 (block `0300`), R18 (release) |
 | delivery repo tip | `8fb8e43f` (docs only; `patches/`/`release.json` untouched) |
 | new fork point | `919794500` |
 | build | `cd ~/llama.cpp && ~/bin/build-llama-rocm`, then `cmake --build build-rocm -j 24` for the per-rung loop (`build-rocm`: `GGML_HIP_NO_VMM=OFF`, `GGML_CUDA_FA_QUANTS` includes `iq4_nl-iq4_nl`, `LLAMA_USE_PREBUILT_UI=OFF`) |
@@ -69,7 +70,8 @@ Note: **no `-lv`** on a text arm (it corrupts the stream). A census arm is a sep
    live references; everything else is closed.
 4. `~/llama-cpp-rdna-boosts/AGENTS.md` — the policy layer (apply with `scripts/apply-all.sh`, `-lv` rules,
    goldens, push policy). Its *Verify* table is what a rung's exit criteria come from.
-5. For R12 only: `r12-wip/README.md` — the paused rung's state (what is settled, what is not).
+5. For R12 (landed): `RUNGS.md` §R12 (esp. §R12.3, the two splice-orphaned server features, and §R12.4, the
+   DFlash decision).  `r12-wip/` is the paused session's evidence and is no longer an entry point.
 
 `HANDOVER.md` is session-2/3's delta and is now partly historical; this file supersedes it as the entry point.
 
@@ -88,8 +90,8 @@ Note: **no `-lv`** on a text arm (it corrupts the stream). A census arm is a sep
   (`scripts/fork-refresh.sh`). A bare `git push` there targets upstream `ggml-org/llama.cpp` — never acceptable.
 - **Report findings before committing a delivery-affecting change**; a rung's own log in `RUNGS.md` is where a rung's
   findings go.
-- **A rung must build and pass its coherence arm.** It is better to pause a rung (as R12 is) than to commit a tree
-  that does not build.
+- **A rung must build and pass its coherence arm.** It is better to pause a rung (as R12 was) than to commit a
+  tree that does not build — but a paused rung must capture *all* its resolved work in one patch (r12-wip did).
 
 ## §5 Ladder status (one line each)
 
@@ -107,112 +109,66 @@ Note: **no `-lv`** on a text arm (it corrupts the stream). A census arm is a sep
 | R09 | 09 host-resident MoE | done — `seq_rm` adopted; finding R09.3 (arena-off text divergence; closed at R10) |
 | R10 | 10 slab + **single fusion dispatcher** | done — the dispatcher reconciled into `ggml-cuda-try-fuse.cu`; R06.2 dense half + R09.3 closed; **R10.3 decode regression opened (§8)** |
 | R11 | 11 qwen4exp/QSA | done — D13 carried; `gate-hc-fusions.sh` **RED** (R11.2) |
-| **R12** | 12 DFlash/CPU wins/server cache | **PAUSED** — see §6 |
+| R12 | 12 DFlash/CPU wins/server cache/seqpar | **DONE 2026-11-20** — `a9d8e1a96`; the speculator class merged onto upstream's `init(opt)` seam (D17: the delivery's feature set kept, measured); six gates PASS (`spec-reuse-window`, `seqpar --record`, `state-pipe`, `ckpt-reuse`, `park-idle-slots`, `mtp-dev-rows`) |
 | R13–R17 | 13..0300 | not started |
 | R18 | release | not started (a long checklist, `RUNGS.md` R18) |
 
-## §6 R12 — how to resume (the next session's first job)
+## §6 R12 — landed; what it cost, and what to do first in R13
 
-R12 = `git cherry-pick dad1442b3` (64 files, +10k). Ten conflicted files. **Ten of them are already resolved** —
-captured in [`r12-wip/r12-resolved-but-unbuildable.diff`](r12-wip/r12-resolved-but-unbuildable.diff), with the
-rationale per file in [`r12-wip/README.md`](r12-wip/README.md). Apply that patch over `dbe4fdd40` (or redo the
-cherry-pick using that README's table as the checklist — it is 10 rows).
+R12 is in (`a9d8e1a96`, tree `f0f9db34b1c3ae8a93f834e5c2fad472113a1af9`).  The full log is `RUNGS.md` §R12; the
+short version a fresh session needs:
 
-The one thing that does not build is `common/speculative.cpp`:
+* The paused session's ten resolutions were applied from `r12-wip/r12-resolved-but-unbuildable.diff`, then
+  `common_speculative_impl_draft_dflash` was merged onto upstream `#32016`'s `dflash_options` + `init(opt)` seam
+  (upstream's split classes, the delivery's features as state `init()` sets — `is_mrope`/`strict_pos`, the
+  `LLAMA_DFLASH_INGEST_TAIL` window + `set_prompt_end`, the ingest filter and `spec_draft_align_cache()`, and
+  `opt.dev_features` instead of the old `!is_lilicorr` guard).  The merged class now differs from upstream by
+  exactly the delivery's 207 lines.
+* Two features the splice had orphaned in `tools/server/` were restored: `prompt_load_with_room()` had **no
+  caller** (so the parked-slot restore retry was dead code) and `server_prompt_cache::load()` read three
+  locals that had moved into `find()`.
+* `ckpt_recycle()` needed a deliberate `std::const_pointer_cast` against upstream's new
+  `shared_ptr<const common_prompt_checkpoint>` immutability rule; the guard (`use_count() == 1`) is what makes
+  it safe and `gate-ckpt-reuse.sh` is the oracle.
+* **D17** — the DFlash decision, resolved by measurement in the maintainer's direction: the delivery's feature
+  set stays on upstream's seam.  Numbers: `benchmarks/2026-11-20-r328-r12-dflash-merge.md`.
 
-> **`common_speculative_impl_draft_dflash` is two implementations of one class.**
-> * upstream `#32016` (the R02/D5 refactor): a delegating ctor pair taking `dflash_options`, a
->   `void init(const dflash_options & opt)` seam, and members `{features_buf, smpls, backend_chains,
->   n_embd_dec/enc/tgt, block_size, causal_attn, target_layer_ids(_n), use_dev_features}` — 388 lines.
-> * the delivery (block 12): one ctor doing everything inline, plus `is_dspark`, `sample_from_anchor`,
->   `is_dflash2`, `is_mrope`, `strict_pos`, `selector_top_k`, `dflash2_rng`/`dflash2_seed` (probabilistic
->   drafting), `ingest_window`/`ingest_from` (the prompt-tail ingest), the `lilicorr_*` state, and methods
->   (`begin`, `set_prompt_end`, the tail-filtered `draft`) that upstream's version does not have — 620 lines.
+**First thing in R13:** re-run `scripts/gate-hc-fusions.sh` (R11.2 is still red and block 12's `hc`/`mmb` knobs
+may be what restores the `mix_op` anchor) and keep R10.3 (the host-expert arena decode, 54.4 → 20.4 t/s, a
+release blocker) in view for R15.
 
-**The intended merge shape** (decided from the code, to be validated by building + the MTP four-axis protocol):
-build on **upstream's seam** (`dflash_options` + `init(opt)`), because that is what every other speculator class in
-this tree now uses (R02 resolved D5 as MERGE for exactly that reason), and add the delivery's state as fields that
-`init()` sets from the options, with its `begin`/`set_prompt_end`/`draft` additions as overrides on upstream's base.
-**Nothing of the delivery's feature set is dropped** — see §7, which is the important part of this document.
+## §6b The rungs left (one line each)
 
-## §7 The DFlash decision — what the maintainer asked for, and what to measure
-
-**Maintainer's instruction (2026-11-21):** *"the best way to make a decision on which way to go with the dflash
-choice is to measure which is more performant.  I know that we spent a lot of effort on optimizing DFlash2 within
-the delivery repo.  I am reticent to drop its work for upstream's."*
-
-So: **measurement decides, and the default is to preserve the delivery's work.** Before measuring, understand
-which layer the question is even about, because I checked and the layers are very different:
-
-### Layer B — the graph builders: NOT a performance fork (already answered)
-
-Upstream (at this base) has split the speculator graphs into per-campaign files, and their builders are the
-**same code** as the delivery's:
-
-| builder | upstream | delivery (block 12) | difference |
-|---|---|---|---|
-| `build_dflash2_selector` | `src/models/dflash2.cpp:120`, used at 223 | `src/models/dflash.cpp` (block 12) | **the delivery's is upstream's + one block**: the all-gather of vocab-split logits (`ggml_all_gather`) under `-sm tensor`, which is a **correctness fix** (upstream's selector aborts on a per-row op over a row that straddles a split) |
-| `build_dspark_markov_head` | `src/models/dspark.cpp:180` | `src/models/dflash.cpp` | **byte-identical** (7,037 bytes each, verified by diff at R12) |
-| `build_lilicorr_scores` | `src/models/lilicorr.cpp:82` | `src/models/dflash.cpp` | **byte-identical** (11,151 bytes each, diffed at R12) |
-| `build_dflash2_conv` | a **class member** (`dflash2.cpp:53`) | a static free function | structural only |
-
-**Consequence for the measurement plan:** an A/B of "delivery builders vs upstream builders" would compare the same
-arithmetic, and the only measurable delta is the all-gather arm, where upstream's version is not merely slower — it
-**aborts**. Port the delivery's all-gather into upstream's `dflash2.cpp` (already done in the R12 WIP patch) and the
-builders are a non-question: keep upstream's file layout, keep the delivery's fix.
-
-### Layer A — the speculator class seam: structural, not a performance fork either
-
-Every delivery feature that "we spent a lot of effort on" is a *switch or a state field* on this class, not an
-alternative implementation of upstream's:
-
-| feature | knob | measured value (delivery records — do not re-derive) |
+| rung | block | source commit |
 |---|---|---|
-| prompt-tail ingest (every draft layer has a sliding window) | `LLAMA_DFLASH_INGEST_TAIL` (on) | prefill **+8–12 %** at 6K/26K/88K (27B UD-Q4_K_XL + DFlash2-Q4_K_M, 3× gfx1201 `-sm tensor -mg 0`, `-fa on -ctk/ctv q8_0`: 88.6K 1271 → 1395 t/s, draft share of prefill 10.2 % → 1.4 %); 35B-A3B Q4_K_M + its DFlash2 **+14.6 %** at 6.1K; text and draft counts byte-identical |
-| device-resident layer-input features (F1) | `LLAMA_DFLASH_DEV` (on) | `ENVIRONMENT.md` §LLAMA_DFLASH_DEV; since r163 the target graph writes them with an in-graph `SET_ROWS` (188.8 MiB of compute buffer saved at `-ub 2048` on a 27B) |
-| probabilistic drafting (per-seq rng + seed) | state: `dflash2_rng` / `dflash2_seed` | expressiveness, not a rate |
-| anchor-first sampling (DSpark) | state: `sample_from_anchor` | DSpark correctness |
-| DFlash2 itself vs the alternatives (the reason any of this exists) | `--spec-type draft-dflash` | 27B UD-Q4_K_XL, 2 dev `-sm tensor -c 16384` q8_0 KV, `-n 2000`, 4 prompts: plain **48.6**, `draft-mtp` n5 **131.2**, adaptive n5 126.8, **`draft-dflash` n5 144.3, n7 153.1** (mean over R/P/C/K) — DFlash2 wins by ~20 % over the best adaptive-MTP arm (`archive/work/qwen4exp-dflash2/README.md`) |
+| R13 | 13 | `1014e6bf5` |
+| R14 | 14 | `e88d45d9e` (streamed KV window + attendance pool + MTP draft ring, 3 conflicts) |
+| R15 | 15 | `35a9ae985` (UMA GTT expert store — **R10.3 is owed here**) |
+| R16 | 16 | `286191b31` (server prompt admission, D7) |
+| R17 | `0300` | `e159adfc2` (`-sm relaxed-tensor` + `TODO` #351, the flint re-test) |
+| R18 | — | the release checklist at the end of `RUNGS.md` |
 
-**Consequence:** dropping the delivery's class for upstream's deletes the ingest-tail (~+10 % prefill), F1, the
-probabilistic drafting state and the DSpark anchor path — i.e. exactly the work the maintainer does not want to
-lose. The seam merge is therefore **structural**: implement the delivery's features on upstream's `init(opt)` base.
+## §7 The DFlash decision — **RESOLVED (D17): the delivery's feature set stays**, measured
 
-### The measurement that IS worth running (and its arms)
+Maintainer's instruction (2026-11-21): *"the best way to make a decision on which way to go with the dflash
+choice is to measure which is more performant … I am reticent to drop its work for upstream's."*  Resolved at
+R12 by measurement, in that direction.  Full record: `benchmarks/2026-11-20-r328-r12-dflash-merge.md`;
+decision: `DECISIONS.md` D17; rung log: `RUNGS.md` §R12.4.  What a later session needs from it:
 
-Once R12 builds, this is the honest A/B — *the delivery's feature set against upstream's behaviour on the same
-targets*, plus a per-feature isolation so the difference is attributed rather than assumed:
-
-**Targets** (this box has the heads):
-
-| target | DFlash2 head |
-|---|---|
-| `/llm/models/Qwen3.8/27B/Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf` | `/llm/models/Qwen3.8/27B/Q4_K_XL/Qwen3.8-27B-DFlash2-Q4_K_M.gguf` |
-| `/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf` | `/llm/models/Qwen3.6/35B-A3B/DFlash2/Q8_0/Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf` |
-| `/llm/models/Qwen3.8/Flash-Next/GSQ-RCO-IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf` | `…/Qwen3.8-Flash-Next-DFlash2-Q8_0.gguf` |
-
-**Arms** (one run per cell, `--seed 42 --temp 0`, `HIP_VISIBLE_DEVICES` pinned, one GPU workload at a time):
-
-| # | what it answers | command sketch |
-|---|---|---|
-| U | upstream behaviour: delivery features off | `--spec-type draft-dflash … LLAMA_DFLASH_INGEST_TAIL=0 LLAMA_DFLASH_DEV=0` |
-| D | the delivery's feature set (default) | `--spec-type draft-dflash …` (both env vars default on) |
-| D-it | ingest-tail's own contribution | `LLAMA_DFLASH_INGEST_TAIL=0` only |
-| D-f1 | F1's own contribution | `LLAMA_DFLASH_DEV=0` only |
-| U-st | **correctness gate for `-sm tensor`** | arm U with `-sm tensor`: upstream's selector must be shown to abort (or the all-gather must be present) — this is the one place a rate comparison is meaningless |
-
-Prefill and decode are separate claims: measure **pp** at 6K and 26K (the ingest-tail's win is a *prefill* win) and
-**tg** with `-n 2000` (DFlash2's win is a *decode* win), plus the **acceptance** counts (accepted/generated, mean
-block length, per-position rates) from `-lv 4`.
-
-**Pass criteria, in order:** (1) where the feature sets match, text **and** acceptance counts are identical; (2) the
-HARD correctness arms hold — upstream's `-sm tensor` selector abort is the proof that the all-gather must stay, and
-no arm may corrupt (`////`); (3) **the faster arm wins per metric** (prefill separately from decode), per the
-maintainer's standing "per knob, not per file" rule.  A mixed result is a fine outcome: e.g. keep upstream's file
-layout and the delivery's builders + all-gather, with the delivery's features on upstream's seam.
-
-Record the numbers in `benchmarks/` and the choice in `RUNGS.md` R12 — **the maintainer's reluctance is the default
-direction**, so the measurement has to *show* a loss to justify dropping anything.
+* **The graph builders are not a performance fork.**  `build_dspark_markov_head` and `build_lilicorr_scores` are
+  byte-identical to the delivery's; `build_dflash2_conv` differs only structurally; the one real difference —
+  the delivery's all-gather of the vocab-split logits in `build_dflash2_selector` — is a **correctness** fix
+  (the pristine base aborts that arm under `-sm tensor`: `ggml-backend-meta.cpp`'s `handle_per_row`,
+  `GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0)`; the plain control on that base runs).
+* **The seam is structural**: upstream's class split + `dflash_options`/`init(opt)` is kept, the delivery's
+  features (`is_mrope`/`strict_pos`, the `LLAMA_DFLASH_INGEST_TAIL` window and its `set_prompt_end` hook, the
+  ingest filter, `spec_draft_align_cache()`, `opt.dev_features`) are state `init()` sets.  The pre-split
+  duplicate state was deleted because upstream's subclasses already own it — no feature was dropped.
+* **Measured** (3 targets × U/D/D-it/D-f1, 6K and 26K, `-n 2000`, `-lv 4` with the text on stdout): text and
+  per-position acceptance identical in every pair; the ingest tail is **+29.8 % pp at 26K on the 2-GPU 35B** and
+  +11.7 % on 3-GPU Flash-Next, ~neutral on a 1-GPU `-sm layer` cell (nothing to overlap — the delivery's own
+  r130 record says the same); **F1 is +6-7 % pp on the dense 27B and inert on both MoE heads** (their draft
+  contexts fail `llama_supports_embd_row()` and log "host copies"); decode is flat everywhere.
 
 ## §8 Open obligations carried into the next session (do not lose these)
 
@@ -221,6 +177,7 @@ direction**, so the measurement has to *show* a loss to justify dropping anythin
 | **R10.3 — RELEASE BLOCKER** | the host-expert arena arm's decode: 35B-A3B Q8_0, 1 GPU, `-ncmoe 20 -c 8192 -ub 1024`, `MOE_EXPERT_HEATMAP=load` → **R09 54.4 t/s, R10 20.4 t/s**, reproducible, text unchanged, and **no switch recovers it** (`DISABLE_FUSION=1` 18.5, `SLAB=0` 13.8; r327 reads 49.7) | maintainer, 2026-11-21: *"the decode regression must be fixed before we release; that can happen later."* Re-check at **R15**; if still open, bisect from `pool_stack` / `mmb_yield_caches` / the MMB slot lifetime. **r328 does not ship with it open.** |
 | **R11.2** | `gate-hc-fusions.sh` **RED**: `mix_op`, `dsv4_pre_op`, `ops_no_post` left their r327 anchors (comm_op is exact; the chain itself moved). Half was predicted by block 11's own commit message; the fused **mixer** arm moving is new | re-run at **R13/R14/R17**; if `mix_op` still differs, the fused mixer must not ship default-on. Re-anchoring planted values is a **maintainer decision**, arm by arm |
 | **R06.2 (routed half)** | the forced routed MMB arm (`GGML_CUDA_MMB_TYPES=q8_0 GGML_CUDA_MMB_ROUTED=1`, 35B-A3B) still aborts on the pool LIFO assert where r327 reads `86b7f9b5aa80` | owed at **R15**/R18; it is an A/B override, not a shipped default (RDNA4: `routed=0`, Q8_0 not in the mask) |
+| **R12-owed gates** | the gates for block 12 that R12 did **not** run: `gate-spec-align.sh` (`LLAMA_SPEC_ALIGN`), `gate-spec-ckpt-device.sh` (`LLAMA_SERVER_SPEC_CKPT_DEVICE`), `gate-spec-width-band.sh`, and the `-sm tensor` arms of `gate-host-pool.sh` / `gate-prefill-logits.sh` for block 09's Meta split-state cache (which D7/R12 edits) | run at **R13**/R18; `gate-seqpar.sh --record` was refreshed at R12, so R18 must re-record the prefill-logit base on the final tree |
 | **R18 (delivery repo)** | drop block 10's `top_k` hunk is DONE (de-duplicated by construction at R10); still owed: squash `3ea8b0212` into block 00, re-measure `mm_ids_helper_512_10`, regenerate the generated docs and assert no drift, `TODO` #352 (container `web` stage), `TODO` #351 (the flint `-sm tensor` re-test, at R17), the full quant-coherence + QSA section E, `gate-norm-rows-alias.sh`, `MMB_J_MAX=8`'s floor | see `RUNGS.md` R18 and `HANDOVER.md` §2 for the full list |
 
 ## §9 Recipes
@@ -257,7 +214,8 @@ only.
 |---|---|
 | the ladder, per-rung detail | `RUNGS.md` (this dir) |
 | live decision items | `DECISIONS.md` (this dir) — D4/D8/D9/D12/D13 |
-| the paused R12 | `r12-wip/README.md` + `r12-wip/r12-resolved-but-unbuildable.diff` |
+| R12 (landed) | `RUNGS.md` §R12; its evidence patch is `r12-wip/r12-resolved-but-unbuildable.diff` (historical) |
+| the DFlash decision + its numbers | `DECISIONS.md` D17, `benchmarks/2026-11-20-r328-r12-dflash-merge.md` |
 | the delivery's DFlash2 record | `archive/work/qwen4exp-dflash2/README.md`, `archive/work/dflash2-draft-sched2/README.md` |
 | env knobs (incl. `LLAMA_DFLASH_*`) | `~/llama-cpp-rdna-boosts/ENVIRONMENT.md` |
 | delivery policy | `~/llama-cpp-rdna-boosts/AGENTS.md` |

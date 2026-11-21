@@ -430,3 +430,35 @@ now `int64_t` in the typedef and in all four kernels, exactly as `#32217` does. 
 the rest of the climb: **"take the delivery's side" applies to a shared *mechanism*, not to a type widening
 that upstream introduced to make its own new code correct** — the per-head mask is upstream's feature and its
 arithmetic is upstream's to get right.
+
+## D17 — the DFlash feature set vs upstream's behaviour, after R12 merged the class onto `init(opt)`  ·  **DECIDED 2026-11-20 (measurement, per the maintainer's instruction): the delivery's feature set stays**
+
+Maintainer, 2026-11-21: *"the best way to make a decision on which way to go with the dflash choice is to
+measure which is more performant.  I know that we spent a lot of effort on optimizing DFlash2 within the
+delivery repo.  I am reticent to drop its work for upstream's."*  So the delivery's work was the default and a
+**loss** had to be shown before anything was dropped.  The question has three layers and only one is
+measurable as a rate:
+
+1. **The graph builders are not a fork.**  `build_dspark_markov_head` and `build_lilicorr_scores` are
+   byte-identical between upstream's new per-campaign files and the delivery's `src/models/dflash.cpp`
+   (7,037 B / 11,151 B), `build_dflash2_conv` differs only structurally, and the one real difference —
+   `build_dflash2_selector`'s all-gather of the vocab-split logits — is a **correctness** fix: the pristine
+   base aborts the same arm under `-sm tensor` (`ggml-backend-meta.cpp`'s `handle_per_row`:
+   `GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0)`), while the plain control on that base runs and
+   the re-based tree runs every arm.  Upstream's file layout is kept; the all-gather is ported into it.
+2. **The seam is structural**: every delivery feature is a switch or a state field, not an alternative
+   implementation, so it is implemented on upstream's `dflash_options`/`init(opt)` base and the pre-split
+   duplicate state (`is_dspark`/`is_dflash2`/`is_lilicorr`/`sample_from_anchor`/`selector_top_k`/
+   `dflash2_rng`/`lilicorr_*`) is deleted from the base, where upstream's subclasses already own it.  Nothing
+   of the delivery's feature set is lost by that deletion.
+3. **The feature set was measured** (three targets, four arms, 6K and 26K prompts, text + acceptance + pp + tg;
+   `benchmarks/2026-11-20-r328-r12-dflash-merge.md`).  Text and per-position acceptance are **identical in every
+   pair**; the ingest tail is **+29.8 % pp at 26K on the 2-GPU 35B** and +11.7 % on 3-GPU Flash-Next, ~neutral
+   only on a 1-GPU `-sm layer` cell (where there is nothing to overlap, as the delivery's own r130 record
+   says); F1 is +6-7 % pp on the dense 27B and inert on both MoE heads; decode is flat everywhere.
+
+**Decision: keep upstream's file layout and class split with the delivery's whole feature set on top** — ingest
+tail default-on (`LLAMA_DFLASH_INGEST_TAIL=0` kills it), F1 default-on (`LLAMA_DFLASH_DEV=0`), the ported
+all-gather, DFlash2's selector/probabilistic paths and DSpark's anchor layout as upstream now has them.  No
+number anywhere argued for dropping a delivery feature; the only thing dropped is the build's second,
+pre-split copy of the class.  Recorded at R12 (`RUNGS.md` §R12.4).

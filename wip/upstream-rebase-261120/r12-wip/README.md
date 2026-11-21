@@ -1,4 +1,9 @@
-# R12 — paused mid-rung (session 3, 2026-11-21)
+# R12 — paused mid-rung (session 3, 2026-11-21)  ·  **since LANDED 2026-11-20 as `a9d8e1a96`**
+
+> **Kept as evidence, no longer an entry point.**  The next session merged `common_speculative_impl_draft_dflash`
+> onto upstream's `init(opt)` seam, fixed the two splice-orphaned server features, and landed the rung — the log is
+> `../RUNGS.md` §R12 and the DFlash decision is `../DECISIONS.md` D17.  This file describes the paused state and
+> stays accurate as a record of it.
 
 **Status: NOT landed. The ladder is clean at `dbe4fdd40` (R11).**  `r12-resolved-but-unbuildable.diff` is the
 whole work of the session's R12 attempt: `git cherry-pick dad1442b3`, all ten conflicted files resolved, and the

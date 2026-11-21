@@ -2,49 +2,52 @@
 
 > Continue the r328 upstream re-base ladder in `~/llama-cpp-rdna-boosts/wip/upstream-rebase-261120/`.
 >
-> **First, read `COLD-START.md` in that directory top to bottom** — it is self-contained and it supersedes
-> `HANDOVER.md` as the entry point. Then verify the state it claims (`cd ~/llama.cpp && git status`, `git log
-> --oneline -1`: expect clean, `rebase-r328`, `dbe4fdd40`). Read `RUNGS.md` (last landed rung R11 plus R06–R10's
-> open obligations) and, for the rung itself, `r12-wip/README.md`.
+> **First, read `COLD-START.md` in that directory top to bottom** — it is self-contained. Then verify the state it
+> claims (`cd ~/llama.cpp && git status --short && git branch --show-current && git log --oneline -1`: expect
+> clean, `rebase-r328`, `a9d8e1a96`, tree `f0f9db34b1c3ae8a93f834e5c2fad472113a1af9`). Read `RUNGS.md` §R12
+> (what the last rung cost and what it left open), then the ledger rows for R13-R17 and `DECISIONS.md`'s live
+> items (D4, D8, D9, D12, D13, **D17**).
 >
-> **Job 1 — finish R12.** It is paused, not landed: its ten conflicted files are already resolved (see
-> `r12-wip/r12-resolved-but-unbuildable.diff` and the rationale table in `r12-wip/README.md`), and the tree fails
-> to build only in `common/speculative.cpp`, because `common_speculative_impl_draft_dflash` is two implementations
-> of one class (upstream `#32016`'s `dflash_options`/`init(opt)` seam, 388 lines, vs block 12's inline ctor plus
-> the DSpark/DFlash2/LiliCorr/ingest state and methods, 620 lines). Merge them the way `COLD-START.md` §6
-> describes — upstream's seam, the delivery's features added as state that `init()` sets plus overrides — then
-> build, run the coherence arm (`100 chars sha=1c5d32ac537d`) and the rung's own checks, and write the rung's log
-> in `RUNGS.md`. Do not commit a tree that does not build or does not pass coherence; pausing again with the work
-> captured is a better outcome than a green-looking commit.
+> **R12 landed 2026-11-20** (`a9d8e1a96`): the paused speculator-class merge was finished by putting the
+> delivery's DFlash features on upstream's `dflash_options`/`init(opt)` seam, two splice-orphaned server features
+> were restored (`prompt_load_with_room` had no caller; `server_prompt_cache::load()` read three locals that had
+> moved into `find()`), and the DFlash decision (**D17**) was settled by measurement in the maintainer's
+> direction: **the delivery's whole feature set stays** (ingest tail +29.8 % pp at 26K on a 2-GPU 35B, +11.7 % on
+> 3-GPU Flash-Next; F1 +6-7 % pp on the dense 27B and inert on both MoE heads; text and acceptance identical in
+> every pair). Numbers in `benchmarks/2026-11-20-r328-r12-dflash-merge.md`. R12 ran six gates green
+> (`gate-spec-reuse-window`, `gate-seqpar --record`, `gate-state-pipe`, `gate-ckpt-reuse`, `gate-park-idle-slots`,
+> `gate-mtp-dev-rows`) plus coherence `1c5d32ac537d` and `MUL_MAT_ID` 1077/0 (== the base's own count).
 >
-> **Job 2 — settle the DFlash question by measurement, in the direction the maintainer set.** The maintainer's
-> instruction: *"the best way to make a decision on which way to go with the dflash choice is to measure which is
-> more performant. I know that we spent a lot of effort on optimizing DFlash2 within the delivery repo. I am
-> reticent to drop its work for upstream's."* So: **preserve the delivery's work by default, and let numbers
-> justify any deletion.** Read `COLD-START.md` §7 before measuring — I already checked the layers: the three graph
-> builders are the *same code* (two byte-identical, the DFlash2 selector differing only by the delivery's
-> all-gather, which is a correctness fix under `-sm tensor` where upstream's version aborts), so the real question
-> is the *feature set* (ingest-tail ≈ +10 % prefill, F1 device features, probabilistic drafting, anchor-first
-> DSpark) and the seam, not "which lattice is faster". Run the arms in §7's table (U / D / D-it / D-f1 / U-st) on
-> the three targets listed there, report prefill and decode separately plus the acceptance counts, and record the
-> numbers in `benchmarks/` and the choice in `RUNGS.md` R12.
+> **Job 1 — R13** (`git cherry-pick 1014e6bf5`, 0 conflicts expected). Build, coherence, the block's own census /
+> kill-switch arm, then the rung log in `RUNGS.md`.
 >
-> **Constraints that are not negotiable:** no `-lv` on a text arm (`-lv 4` only for a census); pin
+> **Job 2 — the two carried obligations, in this order.** (a) **R11.2**: `scripts/gate-hc-fusions.sh` is still RED
+> (`mix_op`, `dsv4_pre_op`, `ops_no_post` left their r327 anchors). Block 12's `hc`/`mmb` knob path is now in the
+> tree, so re-run it and see whether the `mix_op` anchor is restored; if the fused **mixer** still differs it must
+> not ship default-on, and re-anchoring planted values is a maintainer decision, arm by arm. (b) Then the R12-owed
+> gates from `COLD-START.md` §8: `gate-spec-align.sh`, `gate-spec-ckpt-device.sh`, `gate-spec-width-band.sh`, and
+> the `-sm tensor` arms of `gate-host-pool.sh` / `gate-prefill-logits.sh` for block 09's Meta split-state cache.
+>
+> **Non-negotiable constraints:** no `-lv` on a text arm — `-lv 4` only for a census, and note that `-lv 4` puts
+> every census on **stderr** while the generated text stays on **stdout**, so one run can serve as both arms; pin
 > `HIP_VISIBLE_DEVICES`; one GPU workload at a time; build-completion by the `BUILD_RC=` sentinel, never `pgrep`;
-> any abort gets the same arm re-run on `~/llama.cpp/build-rocm/bin-r327` before it is called a regression; never
-> push from `~/llama.cpp` except the release-time `rdna-boosts` refresh to the personal fork; report findings
-> before committing anything delivery-affecting.
+> any abort gets the same arm re-run on `~/llama.cpp/build-rocm/bin-r327` before it is called a regression, and on
+> `build-base-novmm` when the question is "is this upstream's behaviour?"; never push from `~/llama.cpp` except the
+> release-time `rdna-boosts` refresh to the personal fork; report findings before committing anything
+> delivery-affecting.
 >
-> **Two things are already on the board and must not be lost** (details in `COLD-START.md` §8):
+> **Still on the board and not to be lost** (`COLD-START.md` §8 has the detail):
 > 1. **R10.3 is a RELEASE BLOCKER** — the host-expert arena arm's decode fell 54.4 → 20.4 t/s between R09 and R10
 >    (35B-A3B Q8_0, 1 GPU, `-ncmoe 20 -c 8192 -ub 1024`, `MOE_EXPERT_HEATMAP=load`), reproducibly, text unchanged,
->    and no switch recovers it. The maintainer: *"the decode regression must be fixed before we release; that can
->    happen later though."* Re-check it at R15; r328 does not ship with it open.
-> 2. **R11.2** — `scripts/gate-hc-fusions.sh` is red (`mix_op`, `dsv4_pre_op`, `ops_no_post` left their r327
->    anchors; `comm_op` is exact). Re-run at R13/R14/R17; if the fused mixer still differs, it must not ship
->    default-on, and re-anchoring planted values is a maintainer decision, arm by arm.
+>    no switch recovers it. Re-check at **R15**; r328 does not ship with it open.
+> 2. **R11.2** — as above.
+> 3. **R06.2 (routed half)** — the forced routed MMB arm still aborts on the pool LIFO assert where r327 reads
+>    `86b7f9b5aa80`; owed at R15/R18 (an A/B override, never a shipped default).
 >
-> After R12, carry on down the ladder: R13, R14, R15, R16, R17 (block `0300`, which includes `TODO` #351 — the
-> flint `-sm tensor` re-test that decides whether `0300` can be dropped), then R18's release checklist. Write each
-> rung's log in `RUNGS.md` (resolutions table, exit criteria, findings, notes-for-later) and commit the delivery
-> repo's docs per rung; `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork stay untouched until R18.
+> Then carry on: R14 (3 conflicts, the streamed KV window), R15 (**the R10.3 re-check**), R16 (server prompt
+> admission), R17 (block `0300`, including `TODO` #351), then R18's release checklist (`RUNGS.md` R18: the
+> `--all` per-block ladder, `TODO` #352, the R00 repair squash, `gate-prefill-logits.sh --record`, the full
+> quant-coherence + QSA section E, `make-patches.sh`/`make-release.sh`/`validate-set.sh`, `fork-refresh.sh
+> --build --gates --push`, the worker container build, and the `WORKLOG.md` release entry). Write each rung's log
+> in `RUNGS.md` and commit the delivery repo's docs per rung; `patches/`, `release.json`,
+> `rdna-boosts-all.patch` and the fork stay untouched until R18.

@@ -1,10 +1,10 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: OPEN — 12 of 18 rungs climbed (R00-R11) on 2026-11-21; R12 is paused mid-rung (see below). Nothing is delivery yet.**
+**Status: OPEN — 13 of 18 rungs climbed (R00-R12); nothing is delivery yet.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
-the final rung (R18).  Ladder branch `rebase-r328` = `dbe4fdd40` (tree `2b6aec1f0`): R00..R11 plus two rung
-repairs (R00's top-k gather, R05's `nb32` widening); every rung is green on build + coherence and each has one
-entry in [`RUNGS.md`](RUNGS.md).
+the final rung (R18).  Ladder branch `rebase-r328` = `a9d8e1a96` (tree
+`f0f9db34b1c3ae8a93f834e5c2fad472113a1af9`): R00..R12 plus two rung repairs (R00's top-k gather, R05's `nb32`
+widening); every rung is green on build + coherence and each has one entry in [`RUNGS.md`](RUNGS.md).
 **The one known-red is closed at R00** (repair `3ea8b0212`): the delivery's required VMM pool refuses
 upstream's strided 2-D indexer top-k copy, and it reproduces on the pristine base with *only* the `#30542`
 revert, so the fix (block 10's `top_k_gather_rows`, moved down — [`DECISIONS.md`](DECISIONS.md) D15) lives in
@@ -47,12 +47,18 @@ produced a new finding: the arena arm's decode dropped 54.4 -> 20.4 t/s and no k
 5 conflicts, D9 and D13 were carried (upstream's FP8 PLE scale *and* the delivery's lazy reader coexist), and both
 block gates ran — quant-coherence PASS, but **`gate-hc-fusions.sh` is RED**: the fused *mixer* arm and the two
 dsv4 pre/post arms left their r327 anchors while the combine arm is exact (`RUNGS.md` R11.2, owed at R13/R14/R17
-and needing a maintainer call on re-anchoring).  **R12 is paused, not landed**: its ten conflicts were resolved
-and captured in [`r12-wip/`](r12-wip/README.md), but `common_speculative_impl_draft_dflash` turned out to be **two
-implementations of one class** (upstream's `#32016` `dflash_options`/`init()` seam against block 12's inline ctor
-plus the DSpark/DFlash2/LiliCorr/ingest state and methods), which is a merge that needs its own session and the MTP
-four-axis protocol as its oracle.  The ladder was reverted to `dbe4fdd40` (R11) rather than commit a tree that does
-not build.  Target: the next
+and needing a maintainer call on re-anchoring).  **R12 is done** (`a9d8e1a96`): the paused session's ten resolutions were applied, and
+`common_speculative_impl_draft_dflash` — upstream's `#32016` `dflash_options`/`init()` seam against block 12's
+inline ctor plus the DSpark/DFlash2/LiliCorr/ingest state — was merged by keeping upstream's seam and class
+split and implementing the delivery's features on it (the merged class differs from upstream by exactly the
+delivery's 207 lines).  Two features the splice had orphaned in `tools/server/` were restored (the parked-slot
+restore retry had no caller; `server_prompt_cache::load()` read locals that had moved into `find()`), and the
+DFlash question was settled by measurement in the maintainer's direction — **D17: the delivery's feature set
+stays** (ingest tail +29.8 % pp at 26K on a 2-GPU 35B, +11.7 % on 3-GPU Flash-Next, ~neutral on a 1-GPU
+`-sm layer` cell; F1 +6-7 % pp on the dense 27B and inert on both MoE heads; text and acceptance identical in
+every pair; the pristine base still aborts DFlash under `-sm tensor`).  Numbers:
+[`../../benchmarks/2026-11-20-r328-r12-dflash-merge.md`](../../benchmarks/2026-11-20-r328-r12-dflash-merge.md).
+Six gates green.  Target: the next
 release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 
@@ -67,7 +73,7 @@ The method, the exit criteria and the traps are the ones proved by
 re-base, 17 blocks from `a691b2345` onto `4f9dfa0e3`) and `../../archive/work/upstream-rebase-261108/` (the
 r236 re-base).  Read the r278 record's §1 before starting a session; nothing in it has stopped being true.
 
-**A fresh session starts at [`COLD-START.md`](COLD-START.md)** (self-contained state, anchors, the R12 resume plan,
+**A fresh session starts at [`COLD-START.md`](COLD-START.md)** (self-contained state, anchors, the R13 plan,
 the DFlash measurement mandate and the carried obligations); the prompt to paste is
 [`NEXT-SESSION-PROMPT.md`](NEXT-SESSION-PROMPT.md).  `HANDOVER.md` is the previous sessions' delta.
 
