@@ -953,8 +953,10 @@ from context-lifetime to per-compute via `ggml_cuda_mmb_yield_caches`), which is
 (slab-transient absorption / streamed KV) and **15** (the pool/GTT store) rework — and r327's 49.7 shows the
 shipping set does not have it.
 
-**Owed:** R15 must re-run this arm; if the decode has not recovered by then, R18 cannot ship the set and the
-bisect starts from `pool_stack`/`mmb_yield_caches`.
+**Owed — and this is a RELEASE BLOCKER (maintainer, 2026-11-21: "the decode regression must be fixed before we
+release; that can happen later").**  R15 must re-run this arm; if the decode has not recovered by then, the bisect
+starts from `pool_stack` / `mmb_yield_caches` / the MMB slot lifetime, and **R18 does not ship until the arena arm
+reads ~50 t/s decode again on this config.**  A green ladder is not permission to release past it.
 
 ## R10.4 Notes for later rungs
 

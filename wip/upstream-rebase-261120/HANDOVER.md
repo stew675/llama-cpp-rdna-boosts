@@ -196,7 +196,9 @@ with upstream's `#32454` NORM+MUL arms in it (D4 shipped), R06.2's *dense* half 
 reads r327's `ebf2a5a9b00a`), the `top_k_gather_rows` hunk is de-duplicated by construction, and R09.3 is closed
 (arena == arena-off).  **Still owed:** R06.2's *routed* half (the forced `GGML_CUDA_MMB_ROUTED=1` arm still
 aborts on the pool LIFO assert — now R15's), and a **new decode finding** (R10.3: the arena arm reads 20.4 t/s
-where R09 read 54.4, fusion- and slab-independent, owned by blocks 14/15).
+where R09 read 54.4, fusion- and slab-independent, owned by blocks 14/15).  **R10.3 is a RELEASE BLOCKER** — the
+maintainer's instruction (2026-11-21): *"the decode regression must be fixed before we release; that can happen
+later"*.  Do not cut r328 with it open, whatever the rest of the ladder says.
 
 **Historical note — R10's four obligations were:** — run them as part of its verification, not later:
 (1) `RUNGS.md` **R06.2** — after block 10's `pool_stack` lands, the 27B UD-IQ3_S dense arm (default MMB) must
