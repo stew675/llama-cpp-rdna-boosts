@@ -67,6 +67,10 @@ The method, the exit criteria and the traps are the ones proved by
 re-base, 17 blocks from `a691b2345` onto `4f9dfa0e3`) and `../../archive/work/upstream-rebase-261108/` (the
 r236 re-base).  Read the r278 record's §1 before starting a session; nothing in it has stopped being true.
 
+**A fresh session starts at [`COLD-START.md`](COLD-START.md)** (self-contained state, anchors, the R12 resume plan,
+the DFlash measurement mandate and the carried obligations); the prompt to paste is
+[`NEXT-SESSION-PROMPT.md`](NEXT-SESSION-PROMPT.md).  `HANDOVER.md` is the previous sessions' delta.
+
 ## §0  Baseline facts (as measured 2026-11-20)
 
 | item | value |

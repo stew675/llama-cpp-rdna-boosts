@@ -1,5 +1,9 @@
 # HANDOVER — r328 re-base ladder, 12 of 18 rungs climbed, resume at **R12 (paused mid-rung)**
 
+> **This file is session-2/3's delta.**  A fresh session should start at [`COLD-START.md`](COLD-START.md)
+> (self-contained, includes the DFlash measurement mandate and R12's resume plan); the prompt to paste is
+> [`NEXT-SESSION-PROMPT.md`](NEXT-SESSION-PROMPT.md).
+
 Written 2026-11-21 (session 2/3, which climbed R06, R07, R08, R09 and R10).  Read [`README.md`](README.md) §1 (method + traps),
 [`RUNGS.md`](RUNGS.md) (the per-rung ledger and every resolution so far) and [`DECISIONS.md`](DECISIONS.md)
 (the decision log) — this file is the delta: what is done, what is owed, and how to not repeat the mistakes of
