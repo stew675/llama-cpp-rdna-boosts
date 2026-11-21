@@ -1555,3 +1555,20 @@ Record: `WORKLOG.md` 261121.007, `archive/work/r328-followups/` (§3 rows and `l
   body file).  Audited clean at r331 apart from this one site, which now says `GGML_CUDA_CC_GB10`.  The same
   re-base pass also lost `ggml_cuda_should_fuse_rope_set_rows()`'s `GGML_CUDA_DISABLE_ROPE_SET_ROWS` kill switch
   (restored; a bisect knob only, `ENVIRONMENT.md` §7.3).  Record: `WORKLOG.md` 261121.010.
+
+
+* **Per-block independent buildability is NOT a delivery property (r332, maintainer's decision 2026-11-21).**  The
+  set is the artifact: `apply-all.sh` applies every block and ONE `all` build of the applied tip proves it (6-10 min
+  cold, ~10 s warm).  A block is a LAYER on its predecessors — it owns its functionality but has no standalone
+  build/apply guarantee — and the r2 rule ("every block commit builds the `all` target on its own") was retired
+  after it cost **35-55 min per re-base and weeks of wall time over the project's life**: the per-rung configure
+  alone is ~30 s x 18, the FA template-instance set recompiles per rung when a widely included header moves, and
+  on a 16-core box a re-base ladder measured 31 min even fully warm.  What the rule was credited with, it did not
+  cover: a block that is uncompilable **in the applied set** fails the set build (the only thing a consumer
+  compiles), and a file a re-base silently dropped is invisible to *any* build — that is the file-set
+  reconciliation's job (`TODO` #358), which is what would have caught r328's `ggml-alloc.c` loss.  The walker
+  (`scripts/gate-per-block-build.sh`) is kept as a bisection tool (`--changed-from <previous release tip>`) and is
+  called by nothing in the release or per-push flows.  Cost of the decision: a regression that makes an intermediate
+  tree uncompilable while the tip compiles is no longer detected by construction (the r305-r307 class); a bisect
+  that needs it runs the walker on demand.  Record: `WORKLOG.md` 261121.011, `MANIFESTS.md` gate 5, `AGENTS.md`
+  -> *Build the fork*.

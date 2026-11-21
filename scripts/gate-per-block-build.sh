@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
-# Per-block build gate -- the r2 "every one of the 16 commits builds the `all`
-# target" standard.
+# Per-block build walker -- a BISECTION TOOL, NOT A RELEASE GATE (r332).
+#
+# The delivery's contract is that the WHOLE SET applies and builds: `scripts/apply-all.sh` applies all the
+# blocks and one `all` build at the tip proves the artifact.  A block is a LAYER on the blocks before it; there
+# is NO expectation that any single block applies or builds alone.  That was the r2 rule, and it was retired by
+# the maintainer's decision of 2026-11-21 (`WORKLOG.md` 261121.011): it cost 35-55 min per re-base, weeks of
+# wall time over the project's life, and it never covered the failure it was meant to (a block that is
+# *uncompilable in the applied set* is caught by the set build, which is the thing consumers compile; a file a
+# re-base silently dropped is caught by the file-set reconciliation, `TODO` #358, not by a build at all).
+#
+# Keep this script for the one job it is good at: localising WHICH block introduced a breakage.
+#   - `--changed-from <previous release tip>` builds only the blocks whose delta moved, plus the tip (minutes).
+#   - a full walk is for a bisect that needs it; it is never a release or per-push step.
+#
+# The historical header follows, because the method (a FRESH build dir per commit) is still the right one when
+# the tool is used:
 #
 # WHY THIS EXISTS:
 #   The default delivery (16 official blocks + the temporary 0300) is bisected and reviewed block by block, so every block

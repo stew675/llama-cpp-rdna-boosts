@@ -9,7 +9,10 @@
 #
 # WHAT IT CHECKS (each step must pass; nothing is skipped silently -- a step that cannot run FAILS):
 #   1. state      both repos clean, the fork tip/tree, `master` pinned at the fork point, the builds present
-#   2. build      a clean build per block commit            -> scripts/gate-per-block-build.sh --fast
+#   2. build      the WHOLE applied set builds, once        -> scripts/gate-per-block-build.sh (one rung)
+#                 (r332: per-block independent buildability is NOT a requirement -- a block is a layer on the
+#                  blocks before it, and the deliverable is the applied set; the per-block ladder is now a
+#                  bisection tool, see WORKLOG 261121.011)
 #   3. numerics   the prefill-logit KLD gate                -> scripts/gate-prefill-logits.sh
 #   4. ops        tests/test-backend-ops: MUL_MAT_ID (incl. the duplicate-id oracle), MUL_MAT
 #   5. text       same-seed greedy text on the coherence arms, against recorded hashes
@@ -47,8 +50,8 @@
 #   ARMS          "name|model|extra llama-bench args" lines (defaults below)
 #   TEXT_PREFILL_ARMS  "name|model|llama-cli args" lines for step 5b (default below; the prompt is always
 #                 prompts/prose-rdna-boosts.txt, `-n 0`, i.e. prompt-eval only)
-#   WARMUP        discarded warm-up passes over the perf arms before timing (default 1).  The per-block
-#                 build ladder leaves the GPU hot; without this the first timed round reads 1-2 points low.
+#   WARMUP        discarded warm-up passes over the perf arms before timing (default 1).  The build
+#                 leaves the GPU hot; without this the first timed round reads 1-2 points low.
 #   TEXT_TOLERANCE  allowed regression of a real-text prefill arm, percent (default 3.0 -- a single
 #                 llama-cli run is noisier than `llama-bench -r 5`, and the arm exists to catch a
 #                 transport/arena regression, which is tens of percent, not one)
@@ -174,32 +177,18 @@ step_state() {
 }
 
 # ---------------------------------------------------------------------------------------------------------------
-# 2. per-block build
+# 2. the whole-set build
 # ---------------------------------------------------------------------------------------------------------------
 step_build() {
-    echo "== 2. build (clean, per block commit) ==================================="
-    local log="$LOGDIR/gate-per-block-build.log"
-    # `release.json.tip` is the CANONICAL re-cut commit, and it only exists in the checkout AFTER
-    # `scripts/fork-refresh.sh` has re-cut (release time).  A fold leaves the checkout on the WORKING chain,
-    # whose tip has the same tree and different ids, and that chain is the only one to walk: the plain call
-    # failed with "ERROR: tip <canonical> not in <fork>" and the whole verdict read NOT RELEASABLE although
-    # every block built (r239).  So walk the checkout's own tip when the recorded one is absent and its tree
-    # is the recorded tree; anything else stays a FAIL (a genuinely wrong set must not be talked past).
-    local tip_args=()
-    if command -v jq >/dev/null 2>&1 && [ -d "$FORK/.git" ] &&
-            ! git -C "$FORK" rev-parse --verify -q "$(jq -r '.tip // empty' "$REPO/release.json")^{commit}" >/dev/null 2>&1; then
-        local rec_tree head_tree
-        rec_tree="$(jq -r '.tree // empty' "$REPO/release.json")"
-        head_tree="$(git -C "$FORK" rev-parse -q 'HEAD^{tree}' 2>/dev/null)"
-        if [ -n "$rec_tree" ] && [ "$rec_tree" = "$head_tree" ]; then
-            tip_args=(--tip HEAD)
-            echo "    (release.json .tip is not in $FORK; walking HEAD, whose tree is the recorded one)"
-        fi
-    fi
-    if bash "$REPO/scripts/gate-per-block-build.sh" --fast "${tip_args[@]}" > "$log" 2>&1; then
-        record PASS per-block-build "clean build per block commit (--fast)"
+    echo "== 2. build (the whole applied set, one build) =========================="
+    local log="$LOGDIR/whole-set-build.log"
+    # r332: the delivered artifact is the applied SET, so the gate is that the set builds once.  A block is a
+    # layer on the blocks before it and is not expected to build alone; the per-block ladder this replaced cost
+    # 35-55 min per re-base (and weeks of wall time over the project) for a guarantee the artifact does not need.
+    if bash "$REPO/scripts/gate-per-block-build.sh" --repo "$FORK" --base 'HEAD^' --tip HEAD --fast > "$log" 2>&1; then
+        record PASS whole-set-build "the applied tip builds (release profile)"
     else
-        record FAIL per-block-build "see $log"
+        record FAIL whole-set-build "see $log"
     fi
 }
 
@@ -358,7 +347,7 @@ bench_tps() { # bench_tps <binary> <model> <arm args...> -> t/s on stdout
 step_perf() {
     echo "== 6. perf: new build vs the SHIPPED build (interleaved, -r $REPS, $ROUNDS rounds) =="
     local name model args n b r ok=1
-    # A DISCARDED warm-up round first.  Step 2 (the per-block build ladder) leaves the GPU hot and busy for
+    # A DISCARDED warm-up round first.  Step 2 (the whole-set build) leaves the GPU hot and busy for
     # minutes, and the dense-27B arm sits 1 % under the shipped build, so the first timed round then reads
     # 1-2 points low: measured at R17 (2026-11-08) as -3.44 % on round 1 against -1.68 / -1.59 after
     # (spread 1.85, verdict -2.24 %) while the same A/B on a quiet box reads -1.31 / -1.19 / -1.32
@@ -434,7 +423,7 @@ if [ "$PERF_ONLY" = 1 ]; then
     step_perf
 else
     wanted state  && step_state
-    if [ "$QUICK" = 1 ]; then record WARN per-block-build "skipped (--quick)"; else wanted build  && step_build;  fi
+    if [ "$QUICK" = 1 ]; then record WARN whole-set-build "skipped (--quick)"; else wanted build  && step_build;  fi
     if [ "$QUICK" = 1 ]; then record WARN prefill-logits "skipped (--quick)";  else wanted logits && step_logits; fi
     wanted ops    && step_ops
     wanted text   && step_text

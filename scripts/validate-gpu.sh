@@ -4,8 +4,8 @@
 # WHY THIS EXISTS
 #   The repo's gating has three tiers, and only two could run anywhere:
 #     * tier 1  `.github/workflows/validate.yml`  -- apply + tree/marker checks, ~20 s, no GPU;
-#     * tier 2  THIS SCRIPT on the off-host CI worker (radiance, gfx1151) -- apply, the
-#               per-block `--fast` ladder, the op-test oracles and the prefill-logit KLD gate;
+#     * tier 2  THIS SCRIPT on the off-host CI worker (radiance, gfx1151) -- apply, a WHOLE-SET build of
+#               the applied tree, the op-test oracles and the prefill-logit KLD gate;
 #     * tier 3  the release flow -- the `all` build, coherence, MTP Protocol A, arch sweeps.
 #   Tier 2 is the one that actually catches a bad patch set, because almost every delivery
 #   block is a CUDA/HIP kernel change and a hosted runner has no ROCm.  It is the automation
@@ -16,7 +16,8 @@
 # WHAT IT DOES (each step is skippable; see the env list)
 #   1. materialises the set: delivery repo checked out at REV, `apply-all.sh` in LLAMA_REPO,
 #      applied tree == that rev's `release.json.tree` (strict `git am`);
-#   2. `gate-per-block-build.sh --fast` over every block commit (the ladder);
+#   2. builds the WHOLE applied tree once (the delivery's contract since r332: the set applies and builds as
+#      a set -- per-block independent buildability is not a gate; see scripts/gate-per-block-build.sh);
 #   3. builds the tip's test-binary and runs the op oracles (`FLASH_ATTN_EXT`,
 #      `GATED_DELTA_NET`, `FLASH_ATTN_QSA`, `MUL_MAT`, `MUL_MAT_ID`, `TOP_K_MASK`, `HC_MIX`,
 #      `HC_COMBINE`, `HC_COMBINE_MIX`);
@@ -54,18 +55,19 @@
 #      GDN_WIDTH_MODELS              space-separated GDN/hybrid GGUFs for the conv-fold width gate
 #                                    (a missing path is skipped); GDN_WIDTH_P ("3584 4096"),
 #                                    GDN_WIDTH_RUNS (3), GDN_WIDTH_TEXT, GDN_WIDTH_ALWAYS=1
-#      SKIP_LADDER=1 / SKIP_OPTESTS=1 / SKIP_KLD=1 / SKIP_HC=1 / SKIP_GDN_WIDTH=1   narrow the run
+#      SKIP_BUILD=1 (alias SKIP_LADDER=1) / SKIP_OPTESTS=1 / SKIP_KLD=1 / SKIP_HC=1 / SKIP_GDN_WIDTH=1
+#                                        narrow the run
 #      MAX_ATTEMPTS (3, per rev)         KEEP_RUNS (5)
 #      KLD_ALWAYS=1                      run the prefill-logit gate even when the applied tree
 #                                        did not touch a prefill path (see below)
 #
 # COST (measured on radiance, gfx1151 APU, 16 threads, 2026-10-25)
-#   cold ccache, whole chain        87m37   <- ONE-TIME; the FA instantiation sets dominate: the
-#                                            ladder was 4882 s and blocks 05-12 each compile their
-#                                            own set cold (520-610 s per block; 00-04 are 10-114 s)
-#   warm ladder, whole chain        89 s
+#   cold ccache, whole set          6-10m   <- ONE-TIME; the FA instantiation sets dominate and they are
+#                                            per-TU, not per-block, so this is the same cost as the
+#                                            whole-set build a consumer pays (r332 retired the per-block
+#                                            ladder: it cost 4882 s cold / 89 s warm on top of this)
 #   unchanged delivery content      0.3 s   skipped on base:tree:n_blocks, not on the commit
-#   warm full run (patch set same)  5m36    ladder 6 s (only the tip) + ~5 min op oracles
+#   warm full run (patch set same)  5m36    whole-set build (near 0 s) + ~5 min op oracles
 #   prefill-logit, when relevant    ~6 min  a 9B Q8_0 base at ctx 512 x 40 chunks
 #   => a release-shaped push costs ~6 min, ~12 min if it moves a prefill kernel, and a docs or
 #      benchmarks push costs 0.3 s.  The cold figure is bring-up only: do not plan around it.
@@ -156,7 +158,7 @@ while [ $# -gt 0 ]; do
 done
 
 for t in git jq rsync; do command -v "$t" >/dev/null || die "$t is required"; done
-command -v ccache >/dev/null && : || log "WARN: ccache not found -- the ladder will be slow and cold"
+command -v ccache >/dev/null && : || log "WARN: ccache not found -- the whole-set build will be slow and cold"
 
 # ROCm: pick the installed 10.1 tree and its target, so this works on any gfx box.
 if [ -z "${ROCM_DIR:-}" ]; then
@@ -247,7 +249,7 @@ if git -C "$LLAMA_REPO" rev-parse --git-dir >/dev/null 2>&1; then
     prev_base="$(cat "$STATE_DIR/last-applied-base" 2>/dev/null || true)"
 fi
 if [ -n "$prev_tip" ] && [ "$prev_base" != "$base" ]; then
-    log "note: base changed ($prev_base -> $base): full ladder, full prefill gate"
+    log "note: base changed ($prev_base -> $base): full prefill gate"
     prev_tip=""
 fi
 
@@ -268,22 +270,25 @@ applied="$(git -C "$LLAMA_REPO" rev-parse HEAD^{tree})"
 tip="$(git -C "$LLAMA_REPO" rev-parse HEAD)"
 say "apply    : strict, tree $applied == release.json.tree"
 
-# --- 2. per-block build ladder ----------------------------------------------------------------
-if [ "$SKIP_LADDER" = 1 ]; then
-    say "ladder   : skipped (SKIP_LADDER=1)"
+# --- 2. the whole-set build -------------------------------------------------------------------
+# r332: the per-block ladder is NOT a gate any more -- the deliverable is the applied SET, and a block is a
+# layer on the blocks before it (the maintainer's decision, WORKLOG 261121.011).  What is still required is the
+# one thing a consumer does: the whole applied tree builds.  One rung over the applied tip, into the build dir
+# the op-test step below reuses.
+if [ "${SKIP_BUILD:-$SKIP_LADDER}" = 1 ]; then
+    say "build    : skipped (SKIP_BUILD=1)"
 else
-    ladder_args=(--repo "$LLAMA_REPO" --base "$base" --tip "$tip" --rocm "$ROCM_DIR"
-                 --gpu-target "$GPU_TARGETS" --jobs "$JOBS" --fast --keep-going)
-    [ -n "$prev_tip" ] && ladder_args+=(--changed-from "$prev_tip")
-    if bash "$REPO/scripts/gate-per-block-build.sh" "${ladder_args[@]}" >"$RUN/ladder.log" 2>&1; then
-        say "ladder   : $(grep -E '^==> result:' "$RUN/ladder.log" | tail -1 | sed 's/^==> result: //')"
+    build_args=(--repo "$LLAMA_REPO" --base "$tip^" --tip "$tip" --rocm "$ROCM_DIR"
+                --gpu-target "$GPU_TARGETS" --jobs "$JOBS" --fast)
+    if bash "$REPO/scripts/gate-per-block-build.sh" "${build_args[@]}" >"$RUN/build.log" 2>&1; then
+        say "build    : $(grep -E '^==> result:' "$RUN/build.log" | tail -1 | sed 's/^==> result: //')"
     else
-        cp "$RUN/ladder.log" "$STATE_DIR/last-ladder-fail.log"
-        fail "per-block ladder (log: $RUN/ladder.log)"
+        cp "$RUN/build.log" "$STATE_DIR/last-build-fail.log"
+        fail "whole-set build (log: $RUN/build.log)"
     fi
 fi
 
-BUILD="$LLAMA_REPO/build-per-block"   # the gate's build dir, holding the TIP tree after the ladder
+BUILD="$LLAMA_REPO/build-per-block"   # the build dir holding the applied TIP tree
 # --- 3. op oracles ----------------------------------------------------------------------------
 if [ "$SKIP_OPTESTS" = 1 ]; then
     say "op tests : skipped (SKIP_OPTESTS=1)"

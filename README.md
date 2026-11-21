@@ -146,7 +146,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── scripts/               # apply / regenerate / validate / publish tooling; index: scripts/README.md
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift; --include-beta)
 │   ├── gate-prefill-logits.sh  # prefill-logit KLD release gate (issue #113)
-│   ├── gate-per-block-build.sh # a clean `all` build per block commit
+│   ├── gate-per-block-build.sh # bisect only (r332): which block broke a build
 │   └── make-patches.sh    # regenerates the set from the fork (~/llama.cpp)
 ├── benchmarks/            # benchy methodology + v1/v2 results + graphs (dated records)
 ├── prompts/               # versioned, hash-stable test prompts (sha256-recorded; never edited in place)

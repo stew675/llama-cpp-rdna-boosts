@@ -1,3 +1,69 @@
+## 261121.011 (r332) -- **the per-block independent-build requirement is RETIRED**; the whole applied set is the artifact (maintainer's decision)
+
+**No delivery patch, `release.json` or block structure changed** (no `patches/` file moved, no tag): this is a
+policy + tooling change only, like `261121.009`.  `v17-919794500-r331` remains the release.
+
+### The decision
+
+A block is a **layer** on the blocks before it.  It still **owns** its functionality, but there is **no
+expectation that it applies, compiles or works alone** — the deliverable is the applied **set**, and the build
+gate is **one build of the whole set** at the tip.  The r2 rule "every block commit builds the `all` target on
+its own" is retired permanently.
+
+### Why (the maintainer's call, and it is about wall time)
+
+The ladder cost **35-55 min per re-base** and, over the project's life, weeks of recompiling — and it never
+covered the failure class it was credited with:
+
+* a block that is uncompilable **in the applied set** is caught by the set build, which is the *only* build a
+  consumer ever does;
+* the failure it was actually invoked against (r305-r307: blocks 09-11 uncompilable in an intermediate tree
+  while the tip compiled) is a bisect concern, not a shipping concern — it now runs the walker on demand;
+* the failure that motivated r331 (`ggml-alloc.c` silently dropped from block 00 by the re-base) is invisible to
+  **every** build, warm or cold, `all` or `fast` — see `TODO` #358.  r331 itself cost 31 min of rung compiles to
+  learn nothing a single set build would not have said.
+
+Measured on the r331 release (this session, 16-core box): one cold rung **60 s** warm-cache, the block-15 rung
+~9 min (its own content delta), the full 18-rung walk **1862 s**, against **~2.4 s** for the release-profile build
+of the applied tree when only `ggml-alloc.c` moved and **6-10 min** for a genuinely cold `all` build.  The ladder
+is 3-5x the cost of the thing it was supposed to approximate, and the thing it approximates is the actual gate.
+
+Also recorded, because it produced a false "3 hour recompile" reading earlier the same day: a `timeout`-killed
+ladder left its `cmake --build`/`clang` children running, and a second ladder into the same build dir fought
+them (8-11 min rungs on a box whose honest rung is 60 s).  `scripts/gate-per-block-build.sh` now runs each child
+in its own session and kills the tree on INT/TERM/HUP (r331), so that cannot recur.
+
+### What changed
+
+* `AGENTS.md` -- *Build the fork*: the release flow is **one `all` build of the applied set**; the "no per-block
+  build requirement" policy replaces the ladder text.  Gate-picker rows: "anything (before a tag)" and the
+  allocator row now name the set build; the `scripts/` layout row marks the walker as a bisection tool.
+* `MANIFESTS.md` -- release gate 5 is rewritten as **"the whole set builds"** (one `all` build at the tip),
+  tier 2's per-push worker builds the applied tree once, and the r331 re-base paragraph now points at the
+  file-set reconciliation instead of a rung walk.
+* `scripts/validate-gpu.sh` -- step 2 is a **whole-set build** (one rung over the applied tip, into
+  `build-per-block`, which steps 3+ reuse).  `SKIP_BUILD=1` (`SKIP_LADDER` kept as an alias) skips it; the cost
+  note is re-measured.
+* `scripts/gate-rebase-release.sh` -- step 2 is the same whole-set build (`--base HEAD^ --tip HEAD`), recorded
+  as `whole-set-build`; `--quick` still skips it.
+* `scripts/gate-per-block-build.sh` -- header rewritten: **a bisection tool, not a gate**; kept because
+  `--changed-from <previous release tip>` is the right way to localise which block broke a build.
+* `scripts/README.md`, `README.md` (tree), `TODO` #358 (the reconciliation's home is now `validate-set.sh`, since
+  the walker is out of the flows), `INVARIANTS.md` r332 (the fact + the accepted cost of the decision).
+
+### Verified
+
+The replacement path was exercised, not just written: `gate-per-block-build.sh --repo ~/llama.cpp --base 'HEAD^'
+--tip HEAD --fast` (the exact call `gate-rebase-release.sh` now makes) builds the applied set in **60 s**, and the
+r331 release's own whole-set `all` build was the release build.  `bash -n` clean on every edited script.
+
+### The one thing this gives up
+
+An intermediate tree that does not compile while the tip does is no longer detected by construction.  That is
+the accepted trade: the artifact is the set, the bisect that needs it can run the walker (`--changed-from`, or a
+targeted `--tip <block>`), and the class is now explicitly recorded here rather than implied by a gate nobody
+could afford to run.
+
 ## 261121.010 (r331) -- **RELEASE: the r328 re-base had silently dropped block 00's `ggml-alloc.c` half; blocks 00 and 10 are amended to restore it** (issue #345), plus a signal-safety fix that stops a killed ladder from orphaning its build
 
 **Delivery change: two blocks amended, no block added, split or renumbered, no fork point moved.**  Release

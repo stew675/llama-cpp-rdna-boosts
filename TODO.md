@@ -314,9 +314,11 @@ against the previous release.
 Owed: a mechanical check in the re-base flow — for each rung, compare `git diff-tree --name-only` against the
 file set of the patch it replaces (same subject, previous release's chain) and fail on a file the old patch
 touched and the new one does not, with an explicit allow-list for a retirement that a decision row names (D1's
-`mmf.cu`/`mmf.cuh`).  The natural home is `scripts/gate-per-block-build.sh` (it already walks `base..tip` and
-knows each commit's subject) or a `scripts/check-rebase-files.sh` it calls once per rung.  Record: `WORKLOG.md`
-261121.010, `INVARIANTS.md` r331.
+`mmf.cu`/`mmf.cuh`).  The natural home is **`scripts/validate-set.sh`** — it already applies the series in CI on every push and knows
+the previous release's `release.json`, so it can compare each block's changed-file set against the patch with the
+same subject in the previous release and fail on a shrink that no decision names (no GPU, no build, ~1 s).  The
+per-block build walker is a bisection tool since r332, so it is the wrong place for a repo-level check.  Record:
+`WORKLOG.md` 261121.010, `INVARIANTS.md` r331.
 
 ## 359. `gate-fusion-alias-copy.sh`'s fused-vs-chain text oracle does not survive the r328 base
 

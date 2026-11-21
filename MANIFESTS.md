@@ -93,7 +93,7 @@ cheap:
 | tier | where | what | trigger |
 |---|---|---|---|
 | 1 | `.github/workflows/validate.yml` (hosted, no GPU) | `validate-set.sh`: strict apply on a fresh tarball, tree/count, per-artifact sha256, the Windows path + portability lints, and a conflict-marker/subject scan of every block tree | every push and PR, ~20 s |
-| 2 | `radiance` (`scripts/validate-gpu.sh`, cron every 30 min) | re-applies the set at `origin/main` from scratch, `gate-per-block-build.sh --fast`, the seven op oracles, then `gate-prefill-logits.sh` (records a base on a fresh box, compares after) | every new `origin/main` commit, unattended |
+| 2 | `radiance` (`scripts/validate-gpu.sh`, cron every 30 min) | re-applies the set at `origin/main` from scratch, builds the **whole applied tree once**, the seven op oracles, then `gate-prefill-logits.sh` (records a base on a fresh box, compares after) | every new `origin/main` commit, unattended |
 | 3 | a GPU box, by hand | the release flow: `all` build, coherence, MTP Protocol A, arch sweeps, the generated-docs drift check (`scripts/check-gen-docs.sh`, r329) | before a tag |
 
 Tier 2 exists because almost every block is a CUDA/HIP kernel change and a hosted runner has no ROCm, so
@@ -108,9 +108,9 @@ to remove.  The release container images are built **off-host by the worker** an
 per-block gate table below is owed **in full**, not only for the blocks whose text was edited.  The r328 re-base
 ran the ladder, the coherence arms, the prefill point and the block gates it remembered and **missed block 00's
 `gate-glu-inplace.sh`**, which is how that block's `ggml-alloc.c` half stayed dropped for two releases while its
-docs still described it (r331, issue #345, `WORKLOG.md` 261121.010).  The mechanical warning is a rung that lands
-**fewer files than the patch it replaces carried**: the ladder only proves that each rung *compiles*, and a
-missing file's hunks inside other files compile fine -- only the block's own gate runs the rule.
+docs still described it (r331, issue #345, `WORKLOG.md` 261121.010).  The mechanical warning is a re-expressed block that lands
+**fewer files than the patch it replaces carried**: a build only proves that the tree *compiles*, and a missing
+file's hunks inside other files compile fine -- only the block's own gate runs the rule.
 
 `scripts/validate-set.sh` covers patch integrity only (checksums + a fresh-tarball strict apply) and runs
 in CI.  The model-level gates are manual:
@@ -213,27 +213,17 @@ in CI.  The model-level gates are manual:
    part of the point — it is folded into the base file name, recorded in the base meta and **refused on
    mismatch** — because on that shape `ROCBLAS_USE_HIPBLASLT` alone moves the greedy text
    (`benchmarks/2026-11-18-host-expert-prefill-oracle.md`).
-5. **Per-block build** — `scripts/gate-per-block-build.sh` on a clean build per commit (bisection and
-   review walk the blocks individually, so every block must build on its own).  **The profile: `--fast` is the
-   default and the release flow (r327)** — shipped binaries + `test-backend-ops`, measured 2.5-12 min for 18
-   rungs, of which ~9 min is the fresh per-rung configure (~30 s each, the ladder's floor); `--all` is the r2
-   standard and belongs to a **re-base**, or to a commit that edits a **`tests/` TU or the build graph**
-   (CMakeLists / *.cmake).  A shared header is NOT an `all` case: `--fast` recompiles the shipped binaries and
-   `test-backend-ops` in every rung anyway, and ONE `all` build at the tip (which the release flow's own
-   `~/bin/build-llama-rocm` does) carries the "the other test/example/tool binaries still compile" claim.  The
-   old rule named a shared header as an `all` case, so the r327 integration of PR #337 (a `common.cuh`
-   amendment in block 10) spent ~70 min on a ladder whose extra hour bought only that one claim — the cost the
-   r327 tooling change exists to stop.  Use `--changed-from` to
-   rebuild only the blocks a release changed -- but understand what that buys: it is a **delta** gate, so a block
-   whose own patch-id did not move is not rebuilt even when its TREE moved (an amendment to an earlier block), and
-   a symbol one block introduces for a LATER block's feature makes every tree between them uncompilable while the
-   tip still builds.  That is exactly how blocks 09-11 stayed broken from r305 to r307 (`INVARIANTS.md` r307 fact
-   5), so **run the whole ladder after amending an early block** (measured r307: `--fast`, 18/18, ~12 min once the
-   cache is warm; measured r326: `--fast --jobs 28`, 18/18 in ~11 min, against **~55 min for the same ladder in
-   the `all` profile** -- the cost is the `tests/test-backend-ops.cpp` TU, ~5 min, several distinct contents).  The
-   gate prints a `configured (Ns)` line and ticks while it CONFIGURES as well as while it compiles: a per-rung
-   configure is ~20-25 s of silent cmake, and a heartbeat that only covered compiling made a working ladder look
-   hung.  **`test-backend-ops -o <op>` is a CLAIM CHECK, not a delivery gate, for an opt-in change** (r327): the
+5. **The whole set builds** — ONE build of the applied tip in the `all` profile (`~/bin/build-llama-rocm`:
+   shipped binaries + every test/example/tool TU; measured 6-10 min cold, ~10 s warm).  **There is no per-block
+   build requirement (r332):** a block is a layer on the blocks before it, the delivered artifact is the applied
+   set, and the r2 rule "every block commit builds the `all` target on its own" was retired by the maintainer's
+   decision of 2026-11-21 (`WORKLOG.md` 261121.011) after it cost 35-55 min per re-base and weeks of wall time
+   for a guarantee the artifact does not need — a block that is uncompilable *in the set* fails this build, which
+   is the one a consumer compiles.  `scripts/gate-per-block-build.sh` survives as a **bisection tool** for
+   localising which block broke a build (`--changed-from <previous release tip>` builds only the moved blocks
+   plus the tip); nothing in a release or a per-push flow calls it.  The class it was credited with catching — a
+   file a re-base silently dropped while every surviving file compiled — is caught by the file-set reconciliation
+   (`TODO` #358), never by a build.  **`test-backend-ops -o <op>` is a CLAIM CHECK, not a delivery gate, for an opt-in change** (r327): the
    full `FLASH_ATTN_EXT` arm is 7 381 cases and ~25 min, which is right when the change's own claim is "the op
    family still passes" (a contributor PR's evidence, or a default-on kernel change), and waste when the change
    is an opt-in scheduler path whose default path is unchanged -- there, the arms that matter are the census
@@ -595,7 +585,7 @@ in CI.  The model-level gates are manual:
    Windows (and it needs a cmake re-run: `ggml/src/ggml-cuda/CMakeLists.txt` globs `*.cu` without
    `CONFIGURE_DEPENDS`).  Then the ordinary tip gates as evidence rather than as a search: coherence on 1 GPU
    and a 3-GPU `-sm tensor` arm (byte-identical to the previous release), `gate-prefill-logits.sh`,
-   `gate-per-block-build.sh --changed-from <prev tip>` (the blocks the fold touched), `check-gpu-faults.sh`,
+   the whole-set build after the fold, `check-gpu-faults.sh`,
    and `validate-set.sh`, whose portability lint scans the added file (tier 1).  **The Windows arms are the
    reporter's numbers and say so in the block notes** — this gate cannot validate them, and a release that
    claims otherwise is wrong.  r209: 4 TUs token-identical, coherence `897 a77fa8c1107a` / `964 eab86065e67e`
