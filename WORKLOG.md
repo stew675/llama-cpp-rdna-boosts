@@ -59,6 +59,36 @@ tree has the new layout.
 
 ---
 
+## 261120.007 (r327) -- r330 re-base rungs R00-R05 climbed; the Inkling-2-Mini file on this box needs upstream loader support (no delivery change)
+
+**No delivery patch changed, no block created, split or renumbered, no release.**  Progress record for the
+r328 re-base campaign ([`wip/upstream-rebase-261120/`](wip/upstream-rebase-261120/RUNGS.md)) and one finding
+about a model file.
+
+### Rungs
+
+`rebase-r328` = `c3860af1e`: **R00** (block 00) + one rung repair, **R01** (01), **R02** (02), **R03** (03),
+**R04** (04), **R05** (05) + one rung repair.  Every rung is green on build + coherence (`1c5d32ac537d`
+throughout) and non-vacuous on its own switch; per-rung evidence is in `RUNGS.md`.  Two decisions were taken by
+the maintainer: **D15** (the VMM-pool top-k workaround lives in block 00, as a rung repair) and **D16** (the
+delivery's FA band iteration model wins over upstream `#32407`'s K/V read-order rotation, which is therefore not
+carried -- verified absent, FA op matrix 7428/7428).
+
+### Finding: `Inkling-2-Mini` cannot load at the new base
+
+`/llm/models/Inkling-2-Mini/Q8_K_XL/Inkling-2-Mini-UD-Q8_K_XL.gguf` (placed by the maintainer to validate
+upstream's per-head FA mask) declares `block_count = 48` but ships **24 physical blocks** plus
+`loop.core_start = 6`, `loop.core_end = 18`, `num_loops = 3` and 12 `loop_*` tensors per loop group: it is a
+*looped* architecture (6 pre + 12 core x 3 + 6 post).  `src/models/inkling2.cpp` at `919794500` implements
+none of that and asks for `blk.24.*`, so the load dies with `check_tensor_dims: tensor 'blk.24.attn_q.weight'
+not found`.  **The pristine base fails identically and r327 does not know the architecture**, so no delivery
+change is involved; upstream has the mechanism in `nanbeige.cpp` (`n_loops` / `n_layer_phys`) and has not
+applied it to inkling2.  Tracked as `TODO` #353, which also records what it blocks: the only local coverage of
+`#32217`'s per-head mask (the op matrix sweeps `mask_heads = 1` only) and of the `nb32` widening that term
+needs.
+
+---
+
 ## 261120.005 (r327) -- re-base campaign opened: 18 blocks `4f9dfa0e3` -> `919794500`, measured conflict map, 14 decision points, and the r278 base blocker is still live (no delivery change)
 
 **No delivery patch changed, no block created, split or renumbered, no release.**  This entry records the

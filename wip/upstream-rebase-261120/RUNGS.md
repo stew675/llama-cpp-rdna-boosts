@@ -514,8 +514,14 @@ its parameter list are byte-identical between block 05's commit and the merged t
    (`fattn-common.cuh`, `fattn-mma-f16.cuh`, `fattn-tile.cuh`, `fattn-vec.cuh`); `nb31` stays `int32_t`, as
    upstream leaves it.  Repair `c3860af1e`; FA matrix re-verified 7428/7428.
    **Honest gap:** the op matrix exercises **zero** cases with `mask_heads > 1`, so the per-head path this
-   serves has no automated coverage here, and there is no Inkling 2 model on this box — the type is correct by
-   construction and matches upstream, but it is not locally validated.
+   serves has no automated coverage here.  The maintainer then placed `Inkling-2-Mini` on the box to close it
+   (`/llm/models/Inkling-2-Mini/Q8_K_XL/…`, `arch = inkling2`, `block_count = 48` with **24 physical blocks**
+   plus `loop.core_start/end` and `num_loops = 3`) — and **that model cannot load at any base in this ladder**:
+   `src/models/inkling2.cpp` implements no loop, so it asks for `blk.24.*`.  The pristine `919794500` base fails
+   identically and r327 does not know the arch, so no delivery change is involved.  Recorded as **`TODO` #353**
+   with the diagnosis, what it blocks (this per-head path and the `nb32` widening) and its two re-entry
+   conditions.  So the widening is correct by construction and matches upstream, and is still **not locally
+   validated** — which is a property of the model support, not of this rung.
 2. **`#31617`'s typed masks reach block 05's own code.**  HIP now static_asserts a 64-bit warp mask, so the
    seven raw `__shfl[_xor]_sync(0xFFFFFFFF, ...)` calls in the band/fetch-ahead code had to become
    `ggml_cuda_shfl_xor` / `ggml_cuda_shfl` — the same class of repair as R01, but inside block 05's new code
