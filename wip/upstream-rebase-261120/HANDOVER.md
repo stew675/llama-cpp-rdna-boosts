@@ -1,6 +1,6 @@
-# HANDOVER — r328 re-base ladder, 10 of 18 rungs climbed, resume at **R10**
+# HANDOVER — r328 re-base ladder, 11 of 18 rungs climbed, resume at **R11**
 
-Written 2026-11-21 (session 2, which climbed R06, R07, R08 and R09).  Read [`README.md`](README.md) §1 (method + traps),
+Written 2026-11-21 (session 2/3, which climbed R06, R07, R08, R09 and R10).  Read [`README.md`](README.md) §1 (method + traps),
 [`RUNGS.md`](RUNGS.md) (the per-rung ledger and every resolution so far) and [`DECISIONS.md`](DECISIONS.md)
 (the decision log) — this file is the delta: what is done, what is owed, and how to not repeat the mistakes of
 the earlier sessions.
@@ -9,9 +9,9 @@ the earlier sessions.
 
 | item | value |
 |---|---|
-| working branch | **`rebase-r328`** in `~/llama.cpp`, clean, **HEAD = `24cecfb51`** (tree `b05ee8543`) |
-| rungs done | **R00 … R09** + **two rung repairs** (R00's top-k gather, R05's `nb32` widening) |
-| next rung | **R10** — block 10 (`7bbf540d5`), 87 files, **9 conflicted paths** (the FA family plus `fwht.cu`/`mmvq.cu`/`rope.cu`/`topk-moe.cu`).  It is the block that **owns three open obligations**: the **R06.2** MMB pool fix (`ctx.pool_stack_*`), the **R08.2/D4** placement of the narrow-row norm matcher ahead of upstream's generic norm branches, and — most importantly — the **R09.3** offload-decision rework (`ggml_cuda_device_offload_op`/`GGML_MOE_HOST_OFFLOAD`) that the arena-off text divergence is waiting on.  `D8`/`D12` are `MERGE` |
+| working branch | **`rebase-r328`** in `~/llama.cpp`, clean, **HEAD = `f5a090a31`** (tree `394e0b708`) |
+| rungs done | **R00 … R10** + **two rung repairs** (R00's top-k gather, R05's `nb32` widening) |
+| next rung | **R11** — block 11 (`61168c60b`), 52 files, **5 conflicted paths**, `src/models/qwen4exp.cpp` among them.  `D9` (indexer key rotation) and `D13` (upstream's qwen4exp fixes) are both `MERGE`: take upstream's fixes, keep the delivery's QSA/indexer/lazy-reader additions on top, and re-run `gate-qwen4exp-quant-coherence.sh` |
 | delivery repo | `~/llama-cpp-rdna-boosts` — **`patches/`, `release.json`, `rdna-boosts-all.patch` and the fork are untouched** (that is R18) |
 | target release | next after `v17-4f9dfa0e3-r327`, i.e. **r328**; new fork point **`919794500`** |
 | reference binaries | `~/llama.cpp/build-rocm/bin-r327` (the shipping r327 `bin/`) — **the attribution oracle for any abort** |
@@ -34,9 +34,10 @@ ee377ec45  b5dc56996  block 06: MMB quantized prefill GEMM
 1435e7873  d3b004581  block 07: k-quant boosts (mmvq VDR, Q6_K MMQ, Q1_0, grid pad)
 510769147  2ed6cb541  block 08: fused kernels (fusions + fused MoE + norm-gated + gdn/ple conv)
 24cecfb51  b05ee8543  block 09: host-resident MoE (iface, scheduler, Meta, slab, cache engine)
+f5a090a31  394e0b708  block 10: slab, fusion dispatcher and async input ring
 ```
 
-## §1 What each rung cost, so R10..R17 can be planned
+## §1 What each rung cost, so R11..R17 can be planned
 
 | rung | conflicts | what it actually took |
 |---|---|---|
@@ -184,13 +185,20 @@ few-row MMQ is HIP-compiled-out) needs no preference at all — keep both, upstr
 
 ```bash
 cd ~/llama.cpp && git status && git branch --show-current      # must be rebase-r328, clean
-git log --oneline -1                                            # expect 24cecfb51
-git cherry-pick 7bbf540d5                                       # R10 = block 10 (87 files, 9 conflicts)
-(cmake --build build-rocm -j 24 > /tmp/r10.log 2>&1; echo "BUILD_RC=$?" >> /tmp/r10.log)
+git log --oneline -1                                            # expect f5a090a31
+git cherry-pick 61168c60b                                       # R11 = block 11 (52 files, 5 conflicts)
+(cmake --build build-rocm -j 24 > /tmp/r11.log 2>&1; echo "BUILD_RC=$?" >> /tmp/r11.log)
 # poll for BUILD_RC, then: coherence -> the block's own switch -> the rung's log in RUNGS.md -> commit
 ```
 
-**R10 carries three obligations from earlier rungs** — run them as part of its verification, not later:
+**R10 closed four of the carried obligations and opened one** (see `RUNGS.md` R10): the dispatcher is now ONE TU
+with upstream's `#32454` NORM+MUL arms in it (D4 shipped), R06.2's *dense* half is closed (27B IQ3_S prefills and
+reads r327's `ebf2a5a9b00a`), the `top_k_gather_rows` hunk is de-duplicated by construction, and R09.3 is closed
+(arena == arena-off).  **Still owed:** R06.2's *routed* half (the forced `GGML_CUDA_MMB_ROUTED=1` arm still
+aborts on the pool LIFO assert — now R15's), and a **new decode finding** (R10.3: the arena arm reads 20.4 t/s
+where R09 read 54.4, fusion- and slab-independent, owned by blocks 14/15).
+
+**Historical note — R10's four obligations were:** — run them as part of its verification, not later:
 (1) `RUNGS.md` **R06.2** — after block 10's `pool_stack` lands, the 27B UD-IQ3_S dense arm (default MMB) must
 prefill instead of aborting at `ggml-cuda.cu:808`, *and* the forced routed arm
 (`GGML_CUDA_MMB_TYPES=q8_0 GGML_CUDA_MMB_ROUTED=1` on 35B-A3B) must read `73 chars sha=86b7f9b5aa80`;

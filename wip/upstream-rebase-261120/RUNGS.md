@@ -41,7 +41,7 @@ Conflict evidence per rung: [`CONFLICT-MAP.md`](CONFLICT-MAP.md).
 | R07 | 07 | `f5bdbefda` | 1 (2 regions) | D11 | **DONE 2026-11-21** — `1435e7873`, tree `d3b004581`; both conflicts in `mmvq.cu` are unions (enum `ORIN` + `NAVI21`, `calc_nwarps` both special cases); upstream's RDNA3_5 `ne11` gate adopted (dispatch threshold, not an alternative to our VDR tables, unreachable on gfx1201); coherence `1c5d32ac537d`; MUL_MAT (q6_K/q8_0/q1_0/iq4_xs) 335/0; 27B Q6_K pp2048 1154.5 — the delivery's `MMQ_J_MAX` cap only hurts (64 → 977.5), the grid pad is +1.4 % with identical text |
 | R08 | 08 | `fe283f27c` | 8 (13 regions) | **D4 (resolved: MERGE, no precedence change)**, D3, D11 | **DONE 2026-11-21** — `510769147`, tree `2ed6cb541`; repair list in R08.3 (5 raw warp-mask sites in block 08's own code, the `k_set_rows_q8_0_group` F32-source gate, a `force_tiling`→`has_gate` template-slot artifact, a lost `#if` guard); coherence `1c5d32ac537d` on the default and on all three kill switches; NORM/RMS_NORM/GROUP_NORM/SET_ROWS 368/0; MUL_MAT_ID 1079/0 (16 dup); fusion off costs −5.4 % pp2048 / −18.7 % tg128 with identical text; `DISABLE_NORM_ROWS=1` is **inert** here (its dispatch is block 10's) |
 | R09 | 09 | `123d53419` | 4 (7 regions) | D8, D9 (both MERGE) | **DONE 2026-11-21** — `24cecfb51`, tree `b05ee8543`; all four conflicts resolved as merges (the two extracted functions moved to `mmvq.cu` with upstream's two refinements ported in, `seq_rm` adopted, `split_has_nodes` **not** taken — see R09.3); build green, coherence `1c5d32ac537d`, MUL_MAT_ID 1079/0; **finding: the arena-off arm diverges in text, and the cause is block 09's own host-offload relaxation** (control `GGML_MOE_HOST_OFFLOAD=0` restores identity; r327 agrees) |
-| R10 | 10 | `7bbf540d5` | 9 | D8, D12 + **drop block 10's `top_k` hunk (R00.6 obligation 1)** | not started |
+| R10 | 10 | `7bbf540d5` | 7 (4+3+2+1 regions) | D8, D12 + the four carried obligations | **DONE 2026-11-21** — `f5a090a31`, tree `394e0b708`; the dispatcher reconciled into **one** TU (upstream's two `#32454` NORM+MUL arms ported in = D4's arm), `top_k_gather_rows` de-duplicated by construction; **R06.2 dense half CLOSED** (27B IQ3_S prefills, `ebf2a5a9b00a` = r327) and **R09.3 CLOSED** (arena == arena-off now); a `needs_sync`-vs-dispatch mismatch my own union created was caught by the op test and fixed; **new finding**: the arena arm's decode fell 54.4 -> 20.4 t/s and no switch recovers it (owned by blocks 14/15) |
 | R11 | 11 | `61168c60b` | 5 | D9, D13 | not started |
 | R12 | 12 | `dad1442b3` | 9 | D5, D6, D7 | not started |
 | R13 | 13 | `1014e6bf5` | 0 | — | not started |
@@ -867,6 +867,104 @@ reproduce the same two hashes; `-ub 512` reproduces it as well; pinning the heat
 - The host-expert tier's own numbers at this rung (1268.8 / 54.4) are **not** comparable to r327's (2304.7 / 49.7):
   blocks 10-17 (the fusion dispatcher, the streamed KV, the pool) are still missing, and block 10 alone is most of
   the prefill gap.
+
+---
+
+# R10 — block 10, slab, fusion dispatcher and async input ring  ·  **DONE 2026-11-21** — `f5a090a31`, tree `394e0b708`
+
+```
+git cherry-pick 7bbf540d5        # 87 files, +9.8k/-… (ggml-cuda-try-fuse.cu 168 KB new, slab, async ring)
+```
+
+The rung that owns the most carried obligations, and the first whose resolution is **structural** rather than a
+union: upstream's inline fusion dispatcher and block 10's separate-TU dispatcher are two copies of the same
+subsystem, so the tree keeps exactly one.
+
+| exit criterion | result |
+|---|---|
+| conflicts | 7 files / 11 regions (`fwht.cu`, `ggml-cuda.cu`×4, `mmvq.cu`×3, `rope.cu`×2, `set-rows.cu`, `top-k.cu`×2, `topk-moe.cu`×3) |
+| no markers left | yes; no `TODO(rebase)` |
+| build | green, `all` targets, 0 errors, **0** warnings in the touch-path files |
+| coherence 4B | **`100 chars sha=1c5d32ac537d`** — unchanged (and unchanged after the `needs_sync` repair below) |
+| `test-backend-ops -o MUL_MAT_ID` | **1079 OK / 0 FAIL** — only after the repair in R10.2; the first run *aborted* on the assert that guards it |
+| **R00.6 obligation 1** (drop block 10's `top_k` hunk) | **satisfied by construction**: the two sides' functions are byte-identical, git kept one copy, and only the *comment* conflicted.  Both attributions unioned (the R00.6 pristine-base evidence and block 10's slab/dsv4 evidence); the `CUDA_CHECK(cudaGetLastError())` the R00 repair added is kept |
+| **R06.2 obligation (dense half)** | **CLOSED** — 27B UD-IQ3_S with the default MMB: prefill **1139.4 / 38.0 t/s**, `50 chars sha=ebf2a5a9b00a` (**identical to r327's**).  At R06 this arm aborted at `ggml-cuda.cu:808`; block 10's `ctx.pool_stack_*` is the fix, exactly as the R06.2 finding predicted |
+| **R06.2 obligation (routed half)** | **STILL OPEN** — the forced routed arm (`GGML_CUDA_MMB_TYPES=q8_0 GGML_CUDA_MMB_ROUTED=1`) still aborts on the same pool-LIFO assert (`ggml-cuda.cu:1433`) where r327 reads `73 chars sha=86b7f9b5aa80`.  Now owed at **R15** (the pool/GTT tier) / R18.  Note it is an A/B override, not a shipped default: on RDNA4 the mask excludes Q8_0 and `routed=0` |
+| **R08.2 / D4 obligation** | **CLOSED** — see R10.1 |
+| **R09.3 obligation** | **CLOSED** — the triple now reads **one** text: arena `86b7f9b5aa80`, arena-off `86b7f9b5aa80` (at R09 the arena-off arm read `22584470ac60`).  Block 10's offload-decision rework is the fix, as predicted; the `GGML_MOE_HOST_OFFLOAD=0` control is no longer needed to reconcile them |
+| **one new finding** | R10.3: the arena arm's **decode fell 54.4 -> 20.4 t/s** and no kill switch recovers it |
+
+## R10.1 The dispatcher reconciliation (the rung's real work)
+
+Upstream 919794500 has `ggml_cuda_try_fuse()` + `ggml_cuda_should_fuse_rope_set_rows()` inline in
+`ggml-cuda.cu`; block 10 carries them in `ggml-cuda-try-fuse.cu`.  Keeping both would duplicate every symbol
+(and, per block 10's own commit message, previously produced a fallback copy that was "upstream's dispatcher
+merged with STALE DUPLICATES of delivery arms" — one of which silently diverged on a state-carrying path).
+So: **the TU is the single dispatcher** (which is also what r327 ships), and the merge is *reconciling the TU
+forward* to this base:
+
+1. **Which arms were missing?**  A mechanical comparison of `ggml_cuda_can_fuse(cgraph, i, {...})` call sites
+   between upstream's inline copy and the TU found **exactly two** upstream arms without a counterpart — and
+   they are precisely `#32454`'s `{NORM, MUL}` and `{NORM, MUL, ADD}`.  Everything else in the TU was already
+   current, which is what made this rung tractable.
+2. **`ggml_cuda_should_fuse_rope_set_rows`**: the TU's copy was block 10's, taken before R04 added the
+   `GGML_CUDA_DISABLE_ROPE_SET_ROWS` kill switch and before D3's resolution.  HEAD's version (kill switch +
+   the "every {F32,F16,BF16} pair has an arm" comment) replaced it.
+3. **`ggml_cuda_can_fuse`**: HEAD's version replaced the TU's wholesale — it is upstream@this-base **plus** the
+   delivery's blocks 00-08, so it brings in upstream's NORM+MUL predicate (**D4's arm**), the RMS-norm BF16
+   looseness, the `RMS_NORM+SCALE` assert→`return false` and the softcap contiguity guard, **and** the
+   delivery's `hc_post_gate` arm that block 10's stale copy lacked.  One TU-only line was kept: the
+   `set_rows->type != GGML_TYPE_BF16` guard, because `ggml_cuda_op_rms_norm_mul_rope_fused` still writes F32/F16
+   rows only.
+4. **The two NORM+MUL dispatch arms** were added to the TU **after** `ggml_cuda_norm_rows_try_fuse()` and next to
+   the generic `RMS_NORM` arms — i.e. exactly the position r327 ships, which *is* the D4 resolution: the
+   delivery's narrow-row matcher wins where it matches, upstream's general epilogue is the fall-through.
+5. `ggml-cuda.cu` keeps the delivery's `ggml_cuda_graph_evaluate_and_capture(... ggml_cuda_graph * graph)` — the
+   caller (`ggml_backend_cuda_graph_compute`) resolves the entry once from the keyed cache and passes the
+   pointer, which is the delivery's API; upstream's key parameter would have meant resolving it twice.
+
+## R10.2 A `needs_sync` / dispatch disagreement that my own union created (caught by the op test)
+
+`ggml_cuda_mul_mat_id_needs_sync()` must return true **exactly** when `ggml_cuda_mul_mat_id()` falls through to
+the sort/scatter fallback — the fallback asserts it, and CUDA-graph capture depends on it.  R10's union adopted
+upstream's "MMVF reads src0 in pairs, so an even number of columns" guard in the *dispatch* while keeping the
+delivery's `else if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE && AMD)` in the *predicate*, so an odd-`k` F16 arm was
+answered "no sync" and then fell through: `GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc)) failed`.
+The predicate now carries `src0->ne[0] % 2 == 0` too, with a comment saying why the pair must stay in step.
+**Class of trap:** when a union changes a dispatch condition, grep for the predicate that predicts that
+dispatch — here the two live ~40 lines apart in the same file, and only the op matrix noticed.
+
+## R10.3 FINDING — the arena arm's decode collapsed at this rung (54.4 -> 20.4 t/s), and it is not the fusions
+
+Same arm as R09.3 (35B-A3B Q8_0, 1 GPU, `-ncmoe 20 -c 8192 -ub 1024`, 5298-token prompt, heatmap pinned):
+
+| arm | R09 | R10 |
+|---|---|---|
+| arena default | 1268.8 / **54.4** | 1378-1382 / **20.4** (two runs, reproducible) |
+| `MOE_EXPERT_CACHE_MIB=0` | 1338.0 / 29.0 | 1334.6 / 28.6 |
+| `GGML_CUDA_DISABLE_FUSION=1` | — | 1317.5 / 18.5 |
+| `GGML_CUDA_SLAB=0` | — | 1640.9 / 13.8 |
+| r327 (all 18 blocks) | 2304.7 / 49.7 | — |
+
+So prefill *improved* (block 10's fusions) while decode lost 63 %, and **no kill switch recovers it** — not the
+fusions (18.5), not the slab (13.8).  The text is unchanged throughout (`86b7f9b5aa80`).  The remaining
+difference against R09 is block 10's cache/allocator tier (`ctx.pool_stack_*`, the MMB slot lifetime changing
+from context-lifetime to per-compute via `ggml_cuda_mmb_yield_caches`), which is exactly what blocks **14**
+(slab-transient absorption / streamed KV) and **15** (the pool/GTT store) rework — and r327's 49.7 shows the
+shipping set does not have it.
+
+**Owed:** R15 must re-run this arm; if the decode has not recovered by then, R18 cannot ship the set and the
+bisect starts from `pool_stack`/`mmb_yield_caches`.
+
+## R10.4 Notes for later rungs
+
+- `ggml-cuda-try-fuse.cu` is now the *only* dispatcher and carries upstream@919794500 wholesale.  Any later
+  upstream fusion arm must be added **there**; `ggml-cuda.cu` must not grow a second copy again.
+- `fwht.cuh`, `set-rows.cuh`, `mmvq-moe.cu` and `mmvq-ksplit-body.inc` joined the 64-bit-warp-mask repair list
+  (4th recurrence of the `#31617` class) — block 10's new TUs were written against the old API.
+- The async input ring (`GGML_CUDA_ASYNC_INPUT*`) and the slab (`GGML_CUDA_SLAB*`) are block 10's and stay
+  default-on; R18's gates are `gate-node-budget.sh` (block 10 owns the budget's other half, **D8**) and
+  `gate-fusion-alias-copy.sh` / `gate-lora-fusion.sh` for the dispatcher.
 
 ---
 

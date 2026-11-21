@@ -1,8 +1,8 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
-**Status: OPEN — 10 of 18 rungs climbed (R00-R09) on 2026-11-21. Nothing is delivery yet.**
+**Status: OPEN — 11 of 18 rungs climbed (R00-R10) on 2026-11-21. Nothing is delivery yet.**
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
-the final rung (R18).  Ladder branch `rebase-r328` = `24cecfb51` (tree `b05ee8543`): R00..R09 plus two rung
+the final rung (R18).  Ladder branch `rebase-r328` = `f5a090a31` (tree `394e0b708`): R00..R10 plus two rung
 repairs (R00's top-k gather, R05's `nb32` widening); every rung is green on build + coherence and each has one
 entry in [`RUNGS.md`](RUNGS.md).
 **The one known-red is closed at R00** (repair `3ea8b0212`): the delivery's required VMM pool refuses
@@ -37,9 +37,14 @@ conflicted paths, **D8** and **D9** both resolved as merges without a choice, an
 functions had to be re-ported with upstream's later refinements carried in (`cc < GGML_CUDA_CC_VOLTA`, the
 few-row-MMQ early-out) — but it carries a **finding**: with the arena off, this tree reads different text from the
 arena arm where r327 reads one text on both, and the `GGML_MOE_HOST_OFFLOAD=0` control pins the cause on block
-09's own host-offload relaxation (`RUNGS.md` R09.3, owed at R10/R18).  Next rung: **R10** (block 10 — the fusion
-dispatcher and slab, 9 conflicted paths, and it owns the offload-decision rework, the block-06 MMB pool fix and
-the top-k hunk drop).  Target: the next
+09's own host-offload relaxation (`RUNGS.md` R09.3, owed at R10/R18).  R10 is done, and it was the rung that owns
+the most carried obligations: the tree keeps **one** fusion dispatcher (`ggml-cuda-try-fuse.cu`, reconciled
+forward to this base — upstream's two `#32454` NORM+MUL arms were the only missing ones, and they are D4's arm),
+the `top_k_gather_rows` hunk de-duplicated by construction, **R06.2's dense half closed** (27B UD-IQ3_S now
+prefills and reads r327's exact hash) and **R09.3 closed** (arena and arena-off now read one text).  It also
+produced a new finding: the arena arm's decode dropped 54.4 -> 20.4 t/s and no kill switch recovers it
+(`RUNGS.md` R10.3, owned by blocks 14/15).  Next rung: **R11** (block 11, qwen4exp/QSA and the indexer — D9 and
+D13).  Target: the next
 release after `v17-4f9dfa0e3-r327`, i.e. **r328**, fork point
 **`919794500`**.
 
