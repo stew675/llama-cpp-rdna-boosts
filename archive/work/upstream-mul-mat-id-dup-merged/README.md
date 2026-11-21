@@ -5,7 +5,7 @@ feature in the backend: it removes the `[TAG_MUL_MAT_ID_DUPLICATE_ID]` caveat fr
 `mmid.cu` (+209) around a shared-memory `mm_ids_helper_store` + `check_experts<>`/`dump_store`, and
 restructures `mmf.cuh` (−245).  The delivery's block 00 carried a **port** of this candidate
 (`upstream/UPSTREAM-PR-mul-mat-id-dup.patch`) so the CUDA `MUL_MAT_ID` handled a repeated expert id; at the
-r328 re-base the maintainer's decision (`wip/upstream-rebase-261120/DECISIONS.md` `D1`) was **take upstream's,
+r328 re-base the maintainer's decision (`archive/work/upstream-rebase-261120/DECISIONS.md` `D1`) was **take upstream's,
 drop ours**, so block 00 no longer carries the port and this candidate has no consumer.
 
 The one thing that does **not** come from upstream, and must survive the r328 R00 rung, is the delivery's own

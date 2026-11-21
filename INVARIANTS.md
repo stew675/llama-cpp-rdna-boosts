@@ -1469,7 +1469,7 @@ Rules:
    binaries run on the same arm set *first* — `LLAMA_CLI=…/bin-r327/llama-cli ./scripts/gate-….sh`.  Two
    minutes of that refuted a carried blocker here.
 
-Record: `RUNGS.md` R18.4, `wip/upstream-rebase-261120/COLD-START.md` §8, `WORKLOG.md` 261121.003.
+Record: `RUNGS.md` R18.4, `archive/work/upstream-rebase-261120/COLD-START.md` §8, `WORKLOG.md` 261121.003.
 
 ## r329 — a census assertion cannot fail on a binary that predates it: anchor the binary too
 
@@ -1514,3 +1514,16 @@ Two facts this session established alongside it:
   *faster* with the knob on (2.28 → 2.47 tok/s).
 
 Record: `WORKLOG.md` 261121.007, `archive/work/r328-followups/` (§3 rows and `logs/`).
+
+* **A generated file is a delivery artifact, and its check belongs next to the generator.**  `tools/cli/README.md`,
+  `tools/completion/README.md` and `tools/server/README.md` are written by `llama-gen-docs` from `common/arg.cpp`,
+  so every block that adds an option silently owes a regeneration.  The r328 set shipped them last regenerated at
+  **block 02**: `llama-gen-docs` rewrites all three on the released tree (`34 insertions(+), 14 deletions(-)`), and
+  a consumer reading the delivered CLI docs cannot see `--kv-window`, `--kv-attendance-pool`, `-lme`,
+  `--wmma-verify`, `-ib`, `--spec-draft-mtp-vocab`, the `-ncmoe` LAST-N wording, `--load-mode buffered` or
+  `relaxed-tensor`.  The obligation was written down (the re-base's R18 checklist) and skipped, and **no gate
+  compares the committed docs against the generator** — the same shape as the stale-anchor rule above: a check
+  that cannot fail is not a check.  Fixed by regenerating into block 16 (the last OFFICIAL block touching
+  `common/arg.cpp`) and by `scripts/check-gen-docs.sh`, which runs the generator built from the tree under test and
+  fails on a rewrite.  Rule: when a file is generated, the generator run is part of the block's change, and the
+  drift check runs before a tag.

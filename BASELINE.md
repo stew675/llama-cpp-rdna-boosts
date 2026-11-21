@@ -20,7 +20,7 @@ upstream moves.  It is not a changelog — the current release, tip/tree and per
 from `4f9dfa0e3` onto **`919794500`** — 228 upstream commits, 1944 files, +147 k / −41 k — as a **ladder climb**
 (one rung per block, each resolved, built and coherent before the next), with the three rung repairs squashed
 into their owning blocks (00's top-k gather, 05's `nb32`, 16's sign-compare).  The ladder, the per-rung conflict
-map and the decisions are in `wip/upstream-rebase-261120/` (`RUNGS.md`, `DECISIONS.md`); the narrative and gate
+map and the decisions are in `archive/work/upstream-rebase-261120/` (`RUNGS.md`, `DECISIONS.md`); the narrative and gate
 numbers are `WORKLOG.md` 261121.005.  **Block contents are unchanged by it** — the tree is the same delivery
 re-expressed on a new base — and the earlier r278 note below is kept as the previous record.
 

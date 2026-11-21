@@ -26,7 +26,7 @@ release (`r329`) must not be cut until every row in §3 is closed or explicitly 
 | base / tip / tree | `919794500` / `6d9d54238` / `0c46248f7371a0eee84a980a1e16ad25a6fbd38f` |
 | delivery repo | `~/llama-cpp-rdna-boosts`, `main` at **`ecfce7bd`** or later (pull first) |
 | release record | `WORKLOG.md` 261121.005 (the release) and 261121.006 (the post-release validation) |
-| re-base campaign | `wip/upstream-rebase-261120/` (`RUNGS.md` per rung, `DECISIONS.md`, `REMOTE-VALIDATION.md`) |
+| re-base campaign | `archive/work/upstream-rebase-261120/` (`RUNGS.md` per rung, `DECISIONS.md`, `REMOTE-VALIDATION.md`) |
 | evidence for this file | `archive/work/r328-followups/logs/` (29 logs: every gate below, both primary-box and remote) |
 | ladder checkout | `~/llama.cpp`: branch `rebase-r328` = `73a74454b` (the pre-cut ladder; `rdna-boosts` is now the re-cut r328 branch), `backup-pre-squash-r328` = the pre-squash tip |
 | remote boxes | `ssh halo` (gfx1151 APU, 123 GiB, 16 threads) · `ssh fingon` (gfx1100, 24.5 GiB, 16 threads) — both hold the r328 tree in `~/llama.cpp/build-r328` and the logs in `~/r328-arch/` |
@@ -159,7 +159,7 @@ Sorted by what blocks what.  "Owner" is the file/doc that must change.
 Order of work for the `r329` session, once the rows are decided:
 
 1. Any **delivery** fixes (F1 if it is the emitter, F3's block-02 change) are folded into their **owning blocks**
-   with one `git rebase -i` pass — the discipline that worked at R18 (`wip/upstream-rebase-261120/RUNGS.md`
+   with one `git rebase -i` pass — the discipline that worked at R18 (`archive/work/upstream-rebase-261120/RUNGS.md`
    §R18.1/§R18.5): never a trailing commit, never in `0300`.
 2. Re-run the gates the changed blocks own (`AGENTS.md` → *Pick the gate for what you changed*), then
    `gate-per-block-build.sh --all` (or `--changed-from <prev tip>` for a delta), then `check-gpu-faults.sh`.
@@ -207,7 +207,7 @@ Order of work for the `r329` session, once the rows are decided:
 | the next session's prompt | `archive/work/r328-followups/NEXT-SESSION-PROMPT.md` |
 | every log behind §2/§3 | `archive/work/r328-followups/logs/` |
 | the release + post-release records | `WORKLOG.md` 261121.005 / 261121.006 |
-| the re-base's per-rung record | `wip/upstream-rebase-261120/RUNGS.md` (§R18.1 squash, §R18.3 gate sweep, §R18.4 R11.2 refutation, §R18.5 attribution fixup, §R18.6 tmpfs, §R18.7 spec-align, §R18.8 release) |
-| the arch runbook + box inventory | `wip/upstream-rebase-261120/REMOTE-VALIDATION.md` |
+| the re-base's per-rung record | `archive/work/upstream-rebase-261120/RUNGS.md` (§R18.1 squash, §R18.3 gate sweep, §R18.4 R11.2 refutation, §R18.5 attribution fixup, §R18.6 tmpfs, §R18.7 spec-align, §R18.8 release) |
+| the arch runbook + box inventory | `archive/work/upstream-rebase-261120/REMOTE-VALIDATION.md` |
 | MTP + KLD protocols | `benchmarks/mtp-adaptive-methodology.md`, `benchmarks/prefill-logit-methodology.md` |
 | policy / engineering facts | `AGENTS.md`, `INVARIANTS.md` (see the r328 entries) |

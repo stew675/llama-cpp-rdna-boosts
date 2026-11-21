@@ -56,6 +56,7 @@ none is an r329 deliverable.  A green gate ladder is still not permission to ski
 | **351** | does upstream now support `-sm tensor` for `flint`?  If it does, the temporary block `0300` (`-sm relaxed-tensor`) can be dropped -- upstream's per-architecture refusal is the only reason the block exists | delivery structure / temporary block `0300` | **OPEN, ANSWERED for r328** -- re-tested at R17 of the re-base on the real model this box has: **it cannot be dropped** (flint still refuses `-sm tensor` at `919794500`, while `-sm relaxed-tensor` is byte-identical to `-sm layer`); re-test at the next re-base; §351 |
 | **353** | no Inkling-2 model loads at `919794500`: the looped family needs support this snapshot lacks — Unsloth's file is `arch = inkling2` with 24 physical blocks but `block_count = 48` + `num_loops = 3` (the loader has no loop, so it asks for `blk.24.*`), and **GGML's reference file is `arch = inkling2_loop`, which this tree does not know at all** | upstream model support / validation target | **OPEN (waiting on upstream)** -- the pristine base repeats both failures and r327 knows neither arch, so no delivery change is involved; it blocks the only local validation of upstream's per-head FA mask (`#32217`) and of the `nb32` widening; §353 |
 
+
 ## Handle numbering
 
 **New handles append after `#357`, the highest issued so far, so the next free handle is `#358`; a number is
@@ -238,7 +239,7 @@ shipping): it changes the default apply set from 18 patches to 17.
 
 **Kept separate on purpose:** the `#30542` HIP-VMM revert is carried in block 00 for the **VMM pool** (the
 host-expert arena needs VMM; the reachable base hangs without the revert --
-`wip/upstream-rebase-261120/BASE-BLOCKER.md`), not for tensor-split support.  If the maintainer's intent was
+`archive/work/upstream-rebase-261120/BASE-BLOCKER.md`), not for tensor-split support.  If the maintainer's intent was
 that the two are linked, the test above is what settles it: it runs with the revert in place, so a passing
 `-sm tensor` for `flint` cannot be an artifact of the revert's absence.
 

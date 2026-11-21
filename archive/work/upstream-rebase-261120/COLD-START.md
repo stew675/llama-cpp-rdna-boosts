@@ -3,7 +3,7 @@
 **Read this file top to bottom before touching anything.** It is self-contained: a fresh session should not need
 the campaign's history, only this, then the two files it names in §3.
 
-Campaign dir: `~/llama-cpp-rdna-boosts/wip/upstream-rebase-261120/` (the delivery repo).
+Campaign dir: `~/llama-cpp-rdna-boosts/archive/work/upstream-rebase-261120/` (the delivery repo).
 Ladder checkout: `~/llama.cpp`, branch **`rebase-r328`** (never commit to `master` there — it is the pristine
 upstream snapshot).
 

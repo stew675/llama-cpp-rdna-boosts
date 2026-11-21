@@ -7,10 +7,10 @@ the invariants, and the first action.  Kept in the repo so a later session does 
 
 We are mid-way through re-basing the `rdna-boosts` delivery patch set onto a new upstream llama.cpp snapshot.
 **Continue the ladder climb from R06.**  Work in `~/llama.cpp` (the fork checkout) and record everything in
-`~/llama-cpp-rdna-boosts/wip/upstream-rebase-261120/`.
+`~/llama-cpp-rdna-boosts/archive/work/upstream-rebase-261120/`.
 
 **Read first, in this order** (they are short and they are the contract):
-1. `~/llama-cpp-rdna-boosts/wip/upstream-rebase-261120/HANDOVER.md` — state, what each rung cost, what is owed
+1. `~/llama-cpp-rdna-boosts/archive/work/upstream-rebase-261120/HANDOVER.md` — state, what each rung cost, what is owed
    at R10/R17/R18, the traps that bit, the measured baselines, and the standing bias with its limit.
 2. `…/README.md` §1 (the method and the traps) and §3 (session protocol).
 3. `…/RUNGS.md` — the ledger plus the full resolution log of R00-R05.  Read R05.1-R05.3 before touching

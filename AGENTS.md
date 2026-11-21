@@ -479,6 +479,12 @@ current-state headers (`patches/README.md`, `README.md`, `MANIFESTS.md`, `BASELI
 `release.json`) plus the newest `WORKLOG.md` entry. When you change the delivery, update those headers and
 add a new dated `WORKLOG.md` entry (newest first) — never edit dated validation records in place.
 
+**Three of the files the delivery ships are GENERATED** (`tools/cli/README.md`, `tools/completion/README.md`,
+`tools/server/README.md`, from `llama-gen-docs` + `common/arg.cpp`).  A block that adds or changes an option owes a
+regeneration, folded into the last OFFICIAL block that touches `common/arg.cpp` — never into the temporary `0300`,
+which is dropped.  `scripts/check-gen-docs.sh` is the check (release gates, `MANIFESTS.md`); why it exists is
+`INVARIANTS.md` r329.
+
 **Each top-level doc has one job — keep it that way.**  `README.md` describes the *set* (what it is, how to
 apply it, what a consumer needs); `MANIFESTS.md` is the apply order + verification contract; `BASELINE.md` is
 provenance + the drift policy; `GREEDY-PURITY.md` is the rulebook (claim, rule, numbers per `§N`, with the

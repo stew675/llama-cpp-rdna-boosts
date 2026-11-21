@@ -3,7 +3,7 @@
 Closes the gfx1201-only gap of the `v17-919794500-r328` release (`TODO` #354).  Both boxes were driven over
 `ssh` from the primary box, **each from a fresh apply of the RELEASED patch set** (not the ladder branch), so this
 is also an independent re-verification of `scripts/apply-all.sh` + `release.json` on two more machines — the
-method the r138 record used.  Runbook: `wip/upstream-rebase-261120/REMOTE-VALIDATION.md`.
+method the r138 record used.  Runbook: `archive/work/upstream-rebase-261120/REMOTE-VALIDATION.md`.
 
 | | **halo** | **fingon** |
 |---|---|---|

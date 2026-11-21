@@ -1,5 +1,28 @@
 # Upstream re-base campaign — 18 blocks from `4f9dfa0e3` onto `919794500`
 
+> ## CLOSED — 2026-11-21 (archived after the r329 follow-up session).  Every obligation this campaign carried is
+> closed; the two residuals it surfaced are now tracked in `TODO.md`, not here.
+>
+> | obligation (`COLD-START.md` §8 / `RUNGS.md` §2) | final state |
+> |---|---|
+> | the 18 rungs, R00-R17 | **DONE** — one rung per block on `rebase-r328`, `gate-per-block-build.sh --all` **18/18**, coherence `1c5d32ac537d` at every rung |
+> | the three rung repairs | **squashed** into block 00 / 05 / 03 at R18 (§R18.1, final tree unchanged) |
+> | R11.2 (the "moved HC chain") | **REFUTED** (§R18.4): r327's own binaries read the r328 numbers byte for byte; the gate's anchors had been stale since r309..r319 and its reference arm was unanchored. `gate-hc-fusions` now anchors the chain too |
+> | `mm_ids_helper_512_10` re-measure | **DONE at R00**: **+0.7 %** prefill at 5298 tokens with identical text — the recorded +4.5 %/+5.2 % is superseded, and block 00's note says so |
+> | R10.3 (the host-expert arena collapse) | **CLOSED at R15**: median 49.9 t/s against r327's 49.7, text `86b7f9b5aa80` |
+> | R06.2 (the forced routed-MMB abort) | **CLOSED 2026-11-21**: the r328 arm exits 0 with the `GGML_CUDA_MMB=0` control hash `86b7f9b5aa80` and `MMB_GLU` proven reached; the abort belonged to the intermediate ladder tree (blocks 06+09 without block 10's `pool_stack`).  `WORKLOG.md` 261121.007 |
+> | block 15's APU gates | **CLOSED 2026-11-21** on `halo`: `gate-uma-experts` **49/49**, `gate-prefill-server-slots` **3/0** at `-lme 85` — both had been run against the campaign tree rather than the delivery build (`INVARIANTS.md` r329) |
+> | gfx1151 + gfx1100 arch validation | **DONE** — `benchmarks/2026-11-21-r328-arch-validation.md` (apply 18/18 + tree/tip match on both boxes, op matrix green, gfx1100 `gate-spec-align` and `gate-hc-fusions` PASS) |
+> | `gate-node-budget` (phi-4) | **CLOSED 2026-11-21**: phi-4 IQ4_XS fetched, four arms `a1b7eb2ee7a6` |
+> | the R18 gate sweep | **DONE** — ten block-owned gates green on the final tree (`WORKLOG.md` 261121.005), including `gate-spec-align`, `gate-spec-ckpt-device`, `gate-spec-width-band`, `gate-norm-rows-alias`, `gate-park-idle-slots`, the quant-coherence + QSA section E |
+> | the prefill-logit base on the final tree | **DONE** — `--record` re-pinned at R18 (`build=73a74454b`), KLD **0.000000 / 100.000 %** |
+> | `TODO` #352 (the container `web` stage) | **CLOSED** — the worker published all six r328 images with `ui/apps/chat` built |
+> | generate the docs / assert no drift | **NOT DONE — now `TODO` #358.**  This is the one obligation that was skipped, and it is a real (docs-only) delivery defect: `llama-gen-docs` rewrites three committed files, because everything block 06/09/12/14/15/16/0300 added to `common/arg.cpp` is missing from them.  Fix rides **block 16** on the next release, with a `validate-set.sh` check so it cannot silently recur |
+> | `-Wdeprecated-declarations` in two test TUs | **now `TODO` #359** — cosmetic, recorded here as "a TODO" but never given a handle, so it would have been lost with this directory |
+>
+> The release itself: **`v17-919794500-r328`** — `RUNGS.md` §R18.8, `WORKLOG.md` 261121.005.  The follow-ups that
+> closed the rungs' owed list: `WORKLOG.md` 261121.007 (`TODO` #352/#354/#356/#357 retired).
+
 **Status: RELEASED — `v17-919794500-r328`** (tip `6d9d54238`, tree `0c46248f7371a0eee84a980a1e16ad25a6fbd38f`; ladder branch `rebase-r328` = `73a74454b`).  R00-R17 landed, R18 cut the set.  What is left is the **gfx1151 + gfx1100 validation** (`TODO` #354, [`REMOTE-VALIDATION.md`](REMOTE-VALIDATION.md)) — the ladder itself is closed.
 `patches/`, `release.json`, `rdna-boosts-all.patch` and the fork's `rdna-boosts` branch are untouched until
 the final rung (R18).  Ladder branch `rebase-r328` = `73a74454b` (tree

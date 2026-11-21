@@ -1,6 +1,6 @@
 # Prompt to paste into the fresh session — R18, the release
 
-> Do the r328 release from the completed ladder in `~/llama-cpp-rdna-boosts/wip/upstream-rebase-261120/`.
+> Do the r328 release from the completed ladder in `~/llama-cpp-rdna-boosts/archive/work/upstream-rebase-261120/`.
 >
 > **First, read `COLD-START.md` top to bottom**, then verify its state: `cd ~/llama.cpp && git status --short &&
 > git branch --show-current && git log --oneline -1` — expect clean, `rebase-r328`, `73a74454b`, tree

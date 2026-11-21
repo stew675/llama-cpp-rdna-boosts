@@ -7,7 +7,7 @@ decision (upstream's refactor vs our second path).  A block whose files were tou
 upstream commits is a different rung from one whose files nobody touched, even when neither has a
 text conflict.
 
-USAGE:  python3 wip/upstream-rebase-261120/probe-overlap.py [/path/to/llama.cpp]
+USAGE:  python3 archive/work/upstream-rebase-261120/probe-overlap.py [/path/to/llama.cpp]
 Writes overlap-map.json beside itself, prints a per-block table + the upstream commits per block.
 """
 import json

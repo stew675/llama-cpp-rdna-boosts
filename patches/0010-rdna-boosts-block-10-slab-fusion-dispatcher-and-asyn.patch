@@ -1,4 +1,4 @@
-From 3596d670692449d54e0c6981f15a7da64e3edc07 Mon Sep 17 00:00:00 2001
+From b431a731be41d9ae1a19e24a3ca9552e6eeddae6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/17] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -237,9 +237,9 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  src/llama-model.h                             |    7 +-
  tests/test-backend-ops.cpp                    |   60 +-
  tests/test-fusion-gate-beta-multiseq.cpp      |  321 +
- tests/test-logits-width-probe.cpp             |  233 +-
+ tests/test-logits-width-probe.cpp             |  234 +-
  tools/server/server-context.cpp               |   30 +-
- 87 files changed, 17886 insertions(+), 5678 deletions(-)
+ 87 files changed, 17887 insertions(+), 5678 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -28287,7 +28287,7 @@ index 000000000..69c0e1420
 +    return 0;
 +}
 diff --git a/tests/test-logits-width-probe.cpp b/tests/test-logits-width-probe.cpp
-index 4b117dbe3..7cd503dea 100644
+index 4b117dbe3..5b1e3702c 100644
 --- a/tests/test-logits-width-probe.cpp
 +++ b/tests/test-logits-width-probe.cpp
 @@ -32,6 +32,7 @@
@@ -28341,7 +28341,7 @@ index 4b117dbe3..7cd503dea 100644
      const llama_vocab * vocab = llama_model_get_vocab(model);
  
      std::string text;
-@@ -100,97 +135,129 @@ int main(int argc, char ** argv) {
+@@ -100,97 +135,130 @@ int main(int argc, char ** argv) {
  
      const int n_vocab = llama_vocab_n_tokens(vocab);
      const ggml_type kv_type = kv_from_env();
@@ -28445,30 +28445,31 @@ index 4b117dbe3..7cd503dea 100644
 -            const float * l = llama_get_logits_ith(ctx, j);
 -            if (!l) { fprintf(stderr, "no logits for row %d (W=%d)\n", j, W); return 1; }
 -            rows[W - 1].push_back(std::vector<float>(l, l + n_vocab));
-+            // the prefill batch holds P_arm tokens, so size the batch for it (not just n_ubatch)
-+            llama_batch b = llama_batch_init(cp.n_batch, 0, 1);
-+            b.n_tokens = 0;
++            // the ext batch grows to what is added (no pre-size): prefill P_arm tokens with no logits, then the
++            // W tokens of the probe width, each asking for logits
++            llama_batch_ext * b = llama_batch_ext_init(ctx);
 +            for (int i = 0; i < P_arm; ++i) {
-+                b.token[b.n_tokens] = toks[i]; b.pos[b.n_tokens] = i;
-+                b.n_seq_id[b.n_tokens] = 1; b.seq_id[b.n_tokens][0] = 0; b.logits[b.n_tokens] = 0;
-+                b.n_tokens++;
++                const int32_t idx = llama_batch_ext_add_token(b, 0, toks[i]);
++                const llama_pos pos = i;
++                llama_batch_ext_set_pos(b, idx, &pos);
 +            }
-+            if (llama_decode(ctx, b) != 0) { fprintf(stderr, "prefill decode failed (arm=%s W=%d)\n", label, W); return 1; }
++            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b) != 0) { fprintf(stderr, "prefill decode failed (arm=%s W=%d)\n", label, W); return 1; }
 +
-+            b.n_tokens = 0;
++            llama_batch_ext_clear(b);
 +            for (int j = 0; j < W; ++j) {
-+                b.token[b.n_tokens] = toks[P_arm + j]; b.pos[b.n_tokens] = P_arm + j;
-+                b.n_seq_id[b.n_tokens] = 1; b.seq_id[b.n_tokens][0] = 0; b.logits[b.n_tokens] = 1;
-+                b.n_tokens++;
++                const int32_t idx = llama_batch_ext_add_token(b, 0, toks[P_arm + j]);
++                const llama_pos pos = P_arm + j;
++                llama_batch_ext_set_pos(b, idx, &pos);
++                llama_batch_ext_set_output_logits(b, idx, true);
 +            }
-+            if (llama_decode(ctx, b) != 0) { fprintf(stderr, "batch decode failed (arm=%s W=%d)\n", label, W); return 1; }
++            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b) != 0) { fprintf(stderr, "batch decode failed (arm=%s W=%d)\n", label, W); return 1; }
 +
 +            for (int j = 0; j < W; ++j) {
 +                const float * l = llama_get_logits_ith(ctx, j);
 +                if (!l) { fprintf(stderr, "no logits for row %d (arm=%s W=%d)\n", j, label, W); return 1; }
 +                rows[W - 1].push_back(std::vector<float>(l, l + n_vocab));
 +            }
-+            llama_batch_free(b);
++            llama_batch_ext_free(b);
 +            llama_free(ctx);
          }
 -        llama_batch_free(b);

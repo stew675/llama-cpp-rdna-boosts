@@ -2617,6 +2617,16 @@ next item) and the census to expect is `direct` ~= 0 with `properties_changed` i
 
 ## Block 10 — the slab, the fusion dispatcher, the async input ring (infrastructure)
 
+> **r329 amendment (housekeeping, no behaviour change): `tests/test-logits-width-probe.cpp` moved off the
+> deprecated batch API.**  The probe (block 06 introduced it, this block last touched it) still built batches with
+> `llama_batch_init` / `llama_decode` / `llama_batch_free`, i.e. four `-Wdeprecated-declarations` warnings per
+> build.  It now uses the ext builder — `llama_batch_ext_init` + `llama_batch_ext_add_token` /
+> `_set_pos` / `_set_output_logits` (the prefill arm asks for no logits, the width arm for every row) and
+> `llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, …)`, with `llama_batch_ext_clear` between the two arms.
+> **Verified numerically identical**: the probe's 16 per-arm hashes reproduce the pre-migration build byte for
+> byte on 27B Q8_0 (`P=4096` flat W=8 `1f009059617b555a`, `P=4348` boundary W=8 `ffe25542c6f2a557`,
+> `width_purity=PASS` both arms), and it is the probe `gate-spec-purity.sh` calls.
+
 > **r327 amendment (contributor PR #337, `TODO` #348 retired): one packed FA KV-group bitmap per graph
 > evaluation, opt-in.**  `GGML_CUDA_FA_KQ_BLOCKS_REUSE=1` makes the FIRST attention layer of a graph evaluation
 > build the packed bitmap (`flash_attn_mask_to_KV_blocks`) into a 64 KiB buffer the CUDA context owns, and the
@@ -5145,6 +5155,15 @@ re-copied out of the arena per prefill ubatch — closed in r258: an identity ta
 
 ## Block 13 — MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in)
 
+> **r329 amendment (housekeeping, no behaviour change): `tests/test-mtp-draft-vocab.cpp` moved off the deprecated
+> batch API.**  Three warnings (`llama_batch_init` / `llama_decode` / `llama_batch_free`) are gone; the batch is
+> now `llama_batch_ext_init` + `add_token` + `_set_embd_state` + `_set_pos` + `_set_output_logits` and
+> `llama_process(…, LLAMA_PROCESS_TYPE_DECODE, …)`.  **The embedding is the MTP *state*, not a token embedding**:
+> the legacy API carried it as `batch.embd` next to `batch.token`, and `llama_batch_compat::init` maps exactly that
+> case to `set_embd_state` — using `llama_batch_ext_set_embd_token` instead aborts in
+> `llm_graph_result::set_inputs` ("this graph requires a state embedding").  The test PASSES on 27B IQ4_NL
+> (`-ngl 99`): six context-pair scenarios, `0 mismatches` against the full-vocabulary logits, same argmax values.
+
 > **r217 amendment (issue #273 item 4, `getenv` audit):** `llama-graph.cpp`'s `LLAMA_GRAPH_RESULT_DEBUG` was
 > read on every graph result (9 per run in the audit trace); it is latched now.  No behaviour change.
 
@@ -5950,6 +5969,16 @@ under a 1 GiB `ulimit -l` refuses naming the 21 741.3 MiB shortfall, and **`-lme
 `WORKLOG.md` 261114.005, `INVARIANTS.md` (r284).
 
 ## Block 16 — the server's prompt admission policy (the fair share, `-ib`, the skew, the duty cycle)
+
+> **r329 amendment (docs, no behaviour change): the generated help documents are regenerated.**  Block 16 is the
+> last OFFICIAL block that touches `common/arg.cpp`, so it owns the regeneration of the three files
+> `llama-gen-docs` writes: `tools/cli/README.md`, `tools/completion/README.md`, `tools/server/README.md`.  They
+> had been stale since **block 02** — every option the delivery adds afterwards was missing from the delivered
+> docs (`--kv-window`, `--kv-attendance-pool`, `-lme`/`--host-experts` and the APU GTT wording, `--wmma-verify`,
+> `-ib`, `--spec-draft-mtp-vocab`, the `-ncmoe`/`-ncmoed` LAST-N wording and `LLAMA_HOST_EXPERTS_FROM_END`,
+> `--load-mode buffered`, the `mlock`-is-residency text, `relaxed-tensor`, `LLAMA_LAZY_BUF_MB`), i.e. a consumer
+> reading the shipped `tools/cli/README.md` could not see the delivery's own flags.  `scripts/check-gen-docs.sh`
+> is the check that makes a repeat loud: run it on the tree you are about to cut.
 
 New block at **r301** (`TODO` #339): the code was folded into block 12 at r300 and moved out here when the
 maintainer's deferred structure decision was taken.  **Why an official `0016` and not a `03xx`:** the policy is

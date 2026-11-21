@@ -1,4 +1,4 @@
-From cbeb5044a3675c9d0b147e8b30045f420b012239 Mon Sep 17 00:00:00 2001
+From 4fb11476a0bf8216e581a83797104111b61e1567 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/17] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -85,15 +85,15 @@ Exit verified on this tree (gfx1201, ROCm 10.1.0, VMM build):
  src/llama-cparams.h             |   2 +
  src/llama-graph.cpp             |   9 +-
  src/llama-graph.h               |   8 ++
- src/llama-model.cpp             | 149 ++++++++++++++++++++
+ src/llama-model.cpp             | 149 +++++++++++++++++++
  src/llama-model.h               |  20 +++
  src/models/gemma4-assistant.cpp |  16 ++-
  src/models/qwen35.cpp           |  13 +-
  src/models/qwen35moe.cpp        |  13 +-
  src/models/qwen4exp.cpp         |  17 ++-
  tests/CMakeLists.txt            |   1 +
- tests/test-mtp-draft-vocab.cpp  | 243 ++++++++++++++++++++++++++++++++
- 19 files changed, 588 insertions(+), 8 deletions(-)
+ tests/test-mtp-draft-vocab.cpp  | 244 ++++++++++++++++++++++++++++++++
+ 19 files changed, 589 insertions(+), 8 deletions(-)
  create mode 100644 tests/test-mtp-draft-vocab.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
@@ -726,10 +726,10 @@ index 034f04647..bcdefb2c7 100644
  
 diff --git a/tests/test-mtp-draft-vocab.cpp b/tests/test-mtp-draft-vocab.cpp
 new file mode 100644
-index 000000000..ca514151a
+index 000000000..f6b7e9880
 --- /dev/null
 +++ b/tests/test-mtp-draft-vocab.cpp
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,244 @@
 +// Regression test for llama_context_params::mtp_draft_vocab.
 +//
 +// The draft vocabulary subset belongs to the MTP context that asked for it. Contexts over the same model with a
@@ -801,25 +801,26 @@ index 000000000..ca514151a
 +    const int32_t n_embd  = llama_model_n_embd_out(model);
 +    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 +
-+    llama_batch batch = llama_batch_init(1, n_embd, 1);
-+    batch.token = (llama_token *) malloc(sizeof(llama_token));
++    llama_batch_ext * batch = llama_batch_ext_init(ctx);
 +
++    // one entry carrying BOTH a token id and the hidden state the MTP head continues from -- the legacy API
++    // carried that as `batch.embd` next to `batch.token` (see llama_batch_compat::init), which is exactly
++    // llama_batch_ext_set_embd_state
++    const int32_t idx = llama_batch_ext_add_token(batch, 0, (llama_token) ((pos * 7919 + 13) % 30000));
++    std::vector<float> h((size_t) n_embd);
 +    std::mt19937 rng(1000 + pos);
 +    std::normal_distribution<float> dist(0.0f, 1.0f);
 +    for (int32_t i = 0; i < n_embd; ++i) {
-+        batch.embd[i] = dist(rng);
++        h[(size_t) i] = dist(rng);
 +    }
-+    batch.token[0]     = (llama_token) ((pos * 7919 + 13) % 30000);
-+    batch.pos[0]       = pos;
-+    batch.n_seq_id[0]  = 1;
-+    batch.seq_id[0][0] = 0;
-+    batch.logits[0]    = 1;
-+    batch.n_tokens     = 1;
++    llama_batch_ext_set_embd_state(batch, idx, llama_embd{ h.data(), 1, (size_t) n_embd });
++    llama_batch_ext_set_pos(batch, idx, &pos);
++    llama_batch_ext_set_output_logits(batch, idx, true);
 +
-+    const int rc = llama_decode(ctx, batch);
-+    llama_batch_free(batch);
++    const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
++    llama_batch_ext_free(batch);
 +    if (rc != 0) {
-+        fprintf(stderr, "llama_decode failed: %d\n", rc);
++        fprintf(stderr, "llama_process failed: %d\n", rc);
 +        return false;
 +    }
 +    const float * logits = llama_get_logits_ith(ctx, -1);
