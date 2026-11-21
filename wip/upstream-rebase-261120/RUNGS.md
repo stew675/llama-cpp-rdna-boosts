@@ -1535,6 +1535,11 @@ only ones that write big files: a prefill-logit base is 1-5 GiB, its control arm
 | blocks | 17 official (`0000`-`0016`) + temporary `0300` = **18 default**; 2 optional |
 | optional | `0100` alone → `931a0f8b8`, `0101` alone → `83477d27`, cumulative → **`fd9d60abd5`** (`optional_tree`) |
 
+Published: delivery `main` → `bb206748`; fork `rdna-boosts` `e159adfc2` → **`6d9d54238`**; tag
+`v17-919794500-r328`; CI green on both the tag and `main` (`Validate delivery set`, and `Release patch set` which
+published `patches.tar.gz` / `rdna-boosts-all.patch` / `release.json` / `SHA256SUMS`); the worker watcher on
+`radiance` picked the tag up at its next poll (05:10) and started the image build — `CONTAINERS.md` has the rest.
+
 The cut: `make-patches.sh` from the ladder tip (exports the 18 default + both optional), `make-release.sh` with
 the re-cut tip/trees, `validate-set.sh` **GREEN** (strict apply at `919794500` → tree match, both optional
 artifacts alone and cumulatively, 515 added files through the Windows portability scan), `fork-refresh.sh
