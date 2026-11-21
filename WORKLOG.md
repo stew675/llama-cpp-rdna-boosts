@@ -317,8 +317,8 @@ introduced by either artifact.
 
 `release.json` unchanged (`v17-919794500-r329`, base `919794500`, tip `bbd08a300`, tree `63195b0ce6`,
 `optional_tree` `d8deaa13e8`); no tag, no fork refresh, no container rebuild (nothing a consumer applies has
-changed).  The optional-applied verification tree (`opt-r329-verify`, tip `f8df8a484`) stays in `~/llama.cpp` as
-the arm record; it is not a delivery branch.
+changed).  The optional-applied verification tree for that revision was `opt-r329-verify` (`f8df8a484`); it is not a
+delivery branch, and at r333 it was replaced by `opt-r331-verify` on the current tree (optional tree `5d50ae466`).
 
 ## 261121.008 (r329) -- the delivery's generated docs were stale and two test TUs were on the deprecated batch API: three block amendments, and a check so the docs cannot silently drift again
 
