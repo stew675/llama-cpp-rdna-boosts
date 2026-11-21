@@ -67,6 +67,18 @@ through its own gate (12/12).  `TODO` #352 landed earlier (`261121.001`): the co
 `ui/apps/chat`.  **The images are built and pushed off-host by the worker watcher** after the tag — never on the
 primary box.
 
+### Published
+
+* **delivery repo**: `git push origin main` → `2047dc38` on `github.com:stew675/llama-cpp-rdna-boosts`.
+* **the fork**: `scripts/fork-refresh.sh --push` — re-cut tree == `release.json.tree`, tip **`6d9d54238`** ==
+  `.tip`, then `force-with-lease` to `git@github.com:stew675/llama.cpp.git` (`rdna-boosts`: `e159adfc2` →
+  `6d9d54238`).  Consumers who clone the branch are on r328 from that point.
+* **the tag**: `v17-919794500-r328` on `2047dc38`, pushed.
+* **the images**: the worker watcher on `radiance` (`~/bin/rdna-container-watch.sh`, cron `*/10`) polls for the
+  newest release tag by creation date and runs `scripts/build-containers.sh --rocm "7.14.1 10.1" --push --prune`
+  there.  **Nothing else is needed after the tag** — and the full two-line image build must never run on the
+  primary box.
+
 ### What this release leaves owed (all named, none blocking a gfx1201 shipment)
 
 * **gfx1151 + gfx1100 validation** — the ladder was gated on gfx1201 only.  `TODO` #354: one session per box
