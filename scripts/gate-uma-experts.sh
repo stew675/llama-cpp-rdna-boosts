@@ -20,6 +20,11 @@
 #     off      MOE_EXPERT_GTT=0                     the delivery's behaviour: no store, the cache disabled on an IGPU
 #     ref      the shipped default                  the GTT store as the cache's arena (`MOE_EXPERT_GTT_ARENA` is
 #                                                   still opt-in, see ENVIRONMENT.md -- this gate passes it)
+#     mapwarn  LLAMA_ARG_LOAD_MODE=mmap            the arena's read transport is PINNED to the mapping: the r344
+#                                                   warning must name it (there is no host pool, so the pool's
+#                                                   memory-tight warning never fires on this tier)
+#     buffered LLAMA_ARG_LOAD_MODE=buffered        keeps the mapped master and fills straight into the slot: no
+#                                                   mapping warning, same text
 #     resident -lme 20                              the store holds the WHOLE set: placement, 0 evictions
 #     budget   -lme 6                               the extent is the request (+- one slot) and is named
 #     nomove   (steady state, same as ref)          arena releases == 0, no unregister on the hot path
@@ -241,6 +246,12 @@ LME_FLAG="-lme $LME"
 if ! run_arm off "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" MOE_EXPERT_GTT=0; then exit 1; fi
 LME_FLAG="-lme $LME"
 if ! run_arm ref "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" "${BASE_ENV[@]}"; then exit 1; fi
+# r344 (issue #347 follow-up): the ARENA tier has no host pool, so the pool's memory-tight warning never fires.
+# `--load-mode mmap` pins the mapping transport and must NAME it; `buffered` keeps the mapped master and must not.
+LME_FLAG="-lme $LME"
+if ! run_arm mapwarn "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" "${BASE_ENV[@]}" LLAMA_ARG_LOAD_MODE=mmap; then exit 1; fi
+LME_FLAG="-lme $LME"
+if ! run_arm bufferedwarn "$MODEL" "$LME" "$AS_KB" "$LOCK_KB" "${BASE_ENV[@]}" LLAMA_ARG_LOAD_MODE=buffered; then exit 1; fi
 # The store is mlock'ed, so an 8 GiB RLIMIT_MEMLOCK CLAMPS it -- that is the documented lock policy, and it is why
 # this arm relaxes the barrier: `-lme $LME_BIG` can only be placement if it can actually be locked.
 LME_FLAG="-lme $LME_BIG"
@@ -306,7 +317,7 @@ note "text identity (every arm must match the delivery's own behaviour, arm 'off
 REF="$(text_hash off)"
 echo "    off      $REF"
 [ -n "$REF" ] && ok "the reference arm produced a hash" || fail "off: no text hash (see $KEEPOUT/off/out.txt)"
-for arm in ref resident budget lmeauto lock pfoff pfcp inplace shapefit cold fault nohb; do
+for arm in ref mapwarn bufferedwarn resident budget lmeauto lock pfoff pfcp inplace shapefit cold fault nohb; do
     [ -f "$KEEPOUT/$arm/out.txt" ] || continue
     hard
     H="$(text_hash "$arm")"
@@ -321,6 +332,27 @@ done
 if [ -f "$KEEPOUT/ram/out.txt" ]; then
     hard
     if [ -n "$(text_hash ram)" ]; then ok "ram: $(text_hash ram) (a >RAM model completes)"; else fail "ram: no text"; fi
+fi
+
+note "r344: the arena's pinned mapping transport is NAMED (and the buffered arm is silent)"
+hard
+if grep -q 'PINNED its read transport to the MAPPING' "$KEEPOUT/mapwarn/err.txt"; then
+    ok "mapwarn: --load-mode mmap on the arena reports the pinned-mapping warning"
+else
+    fail "mapwarn: no pinned-mapping warning on the arena (r344)"
+fi
+hard
+if grep -q 'PINNED its read transport to the MAPPING' "$KEEPOUT/bufferedwarn/err.txt"; then
+    fail "bufferedwarn: the pinned-mapping warning fired on --load-mode buffered"
+else
+    ok "bufferedwarn: no pinned-mapping warning"
+fi
+hard
+if [ -n "$(census mapwarn 'host read transport -> map')" ] && \
+   [ -n "$(census bufferedwarn 'host read transport -> file')" ]; then
+    ok "mapwarn/bufferedwarn: each arm took the transport its load mode names"
+else
+    fail "mapwarn/bufferedwarn: the transport census does not match the requested arms"
 fi
 
 note "the arena is real (arm 'ref' must not be vacuous)"

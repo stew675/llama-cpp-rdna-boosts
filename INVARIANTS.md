@@ -1937,3 +1937,36 @@ appear then (a second/third context's graph reserve, per active-slot width), not
 `GGML_CUDA_SLAB_HEADROOM_MIB` is the lever that does not cost arena on a budgeted shape.
 
 Record: `WORKLOG.md` 261122.005; `ENVIRONMENT.md` §1.3; `wip/prefill-decode-arms/RESULTS-2026-11-22.md` pass 5 §4.
+
+## r344 — on an APU GTT **arena**, the read transport is the page-cache decision, `dio` keeps the mapping, and the warning that should have named it never fired (block 15, issue #347 follow-up)
+
+1. **`--load-mode` pins the ARENA's read transport like any host tier** (`src/llama-model-loader.cpp:1745-1779`,
+   `moe-expert-cache.cu:2626-2706`): `mmap` / `mmap+mlock` / `mlock` => `POOL_TR_MAP`, **pinned, no monitor**.
+   Every arena miss is then a `memcpy` out of the pageable model mapping, so the expert pages enter the page cache
+   as **MAPPED** pages.  On a box whose page cache cannot hold the set (a cgroup `memory.max`, a >RAM model) that
+   cache is the only elastic tier and it churns.  Measured (gfx1151, ROCm 10.2, GSQ-IQ3_XXS 40 925.6 MiB set,
+   `-lme 24`, `MemoryMax=44G`, no swap, cold cache, 5 298-token prompt + 64 greedy tokens): `mmap` 216.7 t/s
+   prefill / 9.7 t/s decode, 17.4 GiB mapped GGUF, 16.54 M refaults, 8 772 major faults; `buffered` 265.4 / 18.6,
+   0.7 GiB, 4.04 M, 152; `auto` (forced map start) 255.4 / 18.0, 3.4 GiB, 5.53 M; `dio` 205.6 / 15.7, 0.9 GiB,
+   **0** refaults.  `-lme 28`: `buffered` 314.6 / 21.5, `dio` 291.8 / 20.4.  The census names the fill cost:
+   `direct slot fills ... 4 668 MiB/s` (buffered) against `per-expert mapping reads (bounce) ... 1 482 MiB/s`
+   (map) and `per-expert storage reads (bounce) ... 1.93 GiB/s` (dio); the prefill span stream is 6.9 GiB/s
+   buffered against 3.65 GiB/s O_DIRECT.
+2. **`dio` does NOT drop the mapping on the ARENA arm** (the correction to the first version of this finding):
+   `plan_gtt_expert_store()` force-maps the model as the arena's fill master (`use_mmap = true`, with a WARN),
+   whatever the load mode, so `--lazy-mode on` still serves the PLE from the mapping and `anon` stays arena + ~0.2
+   GiB.  The mapping is forced only in the **arena** arm; on the **placement** arm (budget covers the set) `dio`
+   still means no mapping, and the lazy PLE would become resident.  Do not generalise the one to the other.
+3. **The `buffered` vs `dio` order is the DRIVE's O_DIRECT latency, not a universal rule.**  On this box's Crucial
+   T500 `buffered` wins at 24 GiB (+29 % prefill, +18 % gen) and 28 GiB (+7.8 %, +5.4 %); at a 36 GiB cap they tie
+   on generation (15.7 both) and `buffered` is +7 % prefill.  `dio` removes every file-page refault, so its window
+   is a tight page-cache budget or a controller whose O_DIRECT latency is low (the maintainer's SN850X finding);
+   `buffered`'s window is a drive where the deep buffered reads and the direct slot fill are much faster.  All
+   three transports read the same text (`96533be7cb80`), and the text is not a transport oracle.
+4. **The pinned-transport memory-tight warning never covered the arena.**  It required `planned_pool > 0`, and the
+   arena has no host pool, so the one shape it exists for ran silently.  It now also fires for
+   `g_gtt_arena && transport == map`, names the budget and the per-device set, and points at `buffered`/`auto`.
+   `gate-uma-experts.sh` grew `mapwarn` (must fire) and `bufferedwarn` (must not) and asserts each arm's named
+   transport; 54/0 with every text arm still `4f29f1e4a4d6`.
+
+Record: `WORKLOG.md` 261122.004; `ENVIRONMENT.md` §20; `patches/README.md` block 15; issue #347 follow-up.

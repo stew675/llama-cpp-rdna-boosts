@@ -1,3 +1,89 @@
+## 261122.004 (r344) -- the APU arena's PINNED mapping transport is named: the issue #347 follow-up is a `--load-mode buffered` fix, not a leak
+
+**Delivery change: block 15 only** (one WARN; no default moved and no byte of a read changed).  `release.json` is now
+`v17-919794500-r344`, base unchanged, tip **`442a7bb50`**, tree **`39fcfe7b42035ffbdde2366926a2677cd4a89ea5`**; both
+optional artifacts were re-cut against the new default tree (0100 -> `2ac9015f7`, 0101 -> `10ebc31c6`, cumulative
+`5f63cebbe`), and `scripts/validate-set.sh` is green.  No new block, no renumbering.
+
+### 1. The report and the mechanism
+
+`@tazmaniax`'s follow-up (issue #347, comment 7078596827) is not the r337 regression returning: `anon` is the
+arena plus ~0.3 GiB, so the full pageable copy is still gone.  The churn is the **read transport**.  Since r294
+`--load-mode` *is* the host-read transport (`src/llama-model-loader.cpp:1745-1779`), and `mmap` maps to
+`POOL_TR_MAP` with `g_pool_tr_mode < 3`, i.e. **pinned, no monitor** (`moe-expert-cache.cu:2626-2706`).  Every
+arena miss is a `memcpy` out of the pageable model mapping, so the expert pages enter the page cache as **mapped**
+pages; under a hard cap that cache is the only elastic tier, so it fills and is evicted/re-faulted -- exactly the
+reporter's `file ~= file_mapped`, `unevictable` flat at the arena, `workingset_refault_file` climbing and `oom=0`.
+The r337 reply said "no setting change needed; `-lme 28 --load-mode mmap` is the r279 configuration" -- true for
+the pageable-copy fix, wrong for the transport.  `--load-mode buffered` and `auto` keep the mapped master (so
+`--lazy-mode on` for the 27.5 GiB PLE still works); `buffered` fills straight into the slot, and `auto` falls to
+it on a stall.  `dio` is also viable on the ARENA arm -- the arena force-maps the model as its fill master, so the
+lazy PLE stays mapped -- and it removes the file-page churn entirely (0 refaults, 3.3 GiB of page cache), at the
+cost of the O_DIRECT read path: on this box's Crucial T500 it read 205.6 / 15.7 t/s against `buffered` 265.4 /
+18.6.  The fill transport is the drive's O_DIRECT latency against the page-cache room, not a universal order.
+
+### 2. Measured on the equivalent shape (gfx1151, ROCm 10.2, r343 build)
+
+GSQ-IQ3_XXS (a 40 925.6 MiB expert set, 27 465 MiB PLE), `-lme 24 --lazy-mode on --fit off`, `MemoryMax=44G`,
+`MemorySwapMax=0`, cold page cache, 5 298-token prompt + 64 greedy tokens, same text on every transport
+(`614 chars sha=96533be7cb80` on the short recall arm):
+
+| `--load-mode` | page cache peak | mapped | refaults (same work) | maj faults | prefill | gen |
+|---|---:|---:|---:|---:|---:|---:|
+| `mmap` | 19.7 GiB | 17.4 | 16.54 M | 8 772 | 216.7 t/s | 9.7 t/s |
+| `buffered` | 19.5 GiB | 0.7 | 4.04 M | 152 | 265.4 t/s | 18.6 t/s |
+| `auto` (forced map start) | 19.7 GiB | 3.4 | 5.53 M | 861 | 255.4 t/s | 18.0 t/s |
+| `dio` | 3.3 GiB | 0.9 | **0** | 197 | 205.6 t/s | 15.7 t/s |
+
+The census names the difference: `direct slot fills (buffered pread into the arena, no bounce/H2D) ... 4 668
+MiB/s` against `per-expert mapping reads (bounce) ... 1 482 MiB/s`; `dio` uses the bounce/staging path at 1.9
+GiB/s and its prefill spans read 3.65 GiB/s O_DIRECT against 6.9 GiB/s buffered, which is why zero churn does not
+make it the fastest on this drive.  A sweep with `buffered` at 44 GiB read `-lme 20` 243.4 / 16.8, `-lme 24`
+265.4 / 18.6, `-lme 28` **314.6 / 21.5** (`dio` at 28: 291.8 / 20.4) -- so the 28 GiB arena is the better point
+again once a miss is cheap, and the 36 GiB cap narrows `buffered` vs `dio` to 220.7 / 15.7 against 206.9 / 15.7.
+`memory.events max` fired in every arm (`mmap` 353 496, `buffered` 152 526) with `oom`/`oom_kill` both 0: the
+reporter's guard stops on reclaim, not on OOM.
+
+**#348 is unrelated.**  That fix is `server_prompt_cache::take()` (anonymous slot-state buffers, `--cache-ram`),
+and the reporter's log says the prompt cache is disabled, so the huge-page path never runs there; it cannot move
+file-backed mapping churn either way.
+
+### 3. The change (block 15, one WARN)
+
+`pool_transport_init_locked()`'s memory-tight warning required `planned_pool > 0`, and the arena has no host
+pool, so the one shape it exists for ran silently.  It now also fires for `g_gtt_arena && transport == map`,
+names the arena budget and the per-device expert set, and says `buffered` fills straight into the slot while
+`auto` falls to it.  This is a log-only amendment: no bytes moved, no default changed.  The gate grew two arms,
+`mapwarn` (the warning must fire) and `bufferedwarn` (it must not), and asserts each arm takes the transport its
+load mode names.
+
+### 4. Verified
+
+* `scripts/gate-uma-experts.sh` **54 checks / 0 failures** (full, including the >RAM arm); all text arms
+  byte-identical (`4f29f1e4a4d6`), the two new warning checks pass, no GPU faults.
+* `scripts/gate-prefill-logits.sh --allow-base-mismatch` **PASS** 0.000000 mean KLD / 99.990 % same-top-p.  The
+  only recorded base is ROCm 10.1 and this build is 10.2, so the comparison is cross-toolchain (the 0.01 % is
+  the known cross-line figure, not this log-only change); a proper 10.2 base is still owed.
+* `scripts/validate-set.sh` green end-to-end (fresh tarball, strict 18/18, both optional artifacts strict on the
+  new tree, cumulative `5f63cebbe`, Windows lints, `check-rung-file-sets.py` 0 unexplained).
+* Coherence: dense 4B Q8_0, 1 GPU, 24 greedy tokens -- **111 chars `7e6229b260f6`** (the r336/r337 anchor,
+  unchanged), no GPU fault.
+
+### 5. Docs and issue handling
+
+`patches/README.md` block 15 (the r344 amendment), `ENVIRONMENT.md` §20 (the arena transport paragraph),
+`INVARIANTS.md` (r344, appended), `MANIFESTS.md` (block 15 + the gate row) and `scripts/README.md` (the gate's
+arm count).  Replied on issue #347 with the mechanism, the measured table and the `--load-mode buffered` request
+(`#issuecomment-7079316559`), then corrected the `dio` claim with the measured `dio` row and the drive-dependent
+crossover (`#issuecomment-7079449284`).
+
+**Release.**  The personal fork's `rdna-boosts` branch was re-cut from `patches/` at `919794500` and
+force-pushed at **`442a7bb50`** (tree `39fcfe7b4`, checked by `scripts/fork-refresh.sh --build --push`); the
+delivery repo carries the `v17-919794500-r344` tag.  The tag is the container watcher's cue on `radiance`, so no
+image was built on this box.  The fork refresh was run without `--gates` because its `gate-prefill-logits.sh` call
+refuses the 10.1 base on a 10.2 build; the coherence and KLD runs above are the gate record, and the coherence
+hash is unchanged.
+
 ## 261122.003 (r343) -- the slab headroom default is `1408 + 128 x n_gpu` (1536 MiB on one GPU), sized for allocations made AFTER the slab extends
 
 **Delivery change: block 10 only** (its content, not its number).  `release.json` is now `v17-919794500-r343`, base

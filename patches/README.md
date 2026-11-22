@@ -6206,6 +6206,28 @@ and `host pool PLACEMENT reads`) now say the arena / stay silent.  Blocks 00-14 
 `gate-prefill-server-slots.sh` 3/3, prefill-logit -0.000000 / 100.000 % (arena arm) and 0.000000 / 99.990 %
 (default point).  Record: `WORKLOG.md` 261121.016, `INVARIANTS.md` (r337).
 
+**r344 amendment to block 15 -- the arena's PINNED mapping transport is NAMED (issue #347 follow-up).**  The
+arena's read transport is `--load-mode`'s decision like any other (`ENVIRONMENT.md` §19): `mmap` / `mmap+mlock` /
+`mlock` **pin** it to the model mapping, so every arena miss is a `memcpy` out of the pageable mapping and the
+expert pages enter the page cache as **MAPPED** pages.  The tier's own memory-tight warning required
+`planned_pool > 0`, and the arena has no host pool, so the one shape it exists for ran silently.  It now also
+fires for `g_gtt_arena && transport == map`, names the arena budget and the set, and says `--load-mode buffered`
+keeps the mapped master and fills straight into the slot (`auto` falls to it on a stall).  Measured on `halo`
+(gfx1151, 44 GiB `MemoryMax`, no swap, the 40 925.6 MiB GSQ-IQ3_XXS expert set, `-lme 24`, a 5 298-token prompt +
+64 greedy tokens, cold page cache): `mmap` **216.7 t/s prefill / 9.7 t/s decode**, 17.4 GiB of MAPPED GGUF and
+16.54 M refaults; `buffered` **265.4 / 18.6**, 0.7 GiB and 4.04 M; `auto` **255.4 / 18.0** (1 switch, 3.4 GiB
+mapped); `dio` **205.6 / 15.7**, 3.3 GiB of cache and **0 refaults**.  `-lme 28`: `buffered` **314.6 / 21.5**,
+`dio` **291.8 / 20.4**.  The direct slot fill reads at 4 668 MiB/s where the mapping arm's bounce reads at 1 482
+MiB/s; `dio` uses the bounce/staging path at 1.9 GiB/s and its prefill spans read 3.65 GiB/s O_DIRECT against 6.9
+GiB/s buffered, which is why the zero churn does not make it the fastest on this drive.  **`dio` is valid on the
+ARENA arm** -- the arena force-maps the model as its fill master, so `--lazy-mode on` stays active -- and its edge
+is the drive's O_DIRECT latency (an SN850X-class controller is cheaper than this box's Crucial T500), so the
+choice between it and `buffered` is a measured crossover, not a rule.  The same transports all read 614 chars
+`sha=96533be7cb80`.  Log-only: no default moved, no byte of a read changed.  Gates: `gate-uma-experts.sh`
+**54/0** (the new `mapwarn` / `bufferedwarn` arms: the warning must fire for `mmap` and must not for `buffered`,
+and each arm must take the transport its load mode names; every text arm still `4f29f1e4a4d6`), `validate-set.sh`
+green.  Record: `WORKLOG.md` 261122.004, `INVARIANTS.md` (r344).
+
 ## Block 16 — the server's prompt admission policy (the fair share, `-ib`, the skew, the duty cycle)
 
 > **r329 amendment (docs, no behaviour change): the generated help documents are regenerated.**  Block 16 is the

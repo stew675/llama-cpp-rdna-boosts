@@ -70838,10 +70838,10 @@ index 5605bf7a4..4aef754a5 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..fe5337a9e
+index 000000000..e733051f2
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,13769 @@
+@@ -0,0 +1,13796 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -73465,7 +73465,6 @@ index 000000000..fe5337a9e
 +static bool direct_fill_wanted();
 +
 +static void pool_transport_init_locked(const table_t & t, int64_t planned_pool) {
-+    (void) t;
 +    // TODO #332: the first pool build cannot be inside the `--fit` probe's quiet log scope, so it is one of the
 +    // three points that report what `parse_env()` buffered (a no-op after the first).
 +    env_log_flush();
@@ -73543,6 +73542,34 @@ index 000000000..fe5337a9e
 +                          __func__, pool_transport_name(g_pool_transport), (double) avail / (1024.0 * 1024.0),
 +                          (double) planned_pool / (1024.0 * 1024.0), (double) host / (1024.0 * 1024.0),
 +                          pool_transport_name(g_pool_transport));
++        }
++        // r344 (issue #347 follow-up): the ARENA tier has no host pool, so `planned_pool == 0` and the
++        // memory-tight warning above never fires -- yet a pinned `map` transport is exactly the arm that
++        // turns every arena miss into a `memcpy` out of the pageable model mapping, i.e. GGUF pages that
++        // become MAPPED page cache and are evicted/re-faulted under a memory cap (the cgroup `memory.max`
++        // case in issue #347).  The arena's read transport is `--load-mode`'s decision like any other, so
++        // name the arm and the one that reads straight into a slot.  The arena records its set in the
++        // per-device preflight bytes (its host-pool accumulator is deliberately not built on this tier).
++        const int64_t arena_set = t.device >= 0 && t.device < GGML_CUDA_MAX_DEVICES
++                                    ? g_preflight_device_bytes[t.device] : 0;
++        if (g_gtt_arena && g_pool_transport == POOL_TR_MAP && arena_set > 0) {
++            char budget_note[64];
++            if (g_budget == (size_t) -1) {
++                snprintf(budget_note, sizeof(budget_note), "a -lme budget");
++            } else {
++                snprintf(budget_note, sizeof(budget_note), "%.1f MiB of slots",
++                         (double) g_budget / (1024.0 * 1024.0));
++            }
++            GGML_LOG_WARN("%s: this APU's GTT expert store is the MoE ARENA (%s against a %.1f MiB expert set), "
++                          "and this load PINNED its read transport to the MAPPING (--load-mode "
++                          "mmap/mmap+mlock/mlock).  Every arena miss is then a memcpy out of the pageable model "
++                          "mapping, so the expert pages enter the page cache as MAPPED pages; under a memory cap "
++                          "(a cgroup memory.max, a model larger than RAM) that cache is the only elastic tier, so "
++                          "it churns and each miss is a major fault.  --load-mode buffered keeps the mapped master "
++                          "(so --lazy-mode still works) and reads each miss straight into its arena slot (the "
++                          "direct fill, no bounce and no H2D); --load-mode auto starts on the mapping and falls to "
++                          "that arm on a stall.  The bytes are identical; only the transport differs.\n",
++                          __func__, budget_note, (double) arena_set / (1024.0 * 1024.0));
 +        }
 +        return;
 +    }

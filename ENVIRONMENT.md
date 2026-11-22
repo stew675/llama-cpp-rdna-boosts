@@ -1542,6 +1542,25 @@ streaming** (without it a model whose weights do not fit RAM is refused at load 
 left to swap).  Everything here is inert on a discrete GPU, measured: zero census lines with the env forced on, and
 `scripts/gate-host-pool.sh` 42/42 with the same build.
 
+**The arena's read transport is `--load-mode` (r344, issue #347 follow-up).**  Like any host tier, the arena's
+transport is the load mode §19: `mmap` / `mmap+mlock` / `mlock` **pin** it to the model mapping, so every arena
+miss is a `memcpy` out of the pageable mapping and the expert pages become **MAPPED** page cache.  On a box whose
+page cache cannot hold the set (a cgroup `memory.max`, a model larger than RAM) that is the only elastic tier, so
+it churns.  Measured (`halo`, 44 GiB cap, a 40 925.6 MiB set, `-lme 24`, a 5 298-token prompt + 64 greedy tokens,
+cold page cache): `mmap` **216.7 t/s prefill / 9.7 t/s decode** with 17.4 GiB of mapped GGUF and 16.54 M refaults,
+against `buffered` **265.4 / 18.6** with 0.7 GiB and 4.04 M -- and `-lme 28 buffered` **314.6 / 21.5**.  The
+direct slot fill reads at 4 668 MiB/s where the mapping arm's bounce reads at 1 482 MiB/s, and the text is
+identical.  **`--load-mode buffered` keeps the mapped master, so `--lazy-mode on` still works; `auto` starts on
+the mapping and falls to it on a stall.  `dio` is also viable on the ARENA arm** -- the arena force-maps the model
+as its fill master, so the lazy PLE stays mapped -- and it removes the file-page churn entirely: 3.3 GiB of cache
+and **0 refaults** against ~19.5 GiB and 4.04 M on `buffered`.  On this box's Crucial T500 it read 205.6 t/s
+prefill / 15.7 t/s decode at `-lme 24` (291.8 / 20.4 at 28) against `buffered` 265.4 / 18.6 (314.6 / 21.5),
+because its fills go through the bounce path at 1.9 GiB/s against the direct buffered slot fill at 4.7 GiB/s, and
+its prefill spans read 3.65 GiB/s O_DIRECT against 6.9 GiB/s buffered.  That is **drive-dependent**: O_DIRECT's
+per-read latency is low on an SN850X-class controller, so `buffered` and `dio` are both legitimate and the choice
+is the page-cache room against the drive's O_DIRECT latency; `mmap` is the one to avoid when the set is over the
+page-cache room.  A pinned mapping transport on an arena now prints one WARN naming the arm and the fix.
+
 | variable | default | class | meaning |
 |---|---|---|---|
 | `MOE_EXPERT_GTT` | `1` | **kill-switch** | `0` = no GTT store at all: the delivery's previous behaviour and log, byte for byte |
