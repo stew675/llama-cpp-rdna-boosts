@@ -1,7 +1,7 @@
 From 00a568fba2e756f3d4a36e9f5598f90e4d168584 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 22 Nov 2026 16:04:47 -0600
-Subject: [PATCH 1/2] crash #373 fix (candidate): one apply lock per memory
+Subject: [PATCH 1/3] crash #373 fix (candidate): one apply lock per memory
  GROUP -- the pair's two arms mutate one KV cell map from two threads, which
  is the qwen4exp n_kv abort AND a std::set/tree corruption in
  llama_kv_cache::prepare()'s rollback snapshot; plus set the meta view slot on
@@ -204,7 +204,7 @@ index 7d1b577c2..fabf0a041 100644
 From 7ea83092273d0e738f544949e0dcb3ab0e832c04 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 22 Nov 2026 16:40:11 -0600
-Subject: [PATCH 2/2] crash #373 fix (candidate), part 2: the Meta split-state
+Subject: [PATCH 2/3] crash #373 fix (candidate), part 2: the Meta split-state
  cache is per VIEW SLOT (two co-owner contexts resolved the shared KV's views
  through one rotating unordered_map -- the released build's SIGSEGV in
  ggml-backend-meta.cpp), the view slot is bound for EVERY graph build/alloc
@@ -425,6 +425,335 @@ index 9ab266537..d96b8ec91 100644
  
      // whether this ubatch is the draft context's second graph (the draft step) rather than its ingest /
      // KV-injection graph; the batch kind, not `n_outputs`, is the discriminator for DFlash/DFlash2
+-- 
+2.56.1
+
+
+From eae8c79c09ad68aa3e27ab6ce0d8124ac1dc0aef Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Sun, 22 Nov 2026 17:07:27 -0600
+Subject: [PATCH 3/3] crash #373 fix (candidate), part 3: A -- the VMM pool's
+ peer grant is BEST EFFORT, exactly as the slab's already is
+
+cuMemSetAccess over all peer descriptors in ONE call meant a single refused descriptor (the driver cannot build a
+peer mapping once the MoE arena has taken the VRAM) poisoned the grant and aborted the process; it was invisible
+while one context existed because its pools are grown during load, and the pair adds a SECOND context whose pools
+grow at request time -- measured 'HipVMM Failure: invalid argument' in ggml_cuda_pool_vmm::alloc from mul_mat_q,
+~2 s in, only with the arena on and only with the pair.  Now: grant the OWNER's descriptor alone (located
+explicitly -- the list is in device order, so the owner is not always first), then each peer alone, keep the mask of
+what was granted and the ranges in a registry, and let the copy predicate answer for pool destinations too
+(ggml_cuda_slab_peer_copy_ok -> ggml_cuda_peer_copy_ok, slab AND pool).  A refused peer stages through host memory.
+
+Also: the async-input origin uploads on a private non-blocking stream instead of the cudaStreamPerThread sentinel
+(HIP couples that to the legacy default stream, so a peer arm's capture refuses it: measured as a failed set_input in
+llm_graph_input_ple on the host tier).  Ordering was already carried by events, never by the handle.
+
+Host tier now clean end to end (2 rounds of 71k + 23k + 800-token generation, -ncmoe 48) with the decode context's
+declared reserve raised (MOE_EXPERT_CACHE_AUX_RESERVE_MIB=6144; the flat 3584 MiB is not enough there -- TODO #366
+is a hard blocker for the host tier, not a cost item).  Resident config unchanged: 2 rounds clean, soak gate 11/11.
+---
+ ggml/src/ggml-cuda/ggml-cuda-slab.cu |  11 +-
+ ggml/src/ggml-cuda/ggml-cuda-vmm.h   |  17 +--
+ ggml/src/ggml-cuda/ggml-cuda.cu      | 154 +++++++++++++++++++++++++--
+ 3 files changed, 167 insertions(+), 15 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index 01087b511..d35b157a9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -84,7 +84,7 @@ static bool ggml_cuda_vmm_map_phys(int device, CUdeviceptr addr, size_t aligned,
+     // second and third ~29 GiB slab (no free VRAM left in the peers for the driver to build a 29 GiB peer
+     // mapping), the owner-only retry papered over it, and every peer copy into those slabs then either
+     // returned `invalid argument` or faulted the GPU.  A refused peer keeps owner access only, and copies
+-    // between those devices stage through host memory (see `ggml_cuda_slab_peer_copy_ok`).
++    // between those devices stage through host memory (see `ggml_cuda_peer_copy_ok`).
+     if (cuMemSetAccess(addr, aligned, &access.front(), 1) != cudaSuccess) {
+         (void) cudaGetLastError();
+         (void) cuMemUnmap(addr, aligned);
+@@ -232,7 +232,7 @@ struct ggml_cuda_slab {
+     // grant is best effort: with three ~29 GiB slabs there is no free VRAM left in the peers for the driver
+     // to grant a range that large, and `cuMemSetAccess` refuses it.  A peer copy into a range that was NOT
+     // granted FAULTS the GPU (`HSA_STATUS_ERROR_MEMORY_FAULT`, `__amd_rocclr_copyBuffer`, "Page not
+-    // present"), it does not return an error, so every cross-device copy asks `ggml_cuda_slab_peer_copy_ok`
++    // present"), it does not return an error, so every cross-device copy asks `ggml_cuda_peer_copy_ok`
+     // first and stages through pinned host memory when the grants are incomplete.
+     uint32_t                 peer_mask     = 0;
+     std::map<size_t, size_t> arena_free;        // arena free runs: offset -> size (chunk-aligned)
+@@ -669,10 +669,15 @@ bool ggml_cuda_slab_active(int device) {
+ // a copy fails while ANY live slab's grants are incomplete -- even between two fully granted devices.  A
+ // destination outside every slab is always fine (plain memory peer copies stage inside the driver).
+ // false => stage the copy through pinned host memory.
+-bool ggml_cuda_slab_peer_copy_ok(const void * dst, size_t nbytes) {
++bool ggml_cuda_peer_copy_ok(const void * dst, size_t nbytes) {
+     if (dst == nullptr || nbytes == 0) {
+         return true;
+     }
++    // crash #373: the VMM POOL is the second user of the same grant machinery (a per-context allocation pool is
++    // not part of a slab), so its ranges answer too.  Both answers are required.
++    if (!ggml_cuda_pool_peer_copy_ok(dst, nbytes)) {
++        return false;
++    }
+     std::lock_guard<std::mutex> lock(g_slab_mutex);
+     int      n_live  = 0;
+     uint32_t pending = 0;                         // device ids that have a live slab
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm.h b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+index 7570a3b06..b2253eba7 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm.h
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+@@ -26,13 +26,18 @@ bool   ggml_cuda_slab_configured();
+ // Is the slab live on THIS device?  (The gate can be on while a device failed to create one.)  Used to
+ // keep the generic OOM path from churning the arena, which cannot help under the slab.
+ bool   ggml_cuda_slab_active    (int device);
+-// May `[dst, dst+nbytes)` be the destination of a raw cross-device peer copy?  A peer copy into a slab range
+-// the driver's grants do not cover FAULTS the GPU instead of returning an error (the grant is best effort:
+-// three ~29 GiB slabs leave the peers no free VRAM to build it), and the slab check is process-wide because
+-// a copy fails while ANY live slab's grants are incomplete -- even between two fully granted devices.  A
+-// destination outside every slab is always fine (plain memory peer copies stage inside the driver).
++// May `[dst, dst+nbytes)` be the destination of a raw cross-device peer copy?  A peer copy into a slab OR POOL
++// range the driver's grants do not cover FAULTS the GPU instead of returning an error (the grant is best effort:
++// three ~29 GiB slabs leave the peers no free VRAM to build it), and the check is process-wide because a copy
++// fails while ANY live range's grants are incomplete -- even between two fully granted devices.  A destination
++// outside every slab and pool is always fine (plain memory peer copies stage inside the driver).
++// Covers both VMM users: the movable-boundary slab (ggml-cuda-slab.cu) and the per-context allocation pool
++// (ggml-cuda.cu, crash #373 -- two co-owner contexts own a pool each and grant peers best effort, exactly like
++// the slab, so the same query must know their ranges).
+ // false => stage the copy through pinned host memory.
+-bool   ggml_cuda_slab_peer_copy_ok(const void * dst, size_t nbytes);
++bool   ggml_cuda_peer_copy_ok(const void * dst, size_t nbytes);
++// The pool half of `ggml_cuda_peer_copy_ok` (implemented in ggml-cuda.cu, where the pool lives).
++bool   ggml_cuda_pool_peer_copy_ok(const void * dst, size_t nbytes);
+ // The slab declined because `work estimate + cache floor` does not fit.  The expert cache must then stream
+ // the experts from the host instead of building an arena a wide prefill would have to evict wholesale.
+ bool   ggml_cuda_slab_cache_unusable(int device);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ec5569136..6a45735ed 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1318,6 +1318,87 @@ static ggml_cuda_pool_trace_map & ggml_cuda_pool_trace() {
+     return t;
+ }
+ 
++//
++// crash #373: the VMM POOL's peer-access grants, and the query the cross-device copy paths use.
++//
++// A pool mapping is granted READWRITE to its own device and, BEST EFFORT, to every peer -- the same rule the
++// movable-boundary slab already follows (`ggml_cuda_vmm_map_phys` in ggml-cuda-slab.cu), and for the same measured
++// reason: on a box whose MoE arena has taken nearly all VRAM the driver can refuse to build a peer mapping, and
++// `cuMemSetAccess` then returns `invalid argument`.  The slab learned this the hard way -- granting every descriptor
++// in ONE call meant a single refused peer poisoned the whole grant -- so the rule there is: grant the owner alone,
++// then each peer on its own, keep the mask of what was actually granted, and let the copy path STAGE the pairs the
++// driver refused.  The pool did not do any of that: it granted all descriptors in one call and wrapped it in a
++// CU_CHECK, so a refused grant ABORTED the process.  It was invisible while one context existed (its pools are
++// created and grown during load and the first reserve, before the arena fills); the two-arm server (block 17) adds a
++// SECOND context whose pools grow at request time, when the arena is full -- measured: `HipVMM Failure: invalid
++// argument` in `alloc()` from `mul_mat_q`, ~2 s into the first request, and only with the arena on
++// (`MOE_EXPERT_CACHE_MIB=0` clean) and only with the pair (pair OFF clean).
++//
++// The registry below lets `ggml_cuda_peer_copy_ok()` answer for pool destinations exactly as it does for slabs.
++struct ggml_cuda_pool_peer_range {
++    const void * pool;
++    uintptr_t    base;
++    size_t       size;
++    uint32_t     mask;   // physical devices that hold READWRITE on this range
++};
++
++static std::mutex                            g_pool_peer_mutex;
++static std::vector<ggml_cuda_pool_peer_range> g_pool_peer_ranges;
++
++// Register (or update) one pool's range and grant mask.  `mask` is the intersection of every grant the pool has
++// ever made, so it is pessimistic on purpose: a wrong "yes" faults the GPU, which nothing can catch.
++static void ggml_cuda_pool_peer_register(const void * pool, uintptr_t base, size_t size, uint32_t mask) {
++    std::lock_guard<std::mutex> lock(g_pool_peer_mutex);
++    for (auto & r : g_pool_peer_ranges) {
++        if (r.pool == pool) {
++            r.base = base;
++            r.size = size;
++            r.mask = mask;
++            return;
++        }
++    }
++    g_pool_peer_ranges.push_back({ pool, base, size, mask });
++}
++
++static void ggml_cuda_pool_peer_unregister(const void * pool) {
++    std::lock_guard<std::mutex> lock(g_pool_peer_mutex);
++    for (size_t i = 0; i < g_pool_peer_ranges.size(); i++) {
++        if (g_pool_peer_ranges[i].pool == pool) {
++            g_pool_peer_ranges.erase(g_pool_peer_ranges.begin() + (ptrdiff_t) i);
++            return;
++        }
++    }
++}
++
++// Pool destinations: process-wide and pessimistic, like the slab's answer -- a peer copy fails while ANY live
++// range's grants are incomplete, so every live pool's mask is intersected.
++bool ggml_cuda_pool_peer_copy_ok(const void * dst, size_t nbytes) {
++    if (dst == nullptr || nbytes == 0) {
++        return true;
++    }
++    std::lock_guard<std::mutex> lock(g_pool_peer_mutex);
++    uint32_t pending = 0;
++    uint32_t common  = ~0u;
++    bool     in_pool = false;
++    const uintptr_t lo = (uintptr_t) dst;
++    const uintptr_t hi = lo + nbytes - 1;
++    for (const auto & r : g_pool_peer_ranges) {
++        if (r.base == 0 || r.size == 0) {
++            continue;
++        }
++        pending |= r.mask;
++        common  &= r.mask;
++        if (hi >= r.base && lo <= r.base + r.size - 1) {
++            in_pool = true;
++        }
++    }
++    if (!in_pool) {
++        // outside every pool: nothing here can fault, the slab (or the driver) decides
++        return true;
++    }
++    return (common & pending) == pending;
++}
++
+ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+     static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
+ 
+@@ -1330,6 +1411,9 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+ #if defined(GGML_USE_HIP)
+     std::vector<std::pair<CUdeviceptr, size_t>> mappings;
+ #endif
++    // crash #373: intersection of every peer grant this pool has made (bit per PHYSICAL device).  A refused peer
++    // keeps owner access only; the copy path then stages the copies that pair cannot make (see the registry above).
++    uint32_t peer_mask = ~0u;
+ 
+     explicit ggml_cuda_pool_vmm(int device) :
+         device(device),
+@@ -1338,6 +1422,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+     }
+ 
+     ~ggml_cuda_pool_vmm() {
++        ggml_cuda_pool_peer_unregister(this);
+         if (pool_addr != 0) {
+             if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
+                 g_pool_mapped[device].fetch_sub(pool_size, std::memory_order_relaxed);
+@@ -1426,16 +1511,58 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+                     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                     access_descs.push_back(access);
+                 }
+-                CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, access_descs.data(), access_descs.size()));
++                // crash #373: grant the OWNER first, then each peer ON ITS OWN -- the slab's rule, for the reason the
++                // slab records: one refused peer descriptor poisons a single all-descriptors call, which used to read
++                // as "the pool is broken" and now reads as "stage the copies between these two devices".  A refused
++                // peer keeps owner access only and the mask drops that device (see ggml_cuda_peer_copy_ok).
++                {
++                    GGML_ASSERT(!access_descs.empty());
++                    // the OWNER's descriptor is located explicitly: the list is in device order, so for device 1 and 2
++                    // the owner is not at the front (a peer is), and granting "the front" would grant a peer first --
++                    // and CU_CHECK it, which is the very abort this change removes.
++                    size_t i_own = 0;
++                    for (size_t i = 0; i < access_descs.size(); i++) {
++                        if ((int) access_descs[i].location.id == physical_device) {
++                            i_own = i;
++                            break;
++                        }
++                    }
++                    // owner access is not optional: a range nobody may write is not a range we can serve
++                    CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, &access_descs[i_own], 1));
++                    uint32_t granted = 1u << (uint32_t) physical_device;
++                    for (size_t i = 0; i < access_descs.size(); i++) {
++                        if (i == i_own) {
++                            continue;
++                        }
++                        if (cuMemSetAccess(start_ptr, reserve_size, &access_descs[i], 1) != cudaSuccess) {
++                            (void) cudaGetLastError();
++                            static std::set<std::pair<int,int>> warned;
++                            const int peer_phys = (int) access_descs[i].location.id;
++                            if (warned.insert({ device, peer_phys }).second) {
++                                GGML_LOG_WARN("%s: device %d: peer access to a %.1f MiB pool mapping on device %d was "
++                                        "refused (the arena has taken the VRAM), so copies that pair stages through host "
++                                        "memory; the grant stays best effort, exactly as for the slab\n",
++                                        __func__, device, (double) reserve_size / 1048576.0, peer_phys);
++                            }
++                            continue;
++                        }
++                        granted |= 1u << (uint32_t) access_descs[i].location.id;
++                    }
++                    peer_mask &= granted;
++                }
+             } else {
+-                // set access for non P2P
++                // set access for non P2P: owner only, so no peer copy may target this range (see the registry)
+                 CUmemAccessDesc access = {};
+                 access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                 access.location.id = physical_device;
+                 access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                 CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, &access, 1));
++                peer_mask &= 1u << (uint32_t) physical_device;
+             }
+ 
++            // crash #373: register what was actually granted, before the range becomes allocatable
++            ggml_cuda_pool_peer_register(this, (uintptr_t) pool_addr, pool_size + reserve_size, peer_mask);
++
+             // add to the pool
+             pool_size += reserve_size;
+             if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
+@@ -2028,7 +2155,6 @@ static ggml_cuda_async_input_origin & ggml_cuda_async_input_origin_locked(ggml_c
+     auto it = d.origins.find(key);
+     if (it == d.origins.end()) {
+         it = d.origins.emplace(key, ggml_cuda_async_input_origin()).first;
+-        it->second.stream = cudaStreamPerThread;
+         if (g_async_input_dbg) {
+             fprintf(stderr, "AIN origin: dev=%d key=%llx thread=%llx origins=%zu\n", device,
+                     ggml_cuda_ain_tid(key), ggml_cuda_ain_tid(std::this_thread::get_id()), d.origins.size());
+@@ -2058,6 +2184,22 @@ static bool ggml_cuda_async_input_arm_locked(ggml_cuda_async_input_dev & d, ggml
+             }
+         }
+     }
++    // crash #373: this origin's uploads go on a stream of its OWN, not on `cudaStreamPerThread`.
++    //
++    // The ordering does not depend on the handle: `ev`/`flush_ev` are recorded where the work is issued and every
++    // consumer waits on the EVENT (see the note on `ggml_cuda_async_input_origin`).  What the sentinel DID do is
++    // couple these uploads to the legacy default stream, and HIP refuses an operation on that stream while ANOTHER
++    // thread has a capture in flight -- the two-arm server (`--prefill-decode-arms`, block 17) captures on one arm
++    // while the other arm stages inputs, and the failure surfaces as `operation not permitted when stream is
++    // capturing` -> `operation failed due to a previous error during capture` on the next kernel launch.  Measured
++    // on the 3-device `-sm tensor` pair (host tier, `-ncmoe 48`, ~86 s in) as a failed `set_input` in
++    // `llm_graph_input_ple`.  A private non-blocking stream is invisible to the peer's capture.
++    // Leaked at exit like this origin's events (there is no origin teardown; bounded by the thread count).
++    if (o.stream == nullptr && cudaStreamCreateWithFlags(&o.stream, cudaStreamNonBlocking) != cudaSuccess) {
++        (void) cudaGetLastError();
++        o.stream = nullptr;
++        return false;
++    }
+     if (o.ev == nullptr && cudaEventCreateWithFlags(&o.ev, cudaEventDisableTiming) != cudaSuccess) {
+         (void) cudaGetLastError();
+         o.ev = nullptr;
+@@ -2643,7 +2785,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
+ #ifdef GGML_CUDA_NO_PEER_COPY
+             return false;
+ #else
+-            if (!ggml_cuda_slab_peer_copy_ok(dst->data, ggml_nbytes(src))) {
++            if (!ggml_cuda_peer_copy_ok(dst->data, ggml_nbytes(src))) {
+                 ggml_cuda_peer_copy_staged(src_ctx->device, cudaStreamPerThread,
+                                            dst_ctx->device, cudaStreamPerThread,
+                                            dst->data, src->data, ggml_nbytes(src));
+@@ -8550,7 +8692,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+ // peer mapping, and `cuMemSetAccess` returns `invalid argument`).  The failure is not catchable: without
+ // peer access enabled HIP returns an error host-side, and with `GGML_CUDA_P2P=1` the copy is issued and the
+ // GPU FAULTS (`HSA_STATUS_ERROR_MEMORY_FAULT` in `__amd_rocclr_copyBuffer`, "Page not present"), which
+-// kills the process.  So the copy path asks `ggml_cuda_slab_peer_copy_ok` first and stages the copy through
++// kills the process.  So the copy path asks `ggml_cuda_peer_copy_ok` first and stages the copy through
+ // pinned host memory for the pairs the driver refused.
+ //
+ // One grow-only buffer and one done-event per (src, dst) pair.  The D2H runs on the source stream and the
+@@ -8665,7 +8807,7 @@ static bool ggml_backend_cuda_cpy_tensor_async_impl(ggml_backend_t backend_src,
+             return false;
+ #else
+             // a peer copy the driver's grants do not cover faults the GPU, so ask first
+-            if (!ggml_cuda_slab_peer_copy_ok(dst->data, ggml_nbytes(dst))) {
++            if (!ggml_cuda_peer_copy_ok(dst->data, ggml_nbytes(dst))) {
+                 ggml_cuda_peer_copy_staged(cuda_ctx_src->device, cuda_ctx_src->stream(),
+                                            cuda_ctx_dst->device, cuda_ctx_dst->stream(),
+                                            dst->data, src->data, ggml_nbytes(dst));
 -- 
 2.56.1
 

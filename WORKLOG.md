@@ -1,3 +1,84 @@
+## 261122.034 (no delivery change) -- crash #373 part 3: the VMM pool's peer grant made best-effort (the slab's own rule), and the answer to "why does the single-context path not hit this?"
+
+**No delivery patch changed, no tag.**  Continues `261122.033` on the maintainer's instruction ("implement A", and
+"consider whether the non-two-arm approach's pre-allocation is cleaner").  Both configurations now run clean end to end
+on the scratch branch (`~/llama.cpp` `crash373-fix`, exported as `wip/prefill-decode-arms-followups/repro-373/
+FIX-candidate-373.patch`, now 3 commits, 373 insertions, 9 files).
+
+### A: the peer grant is best effort, which the slab already knew
+
+`ggml_cuda_pool_vmm::alloc` granted **every** peer descriptor in ONE `cuMemSetAccess` call and wrapped it in a
+`CU_CHECK`.  On a box whose MoE arena has taken the VRAM the driver refuses to build a peer mapping, so that call
+returns `invalid argument` and the process aborts -- measured as `HipVMM Failure: invalid argument` in `alloc()` from
+`mul_mat_q`, ~2 s into the first request, **only with the arena on** (`MOE_EXPERT_CACHE_MIB=0` clean) and **only with
+the pair** (pair OFF clean).
+
+The appliance for it already existed: `ggml_cuda_vmm_map_phys()` (the slab's mapper) grants the **owner alone, then each
+peer on its own**, keeps the mask of what was granted, and lets the copy path **stage** the pairs the driver refused --
+with a comment recording exactly this bug from the slab's own history ("one refused peer descriptor would otherwise
+poison the whole call").  The pool never got that treatment.  So A is:
+
+* grant the owner's descriptor alone (located **explicitly** -- the list is in device order, so for devices 1 and 2 the
+  owner is not at the front; my first cut granted "the front" and CU_CHECKed a peer, i.e. reproduced the abort),
+* then each peer alone, best effort: a refusal clears the error, warns once per (device, peer), and drops that device
+  from the pool's `peer_mask` (intersection over every growth),
+* register the pool's `[base, size)` + mask in a process-wide registry, and teach the copy predicate about it: the
+  slab's `ggml_cuda_slab_peer_copy_ok()` becomes **`ggml_cuda_peer_copy_ok()`** and answers for slabs **and** pools
+  (process-wide and pessimistic, exactly as the slab's does -- a wrong "yes" faults the GPU, which nothing catches).
+  A refused pair now stages through pinned host memory instead of aborting.
+
+**And one more of the same class, found on the way:** the async-input ring's origins uploaded on `cudaStreamPerThread`,
+the sentinel HIP couples to the legacy default stream, so a *peer arm's* capture refused them -- measured on the host
+tier as a failed `llm_graph_input_ple::set_input` at ~86 s (`operation failed due to a previous error during capture`,
+then the next kernel launch failed).  The origin now owns a **private non-blocking stream**: the ordering was already
+carried by events, never by a stream handle (see the note on `ggml_cuda_async_input_origin`), so nothing else changes.
+
+### Why the single-context path does not hit it, and whether its approach is cleaner
+
+**It is not pre-allocation of the *buffers*, it is when the *grants* are attempted -- and the pool's grant policy was
+simply inconsistent with the slab's.**  Concretely:
+
+* One context grows **one** set of pools, during load and the first reserve.  The pair grows a **second** set at
+  *request* time (the decode arm's first step), after the arena has taken the VRAM.  Same free-VRAM figure at both
+  moments (~2.8 GiB measured), which is why "more free VRAM" is not the fix: the refusal is HIP declining to build a
+  peer mapping on a nearly-full device, and the *order* of grants decides who gets one.
+* The slab has lived with that for months: its grants are best effort and the copy path stages.  The pool had no such
+  path, so the *pair* only exposed the inconsistency.  Any later pool growth on a full box -- a new ubatch width, a
+  wider verify batch, a third context -- would abort even with perfect timing, so A is the correctness fix regardless.
+
+**Sharing the single context's buffers with the decode arm is not viable**, and that is structural rather than
+timing: the two arms compute **concurrently** with different shapes (a 2048-token prefill vs a 3-token decode), so their
+compute buffers must be separate or they overwrite each other's graphs -- which is exactly why block 17 creates a second
+context and shares only the **KV cache**.  What the non-pair path *does* have and the pair should borrow is its
+**timing discipline**: declare the second context's needs before the arena claims the space.  That is r346's
+`MOE_EXPERT_CACHE_AUX_RESERVE_MIB` (`SLAB_INIT ... aux=`), and on this shape it is now the host tier's last blocker --
+see below.  It is B in `261122.033`, and it is a **performance/headroom** work item (it keeps peer copies direct
+instead of staged), not a correctness one, once A is in.
+
+### Validated
+
+| arm | result |
+|---|---|
+| **fully resident** (94 GB on the cards), 3 slots, 71 231 + 22 940 tokens + an 800-token generation, 2 rounds | **all OK**, 0 asserts, 0 `ROCm error`, 0 HipVMM, 0 OOM |
+| **host tier** (`-ncmoe 48`, `-c 131072`, arena 13.3 GiB, `MOE_EXPERT_CACHE_AUX_RESERVE_MIB=6144`), same workload, 2 rounds | **all OK** -- `aux=6.00 GiB` at `SLAB_INIT`, no OOM; the first round also **survived 6 refused peer grants** and served every request by staging (`A-hosttier2.log`) |
+| `scripts/gate-arms-soak.sh soak --quick` on the final build | **PASS 11/11**, text oracle and GPU-fault check included |
+
+**The host tier is not clean at r346's flat 3584 MiB**: with `MOE_EXPERT_CACHE_AUX_RESERVE_MIB` left at the default the
+decode arm's **post-prefill** re-reserve (1430-1436 MiB on device 0) cannot be allocated next to the arena
+(`graph_reserve: failed to allocate compute buffers` -> `failed to allocate graph`), at both `-c 204800` and
+`-c 131072`, and a smaller arena (8-13 GiB) does not help.  **`TODO` #366 is therefore a hard blocker for the host
+tier, not a "cost" item** -- and the derived form it asks for (estimate from the decode width, flat value as the floor)
+is what would have avoided the manual 6144.  Note the ordering hazard that campaign already recorded is live here:
+`ggml_cuda_slab_set_aux_reserve()` takes the value of the LAST preflight.
+
+### Owed
+
+1. the maintainer's **block decision** (block 17 amendment -- agreed as the target);
+2. `TODO` #366 (the derived decode reserve) to make the host tier work without the manual 6144;
+3. `TODO` #365 (the meta-aware device copy for the state handover) -- next, and independent;
+4. the owed **gate arm** (`repro-373/` is its skeleton), `scripts/validate-set.sh` +
+   `scripts/check-rung-file-sets.py` on the regenerated block, and the fix's own gates, once the block is cut.
+
 ## 261122.033 (no delivery change) -- crash #373, the FIX: three defects in the pair's shared state, all three written and validated on the maintainer's own shape; the host tier is blocked on a fourth (a VMM peer-grant abort)
 
 **No delivery patch changed, no tag.**  Continuation of `261122.032`, on the maintainer's instruction to do the *true*

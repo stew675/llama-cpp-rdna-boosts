@@ -503,6 +503,33 @@ same caches).  The two padded extents then differ whenever the movement crosses 
 for a prompt ubatch), which is why this is rare and why it needs a large prefill plus a request boundary: the boundary is
 when the decode arm gains a sequence and starts applying, and 70K of cells is what puts `used` next to an 8192 multiple.
 
+### UPDATE 2026-11-22 (late): BOTH configurations clean -- the fourth defect (the VMM pool's peer grant) fixed
+
+`WORKLOG.md` 261122.034.  Adding to the three fixes below:
+
+4. **The VMM pool's peer grant is best effort**, exactly as the slab's has been since it hit the same wall.  `alloc()`
+   granted every peer descriptor in ONE `cuMemSetAccess` and `CU_CHECK`ed it, so one refused descriptor (the driver
+   cannot build a peer mapping once the arena has taken the VRAM) aborted the process -- the host tier's
+   `HipVMM Failure: invalid argument` at ~2 s, pair-only and arena-on only.  Now: owner alone (located explicitly),
+   then each peer alone, a per-pool `peer_mask`, ranges in a registry, and the copy predicate widened from
+   `ggml_cuda_slab_peer_copy_ok()` to **`ggml_cuda_peer_copy_ok()`** covering pools too, so a refused pair stages
+   through pinned host memory.  **And** the async-input origin uploads on a **private non-blocking stream** instead of
+   the `cudaStreamPerThread` sentinel (HIP couples that to the legacy default stream, so a peer's capture refused it --
+   measured as a failed `llm_graph_input_ple::set_input` on the host tier).  Ordering was already event-carried.
+
+| configuration | result |
+|---|---|
+| fully resident, 3 slots x (71k + 23k + 800-token gen), 2 rounds | clean |
+| host tier `-ncmoe 48 -c 131072`, arena 13.3 GiB, `MOE_EXPERT_CACHE_AUX_RESERVE_MIB=6144`, 2 rounds | clean (`aux=6.00 GiB`); one earlier round survived **6 refused peer grants** by staging |
+| `gate-arms-soak.sh soak --quick` | PASS 11/11, text oracle included |
+
+**`TODO` #366 is now a hard blocker for the host tier**: at r346's flat 3584 MiB the decode arm's post-prefill
+re-reserve (1430 MiB) cannot be allocated next to the arena, at both `-c 204800` and `-c 131072`; 6144 MiB is clean.
+This is the maintainer's "is the non-pair approach's pre-allocation cleaner?" question, answered: the non-pair path is
+not pre-allocating *buffers* (the two arms must own separate compute buffers -- they compute concurrently with different
+shapes), it simply attempts its grants and its reserves **before** the arena claims the space.  What the pair should
+borrow is that *timing discipline* (`#366`'s derived reserve), not the buffers.
+
 ### UPDATE 2026-11-22 (evening): the THREE fixes, and the one the host tier still needs
 
 `WORKLOG.md` 261122.033.  Implemented on the scratch branch (`~/llama.cpp` `crash373-fix`), exported for review as
