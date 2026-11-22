@@ -21,7 +21,7 @@ started.
 | task | state |
 |---|---|
 | **T1 — the state handover** | **DONE.** `enabling-0002-recurrent-handover.patch`: one sequence's recurrent state moves between the arms **device-to-device in 0.45–0.66 ms** (1.9–2.3 ms on a process's first handover) against **34.5–36.1 ms** for the serialised path (52.7 MiB).  Text-exact on a no-host-tier 4B in every mode/repetition and on the 35B host tier for a single handed-over request (3/3 warm reps) |
-| **T2 — the server skeleton** | **NEXT.**  Its design is measured outside the server (the instrument below) and written out in code points: `RESULTS-2026-11-21.md` §5.  T0 landed, so the prefill/decode pair can share cells safely |
+| **T2 — the server skeleton** | **NEXT, and scoped**: [`T2-SERVER-CUT.md`](T2-SERVER-CUT.md) has the cut in verified code points (contexts, the handover/return, the step to factor, ownership, guards, the gate).  Its design is measured outside the server (the instrument below) and written out in code points: `RESULTS-2026-11-21.md` §5.  T0 landed, so the prefill/decode pair can share cells safely |
 | **T3 — the request-boundary handover + its oracle** | The handover is built and exercised in the instrument; **the oracle is now measured, not hypothesised** — see §3, T3, and [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) |
 | **T4 — the opt-in gate** | Not started; its two rules are now measured (VRAM per slot width, the allocator) |
 | **T5 — measurement + gates** | Not started (the instrument's numbers are the target T5 must beat) |

@@ -268,7 +268,8 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 |---|---|
 | this `README.md` | the campaign: idea, established evidence, design, landmines, tasks, gates, open questions |
 | [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md) | **pass 1**: T1 done and measured, the emulated T2/T3 and the product numbers, the three new landmines, the server cut in code points |
-| [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) | **pass 2**: the §3.4 residual is two effects (hipBLASLt at full residency, a §89 residency class on the tier); the cell censuses that prove the two-cursor scatter and that the arms match the reference exactly with the pin + one allocation state |
+| [`T2-SERVER-CUT.md`](T2-SERVER-CUT.md) | the server cut, scoped against the real `server-context.cpp` (contexts, handover/return, the step to factor, ownership, guards, the two-tier gate) |
+| [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) | **passes 2-3**: the §3.4 residual is two effects (hipBLASLt at full residency, a §89 residency class on the tier); the cell censuses that prove the two-cursor scatter and that the arms match the reference exactly with the pin + one allocation state |
 | [`enabling-0001-second-context-shared-kv.patch`](enabling-0001-second-context-shared-kv.patch) | the second context that shares the first one's KV (text-verified, applies to `release.json`'s tree) |
 | [`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch) | **T1**: the recurrent-state handover, device to device (+ `seq_rm_recr`, `RECR_ONLY`) |
 | [`arms/two_arms.cpp`](arms/two_arms.cpp), [`arms/build-two-arms.sh`](arms/build-two-arms.sh) | the instrument: two arms, two threads, one KV, a request queue and the handover; references `single` / `batch-pair` / `pf-alone` / `dec-alone` |
