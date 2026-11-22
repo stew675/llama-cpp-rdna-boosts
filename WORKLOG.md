@@ -1,3 +1,38 @@
+## 261122.019 (r343, no delivery change) -- wip/prefill-decode-arms pass 14: the decode context is DECLARED like a draft (host tier works with no knob); the pair still reserves ~2.2x the shipped path, and why
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
+`wip/prefill-overlap` (clean).  Record: `wip/prefill-decode-arms/RESULTS-2026-11-22.md` pass 14.
+
+The maintainer asked whether the two-arm mode should differ from the shipping mode in memory allocation at all, and
+whether the original allocation path was the best one.  Measured answer:
+
+* **Shipping is not exposed**: one `llama_context` -> one scheduler -> one compute-buffer reserve that covers BOTH
+  layouts up front (`graph (pp bs=2048, tg bs=2)` = 1504.83 MiB), so a decode step -- one slot or many -- allocates
+  nothing new.  Concurrency there is more ROWS in an already-reserved graph.
+* **The shipped second context is declared**: an MTP draft sets a flat 3584 MiB second-context reserve BEFORE the slab
+  (`SLAB_INIT reserve=5.00 GiB headroom=1.50 aux=3.50 va_spare=3.50`), and pins its compute as narrow-2.  Verified
+  working on the same 1-GPU `-ncmoe 48` shape.
+* **The pair did the opposite**: its decode context (a second 1792.00 MiB reserve) arrived after the slab with nothing
+  declared (`aux=0`, `va_spare=0`), so the arena committed the VRAM and the first decode step could not allocate.  The
+  tg layout is also reserved **twice** -- inside the prefill context's 1504.83 MiB and again standalone.
+
+**Fixed (auto, no operator input):** `common_draft_reserve_derive()` charges a second-context reserve for the pair
+(flat 3584 MiB, the same constant an embedded MTP head uses; no KV term, one shared cache), charged only when the pair
+will run (`prefill_decode_arms != 0 && n_parallel >= 2` and the model has host experts, so fully resident shapes and
+`-np 1` are untouched).  `MOE_EXPERT_CACHE_AUX_RESERVE_MIB` overrides it, a manual `GGML_CUDA_SLAB_RESERVE_MIB` still
+wins, and it is documented on `--prefill-decode-arms`' help text for the manual path.  Verified with an auto arena and
+no knob: Flash-Next 1 GPU layer `h=0.78` PASS and 3 GPU tensor `h=0.85` PASS, text identical to the single context on
+both (they needed 4096 / 8192 MiB of explicit reserve before).  A partial declaration is not enough (aux 2048 ->
+reserve 3.50 GiB still failed; 4.00 GiB passed), which pins the mechanism to reserve = graph + slack.
+
+**Recorded, not implemented (the follow-up the question earned):** the pair reserves ~2.2x the shipped path's compute
+buffers (3296.83 vs 1504.83 MiB) because the tg layout is duplicated, and the second copy is late.  The shipping
+pattern (one reserve, both layouts, sized before the slab) is right; the two contained ways there are (do not
+duplicate the layout / reserve both contexts before the slab) both touch `llama_context`'s reserve path, so the shipped
+single-context behaviour is in the blast radius -- a maintainer decision.  The KV allocation handshake (T0) is *not*
+redundant: two contexts sharing one cell map need one allocation owner, and the shipped path needs no arbitration
+because it has one owner.
+
 ## 261122.018 (r343, no delivery change) -- wip/prefill-decode-arms pass 13: on a HOST TIER the pair needs `GGML_CUDA_SLAB_RESERVE_MIB` (capacity, not state) -- Flash-Next 1/2/3-GPU + `-ncmoe 48`
 
 **No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp` `423c91619`
