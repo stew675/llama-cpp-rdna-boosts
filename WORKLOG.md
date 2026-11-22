@@ -1,3 +1,76 @@
+## 261122.035 (no delivery change) -- `TODO` #366 DONE (the pair's slab reserve derived from the ubatch width), plus the capture class closed for every synchronous host path
+
+**No delivery patch changed, no tag.**  Continues `261122.034`; the fix is still on the scratch branch
+(`~/llama.cpp` `crash373-fix`, exported as `wip/prefill-decode-arms-followups/repro-373/FIX-candidate-373.patch`,
+now 4 commits, 489 insertions, 10 files).  `TODO` #366 is **closed** (its row and detail are removed from `TODO.md`,
+which is forward-looking only).
+
+### 1. The capture class, closed everywhere (not just in the input ring)
+
+`261122.034` moved the async-input ring's origins onto a private stream.  The host tier then failed again, in the
+**synchronous** host paths: `llm_graph_input_ple::set_input` -> `set_tensor` -> `cudaMemcpyAsync(..., cudaStreamPerThread)`
++ `cudaStreamSynchronize(cudaStreamPerThread)`.  `cudaStreamPerThread` is HIP's sentinel for the **legacy default
+stream**, which a peer context's graph capture claims device-wide, so the copy is refused
+(`operation not permitted when stream is capturing`) and every launch after it fails.  53 sites across the set/get
+tensor paths, memset, the bounce and peer-staging copies and the KV-region row moves did that.
+
+**Fix:** `ggml_cuda_host_stream()` -- one private non-blocking stream per **(thread, device)** -- is now the stream every
+synchronous host path uses, and the async ring's origin shares it, so the ordering the sentinel used to provide (a
+`get_tensor` syncs the stream that a queued upload will run on) is preserved exactly.  Two arms no longer serialise each
+other's uploads either.  This is the last of the capture class: with it in place the host tier runs its full workload
+with `ROCm error` count **0**.
+
+### 2. `TODO` #366: the reserve is derived, and the derivation is a WIDTH
+
+The pair's decode context arrives after the slab, so it is charged a reserve (`MOE_EXPERT_CACHE_AUX_RESERVE_MIB`,
+declared before the slab maps its VA).  That was a flat **3584 MiB**, and the host tier failed ~88 s in with
+`graph_reserve: failed to allocate compute buffers` -> `failed to allocate graph`: the pair creates a **second** late
+narrow (decode/verify-width) view -- the prefill arm's **post-prefill re-reserve** (`process_ubatch`'s drop path), which
+lands after the arena has been re-armed -- and the flat reserve did not cover it.
+
+Measured on the maintainer's model (`Qwen3.8-Flash-Next`, `-ncmoe 48`, `-c 131072`, arena 13.3 GiB, 3 x R9700,
+3 slots, 71 231 + 22 940 tokens + an 800-token generation, two rounds per point):
+
+| `MOE_EXPERT_CACHE_AUX_RESERVE_MIB` | result |
+|---|---|
+| 3584 (the flat value) | **fails** ~88 s in, on the post-prefill narrow re-reserve |
+| 4096 | fails, same place |
+| **5120** | **CLEAN** |
+| 6144 (the manual workaround `261122.034` used) | clean |
+
+Both late views are the same tier -- 1430.16 MiB (the decode context's first reserve, already recorded in the code) and
+1430.63 MiB (the post-prefill re-reserve) -- which is why one extra tier on top of the flat floor is what covers them.
+`common_arms_dec_reserve()` now returns **flat 3584 + a width-keyed tier**: `0` at `-ub <= 1024` (a narrow graph is
+small enough that the flat reserve still covers both views -- the pre-#366 behaviour, kept so a small model or a narrow
+ubatch is not charged 1.5 GiB of arena for nothing), **1536 MiB at `-ub >= 2048`**, plus the +256 MiB per doubling the
+draft path already measured for a wider graph.  `MOE_EXPERT_CACHE_AUX_RESERVE_MIB` still wins outright.
+
+**Validated, no knob:**
+
+| configuration | result |
+|---|---|
+| host tier (`-ncmoe 48 -c 131072`, arena 13.3 GiB, `-ub 2048`), same 3-slot workload, 2 rounds | **clean**; the log prints `slab reserve for the PREFILL-DECODE ARMS' decode context: 5120 MiB ... (MOE_EXPERT_CACHE_AUX_RESERVE_MIB overrides)` and `SLAB_INIT ... aux=5.00 GiB` |
+| fully resident, same workload, 2 rounds | clean (`aux` not charged -- there is no arena to sit beside) |
+| `scripts/gate-arms-soak.sh soak --quick` | **PASS 11/11** (text oracle and GPU-fault check included) |
+
+### 3. Found and recorded, not fixed: the gate's `pool` arm is VACUOUS
+
+`scripts/gate-arms-soak.sh pool` fails its own non-vacuity check -- *"the run reached the expert cache (no
+expert-access/teardown census)"* -- **both with the new derived reserve and with
+`MOE_EXPERT_CACHE_AUX_RESERVE_MIB=3584` forced back**, i.e. it pre-dates this change.  The other six checks pass
+(the pair starts, `decline_all=0` / `broken=0 repaired=0`, text equals the single context's, no GPU faults).  So the
+arm proves nothing today; it is recorded as a `TODO` row rather than waved through, and it wants the census (or the
+arm's config) repaired before it is relied on.
+
+### 4. Where the fix stands
+
+Five defects, all found by driving the maintainer's own shape, all fixed on the scratch branch: the **KV cell map**
+(apply lock), the **Meta split-state cache** (per view slot), the **async-input ring** (stream choice + per-origin waits),
+the **VMM pool's peer grant** (best effort, with pool ranges in `ggml_cuda_peer_copy_ok()`), and the **synchronous host
+paths'** default-stream coupling.  Plus `#366` as the reserve derivation.  **Owed:** the maintainer's block-17 amendment
+go-ahead, the owed gate arm (`repro-373/` is its skeleton), and `#365` (the meta-aware device copy for the state
+handover), which is the last open item of the block-17 queue.
+
 ## 261122.034 (no delivery change) -- crash #373 part 3: the VMM pool's peer grant made best-effort (the slab's own rule), and the answer to "why does the single-context path not hit this?"
 
 **No delivery patch changed, no tag.**  Continues `261122.033` on the maintainer's instruction ("implement A", and
