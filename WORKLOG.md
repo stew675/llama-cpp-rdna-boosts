@@ -1,3 +1,51 @@
+## 261122.015 (r343, no delivery change) -- wip/prefill-decode-arms pass 10: the P0 is TWO memory-module defects, both fixed (`hybrid_idx` never shared its caches; a restore moved cells behind the derived indexer pool)
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
+`wip/prefill-overlap` **`acd705146`** (6 files, +169/-14, clean tree).  Full record:
+`wip/prefill-decode-arms/RESULTS-2026-11-22.md` pass 10; `HANDOVER.md` §6 is now "RESOLVED".
+
+**The P0 is reproduced, root-caused and closed.**  On the maintainer's shape (Qwen3.8-Flash-Next IQ4_NL, `-sm tensor`
+on 3 GPUs, `--kv-unified --parallel 3 -c 204800`) a single **82 615-token** request (five attached files + "perform a
+code review") was answered as if the model had seen nothing, arms only; `prompt_n` reported the whole prompt because
+the *prefill* arm's own cache really had it.  Two defects, both in the memory module:
+
+1. **`qwen4exp`'s context never shared anything.**  Its memory is `llama_memory_hybrid_idx` (attention KV + recurrent
+   state + lightning-indexer KV) and `create_memory()` passed `mem_other` to the plain `llama_memory_hybrid` branch
+   **only**, so the decode arm allocated its own attention KV *and* its own indexer KV while the server printed
+   `KV shared, one allocation owner`.  The engine had said so on every run:
+   `W create_memory: ... this architecture's memory module implements no shared view -- this context has its OWN cache
+   (qwen4exp)`.  Fix: `hybrid_idx` takes `mem_other` and wires **both** children (the base's attention sharing plus the
+   indexer cache's own `other` + identity layer-share + `other_coowner`), `alloc_sync()` covers the indexer cache's
+   allocation owner, the layer-share log line tolerates a keys-only layer (`v == nullptr` — it segfaulted on the first
+   shared layer), and `mem_other_used` is set at both `hybrid_idx` sites so the warning can no longer lie.
+2. **A checkpoint restore moved cells behind the derived indexer pool.**  qwen4exp pools consecutive *cells*, the pool
+   is per *context*, and a restore re-places the sequence: a `cache_prompt` repeat read `cache_n=6898` and answered
+   without the prefix it had just reused.  Fix: the handover notes it on the **destination**
+   (`llama_memory_seq_state_take()` -> `llama_memory_hybrid_idx::seq_state_take_note()` -> `mem_idx_stale_set(seq_id,
+   0)`), so the receiving arm re-pools from the shared raw indexer keys (one re-pool on the next batch, TTFT not ITL).
+
+**Ruled out by measurement, not argument** (so the next session does not re-derive it): not phantom prefix reuse (it
+failed on a fresh request, `cache_n=0`); not the Meta/serialised state move (`LLAMA_RS_VERIFY_TAKE=1` re-reads the
+destination and diffs it against the source: **0 of 118 039 420 bytes differ, FAITHFUL**; and forcing the serialised
+move on a 1-GPU shape that has a device copy gives correct text); not the meta path at all (`-sm layer` failed
+identically before the fix, and a 4B plain hybrid passes at 82K on `-sm tensor`).  The cheapest reproducer is
+Flash-Next at **11K tokens** (~40 s); the 4B at 82K is the control that exonerates length.
+
+**Verified after the fix, maintainer's shape, greedy:** arms OFF and arms ON both report the codename at the head of
+FILE 1 and review all five files, and their generated `content` is **byte-identical**; a `cache_prompt` repeat that
+restores checkpoint 6898 is now correct too; `-sm layer` passes; the plain-hybrid shapes (4B r1+r2) are untouched.
+
+**Two box landmines recorded** (they cost most of the session and read as defects in the change under test): exporting
+`TEMP` to a GPU process breaks the ROCm 10.1 runtime (`TEMP=0` -> `hipStreamCreateWithFlags failed` -> "out of
+memory" at context creation), and `kill -9` on a `timeout` wrapper leaves the server alive while `rocm-smi` shows the
+VRAM free (the leaked server answers `/health` and becomes the arm you think you are driving).
+
+**Still owed (promotion package, the maintainer's call):** the arms-aware fairness/duty gate criteria, a long
+multi-turn soak, a dense fork arm, a server-side `gate-host-pool` arm, `validate-set.sh` + `ENVIRONMENT.md` for the
+option, the `off` -> `auto` default flip, the measured cost of the post-handover re-pool, a `GLM5-Next` check (same
+memory module, no checkpoint on this box), and the 4-slot WebUI run.  The meta-aware device copy stays the follow-up
+campaign's item and is now purely a cost (~74.6 ms per `-sm tensor` boundary), since the move is proven faithful.
+
 ## 261122.014 (r343, no delivery change) -- wip/prefill-decode-arms pass 9: THREE `-sm tensor` crashes found and fixed; ONE P0 OPEN BUG (a ~70K-token prompt is invisible except its tail, arms only); HANDOVER.md rewritten for a cold session
 
 **No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  The maintainer took the

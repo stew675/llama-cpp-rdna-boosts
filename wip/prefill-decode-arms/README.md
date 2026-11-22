@@ -1,11 +1,20 @@
 # prefill-decode-arms — one prefill arm and one decode arm, both live on one GPU
 
-**Status: pass 9 (2026-11-22) — opt-in only, and there is ONE OPEN P0.**  `-sm tensor` is now crash-free (three crashes fixed: the take's null-buffer views, a serialised-state-move fallback for a buffer type with no device copy, and a process-global meta view-slot selector that raced between the two arms).  **Open P0**: on the maintainer's Flash-Next `-sm tensor` shape a ~70K-token prompt (5 attached files + a question) is answered as if only its tail were present, arms only — `HANDOVER.md` §6 has the ranked hypotheses and the four tests.  **Scope: this campaign ships opt-in; the meta-aware device copy and speculative decoding are a follow-up campaign.**  T0, T1, **T2** and the **reverse handover** (prefix reuse) are CLOSED: `llama-server --prefill-decode-arms` is the design
-(prefill arm + decode arm on one shared KV, a slot crossing only at a request boundary), **tier 1 passes cold and
-over 3 warm request pairs** (both slots byte-identical to the single-context server, every allocation handshake
-clean), and the campaign's metric is measured: **~47-49 ms ITL p50 / 64-78 ms p95 through a 2.0-5.3 s prefill** at
-**-24 to -27 % prefill** (the smoothness target is met, the <= ~14 % cost target is not — pass 5 §6).  Nothing in
-`patches/`.**  **The interactive number** (`arms/interactive.py`: a reply streaming while another chat pastes a
+**Status: pass 10 (2026-11-22) — opt-in only, and the P0 is CLOSED.**  `llama-server --prefill-decode-arms` is the
+design (a prefill arm + a decode arm on one shared KV, a slot crossing only at a request boundary).  The last open
+blocker — on Qwen3.8-Flash-Next (`qwen4exp`) a ~70K-token prompt with five attached files answered as if the model
+had seen nothing — was **two memory-module defects**, both fixed in `~/llama.cpp` `acd705146`: `hybrid_idx` contexts
+never received the shared view they claimed (`create_memory()` passed `mem_other` to the plain-hybrid branch only, so
+the decode arm ran on an empty attention **and** indexer cache), and a checkpoint restore moved a sequence's cells
+behind the pair's derived indexer pool (a `cache_prompt` repeat could not see the prefix it had just reused).  On the
+maintainer's shape the 82 615-token request now reads all five files and its `content` is **byte-identical** to the
+single-context server; `-sm layer` passes too, and the plain-hybrid shapes are untouched
+([`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) pass 10).  **Scope: this campaign ships opt-in; the meta-aware
+device copy and speculative decoding are a follow-up campaign.**  T0, T1, **T2**, the **reverse handover** (prefix
+reuse) and **T8/T9** are CLOSED; **tier 1 passes cold and over 3 warm request pairs** (both slots byte-identical to
+the single-context server, every allocation handshake clean), and the campaign's metric is measured: **~47-49 ms ITL
+p50 / 64-78 ms p95 through a 2.0-5.3 s prefill** at **-24 to -27 % prefill** (the smoothness target is met, the
+<= ~14 % cost target is not — pass 5 §6).  Nothing in `patches/`.  **The interactive number** (`arms/interactive.py`: a reply streaming while another chat pastes a
 3600-token document): single-context **TTFT 4.46 s at 797 t/s and the reply drops to 23-36 tokens/s for 5 s with
 300-390 ms stalls**; two arms **2.81 s at 1252 t/s and the reply's worst gap is 95 ms** — and since **r343** the pair
 fits with no env knob (the slab headroom default).  See [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) (passes 2-5 + the post-rebase note) and
@@ -173,6 +182,7 @@ line reads *smoothness delivered, cost accepted*, and the cost is **not** an ope
    several steps at every size the cost is **flat at -21…-24 %** and the ubatch buys *absolute* prefill rate
    (`lone` +29 % from 2048 to 8192).  **`-ub`/`-b` 4096 is the sweet spot**; 8192 adds +8 % prefill for a worse tail
    (p95 63.5 / max 124.5 ms against 50.2 / 95.1).  Do not reach for `-ib`.
+9. ~~**The arms path does not reuse a slot's prefix across requests**~~ — see landmine 10.
 9. **A greedy hash is not an oracle for the two arms yet** (`RESULTS-2026-11-21.md` §3.3): the cold rep matches
    the sequential reference and the warm ones do not (nor each other), while the single-context 2-slot
    reference is stable across reps.  Isolated: not the handover (both paths agree), not `GGML_MOE_DEVREMAP`,
@@ -215,6 +225,13 @@ line reads *smoothness delivered, cost accepted*, and the cost is **not** an ope
    (`gate-server-reuse.sh`, `GATE=parity`).  The one thing reuse does **not** guarantee on the 27B is
    reuse-vs-reprefill text equality — the reference server does not either (a checkpoint-restored placement is not a
    re-prefilled one), so the gate states that as its own contract rather than pretending otherwise.
+11. **(pass 10) Two box traps that read as defects in the change under test.**  *Never export `TEMP` to a GPU
+   process*: the ROCm 10.1 runtime uses it, and `TEMP=0` (a harness's sampling temperature) surfaces as
+   `hipStreamCreateWithFlags failed` -> `ROCm error: out of memory` at context creation — half a session went into a
+   phantom VRAM hunt.  And *`kill -9` on a `timeout` wrapper does not kill the server*: `rocm-smi` does not account
+   VMM allocations, so a "VRAM drained" check passes while the leaked server still answers `/health` and becomes the
+   arm you think you are driving.  Start arms under `setsid`, kill the process **group**, and refuse to start while
+   any `llama-server` exists.
 ## 5. The reusable harness
 
 [`archive/work/prefill-transfer-overlap/arms/two_ctx.cpp`](../../archive/work/prefill-transfer-overlap/arms/two_ctx.cpp)
