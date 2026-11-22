@@ -1,3 +1,86 @@
+## 261122.005 (r345, RELEASE v17-919794500-r345) -- issue #350 fixed: the MoE device gather's used-expert BITMAP (block 09), so a deep split stops paying for the routing scan it already did
+
+**Release:** `v17-919794500-r345`.  Base `919794500` (base tree `916941663346eb86004bed77f74e90fcf9c43126`), canonical
+tip **`585360d19`** (tree **`228628e50bec140b25be27966844404ee41a1da2`**), 17 official + 1 temporary = 18 default
+blocks, optional `0100` -> `151c3b84e` / `0101` -> `5377f93d0` (cumulative `db7c6be40`).  **No block created,
+split or renumbered**: one same-block amendment, **block 09** (`ggml/src/ggml-cuda/moe-expert-cache.cu`,
+`moe_cache_gather_host` + `moe_cache_gather_kernel`), plus the census wording of block 12's `device gather:` line
+(where that line lives).  One environment variable added (`MOE_GATHER_MASK`).
+
+### The finding
+
+`moe_cache_gather_kernel`'s grid is `n_experts * n_split` blocks, and every block scanned the WHOLE routing
+(`n_used * n_tok` ids) to answer one question -- "is MY expert routed?" -- so a call paid up to
+`n_experts * n_split` redundant scans.  The copies shrink with `n_split`; the scans do not, which is why a deep
+split lost at low residency.  Issue #350 reports the shape (Flash-Next IQ3_XXS, 55 % arena residency, Windows):
+`MOE_GATHER_NSPLIT` 32 is 466.5 t/s of prefill against 504.1 at 8 and 554.7 at 4, and it "stops changing at 4 and
+below" -- i.e. the shipped r325 default was the worst arm on their box, while r325 measured +7.5 % for it at 84 %
+residency.  Reproduced in direction on gfx1201 at the reporter's own 54.7 % residency (arena 21881.8 MiB of
+40012.5 MiB host experts): 32 -> 1671.7 t/s against 1719.3 at 4, -2.8 %.
+
+The fix is one pass that builds a used-expert bitmap (`moe_cache_gather_mask_kernel`: per-block shared-memory
+bitmap, one atomic per word, not one per routed id -- a direct global atomic per id measured 0.11 ms per call),
+then one word read per block.  `n_split` is now proportional to the copy work alone.  It is engaged when the scan
+volume it replaces (`n_experts * n_split * n_used * n_tok` ids) reaches `1e8`: below that the pass is latency on
+the critical path that buys nothing (measured -1.2 % at 6.7e7 ids, -2.3 % in one 16-split arm), so `n_split` 4-8
+-- the documented A/B arms -- remain exactly the pre-r345 path, and the decode/verify band (five orders of
+magnitude below the threshold) never adds a launch.
+
+| shape (1 x R9700, interleaved, pins: `MOE_EXPERT_HEATMAP=load`, `ROCBLAS_USE_HIPBLASLT=0`) | `n_split` 32, scan (r325 default) | 32, bitmap (r345 default) | delta |
+|---|---:|---:|---:|
+| **54.7 % residency**, Flash-Next IQ3_XXS 512 experts, 17 624-token prompt | 1671.7 | **1741.0** | **+4.1 %** |
+| 84.0 % residency, 35B-A3B Q8_0 256 experts, 5246-token prompt | 3722.3 | **3777.6** | +1.5 % |
+
+And on the released tree with no env knobs: **+4.4 %** (1676.5 -> 1748.5/1751.3) at 54.7 % and **+0.8 %** at
+84 %.  The bitmap also turns `n_split` 64 at 84 % residency from **3412.6 t/s (a 8 % regression)** into
+**3817.8 (+12 % over the same arm)** -- which is the proof that the cost was the scan, not the copy shape, and
+that the answer is the mechanism rather than a different constant.  Full matrix:
+`benchmarks/2026-11-22-gather-bitmap.md`.
+
+**Scope, stated so it is not over-read:** the bitmap removes the `n_split`-proportional WORK.  The reporter
+measures ~19 % where this box measures 2.8 %, so their platform amplifies it (their issue #281 was a Windows
+read-granularity problem, and per-block launch cost is the other candidate).  If 32 is still slower than 4 on
+their box after this, the cause is the grid size rather than the scan, and the fix for that class is a smaller
+grid -- which needs their logs to size, so the reply asks them to re-test rather than claiming their number.
+
+### Gates (all on the released tree, build `585360d19`)
+
+* `scripts/validate-set.sh` -- **green**: 18 default patches + 2 optional + `rdna-boosts-all.patch` checksums,
+  strict apply on a fresh `919794500` tarball, applied tree **`228628e50`** == `release.json`, both optionals
+  apply alone (`151c3b84e` / `5377f93d0`) and cumulatively (`db7c6be40`), Windows portability clean,
+  `check-rung-file-sets.py` accounts for every file/define/env/option (**575 -> 576 envs**, 0 losses), and the
+  system-header check is clean.
+* `scripts/gate-prefill-logits.sh --ab "MOE_GATHER_MASK=0"` on the reporter's shape (`-ncmoe 47 -lme mirror
+  -ub 2048`, q8_0 KV, `MOE_EXPERT_CACHE_MIB=21882`, pins above) -- **PASS**: mean KLD **-0.000000**, same-top-p
+  **100.000 %**, GPU faults clean.  This is the exact-fallback A/B: the base is the scan, the candidate is the
+  bitmap, and the bytes are the same bytes.
+* `scripts/gate-host-pool.sh` -- **PASS, 58/58 checks** (`takeover=0` under both fill faults, every failed fill
+  NOT resident, the census printed once from the teardown, no abort in any arm), every arm's text as recorded,
+  GPU faults clean.
+* `scripts/gate-host-expert-text.sh` -- **PASS**, 3/3 runs read `328 chars sha=7c5a512a8447`; the flipped-library
+  arm reads its own text (`298 chars sha=55a50dee05e0`, reported, r310); GPU faults clean.
+* **Greedy text is byte-identical in every arm of the change**: `172 chars sha=de61b9b1bed7` on the
+  low-residency shape across bitmap on/off and `n_split` 4/32, `206 chars sha=cf7f8b23f404` on the high-residency
+  shape across bitmap on/off.
+* **MTP Protocol A** (27B-UD-Q4_K_XL, `--fit off`, bf16 KV, `-n 3000`), both reasoning axes: **on**
+  `draft-mtp` **54.9 t/s** against `none` **30.2**, **off** **72.2** against **30.3**, the same text inside each
+  pair (`12331 chars sha=eace21fc3399` / `6789 chars sha=4172642d7dc2`).  The decode band is untouched by
+  construction and by census: a decode arm reads `0 by the used-expert bitmap` out of 138 gathers, and a 9..16
+  row verify sits at 2.1e6 scan ids against the 1e8 threshold, so no captured graph changes shape.
+* Census (`-lv 4`, the low-residency prefill): `device gather: 1380 calls (1380 pool-backed, 1242 by the
+  used-expert bitmap)`; with `MOE_GATHER_MASK=0`, `0 by the used-expert bitmap`.  The 138 scan-path calls are the
+  run's narrow (decode-band-sized) routings -- the threshold doing its job, observable in one line.
+
+### Notes
+
+* `n_split` stays **32**.  With the bitmap it is the best measured arm at both residency extremes, so r325's
+  constant was right and r325's *reason* was incomplete: the gain at high residency was real, and the loss at low
+  residency was the scan, not the split.
+* The optional artifacts were re-cut against the new default tree (their recorded trees moved because block 09
+  changed), and blocks 10-16 were regenerated (their contexts and commit ids shift; no block changed content).
+* The gather's per-device bitmap is allocated on first use and falls back to the scan if the allocation fails,
+  so a first use inside a capture is a fallback rather than a capture-time `cudaMalloc`.
+
 ## 261122.004 (r344) -- the APU arena's PINNED mapping transport is named: the issue #347 follow-up is a `--load-mode buffered` fix, not a leak
 
 **Delivery change: block 15 only** (one WARN; no default moved and no byte of a read changed).  `release.json` is now

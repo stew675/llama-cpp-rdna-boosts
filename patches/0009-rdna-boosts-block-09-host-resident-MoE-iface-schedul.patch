@@ -1,4 +1,4 @@
-From 4439df91977e9f2a2f67e781f3f74ffab20ef844 Mon Sep 17 00:00:00 2001
+From e8eb362117e1e4cbbba2fc80d96d9a78125e0024 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/17] rdna-boosts: block 09: host-resident MoE (iface,
@@ -105,7 +105,7 @@ refused, 3-device arm untouched).  Measured: benchmarks/2026-11-21-ffn-even-spli
  ggml/src/ggml-cuda/graph.cuh                  |    4 +
  ggml/src/ggml-cuda/mmvq.cu                    |  282 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 7122 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 7229 +++++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h         |  384 +
  ggml/src/ggml-cuda/norm.cu                    |   35 +
  ggml/src/ggml-cuda/norm.cuh                   |    1 +
@@ -144,7 +144,7 @@ refused, 3-device arm untouched).  Measured: benchmarks/2026-11-21-ffn-even-spli
  tests/test-backend-tensor.cpp                 |    3 +
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 70 files changed, 18436 insertions(+), 547 deletions(-)
+ 70 files changed, 18543 insertions(+), 547 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -11200,10 +11200,10 @@ index 4140f681a..35f625eaa 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..9183f2296
+index 000000000..dcf09d140
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,7122 @@
+@@ -0,0 +1,7229 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -13958,27 +13958,64 @@ index 000000000..9183f2296
 +// parallelism); n_split restores ~64-128 concurrent blocks.  The used-scan is thread-parallel (each
 +// thread checks a strided slice of the routing) - a per-thread full scan cost 256 redundant loads per
 +// thread and dominated the kernel.
++// r345 (issue #350): the used-expert BITMAP.  The gather's grid is `n_experts * n_split` blocks and
++// every one of them used to scan the whole routing (`n_used * n_tok` ids) to learn whether ITS expert
++// is routed -- the same scan duplicated up to `n_experts * n_split` times.  That duplication is the
++// reason a deep split (32) lost to a shallow one (4) on a residency-deficient arena: the copies shrink
++// with n_split while the scans do not, so the launch spends its time on routing reads it already did.
++// One pass builds the bitmap and every block then reads ONE word, which makes n_split proportional to
++// the copy work only.  Each block builds its own bitmap in shared memory and folds it in with one
++// atomic per word, so contention is per block, not per routed id (a direct global atomic per id
++// measured 0.11 ms per call against 16 words).
++static __global__ void moe_cache_gather_mask_kernel(const int32_t * __restrict__ ids, size_t nb0, size_t nb1,
++                                                   int n_used, int n_tok, int n_experts, int n_words,
++                                                   uint32_t * __restrict__ mask) {
++    extern __shared__ uint32_t smask[];   // n_words
++    for (int w = threadIdx.x; w < n_words; w += blockDim.x) {
++        smask[w] = 0;
++    }
++    __syncthreads();
++    const int total = n_used * n_tok;
++    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += blockDim.x * gridDim.x) {
++        const int tok = i / n_used;
++        const int j   = i - tok * n_used;
++        const int32_t x = *(const int32_t *) ((const char *) ids + (size_t) tok * nb1 + (size_t) j * nb0);
++        if (x >= 0 && x < n_experts) {
++            atomicOr(&smask[x >> 5], 1u << (x & 31));
++        }
++    }
++    __syncthreads();
++    for (int w = threadIdx.x; w < n_words; w += blockDim.x) {
++        if (smask[w] != 0) {
++            atomicOr(&mask[w], smask[w]);
++        }
++    }
++}
++
 +static __global__ void moe_cache_gather_kernel(
 +        char * __restrict__ dst_base, const char * __restrict__ src_base,
 +        const int32_t * __restrict__ ids, size_t nb0, size_t nb1,
 +        int n_used, int n_tok, int n_experts, int n_split,
-+        int64_t expert_bytes, int64_t host_bytes, int64_t src_off, int64_t host_pitch, int split_axis) {
++        int64_t expert_bytes, int64_t host_bytes, int64_t src_off, int64_t host_pitch, int split_axis,
++        const uint32_t * __restrict__ used_mask) {
 +    const int e = blockIdx.x % n_experts;
 +    const int s = blockIdx.x / n_experts;
 +
 +    __shared__ int used_s;
 +    if (threadIdx.x == 0) {
-+        used_s = 0;
++        used_s = used_mask != nullptr ? (int) ((used_mask[e >> 5] >> (e & 31)) & 1u) : 0;
 +    }
 +    __syncthreads();
-+    const int total = n_used * n_tok;
-+    for (int i = threadIdx.x; i < total; i += blockDim.x) {
-+        const int tok = i / n_used;
-+        const int j   = i - tok * n_used;
-+        const int32_t x = *(const int32_t *) ((const char *) ids + (size_t) tok * nb1 + (size_t) j * nb0);
-+        if (x == e) { used_s = 1; break; }
++    if (used_mask == nullptr) {
++        const int total = n_used * n_tok;
++        for (int i = threadIdx.x; i < total; i += blockDim.x) {
++            const int tok = i / n_used;
++            const int j   = i - tok * n_used;
++            const int32_t x = *(const int32_t *) ((const char *) ids + (size_t) tok * nb1 + (size_t) j * nb0);
++            if (x == e) { used_s = 1; break; }
++        }
++        __syncthreads();
 +    }
-+    __syncthreads();
 +    if (!used_s) {
 +        return;
 +    }
@@ -16736,6 +16773,52 @@ index 000000000..9183f2296
 +    return span <= host_bytes - src_off;
 +}
 +
++// r345 (issue #350): the used-expert bitmap's per-device buffer, grown on demand (words of 32 experts).
++// One buffer per device is enough: the gather is issued on one stream and every launch is ordered before
++// the next build by that stream, so a later call can never observe an earlier call's bitmap in flight.
++static uint32_t * g_mask_dev  [GGML_CUDA_MAX_DEVICES] = {nullptr};
++static int        g_mask_words[GGML_CUDA_MAX_DEVICES] = {0};
++int64_t           g_gather_mask_calls = 0;   // r345: gathers served by the used-expert bitmap
++// `MOE_GATHER_MASK=0` restores the per-block routing scan (A/B and bisect).
++static const bool g_gather_mask = [] {
++    const char * e = getenv("MOE_GATHER_MASK");
++    return e == nullptr || atoi(e) != 0;
++}();
++// When the bitmap pays.  Its win grows with the SCAN VOLUME it replaces -- `n_experts * n_split *
++// n_used * n_tok` routed ids -- and it is one pass over those ids plus one read per block, so a shallow
++// split (or a narrow decode/verify routing) keeps the scan: the pass is then latency on the critical
++// path that buys nothing.  Measured on gfx1201 (r345, `WORKLOG.md` 261122.003): 6.7e7 ids reads -1.2 %
++// (a 512-expert table at n_split 8) and -2.3 % (a 256-expert table at 16), while 1.34e8 reads +0.7 %
++// (512 experts at 16), +1.5 % (256 at 32) and +4.1 % (512 at 32, a 54.7 %-residency arena), and 2.7e8
++// reads +12 % (256 at 64).  1e8 ids is the crossover; the default (n_split 32) is above it on both
++// shapes, and the decode band (8 ids) is five orders of magnitude below it.
++static const int64_t k_gather_mask_min_scan_ids = 100000000;
++
++static uint32_t * gather_mask_get(int device, int n_experts) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return nullptr;
++    }
++    const int words = (n_experts + 31) / 32;
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (g_mask_dev[device] != nullptr && g_mask_words[device] >= words) {
++        return g_mask_dev[device];
++    }
++    if (g_mask_dev[device] != nullptr) {
++        (void) cudaFree(g_mask_dev[device]);
++        g_mask_dev[device] = nullptr;
++        g_mask_words[device] = 0;
++    }
++    uint32_t * p = nullptr;
++    if (cudaMalloc((void **) &p, (size_t) words * sizeof(uint32_t)) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return nullptr;   // the caller falls back to the per-block scan
++    }
++    (void) cudaMemset(p, 0, (size_t) words * sizeof(uint32_t));
++    g_mask_dev[device]   = p;
++    g_mask_words[device] = words;
++    return p;
++}
++
 +bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
 +                           const ggml_tensor * ids, void * stream, int device,
 +                           size_t slice_off, int split_axis) {
@@ -16862,10 +16945,34 @@ index 000000000..9183f2296
 +                (char *) weight_cpy->data, (int64_t) expert_bytes, n_experts, head_pad);
 +        }
 +    }
++    // r345 (issue #350): one used-expert bitmap instead of a routing scan per (expert, chunk) block,
++    // when the scan volume it replaces is big enough to pay for the pass (see
++    // `k_gather_mask_min_scan_ids`).  A failed allocation or a failed build falls back to the scan, so
++    // this path can only cost a launch, never correctness.
++    uint32_t * used_mask = nullptr;
++    if (g_gather_mask && (int64_t) n_experts * n_split * n_used * n_tok >= k_gather_mask_min_scan_ids) {
++        used_mask = gather_mask_get(device, n_experts);
++        if (used_mask != nullptr) {
++            const int mwords = (n_experts + 31) / 32;
++            if (cudaMemsetAsync(used_mask, 0, (size_t) mwords * sizeof(uint32_t), (cudaStream_t) stream) != cudaSuccess) {
++                (void) cudaGetLastError();
++                used_mask = nullptr;
++            } else {
++                const int mtotal  = (int) (n_used * n_tok);
++                const int mblocks = (mtotal + 255) / 256;
++                moe_cache_gather_mask_kernel<<<mblocks, 256, (size_t) mwords * sizeof(uint32_t),
++                                               (cudaStream_t) stream>>>(
++                    (const int32_t *) ids->data, ids->nb[0], ids->nb[1], (int) n_used, (int) n_tok, n_experts,
++                    mwords, used_mask);
++                g_gather_mask_calls++;
++            }
++        }
++    }
 +    moe_cache_gather_kernel<<<n_experts * n_split, threads, 0, (cudaStream_t) stream>>>(
 +        (char *) weight_cpy->data, (const char *) weight->data,
 +        (const int32_t *) ids->data, ids->nb[0], ids->nb[1], (int) n_used, (int) n_tok, n_experts, n_split,
-+        (int64_t) expert_bytes, (int64_t) host_bytes, (int64_t) slice_off, (int64_t) host_pitch, split_axis);
++        (int64_t) expert_bytes, (int64_t) host_bytes, (int64_t) slice_off, (int64_t) host_pitch, split_axis,
++        used_mask);
 +    if (cudaGetLastError() != cudaSuccess) {
 +        (void) cudaGetLastError();
 +        return false;

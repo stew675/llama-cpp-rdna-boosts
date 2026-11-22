@@ -1,4 +1,4 @@
-From 553369e64b50417bfd722039bafce64143959e7a Mon Sep 17 00:00:00 2001
+From 9f9426a2169d486a061bd5e28224d7a242c31247 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/17] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -23600,7 +23600,7 @@ index 35f625eaa..4aef754a5 100644
  void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
-index 9183f2296..4232da643 100644
+index dcf09d140..0b00ae409 100644
 --- a/ggml/src/ggml-cuda/moe-expert-cache.cu
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -138,6 +138,15 @@ struct table_t {
@@ -23761,7 +23761,7 @@ index 9183f2296..4232da643 100644
          return;
      }
      if ((int) t.heat.size() != t.n_experts || t.n_experts <= 0) {
-@@ -3076,23 +3174,11 @@ void alloc_table_locked(table_t & t, int slots) {
+@@ -3113,23 +3211,11 @@ void alloc_table_locked(table_t & t, int slots) {
      // because the arena is not read until a later token.  A partial copy rolls the table back to the
      // normal remap path.
      t.identity = false;
@@ -23788,7 +23788,7 @@ index 9183f2296..4232da643 100644
              if (err != cudaSuccess) {
                  (void) cudaGetLastError();
                  ok = false;
-@@ -3168,7 +3254,24 @@ static bool moe_cache_tables_complete_locked() {
+@@ -3205,7 +3291,24 @@ static bool moe_cache_tables_complete_locked() {
              expected += g_preflight_device_bytes[d];
          }
      }
@@ -23814,7 +23814,7 @@ index 9183f2296..4232da643 100644
  }
  
  // Deferred, budget-adaptive, UNIFORM sizing.  Every table gets the same slot count
-@@ -3783,6 +3886,37 @@ void alloc_all_locked() {
+@@ -3820,6 +3923,37 @@ void alloc_all_locked() {
  
  } // namespace
  
@@ -23852,7 +23852,7 @@ index 9183f2296..4232da643 100644
  static void devremap_batch_clear_locked();   // device remap: drop the pending sibling batches (defined with g_dr_batch)
  
  
-@@ -5140,7 +5274,8 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
+@@ -5177,7 +5311,8 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
  
  int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes,
                      size_t host_bytes, size_t src_off, size_t host_pitch, int split_axis,
@@ -23862,7 +23862,7 @@ index 9183f2296..4232da643 100644
      if (!g_enabled) {
          return -1;
      }
-@@ -5158,6 +5293,13 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -5195,6 +5330,13 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
          cold_safe = host_bytes > 0 && host_bytes % host_pitch == 0 &&
                      expert_bytes > 0 && expert_bytes % (host_bytes / host_pitch) == 0;
      }
@@ -23876,7 +23876,7 @@ index 9183f2296..4232da643 100644
  
      const std::pair<const void*, int> key = { src0, device };
      const auto it = g_key_to_id.find(key);
-@@ -5188,6 +5330,11 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
+@@ -5225,6 +5367,11 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
      t.host_pitch   = host_pitch;
      t.split_axis   = split_axis;
      t.cold_safe    = cold_safe;
@@ -23888,7 +23888,7 @@ index 9183f2296..4232da643 100644
      // TEMP diagnostic (wip/moe-verify-fusions): print the per-table split geometry, to compare the
      // residency-sensitive qwen4exp tables against the residency-insensitive qwen35moe ones.
      if (ggml_cuda_cache_geom_debug()) {
-@@ -5256,7 +5403,7 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
+@@ -5293,7 +5440,7 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
      if (it != t.expert_slot.end()) {
          return { (char *) t.arena + (size_t) it->second * t.expert_bytes, true };
      }
@@ -23897,8 +23897,8 @@ index 9183f2296..4232da643 100644
          return { (void *) ((const char *) t.host + (size_t) expert * t.host_bytes + t.src_off), false };
      }
      return { nullptr, false };
-@@ -5530,6 +5677,27 @@ static bool moe_cache_slice_addr_ok(size_t host_bytes, size_t expert_bytes, size
-     return span <= host_bytes - src_off;
+@@ -5613,6 +5760,27 @@ static uint32_t * gather_mask_get(int device, int n_experts) {
+     return p;
  }
  
 +// wip/fix-gemma-4 (TODO #77/C): every range of a fused table's slot must lie inside one host expert blob,
@@ -23925,7 +23925,7 @@ index 9183f2296..4232da643 100644
  bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                             const ggml_tensor * ids, void * stream, int device,
                             size_t slice_off, int split_axis) {
-@@ -5792,7 +5960,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+@@ -5899,7 +6067,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
  bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                             const int32_t * ids, int64_t n_used, int64_t n_tok,
                             size_t ids_nb0, size_t ids_nb1, void * stream,
@@ -23935,7 +23935,7 @@ index 9183f2296..4232da643 100644
      g_write_seq++;
      if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
          return false;
-@@ -5835,7 +6004,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5942,7 +6111,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
              host_pitch = weight->nb[1];   // a strided axis-0 slice needs a 2-D fill
          }
      }
@@ -23961,7 +23961,7 @@ index 9183f2296..4232da643 100644
          static bool warned = false;
          if (!warned) {
              warned = true;
-@@ -5852,7 +6038,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -5959,7 +6145,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
          return false;
      }
      const int table = moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes,
@@ -23971,7 +23971,7 @@ index 9183f2296..4232da643 100644
      if (table < 0) {
          return false;
      }
-@@ -5929,7 +6116,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+@@ -6036,7 +6223,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
      // (issue #116's copy-side twin).  Decline the partial-residency case so the scheduler's
      // pageable-safe host path serves the op.  An identity (whole-resident) table needs no fill and is
      // left alone.
@@ -23980,7 +23980,7 @@ index 9183f2296..4232da643 100644
          g_decline_all++;
          return false;
      }
-@@ -6285,7 +6472,7 @@ static bool devremap_cold_ok_locked(const table_t & t) {
+@@ -6392,7 +6579,7 @@ static bool devremap_cold_ok_locked(const table_t & t) {
  
  // Constant for a table and shape once the cache is sized (a graph replay needs a constant take-over decision).
  static bool devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok, int device) {
@@ -23989,7 +23989,7 @@ index 9183f2296..4232da643 100644
             t.arena != nullptr && t.slots > 0 && t.device == device && t.n_experts > 0 &&
             n_used < t.n_experts && t.remap_dev != nullptr && n_used * n_tok <= t.remap_cap &&
             (t.dr_device < 0 || (t.dr_device == device && t.dr_cap == t.remap_cap));
-@@ -6537,7 +6724,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
+@@ -6644,7 +6831,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
                  return true;
              }
          }
@@ -23998,7 +23998,7 @@ index 9183f2296..4232da643 100644
              continue;
          }
          // Fold in this device's slice offset so the kernel never needs to know the tensor-split
-@@ -6614,6 +6801,72 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
+@@ -6721,6 +6908,72 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
      return true;
  }
  
@@ -24071,7 +24071,7 @@ index 9183f2296..4232da643 100644
  moe_cache_serve_status moe_cache_fusion_serve(const ggml_tensor * op, const ggml_tensor * src0,
                                               const ggml_tensor * gate, const ggml_tensor * ids,
                                               int device, void * stream,
-@@ -6635,9 +6888,23 @@ moe_cache_serve_status moe_cache_fusion_serve(const ggml_tensor * op, const ggml
+@@ -6742,9 +6995,23 @@ moe_cache_serve_status moe_cache_fusion_serve(const ggml_tensor * op, const ggml
          // The same routing-shape check the per-op consumer applies before it reads a remap.
          return rm == nullptr || (nu == ids->ne[0] && nt == ids->ne[1]);
      };
@@ -24096,7 +24096,7 @@ index 9183f2296..4232da643 100644
          return MOE_CACHE_SERVE_NONE;   // staged: the scheduler's copies are what every fused lane reads
      }
      if (!up_ok || !gate_ok) {
-@@ -6709,6 +6976,8 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -6816,6 +7083,8 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
      // OPEN 2 slab: gate per TABLE.  The `identity` check below already requires THIS table's arena
      // and slots, so this hook, the update hook and `moe_cache_get_table` agree per table; only the fusion
      // guard is global (`moe_cache_has_arena()`), so a partial cache loses the fusions but keeps serving.
@@ -24105,7 +24105,7 @@ index 9183f2296..4232da643 100644
      {
          std::lock_guard<std::mutex> lock(g_mutex);
          const auto it = g_key_to_id.find({ (const void *) weight, device });
-@@ -6728,6 +6997,18 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
+@@ -6835,6 +7104,18 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
          // `moe_cache_update_host`), so the alias must track the current tensor.
          g_alias_to_id[weight_cpy] = id;
          t.taken_cpy = weight_cpy;   // TODO #335/#336: the promise this hook makes to the scheduler
@@ -24124,7 +24124,7 @@ index 9183f2296..4232da643 100644
      }
      return true;
  }
-@@ -6868,6 +7149,12 @@ void moe_cache_report() {
+@@ -6975,6 +7256,12 @@ void moe_cache_report() {
      GGML_LOG_INFO("%s: takeover=%lld decline_all=%lld get_ok=%lld cold=%s cold_reaches=%lld\n",
                    __func__, (long long) g_takeover, (long long) g_decline_all, (long long) g_get_ok,
                    g_cold_uva ? "uva" : "off", (long long) g_cold_reaches);

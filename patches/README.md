@@ -2004,6 +2004,24 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 > (`572 chars sha=40e29c2b46b6`) and `gate-prefill-logits.sh --ab "MOE_GATHER_NSPLIT=8"` reads mean KLD
 > **-0.000000 / 99.990 % top-p**: the gather only partitions the same bytes across more blocks, it does not
 > reorder them.  `ENVIRONMENT.md` §2; `WORKLOG.md` 261120.002.
+> **r345 amendment (GitHub issue #350): the gather's per-block routing SCAN is replaced by one used-expert
+> BITMAP (`MOE_GATHER_MASK`), and `n_split` stays 32.**  `moe_cache_gather_kernel` is `n_experts * n_split`
+> blocks and each one scanned the whole routing (`n_used * n_tok` ids) to learn whether its expert is routed, so
+> a call paid up to `n_experts * n_split` redundant scans.  The copies shrink with `n_split`; the scans do not,
+> which is why the r325 constant LOST at low residency: on the reporter's shape (Flash-Next IQ3_XXS, arena
+> 21881.8 MiB of 40012.5 MiB host experts = 54.7 % residency) `n_split` 32 reads 1671.7 t/s against 1719.3 at 4
+> and 1727.0 at 8, while r325 measured +7.5 % for 32 at 84 %.  `moe_cache_gather_mask_kernel` builds the bitmap
+> in ONE pass (per-block shared-memory bitmap, one atomic per WORD) and every block reads one word, engaged when
+> the scan volume it replaces (`n_experts * n_split * n_used * n_tok` ids) is at least `1e8` -- below that the
+> pass is critical-path latency (-1.2..-2.3 % measured), so `n_split` 4-8 are exactly the pre-r345 path and the
+> decode/verify band never adds a launch.  Measured on the released tree: **+4.4 %** prefill at 54.7 % residency
+> (1676.5 -> 1748.5/1751.3) and **+0.8 %** at 84 % (3732.5 -> 3737.2/3787.8), decode unchanged, greedy text
+> byte-identical (`172 chars sha=de61b9b1bed7` / `206 chars sha=cf7f8b23f404`) and
+> `gate-prefill-logits.sh --ab "MOE_GATHER_MASK=0"` reads mean KLD -0.000000 / 100.000 % top-p.  `n_split` 64 at
+> 84 % residency goes from -8 % to +12 %, which localises the cost to the scan.  The bitmap buffer is allocated
+> on first use and falls back to the scan if that allocation fails (so it is safe inside a capture).
+> `ENVIRONMENT.md` §2; `INVARIANTS.md` r345; `GREEDY-PURITY.md` §104;
+> `benchmarks/2026-11-22-gather-bitmap.md`; `WORKLOG.md` 261122.005.
 
 > **r317 amendment (GitHub issue #294 closed): the decode band gets its own MoE-fusion census, and the
 > fused-launch contract is `MIXED`-aware.**  `moe_cache_fusion_launched()` gained kinds **4 = mmvf** and

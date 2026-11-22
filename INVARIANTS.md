@@ -1970,3 +1970,39 @@ Record: `WORKLOG.md` 261122.005; `ENVIRONMENT.md` §1.3; `wip/prefill-decode-arm
    transport; 54/0 with every text arm still `4f29f1e4a4d6`.
 
 Record: `WORKLOG.md` 261122.004; `ENVIRONMENT.md` §20; `patches/README.md` block 15; issue #347 follow-up.
+
+## r345 (2026-11-22, `WORKLOG.md` 261122.005) — the MoE gather's `n_split` cost the ROUTING SCAN, not the copy shape: one used-expert bitmap makes a deep split the best arm at both residency extremes (block 09, issue #350)
+
+1. **`moe_cache_gather_kernel`'s parallelism is `n_experts * n_split`, and its per-block USED TEST was
+   `O(n_used * n_tok)` — the same routing scan duplicated up to `n_experts * n_split` times.**  The copies shrink
+   with `n_split`; the scans do not, so the terms move opposite ways as residency falls.  Measured 1 x R9700,
+   gfx1201, `-b 2048 -ub 2048`, the reporter's shape (Flash-Next IQ3_XXS, 512 experts/table, arena 21881.8 MiB of
+   40012.5 MiB host experts = **54.7 % residency**, `-ncmoe 47 -lme mirror`, 17 624-token prompt): `n_split` 32
+   reads **1671.7 t/s** against **1719.3** at 4 and **1727.0** at 8, i.e. the shipped r325 default was the worst
+   arm — the ordering issue #350 reports (~19 % on their Windows box, 2.8 % here).  One bitmap pass
+   (`moe_cache_gather_mask_kernel`, per-block shared-memory bitmap + one atomic per WORD; a global atomic per id
+   measured 0.11 ms/call) makes 32 the BEST arm: **1741.0** (+4.1 % over the shipped default), and on the
+   released tree with no knobs **1748.5/1751.3** (+4.4 %).  At 84 % residency (35B-A3B Q8_0, 256 experts) 32 goes
+   3722.3 -> **3777.6** (+1.5 %).
+2. **The bitmap is a TEST replacement, not a copy change, and the text says so byte for byte.**  `172 chars
+   sha=de61b9b1bed7` (low-residency shape) and `206 chars sha=cf7f8b23f404` (high-residency shape) are identical
+   across bitmap on/off and `n_split` 4/32; `gate-prefill-logits.sh --ab "MOE_GATHER_MASK=0"` on the reporter's
+   shape reads mean KLD **-0.000000 / 100.000 % top-p**.  So a gather change owes the fill-path gates
+   (`gate-host-pool.sh` 58/58) and the exact-fallback KLD point, not a numerics apology.
+3. **Gate the pass on the scan volume it replaces, not on the split alone.**  The condition is
+   `n_experts * n_split * n_used * n_tok >= 1e8` ids, measured: 6.7e7 ids reads **-1.2 %** (512 experts at
+   `n_split` 8) and **-2.3 %** (256 experts at 16) because the pass is then latency on the critical path, while
+   1.34e8 reads **+0.7 %** (512 at 16), **+1.5 %** (256 at 32) and **+4.1 %** (512 at 32).  Two consequences:
+   `n_split` 4-8 stay exactly the pre-r345 path (so the documented A/B arms keep their numbers), and the
+   decode/verify band is five orders of magnitude below the threshold, so no decode op pays a launch — a 9..16
+   row verify is 2.1e6 ids, which also means no captured graph changes shape.
+4. **A constant tuned on one residency is not a constant; find out which term it is buying.**  The bitmap turns
+   `n_split` 64 at 84 % residency from **3412.6 t/s (-8 % against 16)** into **3817.8 (+12 % over that same
+   arm)**, which localises the r325 gain to the SCAN and says the answer is the mechanism, not a value.  Keep the
+   constant at 32 (best at both extremes once the scan is gone) and keep `MOE_GATHER_MASK` as the kill switch.
+5. **A lazily-allocated device buffer on a gather path must FAIL SOFT.**  `gather_mask_get` returns null on a
+   failed `cudaMalloc` and the caller falls back to the scan, so a first use inside a graph capture is a slower
+   call rather than a capture-time allocation.
+
+Record: `WORKLOG.md` 261122.005, `benchmarks/2026-11-22-gather-bitmap.md`, `patches/README.md` block 09,
+`ENVIRONMENT.md` §2 (`MOE_GATHER_MASK`, `MOE_GATHER_NSPLIT`), `GREEDY-PURITY.md` §104, issue #350.
