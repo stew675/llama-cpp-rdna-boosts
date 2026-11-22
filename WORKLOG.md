@@ -28,6 +28,70 @@ refresh to confirm the tooling change and the idempotence: `tip 69c8c8086`, `.ti
 **Record:** `AGENTS.md` (Pushing policy, `.tip` trap (d)); `scripts/fork-refresh.sh`; no `patches/`, no
 `release.json`, no tag change.
 
+## 261122.003 (r343) -- the slab headroom default is `1408 + 128 x n_gpu` (1536 MiB on one GPU), sized for allocations made AFTER the slab extends
+
+**Delivery change: block 10 only** (its content, not its number).  `release.json` is now `v17-919794500-r343`, base
+unchanged, tip `6de4206f2`, tree `e71c0b5908422ad6683168ef3823af33bde7d77b`; both optional artifacts were re-cut
+against the new default tree (0100 → `d14237ed3`, 0101 → `e731d76b7`, cumulative `85d6738af`) and
+`scripts/validate-set.sh` is green end-to-end.  No new block, no renumbering.
+
+> Cut on `main` on top of **r342**, which moved while the campaign branch was open: the change was first written
+> there (as a branch-local "r342", now superseded) and re-cut here as r343.  The campaign branch was backed up as
+> patches (`wip/prefill-decode-arms/branch-backup/`) and rebased onto this revision.
+
+### 1. What changed and why
+
+`GGML_CUDA_SLAB_HEADROOM_MIB`'s default base moves `1152 -> 1408` MiB, i.e. **1536 / 1664 / 1792 MiB on 1 / 2 / 3
+GPUs** (it was 1280 / 1408 / 1536): one GPU now gets the value that used to be the 3-GPU one, +256 MiB everywhere.
+The headroom is the steady-state free VRAM the `slab_extend` reclaim leaves outside the slab, and it pays for
+**every allocation made after the extension** -- including a second context's graph reserve, which comes up
+mid-run and cannot be redirected.  Measured need (`wip/prefill-decode-arms` pass 5): the two-arm server's **2-row
+decode graph asks for 741.48 MiB in ONE allocation**, and at 1280 its first 2-row step died with
+`the movable-boundary slab holds the VRAM; the arena cannot yield physical back to the driver` → `failed to reserve
+graph buffers` → `ret = -2`, after a 1-row decode step had run clean for 5.5 s; `GGML_CUDA_SLAB_HEADROOM_MIB=1536`
+ran the identical shape with zero OOMs.  The r206 sizing took a prefill transient (~300 MiB + one hipBLASLt
+workspace) as T; a late whole-graph allocation is a larger T and it is the general case, not one campaign's.
+
+### 2. Measured cost
+
+The slab leaves 256 MiB more outside, so its arena is 256 MiB smaller on **every** shape (`size(VA)` 28.12 ->
+27.88 GiB; arena 27904 -> 27648 MiB on a `-c 8192` arm).  What that costs downstream depends on what bounds the
+expert cache.  35B-A3B Q4_K_M, `-ncmoe 40 -lme auto`, `MOE_EXPERT_CACHE_MIB=5000`, `-c 16384 -b 2048 -ub 512`,
+`GGML_CUDA_SLAB_STATS=1`, 2 arms (1280 vs 1536, same binary) -- the campaign's product shape:
+
+| headroom | `size(VA)` | expert-cache arena | `h` | fills / evictions | decode |
+|---|---|---|---|---|---|
+| 1280 | 28.12 GiB | 4957.1 MiB | 0.7159 | 17738 / 9578 | 51.12 t/s |
+| **1536** | 27.88 GiB | **4957.1 MiB** | **0.7159** | 17738 / 9578 | **51.36 t/s** |
+
+On a shape whose expert cache is bounded by its own budget the withheld 256 MiB comes out of the slab's unclaimed
+reserve and costs **nothing** measurable; where the arena is what bounds the cache, r206's ~1 pt of hit rate per GiB
+applies.  The slab also DECLINES slightly more readily on a card packed to the edge -- the documented r206 trade,
+taken deliberately.
+
+**Text: no cold-shape oracle exists for this default.**  `-c 8192`, a 12-token prompt, greedy, seed 42: three cold
+runs of the *same* arm read three different hashes (1280: `44fe5ee4` / `9f466bac` / `e207e42c`; 1536: `ac3b79f9` /
+`d9ba0b99` / `2b8d8b8b`) -- the retired campaign's cold-arena ordering effect, not the bump.  The text evidence is
+the r206 precedent (Flash-Next, text-identical) plus a **warm** oracle; the campaign's tier-1 gate is the
+instrument to re-run at this default (it is at r343 afterwards).
+
+### 3. Verified
+
+* the new default computes **`headroom=1.50 GiB`** on this 1-GPU box with **no** env override (`SLAB_INIT` with
+  `GGML_CUDA_SLAB_STATS=1`), arena 4957.1 MiB and `h` 0.6883 on the short-prompt arm -- unchanged from r342;
+* the motivating shape (arena 5000, `-c 16384 -ub 512`, a ~5900-token prompt, the two-arm server) runs **with no
+  `GGML_CUDA_SLAB_HEADROOM_MIB`**: 0 OOM lines, `headroom=1.50 GiB`, 1139.1 t/s prefill, decoder ITL p50 46.3 /
+  p95 67.7 ms (the env-knob arm read 1135.3 / 47.1 / 74.2 -- same numbers);
+* `scripts/validate-set.sh` green (fresh tarball at `919794500`, strict `git am` over all 18 default patches,
+  applied tree `e71c0b590…`, both optional artifacts strict on the new tree, cumulative optional tree `85d6738af…`,
+  Windows portability scan, and `check-rung-file-sets.py` reporting **0 unexplained** against r342).
+
+### 4. Docs
+
+`ENVIRONMENT.md` §1.3 + the §-index row (new default, the r343 note, the measured cost); `INVARIANTS.md` r343;
+`patches/README.md` block 10's row.  `n_blocks`/`n_temporary`/`n_optional` unchanged.
+43: block 10's slab headroom default is 1408 + 128 x n_gpu MiB (1536 on one GPU), sized for allocations made AFTER the slab extends; release v17-919794500-r343)
+
 ## 261122.001 (r342) -- issue #348 fixed and RELEASED: a missing `#include` had compiled the prompt-cache huge-page path out of every Linux build since r328, and the same re-base also dropped block 02's MTP-pair rejection; both restored, both now instrumented
 
 **Shipped:** `v17-919794500-r342`, base `919794500`, tree `e4060a04c864a50c10c72431408cc898d7d275f3`,

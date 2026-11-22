@@ -1911,3 +1911,29 @@ A MoE host-expert shape cannot isolate this measurement: its `AnonHugePages` is 
 
 Record: `WORKLOG.md` 261122.001; `MANIFESTS.md` gate 10 / block 02 + block 12 rows; `ENVIRONMENT.md`;
 `patches/README.md` (blocks 02 and 12).
+
+## r343 — the slab headroom is sized for allocations made AFTER the slab extends, and a second context's graph is the big one
+
+**Fact.**  `GGML_CUDA_SLAB_HEADROOM_MIB`'s default is `1408 + 128 x n_gpu` MiB (1536 / 1664 / 1792 on 1 / 2 / 3
+GPUs), raised from `1152 + 128 x n_gpu` (1280 / 1408 / 1536) so that **one GPU now gets the value that used to be
+the 3-GPU one**.  The headroom is the steady-state free VRAM the `slab_extend` reclaim leaves outside the slab, and
+it is drawn on by *every allocation made after the extension* — including one that cannot be redirected and is not a
+prefill transient at all.
+
+**Why it moved, measured.**  A **second context's graph** comes up mid-run (a draft context;
+`wip/prefill-decode-arms`' decode arm) and its reserve is a single large allocation.  The two-arm server's **2-row
+decode graph asks for 741.48 MiB in ONE allocation**; at 1280 it failed with `ggml_cuda_device_malloc: 741.48 MiB
+allocation failed ... the movable-boundary slab holds the VRAM; the arena cannot yield physical back to the driver`
+→ `failed to reserve graph buffers` → `ret = -2`, on the *first 2-row step* (a 1-row decode step had run for 5.5 s
+immediately before), while `GGML_CUDA_SLAB_HEADROOM_MIB=1536` ran the identical shape with zero OOMs.  So the r206
+sizing (T = a prefill transient, ~300 MiB + one hipBLASLt workspace) is not the right T for this class: a late,
+whole-graph allocation is larger, and it is the general case rather than one campaign's.
+
+**Cost, measured.**  The slab leaves 256 MiB more outside, so its arena is 256 MiB smaller — always: `size(VA)` 28.12 → 27.88 GiB, and arena 27904 → 27648 MiB on a `-c 8192` shape.  What that costs downstream depends on what bounds the expert cache.  On the campaign's product shape (35B-A3B Q4_K_M, `-ncmoe 40 -lme auto`, `MOE_EXPERT_CACHE_MIB=5000`, `-c 16384 -b 2048 -ub 512`) it was **free**: the expert cache's arena 4957.1 MiB, `h` 0.7159, fills 17738 and evictions 9578 were **identical** at 1280 and 1536 and decode was flat (51.12 vs 51.36 t/s) — the withheld MiB came out of the slab's unclaimed reserve.  Where the arena is instead what bounds the cache, r206's ~1 pt of hit rate per GiB held back applies.  It also makes the slab **decline** on a card packed to the edge slightly more likely — the documented r206 trade, taken deliberately.  **No cold-shape text oracle exists for this default**: `-c 8192` greedy text read 3 distinct hashes in 3 cold runs *of the same arm* (and the text follows the arena placement, `GREEDY-PURITY.md` §89's class, whenever the residency changes), so any 2-arm text comparison on a cold short-prompt shape is vacuous — use a warm oracle.
+
+**Rule.**  When sizing anything that must fit *after* the slab has extended, size for the widest allocation that can
+appear then (a second/third context's graph reserve, per active-slot width), not for the widest prefill transient.  A
+`ret = -2` from `llama_process` on the first step that changes a context's batch WIDTH is this class; raising
+`GGML_CUDA_SLAB_HEADROOM_MIB` is the lever that does not cost arena on a budgeted shape.
+
+Record: `WORKLOG.md` 261122.005; `ENVIRONMENT.md` §1.3; `wip/prefill-decode-arms/RESULTS-2026-11-22.md` pass 5 §4.
