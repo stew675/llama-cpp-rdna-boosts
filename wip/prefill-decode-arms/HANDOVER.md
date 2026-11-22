@@ -24,7 +24,7 @@ allocation owner); **pass 5 built the server cut and tier 1 passes**.
 | **T2 — the server skeleton** | **DONE 2026-11-22 (pass 5).**  `llama-server --prefill-decode-arms` is the design, not an emulation: a prefill arm (main loop, `ctx_tgt`) + a decode arm (`ctx_dec`, its own thread, co-owning the prefill arm's KV), a slot crossing only at a request boundary.  **Tier 1 passes cold and over 3 warm request pairs** (both slots byte-identical, every allocation handshake clean).  `~/llama.cpp` `683deed67`; built in `T2-SERVER-CUT.md`'s code points + three small deviations; see [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) pass 5 |
 | **T3 — the request-boundary handover + its oracle** | **DONE, both tiers (tier 2 2026-11-22, pass 6).**  Tier 1: the server reproduces the reference text exactly, cold and over 3 warm pairs.  Tier 2: `scripts/gate-prefill-logits.sh` on the WIP build reads **mean KLD 0.000000 / same-top-p 100 %** (the artifacts are bit-inert on the default path) -- with the honest limit that `llama-perplexity` has one context and so cannot reach the arms path (pass 6 §2) |
 | **T4 — the opt-in gate** | Not started; its rules are now measured *in the server*: the 2-row decode graph asks **741.48 MiB** and does not fit at arena 5000 next to a grown prefill graph unless **`GGML_CUDA_SLAB_HEADROOM_MIB=1536`** (pass 5 §4) |
-| **T5 — measurement + gates** | **The measurement is taken** (pass 5 §3): the smoothness target is met (~47-49 ms p50 through a 2.0-5.3 s prefill), the cost target was **accepted** (README §3b; -24 to -27 %, pass 5 §6 explains why).  **The gates that are reachable are RUN (pass 6, `RESULTS-2026-11-22.md` §3-§7)**: fairness + `--self-test`, duty, park, ckpt, `check-gpu-faults` on 32 logs.  Fairness and duty are red **as shipped** on a *relative* bound that the arms remove (and green under the gate's own absolute / inert-floor criterion); park and ckpt **SKIP by construction**.  Still owed before promotion: `gate-host-pool.sh` and `gate-moe-promise.sh` |
+| **T5 — measurement + gates** | **The measurement is taken** (pass 5 §3): the smoothness target is met (~47-49 ms p50 through a 2.0-5.3 s prefill), the cost target was **accepted** (README §3b; -24 to -27 %, pass 5 §6 explains why).  **The gates that are reachable are RUN (pass 6, `RESULTS-2026-11-22.md` §3-§7)**: fairness + `--self-test`, duty, park, ckpt, `check-gpu-faults` on 32 logs.  Fairness and duty are red **as shipped** on a *relative* bound that the arms remove (and green under the gate's own absolute / inert-floor criterion); park and ckpt **SKIP by construction**.  Owed before promotion: an arms **arm** in the promise gate's `seq` shape + a server-side pool arm (neither gate reaches this path as shipped -- pass 6 §7b, where the promise gate's own criteria are MET by the oracle's exit census) |
 | **T0 — one allocator for the pair** (new, 2026-11-21) | **DONE 2026-11-22 (pass 3).**  [`enabling-0003-shared-kv-allocator.patch`](enabling-0003-shared-kv-allocator.patch) (7 files, +386/-10, `~/llama.cpp` `386b7dd48`): ONE shared owner, **per-ubatch** reserve/commit/release, with `llama_memory_alloc_sync()` as the request-boundary handshake.  `LLAMA_KV_ALLOC_SHARED=0` is the A/B control.  Measured: the two-arm run is **bit-identical to the single-context reference in every rep on both shapes**, no harness control (`RESULTS-2026-11-22.md` pass 3).  **In the server it is called on both arms at every request boundary and asserted clean** (pass 5 §1/§2) |
 
 ## 2. What exists as code (do not re-derive any of it)
@@ -317,8 +317,10 @@ cross-request prefix reuse).
 
 Still open (the traps): **no prefix reuse across requests on the arms path** — now with a number: a chat turn that
 appends ~9 tokens costs **685 ms instead of 33 ms** (`gate-ckpt-reuse` on the 4B, pass 6 §6), needing a **reverse
-handover**; `gate-host-pool.sh` + `gate-moe-promise.sh` (not yet run — the host tier is covered by the oracle, but
-landmine 6 wants the promise gate re-checked when the decode arm batches many slots); the T4 gate itself (its rules
+handover**; the two gates that cannot reach this path as shipped (`gate-host-pool.sh` is llama-cli-only, and
+`gate-moe-promise.sh`'s `seq` arm hard-codes `-np 1`) -- though the promise gate's criteria ARE met by the oracle's
+exit census, pass 6 §7b: 0 repair lines, `broken=0 repaired=0 stale=3360` cold / `10338` warm over two interleaving
+graphs; the T4 gate itself (its rules
 are measured: `README.md` landmine 8 + §3b, plus the `-np`/`--kv-unified` interaction of pass 6 §5); what happens to
 block 16's duty cycle (measured **inert** on this path, pass 6 §4, while its *fair-share* half stays live); and
 promotion (a block needs the maintainer's explicit go-ahead plus the full ladder).
@@ -326,7 +328,8 @@ promotion (a block needs the maintainer's explicit go-ahead plus the full ladder
 ## 8. The one-line summary of what is left
 
 **The server cut is built, both tiers of the oracle pass, and the smoothness target is met at an accepted cost.**
-What is left is not another mechanism: it is (a) the two gates not yet run (`gate-host-pool.sh`, `gate-moe-promise.sh`)
+What is left is not another mechanism: it is (a) an arms **arm** for the promise gate's `seq` shape and a server-side pool arm (neither owed gate reaches
+this path as shipped)
 and the *arms* that two existing gates need instead of a flag (fairness' ITL criterion, duty's inertness criterion —
 pass 6 §7), (b) the reverse handover (prefix reuse) **if the maintainer wants it**, (c) T4's opt-in gate — with the
 measured VRAM rule (`741.48 MiB` for the 2-row decode graph, `GGML_CUDA_SLAB_HEADROOM_MIB` now a shipped default) and
