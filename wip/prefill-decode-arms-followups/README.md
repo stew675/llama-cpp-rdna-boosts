@@ -41,7 +41,7 @@ documented "no"; it is also the one the maintainer asked for by name.**
 | **W6** | the **prefill/decode speed balance**: the prefill arm SKIPS turns while a decoder is active | tuning | #371 | medium | none; measure first (§7.1) |
 | **W7** | the pair's **slot erase and cell accounting** | correctness (narrow) | #370 | small | none |
 | **W8** | **multi-slot prefill batching** ("layer-major" across active prefill slots) | tuning / architecture | #372 | medium | read the premise check first (§11.1) |
-| **W9** | **P0: a qwen4exp abort at a request boundary** (`the indexer cache must track the attention cache cell for cell`) with 3 concurrent slots | **correctness (P0)** | #373 | small if the hypothesis holds | none; needs a 70K+40K+decode repro |
+| **W9** | **P0: the pair mutates ONE KV cell map from TWO threads with no lock** -- the qwen4exp assert *and* a libstdc++ RB-tree SIGSEGV (`prepare()`'s snapshot); plus two more shared-state defects behind them (a shared meta buffer, a HIP capture/staging conflict).  **REPRODUCED 2026-11-22** in ~30 s (`repro-373/`); the memory-group apply lock is written+validated but NOT shipped | **correctness (P0)** | #373 | lock = small (done); the Meta + capture defects = a campaign | **done**: `repro-373/` (3 slots, two prefills + a decode) |
 | **G1** | gate debt: three gates still anchored to the retired Flash-Next model | tooling | #369 | small | none |
 
 Ordering suggestion: **G1, W7, W3** (small, close out loose ends) → **W6** (the one the maintainer wants measured) →
@@ -503,8 +503,36 @@ same caches).  The two padded extents then differ whenever the movement crosses 
 for a prompt ubatch), which is why this is rare and why it needs a large prefill plus a request boundary: the boundary is
 when the decode arm gains a sequence and starts applying, and 70K of cells is what puts `used` next to an 8192 multiple.
 
-**Leading hypothesis, stated as such:** a **co-owner race on the two children's `n_kv` computation**, not a stale indexer
-pool and not the pad formula itself.  Two facts support it and one would settle it:
+### UPDATE 2026-11-22: REPRODUCED, DIAGNOSED, and it is bigger than one bug
+
+The full record is `WORKLOG.md` 261122.032; the harness is `repro-373/`.  What changed from the analysis below:
+
+* **It is not rare and the pad boundary is a red herring.**  Three slots (a short prompt + a long generation, a 20k prompt,
+  a 6k prompt) abort on the assert **within ~30 s, first try**; the 71k/23k shape in 40-55 s.  Instrumenting the two
+  children at the abort measured `attn used=22921` vs `idx used=23999` (`n_kv` 23040 vs 24064, both `size=204800`): the
+  divergence is **one whole peer PREFILL ubatch**, so any interleaving shows up and nothing had to cross an 8192 bucket.
+  Pair OFF: clean (`E1` confirmed).
+* **The window is wider than "two reads".**  `apply()` and `init_batch()` BOTH mutate the shared cell map, and neither was
+  serialised: `init_batch()` -> `llama_kv_cache::prepare()` **copies the whole cell map** for its rollback snapshot, so a
+  peer `apply_ubatch()` during that copy corrupts `std::set<uint32_t> used` -- measured as a SIGSEGV inside libstdc++'s
+  red-black tree.  That is the *same* defect with a memory-safety symptom, and it is pre-existing on the release build.
+* **Fix (written, validated, NOT shipped):** one apply lock per memory **group** (`llama_memory_i::apply_mutex()`, shared
+  through `create_memory()`), taken at the engine's memory entry points -- `init_batch`, `apply`, `clear`,
+  `state_write/read`, the `llama_memory_*` seq ops and park.  `alloc_sync`/`seq_state_take` stay unlocked (request-boundary
+  only).  Worst critical section measured **783-1161 us** (a 2048-token `init_batch`), one per prefill step;
+  `gate-arms-soak.sh soak --quick` 11/11.
+* **Two more defects sit behind it, so the pair is not stable on this shape yet:** (1) a SIGSEGV inside
+  `ggml-backend-meta.cpp` (`set_tensor_async`'s copy lambda / `get_split_state`) that the **released** r346 build already
+  has -- the shared KV buffer's per-graph VIEWS are registered in the view source's buffer, which both arms use; a
+  candidate hardening (set `g_meta_view_slot` on every `sched_alt_select`, not only on an alt-state change -- measured
+  arms at slots 0 and 3 afterwards) did not fix it alone.  (2) a HIP `operation not permitted when stream is capturing`
+  from `ggml_cuda_async_input_set`, i.e. one arm's async input staging against the other's capture; `GGML_CUDA_DISABLE_GRAPHS=1`
+  (the real knob -- there is no `GGML_CUDA_GRAPHS`) still crashes, so it is not capture alone.
+* **Owed:** the maintainer's block decision; the Meta and capture/staging defects; and the gate arm below, which is now
+  `repro-373/` plus assertions.
+
+**Leading hypothesis, stated as such (kept for the record; superseded by the UPDATE above):** a **co-owner race on the two
+children's `n_kv` computation**, not a stale indexer pool and not the pad formula itself.  Two facts support it and one would settle it:
 
 * the abort is on the prefill arm's thread while the decode arm is live, and only ONE
   `allocation handshake clean at the 'handover' boundary` line precedes it (the boundary that gave the decode arm its

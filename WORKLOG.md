@@ -1,3 +1,119 @@
+## 261122.032 (no delivery change) -- crash #373 REPRODUCED and diagnosed: the pair mutates ONE cell map from TWO threads with no lock (3 defects, 2 fixed in a scratch tree); the handover's pad-boundary condition is NOT needed
+
+**No delivery patch changed, no tag.**  A debugging session on `TODO` #373 / campaign `W9`, the P0 from `261122.031`.
+What it establishes: the crash **reproduces on demand** (it is not rare), the mechanism is a **missing lock on the KV
+cell map that the two arms share** (not a pad-boundary coincidence), the same root cause has a **second, worse symptom
+(a SIGSEGV inside libstdc++'s red-black tree)**, and there are **two further shared-state defects** behind it that must
+be fixed before block 17 can be called stable on this shape.  The fix is written and validated for the first class; the
+rest is a campaign, and **the block decision is the maintainer's, so nothing was regenerated**.
+
+### The repro (this is the headline: it is easy)
+
+The maintainer's own shape on `build-2ctx` (ROCm 10.1, 3 x R9700, `Qwen3.8-Flash-Next-MTP4-IQ4_NL`, `-c 204800
+--parallel 3 --kv-unified -sm tensor`, `q8_0` K/V, `-ub 2048`, `--lazy-mode on`, `--prefill-decode-arms-mode auto`) with
+**three concurrent requests: a short prompt + a long generation (the decoder), one 20k prompt, one 6k prompt** aborts on
+the qwen4exp assert **within ~30 s, first try** (`wip/prefill-decode-arms-followups/repro-373/`).  A 71k + 23k + 800-token
+shape reproduces in 40-55 s.  The handover called this "rare"; at three slots with two prefills in flight it is close to
+deterministic.  **Pair OFF, both shapes: clean** (2/2), which is E1 confirmed.
+
+### Mechanism, measured (this refutes the pad-boundary part of H1)
+
+A temporary instrument in `llama_memory_hybrid_idx_context::apply()` printed both children's `n_kv`, the unpadded `used`
+extent, the cache size and the calling thread.  At the abort:
+
+```
+[DBG_APPLY] MISMATCH tid=<DECODE arm> n_tok=1 n_seqs_unq=1 | attn n_kv=23040 used=22921 size=204800
+                                                          | idx  n_kv=24064 used=23999 size=204800 | USED-DIFFER
+qwen4exp.cpp:1138: GGML_ASSERT(mctx_idx->get_n_kv() == inp->mctx->get_attn()->get_n_kv() ...) failed
+```
+
+So the two children differed by **~1078 cells, i.e. one whole peer PREFILL ubatch**, not by the 1-3 cells a pad
+coincidence would need.  `H1` is right about the window and wrong about its narrowness: the peer is not a decode step
+(tens of milliseconds to cross a pad bucket), it is the *other arm's 2048-token prefill apply*, so any interleaving shows
+up and no boundary luck is required.  Two further facts close the alternatives: both caches report the same
+`size = 204800` (H3 dead), and the mismatch lands in **`apply()`, which runs before the graph build**, so the assert is
+only the messenger.
+
+The window is exactly what the handover drew: `apply()` computes the attention child's padded extent, then applies the
+indexer child; the engine takes **no lock** over that pair, and the arms' `arm_step_guard` deliberately lets both arms
+run `llama_process()` at once.
+
+### The same root cause has a second symptom, and it is a memory-safety bug
+
+With the assert's window covered, the shape still crashed: `SIGSEGV at 18 ... libstdc++.so.6` with the faulting
+instruction a red-black-tree walk (`48 8b 52 18`, i.e. `mov 0x18(%rdx),%rdx`).  The caller chain is
+`llama_kv_cache::prepare()` via `memory->init_batch()`: to roll a failed placement back it **copies the whole cell map**
+(`std::vector<llama_kv_cells>`, each with a `std::set<uint32_t> used`) while the peer arm's `apply_ubatch()` is inserting
+into those same sets.  Pre-fix this is masked by the assert firing first; it is a real crash on the released build for the
+larger shape.  **`init_batch()` is as much a cell-map mutator as `apply()`, and it was never serialised.**
+
+### Fix A (written, validated): one apply lock per memory GROUP
+
+- `src/llama-memory.h`: `llama_memory_i` gains `std::shared_ptr<std::mutex> mtx_apply`, `apply_mutex()` and
+  `apply_mutex_share()`.
+- `src/llama-model.cpp` (`create_memory()` tail): a context that VIEWS another memory's cells (`mem_other_used`, i.e. the
+  same condition that decides the shared view) shares that memory's lock.  One hook, every memory module, so a future
+  module cannot forget it -- the r346 lesson ("implements no shared view" must be loud) applied to the lock.
+- `src/llama-context.cpp`: the lock is taken at the **engine's memory entry points** -- `init_batch()` (decode and the
+  trainer), `apply()` (`process_ubatch`, `memory_update`, the trainer), the truncation `seq_rm`, `clear`, the four
+  `state_write/read` sites, and the `llama_memory_*` API (`clear`, `seq_rm`, `seq_rm_recr`, `seq_cp`, `seq_keep`,
+  `seq_add`, `seq_div`); `llama_memory_seq_park()` in `llama-memory.cpp`.  **Not** locked, and documented as such:
+  `alloc_sync()` and `seq_state_take()` -- request-boundary only, already inside the arms' quiet window (and a take
+  reads the peer's map, so a lock there would have to span two groups).
+- Rationale for the engine boundary rather than per-module locks: all concurrency enters through a `llama_context`, the
+  sites sit in one contiguous API layer of one file, and a composite memory's children are covered as a unit (a leaf
+  lock cannot make `attn read -> idx apply` atomic).  Cost measured, not assumed (below).
+
+**Cost:** the critical section a peer arm can be held out by is `init_batch()` for a 2048-token prefill ubatch =
+**783-1161 µs** (44 occurrences in a 55 s run, the worst 1.16 ms).  `apply()` itself is far smaller.  Against the pair's
+contract (`r346`: p50 47-49 ms / p95 64-78 ms decode through a prefill) that is noise; it is one short wait per prefill
+step, and the arms' *compute* is untouched.
+
+### The remaining defects (NOT fixed, and not one bug)
+
+1. **The Meta backend on a shared cache.**  The *released* `v18-919794500-r346` binary segfaults on the 71k/23k shape
+   **before** the assert can fire -- `SIGSEGV` inside `ggml-backend-meta.cpp` (`set_tensor_async`'s copy lambda in one
+   run, `get_split_state` in another; the same shape with the pair OFF is clean).  The pair is a graph builder/allocator
+   on two threads over a meta buffer whose per-graph **views are registered in the view source's buffer** -- one of which
+   (the shared KV cache) both arms use.  A candidate hardening was written and is **unproven**: `sched_alt_select()`
+   returned early when the alt scheduler state was unchanged, so a context whose graphs never switch keeps the
+   thread-local `g_meta_view_slot = 0`; with the slot set on *every* call the two arms measure at slots 0 and 3.  It did
+   not make the shape stable on its own, so it is reported as hardening, not as a fix.
+2. **A HIP capture/staging conflict between the arms.**  One run aborted with `ROCm error: operation not permitted when
+   stream is capturing` from `ggml_cuda_async_input_set` (and `ggml_cuda_kernel_launch`), i.e. one arm's async input
+   staging against a capture in flight.  It is **not** "just graphs": `GGML_CUDA_DISABLE_GRAPHS=1` still crashes (one
+   clean round, then a silent SIGSEGV), and the earlier `GGML_CUDA_GRAPHS=0` "pass" was a no-op variable and luck (there
+   is no such knob -- it is `GGML_CUDA_DISABLE_GRAPHS`).
+
+So `-sm tensor` + two arms + this model is **not yet a stable configuration**, and the two fixes above are necessary but
+not sufficient.  Nothing in this list is a text/numerics question: every arm is byte-identical when it survives.
+
+### What is green
+
+- The two fixes: the assert and the `std::set`/RB-tree SIGSEGV are **gone** from every run (20k/6k: 4/4 rounds clean,
+  3 slots each; the 71k/23k shape gets past both and dies later on the Meta/HIP classes).
+- `scripts/gate-arms-soak.sh soak --quick` on the fixed build: **PASS 11/11**, including the class-matched text oracle
+  (the pair's cold answer equals the single-context server's) and `check-gpu-faults.sh` clean.
+- Pair OFF on both shapes: clean, i.e. the lock changes nothing observable on the single-context path.
+
+### State / what is owed
+
+The fix lives in `~/llama.cpp` on a scratch branch (`crash373`, WIP commit `ccfd7042f`, **not pushed**), together with the
+temporary instrumentation (the `[DBG_APPLY]` print + `dbg_*` accessors, the `[DBG_VIEWSLOT]` print and the `[DBG_TIMING]`
+measurement all have to come out before any patch exists).  The repro harness is
+`wip/prefill-decode-arms-followups/repro-373/` (`armload.py` + `run.sh`).  **Owed before a fix release:**
+
+1. the maintainer's decision on **block structure** (an r346-style amendment of block 17, or a new block) -- `AGENTS.md`
+   rule 13, not a gate outcome;
+2. the Meta-backend defect (1) diagnosed to a fix, and (2) the capture/staging one;
+3. the owed gate arm from the handover (3 slots, two prefills and a decode, pad buckets shrunk, repeated N times) --
+   which the harness in `repro-373/` is already the skeleton of, and which would have caught all three defects;
+4. `scripts/validate-set.sh` + `scripts/check-rung-file-sets.py` on the regenerated set, and the fix's own gates.
+
+**Why this is recorded rather than shipped:** a fix release that leaves the feature crashing is not a fix release, and
+the block decision plus the two open defects are the maintainer's call.  `TODO` #373 stays OPEN; its detail section now
+carries the measured mechanism instead of the hypothesis.
+
 ## 261122.031 (no delivery change) -- CRASH REPORT (P0): a qwen4exp abort at a request boundary on the pair, `qwen4exp.cpp:1138`
 
 **No delivery patch changed, no tag.**  A user-facing abort in the shipped block 17, reproduced by the maintainer while
