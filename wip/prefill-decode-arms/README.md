@@ -209,7 +209,12 @@ line reads *smoothness delivered, cost accepted*, and the cost is **not** an ope
    an inconsistent state, and a forced re-prefill is the safe failure).  `~/llama.cpp` `16e942d2f`; measured
    `gate-ckpt-reuse.sh` **SKIP -> PASS** (3 restores, 33 ms turns), a reused prefix moves **no token** against a
    never-reusing arm (grow and fork; two slots reusing concurrently at 3.2x/3.4x), and tier 1 is unchanged.  A
-   cancelled conversation keeps its prefix too.
+   cancelled conversation keeps its prefix too.  **Covered on the shapes that matter (pass 8)**: a dense architecture
+   (phi-4, where a *fork below* the prefix also reuses — no checkpoint needed) and a **fully resident 27B on one GPU**
+   (the agentic-coding default), where the arms' reuse path is byte-identical to the single-context server's own
+   (`gate-server-reuse.sh`, `GATE=parity`).  The one thing reuse does **not** guarantee on the 27B is
+   reuse-vs-reprefill text equality — the reference server does not either (a checkpoint-restored placement is not a
+   re-prefilled one), so the gate states that as its own contract rather than pretending otherwise.
 ## 5. The reusable harness
 
 [`archive/work/prefill-transfer-overlap/arms/two_ctx.cpp`](../../archive/work/prefill-transfer-overlap/arms/two_ctx.cpp)

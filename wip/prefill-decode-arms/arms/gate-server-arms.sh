@@ -38,6 +38,7 @@ NCMOE=${NCMOE:-40}
 ARENA=${ARENA:-5000}
 CTX=${CTX:-8192}
 UB=${UB:-512}
+B=${B:-2048}
 NP=${NP:-2}
 NPREDICT=${NPREDICT:-32}
 PORT=${PORT:-8123}
@@ -92,10 +93,20 @@ mkdir -p "$OUT"
 
 if [[ -n ${UB_OVERRIDE:-} ]]; then UB=$UB_OVERRIDE; fi   # before the flag array is built
 
+# NO_HOST_TIER=1: a fully resident shape (every weight in VRAM, no expert arena, no gathers) -- the common
+# single-GPU end-user case, and the shape a dense MoE-free model has to use because -ncmoe does not apply
+tier_args=()
+if [[ ${NO_HOST_TIER:-0} == 1 ]]; then
+    unset MOE_EXPERT_CACHE_MIB MOE_EXPERT_HEATMAP
+    tier_args=(-ngl "$NGL")
+else
+    tier_args=(-ngl "$NGL" -ncmoe "$NCMOE" -lme auto)
+fi
+
 common=(
     -m "$MODEL"
-    -ngl "$NGL" -ncmoe "$NCMOE" -lme auto
-    -c "$CTX" -b 2048 -ub "$UB" -np "$NP"
+    "${tier_args[@]}"
+    -c "$CTX" -b "$B" -ub "$UB" -np "$NP"
     -t 8 --host 127.0.0.1 --port "$PORT"
     -lv 4
 )
@@ -120,7 +131,8 @@ done
 
 export LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib
 export HIP_VISIBLE_DEVICES=0
-export MOE_EXPERT_CACHE_MIB="$ARENA" MOE_EXPERT_HEATMAP=load ROCBLAS_USE_HIPBLASLT=0
+export MOE_EXPERT_HEATMAP=load ROCBLAS_USE_HIPBLASLT=0
+export MOE_EXPERT_CACHE_MIB="$ARENA"
 
 tag="$mode"; for c in "${control[@]}"; do tag+="-$c"; done
 log="$OUT/$tag.log"
