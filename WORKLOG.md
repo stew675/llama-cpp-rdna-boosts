@@ -1,3 +1,51 @@
+## 261122.009 (r343, no delivery change) -- wip/prefill-decode-arms: `-ub 8192` measured, and the "cost falls with the ubatch" reading is CORRECTED (it was a one-step artifact)
+
+**No delivery patch changed.**  The maintainer asked for `-ub 8192`; it was measured, and it refutes part of
+`261122.008`.
+
+### 1. The correction
+
+`261122.008` reported the pair's prefill cost falling `-26.6 % -> -19.3 % -> -16.4 %` as the ubatch went
+512 -> 2048 -> 4096.  That sweep used a **~3700-token** prompt, so at 4096 **and** 8192 the prompt fits in ONE step:
+those two points measure a single contended step against a single-step reference, not the same experiment as the
+512/2048 points.  Measured at `-ub 8192` on the same prompt: `lone` 3859.4 / arms 3159.9 = **-18.1 %** — i.e. going
+4096 -> 8192 *does not* improve once both are one step.
+
+### 2. The honest table: a ~8300-token prompt, several steps at every ubatch, both pins, warm
+
+arena 5000 (`-c 20480`):
+
+| `-ub` | `lone` | two arms | cost | decoder p50 / p95 / max |
+|---|---|---|---|---|
+| 4096 | 3625.4 t/s | 2866.3 t/s | **-20.9 %** | 37.8 / **50.2** / **95.1 ms** |
+| 8192 | 3836.6 | 2997.3 | **-21.9 %** | 32.7 / 63.5 / 124.5 ms |
+
+arena 4000, same prompt:
+
+| `-ub` | `lone` | two arms | cost | decoder p50 / p95 / max |
+|---|---|---|---|---|
+| 2048 | 2954.6 | 2278.9 | -22.9 % | 39.4 / 61.5 / 104.0 |
+| 4096 | 3525.6 | 2779.9 | -21.2 % | 38.1 / 54.2 / 101.5 |
+| 8192 | 3799.5 | 2892.7 | -23.9 % | 34.5 / 74.0 / 131.4 |
+
+**The relative cost is flat at -21…-24 % from 2048 up; the ubatch buys *absolute* prefill rate** (`lone` 2955 ->
+3526 -> 3800 t/s, the pair 2279 -> 2780 -> 2893, **+29 %**), which is the 2.6x over the `-ub 512` shape that the
+VRAM workaround had forced.
+
+### 3. Where 8192 lands
+
++8 % prefill over 4096 — and a **worse decoder tail**: p95 63.5 / max 124.5 ms against 50.2 / 95.1, because an
+8192-token step takes **2.2 s** (`pf_step_max`) and the driver cannot always fill a queue that long.  So
+**`-ub`/`-b` 4096 is the sweet spot**; 8192 only where prefill rate is worth more than the tail.  Both fit at arena
+5000 with `-c 20480` and `reserve=1.50 GiB`, no OOM (r343's headroom again).
+
+### 4. What still stands from 261122.008
+
+`-ib` is inert on the arms path (every arm here set `-ib` = `-ub`, so it never bound) and the `decode_active`
+leftover is fixed; `-ub 512` was a VRAM workaround, not a property of the design (2.6x the prefill at 4096 on the
+same arena).  The claim "a bigger ubatch is better on both axes" is **refuted at a multi-step prompt** and marked so
+in place in `RESULTS-2026-11-22.md`.
+
 ## 261122.008 (r343, no delivery change) -- wip/prefill-decode-arms: `-ib` is a single-context hack, a BIG ubatch is better on both axes, and the pair fits at 4096 now
 
 **No delivery patch changed.**  Campaign measurement + one code change in the WIP server branch (`decode_active`
