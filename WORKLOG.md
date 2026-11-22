@@ -1,3 +1,26 @@
+## 261122.020 (r343, no delivery change) -- wip/prefill-decode-arms pass 15: the "duplication" was WRONG (measured 0 MiB), (1) reverted; the declared reserve (2) is the fix and is in
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
+`wip/prefill-overlap` back at `a7958316c` (clean).  Record: `wip/prefill-decode-arms/RESULTS-2026-11-22.md` pass 15.
+
+The maintainer directed: fix the allocation duplication (1) first, retest, and only if it still fails look into (2).
+Implemented (1) -- `llama_context_params::ctx_no_decode_reserve`, so the prefill context skips the tg layout when the
+pair will decode (a decode that lands there re-reserves on demand) -- and measured: the saving is **zero** (Flash-Next
+1504.83 MiB with and without; 4B 224.57 with and without) because the wide pp layout dominates that per-context union,
+and the pair still fails with the declaration disabled.  So pass 14's "the tg layout is reserved twice / 2.2x
+duplication" reading was **wrong**: the sizes were right, the attribution was not.  The pair's extra ~1.8 GiB is the
+decode context's own graph buffers, which two schedulers inherently need.
+
+(1) reverted, for a reason beyond "saves nothing": it would leave the fallback path (pair refused, `auto` fallback,
+cancelled handover) without a tg layout it may need, i.e. it would create the late-allocation class it was meant to
+remove, on a host tier.  `~/llama.cpp` is back at `a7958316c`; re-verified Flash-Next 1 GPU `-ncmoe 48`, auto arena, no
+knob -> PASS `h=1.00`, text identical to the single context.
+
+(2) turns out to be two implementations of one idea: *declare the second context before the arena claims the space*.
+The declaration (`aux_reserve`, flat 3584 MiB, pass 14) is implemented and verified on 1 GPU layer and 3 GPU tensor
+with an auto arena; the alternative (move the decode context's construction before the slab) is a construction-order
+refactor that would account for the same VRAM and not less.  Nothing owed on layout dedup.
+
 ## 261122.019 (r343, no delivery change) -- wip/prefill-decode-arms pass 14: the decode context is DECLARED like a draft (host tier works with no knob); the pair still reserves ~2.2x the shipped path, and why
 
 **No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
