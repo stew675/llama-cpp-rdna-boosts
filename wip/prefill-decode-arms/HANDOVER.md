@@ -25,7 +25,10 @@ defect fell out of the same probe (a checkpoint restore moves a sequence's cells
 pool, so a `cache_prompt` repeat could not see the prefix it had just reused).  Both are fixed in
 `~/llama.cpp` `acd705146`; on the maintainer's shape the 82 615-token request now reads all five files and its
 `content` is **byte-identical** to the single-context server (`RESULTS-2026-11-22.md` pass 10).  `-sm layer` passes
-too, and the plain-hybrid shapes are untouched.
+too, and the plain-hybrid shapes are untouched.  **Pass 11 added the coverage matrix** (`runs/coverage-matrix/`):
+4 models (35B-A3B, Gemma4 26B-A4B, Flint, 27B) x layer/tensor x 2/3 GPUs = **16/16 PASS** — and it caught the *same
+defect class in a second memory module* (`llama_kv_cache_iswa`, i.e. gemma4, was emitting `COCOCOCO...` on every device
+count before `423c91619`).
 
 **Scope ruling (maintainer).**  This campaign ships **opt-in only** (`--prefill-decode-arms` / `mode on`).  Two items
 are explicitly a **follow-up campaign**, not this one: (a) a **meta-aware device copy** for the handover (today a
@@ -282,7 +285,8 @@ maintainer has scoped it to the follow-up campaign.
 | `arms/gate-server-reuse.sh` | **strict** PASS on 4B/phi-4/35B, **parity** PASS everywhere | §4 |
 | `scripts/gate-moe-promise.sh` | **cannot reach the path as shipped** (`-np 1` hard-coded, model absent) — but its **criteria are met** by the oracle's exit census: 0 repair lines, `broken=0 repaired=0 stale=3360` cold / `10338` warm | promotion owes an **arm**, not a pass |
 | `scripts/gate-host-pool.sh` | **cannot reach the path** (llama-cli only) | a server-side pool arm is owed |
-| `scripts/check-gpu-faults.sh` | **clean** over 50+ logs across passes 6-9 | run it on every arm |
+| [`runs/coverage-matrix/`](runs/coverage-matrix/README.md) | **16/16 PASS** (35B-A3B, Gemma4 26B-A4B, Flint, 27B x layer/tensor x 2/3 GPUs, arms-on text identical to arms-off).  **This is the check that finds a memory module the campaign has not wired** — it found `iswa` (gemma4) the same way pass 10 found `hybrid_idx` (qwen4exp).  Re-run it after any memory-module change |
+| `scripts/check-gpu-faults.sh` | **clean** over 50+ logs across passes 6-9 and pass 11 | run it on every arm |
 
 ---
 
@@ -398,7 +402,13 @@ LLAMA_KV_DEBUG_CELLS=1, LLAMA_RS_DEBUG_CELLS=1   # the cell censuses (engine sid
    * a **dense fork arm** (`FORK_REUSE=1`), a **server-side `gate-host-pool` arm**;
    * `scripts/validate-set.sh` + `ENVIRONMENT.md` for the option, then the **default flip** `off` -> `auto`
      (a delivery-behaviour change).
-3. **Still owed on the fixed path itself:** the re-pool cost after a handover has not been measured separately (it
+3. **The memory modules are the hazard, and the matrix is the detector.**  `create_memory()` has one wiring per memory
+   module; the campaign has now met four (`llama_kv_cache`, `llama_memory_hybrid`, `llama_memory_hybrid_idx`,
+   `llama_kv_cache_iswa`).  Still unshared and unexercised: a **recurrent-only** memory (a pure Mamba-class model gets
+   *no* state on the pair, because `llama_memory_seq_state_take()` refuses a non-hybrid), `-sm row`, and a host-tier
+   arm of each model.  When a new architecture is added to the delivery, run `runs/coverage-matrix/matrix.sh` on it
+   before believing anything else.
+4. **Still owed on the fixed path itself:** the re-pool cost after a handover has not been measured separately (it
    lands in TTFT, not ITL); `GLM5-Next` shares the same memory module and the same missing wiring and should be
    fixed by `acd705146` but is **not validated** (no checkpoint on this box); the 4-slot WebUI shape was not re-run
    end to end; and the meta-aware device copy (the ~74.6 ms serialised boundary) remains the follow-up campaign's
