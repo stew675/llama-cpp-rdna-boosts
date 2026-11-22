@@ -1,3 +1,22 @@
+## 261122.023 (r343, no delivery change) -- wip/prefill-decode-arms pass 18: "does MTP work now?" -- shipped MTP yes (unchanged), MTP *with the arms* still refused; and the reserve work had a bug that would have cost an MTP run 3.5 GiB (fixed)
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
+`wip/prefill-overlap` `9b8ac957f` (clean).  Record: `RESULTS-2026-11-22.md` pass 18.
+
+Three answers, all measured on Qwen3.8-Flash-Next, 1 GPU, `-ncmoe 48`, auto arena:
+
+1. **Shipped MTP works, and always did on this shape**: `--spec-type draft-mtp --spec-draft-n-max 3`, arms off ->
+   PASS, a `draft acceptance` line logged, slab `aux=3.50 GiB` (the DRAFT's second-context reserve).  The reserve work
+   in this campaign does not touch that path.
+2. **MTP + the arms is still refused, by design**: `create_decode_arm()` declines the pair when a speculator is
+   configured (a drafter owns its own context and per-slot checkpoint path).  `mode auto` falls back with a warning
+   and MTP runs (PASS, draft acceptance logged); `mode on` refuses to start.  Speculative decoding *with* the arms
+   stays the follow-up campaign's item.
+3. **A bug this question caught**: `common_draft_reserve_derive()` charged the arms' flat 3584 MiB reserve whenever
+   `prefill_decode_arms != 0`, including a run with a speculator, where the pair is refused and the reserve only
+   shrinks the arena of a legitimate MTP run.  Fixed by mirroring the server's refusal (no `has_dft()`/`has_mtp()`),
+   and verified: that run reports `aux=3.50 GiB` (the draft's) and no arms reserve line.
+
 ## 261122.022 (r343, no delivery change) -- wip/prefill-decode-arms pass 17: a BUDGETED 40 GiB arena on 3 GPUs puts both arms in the SAME residency class (h identical), and the maintainer's -c 204800 shape passes there too
 
 **No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp` `a7958316c`
