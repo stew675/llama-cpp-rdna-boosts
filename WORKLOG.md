@@ -1,3 +1,34 @@
+## 261122.016 (r343, no delivery change) -- wip/prefill-decode-arms pass 11: the COVERAGE MATRIX (16/16 shapes clean) and the same memory-module defect a second time, in `iswa` (gemma4)
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
+`wip/prefill-overlap` **`423c91619`**, clean.  Record: `wip/prefill-decode-arms/RESULTS-2026-11-22.md` pass 11;
+matrix + re-run instructions: `wip/prefill-decode-arms/runs/coverage-matrix/README.md`.
+
+**The question asked was the right one.**  4 models (Qwen3.6-35B-A3B Q8_0, Gemma4 26B-A4B Q8_0, Flint Q8_0,
+Qwen3.8-27B Q8_0) x {layer, tensor} x {2, 3} GPUs = 16 configurations, **both arms each**, generated text compared
+byte for byte on the same shape: **16/16 PASS** (arms-on == arms-off, marker found everywhere).  Raw data in
+`runs/coverage-matrix/matrix.tsv`.
+
+**And it found the P0's defect class a second time.**  `gemma4`'s memory is `llama_kv_cache_iswa` (a non-SWA cache +
+an SWA cache) and `create_memory()` passed `mem_other` only in the `GEMMA4_ASSISTANT` (drafter-mirror) branch, so a
+gemma4 *pair* ran on two empty private caches and emitted `COCOCOCO...` on **1, 2 and 3 GPUs** (raw `/completion`, so
+generation, not the chat template; the chat endpoint returned a `500 ... does not match the expected peg-gemma4
+format`).  Same WARNING as qwen4exp: *"ctx_other_share_memory was requested, but this architecture's memory module
+implements no shared view"*.  Fixed: `llama_kv_cache_iswa` takes `other_coowner` and forwards it to both children (the
+assistant mirror keeps `false`), the SWA branch of `create_memory()` passes `mem_other` with an identity layer share,
+and `iswa::alloc_sync()` covers both children's allocation owners.  After the fix gemma4 is identical on/off
+(`20e9864d44112da4`) and holds at `-c 65536` on 3 GPUs in tensor split too.
+
+**Two consumer-side facts settled:** Flint's tensor arm **must** use `-sm relaxed-tensor` — plain `-sm tensor` is
+refused at load (`LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'flint'; this arch's MoE amax rescale needs
+'-sm relaxed-tensor'`), i.e. block `0300`'s reason to exist; and gemma4 3-GPU tensor split *does* work on this build
+(the earlier suspicion did not reproduce — but before the iswa fix the pair was broken on every device count).
+
+**Not covered, stated plainly:** a recurrent-only memory (a pure Mamba-class model gets no state on the pair at all:
+`llama_memory_seq_state_take()` refuses a non-hybrid), `-sm row`, a host-tier/`-ncmoe` arm of each model, and a
+multi-turn soak per model.  The lesson recorded in `HANDOVER.md` §13: **the memory modules are the hazard, and the
+matrix is the detector** — run it for any architecture added to the delivery.
+
 ## 261122.015 (r343, no delivery change) -- wip/prefill-decode-arms pass 10: the P0 is TWO memory-module defects, both fixed (`hybrid_idx` never shared its caches; a restore moved cells behind the derived indexer pool)
 
 **No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
