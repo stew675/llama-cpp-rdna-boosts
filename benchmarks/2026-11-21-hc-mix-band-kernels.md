@@ -11,7 +11,7 @@ Both mechanisms are verified here on the delivery's own Q8_0-hc class (unsloth `
 | | |
 |---|---|
 | GPU | 3 x R9700 (gfx1201), 9950X3D |
-| toolchain | **ROCm 10.1.0-gfx120X** for the A/B (scratch tree, one path, ccache), ROCm 10.2.0-gfx120X for the release arms; the whole set also builds and runs on **7.14.1-gfx120X** (\xc2\xa76) |
+| toolchain | **ROCm 10.1.0-gfx120X** for the A/B (scratch tree, one path, ccache), ROCm 10.2.0-gfx120X for the release arms; the whole set also builds and runs on **7.14.1-gfx120X** (§6) |
 | arms | `bin-base` = the r338 tree (`2f0d05010`), `bin-pr344` = the same tree + the two patches (fixed, see §5) |
 | models | `Qwen3.8/Flash-Next/Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL` (Q8_0 hc + **F32** inject), `Qwen3.8/Flash-Next/Q4_K_M` (Q8_0 hc + **Q8_0** inject), `Qwen3.8/Flash-Next/GSQ-RCO-IQ3_S` (BF16 hc) |
 
