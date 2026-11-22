@@ -1,3 +1,29 @@
+## 261122.018 (r343, no delivery change) -- wip/prefill-decode-arms pass 13: on a HOST TIER the pair needs `GGML_CUDA_SLAB_RESERVE_MIB` (capacity, not state) -- Flash-Next 1/2/3-GPU + `-ncmoe 48`
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp` `423c91619`
+unchanged (no code change this pass).  Record: `wip/prefill-decode-arms/RESULTS-2026-11-22.md` pass 13;
+`runs/host-tier-single-gpu/README.md` §4.
+
+Asked: does Flash-Next pass on a single GPU with `-ncmoe 48` and **no artificial capping**, and do the multi-GPU host
+tier.  Measured: the **single context** passes on 1, 2 and 3 GPUs with an auto arena; the **pair** fails on all three
+at the same place -- the decode arm's 1430.16 MiB graph reserve (`the movable-boundary slab holds the VRAM … Raise
+GGML_CUDA_SLAB_RESERVE_MIB` -> `the decode arm's step failed (ret = -2)`).  The default reserve is `headroom + the
+DRAFT context estimate`, so a second **co-owning** context is not in it.
+
+With the reserve raised the pair passes and its text is identical to the single context's everywhere:
+1 GPU auto+4096 `h=0.81`; 3-GPU layer auto+4096 `h=0.85`; **3-GPU tensor needs 8192** (`h=0.81`) because the reserve
+is per device and a tensor split divides each device's headroom.  An explicit arena does not substitute: arena 5000
+with the default reserve still fails, arena 2048 + reserve 4096 passes.
+
+**This is a promotion decision, not a gate outcome**: a consumer on the maintainer's own shape (`-sm tensor` +
+`-ncmoe`) hits `the decode arm's step failed` out of the box, i.e. on exactly the tier the arms exist for.  Either
+document the knob on the option + in `ENVIRONMENT.md`, or have the server add the decode context's graph estimate to
+the reserve when the pair is requested and let `--prefill-decode-arms-mode auto` fall back with a message.  Neither is
+implemented.
+
+Caveat recorded in the pass: the 3-GPU **layer** row with `h=0.00` is fully resident, so the genuine 3-GPU host-tier
+rows are the tensor ones (plus every 1-GPU row).
+
 ## 261122.017 (r343, no delivery change) -- wip/prefill-decode-arms pass 12: the HOST-EXPERT tier on one GPU (`-ncmoe 48`) is 4/4 PASS with a non-vacuous gather census; no pure Mamba model exists on this box
 
 **No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`

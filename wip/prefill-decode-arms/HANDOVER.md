@@ -285,7 +285,7 @@ maintainer has scoped it to the follow-up campaign.
 | `arms/gate-server-reuse.sh` | **strict** PASS on 4B/phi-4/35B, **parity** PASS everywhere | §4 |
 | `scripts/gate-moe-promise.sh` | **cannot reach the path as shipped** (`-np 1` hard-coded, model absent) — but its **criteria are met** by the oracle's exit census: 0 repair lines, `broken=0 repaired=0 stale=3360` cold / `10338` warm | promotion owes an **arm**, not a pass |
 | `scripts/gate-host-pool.sh` | **cannot reach the path** (llama-cli only) | a server-side pool arm is owed |
-| [`runs/host-tier-single-gpu/`](runs/host-tier-single-gpu/README.md) | **4/4 PASS** in the regime the arms exist for: one 32 GiB card, `-ncmoe 48`, a deliberately deficient arena (35B-A3B, Flint, Gemma4, Flash-Next), every row `h >= 0.34` so none is vacuous.  Also the two capacity facts: `MOE_EXPERT_CACHE_MIB` has a **floor of 2048** (2000 aborts at load), and Flash-Next needs arena 2048 + `GGML_CUDA_SLAB_RESERVE_MIB=4096` to fit a *pair* on one card (at arena 5000 the decode arm's 1430 MiB graph reserve fails — capacity, not state) |
+| [`runs/host-tier-single-gpu/`](runs/host-tier-single-gpu/README.md) | **The pair needs `GGML_CUDA_SLAB_RESERVE_MIB` on a host tier.**  Flash-Next with `-ncmoe 48`: the single context passes on 1/2/3 GPUs, the **pair fails** at the decode arm's 1430 MiB graph reserve unless the reserve is raised (**4096** on 1 GPU and 3-GPU layer, **8192** on 3-GPU tensor — it is per device).  That is capacity, not state, and it is the tier the arms exist for, so it is a **promotion decision** (document, or make the server add the decode graph to the reserve and let `auto` fall back).  Also **4/4 PASS** in the regime the arms exist for: one 32 GiB card, `-ncmoe 48`, a deliberately deficient arena (35B-A3B, Flint, Gemma4, Flash-Next), every row `h >= 0.34` so none is vacuous.  Also the two capacity facts: `MOE_EXPERT_CACHE_MIB` has a **floor of 2048** (2000 aborts at load), and Flash-Next needs arena 2048 + `GGML_CUDA_SLAB_RESERVE_MIB=4096` to fit a *pair* on one card (at arena 5000 the decode arm's 1430 MiB graph reserve fails — capacity, not state) |
 | [`runs/coverage-matrix/`](runs/coverage-matrix/README.md) | **16/16 PASS** (35B-A3B, Gemma4 26B-A4B, Flint, 27B x layer/tensor x 2/3 GPUs, arms-on text identical to arms-off).  **This is the check that finds a memory module the campaign has not wired** — it found `iswa` (gemma4) the same way pass 10 found `hybrid_idx` (qwen4exp).  Re-run it after any memory-module change |
 | `scripts/check-gpu-faults.sh` | **clean** over 50+ logs across passes 6-9 and pass 11 | run it on every arm |
 
@@ -403,7 +403,10 @@ LLAMA_KV_DEBUG_CELLS=1, LLAMA_RS_DEBUG_CELLS=1   # the cell censuses (engine sid
    * a **dense fork arm** (`FORK_REUSE=1`), a **server-side `gate-host-pool` arm**;
    * `scripts/validate-set.sh` + `ENVIRONMENT.md` for the option, then the **default flip** `off` -> `auto`
      (a delivery-behaviour change).
-3. **There is no pure Mamba-class model on this box** (`llm_arch_is_recurrent` covers MAMBA/MAMBA2/RWKV6/RWKV6QWEN2/
+3a. **A host tier needs `GGML_CUDA_SLAB_RESERVE_MIB` for the pair** (pass 13): the default is `headroom + the DRAFT
+   context estimate`, which does not include a second CO-OWNING context's graph reserve.  Raise it when you run
+   `-ncmoe` with the arms, or the first decode step fails with `the decode arm's step failed`.
+4. **There is no pure Mamba-class model on this box** (`llm_arch_is_recurrent` covers MAMBA/MAMBA2/RWKV6/RWKV6QWEN2/
    RWKV7/ARWKV7; everything here is attention-only, hybrid, or looped-attention), so the "a recurrent-only model gets
    no state on the pair" gap stays **untested** — do not quote it as fixed.
 4. **The memory modules are the hazard, and the matrix is the detector.**  `create_memory()` has one wiring per memory
