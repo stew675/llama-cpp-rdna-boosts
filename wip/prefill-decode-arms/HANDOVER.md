@@ -7,7 +7,7 @@ and the dated record of every pass is [`RESULTS-2026-11-22.md`](RESULTS-2026-11-
 
 ---
 
-## 0. TL;DR — where this stands, and the ONE thing that is on fire
+## 0. TL;DR — where this stands (the P0 is closed; the promotion package is what is left)
 
 **What works.**  `llama-server --prefill-decode-arms` is built and measured: a prefill arm (main loop, `ctx_tgt`) and a
 decode arm (`ctx_dec`, its own thread, co-owning the prefill arm's KV), a slot crossing only at a request boundary.
@@ -17,13 +17,15 @@ resident and the next request on that slot reuses it, at single-context parity. 
 getting tokens every ~47-49 ms (p95 64-78 ms) through a 2-5 s prefill at **-21…-24 % prefill** (accepted cost,
 `README.md` §3b), where the shipped single context stalls 300-880 ms.
 
-**The one open bug (P0, this is why the session ended).**  With the arms enabled, on the maintainer's WebUI shape
-(**Qwen3.8-Flash-Next IQ4_NL, `-sm tensor` on 3 GPUs, `--kv-unified -np 3 -c 204800`, WebUI**), a request whose prompt
-is **~70K tokens (5 attached files + a text prompt, sent as ONE request)** behaves as if the model **cannot see the
-files** — it answers as though only the trailing text prompt were present.  The server reports having read all ~70K
-tokens.  With `--no-prefill-decode-arms` on the same shape the maintainer's UX was fine, and `-sm layer` + arms
-"all worked" (slower decode).  **Not yet reproduced in a probe** (see §6 for exactly what was and was not ruled out,
-and the four tests that will localise it in one session).
+**The P0 is FIXED (pass 10).**  The ~70K-token "the model cannot see the files" bug is reproduced, root-caused and
+closed: on `qwen4exp` (Flash-Next) the memory module is a *triple* (attention KV + recurrent state + lightning
+indexer KV) and `create_memory()` never gave the second context a shared view of it — the decode arm ran on an empty
+attention cache **and** an empty indexer cache, while the server printed `KV shared, one allocation owner`.  A second
+defect fell out of the same probe (a checkpoint restore moves a sequence's cells behind the pair's derived indexer
+pool, so a `cache_prompt` repeat could not see the prefix it had just reused).  Both are fixed in
+`~/llama.cpp` `acd705146`; on the maintainer's shape the 82 615-token request now reads all five files and its
+`content` is **byte-identical** to the single-context server (`RESULTS-2026-11-22.md` pass 10).  `-sm layer` passes
+too, and the plain-hybrid shapes are untouched.
 
 **Scope ruling (maintainer).**  This campaign ships **opt-in only** (`--prefill-decode-arms` / `mode on`).  Two items
 are explicitly a **follow-up campaign**, not this one: (a) a **meta-aware device copy** for the handover (today a
@@ -44,8 +46,8 @@ currently *refuse* a speculator, §8).  Nothing is in `patches/`, no delivery bl
 | **T5 — measurement** | **DONE** (pass 5): ~47-49 ms ITL p50, 64-78 ms p95 through a 2.0-5.3 s prefill at **-24…-27 %** (`-ub 512` shape) / **-21…-24 %** flat from `-ub 2048` up.  Full residency: **-24.2 %** with a **34.9 ms** worst gap against the single context's 327.3 ms.  **`-ub`/`-b` 4096 is the sweet spot** |
 | **T6 — the REVERSE handover (prefix reuse)** | **DONE** (pass 7).  The decode arm frees nothing at the return; the main thread takes the recurrent state **back** to the prefill arm and keeps the prompt.  `gate-ckpt-reuse.sh` on the arms path **SKIP → PASS** (3 restores, **33 ms** turns instead of 685 ms).  Oracles: `arms/gate-server-reuse.sh` (§4) |
 | **T7 — dense + fully-resident coverage, and the option semantics** | **DONE** (pass 8).  Dense (phi-4): fork-below-prefix **also reuses** (`cache_n=220`, 20.2 vs 97.0 ms).  Fully resident 27B: parity with the single-context server's own reuse path, byte for byte.  Option tri-state + deprecation messages (§3) |
-| **T8 — `-sm tensor` correctness** | **THREE CRASHES FOUND AND FIXED** (pass 9, `~/llama.cpp` `b822f89fc`), §7.  What remains on that path is the **serialised handover cost** (~74.6 ms per boundary) — follow-up campaign |
-| **T9 — the long-prompt bug** | **OPEN — P0.  §6.  Start here.** |
+| **T8 — `-sm tensor` correctness** | **THREE CRASHES FOUND AND FIXED** (pass 9, `~/llama.cpp` `b822f89fc`), §7, plus a fourth (a keys-only cache's shared layer has a NULL `v`; the share log line dereferenced it) in pass 10.  What remains on that path is the **serialised handover cost** (~74.6 ms per boundary) — follow-up campaign |
+| **T9 — the long-prompt bug** | **DONE** (pass 10, §6): two memory-module defects, both fixed; 82K arms-on == arms-off byte for byte |
 
 ---
 
@@ -80,6 +82,7 @@ currently *refuse* a speculator, §8).  Nothing is in `patches/`, no delivery bl
 | `16e942d2f` | **the REVERSE handover** (prefix reuse) |
 | `51c1fb8ec` | the option tri-state + `auto` fallback + the `-ib`/`DUTY` deprecation messages |
 | `b822f89fc` | **the `-sm tensor` safety work**: the take's views carry their parent buffer; the serialised fallback; the meta view-slot fix |
+| `acd705146` | **the P0 fix** (pass 10): `hybrid_idx` shares its attention AND indexer caches with the co-owner (the missing `mem_other` wiring), `alloc_sync` covers the indexer owner, the share log line tolerates a keys-only layer, and a handover marks the destination's derived indexer pool stale.  Diagnostics added: `LLAMA_RS_FORCE_SERIALISED`, `LLAMA_RS_VERIFY_TAKE` |
 
 **Build** (the only tree that has any of this):
 
@@ -175,80 +178,49 @@ requests, 32 tokens, temp 0, seed 42): **SLOT 0 `459865c93d55cbaf`, SLOT 1 `7dc2
 
 ---
 
-## 6. **THE OPEN BUG (P0) — a ~70K-token prompt is "invisible" except its tail, arms only**
+## 6. The P0 (RESOLVED, pass 10) — "the model cannot see the ~70K-token attachment"
 
-### 6.1 The maintainer's report, verbatim in substance
+**Status: fixed in `acd705146`; the full record is `RESULTS-2026-11-22.md` pass 10.**  Kept here because the *shape*
+of the miss is the lesson: every oracle the campaign had passed, and the bug lived in the one architecture no oracle
+ran.
 
-* Shape: the WebUI on **Qwen3.8-Flash-Next IQ4_NL** (`STEW675-IQ4_NL/runme`): `-sm tensor` on **3 GPUs**,
-  `-c 204800 --parallel 3 --kv-unified --load-mode dio --lazy-mode mlock -b/-ub 4096`,
-  `GGML_CUDA_SLAB_HEADROOM_MIB=1536`, `--prefill-decode-arms`.
-* Prompt: **5 files attached in the WebUI + "Please perform a code-review of this project", ~70K tokens, ONE request.**
-* Symptom: the model behaves as if it **cannot see the files** and answers as though only the trailing text prompt
-  were present.  The server reports having read all ~70K tokens.
-* Scope: **only with the arms enabled.**  With `--no-prefill-decode-arms` on the same shape the UX was fine; with
-  `-sm layer` + arms "it all worked" (decode much slower).  Also seen: speculative decoding is refused (§8).
+### 6.1 What it was (two defects, both in the memory module)
 
-### 6.2 What is already ruled OUT (do not redo)
+1. **`qwen4exp`'s context never shared anything.**  Its memory is `llama_memory_hybrid_idx` — attention KV +
+   recurrent state + a lightning-indexer KV — and `create_memory()` passed `mem_other` to the plain
+   `llama_memory_hybrid` branch *only*.  The decode arm got its own attention KV and its own indexer KV, so its
+   top-k selection attended over nothing; the server printed `KV shared, one allocation owner` anyway.  The engine
+   had been printing the truth on every run:
+   `W create_memory: ctx_other_share_memory was requested, but this architecture's memory module implements no
+   shared view -- this context has its OWN cache (qwen4exp)`.
+2. **A restore moved cells behind the derived indexer pool.**  qwen4exp pools consecutive *cells*, the pool is per
+   *context*, and a checkpoint restore re-places the sequence — so the arm that received the sequence kept a layout
+   built for its previous cells and attended only over what it re-prefilled itself.  A `cache_prompt` repeat read
+   `cache_n=6898` and answered without the prefix.
 
-* **1 GPU, 4B Q8_0, 15.7K-token prompt, `-ub 4096` (4 chunks), arms ON vs OFF**: identical and **correct** —
-  `prompt_n=15773`, the answer is the marker placed at the very start; and with `cache_prompt:true` a repeat reads
-  `cache_n=15769` / `prompt_n=4` and is still correct.  So a multi-chunk prompt is not broken by the arms per se, and
-  the reuse path is not broken on that shape.
-* **Flash-Next, `-sm tensor`, 3 GPUs, 15.7K prompt, arms ON and OFF**: both returned **empty content** (that prompt
-  framing makes this thinking model emit EOG immediately) → **inconclusive, NOT a reproduction**.  If you retry it,
-  read `reasoning_content` as well as `content` and give it more tokens.
+### 6.2 What it was NOT (do not re-derive)
 
-### 6.3 Hypotheses, most likely first
+* **Not H1, phantom prefix reuse**: it failed on a *fresh* request (`cache_n=0`), before any reuse.
+* **Not H2, the Meta/serialised state move**: `LLAMA_RS_VERIFY_TAKE=1` re-reads the destination and diffs it against
+  the source — `0 of 118039420 byte(s) differ`, FAITHFUL.  Forcing the serialised move on a 1-GPU shape that *has* a
+  device copy gives correct text, so the serialised logic is sound.
+* **Not the meta path at all**: `-sm layer` failed identically before the fix (the maintainer's "-sm layer worked"
+  did not reproduce with a marker probe).  The 4B plain hybrid passes at 82K on `-sm tensor`.
+* **Not H3** (no shift: `prompt_n` = the whole prompt, no shift lines) and **not H4** (the probe sends one request).
 
-1. **H1 — phantom prefix reuse (the most likely, and it is code from pass 7).**  The reverse handover keeps
-   `slot.prompt` across requests.  If the KV that prompt refers to is ever gone while the bookkeeping survives, the
-   next request computes `n_past` = the full retained prefix, reports `cache_n` ≈ 70K, evaluates only the trailing
-   tokens — and the model answers as if the files were never ingested.  This is exactly "forgetting everything prior
-   to the very last prompt" and it can only happen with the arms, because only then does the prompt survive a request
-   while the state moves between contexts.  Candidate sources of "cells gone, prompt kept": an eviction of the unified
-   KV under pressure where the save/clear pairing fails, a sequence dropped by a failed take while the prompt was not
-   cleared on some path, or a cancel (`arm_release`) that takes the state back onto a sequence whose cells the decode
-   arm had already released.
-2. **H2 — the long prompt itself on the meta path.**  `-sm tensor` means the *handover* is the **serialised state
-   move** (§7) and the recurrent cache lives in the Meta split-state buffer.  If that move restores only part of the
-   state (or the decode arm's `n_kv`/band range is derived from a co-owner's view of the cells), the decode arm would
-   attend over the tail only.  It would be `-sm tensor`-specific — which matches "it all worked with `-sm layer`".
-   Note this is a *decode-side attention* failure, so the prefill's own `prompt_n` would still read 70K.
-3. **H3 — the context limit / shift.**  With `--kv-unified`, each slot's `n_ctx` is the whole `-c` (204800), so a 70K
-   prompt fits — but confirm it in the log (`new slot, n_ctx = ...`) and look for `slot context shift` (a shift drops
-   the oldest half by design and would look exactly like this).  Falsifiable in one grep.
-4. **H4 — the WebUI sends the files as several requests.**  Then the failure would be in the *append* path (each
-   request reusing the previous prefix).  Distinguishable from H1 only by the request count — check the log's
-   `new prompt` / `prompt done` lines, or `prompt_n` per request.
+### 6.3 The probes (kept, they are the cheap reproducers)
 
-### 6.4 The four tests, in order (each cheap, each bounded)
+`runs/p0-longprompt/` — `mkprompt.sh` builds a 5-file attachment whose FILE 1 states a codename on its third line
+(the head is what a broken decode arm loses); `run_arm.sh` drives one server, one or two requests, and reports
+`prompt_n`/`cache_n` plus MARKER FOUND/ABSENT.  Flash-Next at **11K** reproduces it (~40 s per arm); the 4B at
+**82K** does not (which is what exonerated length and the meta path).  Diagnostics: `LLAMA_RS_FORCE_SERIALISED=1`,
+`LLAMA_RS_VERIFY_TAKE=1`.
 
-1. **Fresh server, ONE request, arms on, the 70K prompt** (no prior traffic on that slot).
-   - **fails** → it is H2/H3 (not reuse).  Go to test 3.
-   - **passes** → it is **H1**: reuse.  Go to test 2.
-2. **Two requests with `cache_prompt:true`** (the files, then the question).  Read the second response's `timings`:
-   a **large `cache_n`** with an answer that ignores the prefix = phantom cache confirmed.  Cross-check the log:
-   `cached n_tokens = N, memory_seq_rm [N, end)` (what it thought it had) and whether
-   `forcing full prompt re-processing due to lack of cache data` appears (a hybrid model without a usable checkpoint
-   must print that and re-prefill).
-3. **Same 70K prompt, `-sm layer`, arms on** — the maintainer says this worked.  If it also fails, the meta path is
-   exonerated and H1/H4 is the whole story.
-4. **Same 70K prompt on a single GPU** (27B fully resident, `-c 131072`, one device) with arms on, one request:
-   removes `-sm tensor` from the picture entirely.
+### 6.4 Containment, if it were ever to come back
 
-Always capture: the response `timings` (`prompt_n`, `cache_n`), and the server log with **`-lv 4`** (`new prompt`,
-`prompt done: posted to the decode arm`, `allocation handshake clean`, `cached n_tokens`, `slot context shift`,
-`forcing full prompt re-processing`, `restored context checkpoint`).
-
-### 6.5 Containment while it is open (for real use of the server)
-
-The reuse half is what H1 implicates, and it is one code path.  If a build that cannot exhibit a phantom prefix is
-wanted **now**, the minimal, reversible change is a kill switch that restores pass-6 behaviour — `prompt_clear()` on
-the return instead of keeping the prompt (i.e. no cross-request reuse; a re-prefill per request).  **Not implemented
-yet** — it is a behaviour change and wants the maintainer's go-ahead, but it is ~6 lines in
-`finish_returned_slots()` / `arm_release()` behind `LLAMA_ARMS_KEEP_PROMPT=0` (default ON = today's behaviour).
-
----
+The measured containment is defect 1's fix; nothing else is needed.  If a phantom prefix is ever *seen* again, the
+two checks that localise it fastest are (a) a fresh request with `cache_n=0` (rules reuse out) and (b) the 11K
+Flash-Next arm vs the 4B 82K arm (rules length and the meta path out).
 
 ## 7. `-sm tensor` and the Meta split-state cache (three crashes, all fixed; one cost remains)
 
@@ -315,6 +287,18 @@ maintainer has scoped it to the follow-up campaign.
 ---
 
 ## 10. Rules and traps (each of these cost a session; several cost this one)
+
+**Box (these read as defects in the change under test; they are not)**
+* **Never export `TEMP` to a GPU process.**  `TEMP=0` (a harness's sampling temperature, in this campaign's case)
+  makes the ROCm 10.1 runtime fail, and it surfaces as `hipStreamCreateWithFlags failed` -> `ROCm error: out of
+  memory` at context creation.  It cost half a session of chasing a phantom VRAM bug.  The harness knob is
+  `REQ_TEMP`.
+* **`kill -9` on a `timeout` wrapper leaves the server alive**, and `rocm-smi` does not account VMM allocations, so a
+  "VRAM drained" check does not see a leaked server — which still answers `/health` and becomes the arm you think
+  you are driving.  Start arms under `setsid`, kill the process *group*, and refuse to start while any
+  `llama-server` exists.
+* A GPU OOM reported at `hipStreamCreateWithFlags` / `hipMemsetAsync` is a **sticky** error: the real failure was an
+  earlier allocation, so read the first `E` line, not the last.
 
 **Measurement**
 * **One GPU arm at a time**; pin `HIP_VISIBLE_DEVICES`; `ROCBLAS_USE_HIPBLASLT=0` on **every** arm (a second context
@@ -404,15 +388,19 @@ LLAMA_KV_DEBUG_CELLS=1, LLAMA_RS_DEBUG_CELLS=1   # the cell censuses (engine sid
 
 ## 13. Do this, in this order
 
-1. **Reproduce the P0 long-prompt bug** (§6.4, tests 1→4).  Do not start from a fresh theory; four tests settle it.
-   If it is H1 (reuse), the phantom cache is in `finish_returned_slots()`'s retained prompt and fix there.  If it is
-   H2, it is the meta/serialised-take path and the follow-up campaign's device copy is the real answer — in which
-   case the honest first-shippable move is to **refuse `-sm tensor` with the arms** (a guard) rather than ship it.
-2. **Report the finding before any delivery-affecting commit.**  The maintainer decides fix-now / defer / drop.
-3. If the bug is fixed: the containment question (§6.5) and the promotion question come back to the table.  The
-   promotion package would be: the two gate *arms* (§9), a long multi-turn soak (cells filling →
-   `try_clear_idle_slots` on the arms path is **untested**), a dense fork arm, a server-side `gate-host-pool` arm,
-   then `validate-set.sh` + `ENVIRONMENT.md` for the option — and the **block structure, which is the maintainer's
-   call alone**.
-4. **Still not run, and owed before promotion:** a long multi-turn soak; the arms-vs-single text comparison on a
-   *streamed/windowed KV* shape (block 14's window and pool are off by default, so nothing measured here covers them).
+1. **Nothing is on fire.**  The P0 is fixed and verified on the maintainer's shape (`RESULTS-2026-11-22.md` pass 10);
+   re-run the probe there first if a doubt remains (`runs/p0-longprompt/run_arm.sh`, the 11K Flash-Next arm is the
+   40-second reproduction, the 82K one is the product shape).
+2. **The promotion package — the maintainer's call, never a gate outcome:**
+   * the two gate *arms*: fairness needs an **arms-aware ITL criterion** (its shipped `chunk/b` bound is 13 ms, below
+     the decode arm's own 28-30 ms step) and duty needs a **two-sided band** (±10 %), not a 1.0x floor;
+   * a **long multi-turn soak** (cells filling -> `try_clear_idle_slots` on the arms path is still untested);
+   * a **dense fork arm** (`FORK_REUSE=1`), a **server-side `gate-host-pool` arm**;
+   * `scripts/validate-set.sh` + `ENVIRONMENT.md` for the option, then the **default flip** `off` -> `auto`
+     (a delivery-behaviour change).
+3. **Still owed on the fixed path itself:** the re-pool cost after a handover has not been measured separately (it
+   lands in TTFT, not ITL); `GLM5-Next` shares the same memory module and the same missing wiring and should be
+   fixed by `acd705146` but is **not validated** (no checkpoint on this box); the 4-slot WebUI shape was not re-run
+   end to end; and the meta-aware device copy (the ~74.6 ms serialised boundary) remains the follow-up campaign's
+   item — now purely a cost, since the move is proven faithful.
+4. **A block is always a question.**  Nothing here created, amended or renumbered one.
