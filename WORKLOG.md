@@ -1,3 +1,22 @@
+## 261122.022 (r343, no delivery change) -- wip/prefill-decode-arms pass 17: a BUDGETED 40 GiB arena on 3 GPUs puts both arms in the SAME residency class (h identical), and the maintainer's -c 204800 shape passes there too
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp` `a7958316c`
+(clean, unchanged).  Record: `RESULTS-2026-11-22.md` pass 17;
+`runs/host-tier-single-gpu/verify-3g-cap.sh` / `verify-3g-cap.log`.
+
+Capped the 3-GPU Flash-Next arena to **40 GiB total** (13653 MiB/device -- `MOE_EXPERT_CACHE_MIB` is a per-device
+budget) so the host-resident path is the shape rather than an accident: **PASS in all three configurations**, with the
+census **identical in both arms** -- layer 0.9352/0.9352, tensor 0.9376/0.9376, and the maintainer's
+`-c 204800 --parallel 3` 0.9352/0.9352 -- text byte-identical within each pair.
+
+**This corrects pass 16's "cost".**  The single-context-resident (`h=0.000`) vs pair-deficient (`h=0.851`) difference
+is an **auto** (free-VRAM sized) arena artifact: with an explicit `MOE_EXPERT_CACHE_MIB` the arena is a budget, so the
+3584 MiB second-context reserve comes out of the slab's own unclaimed reserve and both arms stay in one residency
+class.  That is also why the campaign's gates never hit a residency-class mismatch on the tier -- their product shape
+always pinned the arena.  Consequence for the promotion gates: **a budgeted arena is the right shape for an
+arms-vs-single text comparison on a host tier**; on an auto arena the pair is legitimately one §89 class more deficient
+than the same config's single context, so their texts are not an equality oracle there.
+
 ## 261122.021 (r343, no delivery change) -- wip/prefill-decode-arms pass 16: post-fix verification -- every host-tier shape passes with a DEFAULT arena and NO knob (incl. the maintainer's `-c 204800` 3-GPU tensor shape)
 
 **No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp` `a7958316c`
