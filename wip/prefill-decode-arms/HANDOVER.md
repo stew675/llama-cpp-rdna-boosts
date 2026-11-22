@@ -22,9 +22,9 @@ allocation owner); **pass 5 built the server cut and tier 1 passes**.
 |---|---|
 | **T1 — the state handover** | **DONE.** `enabling-0002-recurrent-handover.patch`: one sequence's recurrent state moves between the arms **device-to-device in 0.45-0.66 ms** (1.9-2.3 ms on a process's first handover) against **34.5-36.1 ms** for the serialised path (52.7 MiB).  Text-exact on a no-host-tier 4B in every mode/repetition and on the 35B host tier for a single handed-over request (3/3 warm reps) |
 | **T2 — the server skeleton** | **DONE 2026-11-22 (pass 5).**  `llama-server --prefill-decode-arms` is the design, not an emulation: a prefill arm (main loop, `ctx_tgt`) + a decode arm (`ctx_dec`, its own thread, co-owning the prefill arm's KV), a slot crossing only at a request boundary.  **Tier 1 passes cold and over 3 warm request pairs** (both slots byte-identical, every allocation handshake clean).  `~/llama.cpp` `683deed67`; built in `T2-SERVER-CUT.md`'s code points + three small deviations; see [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) pass 5 |
-| **T3 — the request-boundary handover + its oracle** | **DONE for tier 1** (the hash, both arms' approval): the server reproduces the reference text exactly, cold and warm.  **Tier 2 is not run yet** (KLD + the residency census) -- it is delivery-bound work, and nothing here is delivery-bound |
+| **T3 — the request-boundary handover + its oracle** | **DONE, both tiers (tier 2 2026-11-22, pass 6).**  Tier 1: the server reproduces the reference text exactly, cold and over 3 warm pairs.  Tier 2: `scripts/gate-prefill-logits.sh` on the WIP build reads **mean KLD 0.000000 / same-top-p 100 %** (the artifacts are bit-inert on the default path) -- with the honest limit that `llama-perplexity` has one context and so cannot reach the arms path (pass 6 §2) |
 | **T4 — the opt-in gate** | Not started; its rules are now measured *in the server*: the 2-row decode graph asks **741.48 MiB** and does not fit at arena 5000 next to a grown prefill graph unless **`GGML_CUDA_SLAB_HEADROOM_MIB=1536`** (pass 5 §4) |
-| **T5 — measurement + gates** | **The measurement is taken** (pass 5 §3): the smoothness target is met (~47-49 ms p50 through a 2.0-5.3 s prefill), the cost target is **not** (-24 to -27 % vs the instrument's -14.1 %, and pass 5 §6 explains why).  The delivery-bound gates are **not** run |
+| **T5 — measurement + gates** | **The measurement is taken** (pass 5 §3): the smoothness target is met (~47-49 ms p50 through a 2.0-5.3 s prefill), the cost target was **accepted** (README §3b; -24 to -27 %, pass 5 §6 explains why).  **The gates that are reachable are RUN (pass 6, `RESULTS-2026-11-22.md` §3-§7)**: fairness + `--self-test`, duty, park, ckpt, `check-gpu-faults` on 32 logs.  Fairness and duty are red **as shipped** on a *relative* bound that the arms remove (and green under the gate's own absolute / inert-floor criterion); park and ckpt **SKIP by construction**.  Still owed before promotion: `gate-host-pool.sh` and `gate-moe-promise.sh` |
 | **T0 — one allocator for the pair** (new, 2026-11-21) | **DONE 2026-11-22 (pass 3).**  [`enabling-0003-shared-kv-allocator.patch`](enabling-0003-shared-kv-allocator.patch) (7 files, +386/-10, `~/llama.cpp` `386b7dd48`): ONE shared owner, **per-ubatch** reserve/commit/release, with `llama_memory_alloc_sync()` as the request-boundary handshake.  `LLAMA_KV_ALLOC_SHARED=0` is the A/B control.  Measured: the two-arm run is **bit-identical to the single-context reference in every rep on both shapes**, no harness control (`RESULTS-2026-11-22.md` pass 3).  **In the server it is called on both arms at every request boundary and asserted clean** (pass 5 §1/§2) |
 
 ## 2. What exists as code (do not re-derive any of it)
@@ -307,18 +307,30 @@ Read it as: **the arms are better than the single-context server on both axes on
 ~-21…-24 % (accepted by the maintainer, `README.md` §3b), the decoder's worst case is 34-131 ms instead of 327-878,
 and **`-ub`/`-b` 4096 is the sweet spot** (`-ib` inert; 8192 buys +8 % prefill for a worse tail).
 
-Still open (the traps): tier 2 (KLD) + the server gates of `T2-SERVER-CUT.md` §6.3; **no prefix reuse across requests
-on the arms path** (`finish_returned_slots()` clears the prompt — a reverse handover would be needed); the T4 gate
-itself (its rules are measured, `README.md` landmine 8 + §3b); what happens to block 16's duty cycle on this path (it
-is redundant: `-ib` cannot bind and the bursts it exists to create are already gone); and promotion (a block needs
-the maintainer's explicit go-ahead plus the full ladder).
+**The gates that are reachable on this path are RUN (pass 6, `RESULTS-2026-11-22.md` §3-§7)** — and the short version
+is that the delivery's own instruments confirm the campaign rather than contradict it: the single-context
+fairness baseline's worst in-window ITL on the gate's own shape is **323 ms**, the arms' baseline is **29 ms**; the
+single-context duty baseline delivers **16** decoder tokens through the prefill, the arms' baseline **73**.  Both gates'
+remaining reds are *relative* bounds (`chunk/b`, `3x the baseline`) that a design which removes the shared step has no
+lever to satisfy.  Park and ckpt **SKIP by construction** (a co-owner pair is not one stream; the arms path has no
+cross-request prefix reuse).
+
+Still open (the traps): **no prefix reuse across requests on the arms path** — now with a number: a chat turn that
+appends ~9 tokens costs **685 ms instead of 33 ms** (`gate-ckpt-reuse` on the 4B, pass 6 §6), needing a **reverse
+handover**; `gate-host-pool.sh` + `gate-moe-promise.sh` (not yet run — the host tier is covered by the oracle, but
+landmine 6 wants the promise gate re-checked when the decode arm batches many slots); the T4 gate itself (its rules
+are measured: `README.md` landmine 8 + §3b, plus the `-np`/`--kv-unified` interaction of pass 6 §5); what happens to
+block 16's duty cycle (measured **inert** on this path, pass 6 §4, while its *fair-share* half stays live); and
+promotion (a block needs the maintainer's explicit go-ahead plus the full ladder).
 
 ## 8. The one-line summary of what is left
 
-**The server cut is built and tier 1 passes; the smoothness target is met and the cost target is not.**  What is
-left is not another mechanism: it is (a) tier 2 (the KLD point) and the server-side gates of
-`T2-SERVER-CUT.md` §6.3, (b) T4's opt-in gate — now with the measured VRAM rule (`741.48 MiB` for the 2-row decode
-graph, and `GGML_CUDA_SLAB_HEADROOM_MIB=1536` as the lever that makes the pair fit), and (c) the maintainer's
-decision on what this is worth: **-24…-27 % prefill for an ITL p95 of 64-78 ms** against the shipped duty cycle's
-519-568 ms at -30 % (`RESULTS-2026-11-22.md` pass 5 §3/§6).  Nothing here is delivery-bound, and a block is a
-question, never a gate outcome.
+**The server cut is built, both tiers of the oracle pass, and the smoothness target is met at an accepted cost.**
+What is left is not another mechanism: it is (a) the two gates not yet run (`gate-host-pool.sh`, `gate-moe-promise.sh`)
+and the *arms* that two existing gates need instead of a flag (fairness' ITL criterion, duty's inertness criterion —
+pass 6 §7), (b) the reverse handover (prefix reuse) **if the maintainer wants it**, (c) T4's opt-in gate — with the
+measured VRAM rule (`741.48 MiB` for the 2-row decode graph, `GGML_CUDA_SLAB_HEADROOM_MIB` now a shipped default) and
+the `-np`/`--kv-unified` interaction, and (d) the maintainer's decision on what this is worth:
+**-24…-27 % prefill for an ITL p95 of 64-78 ms** against the shipped duty cycle's 519-568 ms at -30 %
+(`RESULTS-2026-11-22.md` pass 5 §3/§6).  Nothing here is delivery-bound, and a block is a question, never a gate
+outcome.
