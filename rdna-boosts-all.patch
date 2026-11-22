@@ -70838,7 +70838,7 @@ index 5605bf7a4..4aef754a5 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..722f8fb3f
+index 000000000..1713a03fb
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
 @@ -0,0 +1,13903 @@
@@ -80599,7 +80599,7 @@ index 000000000..722f8fb3f
 +// When the bitmap pays.  Its win grows with the SCAN VOLUME it replaces -- `n_experts * n_split *
 +// n_used * n_tok` routed ids -- and it is one pass over those ids plus one read per block, so a shallow
 +// split (or a narrow decode/verify routing) keeps the scan: the pass is then latency on the critical
-+// path that buys nothing.  Measured on gfx1201 (r345, `WORKLOG.md` 261122.003): 6.7e7 ids reads -1.2 %
++// path that buys nothing.  Measured on gfx1201 (r345, `WORKLOG.md` 261122.005): 6.7e7 ids reads -1.2 %
 +// (a 512-expert table at n_split 8) and -2.3 % (a 256-expert table at 16), while 1.34e8 reads +0.7 %
 +// (512 experts at 16), +1.5 % (256 at 32) and +4.1 % (512 at 32, a 54.7 %-residency arena), and 2.7e8
 +// reads +12 % (256 at 64).  1e8 ids is the crossover; the default (n_split 32) is above it on both

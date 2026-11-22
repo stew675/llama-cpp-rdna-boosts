@@ -1,8 +1,8 @@
 ## 261122.005 (r345, RELEASE v17-919794500-r345) -- issue #350 fixed: the MoE device gather's used-expert BITMAP (block 09), so a deep split stops paying for the routing scan it already did
 
 **Release:** `v17-919794500-r345`.  Base `919794500` (base tree `916941663346eb86004bed77f74e90fcf9c43126`), canonical
-tip **`b0bd1940a`** (the re-cut `apply-all.sh` produces; the working chain tip `585360d19` is a DIFFERENT
-commit with the same tree **`228628e50bec140b25be27966844404ee41a1da2`**, which is the contract), 17 official + 1 temporary = 18 default
+tip **`e695c46ce`** (the re-cut `apply-all.sh` produces; the working chain tip `ac8515642` is a DIFFERENT
+commit with the same tree **`0d2f70e6c44eb246a9c71f29e015d6ebe98f214d`**, which is the contract), 17 official + 1 temporary = 18 default
 blocks, optional `0100` -> `151c3b84e` / `0101` -> `5377f93d0` (cumulative `db7c6be40`).  **No block created,
 split or renumbered**: one same-block amendment, **block 09** (`ggml/src/ggml-cuda/moe-expert-cache.cu`,
 `moe_cache_gather_host` + `moe_cache_gather_kernel`), plus the census wording of block 12's `device gather:` line
@@ -44,10 +44,10 @@ read-granularity problem, and per-block launch cost is the other candidate).  If
 their box after this, the cause is the grid size rather than the scan, and the fix for that class is a smaller
 grid -- which needs their logs to size, so the reply asks them to re-test rather than claiming their number.
 
-### Gates (all on the released tree, build `585360d19` / canonical re-cut `b0bd1940a`)
+### Gates (all on the released tree, build `ac8515642` / canonical re-cut `e695c46ce`)
 
 * `scripts/validate-set.sh` -- **green**: 18 default patches + 2 optional + `rdna-boosts-all.patch` checksums,
-  strict apply on a fresh `919794500` tarball, applied tree **`228628e50`** == `release.json`, both optionals
+  strict apply on a fresh `919794500` tarball, applied tree **`0d2f70e6c`** == `release.json`, both optionals
   apply alone (`151c3b84e` / `5377f93d0`) and cumulatively (`db7c6be40`), Windows portability clean,
   `check-rung-file-sets.py` accounts for every file/define/env/option (**575 -> 576 envs**, 0 losses), and the
   system-header check is clean.

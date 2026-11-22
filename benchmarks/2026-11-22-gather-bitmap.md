@@ -71,7 +71,7 @@ a 12 % win, which is why the bitmap — not a different constant — is the fix.
 
 ## 3. The shipped default, on the released tree
 
-`release.json` tree `228628e50` (the working chain's build `585360d19`; the canonical re-cut is `b0bd1940a`),
+`release.json` tree `0d2f70e6c` (the working chain's build `ac8515642`; the canonical re-cut is `e695c46ce`),
 no env knobs, three interleaved pairs:
 
 | shape | shipped (bitmap at 32) | `MOE_GATHER_MASK=0` (pre-r345) | delta |
