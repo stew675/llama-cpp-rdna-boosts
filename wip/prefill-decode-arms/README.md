@@ -1,7 +1,8 @@
 # prefill-decode-arms — one prefill arm and one decode arm, both live on one GPU
 
-**Status: pass 1 done (2026-11-21) — T1 CLOSED, T2/T3 emulated outside the server, three new landmines.
-Nothing in `patches/`.**  See [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md).  It inherits the conclusion of the
+**Status: pass 2 done (2026-11-22) — T1 CLOSED, T2/T3 emulated outside the server, the §3.4 residual
+resolved (two effects, neither of them the design).  Nothing in `patches/`.**  See
+[`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) (pass 2) and [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md) (pass 1).  It inherits the conclusion of the
 retired [`archive/work/prefill-transfer-overlap/`](../../archive/work/prefill-transfer-overlap/README.md)
 (it established *what* the win is and *which mechanism* delivers it).  This campaign builds the product.
 
@@ -159,7 +160,10 @@ yield point, the stream-priority plumbing — the last two are recorded losers, 
    prefill thread alone changes nothing here — what the prefill must own is the *allocation*, while the decode
    arm still applies the publish (a posted message, never a lock the prefill waits on: a direct mutex take
    starves the prefill for 2.85 s, results file §2).  Residual: the *second* concurrent slot still reads one
-   stable-but-different value warm (results file §3.4 item 3).
+   stable-but-different value warm (results file §3.4 item 3) — **RESOLVED 2026-11-22, two effects**: at full
+   residency it is the **hipBLASLt** path (`ROCBLAS_USE_HIPBLASLT=0` makes the arms bit-identical to the reference,
+   480/480 logits rows, and the divergent row is R1's own *prefill* row), and on a partial arena it is a **§89
+   residency class** (`h=0.8161` vs `h=0.8172`) that survives every pin.  [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md).
 
 ## 5. The reusable harness
 
@@ -233,13 +237,20 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 6. **New: which oracle does the maintainer want for T3?**  §3.3 says a cross-configuration hash is not
    available on a partial host-expert arena.  Proposed: text at full residency (or no host tier) + KLD on the
    tier + a same-configuration repetition to catch non-determinism.  Confirm before T2's gate is written.
-7. **New: is the 2-slot warm text instability a *bug* or a graph-bucket effect?**  This pass could not settle
-   it (the isolation matrix is in the results file §3.3).  It **refuted** the host-tier explanation (full
-   residency reproduces it), and the single-context text itself moves with `LLAMA_KV_N_PAD_MIN`, so it is a
-   shape/numerics effect, and `n_kv` and the decode context's buffer layout are both eliminated.  The leading
-   hypothesis is the **physical KV cell indices** (a per-context allocation cursor + an index-dependent tile-FA
-   split).  Next instrument: print the cell indices each arm's sequence holds and the resulting
-   `parallel_blocks`, and diff the **logits** of the same token decoded on A and on B.
+7. **New: is the 2-slot warm text instability a *bug* or a graph-bucket effect?**  **SETTLED 2026-11-22**
+   ([`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md)): it is **two** effects.  (a) The two allocation cursors — real,
+   §3.4 was right: the arms' KV cell layout is byte-identical to the single-context reference when the allocation
+   state is shared (0/243 census lines differ, both shapes, every rep) and *scatters* when it is not (192/243;
+   a warm rep puts pos 512 in cell 0 while the prompt sits in 512–1023).  (b) `b79e73e3fe9f` — the *residual*: at full
+   residency the **hipBLASLt** solution path (pass 1's full-residency oracle block omitted the r310 pin), and on the
+   host tier a **residency class** (§89) that survives both pins.  So the strong oracle IS available at full
+   residency with the pin **and** one allocator; on the tier it is KLD + class-matched text.
+   ~~The leading hypothesis is the physical KV cell indices, next instrument: cell indices + logits.~~  Done — see
+   above: the cells are a carrier only through the *allocation state*, and the logits named the prefill row.
+8. **New (2026-11-22): which shape does the T3 gate run on?**  The strong (hash) point is only valid at full
+   residency with the pin and one allocator; the *product* shape (partial arena) can only be judged by KLD +
+   class-matched text.  Confirm that a two-tier oracle is acceptable, or pick one (my recommendation: two-tier —
+   the hash is the sharp one, the KLD is the honest one where the feature lives).
 
 ## Files
 | file | what |
@@ -248,6 +259,7 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 |---|---|
 | this `README.md` | the campaign: idea, established evidence, design, landmines, tasks, gates, open questions |
 | [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md) | **pass 1**: T1 done and measured, the emulated T2/T3 and the product numbers, the three new landmines, the server cut in code points |
+| [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) | **pass 2**: the §3.4 residual is two effects (hipBLASLt at full residency, a §89 residency class on the tier); the cell censuses that prove the two-cursor scatter and that the arms match the reference exactly with the pin + one allocation state |
 | [`enabling-0001-second-context-shared-kv.patch`](enabling-0001-second-context-shared-kv.patch) | the second context that shares the first one's KV (text-verified, applies to `release.json`'s tree) |
 | [`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch) | **T1**: the recurrent-state handover, device to device (+ `seq_rm_recr`, `RECR_ONLY`) |
 | [`arms/two_arms.cpp`](arms/two_arms.cpp), [`arms/build-two-arms.sh`](arms/build-two-arms.sh) | the instrument: two arms, two threads, one KV, a request queue and the handover; references `single` / `batch-pair` / `pf-alone` / `dec-alone` |
