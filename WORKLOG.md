@@ -1,3 +1,152 @@
+## 261121.021 (r340) -- `TODO` #362 resolved: the per-start hipBLASLt lottery is measured on both ROCm lines, the 10.2 mapping is verified STRUCTURALLY (1 solution offered vs 18), and 10.2 is recorded as the canonical validated line
+
+**No delivery patch changed: `patches/`, `release.json` (base/tip/tree/counts/hashes) and the block structure are
+untouched, so this session cuts no tag** (the `261121.007`/`.009` precedent for a tooling-and-records revision).
+What changed: one new check script, `BASELINE.md`'s validated-line table, the §44 doctrine text, `README.md`,
+`TODO.md` and this record.
+
+### 1. What the item asked, and what the delivery can actually reach
+
+`#362` wanted §44's two recorded call sites replayed over N fresh starts on `/opt/rocm-10.2.0-gfx120X` with
+hipBLASLt **left enabled**, to decide whether the `c50ea60130f` (hipBLASLt 1.5) mapping still needs a pin.  The
+r336 arms were vacuous on both lines (10/10 and 6/6) for a reason this session confirmed directly, with the
+`GGML_CUDA_GCDBG` matmul census and a `HIPBLASLT_LOG_LEVEL=4 HIPBLASLT_LOG_MASK=1` trace:
+**the delivery no longer sends those shapes to hipBLASLt at all.**  Block 06's `mmf32` claims the F32 router and
+the F32 GDN `ssm_alpha`/`ssm_beta` shapes (r336), and block 10's GDN gate/beta epilogue fusion removes the
+per-layer `ssm` GEMMs — on the 35B-A3B prefill arm the DEFAULT environment dispatches **0** hipBLASLt GEMMs, and
+with `GGML_CUDA_MMF32=0` (the pre-block-06 routing) exactly **40** (`A[R_32F 2048x256] B[R_32F 2048x256] OP_T
+OP_N`, one per layer × ubatch).
+
+### 2. The arms, and the counts (`N` = fresh processes, one class per start)
+
+Instrument: a prefill-logits fingerprint per start — `test-logits-width-probe`'s row-0 FNV hash for the probe
+arms, and `sha256` of `llama-perplexity --kl-divergence-base`'s dump (a function of the logits only) for the
+perplexity arms.  Box: gfx1201, 1-3 R9700, r339 tree (`41a11cf04`), one build per line.
+
+| arm | ROCm 10.1.0 (hipBLASLt 1.4.1) | ROCm 10.2.0 (hipBLASLt 1.5.0) |
+|---|---|---|
+| gemma-4-26B-A4B Q8_0, F32 router at `m=128` (probe `P=128`) | **18/18** `49b8d53c10b8ebb9` | **18/18** `49b8d53c10b8ebb9` |
+| Flash-Next GSQ-RCO-IQ3_S, BF16 dense prefill at `m=512` (probe `P=512`, 3 devices `-ncmoe 47`) | **18/18** `bd347f7b5c4c40f2` | **18/18** `bd347f7b5c4c40f2` |
+| Qwen3.8-27B BF16 dense prefill at `m=512` (probe `P=512`, 2 devices) | **16/16** `099c21da867debc6` | not run (the class is covered twice above) |
+| 35B-A3B Q8_0 GDN, delivery default (perplexity, 256 tokens, `-ub 256`) | **8/8** `c0706cdd9601708e` | **8/8** `c0706cdd9601708e` |
+| same arm, `GGML_CUDA_MMF32=0` (the library arm) | **8/8** `c35c06f93acd4030` | **8/8** `ac690ba06fe921d6` |
+
+So: **68 fresh starts on 10.1 and 52 on 10.2, one logits class per arm on both lines.**  The two probe arms
+even read the *same* hash on both lines.  By §44's own rule this is **not** evidence that the library is fixed —
+a config that does not flip says nothing about the mechanism.  §44 stays true.
+
+### 3. What settles the mapping: the candidate container, not the logits
+
+The mechanism `c50ea60130f` addresses is hipBLASLt's `getAllSolutions()` container — the candidate list whose
+order was heap-address dependent, so a fresh process could pick a different TensileLite spine.  That container is
+**directly observable** in the trace, and it differs between the lines by more than an order:
+
+| line | per call (the `ssm` shape above) | log line shape |
+|---|---|---|
+| **10.1.0 / hipBLASLt 1.4.1** | **18 candidates** `140215, 140219, 140218, 140216, 140222, 140223, 140220, 140217, 140224 …`, tag `Equal` | a bare `[Info][getBestSolutions]` header, then one `[Info][getAllSolutions] sol-idx = N` line per candidate |
+| **10.2.0 / hipBLASLt 1.5.0** | **1 candidate** — `getBestSolutions(): sol-idx = 138457`, tag `Others`, and **no candidate list at all** | the pick is printed on the header line |
+
+8 starts per line, 40 calls each (320 calls per line): 10.2 offered a single solution in **every** call, i.e. the
+per-start solution choice **cannot** happen on that line for these shapes, which is exactly the fix's effect.
+On this install 10.1's 18-candidate order was itself stable (8/8, one order), so this box cannot *witness* the
+10.1 flip — which is why the container cardinality, not a flipping start, is the evidence of record.
+
+**Verdicts.**  10.2 = **NO-CHOICE** (the §44 pin is not needed there for these shapes); ≤10.1 = **STABLE-LIST
+here, mechanism live in principle** (keep the pin; it is also cheap since r336: 1-4 %).  The delivery never pins
+it, and every gate runs with hipBLASLt enabled, so nothing in the gate ladder changes.
+
+### 4. The instrument is now repeatable, not a one-off
+
+`scripts/check-hipblaslt-lottery.sh` runs both arms over `--starts N` fresh processes and prints the class
+census, the dispatch count and the candidate-list census, then one of three verdicts: `NO-CHOICE` (one candidate
+per call — the fix is present on this line), `EXPOSED` (several candidates and the order or the class varies —
+the lottery is live, pin before comparing) or `STABLE-LIST` (several candidates, one order, one class — the arm
+did not witness it and must not be quoted as a pass).  It **fails** only if the delivery default itself splits
+(a real defect), if the library arm never reached hipBLASLt (a vacuous arm must not report a verdict) or if a run
+fails; an `EXPOSED` verdict on a ROCm ≤ 10.1 box is a valid state, not a failure.  It is a **check, not a release
+gate** (it measures a toolchain and is expected to differ per line).  Two traps it encodes: the working trace env
+is `HIPBLASLT_LOG_LEVEL=4 HIPBLASLT_LOG_MASK=1 HIPBLASLT_LOG_FILE=…` (`HIPBLASLT_LOG_MASK=160`, the value the
+2026-10-21 record quotes, emits nothing on either line today), and hipBLASLt **1.5** prints the pick on the
+header line with no candidate list, so a parser that only understands 1.4's two-line form reports `lens=0` and
+would call 1.5 "no candidates" instead of "one, chosen".
+
+### 5. Policy: ROCm 10.2 is the canonical validated line (and always was)
+
+The second half of the item is a decision, and it is answered by what the repo already does: `~/bin/build-llama-rocm`
+builds **ROCm 10.2.0** into `build-rocm`, which is the tree every gate, every recorded arm and `release.json`'s
+reference point are measured on; `build-llama-rocm-101` (`build-rocm-101`, 10.1.0) and `build-llama-rocm-714`
+(`build-rocm-714`, 7.14.1) are the siblings used for line-specific checks, and r339 already built and ran the
+whole set on all three.  What was missing was the *statement* — `BASELINE.md` now carries a validated-line table
+(which line is canonical, which are build/coherence-validated, and the per-line rule that a prefill-logit base is
+not portable: `gate-prefill-logits.sh` refuses a base recorded on another line).  A pinned arm is a
+kernel-family switch on 10.1 (r336), not a determinism requirement, and no line's numbers are quoted across lines.
+
+### 6. Records
+
+`BASELINE.md` (*Validated ROCm lines*), `GREEDY-PURITY.md` §44 (addendum r340 + the rule text), `README.md`
+(the hipBLASLt paragraph: the measured evidence and a pointer to the check), `scripts/README.md` (index + the
+check's own entry), `INVARIANTS.md` (two facts: the 1-vs-18 candidate container, and the delivery default's 0
+dispatches), `TODO.md` (`#362` retired).  No GPU fault in any arm's log; nothing was built or benchmarked beside
+another run.
+
+## 261121.020 (r340) -- `TODO` #359 resolved: `gate-fusion-alias-copy.sh`'s arm-A oracle is re-derived as a LOGIT point (the unfused chain moved at the r328 base, and the fusion is not the cause)
+
+**No delivery patch changed** (a gate script + its contract text), so no tag.  The gate was red at r329, r331 and
+r339 for one reason: arm A still asserted that the fused `MUL_MAT_ID(gate) MUL_MAT_ID(up) GLU` launch reads
+**byte-identical text** to the `GGML_CUDA_DISABLE_FUSION=1` chain at `-ub 14`, and it does not any more.
+
+### 1. Reproduced, then attributed
+
+On the r339 build, the gate's own arms: `a_chain` **194 chars `dfe59c9c5257`**, `a_fused` **193 chars
+`3fab4da87774`** (the r239 anchor, i.e. the fused arm did **not** move), `a_no_moe_band` `dfe59c9c5257`
+(= the chain), `b_fill_fault` **`3fab4da87774`** (so section B was failing against the chain too, not against
+anything it owns), and section C green (`c_cache_on` `3fab4da87774` + 1 decline with `GGML_GLU_INPLACE=0`).
+3/3 repeats, each arm deterministic.
+
+Attribution, measured rather than argued:
+
+* the **unfused chain** is what moved.  With `GGML_MOE_HOST_OFFLOAD=0` — the pre-#323 offload decision — the
+  chain reads **`3fab4da87774` 3/3**, i.e. the anchor again.  `GGML_OP_OFFLOAD_MIN_BATCH=1` and `=999` (all-GPU
+  and all-CPU per-op placement) both read the *chain* text, so it is not a CPU-vs-GPU kernel difference either;
+* what the relaxation changes at this shape is the graph's **partitioning**: `GGML_SCHED_DEBUG=2 -lv 5` counts
+  **958 splits** with it and **1443** without, which selects the per-op MoE kernel set through the same seam
+  `INVARIANTS.md` r305 / `GREEDY-PURITY.md` §89 already name (and the r328 campaign's R09.3 recorded for the
+  arena-vs-arena-off arm).  The fused launch keeps its own layout, which is why it still reads the r239 anchor;
+* the divergence is **rounding level**: mean KLD **0.000002** / same-top-p **100.000 %** between the two arms at
+  the gate's own shape (256 scored tokens, `-ub 14`, hipBLASLt enabled), **0.000008 / 100.000 %** with the pins
+  the repaired gate adds.  The 193-vs-194 difference is one near-tie at the end of a 40-token run.
+
+### 2. The repair
+
+* **A** now asserts the **fused** arm's text against the recorded `ANCHOR` (exact bytes, the same anchor section C
+  uses) and that the chain's text is not degenerate, plus the existing `GGML_CUDA_DISABLE_MMVQ_MOE_BAND=1`
+  equality.  The fused-vs-chain equivalence is a new **A.2** leg: `llama-perplexity --kl-divergence` at the
+  gate's shape, base recorded **in-run** from the chain, both legs pinned `ROCBLAS_USE_HIPBLASLT=0` (§44: a base
+  recorded in one process is compared in another) and `MOE_EXPERT_HEATMAP=load` (§89), limits mean KLD
+  **<= 0.001** and same-top-p **>= 99.9 %**.  Not vacuous: the same-kernel `-ub 8` reordering control at that
+  shape reads **0.003746 / 93.701 %** (~470x the measured pair), and a `KLD_MAX=0.000002` run was confirmed to
+  FAIL, so the leg can fail.
+* **B** is graded against the fused arm (it runs the default, fused path), i.e. against the anchor.
+* The KLD base is written to `~/.cache/rdna-boosts/gates/fusion-alias` (never `/tmp`, which is tmpfs) and deleted
+  after the compare; `KEEP_KLD=1` keeps it.  New knobs: `LLAMA_PPL`, `KLD_CORPUS`, `KLD_CTX`, `KLD_CHUNKS`,
+  `KLD_MAX`, `KLD_MIN_TOPP`, `KLD_BASE_DIR`, `KLD_THREADS`, `KLD_ARM=0` (arm A without its oracle, which is
+  reported as such).
+
+### 3. Gate result (r339 build, gfx1201)
+
+`PASS` on all sections: `a_fused` 193 `3fab4da87774` == anchor, `a_chain` 194 `dfe59c9c5257` (judged by the KLD),
+`a_no_moe_band` == `a_chain`, the trace arm declines `GLU<-NONE/copy@268435456` (1 class, default env 0 -- the
+protection firing is the point), A.2 **0.000008 / 100.000 %**, `b_fill_fault` == anchor, `c_cache_on` == anchor
+with 1 decline under `GGML_GLU_INPLACE=0`, and `check-gpu-faults.sh` clean over the gate's own window.
+
+### 4. Records, and one handle note
+
+`scripts/README.md` (index + the gate's entry), `MANIFESTS.md` gate 25 (the oracle and the reason), `INVARIANTS.md`
+(the measured fact), `TODO.md` (`#359` retired).  **Handle note:** `#359` was also used on the record for the
+"two test TUs on the deprecated batch API" item (`WORKLOG.md` 261121.008/.009, `wip/CAMPAIGNS.md`), which closed
+at r329; both uses are left in place (dated records are immutable and numbers are never reused), and this entry's
+subject is the `TODO.md` row as it stood.
+
 ## 261121.019 (r339, published) -- `v17-919794500-r339` is PUBLISHED: delivery repo `main` + tag, and the fork's `rdna-boosts` is re-cut at `.tip`
 
 **Published.**  Delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main` `ecbc6dbb..aea49b7e`, annotated

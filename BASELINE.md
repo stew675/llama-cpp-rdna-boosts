@@ -16,6 +16,25 @@ upstream moves.  It is not a changelog — the current release, tip/tree and per
 | canonical chain | `release.json .tip` / `.tree` |
 | release identity | `release.json .release` (`v<blocks>-<base>-r<N>`) |
 
+### Validated ROCm lines
+
+The delivery is validated on **three ROCm lines**, one build tree each.  **Which line a number was measured on is
+part of the number**: a prefill-logit base recorded on one line is not a rounding-level reference for another
+(a different compiler moves the low bits of every prefill kernel, so `scripts/gate-prefill-logits.sh` **refuses**
+a base whose recorded line differs from the binary's), and a pinned arm is a kernel-family switch rather than a
+determinism requirement (`GREEDY-PURITY.md` §44 addendum, r336).
+
+| line | install | build | status |
+|---|---|---|---|
+| **ROCm 10.2.0** – hipBLASLt 1.5.0 | `/opt/rocm-10.2.0-gfx120X` | `~/bin/build-llama-rocm` (default `BUILD_DIR=build-rocm`) | **canonical**: the tree every gate, every recorded arm and every `release.json` reference in this repo is measured on unless it says otherwise.  hipBLASLt's `getAllSolutions()` offers **one** solution per call on the F32 GDN shapes, so the §44 per-start lottery cannot fire there (`TODO #362` closed, `WORKLOG.md` 261121.021) |
+| ROCm 10.1.0 – hipBLASLt 1.4.1 | `/opt/rocm-10.1.0-gfx120X` | `~/bin/build-llama-rocm-101` (`BUILD_DIR=build-rocm-101`) | validated for build + coherence (whole `all` target, `test-backend-ops`, the same-seed text arms at r339).  The line §44's numbers of record were measured on; on this box its candidate list is **stable** across starts (18 candidates, one order), so a fresh-start flip cannot be witnessed here |
+| ROCm 7.14.1 – hipBLASLt 1.4.1 | `/opt/rocm-7.14.1-gfx120X` | `~/bin/build-llama-rocm-714` (`BUILD_DIR=build-rocm-714`) | validated for build + coherence (whole `all` target and `test-backend-ops -o HC_MIX` 30/30 at r339) |
+
+`scripts/check-hipblaslt-lottery.sh` is the repeatable instrument for the per-line hipBLASLt question (class
+census + dispatch census + candidate-list census, one verdict per line); it is a check, not a release gate, and
+it is expected to read differently per line.  Only the AMD devices the maintainer runs are validated: gfx1201
+(RDNA4) primarily, plus gfx1151 (RDNA3_5) and gfx1100 (RDNA3_0).
+
 **The base is fixed by a re-base.**  The last re-base is **`v17-919794500-r328`** (2026-11-21);
 `v17-919794500-r329` amends three blocks on that same base and moves no fork point, and
 `v17-919794500-r331` amends blocks 00 and 10 on it — block 00's `ggml-alloc.c` half (the GLU-in-place rule,

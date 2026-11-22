@@ -811,5 +811,7 @@ on a freshly fetched phi-4, and the two arch follow-ups (`TODO` #352/#354/#356/#
 record — `README.md` with a per-obligation closure banner, `RUNGS.md`, `DECISIONS.md`, `COLD-START.md`,
 `CONFLICT-MAP.md`, `REMOTE-VALIDATION.md`, the probe scripts — moved to `archive/work/upstream-rebase-261120/`.  The
 one obligation it did NOT close (regenerate the generated docs) and one item it named but never gave a handle (two
-test TUs on the deprecated batch API) are now `TODO` #358/#359.  See `WORKLOG.md` 261121.005 and 261121.007.
+test TUs on the deprecated batch API) became `TODO` #358/#359; the docs fold is still `#358`, and the batch-API
+TUs closed at r329 (as did the later `#359` the table carried, the fusion-alias gate oracle, at r340).  See
+`WORKLOG.md` 261121.005, 261121.007 and 261121.020.
 

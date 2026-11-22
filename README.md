@@ -674,6 +674,20 @@ prefill logits bit-identical), so a default run is unaffected; the delivery stil
 itself.  If you pin for an unrelated reason on 10.2 (a hipBLASLt OOM at a tight slab headroom, say) you keep
 the speed as well.  Knobs: [`ENVIRONMENT.md`](ENVIRONMENT.md) §10.2.
 
+**Measured on both lines (r340, `TODO` #362) — and the delivery barely reaches hipBLASLt at all.**  The
+mapping above is now backed by an arm rather than by the upstream commit message, and it is backed on the
+*container* hipBLASLt picks from, because the logits cannot decide it here: on this tree block 06's `mmf32`
+claims the F32 router and the F32 GDN `ssm_alpha`/`ssm_beta` shapes and block 10's GDN epilogue fusion removes
+the per-layer `ssm` GEMMs, so a 35B-A3B prefill dispatches **0** hipBLASLt GEMMs by default (40 with
+`GGML_CUDA_MMF32=0`), and every arm we could build read **one** logits class over 68 fresh starts on 10.1 and
+52 on 10.2 — which by §44's own rule says nothing about the mechanism.  What differs is the candidate list:
+hipBLASLt **1.4.1 (ROCm ≤ 10.1) offers 18 candidates** per call for that shape, hipBLASLt **1.5.0 (10.2)
+offers exactly one** (`138457`, tag `Others`, no list) in all 320 calls over 8 starts — i.e. on 10.2 there is no
+per-start solution choice to make, which is what the fix does.  So: the pin is **not needed** on 10.2 for these
+shapes, it stays the control on ≤ 10.1 (and cheap there, above), and the delivery still never sets it.
+`scripts/check-hipblaslt-lottery.sh` re-measures this per line over `--starts N` and prints one verdict
+(`NO-CHOICE` / `EXPOSED` / `STABLE-LIST`); `BASELINE.md` records 10.2 as the canonical validated line.
+
 ## Concurrent serving with `--kv-unified` is not deterministic (issue #134)
 
 Mixing `-np > 1` with `--kv-unified` does **not** give run-to-run reproducible greedy output: a

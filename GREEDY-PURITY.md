@@ -926,6 +926,47 @@ version probe (`INVARIANTS.md` r336).
 
 *Narrative:* `archive/docs/GREEDY-PURITY-FINDINGS.md` §44.
 
+### §44 addendum (r340, `TODO` #362) — the 10.2 mapping is measured **structurally**: 10.2 offers ONE solution where 10.1 offers 18
+**The rule is unchanged, and the delivery still never pins it.**  What is new is that the ROCm-version mapping
+above was measured here, and that the measurement had to be made on the *container*, not on the logits: on this
+tree **the delivery no longer sends §44's two call sites to hipBLASLt at all**.  Block 06's `mmf32` claims the
+F32 router and the F32 GDN `ssm_alpha`/`ssm_beta` shapes (r336), and block 10's GDN gate/beta epilogue fusion
+removes the per-layer `ssm` GEMMs — a 35B-A3B prefill dispatches **0** hipBLASLt GEMMs in the default
+environment, and exactly 40 (one per layer) with `GGML_CUDA_MMF32=0`, the pre-block-06 routing.
+
+**The counts (`N` = fresh processes, one logits class per arm on both lines; r339 tree `41a11cf04`).**
+68 starts on ROCm 10.1.0 and 52 on 10.2.0 across five arms — a gemma-4-26B-A4B F32 router arm at `m=128`
+(18/18 `49b8d53c10b8ebb9` on **both** lines), a Flash-Next BF16 dense prefill at `m=512` (18/18
+`bd347f7b5c4c40f2` on both), a 27B BF16 dense prefill (16/16 on 10.1 `099c21da867debc6`), and the 35B-A3B GDN
+arm with the delivery default (8/8 `c0706cdd9601708e` on both) and with `GGML_CUDA_MMF32=0` (8/8
+`c35c06f93acd4030` on 10.1, `ac690ba06fe921d6` on 10.2) — read **one class each**.  By this section's own rule
+that is **no evidence** about the mechanism: a config that does not flip says nothing.  The 10.1 install's
+`getAllSolutions()` order was itself stable across starts (8/8), so this box cannot witness the pre-fix flip.
+
+**What does decide it: the candidate list.**  `c50ea60130f` stably sorts the container a fresh process picks
+from, and the trace prints it (`HIPBLASLT_LOG_LEVEL=4 HIPBLASLT_LOG_MASK=1 HIPBLASLT_LOG_FILE=…`; the
+`HIPBLASLT_LOG_MASK=160` of the 2026-10-21 record emits nothing on either line today).  Per call, on the one
+shape the delivery can still put there:
+
+| line | candidates offered | log shape |
+|---|---|---|
+| ROCm 10.1.0 / hipBLASLt 1.4.1 | **18** (`140215, 140219, 140218, 140216, 140222, 140223, 140220, 140217, 140224 …`, tag `Equal`) | a `[Info][getBestSolutions]` header, then one `[Info][getAllSolutions] sol-idx = N` line per candidate |
+| ROCm 10.2.0 / hipBLASLt 1.5.0 | **1** (`getBestSolutions(): sol-idx = 138457`, tag `Others`, no list) | the pick on the header line |
+
+320 calls per line over 8 starts: 10.2 offered a single solution in **every** call, so **no per-start selection
+can happen on that line** for these shapes — which is the fix, observed directly.  **Verdict:** the pin is not
+*needed* on ROCm 10.2 for these shape classes (the tester's doctrine is retired there), it stays the control on
+≤ 10.1 (where it is also cheap, 1-4 %, r336), and it stays a documented *kernel-family* switch either way.  A
+10.2 result is only quotable as a line because `BASELINE.md` now records 10.2 as the canonical validated line.
+
+**The instrument is repeatable**: `scripts/check-hipblaslt-lottery.sh` (`--starts N`, both arms) prints the
+class/dispatch/candidate censuses and one verdict — `NO-CHOICE` (one candidate per call: the fix is present),
+`EXPOSED` (several candidates *and* the order or the class varies: pin before comparing) or `STABLE-LIST`
+(several candidates, one order, one class: the arm did **not** witness the lottery and must not be quoted as a
+pass).  It is a check, not a release gate, and it is expected to read differently per line.
+
+*Record:* `WORKLOG.md` 261121.021, `BASELINE.md` (*Validated ROCm lines*), `INVARIANTS.md` r340.
+
 ## 45. A split the op cannot serve locally is a refusal, not an approximation
 **Claim.**  The Meta backend's per-op split-state handlers decide whether an op is **local** given how a
 tensor is divided across devices.  The only splits they may accept are ones where no device **straddles the

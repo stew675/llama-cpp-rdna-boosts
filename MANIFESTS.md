@@ -719,13 +719,20 @@ in CI.  The model-level gates are manual:
     graph, so the fused gate+up+GLU wrote the GLU output into the gate-weight copy it was still reading (NaN
     logits).  The arm needs host-resident experts served from scheduler copies, a ubatch inside the extended
     MMVQ MoE band (9..16 columns) and that ubatch offloaded, so it is `--n-cpu-moe 99 -fa on -ub 14` with the
-    expert cache off and `GGML_OP_OFFLOAD_MIN_BATCH=9`.  **A** requires the text to be byte-identical to the
-    `GGML_CUDA_DISABLE_FUSION=1` arm (at this shape the fused kernel is bit-identical to the chain, so the
-    chain is the oracle) and not degenerate, plus >= 1 `FUSE_TRACE ALIAS .../copy@` line with
-    `GGML_CUDA_FUSE_TRACE=1` (without it the arm never reached the shape and the comparison is vacuous); the
-    `GGML_CUDA_DISABLE_MMVQ_MOE_BAND=1` control must match too.  **B** repeats it with
-    `MOE_HOST_POOL_FILL_FAULT=200` (a declined fill is served from the scheduler's copy -- the reporter's other
-    way in).  **C** is the production arm (expert cache ON, same ubatch): it must equal the recorded anchor
+    expert cache off and `GGML_OP_OFFLOAD_MIN_BATCH=9`.  **A** requires the **fused** arm's text to equal the
+    recorded anchor `3fab4da87774` and not to be degenerate, and the fused-vs-chain equivalence is a
+    **logit** compare, not a text hash (r340, `TODO` #359): `llama-perplexity --kl-divergence` at the same
+    shape (base recorded **in-run** from the `GGML_CUDA_DISABLE_FUSION=1` chain, both legs pinned
+    `ROCBLAS_USE_HIPBLASLT=0` + `MOE_EXPERT_HEATMAP=load`) must read mean KLD <= 0.001 and same-top-p
+    >= 99.9 % (measured 0.000008 / 100.000 %; the same-kernel `-ub 8` reordering control at that shape reads
+    0.003746 / 93.701 %, so the limits are not vacuous).  A text hash cannot be the oracle there: the unfused
+    chain moved at the r328 re-base (block 09's host-offload relaxation changes the graph's partitioning and
+    with it the per-op kernel path) and the two arms are one near-tie apart (194 vs 193 chars).  Plus >= 1
+    `FUSE_TRACE ALIAS .../copy@` line with `GGML_CUDA_FUSE_TRACE=1` (without it the arm never reached the shape
+    and the comparison is vacuous); the `GGML_CUDA_DISABLE_MMVQ_MOE_BAND=1` control must match the chain's
+    text too.  **B** repeats it with `MOE_HOST_POOL_FILL_FAULT=200` (a declined fill is served from the
+    scheduler's copy -- the reporter's other way in) and must equal the fused arm's text, i.e. the anchor.
+    **C** is the production arm (expert cache ON, same ubatch): it must equal the recorded anchor
     `3fab4da87774`, i.e. the extra declines change no output, and it must log a decline, i.e. the check is not
     inert there.  Negative-tested: the pre-fix build fails A (58 chars `793107d73635`), A's trace, B and C.
     Required for any change to `ggml_cuda_check_fusion_memory_ranges()`, to a fusion's out-node set, or to

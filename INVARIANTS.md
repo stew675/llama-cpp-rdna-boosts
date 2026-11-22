@@ -1782,3 +1782,34 @@ Rules:
 
 Record: `WORKLOG.md` 261121.018; `benchmarks/2026-11-21-hc-mix-band-kernels.md`; `ENVIRONMENT.md` §7.7;
 `archive/work/hc-mix-q8/pr344/` (the submission verbatim, with the mask fix marked).
+
+## r340 — the fusion-alias gate's text oracle, and the hipBLASLt candidate container (tooling + toolchain, no patch change)
+
+1. **A fused launch and its unfused chain are one kernel SET only while nothing else selects between them.**  The
+   issue-#287 gate asserted `fused == GGML_CUDA_DISABLE_FUSION=1` text at `-ub 14` and held from r239 to r323; at
+   the r328 base the **unfused chain** moved (194 chars `dfe59c9c5257`) while the fused arm kept the r239 anchor
+   (193 `3fab4da87774`).  Cause, measured: the chain's per-op `MUL_MAT_ID` is placed and partitioned under block
+   09's host-offload relaxation (issue #323, `GGML_MOE_HOST_OFFLOAD`, ON since r307): `GGML_SCHED_DEBUG=2 -lv 5`
+   counts **958 splits** with it and **1443** without at that shape, and `GGML_MOE_HOST_OFFLOAD=0` reproduces the
+   anchor in the chain 3/3.  `GGML_OP_OFFLOAD_MIN_BATCH=1` and `=999` (all-GPU / all-CPU per-op placement) both read
+   the *chain* text, so it is the partitioning's kernel-set choice, not a CPU-vs-GPU kernel difference.  The
+   divergence is rounding level -- mean KLD **0.000002** / same-top-p **100.000 %** (0.000008 with the gate's pins)
+   -- one near-tie at the end of a 40-token run, so a text hash is the wrong instrument: the oracle is the KLD and
+   the exact-bytes claim belongs to the fused arm's own anchor.  The same-kernel `-ub 8` reordering control at that
+   shape reads **0.003746 / 93.701 %**, which is what makes 0.001 / 99.9 % a decidable limit.
+2. **hipBLASLt 1.5 has no per-start solution choice to make on the shapes we reach, and the delivery barely
+   reaches hipBLASLt at all.**  With `HIPBLASLT_LOG_LEVEL=4 HIPBLASLT_LOG_MASK=1` (the `HIPBLASLT_LOG_MASK=160` of
+   the 2026-10-21 record emits nothing on either line today): ROCm 10.1.0 (1.4.1) offers **18 candidates** per call
+   for the F32 GDN `ssm` shape (`140215, 140219, 140218 …`, tag `Equal`, one `getAllSolutions sol-idx` line each),
+   while ROCm 10.2.0 (1.5.0) offers **exactly one** (`getBestSolutions(): sol-idx = 138457`, tag `Others`, no list)
+   in 320/320 calls over 8 starts -- so the container `c50ea60130f` stably sorts is already collapsed on 10.2 and no
+   fresh start can pick differently there.  Meanwhile the delivery default (block 06's `mmf32` claiming the F32
+   router/GDN shapes, block 10's GDN epilogue fusion removing the per-layer `ssm` GEMMs) dispatches **0** hipBLASLt
+   GEMMs on a 35B-A3B prefill and 40 with `GGML_CUDA_MMF32=0`.  Consequence for doctrine: §44's pin is *not needed*
+   on 10.2 for these shape classes, stays a valid control on <= 10.1, and can be retired only on a line whose
+   candidate list has been measured (`scripts/check-hipblaslt-lottery.sh`); an arm that reads one logits class says
+   nothing either way -- 68 starts on 10.1 and 52 on 10.2 across five arms read one class each, including a gemma4
+   F32 router arm and two BF16 dense prefill arms.
+
+Record: `WORKLOG.md` 261121.020 (the gate oracle) and 261121.021 (the lottery + the validated lines);
+`GREEDY-PURITY.md` §44 addendum (r340); `BASELINE.md` (*Validated ROCm lines*); `MANIFESTS.md` gate 25.
