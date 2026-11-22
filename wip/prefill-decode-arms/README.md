@@ -244,6 +244,8 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 ## Files
 | file | what |
 |---|---|
+| [`HANDOVER.md`](HANDOVER.md) | **start here from a cold session**: where the work stands, T0/T2/T3/T4 in order, the landmines, the exact mechanics, the repo rules |
+|---|---|
 | this `README.md` | the campaign: idea, established evidence, design, landmines, tasks, gates, open questions |
 | [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md) | **pass 1**: T1 done and measured, the emulated T2/T3 and the product numbers, the three new landmines, the server cut in code points |
 | [`enabling-0001-second-context-shared-kv.patch`](enabling-0001-second-context-shared-kv.patch) | the second context that shares the first one's KV (text-verified, applies to `release.json`'s tree) |
