@@ -35,7 +35,7 @@ documented "no"; it is also the one the maintainer asked for by name.**
 |---|---|---|---|---|---|
 | **W1** | speculative decoding with the arms (**MTP first**) | capability | #364 | large | W2 helps, not blocks |
 | **W2** | a **meta-aware device copy** for the recurrent handover | cost | #365 | medium | none |
-| **W3** | derive the **decode context's reserve** from the decode width | cost | #366 | small | read `wip/slab-draft-aux-reserve/` first |
+| **W3** | derive the **decode context's reserve** from the decode width | cost | #366 | small | **DONE 2026-11-22**: floor 3584 + a width-keyed tier (0 / 1536 MiB), which prints 5120 on the host tier and needs no knob |
 | **W4** | **GLM5-Next** on the pair | validation | #367 | small (needs a checkpoint) | none |
 | **W5** | a **recurrent-only** memory handover | capability | #368 | medium | needs a Mamba-class model |
 | **W6** | the **prefill/decode speed balance**: the prefill arm SKIPS turns while a decoder is active | tuning | #371 | medium | none; measure first (§7.1) |
@@ -140,6 +140,15 @@ decides which rows matter, and it is set by the same pass.
 ---
 
 ## 4. W3 (TODO #366) — derive the decode context's declared reserve from the decode width
+
+**DONE 2026-11-22** (`WORKLOG.md` 261122.035).  The reserve the pair declares is now the flat **3584 MiB floor plus a
+WIDTH-keyed tier** (`0` at `-ub <= 1024`, **1536 MiB** at `-ub >= 2048`, +256 per doubling above that) for the *second*
+late narrow view the pair creates -- the prefill arm's **post-prefill re-reserve**, which the flat value did not cover.
+Measured (Flash-Next, `-ncmoe 48 -c 131072`, arena 13.3 GiB, 3 slots, 71k + 23k + 800, two rounds per point):
+**3584 fails, 4096 fails, 5120 clean** -- and 5120 is what the derivation prints (`aux=5.00 GiB`), so the host tier
+needs no knob.  `MOE_EXPERT_CACHE_AUX_RESERVE_MIB` still wins outright.  The ordering hazard the pre-read warns about
+(the slab's reserve is whatever the LAST preflight carried) is unchanged and still wants fixing when the draft path is
+next touched.  The original item, kept for the design record:
 
 ### What exists
 
