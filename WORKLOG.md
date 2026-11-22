@@ -19,6 +19,10 @@ tag **`v17-919794500-r339`** -> `aea49b7e`.  The fork `git@github.com:stew675/ll
   `gate-prefill-logits.sh` **-0.000000 / 100.000 %** from a 10.1 build (the line the base was recorded on;
   `MANIFESTS.md` gate 4 now states that rule), the two release text anchors unmoved (`1c5d32ac537d`,
   `c420dfe04c42`), `test-backend-ops -o HC_MIX` 30/30, and no GPU fault in the kernel journal or any arm's log.
+  **The whole applied set also builds at the tip on all three shipped ROCm lines** -- 10.1
+  (`BUILD_DIR=build-rocm-101 ~/bin/build-llama-rocm-101`), 10.2 (`~/bin/build-llama-rocm`) and **7.14.1**
+  (`~/bin/build-llama-rocm-714`, whole `all` target), with `test-backend-ops -o HC_MIX` **30/30 on the 7.14
+  build too** -- which is what the submission's 32-bit masks would have prevented everywhere.
   Details: `benchmarks/2026-11-21-hc-mix-band-kernels.md`.
 * **Container images**: the worker watcher (`scripts/container-watch.sh` on `radiance`) polls for the tag and will
   build and push both ROCm lines.  Nothing was built on the primary box (policy).

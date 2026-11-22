@@ -11,7 +11,7 @@ Both mechanisms are verified here on the delivery's own Q8_0-hc class (unsloth `
 | | |
 |---|---|
 | GPU | 3 x R9700 (gfx1201), 9950X3D |
-| toolchain | **ROCm 10.1.0-gfx120X** for the A/B (scratch tree, one path, ccache), ROCm 10.2.0-gfx120X for the release arms |
+| toolchain | **ROCm 10.1.0-gfx120X** for the A/B (scratch tree, one path, ccache), ROCm 10.2.0-gfx120X for the release arms; the whole set also builds and runs on **7.14.1-gfx120X** (\xc2\xa76) |
 | arms | `bin-base` = the r338 tree (`2f0d05010`), `bin-pr344` = the same tree + the two patches (fixed, see §5) |
 | models | `Qwen3.8/Flash-Next/Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL` (Q8_0 hc + **F32** inject), `Qwen3.8/Flash-Next/Q4_K_M` (Q8_0 hc + **Q8_0** inject), `Qwen3.8/Flash-Next/GSQ-RCO-IQ3_S` (BF16 hc) |
 
@@ -116,7 +116,13 @@ per-op/text/acceptance identity above is measured with that form.
 
 ## 6. Gates
 
-* Builds green on both ROCm lines (whole `all` target).
+* Builds green on **all three ROCm lines the delivery ships for** -- the whole `all` target, from the canonical
+  re-cut tree (`41a11cf04`): **10.1.0-gfx120X** (`BUILD_DIR=build-rocm-101 ~/bin/build-llama-rocm-101`),
+  **10.2.0-gfx120X** (`~/bin/build-llama-rocm`) and **7.14.1-gfx120X** (`~/bin/build-llama-rocm-714`).  This is
+  the first place the submission itself failed: its 32-bit masks were a hard error on every line (§5), and the
+  fixed form compiles on each of them.
+* `test-backend-ops -o HC_MIX` **30/30** on the 10.1 and on the **7.14** builds (the 10.2 release build was
+  covered by `gate-hc-fusions.sh`), so the new kernels *run* on the 7.14 line, not merely compile there.
 * `scripts/gate-hc-fusions.sh` PASS on the release build (Q8_0-hc class, 3-dev `-sm tensor`), every hard arm
   byte-identical to the true chain.
 * `scripts/gate-prefill-logits.sh` **-0.000000 / 100.000 %** against the r338-recorded base (the op is not in a
