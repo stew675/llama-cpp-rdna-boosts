@@ -373,10 +373,15 @@ the measurement plan and the acceptance).
 the full set of layer weights per ubatch chunk"; what if the prefilling were processed layer by layer with each active
 slot handling its ubatch for the active layer, so the slots share the weight read?
 
-**The premise is mostly already the mechanism.**  `share_prompt_budget()` gives **every** active prompt a share of the
-step's window ("nobody fills n_batch first and every active prompt is admitted to every step"), the resulting batch is
-split into `n_ubatch` chunks, and **each chunk is one graph**, so the linear ops read the weights once for all slots'
-rows in that chunk.  What is left, and is the real cost, is the **split**: a step whose admitted tokens exceed
+**The premise is mostly already the mechanism -- since r300, and because of block 16.**  Before r300 the batch was filled
+**in slot index order**, so the lowest slot took the whole window and every other prompt waited for its entire prompt (the
+fairness gate records 1.91 s for a 7-token prompt behind a 13204-token one): a prefill step carried ONE sequence, so every
+step re-read the whole weight set for that one slot's chunk.  The **fair share** is what made the multi-slot prefill batch
+exist.  Today `share_prompt_budget()` gives **every** active prompt a share of the step's window ("nobody fills n_batch
+first and every active prompt is admitted to every step"), the resulting batch is split into `n_ubatch` chunks, and **each
+chunk is one graph**, so the linear ops read the weights once for all slots' rows in that chunk.  The shortest-prompt
+**priority droop** (`LLAMA_SERVER_PREFILL_SKEW`) is a live knob but **default 1 = the plain share**, i.e. off: its job is
+now "who gets the larger share of one window" (a TTFT-vs-throughput tuning), not "who gets to run".  What is left, and is the real cost, is the **split**: a step whose admitted tokens exceed
 `n_ubatch` becomes several chunks, and each re-reads the full weight set.  That is what `-ub` moves, and it is measured:
 the pair's prefill reads **1440 -> 3041 -> 3884 t/s** at `-ub` 512 / 2048 / 4096, with 8192 buying only +8 % and a
 worse decoder tail.

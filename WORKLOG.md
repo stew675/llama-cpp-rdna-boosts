@@ -1,3 +1,34 @@
+## 261122.030 (no delivery change) -- the premise history behind W8 corrected: prefill multi-slot batching arrived WITH block 16's fair share, and the shortest-prompt droop is default-off tuning, not dead code
+
+**No delivery patch changed, no tag.**  A correction to the framing of `WORKLOG.md` 261122.029 (which described the
+current behaviour without saying when it began), recorded because the history is the part a future reader will get wrong.
+
+**Before r300** `update_slots()` added the decode tokens and filled the rest of the batch **in slot index order**: the
+lowest slot took the whole window and every other prompt waited for that slot's **entire** prompt.  The fairness gate's
+own header carries the measurement (a 7-token prompt behind a 13204-token one waited **1.91 s**) and the note that `-b`
+does not help, because it changes the grab size, not the order.  So prefill steps carried **one** sequence and every step
+re-read the whole weight set for that one slot's chunk.  Several sequences per ubatch was always *possible* (it is the
+parallel-request machinery) but the scheduler never composed it for prefills.
+
+**r300 (block 16)** replaced the fill order with `share_prompt_budget()`, and that is what makes the multi-slot prefill
+batch exist.  So "this delivery supports batching on prefills" is true, and it is a consequence of the serialisation fix,
+not a separate capability.  261122.029's statement that the slots already share the weight pass is correct for the current
+code and was wrong before r300; the campaign's W8 section now carries the history.
+
+**The two things that were bundled into "the fix" have different status**, which is the part worth remembering:
+`share_prompt_budget()` itself (every active prompt admitted to every step, one-token floor, rotating tie-break) is **on by
+default** with `LLAMA_SERVER_PREFILL_FAIR=0` as its kill switch; the **shortest-prompt-priority droop**
+`LLAMA_SERVER_PREFILL_SKEW` is a live knob with **default 1 = the plain equal share**, i.e. off.  It is not dead code:
+measured on four prompts of 6000/3000/1500/400 tokens at `-np 4`, mean TTFT is **1.401 s at 1**, 1.082 s at 5 and 1.040 s
+at 20, and the longest prompt improves too (2.201 -> 1.975 s) because short slots retire and stop competing.  Its job
+changed rather than disappearing: "which slot gets to run" became "who gets the larger share of one window", a
+TTFT-versus-throughput tuning that was never promoted to a default because the pathological serialisation was what needed
+fixing.
+
+Record: campaign `wip/prefill-decode-arms-followups/` §W8 (9.1), `TODO` #372, `ENVIRONMENT.md` §22
+(`LLAMA_SERVER_PREFILL_FAIR`, `LLAMA_SERVER_PREFILL_SKEW`), `patches/README.md` block 16, and the fairness gate's header
+(the pre-r300 measurement).
+
 ## 261122.029 (no delivery change) -- design answer: multi-slot prefill is ALREADY batched per ubatch, so "layer-major across slots" is the `-ub` knob, not a new schedule (`TODO` #372)
 
 **No delivery patch changed, no block created or amended, no tag.**  A design question from the maintainer, answered from

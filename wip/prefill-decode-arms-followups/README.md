@@ -354,10 +354,22 @@ the full set of layer weights per ubatch chunk.  What if, with multiple active p
 layer by layer with each active prefill slot processing its ubatch for the active layer?  Could that give batched or
 concurrent prefilling for better throughput?"
 
-### 9.1 The premise check: within one step, the slots ALREADY share the weight pass
+### 9.1 The premise check: within one step, the slots ALREADY share the weight pass -- **since r300, and because of the fair share**
 
-Read the scheduler before designing anything, because the mechanism the question proposes is what the prefill arm
-already does **up to one ubatch**:
+**The history matters here, because "prefill is batched" is a DELIVERY property, not an upstream one.**  Before r300
+(block 16) `update_slots()` added the decode tokens and then filled the rest of the batch **in slot index order**, so the
+**lowest slot took the whole window** and every other prompt waited for that slot's entire prompt: the fairness gate's own
+header records the measurement (a 7-token prompt behind a 13204-token one waited **1.91 s**), and notes that `-b` does not
+help because it changes the grab size, not the order.  Under that scheduler a prefill step carried **one** sequence, so
+every step re-read the whole weight set for that one slot's chunk.  The graph/ubatch layer always supported several
+sequences (that is the parallel-request machinery), but the **scheduler never composed it for prefills**.
+
+r300 replaced the fill order with `share_prompt_budget()`, and that is what makes the multi-slot prefill batch exist at
+all.  So the answer to "does this repo now support batching on prefills" is yes, and it arrived **with the fix for the
+serialisation, not separately from it**.
+
+Read the rest of the scheduler before designing anything, because the mechanism the question proposes is what the prefill
+arm now does **up to one ubatch**:
 
 * `share_prompt_budget()` (`tools/server/server-context.cpp`, the `wip/session-scheduling` fair share that block 16
   shipped) splits the step's prompt window max-min across **every slot that still has prompt tokens**, with the stated
@@ -369,6 +381,25 @@ already does **up to one ubatch**:
 * on the arms path the chunk cap that would shrink a slot's contribution is **inert by construction**: `-ib` bounds a
   step only when a **decoder is waiting on this arm**, and a slot on the decode arm does not (the code says so at the
   `-ib` comment: *"the prefill takes the whole window and `-ib` is inert"*).
+
+**And the shortest-prompt priority is not dead code, but it is not the default either.**  Two different things were
+bundled into "the fix", and they have different status today:
+
+* the **serialisation fix**: `share_prompt_budget()`, i.e. every active prompt is admitted to **every** step, with a
+  one-token floor (so starvation is impossible at any `n_parallel`) and a rotating tie-break (`slot_next`, "rotation makes
+  the tie-break fair across steps").  This is what creates the multi-slot batch.  **ON by default**, with
+  `LLAMA_SERVER_PREFILL_FAIR=0` as its kill switch.
+* the **shortest-prompt-priority droop**: `LLAMA_SERVER_PREFILL_SKEW`, a `N:1` weighting of the shortest-remaining slot,
+  clamped 1..64, explicitly *"not SRPT: every other slot still advances every step, so starvation is impossible"*.
+  **Default `1` = the plain equal share**, i.e. OFF.  It is a live tuning knob, not dead code: measured on four prompts of
+  6000/3000/1500/400 tokens at `-np 4`, mean TTFT is **1.401 s at 1**, 1.082 s at 5 and 1.040 s at 20, and the *longest*
+  prompt also improves (2.201 -> 1.975 s) because short slots retire and stop competing.
+
+So the priority mechanism's job changed rather than disappeared: with the fair share in place the question is no longer
+"which slot gets to run" (everyone does, every step) but "who gets the larger share of one shared window", which is a
+TTFT-versus-throughput tuning.  The default stayed at the plain share because the pathological serialisation was what
+needed fixing, and the droop's gain was not promoted.  Anything that wants the droop back turns one knob, and the
+composition census below is what would tell you whether a droop is what a given shape needs.
 
 So "each slot scans the full weight set per chunk" is **not** what happens for co-batchable slots.  What *is* true, and
 is the real cost, is the **ubatch split**: a step whose admitted tokens exceed `n_ubatch` becomes N ubatches, and each
