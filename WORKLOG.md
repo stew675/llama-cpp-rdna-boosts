@@ -1,3 +1,93 @@
+## 261122.001 (r342) -- issue #348 fixed and RELEASED: a missing `#include` had compiled the prompt-cache huge-page path out of every Linux build since r328, and the same re-base also dropped block 02's MTP-pair rejection; both restored, both now instrumented
+
+**Shipped:** `v17-919794500-r342`, base `919794500`, tree `e4060a04c864a50c10c72431408cc898d7d275f3`,
+tip `69c8c808607f2bf28985b8aa3e81e5382545e533`, 17 official + 1 temporary blocks (+2 optional re-cut onto the new
+tree).  Report: [issue #348](https://github.com/stew675/llama-cpp-rdna-boosts/issues/348), reported by
+`overdoingism` (written by Claude).  Blocks **02** and **12** change; **no default behaviour changes** -- a dead
+include moves to where the code it serves actually lives, a branch that was silently compiled OUT is back in, and
+a `throw` that silently vanished is back.
+
+### 1. The reported defect (block 12, `server-slot-sched.cpp`)
+
+Since r328 `server_prompt_cache::take()` lives in `tools/server/server-slot-sched.cpp`, and its huge-page branch is
+guarded by `#if defined(__linux__) && defined(MADV_HUGEPAGE)`.  The re-base moved the FUNCTION and left
+`#include <sys/mman.h>` behind in `server-task.cpp`, where it had been added for the same function.  So
+`MADV_HUGEPAGE` was undefined in the new file, the branch dropped out of every Linux build **with no diagnostic**,
+and `LLAMA_SERVER_CACHE_HUGEPAGE` (default on, PR #248) did nothing for twelve releases: a 64 MiB+ prompt-cache
+state buffer went back to 4 KiB zero filling.  The reporter's detector was
+`nm -D --undefined-only libllama-server-impl.so | grep madvise` -- absent in r329, present in r327.  Confirmed
+here on r339: absent.
+
+The fix is the reporter's, taken whole: the file includes `<sys/mman.h>` itself, `server-task.cpp` loses the dead
+include, and **the guard becomes `#if defined(__linux__)` alone** so a future lost include is a compile error
+instead of a dropped feature (the silent-drop half is the actual defect class).  `prompt_cache_hugepage()` moved
+inside the `__linux__` guard so a non-Linux build has no unused function.
+
+**Verified** (gfx1201, dense 4B Q8_0, `-c 32768 -np 2 --cache-ram 4096`, five ~11K-token prompts so the unified KV
+evicts a ~0.9 GiB slot state): `madvise@GLIBC_2.2.5` back in `libllama-server-impl.so`; `AnonHugePages` from
+`/proc/<pid>/smaps_rollup` **1 142 784 kB** at the default against **0 kB** with `LLAMA_SERVER_CACHE_HUGEPAGE=0`;
+whole-slot saves **20.74 / 20.78 / 21.46 ms** against **54.23 / 52.78 / 49.65 ms** (-61 %).  A MoE host-expert
+shape cannot isolate this number -- its `AnonHugePages` is ~48 GiB of block 09/15 pool -- which is why the dense
+shape is the record.
+
+### 2. The instrument (this is the part that had to exist before the fix means anything)
+
+`scripts/check-system-headers.py`, **check 10** of `validate-set.sh`.  Gate 38 (r341) reconciles *inventory*
+(files, `#define`s, env vars, options) and is blind here by construction: nothing disappeared -- the include was
+still present, in the file the code had LEFT.  A need that MOVES is invisible to every per-file diff, and a build
+cannot see a branch it does not compile.  The new check fails when a line the delivery inserts calls a table
+symbol whose declaring system header its **include closure** does not reach (`madvise`/`mmap`/`posix_fadvise`/
+`sendfile`/`getrandom`/`flock`/`dlopen`/`clock_gettime`/... plus the `MADV_*`/`MAP_*`/`POSIX_MADV_*`/`O_DIRECT`
+families), and when any such line **guards an `#if` on that macro**.  Scope matches
+`check-windows-portability.sh` (an added file judged whole, an edited upstream file on the inserted lines only),
+which is what keeps it CI-clean -- Hexagon's module-local `mmap(bool)` and log strings full of `O_DIRECT` are not
+findings.  **Negative control**: the r339 tree reports exactly the two `server-slot-sched.cpp` sites; the fixed
+tree reports none.
+
+### 3. The second drop: block 02's MTP-pair rejection (found by scanning the r328 re-base, fixed here)
+
+Asked to check what else that re-base lost, the scan was: delivery-owned identifiers from the r327 tree that no
+longer exist anywhere in the current tree, then delivery-owned lines against the new base.  4 527
+definition-like identifiers added by the r327 set, 25 absent, 25 explained (7 are the `lf_*` DFlash API that was
+renamed to `llama_set_embeddings_layer_inp_dev` + the nextn dev-rows path, 5 the background-prefetch worker
+removed on purpose at r114, 3 CMake function names and 1 version string from the regex, the rest dead code
+removed with `pool_resident_locked`/`table_arena_bytes`/`slab_narrow2_floor_locked`).  **One real loss**: block
+02's
+
+    throw std::invalid_argument("draft-mtp and draft-mtp-adaptive cannot be enabled together");
+
+`draft-mtp` and `draft-mtp-adaptive` are one implementation class (`common_speculative_impl_draft_mtp`) over ONE
+`ctx_dft`, so enabling both built two impls that each run `process()` on every batch and advance the same draft
+context twice.  It is not a file, a `#define`, an env var or an option and a missing `throw` builds and runs, so
+gate 38 could not see it either.  Restored at the same place and in the same shape as the neighbouring
+DFlash-family rule (upstream's bitmask form), and **pinned by a test**, because a configuration guard is a
+behaviour: `tests/test-spec-type-exclusion.cpp` asserts the pair throws, each type alone does not, and the DFlash
+pair still throws.  No model and no draft context are needed -- the rejection precedes every context use.
+Negative control: with the check removed the test asserts at `init_throws({DRAFT_MTP, DRAFT_MTP_ADAPTIVE})` (exit
+134); restored, it passes.  Also fixed en route: the `static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 14)` the same
+re-base had left unindented.
+
+### 4. Gates (all mandatory ones, on this release)
+
+`validate-set.sh` **green** (18 strict, checksums, applied tree `e4060a04c`, the 3 optional trees, Windows
+portability 515 files, file-set reconciliation **0 unexplained + 1 decision row**, the new check); coherence text
+**`1c5d32ac537d`** (the dense-4B reference, unchanged); MTP purity **`none` == `draft-mtp`** `513a3c356108` on
+the Flash-Next shape, and `--spec-type draft-mtp,draft-mtp-adaptive` refused with `failed to initialize
+speculative decoding context: draft-mtp and draft-mtp-adaptive cannot be enabled together`;
+`gate-prefill-logits.sh` **PASS** (mean KLD **0.000000**, same-top-p **100.000 %**, no GPU fault);
+`check-gen-docs.sh` **ok**; `ctest -R "test-spec-type-exclusion|test-speculative-adaptive"` **2/2**;
+`check-gpu-faults.sh` clean on every run log.  The two optional artifacts were re-cut onto the new default tree
+(`0100` -> `c4122acb7`, `0101` -> `abbac6fd6`, cumulative `8b3b1301`, reproduced through the consumer path
+`apply-all.sh --include-optional-all` on a fresh checkout).
+
+**Decision row added**: `patches/FILE-SET-RETIREMENTS.tsv` records the `server-task.cpp` include retirement scoped
+to the `v17-919794500-r339` transition -- gate 38 caught it as a LOSS and the row is the decision, which is
+exactly the ledger working as designed.
+
+**Record:** `INVARIANTS.md` r342 (the rule: guard the OS, never the macro; a moved NEED is invisible to per-file
+diffs; a configuration guard must be TESTED), `MANIFESTS.md` (check 10 note + the block 02 and block 12 rows),
+`ENVIRONMENT.md`, `patches/README.md` (blocks 02 and 12), `scripts/README.md`, `optional/*/README.md`.
+
 ## 261121.022 (r341) -- `TODO` #358 resolved: a re-base rung that lands fewer files is an INSTRUMENT now (`scripts/check-rung-file-sets.py`, gate 38), not a note in a gate table -- zero findings on 68 of 70 release transitions, and the r328 incident reproduced exactly
 
 **No delivery patch changed: `patches/*.patch`, `release.json` (base/tip/tree/counts/hashes) and the block

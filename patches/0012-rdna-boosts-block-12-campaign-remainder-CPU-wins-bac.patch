@@ -1,4 +1,4 @@
-From 501d37ea30c8a770a926fffc0af90d0f10d88ee8 Mon Sep 17 00:00:00 2001
+From 8a37da6b0530e251946dd0f4cac488c72bc017fe Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/17] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -67,11 +67,10 @@ Subject: [PATCH 12/17] rdna-boosts: block 12: campaign remainder (CPU wins,
  tests/test-llama-archs.cpp                    |   18 +-
  tools/llama-bench/llama-bench.cpp             |    4 +-
  tools/server/server-context.cpp               |  344 +-
- tools/server/server-slot-sched.cpp            |  105 +-
+ tools/server/server-slot-sched.cpp            |  114 +-
  tools/server/server-slot-sched.h              |   14 +
- tools/server/server-task.cpp                  |    4 +
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 66 files changed, 10171 insertions(+), 1266 deletions(-)
+ 65 files changed, 10176 insertions(+), 1266 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index f36b39cf0..ebd7320eb 100644
@@ -490,7 +489,7 @@ index 078bfd984..9e0050591 100644
      // Check if a backend sampler has already sampled a token in which case we
      // return that token id directly.
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 1b3f1944f..fd2348612 100644
+index d2fb7e9ea..9e710d829 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -1106,9 +1106,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
@@ -15137,10 +15136,21 @@ index c852e55c9..b14c0eb37 100644
                          if (slot.ctx_dft) {
                              GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 diff --git a/tools/server/server-slot-sched.cpp b/tools/server/server-slot-sched.cpp
-index 9f9779348..b7e613525 100644
+index 9f9779348..c6e2738aa 100644
 --- a/tools/server/server-slot-sched.cpp
 +++ b/tools/server/server-slot-sched.cpp
-@@ -81,6 +81,74 @@ size_t server_prompt_cache::n_tokens() const {
+@@ -6,6 +6,10 @@
+ 
+ #include <algorithm>
+ 
++#if defined(__linux__)
++#include <sys/mman.h>
++#endif
++
+ //
+ // server_prompt
+ //
+@@ -81,6 +85,79 @@ size_t server_prompt_cache::n_tokens() const {
      return res;
  }
  
@@ -15157,6 +15167,7 @@ index 9f9779348..b7e613525 100644
 +// (transparent huge pages, madvise mode) and ~0.3 s for the state copy itself.  Measured on the 9950X3D, 3.47 GiB
 +// alloc+zero: 470 -> 125 ms, and the server's prompt-cache update for a 100K-token slot's new buffer 828 -> 497 ms.
 +// LLAMA_SERVER_CACHE_HUGEPAGE=0: 4 KiB pages
++#if defined(__linux__)
 +static bool prompt_cache_hugepage() {
 +    static const bool v = [] {
 +        const char * e = getenv("LLAMA_SERVER_CACHE_HUGEPAGE");
@@ -15164,6 +15175,7 @@ index 9f9779348..b7e613525 100644
 +    }();
 +    return v;
 +}
++#endif
 +
 +common_state_data server_prompt_cache::take(size_t n) {
 +    // the smallest spare that holds n bytes; resizing it down keeps the memory, resizing it up zero-fills only the tail
@@ -15178,7 +15190,10 @@ index 9f9779348..b7e613525 100644
 +        buf = std::move(spare[best]);
 +        spare.erase(spare.begin() + best);
 +    }
-+#if defined(__linux__) && defined(MADV_HUGEPAGE)
++#if defined(__linux__)
++    // the guard is the OS, never `defined(MADV_HUGEPAGE)`: with a guard on the macro a missing <sys/mman.h> silently
++    // compiles the whole branch out of every Linux build.  It did exactly that from r328 to r339 -- the include stayed in
++    // server-task.cpp when `take()` moved here, and LLAMA_SERVER_CACHE_HUGEPAGE did nothing (issue #348)
 +    else if (prompt_cache_hugepage() && n >= (64u << 20)) {
 +        // reserve() only maps the buffer, so the advice is in place before the zero fill below touches a page; the huge
 +        // pages cover the 2 MiB-aligned part of it (a failed madvise leaves 4 KiB pages, as before)
@@ -15215,7 +15230,7 @@ index 9f9779348..b7e613525 100644
  server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
      // first check if the current state is contained fully in the cache
      for (auto it = states.begin(); it != states.end(); ++it) {
-@@ -114,6 +182,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -114,6 +191,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
          if (len == (int) it->prompt.tokens.size() && are_lora_equal(it->prompt.lora, prompt.lora)) {
              SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
  
@@ -15224,7 +15239,7 @@ index 9f9779348..b7e613525 100644
              it = states.erase(it);
          } else {
              ++it;
-@@ -126,6 +196,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -126,6 +205,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
              SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                      states.front().size() / (1024.0 * 1024.0));
  
@@ -15233,7 +15248,7 @@ index 9f9779348..b7e613525 100644
              states.pop_front();
          }
      }
-@@ -135,8 +207,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -135,8 +216,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
  
      // check if we can allocate enough memory for the new state
      try {
@@ -15244,7 +15259,7 @@ index 9f9779348..b7e613525 100644
      } catch (const std::bad_alloc & e) {
          SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
  
-@@ -164,7 +236,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -164,7 +245,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
      return &states.back();
  }
  
@@ -15254,7 +15269,7 @@ index 9f9779348..b7e613525 100644
      // a prompt made with another lora config is cleared before the new one starts, so it counts as empty
      const bool is_empty = prompt.tokens.empty() || lora_should_clear_cache(prompt.lora, lora_new);
  
-@@ -184,6 +257,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -184,6 +266,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
              continue;
          }
  
@@ -15267,7 +15282,7 @@ index 9f9779348..b7e613525 100644
          const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
  
          const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-@@ -205,7 +284,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -205,7 +293,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
          }
      }
  
@@ -15287,7 +15302,7 @@ index 9f9779348..b7e613525 100644
          SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
  
          const int64_t t_start = ggml_time_us();
-@@ -221,8 +312,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -221,8 +321,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                  return false;
              }
  
@@ -15298,7 +15313,7 @@ index 9f9779348..b7e613525 100644
          }
  
          {
-@@ -239,8 +330,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -239,8 +339,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                      return false;
                  }
  
@@ -15338,21 +15353,6 @@ index fc0099dc0..1005ee09a 100644
      server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
  
      // lora_new: the lora config of the new prompt, the states made with another config are skipped
-diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index 595e57ffb..2f1f6e149 100644
---- a/tools/server/server-task.cpp
-+++ b/tools/server/server-task.cpp
-@@ -12,6 +12,10 @@
- 
- #include <sstream>
- 
-+#if defined(__linux__)
-+#include <sys/mman.h>
-+#endif
-+
- //
- // task_params
- //
 diff --git a/tools/server/tests/unit/test_kv_keep_only_active.py b/tools/server/tests/unit/test_kv_keep_only_active.py
 index 44c05fab0..618a55de0 100644
 --- a/tools/server/tests/unit/test_kv_keep_only_active.py

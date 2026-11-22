@@ -1861,3 +1861,53 @@ Record: `WORKLOG.md` 261121.020 (the gate oracle) and 261121.021 (the lottery + 
    per block.
 
 Record: `WORKLOG.md` 261121.022; `MANIFESTS.md` gate 38; `scripts/README.md`; `patches/FILE-SET-RETIREMENTS.tsv`.
+
+## r342 — a `#if defined(SYSTEM_MACRO)` guard silently compiles a feature out, and a NEED that MOVES to a new file is invisible to every per-file diff (issue #348)
+
+**The defect.**  `server_prompt_cache::take()` moved to `tools/server/server-slot-sched.cpp` at the r328 re-base.
+Its huge-page branch was guarded by `#if defined(__linux__) && defined(MADV_HUGEPAGE)`, and `#include <sys/mman.h>`
+stayed behind in `server-task.cpp`, where the function used to live.  `MADV_HUGEPAGE` was therefore undefined in
+the new file, the branch dropped out of every Linux build **with no diagnostic**, and `LLAMA_SERVER_CACHE_HUGEPAGE`
+(default on, PR #248) did nothing from r328 to r339: a 64 MiB+ prompt-cache state buffer went back to 4 KiB zero
+filling.  The only detector was `nm -D --undefined-only libllama-server-impl.so | grep madvise`, and only a
+reporter ran it (issue #348).
+
+**Why nothing caught it, which is the durable part.**
+
+1. **A guard on a system macro is the trap, not the safety.**  `defined(MADV_HUGEPAGE)` reads as "is the header
+   here?", but the answer is silently "no" when the include is missing, and a missing `#if` branch is not a build
+   error.  **Rule: guard the OS (`#if defined(__linux__)`), never the macro a system header declares.**  Then a
+   lost include is a compile error at the next build, which is the only signal that costs nothing.
+2. **A need that MOVES is invisible to a per-file diff.**  `check-rung-file-sets.py` (gate 38) reconciles files,
+   `#define`s, env vars and options: the include was still present -- in the file the code had LEFT.  Nothing
+   about the *inventory* changed, so a per-block or per-release inventory check can never see this class.
+3. **A build cannot see it** (the branch is not compiled) and **a text/logit gate cannot either** (the surviving
+   path is correct, just slower).  It is a performance defect that only a mechanism census or an import survey
+   exposes.
+
+**The instrument.**  `scripts/check-system-headers.py` (check 10 of `validate-set.sh`): a table of
+symbol -> declaring header plus the macro families (`MADV_*`, `MAP_*`, `POSIX_MADV_*`, `O_DIRECT`, ...), each
+checked against the file's **include closure** (project headers followed transitively), plus the guard rule above.
+Scope matches `check-windows-portability.sh`: a file the delivery adds is judged whole, an edited upstream file on
+the lines it inserts (that is what keeps it CI-clean -- upstream has module-local `mmap()` and string literals full
+of `O_DIRECT`).  Negative control: the r339 tree reports exactly the two `server-slot-sched.cpp` sites, the fixed
+tree reports none.
+
+**The same re-base dropped a second thing of the same shape (found by this session's scan, fixed at r342).**  Block
+02's `throw` rejecting `draft-mtp` + `draft-mtp-adaptive` (one impl class, one `ctx_dft`, so two impls advance the
+same draft context twice) vanished at r328 too: it was a statement inside a re-expressed hunk, i.e. not a file,
+`#define`, env var or option, and a missing `throw` builds and runs.  **Rule: a behaviour that guards a
+configuration must be TESTED, not grepped** -- `tests/test-spec-type-exclusion.cpp` asserts the pair throws, each
+type alone does not, and the neighbouring DFlash-family rule still throws (no model needed: the rejection precedes
+every context use).  A scan of the whole r327 -> r339 transition (delivery-owned identifiers, then delivery-owned
+lines against the new base) found nothing else beyond that pair and the known r331 items.
+
+**Numbers (r342, gfx1201, dense 4B Q8_0, `-c 32768 -np 2 --cache-ram 4096`, five ~11K-token prompts so the unified
+KV evicts a ~0.9 GiB slot state).**  `madvise@GLIBC_2.2.5` present in `libllama-server-impl.so` (absent on r339);
+`AnonHugePages` from `/proc/<pid>/smaps_rollup` **1 142 784 kB** at the default and **0 kB** with
+`LLAMA_SERVER_CACHE_HUGEPAGE=0`; whole-slot saves **20.74 / 20.78 / 21.46 ms** against **54.23 / 52.78 / 49.65 ms**
+(-61 %).  The r173 numbers (3.47 GiB alloc+zero 470 -> 125 ms; a 100K-token save 828.1 -> 497.0 ms) still stand.
+A MoE host-expert shape cannot isolate this measurement: its `AnonHugePages` is ~48 GiB from the block 09/15 pool.
+
+Record: `WORKLOG.md` 261122.001; `MANIFESTS.md` gate 10 / block 02 + block 12 rows; `ENVIRONMENT.md`;
+`patches/README.md` (blocks 02 and 12).

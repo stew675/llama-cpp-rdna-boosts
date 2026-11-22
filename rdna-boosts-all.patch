@@ -3559,7 +3559,7 @@ index 000000000..1f8e8a6b5
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index b40eb5535..e52e0e503 100644
+index b40eb5535..ffcf4d230 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,9 @@
@@ -4693,16 +4693,32 @@ index b40eb5535..e52e0e503 100644
  }
  
  common_speculative_output_limits common_speculative_get_output_limits(
-@@ -3206,7 +3852,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3199,6 +3845,15 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+             throw std::runtime_error("draft-dflash, draft-dflash2, draft-dspark and draft-lilicorr cannot be combined");
+         }
+ 
++        // the same rule for the MTP pair: `draft-mtp` and `draft-mtp-adaptive` are one implementation class
++        // (`common_speculative_impl_draft_mtp`) over ONE ctx_dft, so enabling both builds two impls that each
++        // run process() on every batch and advance the same draft context twice.  Rejected, not merged.
++        // (Restored at r342: the r328 re-base dropped this check with block 02's old hunk, issue #348.)
++        if ((enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) &&
++            (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE))) {
++            throw std::runtime_error("draft-mtp and draft-mtp-adaptive cannot be enabled together");
++        }
++
+         auto add_config_if_enabled = [&](common_speculative_type type, bool available = true) {
+             if (available && (enabled_configs & (1u << type))) {
+                 configs.emplace_back(type, params);
+@@ -3206,7 +3861,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
 -        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 13);
-+static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 14);
++        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 14);
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -3217,16 +3863,20 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3217,16 +3872,20 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
  
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
@@ -4729,7 +4745,7 @@ index b40eb5535..e52e0e503 100644
      for (const common_speculative_config & config : configs) {
          switch (config.type) {
              case COMMON_SPECULATIVE_TYPE_NONE:
-@@ -3240,7 +3890,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3240,7 +3899,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -4742,7 +4758,7 @@ index b40eb5535..e52e0e503 100644
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
-@@ -3415,6 +4069,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+@@ -3415,6 +4078,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
      }
  }
  
@@ -4758,7 +4774,7 @@ index b40eb5535..e52e0e503 100644
  bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
      bool result = true;
  
-@@ -3555,6 +4218,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+@@ -3555,6 +4227,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
      }
  }
  
@@ -4776,7 +4792,7 @@ index b40eb5535..e52e0e503 100644
  // TODO: support the case of more than one speculative implementations having a state
  bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
      if (spec == nullptr) {
-@@ -3625,3 +4299,77 @@ void common_speculative_print_stats(const common_speculative * spec) {
+@@ -3625,3 +4308,77 @@ void common_speculative_print_stats(const common_speculative * spec) {
                  str_perf.c_str());
      }
  }
@@ -115351,7 +115367,7 @@ index 5bed70163..179fb78ea 100644
  
          layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head_l}, TENSOR_NOT_REQUIRED);
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 5b997e91b..bcdefb2c7 100644
+index 5b997e91b..1caf4b407 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -180,6 +180,11 @@ set(LLAMA_CONTEXT_TEST_SRC
@@ -115402,11 +115418,12 @@ index 5b997e91b..bcdefb2c7 100644
  llama_build(test-fusion.cpp)
  
  llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
-@@ -350,6 +377,7 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
+@@ -350,6 +377,8 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
  set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
  
  llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
 +llama_build_and_test(test-speculative-adaptive.cpp)
++llama_build_and_test(test-spec-type-exclusion.cpp  LABEL behavior)
  llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
  # the test serves its repos from an httplib server, and the library links it privately
  target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
@@ -118627,6 +118644,61 @@ index 000000000..249d83a35
 +    fprintf(stderr, "\n%s: total failures = %d\n", n_fail ? "FAIL" : "PASS", n_fail);
 +    return n_fail ? 2 : 0;
 +}
+diff --git a/tests/test-spec-type-exclusion.cpp b/tests/test-spec-type-exclusion.cpp
+new file mode 100644
+index 000000000..d03387256
+--- /dev/null
++++ b/tests/test-spec-type-exclusion.cpp
+@@ -0,0 +1,49 @@
++// The speculative types that share ONE draft context are rejected in combination, never merged.
++//
++// `draft-mtp` and `draft-mtp-adaptive` are one implementation class
++// (`common_speculative_impl_draft_mtp`) over one `ctx_dft`, so enabling both builds two impls that
++// each run process() on every batch and advance the same draft context twice.  The check that
++// rejected the pair arrived with block 02 (adaptive MTP) and was LOST in the r328 re-base: it was a
++// `throw` inside a hunk the re-expression no longer carried, and it is not a file, a define, an env
++// var or an option, so nothing in the release flow failed for twelve releases (issue #348).  This is
++// the instrument that would have: the combination is a behaviour, so it is tested, not grepped.
++//
++// It needs no model and no draft context -- the rejection happens while the enabled-type bitmask is
++// inspected, before any context is touched, so every arm runs with `ctx_dft == nullptr` (which also
++// means the accepted arms build no implementation at all).
++
++#include "speculative.h"
++
++#undef NDEBUG
++
++#include <cassert>
++#include <cstdio>
++#include <stdexcept>
++#include <vector>
++
++static bool init_throws(std::vector<enum common_speculative_type> types) {
++    common_params_speculative params;
++    params.types = std::move(types);
++    try {
++        common_speculative * spec = common_speculative_init(params, /*n_seq=*/ 1);
++        common_speculative_free(spec);
++    } catch (const std::exception &) {
++        return true;
++    }
++    return false;
++}
++
++int main(void) {
++    // the MTP pair shares the draft context: rejected
++    assert(init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE }));
++    // each MTP type alone is a valid run
++    assert(!init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_MTP }));
++    assert(!init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE }));
++    // the DFlash family is the same rule on the same shared context: the control that the pair check
++    // itself is still there (a fix to one pair that drops the other would fail here)
++    assert(init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK }));
++    assert(!init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH }));
++
++    printf("OK: the shared-draft-context type pairs are rejected and single types are accepted\n");
++    return 0;
++}
 diff --git a/tests/test-speculative-adaptive.cpp b/tests/test-speculative-adaptive.cpp
 new file mode 100644
 index 000000000..a5ae0bc64
@@ -120498,10 +120570,21 @@ index bfade25d7..60d3feec3 100644
                          if (slot.ctx_dft) {
                              GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 diff --git a/tools/server/server-slot-sched.cpp b/tools/server/server-slot-sched.cpp
-index 9f9779348..b7e613525 100644
+index 9f9779348..c6e2738aa 100644
 --- a/tools/server/server-slot-sched.cpp
 +++ b/tools/server/server-slot-sched.cpp
-@@ -81,6 +81,74 @@ size_t server_prompt_cache::n_tokens() const {
+@@ -6,6 +6,10 @@
+ 
+ #include <algorithm>
+ 
++#if defined(__linux__)
++#include <sys/mman.h>
++#endif
++
+ //
+ // server_prompt
+ //
+@@ -81,6 +85,79 @@ size_t server_prompt_cache::n_tokens() const {
      return res;
  }
  
@@ -120518,6 +120601,7 @@ index 9f9779348..b7e613525 100644
 +// (transparent huge pages, madvise mode) and ~0.3 s for the state copy itself.  Measured on the 9950X3D, 3.47 GiB
 +// alloc+zero: 470 -> 125 ms, and the server's prompt-cache update for a 100K-token slot's new buffer 828 -> 497 ms.
 +// LLAMA_SERVER_CACHE_HUGEPAGE=0: 4 KiB pages
++#if defined(__linux__)
 +static bool prompt_cache_hugepage() {
 +    static const bool v = [] {
 +        const char * e = getenv("LLAMA_SERVER_CACHE_HUGEPAGE");
@@ -120525,6 +120609,7 @@ index 9f9779348..b7e613525 100644
 +    }();
 +    return v;
 +}
++#endif
 +
 +common_state_data server_prompt_cache::take(size_t n) {
 +    // the smallest spare that holds n bytes; resizing it down keeps the memory, resizing it up zero-fills only the tail
@@ -120539,7 +120624,10 @@ index 9f9779348..b7e613525 100644
 +        buf = std::move(spare[best]);
 +        spare.erase(spare.begin() + best);
 +    }
-+#if defined(__linux__) && defined(MADV_HUGEPAGE)
++#if defined(__linux__)
++    // the guard is the OS, never `defined(MADV_HUGEPAGE)`: with a guard on the macro a missing <sys/mman.h> silently
++    // compiles the whole branch out of every Linux build.  It did exactly that from r328 to r339 -- the include stayed in
++    // server-task.cpp when `take()` moved here, and LLAMA_SERVER_CACHE_HUGEPAGE did nothing (issue #348)
 +    else if (prompt_cache_hugepage() && n >= (64u << 20)) {
 +        // reserve() only maps the buffer, so the advice is in place before the zero fill below touches a page; the huge
 +        // pages cover the 2 MiB-aligned part of it (a failed madvise leaves 4 KiB pages, as before)
@@ -120576,7 +120664,7 @@ index 9f9779348..b7e613525 100644
  server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
      // first check if the current state is contained fully in the cache
      for (auto it = states.begin(); it != states.end(); ++it) {
-@@ -114,6 +182,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -114,6 +191,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
          if (len == (int) it->prompt.tokens.size() && are_lora_equal(it->prompt.lora, prompt.lora)) {
              SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
  
@@ -120585,7 +120673,7 @@ index 9f9779348..b7e613525 100644
              it = states.erase(it);
          } else {
              ++it;
-@@ -126,6 +196,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -126,6 +205,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
              SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                      states.front().size() / (1024.0 * 1024.0));
  
@@ -120594,7 +120682,7 @@ index 9f9779348..b7e613525 100644
              states.pop_front();
          }
      }
-@@ -135,8 +207,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -135,8 +216,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
  
      // check if we can allocate enough memory for the new state
      try {
@@ -120605,7 +120693,7 @@ index 9f9779348..b7e613525 100644
      } catch (const std::bad_alloc & e) {
          SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
  
-@@ -164,7 +236,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -164,7 +245,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
      return &states.back();
  }
  
@@ -120615,7 +120703,7 @@ index 9f9779348..b7e613525 100644
      // a prompt made with another lora config is cleared before the new one starts, so it counts as empty
      const bool is_empty = prompt.tokens.empty() || lora_should_clear_cache(prompt.lora, lora_new);
  
-@@ -184,6 +257,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -184,6 +266,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
              continue;
          }
  
@@ -120628,7 +120716,7 @@ index 9f9779348..b7e613525 100644
          const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
  
          const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-@@ -205,7 +284,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -205,7 +293,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
          }
      }
  
@@ -120648,7 +120736,7 @@ index 9f9779348..b7e613525 100644
          SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
  
          const int64_t t_start = ggml_time_us();
-@@ -221,8 +312,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -221,8 +321,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                  return false;
              }
  
@@ -120659,7 +120747,7 @@ index 9f9779348..b7e613525 100644
          }
  
          {
-@@ -239,8 +330,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -239,8 +339,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                      return false;
                  }
  
@@ -120699,21 +120787,6 @@ index fc0099dc0..1005ee09a 100644
      server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
  
      // lora_new: the lora config of the new prompt, the states made with another config are skipped
-diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index 595e57ffb..2f1f6e149 100644
---- a/tools/server/server-task.cpp
-+++ b/tools/server/server-task.cpp
-@@ -12,6 +12,10 @@
- 
- #include <sstream>
- 
-+#if defined(__linux__)
-+#include <sys/mman.h>
-+#endif
-+
- //
- // task_params
- //
 diff --git a/tools/server/tests/unit/test_kv_keep_only_active.py b/tools/server/tests/unit/test_kv_keep_only_active.py
 index 44c05fab0..618a55de0 100644
 --- a/tools/server/tests/unit/test_kv_keep_only_active.py

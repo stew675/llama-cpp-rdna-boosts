@@ -973,8 +973,9 @@ target-side half of that tail (r118, PR #206): `llama_set_embeddings_nextn_from(
 plus a skip in `llama_context::decode` of the nextn readback and the end-of-ubatch readback wait for a
 prompt ubatch that lies entirely below the installed tail (the `embd_batch_idxs` bookkeeping is still
 appended, so `output_reorder()`'s nextn permutation stays aligned with the dense unmasked host rows);
-a `--fit` SIGSEGV fix with `draft-mtp-adaptive` (issue #38); `tests/test-speculative-adaptive.cpp` and
-`tests/test-recurrent-state-depth.cpp`; and the **embeddings-layer-input preset API**
+a `--fit` SIGSEGV fix with `draft-mtp-adaptive` (issue #38); `tests/test-speculative-adaptive.cpp`,
+`tests/test-spec-type-exclusion.cpp` and `tests/test-recurrent-state-depth.cpp`; and the **embeddings-layer-input
+preset API**
 (`llama_model_set_embeddings_layer_inp_preset`) that the draft setup calls before the target context
 reserves its compute buffers (r94 moved it here, the block that calls it).
 
@@ -984,6 +985,17 @@ for the readback skip, on by default; `0` restores the pre-r118 behaviour with t
 `LLAMA_MTP_DRAFT_OP_OFFLOAD`, `LLAMA_SPEC_ALIGN` (r153: verify-batch alignment, on),
 `LLAMA_SPEC_ALIGN_WIDTH_BAND` (r185: the verify width the aligned depth is bounded by on a band-0 config,
 default 16, `0` = off), `LLAMA_MTP_DEV_ROWS` (r294: opt-in, default **off**).
+
+**`draft-mtp` and `draft-mtp-adaptive` together are REJECTED (r342, issue #348).**  Both are one
+implementation class (`common_speculative_impl_draft_mtp`) over ONE `ctx_dft`, so enabling both builds two
+impls that each run `process()` on every batch and advance the same draft context twice; `common_speculative_init`
+throws instead.  That check shipped with this block and was **lost in the r328 re-base** (it lived inside a hunk
+the re-expression no longer carried; it is not a file, a `#define`, an env var or an option, so the file-set
+reconciliation could not see it, and a build cannot see a missing `throw`), so `--spec-type
+draft-mtp,draft-mtp-adaptive` silently built the pair for twelve releases.  Restored at the same place in the same
+form as the neighbouring DFlash-family rule, and pinned by `tests/test-spec-type-exclusion.cpp` -- the instrument
+that would have failed: it asserts the pair throws, each type alone does not, and the DFlash pair still throws
+(no model and no draft context needed; the rejection precedes every context use).
 
 **The target's MTP hidden rows are read back to the host (r294, GitHub issue #318).**  The r278 re-base brought
 upstream `#31927` in, which keeps the target's `h_nextn` rows in a device buffer (`llama_set_embeddings_nextn_dev` +
@@ -4806,7 +4818,15 @@ had no other home.
   whole-slot save on a 4 KiB-paged host: **3.47 GiB alloc+zero 470 -> 125 ms**, and the server's
   `prompt cache update took` for a 100K-token slot saving into a new 3.4 GiB buffer **828.1 -> 497.0 ms**
   (-40 %; the recycled-buffer case is unchanged at 292.6 -> 291.0, as is everything copied, so no text or
-  logit can move).  **The submission's other half is deliberately NOT taken**: taking the batched state
+  logit can move).  **r342 (issue #348): the branch had been compiled out since r328.**  When `take()` moved
+  to `tools/server/server-slot-sched.cpp` the re-base left `#include <sys/mman.h>` behind in
+  `server-task.cpp`, and the guard was `#if defined(__linux__) && defined(MADV_HUGEPAGE)`, so an undefined
+  macro removed the branch from every Linux build with no diagnostic -- the switch was documented and inert.
+  The file now includes the header itself and the guard is the **OS** (`#if defined(__linux__)`), so a lost
+  include is a compile error; `scripts/check-system-headers.py` (check 10 of `validate-set.sh`) is the
+  instrument.  Re-measured on gfx1201, dense 4B at `-c 32768 -np 2` (a ~0.9 GiB slot state forced out by five
+  ~11K-token prompts): `AnonHugePages` **1 142 784 kB** with the default and **0 kB** with
+  `LLAMA_SERVER_CACHE_HUGEPAGE=0`, whole-slot saves **20.7/20.8/21.5 ms** against **54.2/52.8/49.7 ms**.  **The submission's other half is deliberately NOT taken**: taking the batched state
   path for states above `LLAMA_STATE_ASYNC_MAX_MIB` by *cutting* a piece at a byte offset.  A state piece
   is a window handed to the backend that owns the tensor — under `-sm tensor` that is the meta backend,
   which only serves a window aligned to the tensor's own layout, so a cut trips

@@ -1,4 +1,4 @@
-From 3d4a13efdf027c86280b4a253c2028a6287a3243 Mon Sep 17 00:00:00 2001
+From d5f4fc1e0c360d566e2088c5d3d0e506bbc616c0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 24 Oct 2026 09:35:46 -0500
 Subject: [PATCH 02/17] rdna-boosts: block 02: adaptive MTP draft depth
@@ -96,7 +96,7 @@ untouched (same code path, verified in the log).  Gate: scripts/gate-spec-width-
  common/common.cpp                             |  96 ++-
  common/common.h                               |  46 +-
  common/speculative-adaptive.h                 | 142 +++++
- common/speculative.cpp                        | 561 ++++++++++++++++--
+ common/speculative.cpp                        | 570 ++++++++++++++++--
  common/speculative.h                          |   9 +
  docs/speculative.md                           |   9 +-
  .../speculative-simple/speculative-simple.cpp |   4 +
@@ -108,17 +108,19 @@ untouched (same code path, verified in the log).  Gate: scripts/gate-spec-width-
  src/llama-ext.h                               |  10 +
  src/llama-model.cpp                           |   8 +
  src/llama-model.h                             |   3 +
- tests/CMakeLists.txt                          |  23 +
+ tests/CMakeLists.txt                          |  24 +
  tests/test-arg-parser.cpp                     |  17 +
  tests/test-recurrent-state-depth.cpp          | 215 +++++++
+ tests/test-spec-type-exclusion.cpp            |  49 ++
  tests/test-speculative-adaptive.cpp           | 237 ++++++++
  tools/cli/README.md                           |  12 +-
  tools/completion/README.md                    |   6 +-
  tools/server/README.md                        |  12 +-
  tools/server/server-context.cpp               |  15 +-
- 24 files changed, 1445 insertions(+), 113 deletions(-)
+ 25 files changed, 1504 insertions(+), 113 deletions(-)
  create mode 100644 common/speculative-adaptive.h
  create mode 100644 tests/test-recurrent-state-depth.cpp
+ create mode 100644 tests/test-spec-type-exclusion.cpp
  create mode 100644 tests/test-speculative-adaptive.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
@@ -579,7 +581,7 @@ index 000000000..1f8e8a6b5
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 77bb6d458..7b5a5ecdc 100644
+index 77bb6d458..f32fe2200 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,9 @@
@@ -1322,16 +1324,32 @@ index 77bb6d458..7b5a5ecdc 100644
      }
  
      // the draft context holds as many tokens per sequence as the target context
-@@ -3214,7 +3637,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3207,6 +3630,15 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+             throw std::runtime_error("draft-dflash, draft-dflash2, draft-dspark and draft-lilicorr cannot be combined");
+         }
+ 
++        // the same rule for the MTP pair: `draft-mtp` and `draft-mtp-adaptive` are one implementation class
++        // (`common_speculative_impl_draft_mtp`) over ONE ctx_dft, so enabling both builds two impls that each
++        // run process() on every batch and advance the same draft context twice.  Rejected, not merged.
++        // (Restored at r342: the r328 re-base dropped this check with block 02's old hunk, issue #348.)
++        if ((enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) &&
++            (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE))) {
++            throw std::runtime_error("draft-mtp and draft-mtp-adaptive cannot be enabled together");
++        }
++
+         auto add_config_if_enabled = [&](common_speculative_type type, bool available = true) {
+             if (available && (enabled_configs & (1u << type))) {
+                 configs.emplace_back(type, params);
+@@ -3214,7 +3646,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
 -        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 13);
-+static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 14);
++        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 14);
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -3225,16 +3648,20 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3225,16 +3657,20 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
  
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
@@ -1358,7 +1376,7 @@ index 77bb6d458..7b5a5ecdc 100644
      for (const common_speculative_config & config : configs) {
          switch (config.type) {
              case COMMON_SPECULATIVE_TYPE_NONE:
-@@ -3248,7 +3675,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -3248,7 +3684,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -1371,7 +1389,7 @@ index 77bb6d458..7b5a5ecdc 100644
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
-@@ -3423,6 +3854,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+@@ -3423,6 +3863,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
      }
  }
  
@@ -1387,7 +1405,7 @@ index 77bb6d458..7b5a5ecdc 100644
  bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
      bool result = true;
  
-@@ -3563,6 +4003,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+@@ -3563,6 +4012,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
      }
  }
  
@@ -1726,7 +1744,7 @@ index e86e5e54f..1aa9b1261 100644
  
      //Dense linear projections for SentenceTransformers models like embeddinggemma
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 5b997e91b..3c9224104 100644
+index 5b997e91b..ad8690407 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -180,6 +180,7 @@ set(LLAMA_CONTEXT_TEST_SRC
@@ -1765,11 +1783,12 @@ index 5b997e91b..3c9224104 100644
  llama_build(test-fusion.cpp)
  
  llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
-@@ -350,6 +372,7 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
+@@ -350,6 +372,8 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
  set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
  
  llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
 +llama_build_and_test(test-speculative-adaptive.cpp)
++llama_build_and_test(test-spec-type-exclusion.cpp  LABEL behavior)
  llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
  # the test serves its repos from an httplib server, and the library links it privately
  target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
@@ -2021,6 +2040,61 @@ index 000000000..c35181180
 +
 +    fprintf(stderr, "\n%s: total failures = %d\n", n_fail ? "FAIL" : "PASS", n_fail);
 +    return n_fail ? 2 : 0;
++}
+diff --git a/tests/test-spec-type-exclusion.cpp b/tests/test-spec-type-exclusion.cpp
+new file mode 100644
+index 000000000..d03387256
+--- /dev/null
++++ b/tests/test-spec-type-exclusion.cpp
+@@ -0,0 +1,49 @@
++// The speculative types that share ONE draft context are rejected in combination, never merged.
++//
++// `draft-mtp` and `draft-mtp-adaptive` are one implementation class
++// (`common_speculative_impl_draft_mtp`) over one `ctx_dft`, so enabling both builds two impls that
++// each run process() on every batch and advance the same draft context twice.  The check that
++// rejected the pair arrived with block 02 (adaptive MTP) and was LOST in the r328 re-base: it was a
++// `throw` inside a hunk the re-expression no longer carried, and it is not a file, a define, an env
++// var or an option, so nothing in the release flow failed for twelve releases (issue #348).  This is
++// the instrument that would have: the combination is a behaviour, so it is tested, not grepped.
++//
++// It needs no model and no draft context -- the rejection happens while the enabled-type bitmask is
++// inspected, before any context is touched, so every arm runs with `ctx_dft == nullptr` (which also
++// means the accepted arms build no implementation at all).
++
++#include "speculative.h"
++
++#undef NDEBUG
++
++#include <cassert>
++#include <cstdio>
++#include <stdexcept>
++#include <vector>
++
++static bool init_throws(std::vector<enum common_speculative_type> types) {
++    common_params_speculative params;
++    params.types = std::move(types);
++    try {
++        common_speculative * spec = common_speculative_init(params, /*n_seq=*/ 1);
++        common_speculative_free(spec);
++    } catch (const std::exception &) {
++        return true;
++    }
++    return false;
++}
++
++int main(void) {
++    // the MTP pair shares the draft context: rejected
++    assert(init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE }));
++    // each MTP type alone is a valid run
++    assert(!init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_MTP }));
++    assert(!init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE }));
++    // the DFlash family is the same rule on the same shared context: the control that the pair check
++    // itself is still there (a fix to one pair that drops the other would fail here)
++    assert(init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK }));
++    assert(!init_throws({ COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH }));
++
++    printf("OK: the shared-draft-context type pairs are rejected and single types are accepted\n");
++    return 0;
 +}
 diff --git a/tests/test-speculative-adaptive.cpp b/tests/test-speculative-adaptive.cpp
 new file mode 100644

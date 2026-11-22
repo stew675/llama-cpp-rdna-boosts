@@ -44,6 +44,15 @@
 #      have it and the check says SKIP -- tier 2 (`scripts/validate-gpu.sh`,
 #      a full clone) and the release flow run it for real, and a full clone with
 #      no resolvable tag is a FAIL, not a skip.
+#  10. every system symbol the delivery's own lines call reaches its declaring
+#      header through the file's include closure, and no delivery line guards a
+#      `#if` on a macro such a header declares (issue #348: the r328 re-base left
+#      <sys/mman.h> behind in server-task.cpp when take() moved to
+#      server-slot-sched.cpp, and `#if defined(__linux__) && defined(MADV_HUGEPAGE)`
+#      then compiled the huge-page branch out of every Linux build for twelve
+#      releases -- LLAMA_SERVER_CACHE_HUGEPAGE did nothing.  Not a file, define,
+#      env var or option, so check 9 cannot see it; a build cannot either.
+#      scripts/check-system-headers.py, INVARIANTS r342).
 #
 # Checks 3-5 are the ones that would have caught the 2026-09-13 CI break (a
 # stale fork point) in a minute instead of after three failed matrix jobs.
@@ -283,5 +292,12 @@ else
        from this set.  Restore it, or record the retirement in patches/FILE-SET-RETIREMENTS.tsv
        (TODO #358, INVARIANTS r331)."
 fi
+
+echo "==> checking that every system symbol the delivery calls reaches its header (issue #348)"
+command -v python3 >/dev/null || fail "python3 is required by scripts/check-system-headers.py"
+python3 "$REPO_DIR/scripts/check-system-headers.py" --root "$src" --diff-from "HEAD~$n_default" \
+  || fail "system-header check failed (see above): a delivery line uses a symbol from a header the
+     file does not include, or guards an #if on a system macro -- guard the OS (#if defined(__linux__))
+     so a missing include is a compile error, and add the include (issue #348, INVARIANTS r342)."
 
 echo "==> OK: base $base, $n_blocks official + ${n_temporary:-0} temporary = $n_default default blocks, $n_optional optional; applied tree ${tree:-$got}"
