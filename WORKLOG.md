@@ -1,3 +1,22 @@
+## 261122.021 (r343, no delivery change) -- wip/prefill-decode-arms pass 16: post-fix verification -- every host-tier shape passes with a DEFAULT arena and NO knob (incl. the maintainer's `-c 204800` 3-GPU tensor shape)
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp` `a7958316c`
+(clean).  Record: `RESULTS-2026-11-22.md` pass 16; matrix + re-run:
+`runs/host-tier-single-gpu/verify-postfix.sh` / `verify-postfix.log` / `verify-postfix.tsv`.
+
+Re-ran every host-tier shape that had failed, plus those previously only run with an explicit arena, after the
+declared-reserve fix -- with **no** MOE_EXPERT_CACHE_MIB and **no** GGML_CUDA_SLAB_RESERVE_MIB, both arms, text
+compared: **8/8 PASS**, all arms-on text byte-identical to arms-off.  35B-A3B / Flint / Gemma4 / Flash-Next at 1 GPU;
+Flash-Next at 2 GPU layer, 3 GPU layer, 3 GPU tensor, and 3 GPU tensor at **`-c 204800 --parallel 3`** (the
+maintainer's own shape).
+
+One cost the `h` census exposes: on the 3-GPU LAYER shape the single context was fully resident (`h=0.000`, nothing
+gathered) while the pair runs at `h=0.851` -- the 3584 MiB second-context reserve is withheld from the arena per
+device, so a resident shape becomes residency-deficient for the pair (text identical, prefill fine, but gathers are
+paid).  The flat 3584 MiB is the safe declaration: the measured need is 1792.00 MiB on Flash-Next's decode context and
+9.52 MiB on the 4B's.  Follow-up recorded, not done: derive the declaration from the decode width (as the draft's
+estimate is derived from its ubatch) instead of a flat constant.
+
 ## 261122.020 (r343, no delivery change) -- wip/prefill-decode-arms pass 15: the "duplication" was WRONG (measured 0 MiB), (1) reverted; the declared reserve (2) is the fix and is in
 
 **No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
