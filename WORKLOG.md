@@ -1,33 +1,3 @@
-## 261122.002 (r342) -- "the fork branch stopped receiving release pushes": it did not, and the UI cannot show it.  The rule is recorded (AGENTS.md `.tip` trap (d)) and `fork-refresh.sh` now says it
-
-**No delivery patch changed, no tag** (the `261121.020`/`.021` precedent for a records-and-tooling revision).
-Raised by the maintainer against `github.com/stew675/llama.cpp/tree/rdna-boosts`: the branch looked 2 days stale
-while the WebUI called it 32 minutes fresh, and three things are true at once.
-
-1. **The push landed.**  `gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` returns
-   `69c8c808607f2bf28985b8aa3e81e5382545e533` == `release.json.tip`, and the *remote* blob
-   `tools/server/server-slot-sched.cpp?ref=rdna-boosts` carries `#include <sys/mman.h>` (line 10) and the
-   `# guard is the OS` comment (line 125), i.e. the r342 fix, served from GitHub.  The feed's newest visible
-   push was r339's `41a11cf04` because `repos/.../events` lags and coalesces; it is not the authority.
-2. **The commit list is old BY DESIGN.**  `apply-all.sh` stamps each re-cut commit's committer date from its
-   own author date (the r150 tooling change that makes the ids reproducible), so the branch tip is always
-   `block 0300`, authored **2026-10-25**, whenever the release is cut.  Dating the commits "now" would break
-   `.tip` reproducibility, so this is not a defect to fix.
-3. **The repo landing page is `master`, not the branch.**  The fork's default branch is `master`, which is the
-   upstream mirror at the fork point (`919794500`, committer date 2026-11-20T19:54Z) and is never pushed at
-   release time -- that is the "2 days ago" that was being read as the branch's age.
-
-Freshness therefore has exactly two honest checks, both on the **ref**: the `branches/rdna-boosts` sha (must
-equal `.tip`) and the branch page's "updated <time>".  Recorded as AGENTS.md `.tip` trap **(d)** (with the
-instruction not to "fix" it by dating the commits or pushing `master`), and `scripts/fork-refresh.sh` prints
-the note at the end of every run (`freshness reads on the REF, not on the commit dates: ... whose newest commit
-is dated by its AUTHOR ...`), so the next operator reads it from the tool that cut the branch.  Re-ran the
-refresh to confirm the tooling change and the idempotence: `tip 69c8c8086`, `.tip matches`, tree
-`e4060a04c` -- the same commit ids the tag records.
-
-**Record:** `AGENTS.md` (Pushing policy, `.tip` trap (d)); `scripts/fork-refresh.sh`; no `patches/`, no
-`release.json`, no tag change.
-
 ## 261122.003 (r343) -- the slab headroom default is `1408 + 128 x n_gpu` (1536 MiB on one GPU), sized for allocations made AFTER the slab extends
 
 **Delivery change: block 10 only** (its content, not its number).  `release.json` is now `v17-919794500-r343`, base
@@ -91,6 +61,36 @@ instrument to re-run at this default (it is at r343 afterwards).
 `ENVIRONMENT.md` §1.3 + the §-index row (new default, the r343 note, the measured cost); `INVARIANTS.md` r343;
 `patches/README.md` block 10's row.  `n_blocks`/`n_temporary`/`n_optional` unchanged.
 43: block 10's slab headroom default is 1408 + 128 x n_gpu MiB (1536 on one GPU), sized for allocations made AFTER the slab extends; release v17-919794500-r343)
+
+## 261122.002 (r342) -- "the fork branch stopped receiving release pushes": it did not, and the UI cannot show it.  The rule is recorded (AGENTS.md `.tip` trap (d)) and `fork-refresh.sh` now says it
+
+**No delivery patch changed, no tag** (the `261121.020`/`.021` precedent for a records-and-tooling revision).
+Raised by the maintainer against `github.com/stew675/llama.cpp/tree/rdna-boosts`: the branch looked 2 days stale
+while the WebUI called it 32 minutes fresh, and three things are true at once.
+
+1. **The push landed.**  `gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` returns
+   `69c8c808607f2bf28985b8aa3e81e5382545e533` == `release.json.tip`, and the *remote* blob
+   `tools/server/server-slot-sched.cpp?ref=rdna-boosts` carries `#include <sys/mman.h>` (line 10) and the
+   `# guard is the OS` comment (line 125), i.e. the r342 fix, served from GitHub.  The feed's newest visible
+   push was r339's `41a11cf04` because `repos/.../events` lags and coalesces; it is not the authority.
+2. **The commit list is old BY DESIGN.**  `apply-all.sh` stamps each re-cut commit's committer date from its
+   own author date (the r150 tooling change that makes the ids reproducible), so the branch tip is always
+   `block 0300`, authored **2026-10-25**, whenever the release is cut.  Dating the commits "now" would break
+   `.tip` reproducibility, so this is not a defect to fix.
+3. **The repo landing page is `master`, not the branch.**  The fork's default branch is `master`, which is the
+   upstream mirror at the fork point (`919794500`, committer date 2026-11-20T19:54Z) and is never pushed at
+   release time -- that is the "2 days ago" that was being read as the branch's age.
+
+Freshness therefore has exactly two honest checks, both on the **ref**: the `branches/rdna-boosts` sha (must
+equal `.tip`) and the branch page's "updated <time>".  Recorded as AGENTS.md `.tip` trap **(d)** (with the
+instruction not to "fix" it by dating the commits or pushing `master`), and `scripts/fork-refresh.sh` prints
+the note at the end of every run (`freshness reads on the REF, not on the commit dates: ... whose newest commit
+is dated by its AUTHOR ...`), so the next operator reads it from the tool that cut the branch.  Re-ran the
+refresh to confirm the tooling change and the idempotence: `tip 69c8c8086`, `.tip matches`, tree
+`e4060a04c` -- the same commit ids the tag records.
+
+**Record:** `AGENTS.md` (Pushing policy, `.tip` trap (d)); `scripts/fork-refresh.sh`; no `patches/`, no
+`release.json`, no tag change.
 
 ## 261122.001 (r342) -- issue #348 fixed and RELEASED: a missing `#include` had compiled the prompt-cache huge-page path out of every Linux build since r328, and the same re-base also dropped block 02's MTP-pair rejection; both restored, both now instrumented
 
