@@ -145,9 +145,14 @@ yield point, the stream-priority plumbing — the last two are recorded losers, 
    not `MOE_EXPERT_PREFILL_IN_PLACE`, not the overlap (`ARMS_WAIT_ALL`), not the batch width, and **not the
    host tier** — the 35B-A3B reproduces it at full residency and the dense 4B does not.  The outcomes come
    from a small set and the single-context text itself moves with `LLAMA_KV_N_PAD_MIN`, so it is a
-   graph-bucket / numerics effect (the `LLAMA_KV_N_PAD_*` + §44 family), not corrupted state.  T3's gate is
-   therefore: text on a shape with both arms in ONE `n_kv` bucket (a high `LLAMA_KV_N_PAD_MIN`), a
-   same-configuration repetition, and `scripts/gate-prefill-logits.sh` (KLD) for the prefill path.
+   graph-bucket / numerics effect, not corrupted state — and `n_kv` (pinned with `LLAMA_KV_N_PAD_MIN`) and the
+   decode context's buffer layout (`ARMS_B_BATCH=512`) were then eliminated too.  **The leading hypothesis is
+   the physical KV cell INDICES**: the KV `v_cells` are shared but the allocation cursor (`v_heads`) is
+   per-context, so a slot sits in different cells on the two arms, and this fork's tile-FA decode launcher
+   splits the KV extent by index (`ggml_cuda_fattn_band_wmma_split` / `parallel_blocks` — what
+   `scripts/gate-spec-purity.sh` pins).  T3's text point must therefore compare two runs with the **same cell
+   layout** (or the pair must share one allocation cursor, which the §3.1 allocator fix wants anyway), plus
+   `scripts/gate-prefill-logits.sh` (KLD) for the prefill path.
 
 ## 5. The reusable harness
 
@@ -221,9 +226,10 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 7. **New: is the 2-slot warm text instability a *bug* or a graph-bucket effect?**  This pass could not settle
    it (the isolation matrix is in the results file §3.3).  It **refuted** the host-tier explanation (full
    residency reproduces it), and the single-context text itself moves with `LLAMA_KV_N_PAD_MIN`, so it is a
-   shape/numerics effect of some kind.  Next instrument: a **logits** diff (the same token decoded on A and on
-   B), printing `n_kv`/`used`/recr `head`/`rs_z`/the destination row from both arms, then a high
-   `LLAMA_KV_N_PAD_MIN` to put both arms in one bucket.
+   shape/numerics effect, and `n_kv` and the decode context's buffer layout are both eliminated.  The leading
+   hypothesis is the **physical KV cell indices** (a per-context allocation cursor + an index-dependent tile-FA
+   split).  Next instrument: print the cell indices each arm's sequence holds and the resulting
+   `parallel_blocks`, and diff the **logits** of the same token decoded on A and on B.
 
 ## Files
 | file | what |
