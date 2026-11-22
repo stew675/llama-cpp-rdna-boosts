@@ -1,3 +1,26 @@
+## 261122.017 (r343, no delivery change) -- wip/prefill-decode-arms pass 12: the HOST-EXPERT tier on one GPU (`-ncmoe 48`) is 4/4 PASS with a non-vacuous gather census; no pure Mamba model exists on this box
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
+`wip/prefill-overlap` `423c91619`, clean.  Record: `wip/prefill-decode-arms/RESULTS-2026-11-22.md` pass 12; matrix +
+re-run: `runs/host-tier-single-gpu/README.md`.
+
+Pass 11's matrix is fully resident, so the host-expert machinery (the arena, the gathers, the heatmap) is idle in every
+row of it.  This pass runs the regime the arms exist for: **one 32 GiB R9700, `-ncmoe 48`**, arena deliberately too
+small, both arms, text compared -> **4/4 PASS** (35B-A3B Q8_0 `h=0.62`, Flint Q8_0 `h=0.35`, Gemma4 26B-A4B
+`h=0.48`, Flash-Next IQ4_NL `h=0.34`), every row with a non-zero gather census so no row is vacuous.
+
+Two consumer-facing capacity facts fell out, both named by the engine: **`MOE_EXPERT_CACHE_MIB` has a floor of 2048
+MiB/device** (2000 aborts at load, `0` disables the cache), which is how gemma4's deficit is forced on one card; and
+**Flash-Next cannot fit a pair on one card at arena 5000** — the single context runs, the pair dies on the decode
+arm's 1430 MiB graph reserve (`the movable-boundary slab holds the VRAM … Raise GGML_CUDA_SLAB_RESERVE_MIB`) — but at
+arena 2048 + `GGML_CUDA_SLAB_RESERVE_MIB=4096` both arms run and the text is identical.  So that failure is the 100 GB
+model in 32 GiB, not the arms.
+
+Also answered: **there is no pure Mamba-class model under `/llm/models/`** (`llm_arch_is_recurrent` covers
+MAMBA/MAMBA2/RWKV6/RWKV6QWEN2/RWKV7/ARWKV7; everything here is attention-only, hybrid, or looped-attention such as
+`inkling2`/`ricursive`).  The known gap that `llama_memory_seq_state_take()` refuses a non-hybrid — so a recurrent-only
+model would get no state on the pair — therefore stays **untested, not fixed**, and is recorded that way.
+
 ## 261122.016 (r343, no delivery change) -- wip/prefill-decode-arms pass 11: the COVERAGE MATRIX (16/16 shapes clean) and the same memory-module defect a second time, in `iswa` (gemma4)
 
 **No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
