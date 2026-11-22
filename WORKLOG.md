@@ -1,3 +1,57 @@
+## 261122.007 (r343, no delivery change) -- wip/prefill-decode-arms: the interactive number, and the campaign's code on r343
+
+**No delivery patch changed** -- this is the campaign's record: its code branch was rebased onto the delivery's
+**r343**, the tier-1 oracle was **re-read** on it, and the user-facing measurement was taken with a new tool.
+
+### 1. The rebase, and why it matters
+
+`~/llama.cpp` `wip/prefill-overlap`, 7 WIP commits, rebased `923b910eb -> e6b3cd3e5` (r343's re-cut chain), new tip
+**`9bb97b741`**; tree clean.  The branch had been carrying r339's chain, so it was built on the *old*
+`GGML_CUDA_SLAB_HEADROOM_MIB` default.  On r343 it now inherits **1536 MiB on one GPU**, which is exactly what the
+campaign needed: the pair's **2-row decode graph** fits with **no env override** (pass 5 §4's finding, closed by the
+delivery rather than by an operator knob).
+
+### 2. The tier-1 oracle re-read on r343: PASS, unchanged
+
+The default shifts the slab arena by 256 MiB, so the oracle was re-read, not assumed
+(`wip/prefill-decode-arms/runs/server-oracle-r343/`): product shape, both pins, two concurrent ~500-token requests
+-> SLOT 0 `459865c93d55cbaf`, SLOT 1 `7dc20b0ce0bac255`, i.e. **the same values pass 4 recorded on r339**,
+`HANDSHAKE the pair shares one allocation owner`, census `h=0.6910`.  Stands with pass 5 §6's caveat: a cold
+short-prompt host-expert shape is not run-to-run text-stable in either arm and can never arbitrate a default
+change; the warm 2-slot gate shape can, and holds.
+
+### 3. The interactive number (`arms/interactive.py`, new)
+
+A reply streams on slot 0; a ~3600-token document is pasted into slot 1 0.6 s later; both are read concurrently.
+r343 tree, arena 5000, `-c 16384 -b 2048 -ub 512`, 35B-A3B, both pins, warm, 1 GPU:
+
+| arm | the document | the streaming reply |
+|---|---|---|
+| **default** (single context) | **TTFT 4463 ms**, 4.40 s at **797 t/s** | window gaps p50 18 / p95 **300** / worst **390 ms**; 119 tokens through |
+| **two arms** | **TTFT 2807 ms**, 2.80 s at **1252 t/s** | p50 44 / p95 **62** / worst **95 ms**; 63 tokens through |
+
+Tokens/s of the reply from its start (`|` = the document prefilling):
+
+```
+             0   1   2   3   4   5   6   7   8   9  10  11  12
+default:    23  32  24  25  36  42  61  59  59  60  67  59  53
+             .   |   |   |   |   |   .   .   .   .   .   .   .
+   arms:    27  22  23  35  56  60  62  61  57  61  59  60  17
+             .   |   |   |   .   .   .   .   .   .   .   .   .
+```
+
+The document lands **1.6x sooner** on the two arms and the reply **never freezes** (worst gap 95 ms vs 390 ms; p95
+62 vs 300).  The cost is rate, not liveness: 22-35 tokens/s while the document prefills against ~60/s alone.  The
+single-context server pays twice for the interleave -- its prefill is chunked by `-ib` *and* it still stalls the
+decoder -- which is why its document is slower **and** its reply is burstier.
+
+### 4. Repo hygiene (both repos)
+
+`llama-cpp-rdna-boosts`: this branch was backed up as patches (`wip/prefill-decode-arms/branch-backup/`), rebased
+onto `main` (r343), and its four WORKLOG entries re-inserted above main's 2026-11-22 ones (`.004`-`.006`, plus
+261121.023 unchanged) after the numbering collision the delivery's r342/r343 created.  Only `wip/` differs from
+`main` on this branch.  `~/llama.cpp` is clean at `9bb97b741`, its `rdna-boosts` branch at `.tip` `e6b3cd3e5`.
+
 ## 261122.006 (r341, no delivery change) -- wip/prefill-decode-arms pass 5: the two-arm SERVER is built and tier 1 passes byte-identically; the smoothness target is met and the cost target is not
 
 **No delivery patch changed, no block created or amended, no tag** -- `patches/`, `release.json` and the block

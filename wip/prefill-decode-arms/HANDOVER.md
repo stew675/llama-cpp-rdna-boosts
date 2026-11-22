@@ -64,7 +64,16 @@ allocation owner); **pass 5 built the server cut and tier 1 passes**.
   decode-graph OOM (`GGML_CUDA_SLAB_HEADROOM_MIB=1536`) are all recorded there.
 * The WIP branch `wip/prefill-overlap` in `~/llama.cpp` (**7 commits**: shared KV, the handover, the two recorded
   losers — the per-gather yield point and stream priority — kept as the record, the censuses, T0, and the server
-  cut).  `~/llama.cpp` is **clean**; keep it that way.
+  cut).  **Rebased onto the delivery's r343** (`e6b3cd3e5`), tip **`9bb97b741`**; `~/llama.cpp` is **clean**; keep it
+  that way.  The rebase is what puts the pair on r343's `GGML_CUDA_SLAB_HEADROOM_MIB` default (1536 MiB on one GPU),
+  so the **2-row decode graph fits with no env knob** — pass 5's finding #1 is closed by the delivery, not by an
+  override (`INVARIANTS.md` r343).
+* **`arms/interactive.py`** (pass 5, new): the tool for the question the campaign is really about — *what a user
+  sees*.  A streaming reply on slot 0, a long document pasted into slot 1 0.6 s later, both read concurrently; it
+  reports the document's TTFT, the reply's gaps **inside** the prefill window, and a per-second table of tokens
+  delivered, so a freeze or a burst is visible at a glance.  First run on r343 (arena 5000, `-c 16384 -ub 512`):
+  single-context **4.46 s TTFT at 797 t/s, the reply drops to 23-36 tokens/s for 5 s with 300-390 ms stalls**; two
+  arms **2.81 s at 1252 t/s, worst gap 95 ms** (`runs/interactive-2611/`).
 * The record: `RESULTS-2026-11-21.md` (pass 1: numbers, the three landmines, §3.4's reset experiment, §5's server
   code points, and a "Reproduce" section with the exact commands) and `RESULTS-2026-11-22.md` (pass 2: the residual
   resolved into two effects, the censuses, and the reproduce commands).  Delivery-repo commits `56443c1f`,

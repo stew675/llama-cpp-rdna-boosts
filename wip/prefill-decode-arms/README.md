@@ -1,11 +1,14 @@
 # prefill-decode-arms — one prefill arm and one decode arm, both live on one GPU
 
-**Status: pass 5 done (2026-11-22) — T0, T1 and **T2** CLOSED: `llama-server --prefill-decode-arms` is the design
+**Status: pass 5 done (2026-11-22), on the delivery's r343 — T0, T1 and **T2** CLOSED: `llama-server --prefill-decode-arms` is the design
 (prefill arm + decode arm on one shared KV, a slot crossing only at a request boundary), **tier 1 passes cold and
 over 3 warm request pairs** (both slots byte-identical to the single-context server, every allocation handshake
 clean), and the campaign's metric is measured: **~47-49 ms ITL p50 / 64-78 ms p95 through a 2.0-5.3 s prefill** at
 **-24 to -27 % prefill** (the smoothness target is met, the <= ~14 % cost target is not — pass 5 §6).  Nothing in
-`patches/`.**  See [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) (passes 2-5) and
+`patches/`.**  **The interactive number** (`arms/interactive.py`: a reply streaming while another chat pastes a
+3600-token document): single-context **TTFT 4.46 s at 797 t/s and the reply drops to 23-36 tokens/s for 5 s with
+300-390 ms stalls**; two arms **2.81 s at 1252 t/s and the reply's worst gap is 95 ms** — and since **r343** the pair
+fits with no env knob (the slab headroom default).  See [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) (passes 2-5 + the post-rebase note) and
 [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md) (pass 1).  It inherits the conclusion of the
 retired [`archive/work/prefill-transfer-overlap/`](../../archive/work/prefill-transfer-overlap/README.md)
 (it established *what* the win is and *which mechanism* delivers it).  This campaign builds the product.
@@ -291,6 +294,10 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 | [`runs/t0-2611/`](runs/t0-2611/) | pass 3: every T0 arm (stdout, stderr gzipped, the logits manifests) — the oracle, the `LLAMA_KV_ALLOC_SHARED=0` control, and the `ARMS_NO_WAIT_TAKE=1` race control |
 | [`arms/gate-server-arms.sh`](arms/gate-server-arms.sh) | the T2 gate (tier 1): the two-arm server's reply must be byte-identical to the single-context server's, both slots; `REPS=N` makes it N request pairs in ONE process (the warm reps), `--compare` is the oracle |
 | [`arms/smooth.py`](arms/smooth.py) | the retired campaign's smoothness harness, **verbatim** + `--warm N`: a decoder's ITL *inside* the prefill's window (`itl_d_p50/p95`), the tokens it got through, and the prefill's own `pf_tps` |
+| [`arms/interactive.py`](arms/interactive.py) | the *user's* question: a reply streaming while another chat pastes a long document — the document's TTFT, the reply's gaps inside the prefill window, and a per-second table of tokens delivered |
+| [`runs/interactive-2611/`](runs/interactive-2611/) | that run, both arms (`interactive.tsv` + the per-arm JSON + gzipped logs) |
+| [`runs/server-oracle-r343/`](runs/server-oracle-r343/) | the tier-1 oracle re-read on r343 (the slab default changed, so it was re-read rather than assumed: PASS, same hashes) |
+| [`branch-backup/`](branch-backup/README.md) | a restore point: this branch's own 14 commits as patches (taken when the branch was set aside for the delivery's r343) |
 | [`runs/server-oracle/`](runs/server-oracle/) | pass 4/5: the reference and the two-arm server (one pair each) + `warm/` (3 pairs in one process) |
 | [`runs/smooth-2611b/`](runs/smooth-2611b/) … [`runs/smooth-2611e/`](runs/smooth-2611e/) | pass 5: the four measurement runs — `smooth.tsv` + the per-arm JSON + the gzipped server logs (2611 is the failed one: the 2-row decode-graph OOM) |
 | [`../../archive/work/prefill-transfer-overlap/`](../../archive/work/prefill-transfer-overlap/README.md) | the retired campaign: how the win was established, every measured number, and the two policies that lost |
