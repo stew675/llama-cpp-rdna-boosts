@@ -1,8 +1,23 @@
 # prefill-decode-arms — one prefill arm and one decode arm, both live on one GPU
 
-**Status: NEW CAMPAIGN, opened 2026-11-20; nothing implemented, nothing in `patches/`.**  It inherits the
-conclusion of the retired [`archive/work/prefill-transfer-overlap/`](../../archive/work/prefill-transfer-overlap/README.md)
+**Status: pass 1 done (2026-11-21) — T1 CLOSED, T2/T3 emulated outside the server, three new landmines.
+Nothing in `patches/`.**  See [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md).  It inherits the conclusion of the
+retired [`archive/work/prefill-transfer-overlap/`](../../archive/work/prefill-transfer-overlap/README.md)
 (it established *what* the win is and *which mechanism* delivers it).  This campaign builds the product.
+
+* **T1 (the blocking task) is done**: [`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch)
+  moves one sequence's recurrent state between the two arms **device-to-device in 0.5–0.7 ms** (the serialised
+  path is 36 ms); the text oracle holds byte-for-byte on a no-host-tier model in every mode/repetition, and on
+  the 35B host tier for a single handed-over request (3/3 warm reps).
+* **T2/T3 are emulated, not in the server**: [`arms/two_arms.cpp`](arms/two_arms.cpp) is the server's shape
+  (two contexts, one KV, two threads, a request queue, a handover at the request boundary) and reproduces the
+  campaign's physics — **38 decoder tokens through a 2.08 s prefill at ITL p50 53.7 / p95 71.6 ms** for
+  **+14.1 %** prefill (6.75 ms charged per decoder token, against the retired campaign's 7.7 ms at the same
+  arena).  §5 of the results file is the server cut in code points.
+* **Read the results file before touching this**: §3.1 (the shared KV's cell allocator is not
+  concurrency-safe — a blocker), §3.2 (the second arm's VRAM is a graph reserve *per active-slot width*: 741 MiB
+  for 2 rows, so the pair does not fit at arena 5000 + `-ub 2048`), §3.3 (the 2-slot two-arm text is **not**
+  stable across warm reps on a partial arena — a greedy hash is not a valid oracle on the tier).
 
 ## 0. The idea, in one paragraph
 
@@ -53,10 +68,10 @@ a 4932-token prompt and a 128-token decoder, warm reps.  Full detail: the retire
 | patch | what | state |
 |---|---|---|
 | [`enabling-0001-second-context-shared-kv.patch`](enabling-0001-second-context-shared-kv.patch) | `llama_context_params::ctx_other_share_memory` (one bool, default false), the generic `ctx_other` gate in `llama-context.cpp`, `llama_kv_cache::other_coowner` (a second context OWNS cells in the shared map instead of being a read-only mirror), and the plain-hybrid wiring so `qwen35moe` works | **text-verified** on dense 4B and 35B-A3B, including two contexts computing at once (no host tier, and at full residency).  Applies clean to `release.json`'s tree |
-| (not written) recurrent state | `llama_memory_hybrid`'s **recurrent** memory is not shared: the second context allocates its own 125.6 MiB RS buffer.  Coherent while each sequence stays on one context; **a slot cannot cross arms without it** | **the campaign's first task** |
+| [`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch) | **T1, done 2026-11-21**: `llama_memory_recurrent::seq_state_take()` (one batched device-to-device copy of a sequence's recurrent rows + cell metadata, `ggml_backend_tensor_copy_n` over per-layer views), `llama_memory_seq_state_take()` (llama level, hybrid memories), `llama_memory_i::seq_rm_recr()` / `llama_memory_seq_rm_recr()` (drop ONLY the recurrent cells — the shared attention cells must survive), and `LLAMA_STATE_SEQ_FLAGS_RECR_ONLY` (the serialised control arm; the hybrid wrapper skips its attention half on both sides, which is what makes the handover ~50 MiB instead of the whole cache) | **0.5–0.7 ms vs 36 ms serialised**; text oracle holds (see `RESULTS-2026-11-21.md` §1.2).  WIP branch `wip/prefill-overlap`, commit 4 |
 
-The WIP branch is `wip/prefill-overlap` in `~/llama.cpp` (three commits: shared KV, the yield point, the
-stream-priority plumbing — the last two are recorded losers, kept as the record).
+The WIP branch is `wip/prefill-overlap` in `~/llama.cpp` (four commits: shared KV, the recurrent handover, the
+yield point, the stream-priority plumbing — the last two are recorded losers, kept as the record).
 
 ## 3. The design to build
 
@@ -113,6 +128,26 @@ stream-priority plumbing — the last two are recorded losers, kept as the recor
 6. **The `moe_cache_pass_end` boundary is per graph** (`ggml-cuda.cu:9508`), so two arms at once means two
    graphs' pass boundaries interleave.  Measured harmless for a prefill+decode pair (text identical), but it
    is the reason landmine 1 exists and it must be re-checked when the decode arm batches many slots.
+7. **The shared KV's cell allocator is NOT concurrency-safe** (found 2026-11-21, `RESULTS-2026-11-21.md`
+   §3.1): `llama_kv_cache::find_slot()` is `const` and only *searches* from `v_heads`; `apply_ubatch()`
+   advances the cursor afterwards (`head = sinfo.idxs[s].back() + 1`).  Between the two the cells are not
+   reserved, so two arms that search from the same cursor can be handed **the same cells** — fluent, wrong
+   text, non-deterministically.  The measured arms did not visibly hit it; **fix it before two arms allocate**
+   (reserve at `find_slot` time, or partition each arm's scan range, or a mutex across prepare→apply which
+   serialises the compute and defeats the feature).
+8. **The second arm's VRAM is a graph reserve per arm AND per active-slot width**: a 2-row decode graph on
+   35B-A3B at `-ub 2048` asks for **741.47 MiB** on top of the 1-row one.  At arena 5000 / `-c 16384` /
+   `-ub 2048` the pair does **not** fit on a 32 GiB card (the *prefill* graph's reserve fails); `-ub 512` does.
+   The opt-in gate needs that rule, not landmine 2's 600 MiB.
+9. **A greedy hash is not an oracle for the two arms yet** (`RESULTS-2026-11-21.md` §3.3): the cold rep matches
+   the sequential reference and the warm ones do not (nor each other), while the single-context 2-slot
+   reference is stable across reps.  Isolated: not the handover (both paths agree), not `GGML_MOE_DEVREMAP`,
+   not `MOE_EXPERT_PREFILL_IN_PLACE`, not the overlap (`ARMS_WAIT_ALL`), not the batch width, and **not the
+   host tier** — the 35B-A3B reproduces it at full residency and the dense 4B does not.  The outcomes come
+   from a small set and the single-context text itself moves with `LLAMA_KV_N_PAD_MIN`, so it is a
+   graph-bucket / numerics effect (the `LLAMA_KV_N_PAD_*` + §44 family), not corrupted state.  T3's gate is
+   therefore: text on a shape with both arms in ONE `n_kv` bucket (a high `LLAMA_KV_N_PAD_MIN`), a
+   same-configuration repetition, and `scripts/gate-prefill-logits.sh` (KLD) for the prefill path.
 
 ## 5. The reusable harness
 
@@ -145,11 +180,12 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 
 | # | task | why first |
 |---|---|---|
-| **T1** | recurrent state: share it (preferred) or hand it over at a slot boundary | without it a slot cannot cross arms, i.e. no server design exists |
-| **T2** | server skeleton: second context + second thread + routing of decode-only batches to the decode arm; slots pinned to an arm for a request's lifetime | this alone reproduces the measured win (steady ITL during a prefill) |
-| **T3** | handover at the request boundary, with a text oracle: a request's reply must be byte-identical to today's single-context server | the correctness gate for the whole design |
-| **T4** | policy + opt-in gate (host tier + residency deficit), and the duty cycle's role on this path | the measured boundary: no window at full residency, so no unconditional default |
+| **T1** | ~~recurrent state: share it (preferred) or hand it over at a slot boundary~~ — **DONE 2026-11-21** as a device-to-device handover (`enabling-0002`), 0.5–0.7 ms, text-verified | — |
+| **T2** | server skeleton: second context + second thread + routing of decode-only batches to the decode arm; slots pinned to an arm for a request's lifetime | this alone reproduces the measured win (steady ITL during a prefill).  The design is now measured outside the server (`RESULTS-2026-11-21.md` §2 + §5's code points) and its cost/VRAM rules are §3.1/§3.2 |
+| **T3** | handover at the request boundary, with a text oracle: a request's reply must be byte-identical to today's single-context server | **the oracle has to be chosen carefully**: it holds on a no-host-tier model and for a single handed-over request on the tier, but a 2-slot arm on a partial arena is not text-stable warm (§3.3) — use a full-residency/no-host-tier text point + KLD on the tier |
+| **T4** | policy + opt-in gate (host tier + residency deficit + the VRAM rule of §3.2), and the duty cycle's role on this path | the measured boundary: no window at full residency, so no unconditional default |
 | **T5** | measurement with `smooth.py` against the baseline table + the gates (§7) | the campaign's verdict |
+| **T0** | **the shared-KV allocator fix** (`RESULTS-2026-11-21.md` §3.1) | it must land before two arms are allowed to allocate cells, i.e. before T2 runs at `-np 2` |
 
 ## 7. Gates when it becomes code
 
@@ -175,10 +211,27 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 3. **`-np 1`**: leave it single-context (no second context, no 600 MiB) — confirm.
 4. When this lands it should **retire `LLAMA_SERVER_PREFILL_DUTY` on this path** (keep it as the `F ≈ 0`
    fallback).  That is a default flip and therefore a maintainer decision at promotion time.
+5. **New (2026-11-21): may the allocator fix be its own enabling artifact?**  `RESULTS-2026-11-21.md` §3.1 is a
+   latent defect in the *shared* cache (reserve-at-`find_slot` or a partitioned scan), reachable only with two
+   allocating contexts.  It is a prerequisite of T2 and it changes `llama-kv-cache`, so it wants its own small
+   artifact rather than hiding inside the server cut.
+6. **New: which oracle does the maintainer want for T3?**  §3.3 says a cross-configuration hash is not
+   available on a partial host-expert arena.  Proposed: text at full residency (or no host tier) + KLD on the
+   tier + a same-configuration repetition to catch non-determinism.  Confirm before T2's gate is written.
+7. **New: is the 2-slot warm text instability a *bug* or a graph-bucket effect?**  This pass could not settle
+   it (the isolation matrix is in the results file §3.3).  It **refuted** the host-tier explanation (full
+   residency reproduces it), and the single-context text itself moves with `LLAMA_KV_N_PAD_MIN`, so it is a
+   shape/numerics effect of some kind.  Next instrument: a **logits** diff (the same token decoded on A and on
+   B), printing `n_kv`/`used`/recr `head`/`rs_z`/the destination row from both arms, then a high
+   `LLAMA_KV_N_PAD_MIN` to put both arms in one bucket.
 
 ## Files
 | file | what |
 |---|---|
 | this `README.md` | the campaign: idea, established evidence, design, landmines, tasks, gates, open questions |
+| [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md) | **pass 1**: T1 done and measured, the emulated T2/T3 and the product numbers, the three new landmines, the server cut in code points |
 | [`enabling-0001-second-context-shared-kv.patch`](enabling-0001-second-context-shared-kv.patch) | the second context that shares the first one's KV (text-verified, applies to `release.json`'s tree) |
+| [`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch) | **T1**: the recurrent-state handover, device to device (+ `seq_rm_recr`, `RECR_ONLY`) |
+| [`arms/two_arms.cpp`](arms/two_arms.cpp), [`arms/build-two-arms.sh`](arms/build-two-arms.sh) | the instrument: two arms, two threads, one KV, a request queue and the handover; references `single` / `batch-pair` / `pf-alone` / `dec-alone` |
+| [`runs/2611-arms-35b-arena5000.txt`](runs/2611-arms-35b-arena5000.txt) | the raw 35B arm table behind the results file's §2.1 |
 | [`../../archive/work/prefill-transfer-overlap/`](../../archive/work/prefill-transfer-overlap/README.md) | the retired campaign: how the win was established, every measured number, and the two policies that lost |
