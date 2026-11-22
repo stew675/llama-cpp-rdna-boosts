@@ -1,3 +1,48 @@
+## 261122.014 (r343, no delivery change) -- wip/prefill-decode-arms pass 9: THREE `-sm tensor` crashes found and fixed; ONE P0 OPEN BUG (a ~70K-token prompt is invisible except its tail, arms only); HANDOVER.md rewritten for a cold session
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  The maintainer took the
+campaign's server to the WebUI on their own shape (Qwen3.8-Flash-Next IQ4_NL, `-sm tensor`, 3 GPUs, `--kv-unified
+-np 3 -c 204800`) and found both classes of problem below.  `~/llama.cpp` `wip/prefill-overlap` `b822f89fc` (clean).
+
+**Fixed (three distinct failures, all on the Meta split-state path):**
+
+1. `seq_state_take()`'s views carried **`buffer == NULL`** (an out-of-graph view is unbacked until the graph allocator
+   touches it), so the copy aborted in `ggml_backend_buffer_get_type` on the very first handover.  CUDA's batched
+   `cpy_tensor_n` goes through `view_src` and never looks — which is why every 1-GPU shape had passed.  Views now carry
+   the parent's buffer/data.
+2. That buffer type has **no device-side copy at all** and its host path cannot resolve a strided view of a split
+   tensor (`SIGSEGV` in `ggml_backend_meta_get_tensor_impl`).  The handover now falls back to the **serialised state
+   move** (`LLAMA_STATE_SEQ_FLAGS_RECR_ONLY`, the shipped prompt-cache path) when a new query
+   `ggml_backend_buffer_can_copy_tensor()` says there is none — **the two arms keep running; this is not a fallback to
+   the single-context mode**, only the per-boundary state move changes shape.  Measured cost:
+   **112.57 MiB, ~74.6 ms (39 out + 36 in) per request boundary**; single-GPU shapes never take it.
+3. A **process-global `g_meta_view_slot`** raced between the two arms (read more than once per tensor: register a
+   view's children, then look them up), so one arm flipped it in between → a null per-device child → `GGML_ASSERT(tensor)`
+   in the prefill arm's own `sched_copy_input`, or "tensor write out of bounds" on a 0-row tensor.  It landed on the
+   **second slot's first prefill**.  Now `thread_local`, `n_view_slots` 4, and a co-owner context takes the second
+   pair (slots 2/3).  Verified: 2 slots and **3 slots** with concurrent prefill+decode, **0 asserts** (192/32/32 tokens
+   at 44/35/26 tok/s).
+
+**OPEN — P0, the reason for this entry.**  On that same shape, with the arms enabled, a request carrying **5 files +
+a text prompt (~70K tokens, one request)** is answered as if the model **only saw the trailing text**; the server
+reports reading all ~70K.  Not with `--no-prefill-decode-arms`; not with `-sm layer`.  **Not reproduced yet**: a
+15.7K-token prompt on a 4B (1 GPU) is byte-correct with the arms on *and* off, including the reuse path.  Ranked
+hypotheses and four cheap tests are in `HANDOVER.md` §6 — H1 (a **phantom prefix reuse**: the reverse handover keeps
+`slot.prompt`, and if the KV behind it is gone the next request reports `cache_n`≈70K and evaluates only the tail),
+H2 (the long prompt on the serialised/meta path), H3 (context shift), H4 (the WebUI sending several requests).  A
+containment kill switch (`LLAMA_ARMS_KEEP_PROMPT=0`, clear the prompt on return = pass-6 behaviour) is **proposed but
+not implemented** — it is a behaviour change and needs the maintainer's word.
+
+**Scope ruling recorded:** this campaign ships **opt-in only**; the **meta-aware device copy** (which would remove the
+~74.6 ms boundaries) and **speculative-decoding support** are a **follow-up campaign**.
+
+`HANDOVER.md` is **rewritten for a cold session** (it supersedes the pass-5 version, which stays in git history at
+`7b784bc0`): §1 task table to T9, §2 code map with the commit list, §3 the cut + the option tri-state + the
+`-ib`/`DUTY` deprecation, §4 the two reuse contracts, §5 numbers of record, **§6 the P0 with the four tests**, §7 the
+three `-sm tensor` fixes and the remaining cost, §8 refusals, §9 the gate table, §10 the traps (a leaked server
+answering `/health`, the box's `llama-slot-proxy` on 8037-8039, a bare `wait` hanging a script, `jq --arg` vs a 190 KB
+prompt, the cold-rep §89 class), §11 working commands, §12 repo state, §13 the next steps in order.
+
 ## 261122.013 (r343, no delivery change) -- wip/prefill-decode-arms pass 8: the DENSE and FULLY-RESIDENT cases (prefix reuse holds on both), the option's tri-state with an `auto` that falls back, and `-ib`/`DUTY` reported deprecated on this path
 
 **No delivery patch changed; nothing in `patches/`, no tag.**  The two shapes the maintainer named as the common
