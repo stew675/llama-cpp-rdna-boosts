@@ -13,19 +13,19 @@ inherits the whole prefill step as its inter-token latency.  The retired campaig
 that the fix is **two arms** — a prefill arm and a decode arm, each with its own context and thread, sharing one
 KV, with a slot crossing between them only at a request boundary — and that **every host-side policy on top is
 neutral or worse** (a per-layer yield hook, a rate gate and stream priority were all built and all lost).  This
-campaign builds the product.  Pass 1 built the two enabling changes and the instrument; the server cut has not
-started.
+campaign builds the product.  Pass 1 built the two enabling changes and the instrument; pass 3 built T0 (one
+allocation owner); **pass 5 built the server cut and tier 1 passes**.
 
-## 1. Where the work stands (2026-11-21, pass 1)
+## 1. Where the work stands (2026-11-22, pass 5)
 
 | task | state |
 |---|---|
-| **T1 — the state handover** | **DONE.** `enabling-0002-recurrent-handover.patch`: one sequence's recurrent state moves between the arms **device-to-device in 0.45–0.66 ms** (1.9–2.3 ms on a process's first handover) against **34.5–36.1 ms** for the serialised path (52.7 MiB).  Text-exact on a no-host-tier 4B in every mode/repetition and on the 35B host tier for a single handed-over request (3/3 warm reps) |
-| **T2 — the server skeleton** | **NEXT, and scoped**: [`T2-SERVER-CUT.md`](T2-SERVER-CUT.md) has the cut in verified code points (contexts, the handover/return, the step to factor, ownership, guards, the gate).  Its design is measured outside the server (the instrument below) and written out in code points: `RESULTS-2026-11-21.md` §5.  T0 landed, so the prefill/decode pair can share cells safely |
-| **T3 — the request-boundary handover + its oracle** | The handover is built and exercised in the instrument; **the oracle is now measured, not hypothesised** — see §3, T3, and [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) |
-| **T4 — the opt-in gate** | Not started; its two rules are now measured (VRAM per slot width, the allocator) |
-| **T5 — measurement + gates** | Not started (the instrument's numbers are the target T5 must beat) |
-| **T0 — one allocator for the pair** (new, 2026-11-21) | **DONE 2026-11-22 (pass 3).**  [`enabling-0003-shared-kv-allocator.patch`](enabling-0003-shared-kv-allocator.patch) (7 files, +386/−10, `~/llama.cpp` `386b7dd48`): ONE shared owner, **per-ubatch** reserve/commit/release, with `llama_memory_alloc_sync()` as the request-boundary handshake.  `LLAMA_KV_ALLOC_SHARED=0` is the A/B control.  Measured: the two-arm run is **bit-identical to the single-context reference in every rep on both shapes**, no harness control (`RESULTS-2026-11-22.md` pass 3). |
+| **T1 — the state handover** | **DONE.** `enabling-0002-recurrent-handover.patch`: one sequence's recurrent state moves between the arms **device-to-device in 0.45-0.66 ms** (1.9-2.3 ms on a process's first handover) against **34.5-36.1 ms** for the serialised path (52.7 MiB).  Text-exact on a no-host-tier 4B in every mode/repetition and on the 35B host tier for a single handed-over request (3/3 warm reps) |
+| **T2 — the server skeleton** | **DONE 2026-11-22 (pass 5).**  `llama-server --prefill-decode-arms` is the design, not an emulation: a prefill arm (main loop, `ctx_tgt`) + a decode arm (`ctx_dec`, its own thread, co-owning the prefill arm's KV), a slot crossing only at a request boundary.  **Tier 1 passes cold and over 3 warm request pairs** (both slots byte-identical, every allocation handshake clean).  `~/llama.cpp` `683deed67`; built in `T2-SERVER-CUT.md`'s code points + three small deviations; see [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) pass 5 |
+| **T3 — the request-boundary handover + its oracle** | **DONE for tier 1** (the hash, both arms' approval): the server reproduces the reference text exactly, cold and warm.  **Tier 2 is not run yet** (KLD + the residency census) -- it is delivery-bound work, and nothing here is delivery-bound |
+| **T4 — the opt-in gate** | Not started; its rules are now measured *in the server*: the 2-row decode graph asks **741.48 MiB** and does not fit at arena 5000 next to a grown prefill graph unless **`GGML_CUDA_SLAB_HEADROOM_MIB=1536`** (pass 5 §4) |
+| **T5 — measurement + gates** | **The measurement is taken** (pass 5 §3): the smoothness target is met (~47-49 ms p50 through a 2.0-5.3 s prefill), the cost target is **not** (-24 to -27 % vs the instrument's -14.1 %, and pass 5 §6 explains why).  The delivery-bound gates are **not** run |
+| **T0 — one allocator for the pair** (new, 2026-11-21) | **DONE 2026-11-22 (pass 3).**  [`enabling-0003-shared-kv-allocator.patch`](enabling-0003-shared-kv-allocator.patch) (7 files, +386/-10, `~/llama.cpp` `386b7dd48`): ONE shared owner, **per-ubatch** reserve/commit/release, with `llama_memory_alloc_sync()` as the request-boundary handshake.  `LLAMA_KV_ALLOC_SHARED=0` is the A/B control.  Measured: the two-arm run is **bit-identical to the single-context reference in every rep on both shapes**, no harness control (`RESULTS-2026-11-22.md` pass 3).  **In the server it is called on both arms at every request boundary and asserted clean** (pass 5 §1/§2) |
 
 ## 2. What exists as code (do not re-derive any of it)
 
@@ -52,9 +52,19 @@ started.
   recurrent metadata (`head/n/min/max/rs_z/used` + per cell `pos/src/src0/tail/seq`, and the destination rows right
   after a take).  Both are diagnostic only, env-gated, and cost nothing when off.  `LLAMA_KV_CACHE_DEBUG=3` prints
   the whole cell map, which is too large to diff.
-* The WIP branch `wip/prefill-overlap` in `~/llama.cpp` (**5 commits**: shared KV, the handover, then the two
-  recorded losers — the per-gather yield point and stream priority — kept as the record, then the censuses).
-  `~/llama.cpp` is **clean**; keep it that way.
+* **THE SERVER CUT (pass 5)** — `tools/server/server-context.cpp` on `wip/prefill-overlap` `683deed67`:
+  `llama-server --prefill-decode-arms` (env `LLAMA_ARG_PREFILL_DECODE_ARMS=1`).  `ctx_dec` beside `ctx_tgt`
+  (co-owner, decode-width batch), `batch_dec`, `slot.arm` + `m_arms` (one mutex for the transition),
+  `hand_over_to_decode()` (post + wait), `decode_arm_loop()` (one row per active slot, one batch),
+  `slot_step(ctx, batch, slot, row)` shared by both arms, `finish_returned_slots()`, `arm_release()`,
+  `arms_boundary_sync()` (the T0 handshake, asserted clean at every request boundary).  Guards refuse a speculator,
+  mtmd/TTS/realtime, embeddings/rerank/decision, LoRA, `--sleep-idle`, backend sampling; `-np 1` warns and stays
+  single-context.  **Read `T2-SERVER-CUT.md`'s header and `RESULTS-2026-11-22.md` pass 5 before touching it** — the
+  two defects it produced (a self-deadlock on `m_arms`, a `NEXT_RESPONSE` without an id) and the 741 MiB 2-row
+  decode-graph OOM (`GGML_CUDA_SLAB_HEADROOM_MIB=1536`) are all recorded there.
+* The WIP branch `wip/prefill-overlap` in `~/llama.cpp` (**7 commits**: shared KV, the handover, the two recorded
+  losers — the per-gather yield point and stream priority — kept as the record, the censuses, T0, and the server
+  cut).  `~/llama.cpp` is **clean**; keep it that way.
 * The record: `RESULTS-2026-11-21.md` (pass 1: numbers, the three landmines, §3.4's reset experiment, §5's server
   code points, and a "Reproduce" section with the exact commands) and `RESULTS-2026-11-22.md` (pass 2: the residual
   resolved into two effects, the censuses, and the reproduce commands).  Delivery-repo commits `56443c1f`,
@@ -261,7 +271,10 @@ picked by the arm: a text/hash arm takes **no** `-lv`, a census arm takes **`-lv
 
 ## 8. The one-line summary of what is left
 
-**Ask the maintainer two questions (the allocator artifact and its granularity; the T3 oracle, now with the pass-2
-measurement in hand), then build the allocator (T0), then cut the server skeleton (T2, `RESULTS-2026-11-21.md` §5)
-and measure it with the instrument's own numbers as the target: a decoder getting a token every ~50 ms through a
-~2 s prefill for ≤ ~14 % of prefill.**
+**The server cut is built and tier 1 passes; the smoothness target is met and the cost target is not.**  What is
+left is not another mechanism: it is (a) tier 2 (the KLD point) and the server-side gates of
+`T2-SERVER-CUT.md` §6.3, (b) T4's opt-in gate — now with the measured VRAM rule (`741.48 MiB` for the 2-row decode
+graph, and `GGML_CUDA_SLAB_HEADROOM_MIB=1536` as the lever that makes the pair fit), and (c) the maintainer's
+decision on what this is worth: **-24…-27 % prefill for an ITL p95 of 64-78 ms** against the shipped duty cycle's
+519-568 ms at -30 % (`RESULTS-2026-11-22.md` pass 5 §3/§6).  Nothing here is delivery-bound, and a block is a
+question, never a gate outcome.

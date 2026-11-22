@@ -42,6 +42,7 @@ NP=${NP:-2}
 NPREDICT=${NPREDICT:-32}
 PORT=${PORT:-8123}
 PROMPT_CHARS=${PROMPT_CHARS:-2000}      # ~500 tokens per slot; enough to be deterministic, quick to run
+REPS=${REPS:-1}                         # request PAIRS per server process; >1 = the warm reps (labels r<rep>.<slot>)
 
 mode=ref
 control=()
@@ -155,26 +156,38 @@ req() { # $1 = prompt, $2 = outfile
 
 # BOTH slots at once: the arms' decode step is one token per active slot in one batch, so the reference has to be
 # the same concurrent 2-slot shape, not two sequential requests.
-req "$p0" "$OUT/.r0.json" &
-r0=$!
-req "$p1" "$OUT/.r1.json" &
-r1=$!
-wait $r0 $r1 || { echo "a request failed; see $log" >&2; exit 1; }
+#
+# REPS > 1 sends that pair again, REPS times, in ONE server process: the WARM reps are the interesting ones -- the
+# campaign's text carrier was a WARM-rep effect (the two allocation cursors, then a take racing the next prompt), so
+# a single cold pair can pass while a warm one moves.  The labels stay `SLOT <i>` at REPS=1 (the acceptance values
+# of RESULTS-2026-11-22.md pass 4 are those) and become `SLOT r<rep>.<i>` beyond it.
+: > "$res"
+for rep in $(seq 0 $((REPS - 1))); do
+    req "$p0" "$OUT/.r0.json" &
+    r0=$!
+    req "$p1" "$OUT/.r1.json" &
+    r1=$!
+    wait $r0 $r1 || { echo "a request failed (rep $rep); see $log" >&2; exit 1; }
+
+    for i in 0 1; do
+        f="$OUT/.r$i.json"
+        content=$(jq -r '.content' "$f")
+        ntok=$(jq -r '.tokens_predicted' "$f")
+        sha=$(printf '%s' "$content" | sha256sum | cut -c1-16)
+        if [[ $REPS -gt 1 ]]; then
+            printf 'SLOT r%d.%d sha=%s ntok=%s content=%s\n' "$rep" "$i" "$sha" "$ntok" "$content" >> "$res"
+            printf 'SLOT r%d.%d sha=%s ntok=%s\n' "$rep" "$i" "$sha" "$ntok"
+        else
+            printf 'SLOT %d sha=%s ntok=%s content=%s\n' "$i" "$sha" "$ntok" "$content" >> "$res"
+            printf 'SLOT %d sha=%s ntok=%s\n' "$i" "$sha" "$ntok"
+        fi
+    done
+    rm -f "$OUT/.r0.json" "$OUT/.r1.json"
+done
 
 kill $srv 2>/dev/null || true
 wait $srv 2>/dev/null || true
 trap - EXIT
-
-: > "$res"
-for i in 0 1; do
-    f="$OUT/.r$i.json"
-    content=$(jq -r '.content' "$f")
-    ntok=$(jq -r '.tokens_predicted' "$f")
-    sha=$(printf '%s' "$content" | sha256sum | cut -c1-16)
-    printf 'SLOT %d sha=%s ntok=%s content=%s\n' "$i" "$sha" "$ntok" "$content" >> "$res"
-    printf 'SLOT %d sha=%s ntok=%s\n' "$i" "$sha" "$ntok"
-done
-rm -f "$OUT/.r0.json" "$OUT/.r1.json"
 
 # the arm census, recorded so a difference has a mechanism attached (never asserted here -- tier 2 does that)
 if grep -q "MoE expert cache:" "$log"; then
