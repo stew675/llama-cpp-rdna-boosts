@@ -1,0 +1,371 @@
+diff --git a/include/llama.h b/include/llama.h
+index 4534967ba..1b127def9 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -913,6 +913,29 @@ extern "C" {
+                  llama_pos p0,
+                  llama_pos p1);
+ 
++    // wip/prefill-decode-arms [EXPERIMENTAL]: drop only the RECURRENT part of a sequence's state (a hybrid
++    // model's GDN/conv state).  In a context pair that shares its attention KV
++    // (llama_context_params::ctx_other_share_memory) the KV cells belong to BOTH contexts, so
++    // llama_memory_seq_rm() on the arm that hands a slot over would free the cells the other arm is about to
++    // read.  A handover moves the recurrent state only, so this is what the handing-over arm uses.
++    LLAMA_API void llama_memory_seq_rm_recr(
++            llama_memory_t mem,
++              llama_seq_id seq_id,
++                 llama_pos p0,
++                 llama_pos p1);
++
++    // wip/prefill-decode-arms [EXPERIMENTAL]: MOVE seq_id's recurrent state from `src` to `mem`, device to
++    // device, and release it in `src`.  This is the handover between two contexts of the same model that share
++    // their attention KV (`llama_context_params::ctx_other_share_memory`): the KV cells are already the same
++    // cells on both sides, so the recurrent rows are all that has to follow the slot.  Equivalent to
++    // llama_state_seq_get_data_ext() + llama_state_seq_set_data_ext() with LLAMA_STATE_SEQ_FLAGS_RECR_ONLY,
++    // minus the host round trip (~50-65 MiB, latency-bound).  Returns false (nothing changed) when the two
++    // memories do not carry the same recurrent state -- a caller then falls back to the serialised path.
++    LLAMA_API bool llama_memory_seq_state_take(
++            llama_memory_t mem,
++            llama_memory_t src,
++              llama_seq_id seq_id);
++
+     // Copy all tokens that belong to the specified sequence to another sequence
+     // p0 < 0 : [0,  p1]
+     // p1 < 0 : [p0, inf)
+@@ -1054,6 +1077,12 @@ extern "C" {
+ // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
+ #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
+ 
++// wip/prefill-decode-arms: the RECURRENT part only -- a hybrid model's GDN/conv state, leaving a shared attention
++// KV alone.  A context pair that shares its KV (llama_context_params::ctx_other_share_memory) hands a slot over
++// by moving exactly this: the KV cells are already visible to both arms, and serialising them would copy the whole
++// cache through host memory on every handover.
++#define LLAMA_STATE_SEQ_FLAGS_RECR_ONLY 4
++
+     typedef uint32_t llama_state_seq_flags;
+ 
+     LLAMA_API size_t llama_state_seq_get_size_ext(
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 1b378f451..016de46ec 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -7093,6 +7093,38 @@ bool llama_memory_seq_rm(
+     return mem->seq_rm(seq_id, p0, p1);
+ }
+ 
++void llama_memory_seq_rm_recr(
++        llama_memory_t mem,
++          llama_seq_id seq_id,
++             llama_pos p0,
++             llama_pos p1) {
++    if (!mem) {
++        return;
++    }
++
++    mem->seq_rm_recr(seq_id, p0, p1);
++}
++
++bool llama_memory_seq_state_take(
++        llama_memory_t mem,
++        llama_memory_t src,
++          llama_seq_id seq_id) {
++    if (!mem || !src || mem == src) {
++        return false;
++    }
++
++    // only a hybrid memory carries a recurrent state that has to follow a slot; a plain attention KV is
++    // already shared (the same cells), so it has nothing to move
++    auto * dst_hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
++    auto * src_hybrid = dynamic_cast<llama_memory_hybrid *>(src);
++
++    if (dst_hybrid == nullptr || src_hybrid == nullptr) {
++        return false;
++    }
++
++    return dst_hybrid->get_mem_recr()->seq_state_take(*src_hybrid->get_mem_recr(), seq_id);
++}
++
+ void llama_memory_seq_cp(
+         llama_memory_t mem,
+           llama_seq_id seq_id_src,
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index 8f3b4ce9d..e2bcbbb55 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -175,6 +175,12 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
+     return mem_attn->seq_rm(seq_id, p0, p1);
+ }
+ 
++void llama_memory_hybrid::seq_rm_recr(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
++    // wip/prefill-decode-arms: the attention cells of a co-owner pair belong to BOTH contexts, so a handover
++    // must not free them -- only this context's recurrent rows move to the other arm.
++    mem_recr->seq_rm(seq_id, p0, p1);
++}
++
+ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+@@ -223,12 +229,20 @@ uint32_t llama_memory_hybrid::graph_extra_entries() const {
+ }
+ 
+ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+-    mem_attn->state_write(io, seq_id, flags);
++    // wip/prefill-decode-arms: a handover between two contexts that share the attention KV moves the RECURRENT
++    // state only -- the KV cells are the same cells on both sides, and serialising them would copy the whole
++    // cache through host memory on every request boundary.
++    if (!(flags & LLAMA_STATE_SEQ_FLAGS_RECR_ONLY)) {
++        mem_attn->state_write(io, seq_id, flags);
++    }
+     mem_recr->state_write(io, seq_id, flags);
+ }
+ 
+ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+-    mem_attn->state_read(io, seq_id, flags);
++    // see state_write(): with RECR_ONLY the attention half is neither written nor read
++    if (!(flags & LLAMA_STATE_SEQ_FLAGS_RECR_ONLY)) {
++        mem_attn->state_read(io, seq_id, flags);
++    }
+ 
+     try {
+         mem_recr->state_read(io, seq_id, flags);
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+index e0f517f68..210b9f9fd 100644
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -68,6 +68,8 @@ public:
+     void clear(bool data) override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
++    // wip/prefill-decode-arms: the recurrent half only -- the attention cache may be shared with another context
++    void seq_rm_recr(llama_seq_id seq_id,                           llama_pos p0, llama_pos p1) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+     void seq_keep(llama_seq_id seq_id)                                                          override;
+     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 4048d27f5..b582830ad 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -774,6 +774,185 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+     return n >= n_seqs;
+ }
+ 
++// wip/prefill-decode-arms: the device-to-device handover of one sequence's recurrent state.
++//
++// Semantics are exactly state_write(LLAMA_STATE_SEQ_FLAGS_RECR_ONLY) followed by state_read() on the other
++// memory (see state_read_meta()), which is the shape the campaign's text oracle verified:
++//   * the destination's cells for this seq are dropped first (the destination may have served a previous
++//     request with the same seq id),
++//   * the source's cells are placed into ONE contiguous destination block, whose `pos` is the last one,
++//   * the rows are copied (source cells may map to logical rows through `src`, the pending-rollback plane),
++//   * every destination row is marked as its own source (`cells[i].src = i`), which is what state_read_meta()
++//     leaves behind, and the per-seq rollback index is reset.
++// The rows are what make this a handover: r (and the PLE conv row where the model has one) first, then s.
++bool llama_memory_recurrent::seq_state_take(llama_memory_recurrent & src, llama_seq_id seq_id) {
++    if (&src == this) {
++        return true;
++    }
++
++    const int32_t n_layer = hparams.n_layer();
++
++    if ((int32_t) src.r_l.size() != n_layer || (int32_t) src.s_l.size() != n_layer ||
++        (int32_t) src.p_l.size() != n_layer || n_rs_seq != src.n_rs_seq) {
++        return false;
++    }
++
++    auto same_tensor = [](const ggml_tensor * a, const ggml_tensor * b) {
++        if (a == nullptr || b == nullptr) {
++            return a == b;
++        }
++        return a->type == b->type && a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1];
++    };
++
++    for (int32_t il = 0; il < n_layer; ++il) {
++        if (!same_tensor(r_l[il], src.r_l[il]) || !same_tensor(s_l[il], src.s_l[il]) ||
++            !same_tensor(p_l[il], src.p_l[il])) {
++            return false;
++        }
++    }
++
++    if (seq_id < 0 || (size_t) seq_id >= (size_t) n_seq_max) {
++        return false;
++    }
++
++    // the source's cells for this sequence, in cell order, with the logical row each one holds
++    std::vector<uint32_t>  srows;
++    std::vector<llama_pos> spos;
++    {
++        const uint32_t plane = n_rs_seq != 0 && (size_t) seq_id < src.rs_idx.size() ? src.rs_idx[seq_id] : 0;
++
++        for (uint32_t i = 0; i < src.size; ++i) {
++            const auto & cell = src.cells[i];
++            if (!cell.has_seq_id(seq_id)) {
++                continue;
++            }
++            srows.push_back(plane * src.size + (uint32_t) (cell.src >= 0 ? cell.src : (int32_t) i));
++            spos.push_back(cell.pos);
++        }
++    }
++
++    // the destination may still hold cells of a previous request that used this seq id
++    seq_rm(seq_id, -1, -1);
++
++    if (srows.empty()) {
++        src.seq_rm(seq_id, -1, -1);
++        return true;
++    }
++
++    if (srows.size() > size) {
++        return false;
++    }
++
++    // one contiguous destination block, allocated exactly the way state_read_meta() does it
++    llama_batch_allocr balloc(hparams.n_pos_per_embd());
++
++    llama_ubatch ubatch = balloc.ubatch_reserve((uint32_t) srows.size(), 1);
++    for (size_t i = 0; i < srows.size(); ++i) {
++        ubatch.pos[i] = spos[i];
++    }
++    ubatch.n_seq_id[0] = 1;
++    ubatch.seq_id[0]   = &seq_id;
++
++    if (!find_slot(ubatch)) {
++        return false;
++    }
++
++    const uint32_t dst_row0 = head;
++
++    if (dst_row0 + srows.size() > size) {
++        return false;
++    }
++
++    // views for the batched device copy (one sync for the whole handover); a host buffer takes a plain memcpy
++    ggml_init_params vparams = {
++        /*.mem_size   =*/ (size_t) 2*3*n_layer*ggml_tensor_overhead(),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++
++    ggml_context * vctx = ggml_init(vparams);
++    if (vctx == nullptr) {
++        return false;
++    }
++
++    std::vector<const ggml_tensor *> csrc;
++    std::vector<ggml_tensor *>       cdst;
++    csrc.reserve(3*n_layer);
++    cdst.reserve(3*n_layer);
++
++    auto copy_tensor_rows = [&](ggml_tensor * dst, ggml_tensor * s, size_t row_size) {
++        const bool s_host = ggml_backend_buffer_is_host(s->buffer);
++        const bool d_host = ggml_backend_buffer_is_host(dst->buffer);
++
++        size_t i = 0;
++        while (i < srows.size()) {
++            size_t j = i + 1;
++            while (j < srows.size() && srows[j] == srows[j - 1] + 1) {
++                ++j;   // a run that is contiguous on the source side
++            }
++
++            const uint32_t n_rows = (uint32_t) (j - i);
++            const uint32_t s_row  = srows[i];
++            const uint32_t d_row  = dst_row0 + (uint32_t) i;
++
++            if (s_host && d_host) {
++                memcpy((char *) dst->data + d_row*row_size, (const char *) s->data + s_row*row_size,
++                        (size_t) n_rows*row_size);
++            } else {
++                csrc.push_back(ggml_view_2d(vctx, s,   s->ne[0],   n_rows, s->nb[1],   s_row*row_size));
++                cdst.push_back(ggml_view_2d(vctx, dst, dst->ne[0], n_rows, dst->nb[1], d_row*row_size));
++            }
++
++            i = j;
++        }
++    };
++
++    for (int32_t il = 0; il < n_layer; ++il) {
++        if (r_l[il] == nullptr) {
++            continue;
++        }
++
++        copy_tensor_rows(r_l[il], src.r_l[il], ggml_row_size(r_l[il]->type, hparams.n_embd_r()));
++
++        if (p_l[il] != nullptr) {
++            copy_tensor_rows(p_l[il], src.p_l[il], ggml_row_size(p_l[il]->type, hparams.ple_conv_state()));
++        }
++    }
++
++    for (int32_t il = 0; il < n_layer; ++il) {
++        if (s_l[il] == nullptr) {
++            continue;
++        }
++
++        copy_tensor_rows(s_l[il], src.s_l[il], ggml_row_size(s_l[il]->type, hparams.n_embd_s()));
++    }
++
++    if (!csrc.empty()) {
++        ggml_backend_tensor_copy_n(csrc.data(), cdst.data(), csrc.size());
++    }
++
++    ggml_free(vctx);
++
++    // the restored rows are their own source (what state_read_meta() leaves behind): BOTH fields, because
++    // find_slot() set `src0` to `rs_z`, which is this cell only while no other cell names it as a source
++    for (size_t i = 0; i < srows.size(); ++i) {
++        cells[dst_row0 + i].src  = (int32_t) (dst_row0 + i);
++        cells[dst_row0 + i].src0 = (int32_t) (dst_row0 + i);
++    }
++
++    if (n_rs_seq != 0) {
++        set_rs_idx(seq_id, 0);
++    }
++
++    // release the source rows -- the copy above has completed (the batched copy syncs, the memcpy is immediate)
++    src.seq_rm(seq_id, -1, -1);
++
++    LLAMA_LOG_DEBUG("%s: took seq %d: %zu row(s) from row %u -> %u\n", __func__, (int) seq_id, srows.size(),
++            srows[0], dst_row0);
++
++    return true;
++}
++
+ bool llama_memory_recurrent::get_can_shift() const {
+     // shifting the pos is trivial for recurrent models
+     return true;
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index e0e0cfc71..346645f1b 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -63,6 +63,15 @@ public:
+ 
+     bool get_can_shift() const override;
+ 
++    // wip/prefill-decode-arms: MOVE seq_id's recurrent state from `src` into this memory, device to device, and
++    // release it there.  Two contexts of the same model that share their attention KV
++    // (llama_context_params::ctx_other_share_memory) hand a slot over with this: the KV cells are already the
++    // same cells on both sides, so only the recurrent rows have to follow.  It is the D2D form of
++    // state_write(RECR_ONLY)+state_read(), which instead bounces the rows through host memory (~50-65 MiB, and
++    // latency-bound at ~35 ms in the campaign's measurement).  Returns false, having changed nothing, when the
++    // two memories do not describe the same state (a fallback to the serialised path is then the caller's job).
++    bool seq_state_take(llama_memory_recurrent & src, llama_seq_id seq_id);
++
+     // state write/load
+ 
+     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index 395c0a5c2..7a95c3b0e 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -157,6 +157,13 @@ struct llama_memory_i {
+     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
+     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
+ 
++    // wip/prefill-decode-arms: drop only the RECURRENT part of a sequence's state.  In a context pair that
++    // shares its attention KV (llama_context_params::ctx_other_share_memory) the KV cells are the shared truth
++    // -- a handover moves only the recurrent state between the arms -- so seq_rm() on the arm handing a slot
++    // over would free cells the other arm is about to read.  A memory module with no recurrent state (a plain
++    // attention KV) does nothing here.
++    virtual void seq_rm_recr(llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/) {}
++
+     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+ 
+     // wip/kv-residency (TODO #118) B-A: the ATTENDANCE POOL's footprint -- the compact device pool that is
