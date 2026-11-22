@@ -180,3 +180,13 @@ fi
 
 echo
 echo "==> done.  Record for a NEW release: --tip $got_tip --tree $got_tree"
+# The tip commit's date is its AUTHOR date (apply-all.sh stamps the committer date from it, which is
+# what makes the ids reproducible), so the branch's newest commit always looks OLD in the GitHub UI and
+# the fork's default branch is master.  Freshness is the ref, never the commit list (r342: the branch was
+# reported stale while it was 32 minutes fresh).  Printed for the operator, on both paths.
+echo
+echo "    freshness reads on the REF, not on the commit dates: $BRANCH carries $(git -C "$LLAMA" rev-parse --short "$got_tip"),"
+echo "    whose newest commit is dated by its AUTHOR ($(git -C "$LLAMA" log -1 --format=%ad --date=short "$got_tip")) because the"
+echo "    committer date is stamped from it -- that IS the reproducibility contract, not a stale branch.  The fork's"
+echo "    default branch is master.  Check it with:"
+echo "      gh api repos/$(git -C "$LLAMA" remote get-url origin | sed -e 's|.*github.com[:/]||' -e 's|\.git$||')/branches/$BRANCH --jq .commit.sha"

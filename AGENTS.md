@@ -119,7 +119,7 @@ still open, stop before the release cut, the commit and the tag.
   (`Applied tip: <sha>`), `scripts/fork-refresh.sh` re-checks it against `.tip`, and since the
   deterministic re-cut (tooling change after r150: `apply-all.sh` pins the committer identity to the
   patch series' author and stamps each commit's committer date from its own author date) any checkout
-  of `.base` on any machine produces **the same commit ids**, so the value is reproducible.  Three
+  of `.base` on any machine produces **the same commit ids**, so the value is reproducible.  Four
   traps, all of which have bitten before:
   (a) the *working chain* tip in `~/llama.cpp` (the commits a release is developed on) is a
   **different commit with the same tree** — never record it; (b) a re-cut made before that tooling
@@ -128,7 +128,13 @@ still open, stop before the release cut, the commit and the tag.
   matches, which is the contract); (c) `scripts/validate-set.sh` cannot check the tip — it
   materialises `.base` from the commit tarball into a fresh repository, so its applied commit ids
   differ by construction (it checks the **tree**; `fork-refresh.sh` checks the tip against a real
-  checkout).  If in doubt: **compare trees, never SHAs**; a matching tree plus a `rdna-boosts` branch
+  checkout); (d) **the fork branch always LOOKS stale in the GitHub UI, and that is not a defect** — the
+  committer date is stamped from the author date, so the newest commit is `block 0300` (authored
+  2026-10-25) no matter when the release is cut, while the fork's *default* branch is `master`, so the
+  repo landing page shows the last time `master` moved instead.  Freshness has exactly two honest
+  checks: `gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` (must equal `.tip`) and
+  the branch page's "updated <time>", which is the ref push.  Do not "fix" it by dating the commits or
+  by pushing `master` — the dated commits ARE the reproducibility contract.  If in doubt: **compare trees, never SHAs**; a matching tree plus a `rdna-boosts` branch
   whose tip is `.tip` is the whole contract.
 - **Every release MUST also publish the ROCm container images.**  They are built and pushed
   **off-host** by the worker watcher (`scripts/container-watch.sh` on `radiance`), which polls for the
