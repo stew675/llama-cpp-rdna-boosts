@@ -70,7 +70,11 @@ on the affected MoE shapes (`routed=0`); and the PR never states that the **defa
 Their "+24 % on 8 short prompts" did not reproduce here (+4.2 % on a 5.2 k prompt).
 
 Record: `benchmarks/2026-11-21-ffn-even-split.md`; `GREEDY-PURITY.md` §104; `INVARIANTS.md` r338;
-`patches/README.md` block 09; `ENVIRONMENT.md` §4 / §4.1; `TODO` #363.
+`patches/README.md` block 09; `ENVIRONMENT.md` §4 / §4.1; `TODO` #363.  The campaign record is archived **verbatim** at
+`archive/work/tp-ffn-even-r325/` (the PR's brief, its `0001-*.patch` cut against r325 — not applied — and
+its A/B log), with `PROMOTION.md` for what shipped, what it measured here and the three corrected claims;
+PR #342 is closed unmerged, as #339/#340 were (a `wip/` campaign that is promoted leaves `wip/` and is not
+kept as a stub).
 
 ## 261121.016 (r337) -- **RELEASE**: GitHub issue #347 -- the APU GTT arena MATERIALISED the whole expert set as a pageable copy, because the arena makes holes but no plan; the arena's hole set is now a hole set like any other
 
