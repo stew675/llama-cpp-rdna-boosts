@@ -36,6 +36,16 @@ require every request to complete, shrink the pad buckets (`LLAMA_KV_N_PAD_MIN=2
 mismatch cannot hide in rounding, compare a fourth sequential request's text against the single-context server's (a
 class-matched oracle, `GREEDY-PURITY.md` §105), and run `scripts/check-gpu-faults.sh` over the window.
 
+## `FIX-candidate-373.patch`
+
+The candidate fix for the KV-cell-map class, cut from `~/llama.cpp` on a scratch branch at the release tree
+(`8f88fc861`) -- **a review artifact, not a delivery patch**: it is not in `patches/`, applies to nothing, and shipping
+it is the maintainer's block decision (`AGENTS.md` rule 13).  137 insertions in four files:
+`llama_memory_i::apply_mutex()` + `apply_mutex_share()` (`src/llama-memory.h`), the share in `create_memory()`
+(`src/llama-model.cpp`), the lock at the engine's memory entry points (`src/llama-context.cpp`), and `seq_park`
+(`src/llama-memory.cpp`).  It also carries one piece of **hardening that is unproven**: `sched_alt_select()` now sets the
+Meta view slot on every call instead of only when the alt scheduler state changes.
+
 ## Status at the time of writing
 
 The KV-cell-map defects (the qwen4exp assert and a libstdc++ RB-tree SIGSEGV in `llama_kv_cache::prepare`) are fixed by

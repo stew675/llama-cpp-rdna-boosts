@@ -1,0 +1,202 @@
+From 00a568fba2e756f3d4a36e9f5598f90e4d168584 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Sun, 22 Nov 2026 16:04:47 -0600
+Subject: [PATCH] crash #373 fix (candidate): one apply lock per memory GROUP
+ -- the pair's two arms mutate one KV cell map from two threads, which is the
+ qwen4exp n_kv abort AND a std::set/tree corruption in
+ llama_kv_cache::prepare()'s rollback snapshot; plus set the meta view slot on
+ every sched_alt_select (hardening, unproven)
+
+---
+ src/llama-context.cpp           | 17 ++++++++++++++---
+ src/llama-kv-cache.cpp          | 20 --------------------
+ src/llama-kv-cache.h            |  6 ------
+ src/llama-memory-hybrid-idx.cpp | 29 -----------------------------
+ tools/server/server.cpp         | 20 --------------------
+ 5 files changed, 14 insertions(+), 78 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7faad42b6..153105d6b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -24,6 +24,8 @@
+ #include "llama.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdio>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -1555,6 +1557,18 @@ void llama_context::sched_new(const sched_params & params) {
+ }
+ 
+ void llama_context::sched_alt_select(bool alt) {
++    // a CO-OWNER context (the decode arm) takes the second pair of view slots, so two contexts computing at the
++    // same time never share a meta view container (wip/prefill-decode-arms).
++    //
++    // crash #373: set it on EVERY call, not only when the alt state changes.  `g_meta_view_slot` is thread_local and
++    // starts at 0, and `sched_alt_in_use` starts false -- so a context that never switches schedulers returned below
++    // on its first graph and kept slot 0, i.e. the SAME slot as its co-owner.  Both arms then registered and looked
++    // up the per-graph VIEWS of their shared KV cache (an external view uses the buffer of its view source, see
++    // ggml_backend_meta_buffer_context) in one rotating container, each clearing it under the other: measured as a
++    // SIGSEGV inside libstdc++/libggml-base on `std::set`/`std::unordered_map` nodes, and as the `simple_tensor ==
++    // null` / `tensor write out of bounds` aborts the process-global slot used to cause.
++    ggml_backend_meta_set_view_slot((cparams.ctx_other != nullptr ? 2 : 0) + (alt ? 1 : 0));
++
+     if (alt == sched_alt_in_use) {
+         return;
+     }
+@@ -1571,9 +1585,6 @@ void llama_context::sched_alt_select(bool alt) {
+     std::swap(sched, sched_alt);
+     std::swap(gf_res_prev_active, gf_res_prev_active_alt);
+     sched_alt_in_use = alt;
+-    // a CO-OWNER context (the decode arm) takes the second pair of view slots, so two contexts computing at the
+-    // same time never share a meta view container (wip/prefill-decode-arms)
+-    ggml_backend_meta_set_view_slot((cparams.ctx_other != nullptr ? 2 : 0) + (alt ? 1 : 0));
+ }
+ 
+ bool llama_context::sched_alt_for(const llama_ubatch & ubatch) const {
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index ca4698b32..9949dafd4 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -5270,26 +5270,6 @@ uint32_t llama_kv_cache_context::get_n_kv_rows() const {
+     return n_kv_rows;
+ }
+ 
+-// TEMP DEBUG (crash #373, remove before commit)
+-uint32_t llama_kv_cache_context::dbg_n_kv_used() const {
+-    if (kv == nullptr || ubatches.empty() || i_cur >= sinfos.size()) {
+-        return 0;
+-    }
+-    return kv->get_n_kv_used(sinfos[i_cur]);
+-}
+-
+-uint32_t llama_kv_cache_context::dbg_size() const {
+-    return kv == nullptr ? 0 : kv->get_size();
+-}
+-
+-uint32_t llama_kv_cache_context::dbg_n_tokens() const {
+-    return (ubatches.empty() || i_cur >= ubatches.size()) ? 0 : ubatches[i_cur].n_tokens;
+-}
+-
+-uint32_t llama_kv_cache_context::dbg_n_seqs_unq() const {
+-    return (ubatches.empty() || i_cur >= ubatches.size()) ? 0 : (uint32_t) ubatches[i_cur].n_seqs_unq;
+-}
+-
+ ggml_type llama_kv_cache_context::type_k() const {
+     return kv->type_k();
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 242910412..ac03e10be 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -676,12 +676,6 @@ public:
+     uint32_t get_n_kv() const;
+     uint32_t get_n_kv_rows() const;
+ 
+-    // TEMP DEBUG (crash #373, remove before commit)
+-    uint32_t dbg_n_kv_used() const;
+-    uint32_t dbg_size() const;
+-    uint32_t dbg_n_tokens() const;
+-    uint32_t dbg_n_seqs_unq() const;
+-
+     // wip/kv-residency (TODO #118) B2: see llama_kv_cache::is_streaming
+     bool is_streaming(uint32_t n_kv_asked) const;
+ 
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index c3515d4b8..62847bae2 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -8,12 +8,9 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cmath>
+-#include <cstdio>
+ #include <iterator>
+-#include <pthread.h>
+ #include <stdexcept>
+ #include <type_traits>
+-#include <unistd.h>
+ 
+ //
+ // llama_memory_hybrid_idx
+@@ -1289,36 +1286,10 @@ bool llama_memory_hybrid_idx_context::next() {
+ }
+ 
+ bool llama_memory_hybrid_idx_context::apply() {
+-    // TEMP DEBUG (crash #373, remove before commit)
+-    static const int  dbg_widen_us = getenv("LLAMA_DBG_APPLY_WIDEN_US") ? atoi(getenv("LLAMA_DBG_APPLY_WIDEN_US")) : 0;
+-    static const bool dbg_all      = getenv("LLAMA_DBG_APPLY_CELLS") != nullptr;
+-
+     bool res = llama_memory_hybrid_context::apply();
+ 
+-    // TEMP DEBUG: the attention child has read its n_kv by now; widen the suspect window if asked
+-    const uint32_t dbg_nkv_attn = get_attn() ? get_attn()->get_n_kv() : 0;
+-    if (dbg_widen_us > 0) {
+-        usleep(dbg_widen_us);
+-    }
+-
+     if (ctx_idx) {
+         res = res & ctx_idx->apply();
+-
+-        // TEMP DEBUG (crash #373)
+-        const llama_kv_cache_context * dbg_idx = static_cast<const llama_kv_cache_context *>(ctx_idx.get());
+-        if (dbg_all || dbg_nkv_attn != dbg_idx->get_n_kv()) {
+-            const uint32_t used_attn = get_attn()->dbg_n_kv_used();
+-            const uint32_t used_idx  = dbg_idx   ->dbg_n_kv_used();
+-            fprintf(stderr,
+-                    "[DBG_APPLY] %s tid=%lu n_tok=%u n_seqs_unq=%u | attn n_kv=%u used=%u size=%u | idx n_kv=%u used=%u size=%u | %s\n",
+-                    dbg_nkv_attn == dbg_idx->get_n_kv() ? "agree" : "MISMATCH",
+-                    (unsigned long) pthread_self(),
+-                    dbg_idx->dbg_n_tokens(), dbg_idx->dbg_n_seqs_unq(),
+-                    dbg_nkv_attn, used_attn, get_attn()->dbg_size(),
+-                    dbg_idx->get_n_kv(), used_idx, dbg_idx->dbg_size(),
+-                    used_attn == used_idx ? "used-equal" : "USED-DIFFER");
+-            fflush(stderr);
+-        }
+     }
+ 
+     // Extend the pool layout with this ubatch's cells, then pick what it must re-pool.
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 7d1b577c2..fabf0a041 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -26,25 +26,6 @@
+ #include <windows.h>
+ #endif
+ 
+-// TEMP DEBUG (crash #373): dump a backtrace on a fatal signal, then die.  ggml_print_backtrace() is the
+-// project's own helper (fork + gdb), so no new machinery.  Remove before commit.
+-#include <execinfo.h>
+-static void dbg_fatal_signal_handler(int sig) {
+-    void * trace[96];
+-    const int n = backtrace(trace, 96);
+-    backtrace_symbols_fd(trace, n, STDERR_FILENO);
+-    _exit(128 + sig);
+-}
+-static void dbg_install_backtrace_handlers() {
+-    static const bool on = getenv("LLAMA_DBG_BT_ON_FATAL") != nullptr;
+-    if (!on) {
+-        return;
+-    }
+-    signal(SIGSEGV, dbg_fatal_signal_handler);
+-    signal(SIGBUS,  dbg_fatal_signal_handler);
+-    signal(SIGILL,  dbg_fatal_signal_handler);
+-}
+-
+ static std::function<void(int)> shutdown_handler;
+ static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+ 
+@@ -354,7 +335,6 @@ static bool server_setup_features(
+ 
+ static void server_install_signal_handlers() {
+ #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+-    dbg_install_backtrace_handlers(); // TEMP DEBUG (crash #373)
+     struct sigaction sigint_action;
+     sigint_action.sa_handler = signal_handler;
+     sigemptyset (&sigint_action.sa_mask);
+-- 
+2.56.1
+
