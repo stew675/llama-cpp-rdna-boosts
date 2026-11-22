@@ -43,6 +43,8 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <thread>
 #include <vector>
 
@@ -198,13 +200,69 @@ static bool in_any_window(const std::vector<std::pair<double, double>> & w, doub
 }
 
 // --- greedy sampling (the campaign's text oracle is plain greedy) --------------------------------------
-static llama_token argmax_row(llama_context * ctx, int32_t i) {
-    const float * logits = llama_get_logits_ith(ctx, i);
-    if (logits == nullptr) { return -1; }
-    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+//
+// ARMS_LOGITS_DIR=<dir>: dump every row the arms SAMPLE (the prompt's last row and every decode step) as raw
+// float32 into <dir>/<mode>-r<rep>-q<req>-s<step>.f32 and append one line per row to <dir>/manifest.txt with
+// the row's sha256, its argmax and its top-5.  This is the diff instrument for RESULTS-2026-11-21.md §3.4 item
+// 3: the SAME token decoded on ctx A and on ctx B produces two rows, and the rows (not the sampled ids, which
+// are identical by construction when the text matches) carry the numeric difference.  Instrument only.
+static std::string g_logits_dir;
+static std::string g_mode_tag = "arms";
+static int         g_rep_tag  = 0;
+static std::mutex  g_logits_m;
+
+static llama_token argmax_of(const float * logits, int n_vocab) {
     llama_token best = 0;
     for (int v = 1; v < n_vocab; ++v) {
         if (logits[v] > logits[best]) { best = v; }
+    }
+    return best;
+}
+
+static llama_token sample_row(llama_context * ctx, int32_t i, int req, int step) {
+    const float * logits = llama_get_logits_ith(ctx, i);
+    if (logits == nullptr) { return -1; }
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    const llama_token best = argmax_of(logits, n_vocab);
+
+    if (g_logits_dir.empty()) { return best; }
+
+    char name[128];
+    snprintf(name, sizeof(name), "%s-r%d-q%d-s%d.f32", g_mode_tag.c_str(), g_rep_tag, req, step);
+    const std::string path = g_logits_dir + "/" + name;
+    if (FILE * fp = fopen(path.c_str(), "wb")) {
+        fwrite(logits, sizeof(float), (size_t) n_vocab, fp);
+        fclose(fp);
+    }
+
+    sha256_ctx h;
+    h.update(logits, sizeof(float) * (size_t) n_vocab);
+
+    // the top-5 of the row: the numeric difference is often invisible in the argmax
+    std::vector<int> top(5, -1);
+    for (int v = 0; v < n_vocab; ++v) {
+        for (int k = 0; k < 5; ++k) {
+            if (top[k] < 0 || logits[v] > logits[top[k]]) {
+                for (int j = 4; j > k; --j) { top[j] = top[j - 1]; }
+                top[k] = v;
+                break;
+            }
+        }
+    }
+    char tops[256];
+    tops[0] = 0;
+    for (int k = 0; k < 5 && top[k] >= 0; ++k) {
+        char one[64];
+        snprintf(one, sizeof(one), "%s%d:%.6f", k ? " " : "", top[k], (double) logits[top[k]]);
+        strncat(tops, one, sizeof(tops) - strlen(tops) - 1);
+    }
+
+    std::lock_guard<std::mutex> lk(g_logits_m);
+    if (FILE * mf = fopen((g_logits_dir + "/manifest.txt").c_str(), "a")) {
+        fprintf(mf, "ROW mode=%s rep=%d req=%d step=%d row=%d n_vocab=%d argmax=%d sha=%s top5=%s\n",
+                g_mode_tag.c_str(), g_rep_tag, req, step, (int) i, n_vocab, (int) best,
+                h.final().substr(0, 16).c_str(), tops);
+        fclose(mf);
     }
     return best;
 }
@@ -265,7 +323,7 @@ static bool decode_loop(llama_context * ctx, std::vector<request_t> & reqs, cons
         double t_step_done = 0.0;
         for (int i = 0; i < (int) active.size(); ++i) {
             auto * r = active[i];
-            llama_token tok = argmax_row(ctx, i);   // the first row's sample synchronises the step
+            llama_token tok = sample_row(ctx, i, r->id, (int) r->generated.size());   // the first row's sample synchronises the step
             if (t_step_done == 0.0) { t_step_done = now_ms(); }
             if (tok < 0) { r->done = true; continue; }
             r->generated.push_back(tok);
@@ -293,6 +351,15 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     const std::string mode = getenv("ARMS_MODE") ? getenv("ARMS_MODE") : "arms";
+    g_mode_tag = mode;
+    if (const char * d = getenv("ARMS_LOGITS_DIR")) {
+        g_logits_dir = d;
+        mkdir(g_logits_dir.c_str(), 0777);   // EEXIST is fine
+        if (FILE * mf = fopen((g_logits_dir + "/manifest.txt").c_str(), "a")) {
+            fprintf(mf, "# mode=%s\n", mode.c_str());
+            fclose(mf);
+        }
+    }
     const std::string prompt_a = [&] {
         std::string s = "The history of computing is a long and tangled story.";
         if (const char * f = getenv("TWO_CTX_PF_FILE")) {
@@ -403,6 +470,7 @@ int main(int argc, char ** argv) {
         if (n_reps > 1) {
             printf("REP %d\n", rep);
         }
+        g_rep_tag = rep;
 
         // ARMS_RESET_CACHE: wipe the cell metadata and every allocation cursor at the rep boundary, so each rep
         // starts exactly like rep 0.  Each context owns its OWN cursor (`v_heads`) over the SAME shared cells,
@@ -432,7 +500,7 @@ int main(int argc, char ** argv) {
                 llama_pos pos = 0;
                 if (!ingest_prompt(ctx_a, r.seq, toks, n_batch_a, pos)) { return 1; }
                 r.t_prompt_done = now_ms();
-                llama_token tok = argmax_row(ctx_a, -1);
+                llama_token tok = sample_row(ctx_a, -1, r.id, 0);
                 if (tok < 0) { fprintf(stderr, "no logits\n"); return 1; }
                 r.generated.push_back(tok);
                 r.arrivals_ms.push_back(now_ms());
@@ -470,7 +538,7 @@ int main(int argc, char ** argv) {
 
                 const int n_dec = (mode == "pf-alone") ? 0 : r.n_predict;
                 for (int i = 0; i < n_dec; ++i) {
-                    llama_token tok = argmax_row(ctx, -1);
+                    llama_token tok = sample_row(ctx, -1, r.id, i);
                     if (tok < 0) { fprintf(stderr, "no logits\n"); return 1; }
                     r.generated.push_back(tok);
                     r.arrivals_ms.push_back(now_ms());
@@ -537,7 +605,7 @@ int main(int argc, char ** argv) {
                 }
 
                 // the first token is sampled on the arm that produced the logits
-                llama_token tok = argmax_row(ctx_a, -1);
+                llama_token tok = sample_row(ctx_a, -1, r.id, 0);
                 if (tok < 0) { fprintf(stderr, "req %d: no logits after the prompt\n", r.id); break; }
                 r.generated.push_back(tok);
                 r.arrivals_ms.push_back(now_ms());
@@ -675,7 +743,7 @@ int main(int argc, char ** argv) {
                     double t_step_done = 0.0;
                     for (int i = 0; i < (int) active.size(); ++i) {
                         auto * r = active[i];
-                        llama_token tok = argmax_row(ctx_b, i);   // the first sample synchronises the step
+                        llama_token tok = sample_row(ctx_b, i, r->id, (int) r->generated.size());   // the first sample synchronises the step
                         if (t_step_done == 0.0) { t_step_done = now_ms(); }
                         if (tok < 0) { r->done = true; continue; }
                         r->generated.push_back(tok);
