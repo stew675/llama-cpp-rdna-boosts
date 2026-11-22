@@ -115,6 +115,15 @@ yield point, the stream-priority plumbing — the last two are recorded losers, 
   measured `h` > 0 case); `-np 1` stays single-context.  The knob and its default are a maintainer decision at
   promotion time (`AGENTS.md`).
 
+## 3b. The cost target, decided (maintainer, 2026-11-22)
+
+The `<= ~14 %` prefill cost (§0, §6, pass 5 §3) was a **pre-analysis prediction, not a target**.  The measured
+**-24…-27 %** (pass 5 §3/§6) is **accepted**: it is far better than the ~-75 % that the old tactic of shrinking the
+ubatch cost, and — the point of the whole campaign — it removes the **burstiness** (`interactive.py`: the worst gap
+inside a prefill is 95 ms against 390 ms, p95 62 against 300, and the pasted document lands 1.6x sooner).  What
+matters is that ITL is **smooth**; the prefill rate is the price and it is a bounded one.  So the campaign's verdict
+line reads *smoothness delivered, cost accepted*, and the cost is **not** an open item.
+
 ## 4. Landmines — every one of these was measured, none is theoretical
 
 1. **Two contexts that both submit DECODE-BAND work collide on a partial arena.**  `GGML_MOE_DEVREMAP`'s
