@@ -1,0 +1,707 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 03:54:34 -0600
+Subject: [PATCH] =?UTF-8?q?wip/prefill-decode-arms=20pass=202:=20the=20?=
+ =?UTF-8?q?=C2=A73.4=20residual=20is=20TWO=20effects=20--=20hipBLASLt=20at?=
+ =?UTF-8?q?=20full=20residency,=20a=20=C2=A789=20residency=20class=20on=20?=
+ =?UTF-8?q?the=20tier=20--=20and=20the=20cell=20censuses=20that=20prove=20?=
+ =?UTF-8?q?the=20two-cursor=20scatter?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instrument (nothing delivery-bound, nothing in patches/):
+- LLAMA_KV_DEBUG_CELLS=1 / LLAMA_RS_DEBUG_CELLS=1 (WIP llama.cpp commit c49584c60): one compact line per ubatch
+  for the KV cells (as runs), and the recurrent head/n/min/max/rs_z + per-cell pos/src/src0/tail, including the
+  destination rows right after a seq_state_take().
+- arms/two_arms.cpp: ARMS_LOGITS_DIR dumps every sampled row as raw f32 plus a sha256/argmax/top-5 manifest, so
+  two arms' numerics can be diffed row by row.
+
+Findings (RESULTS-2026-11-22.md, raw logs in runs/diag-cells-2611/ with compare.py):
+- 2x2 on the hipBLASLt pin and the allocation state, full residency: the pin owns b79e73e3fe9f (with it the arms
+  are bit-identical to the reference -- 480/480 logits rows, max|d| = 0 -- both requests, every rep), and the
+  allocation state owns e05c6e16a136/abe253ea957a. The divergent row is R1's own PREFILL last row, so neither the
+  take nor R1's recurrent tail is involved.
+- The arms' KV cell census is identical to the single-context reference with one allocation state (0/243 lines,
+  both shapes, every rep) and scatters without it (192/243: pos 512 lands in cell 0 while the prompt sits in
+  512-1023) -- §3.4's two-cursor finding, measured directly, and T0's justification.
+- On the product shape with BOTH pins the arms' warm text is still stably b79e73e3fe9f while batch-pair is stable
+  at d5083bd41b4c, and the two runs' residency censuses differ (h=0.8161 vs 0.8172): a GREEDY-PURITY §89 residency
+  class, so pass 1's 'the host tier is refuted' is itself refuted.
+- Consequence: T3's strong oracle (a cross-configuration hash) IS available at full residency with the pin and one
+  allocator; on the tier it is KLD + residency-class-matched text. ROCBLAS_USE_HIPBLASLT=0 is mandatory on every
+  text arm, full residency included.
+---
+ wip/CAMPAIGNS.md                              |   2 +-
+ wip/prefill-decode-arms/HANDOVER.md           | 100 ++++++---
+ wip/prefill-decode-arms/README.md             |  32 ++-
+ wip/prefill-decode-arms/RESULTS-2026-11-21.md |  19 ++
+ wip/prefill-decode-arms/RESULTS-2026-11-22.md | 212 ++++++++++++++++++
+ wip/prefill-decode-arms/arms/two_arms.cpp     |  86 ++++++-
+ 6 files changed, 396 insertions(+), 55 deletions(-)
+ create mode 100644 wip/prefill-decode-arms/RESULTS-2026-11-22.md
+
+diff --git a/wip/CAMPAIGNS.md b/wip/CAMPAIGNS.md
+index 81ca99a3..06791cc1 100644
+--- a/wip/CAMPAIGNS.md
++++ b/wip/CAMPAIGNS.md
+@@ -55,7 +55,7 @@ is the signature of a stub, not of a campaign.
+ 
+ | directory | what | status |
+ |---|---|---|
+-| [`prefill-decode-arms/`](prefill-decode-arms/README.md) | **one prefill arm and one decode arm, both live on one GPU.**  `llama-server` today runs ONE context on ONE thread and builds ONE batch per step, so a prompt and a reply take turns inside the same graph and the decoder inherits the whole prefill step as its inter-token latency.  Instead: a **prefill arm** (own thread, own context, multiplexing the admitted prompt slots with block 16's existing admission policy) and a **decode arm** (own thread, own context, continuous batching of the generating slots), both live, the GPU scheduling them, and a slot crossing between them only at a **request boundary**.  Every number behind this is measured in the retired [`prefill-transfer-overlap`](../archive/work/prefill-transfer-overlap/README.md): two contexts free-running read decoder p95 **50 ms** during a 2.27 s prefill for a prefill cost of **-11.3 %**, against the shipped duty cycle's **519-568 ms at -30 %** — and every host-side policy on top (rate gate, per-gather yield, stream priority) is neutral or worse, so the design deliberately has **no policy in the hot path**.  Bounded to a **residency-deficient host-expert tier** (zero window at full residency) | **OPEN — pass 1 done (2026-11-21), T1 CLOSED, nothing in `patches/`.**  [`RESULTS-2026-11-21.md`](prefill-decode-arms/RESULTS-2026-11-21.md): the **recurrent-state handover** exists (`enabling-0002-recurrent-handover.patch`, **0.5-0.7 ms device-to-device** against 36 ms serialised) and its text oracle holds on a no-host-tier model in every mode/repetition and on the 35B host tier for a single handed-over request (3/3 warm reps).  T2/T3 are **emulated outside the server** (`arms/two_arms.cpp`: two contexts, one KV, two threads, a request queue, the handover at the request boundary) and reproduce the physics: **38 decoder tokens through a 2.08 s prefill at ITL p50 53.7 / p95 71.6 ms for +14.1 % prefill** (6.75 ms charged per decoder token).  Three new landmines, one a blocker: **the shared KV's cell allocator is not concurrency-safe** (`find_slot` searches from `v_heads`, `apply_ubatch` advances it afterwards — two arms can be handed the same cells); the second arm's VRAM is a graph reserve **per active-slot width** (741 MiB for 2 rows, so arena 5000 + `-ub 2048` does not fit on a 32 GiB card); and **a 2-slot two-arm decode is not text-stable across warm reps** (cold rep matches the sequential reference, warm ones do not — and the host tier, `n_kv` and the decode context's buffer layout were ALL refuted, and a reset-cursor arm CONFIRMED the carrier: the two per-context allocation cursors over the shared cells (`v_heads` is per-context).  Design instruction: ONE allocator for the pair -- the prefill arm reserves a slot's cell run and the decode arm consumes it, so the decoder never searches or advances the shared cursor; that also removes the double-allocation hazard.  T3's oracle then compares runs with the same cell layout and adds KLD.  The allocator fix (T0) is now **confirmed as the fix direction** by a reset-cursor arm (both arms from one allocation state -> the first request byte-identical in every rep), and §3.4 turns it into a design: **one allocator for the pair, the prefill arm reserving a slot's cell run and the decode arm consuming it** (which also removes the double-allocation hazard).  Start from the campaign's [`HANDOVER.md`](prefill-decode-arms/HANDOVER.md).  Next: T0, then the server cut (the code points are in the results file §5) |
++| [`prefill-decode-arms/`](prefill-decode-arms/README.md) | **one prefill arm and one decode arm, both live on one GPU.**  `llama-server` today runs ONE context on ONE thread and builds ONE batch per step, so a prompt and a reply take turns inside the same graph and the decoder inherits the whole prefill step as its inter-token latency.  Instead: a **prefill arm** (own thread, own context, multiplexing the admitted prompt slots with block 16's existing admission policy) and a **decode arm** (own thread, own context, continuous batching of the generating slots), both live, the GPU scheduling them, and a slot crossing between them only at a **request boundary**.  Every number behind this is measured in the retired [`prefill-transfer-overlap`](../archive/work/prefill-transfer-overlap/README.md): two contexts free-running read decoder p95 **50 ms** during a 2.27 s prefill for a prefill cost of **-11.3 %**, against the shipped duty cycle's **519-568 ms at -30 %** — and every host-side policy on top (rate gate, per-gather yield, stream priority) is neutral or worse, so the design deliberately has **no policy in the hot path**.  Bounded to a **residency-deficient host-expert tier** (zero window at full residency) | **OPEN — pass 1 done (2026-11-21), T1 CLOSED, nothing in `patches/`.**  [`RESULTS-2026-11-21.md`](prefill-decode-arms/RESULTS-2026-11-21.md): the **recurrent-state handover** exists (`enabling-0002-recurrent-handover.patch`, **0.5-0.7 ms device-to-device** against 36 ms serialised) and its text oracle holds on a no-host-tier model in every mode/repetition and on the 35B host tier for a single handed-over request (3/3 warm reps).  T2/T3 are **emulated outside the server** (`arms/two_arms.cpp`: two contexts, one KV, two threads, a request queue, the handover at the request boundary) and reproduce the physics: **38 decoder tokens through a 2.08 s prefill at ITL p50 53.7 / p95 71.6 ms for +14.1 % prefill** (6.75 ms charged per decoder token).  Three new landmines, one a blocker: **the shared KV's cell allocator is not concurrency-safe** (`find_slot` searches from `v_heads`, `apply_ubatch` advances it afterwards — two arms can be handed the same cells); the second arm's VRAM is a graph reserve **per active-slot width** (741 MiB for 2 rows, so arena 5000 + `-ub 2048` does not fit on a 32 GiB card); and **a 2-slot two-arm decode is not text-stable across warm reps** (cold rep matches the sequential reference, warm ones do not).  **Pass 2 (2026-11-22, [`RESULTS-2026-11-22.md`](prefill-decode-arms/RESULTS-2026-11-22.md)) resolved that residual into TWO effects, neither of them the design**: at full residency it is the **hipBLASLt** path (`ROCBLAS_USE_HIPBLASLT=0` — which pass 1's full-residency oracle block omitted — makes the arms **bit-identical to the reference, 480/480 logits rows, both requests, every rep**), and on a partial arena it is a **residency class** (`GREEDY-PURITY.md` §89: the runs' own censuses differ, `h=0.8161` vs `h=0.8172`) that survives every pin — so the earlier "the host tier is refuted" reading is itself refuted.  The **two allocation cursors** are confirmed as a text carrier by direct cell census: with one allocation state the arms' KV layout is byte-identical to the single-context reference (0 of 243 census lines), and without it a warm rep *scatters* the sequence (pos 512 placed in cell 0 while its prompt sits in 512-1023; 192 of 243 lines differ).  The allocator fix (T0) is now **confirmed as the fix direction** by a reset-cursor arm (both arms from one allocation state -> the first request byte-identical in every rep), and §3.4 turns it into a design: **one allocator for the pair, the prefill arm reserving a slot's cell run and the decode arm consuming it** (which also removes the double-allocation hazard).  Start from the campaign's [`HANDOVER.md`](prefill-decode-arms/HANDOVER.md).  Next: **T0 (one allocator; the artifact and its granularity are awaiting the maintainer's approval)**, then the server cut (the code points are in the results file §5).  T3's oracle is now measured: a cross-configuration hash IS available at full residency with the hipBLASLt pin **and** one allocator; on the tier the verdict is KLD + residency-class-matched text |
+ | [`kv-residency-cleanup/`](kv-residency-cleanup/README.md) | the **residue** of the KV-residency campaign (`TODO` **#118**, archived as [`archive/work/kv-residency/`](../archive/work/kv-residency/CLOSEOUT.md)): the residency gate (`P0` — **BUILT 2026-11-01**, `scripts/gate-kv-residency.sh`), O1's go/no-go, a window for a *separate* draft model, a pool-size policy above ~200k, and the close-outs those imply | **OPEN — decisions, no new mechanism.**  Goals A (window), B (attendance pool) and C (MTP draft window) all ship in block 15 (r178/r190/r193, +r196/r197); `TODO` #121-#125, #129 and #122 are closed; #124 (the `-sm tensor` window) shipped in r204 and the missing residency gate (P0) landed in r206 as repo tooling, so what is left here is O1, the separate-draft window, the pool-size policy and the close-outs |
+ | [`moe-cpu-overlap/`](moe-cpu-overlap/README.md) | CPU/GPU expert-pool overlap in the Strata shape (`TODO` **#36**, retired r144) | **RETAINED DELIBERATELY — do not delete.**  The campaign closed on 2026-10-26 with a measured refutation (the MoE miss traffic is 0.1-0.4 % of a decode token at the delivered arena, 7 % at the 2 048 MiB/device floor), and this directory is kept *in `wip/`* on the maintainer's instruction (2026-10-29) as the record that the investigation happened and was rejected, so it is not repeated.  It is a byte-identical copy of the archived record's `README.md`; the full evidence and `RESOLUTION.md` are in [`archive/work/moe-cpu-overlap/`](../archive/work/moe-cpu-overlap/) |
+ | [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 (`TODO` **#116**) | PARKED (2026-09-26) — rebased and building, fully RDNA4-gated, but **gate 2 failed** (the fp8 4B is 0.69x Q8_0 where cllm had 1.16x, because the delivery's MMB/GEMM work made Q8_0 +32 % and the fp8 WMMA path did not follow).  Resume actions are in `PLAN.md`.  Not closed — paused behind the delivery work |
+diff --git a/wip/prefill-decode-arms/HANDOVER.md b/wip/prefill-decode-arms/HANDOVER.md
+index 79a3cb9d..09e550f3 100644
+--- a/wip/prefill-decode-arms/HANDOVER.md
++++ b/wip/prefill-decode-arms/HANDOVER.md
+@@ -22,10 +22,10 @@ started.
+ |---|---|
+ | **T1 — the state handover** | **DONE.** `enabling-0002-recurrent-handover.patch`: one sequence's recurrent state moves between the arms **device-to-device in 0.45–0.66 ms** (1.9–2.3 ms on a process's first handover) against **34.5–36.1 ms** for the serialised path (52.7 MiB).  Text-exact on a no-host-tier 4B in every mode/repetition and on the 35B host tier for a single handed-over request (3/3 warm reps) |
+ | **T2 — the server skeleton** | **NOT STARTED.**  Its design is now measured outside the server (the instrument below) and written out in code points: `RESULTS-2026-11-21.md` §5 |
+-| **T3 — the request-boundary handover + its oracle** | The handover is built and exercised in the instrument; **its oracle had to be redefined** — see §3, T3 |
++| **T3 — the request-boundary handover + its oracle** | The handover is built and exercised in the instrument; **the oracle is now measured, not hypothesised** — see §3, T3, and [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) |
+ | **T4 — the opt-in gate** | Not started; its two rules are now measured (VRAM per slot width, the allocator) |
+ | **T5 — measurement + gates** | Not started (the instrument's numbers are the target T5 must beat) |
+-| **T0 — one allocator for the pair** (new, 2026-11-21) | **NOT STARTED, and it is the next code task.**  It is a *blocker* (a correctness hazard) and it is also the text carrier of the two-arm shape — `RESULTS-2026-11-21.md` §3.1 + §3.4 |
++| **T0 — one allocator for the pair** (new, 2026-11-21) | **NOT STARTED, and it is the next code task.**  It is a *blocker* (a correctness hazard) and it is also the text carrier of the two-arm shape — `RESULTS-2026-11-21.md` §3.1 + §3.4, and `RESULTS-2026-11-22.md` §4 shows the scatter directly.  **Waiting on the maintainer's approval of the artifact and its shape (HANDOVER §8, Q1).** |
+ 
+ ## 2. What exists as code (do not re-derive any of it)
+ 
+@@ -44,17 +44,26 @@ started.
+   `n_batch = n_ubatch = ARMS_B_BATCH`), a request queue between them, the handover at the request boundary, and
+   one token per active slot in one batch.  Modes `single` / `batch-pair` / `arms` / `handover` / `pf-alone` /
+   `dec-alone`.  **This is the server shape without the server** — iterate the design here (minutes per arm)
+-  before touching `tools/server/server-context.cpp`.
+-* The WIP branch `wip/prefill-overlap` in `~/llama.cpp` (**4 commits**: shared KV, the handover, then the two
+-  recorded losers — the per-gather yield point and stream priority — kept as the record).  `~/llama.cpp` is
+-  **clean**; keep it that way.
++  before touching `tools/server/server-context.cpp`.  Pass 2 added `ARMS_LOGITS_DIR=<dir>` (every sampled row as
++  raw f32 + a manifest with each row's sha256/argmax/top-5) — the diff instrument for an arm-vs-arm numeric
++  question.
++* **The cell censuses** (pass 2, `~/llama.cpp` commit `c49584c60`): `LLAMA_KV_DEBUG_CELLS=1` prints one line per
++  ubatch/sequence (cells as runs, `used`, the cursor the scan started from) and `LLAMA_RS_DEBUG_CELLS=1` prints the
++  recurrent metadata (`head/n/min/max/rs_z/used` + per cell `pos/src/src0/tail/seq`, and the destination rows right
++  after a take).  Both are diagnostic only, env-gated, and cost nothing when off.  `LLAMA_KV_CACHE_DEBUG=3` prints
++  the whole cell map, which is too large to diff.
++* The WIP branch `wip/prefill-overlap` in `~/llama.cpp` (**5 commits**: shared KV, the handover, then the two
++  recorded losers — the per-gather yield point and stream priority — kept as the record, then the censuses).
++  `~/llama.cpp` is **clean**; keep it that way.
+ * The record: `RESULTS-2026-11-21.md` (pass 1: numbers, the three landmines, §3.4's reset experiment, §5's server
+-  code points, and a "Reproduce" section with the exact commands).  Delivery-repo commits `56443c1f`, `6e8acb26`,
+-  `aa520ebf`, `6592c874`, `a78dd73e`.
++  code points, and a "Reproduce" section with the exact commands) and `RESULTS-2026-11-22.md` (pass 2: the residual
++  resolved into two effects, the censuses, and the reproduce commands).  Delivery-repo commits `56443c1f`,
++  `6e8acb26`, `aa520ebf`, `6592c874`, `a78dd73e`, then pass 2's.
+ 
+ ## 3. The state of each open question (the crux of this handover)
+ 
+-### T0 — one allocator for the pair.  NEXT.  Read `RESULTS-2026-11-21.md` §3.1 and §3.4 first.
++### T0 — one allocator for the pair.  NEXT, awaiting the maintainer's answer to Q1.  Read `RESULTS-2026-11-21.md`
++### §3.1 and §3.4, then `RESULTS-2026-11-22.md` §4 (the scatter, measured).
+ 
+ Two contexts co-own the KV cells (`v_cells` is shared through `v_cells_impl`) but each has its **own allocation
+ cursor** (`v_heads`, and its own `n`/`head`).  `llama_kv_cache::find_slot()` is `const` and only *searches* from
+@@ -87,22 +96,28 @@ artifact — do **not** bury it in the server cut):
+   Publish as a **posted message**, never as a lock the prefill thread waits on — measured: a direct mutex take
+   starves the prefill arm for **2.85 s** behind the decoder's step loop (`RESULTS-2026-11-21.md` §2).
+ 
+-### T3 — the oracle.  A cross-configuration greedy hash is **not available yet**.
+-
+-* It *is* available for the handover itself: a no-host-tier 4B (all modes agree, 2 reps × 2 requests) and a
+-  single handed-over request on the 35B host tier (3/3 warm reps).
+-* It is **not** available for a 2-slot arm on an MoE model: see the isolation matrix in
+-  `RESULTS-2026-11-21.md` §3.3.  Ruled out, each with its own arm: the handover implementation (device and copy
+-  agree), `GGML_MOE_DEVREMAP=0`, `MOE_EXPERT_PREFILL_IN_PLACE=0`, the prefill/decode overlap (`ARMS_WAIT_ALL`),
+-  the batch width (`batch-pair` is stable at the same widths), the host tier (**full residency reproduces it**),
+-  `n_kv` (`LLAMA_KV_N_PAD_MIN=8192` at `-c 8192`), and the decode context's buffer layout
+-  (`ARMS_B_BATCH=512`).  §3.4 then confirmed the cursors.
+-* **Residual, deterministic, unexplained**: with the reset in place, the *second* request still reads
+-  `b79e73e3fe9f` warm against the reference's `d5083bd41b4c` (rep 1 == rep 2, so it is not noise).  It is the
+-  second concurrent slot — its recurrent tail arrives by a **take** instead of by its own prefill.  **The next
+-  instrument**: print the cell indices (KV *and* recurrent, e.g. `sinfo.idxs` per ubatch and the recr
+-  `head`/`rs_z`/destination row) each request holds on each arm, and diff the **logits** of the same token
+-  decoded on A and on B.  First suspect: the `src0`/`rs_z` surface (see §4).
++### T3 — the oracle.  Pass 2 measured it.
++
++**Read [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) first — it replaces the "residual" story below.**
++
++* **Full residency / no host tier, with `ROCBLAS_USE_HIPBLASLT=0` and ONE allocation state: the strong oracle
++  exists.**  `arms` vs `batch-pair` (2 slots, an MoE model, warm reps) read **bit-identically** — 480/480 sampled
++  logits rows, `max|Δ| = 0`, both requests, every rep.  Pass 2 got that with `ARMS_RESET_CACHE=1` standing in for
++  T0's allocator; once T0 lands the control can be dropped.
++* **On a partial host-expert arena a cross-configuration hash is still not an oracle** — but for the *residency
++  class* reason (`GREEDY-PURITY.md` §89, the two runs' censuses differ: `h=0.8161` vs `h=0.8172`), not for the
++  cursor reason pass 1 named.  There the verdict is `scripts/gate-prefill-logits.sh` (KLD) plus text compared
++  **within one residency class**.
++* **`ROCBLAS_USE_HIPBLASLT=0` is mandatory on EVERY text arm, full residency included.**  The second context's
++  first decode can move the hipBLASLt choice **mid-process** (stable afterwards); pass 1's full-residency oracle
++  block omitted the pin and that omission manufactured the `b79e73e3fe9f` "residual".
++* The earlier (pass 1) reading of that residual — "the second slot's recurrent tail arrives by a take" — is
++  **refuted**: the divergent row is R1's own **prefill** last row (`req 1, step 0`), the take is not involved, and
++  the recurrent cell index (arms put R1 in cell 0, the single context in cell 1) is not a carrier.
++
++What remains true, and is measured: **the two allocation cursors are a text carrier** (the arms' KV layout is
++byte-identical to the reference with one allocation state — 0 of 243 census lines — and scatters without it: 192
++of 243, e.g. pos 512 placed in cell 0 while the prompt sits in 512–1023).  That is T0's justification.
+ 
+ ### T2 — the server cut.  `RESULTS-2026-11-21.md` §5, seven steps.
+ 
+@@ -144,7 +159,10 @@ only: `slots[]`, `batch`, `ctx_tgt`, `spec`, `checkpoints`, the prompt cache.  B
+ 6. **The text moves with shape**: `LLAMA_KV_N_PAD_MIN=8192` changes even the *single-context* text
+    (`b0281be7c5a6` → `649c8596467d`).  Any text comparison must pin the shape (pad, `-c`, `-ub`, cell layout).
+ 7. **Purity pins** on a host-expert arm: `MOE_EXPERT_HEATMAP=load` **and** `ROCBLAS_USE_HIPBLASLT=0` (r310).  The
+-   verdict for a *prefill-path* change is `scripts/gate-prefill-logits.sh` (KLD), not a hash.
++   verdict for a *prefill-path* change is `scripts/gate-prefill-logits.sh` (KLD), not a hash.  **Pass 2: the
++   hipBLASLt pin is mandatory on a no-host-tier text arm too** — the second context's first decode can move the
++   library's choice **mid-process** (stable afterwards), which is what produced pass 1's "residual".  A per-process
++   text comparison is not a purity guarantee here.
+ 8. **Two DECODE-band contexts on a partial arena corrupt each other** through the per-table, per-process
+    `GGML_MOE_DEVREMAP` map (retired campaign, pass 10); a **prefill + decode** pair is safe.  This design must
+    never run two decode contexts.
+@@ -175,7 +193,10 @@ for m in single batch-pair pf-alone dec-alone arms; do
+ done
+ 
+ # full residency (no host tier): the oracle shape, and the reset control
++# NOTE (2026-11-22): ROCBLAS_USE_HIPBLASLT=0 is REQUIRED here too -- without it the arms' warm text diverges on
++# the hipBLASLt path alone (RESULTS-2026-11-22.md §2).
+ unset MOE_EXPERT_CACHE_MIB MOE_EXPERT_HEATMAP
++export ROCBLAS_USE_HIPBLASLT=0
+ ARMS_MODE=batch-pair ./two_arms -m $M -ngl 99 -c 8192 -b 2048 -ub 512 -n 192 -t 8
+ ARMS_MODE=arms ARMS_RESET_CACHE=1 ARMS_WAIT_ALL=1 ./two_arms -m $M -ngl 99 -c 8192 -b 2048 -ub 512 -n 192 -t 8
+ 
+@@ -187,7 +208,12 @@ ARMS_SCENARIO="4932:32@0" ARMS_MODE=handover ./two_arms -m $M -ngl 99 -ncmoe 40
+ 
+ Instrument knobs: `ARMS_MODE`, `ARMS_SCENARIO="<prompt_tokens>:<n_predict>@<admit_ms>,…"`, `ARMS_REPS`,
+ `ARMS_B_BATCH`, `ARMS_WAIT_ALL=1` (no overlap: the step loop holds until every handover is done),
+-`ARMS_HANDOVER=device|copy`, `ARMS_RESET_CACHE=1` (wipe the cells + both cursors at each rep boundary).
++`ARMS_HANDOVER=device|copy`, `ARMS_RESET_CACHE=1` (wipe the cells + both cursors at each rep boundary),
++`ARMS_LOGITS_DIR=<dir>` (dump every sampled row as f32 + a sha256/argmax/top-5 manifest — the arm-vs-arm numeric
++comparison).  Engine censuses: `LLAMA_KV_DEBUG_CELLS=1` (KV cells per ubatch, as runs) and
++`LLAMA_RS_DEBUG_CELLS=1` (recurrent `head/n/rs_z` + per cell `pos/src/src0/tail`, and the destination rows of a
++take).  `runs/diag-cells-2611/compare.py` diffs two arms' censuses and manifests; the pass-2 file's Reproduce
++section has the exact arm commands.
+ 
+ **Never** run two arms in parallel (the 32 GiB card OOMs at load, and it contaminates every number).  `-lv` is
+ picked by the arm: a text/hash arm takes **no** `-lv`, a census arm takes **`-lv 4`** (`-lv 3` corrupts the text
+@@ -217,16 +243,20 @@ picked by the arm: a text/hash arm takes **no** `-lv`, a census arm takes **`-lv
+ ## 7. Read in this order
+ 
+ 1. this file;
+-2. `RESULTS-2026-11-21.md` — §3.1/§3.4 (the allocator + the reset proof), §2 (the instrument's numbers and the
+-   ordering lesson), §3.3 (the isolation matrix and the residual), §5 (the server cut), "Reproduce";
+-3. `README.md` — the campaign's design, all the landmines, T0-T5, the gates and the open questions for the
++2. `RESULTS-2026-11-22.md` — **pass 2**: the residual resolved (hipBLASLt at full residency, a §89 residency class
++   on the tier), the cell censuses, and the two-tier oracle that follows from them;
++3. `RESULTS-2026-11-21.md` — §3.1/§3.4 (the allocator + the reset proof), §2 (the instrument's numbers and the
++   ordering lesson), §3.3 (the isolation matrix and the residual — **read its 2026-11-22 notes**), §5 (the server
++   cut), "Reproduce";
++4. `README.md` — the campaign's design, all the landmines, T0-T5, the gates and the open questions for the
+    maintainer;
+-4. `archive/work/prefill-transfer-overlap/RESULTS-2026-11-20.md` passes 10-13 — the physics and the three
++5. `archive/work/prefill-transfer-overlap/RESULTS-2026-11-20.md` passes 10-13 — the physics and the three
+    policies that lost (rate gate, per-gather yield, stream priority); do not rebuild them;
+-5. `INVARIANTS.md` r305-r310 and `GREEDY-PURITY.md` §44/§89 — the purity traps this campaign keeps meeting.
++6. `INVARIANTS.md` r305-r310 and `GREEDY-PURITY.md` §44/§89 — the purity traps this campaign keeps meeting.
+ 
+ ## 8. The one-line summary of what is left
+ 
+-**Ask the maintainer two questions (the allocator artifact; the T3 oracle), then build the allocator (T0), then
+-cut the server skeleton (T2, `RESULTS-2026-11-21.md` §5) and measure it with the instrument's own numbers as the
+-target: a decoder getting a token every ~50 ms through a ~2 s prefill for ≤ ~14 % of prefill.**
++**Ask the maintainer two questions (the allocator artifact and its granularity; the T3 oracle, now with the pass-2
++measurement in hand), then build the allocator (T0), then cut the server skeleton (T2, `RESULTS-2026-11-21.md` §5)
++and measure it with the instrument's own numbers as the target: a decoder getting a token every ~50 ms through a
++~2 s prefill for ≤ ~14 % of prefill.**
+diff --git a/wip/prefill-decode-arms/README.md b/wip/prefill-decode-arms/README.md
+index 51416f8b..d259a041 100644
+--- a/wip/prefill-decode-arms/README.md
++++ b/wip/prefill-decode-arms/README.md
+@@ -1,7 +1,8 @@
+ # prefill-decode-arms — one prefill arm and one decode arm, both live on one GPU
+ 
+-**Status: pass 1 done (2026-11-21) — T1 CLOSED, T2/T3 emulated outside the server, three new landmines.
+-Nothing in `patches/`.**  See [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md).  It inherits the conclusion of the
++**Status: pass 2 done (2026-11-22) — T1 CLOSED, T2/T3 emulated outside the server, the §3.4 residual
++resolved (two effects, neither of them the design).  Nothing in `patches/`.**  See
++[`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) (pass 2) and [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md) (pass 1).  It inherits the conclusion of the
+ retired [`archive/work/prefill-transfer-overlap/`](../../archive/work/prefill-transfer-overlap/README.md)
+ (it established *what* the win is and *which mechanism* delivers it).  This campaign builds the product.
+ 
+@@ -159,7 +160,10 @@ yield point, the stream-priority plumbing — the last two are recorded losers,
+    prefill thread alone changes nothing here — what the prefill must own is the *allocation*, while the decode
+    arm still applies the publish (a posted message, never a lock the prefill waits on: a direct mutex take
+    starves the prefill for 2.85 s, results file §2).  Residual: the *second* concurrent slot still reads one
+-   stable-but-different value warm (results file §3.4 item 3).
++   stable-but-different value warm (results file §3.4 item 3) — **RESOLVED 2026-11-22, two effects**: at full
++   residency it is the **hipBLASLt** path (`ROCBLAS_USE_HIPBLASLT=0` makes the arms bit-identical to the reference,
++   480/480 logits rows, and the divergent row is R1's own *prefill* row), and on a partial arena it is a **§89
++   residency class** (`h=0.8161` vs `h=0.8172`) that survives every pin.  [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md).
+ 
+ ## 5. The reusable harness
+ 
+@@ -233,13 +237,20 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
+ 6. **New: which oracle does the maintainer want for T3?**  §3.3 says a cross-configuration hash is not
+    available on a partial host-expert arena.  Proposed: text at full residency (or no host tier) + KLD on the
+    tier + a same-configuration repetition to catch non-determinism.  Confirm before T2's gate is written.
+-7. **New: is the 2-slot warm text instability a *bug* or a graph-bucket effect?**  This pass could not settle
+-   it (the isolation matrix is in the results file §3.3).  It **refuted** the host-tier explanation (full
+-   residency reproduces it), and the single-context text itself moves with `LLAMA_KV_N_PAD_MIN`, so it is a
+-   shape/numerics effect, and `n_kv` and the decode context's buffer layout are both eliminated.  The leading
+-   hypothesis is the **physical KV cell indices** (a per-context allocation cursor + an index-dependent tile-FA
+-   split).  Next instrument: print the cell indices each arm's sequence holds and the resulting
+-   `parallel_blocks`, and diff the **logits** of the same token decoded on A and on B.
++7. **New: is the 2-slot warm text instability a *bug* or a graph-bucket effect?**  **SETTLED 2026-11-22**
++   ([`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md)): it is **two** effects.  (a) The two allocation cursors — real,
++   §3.4 was right: the arms' KV cell layout is byte-identical to the single-context reference when the allocation
++   state is shared (0/243 census lines differ, both shapes, every rep) and *scatters* when it is not (192/243;
++   a warm rep puts pos 512 in cell 0 while the prompt sits in 512–1023).  (b) `b79e73e3fe9f` — the *residual*: at full
++   residency the **hipBLASLt** solution path (pass 1's full-residency oracle block omitted the r310 pin), and on the
++   host tier a **residency class** (§89) that survives both pins.  So the strong oracle IS available at full
++   residency with the pin **and** one allocator; on the tier it is KLD + class-matched text.
++   ~~The leading hypothesis is the physical KV cell indices, next instrument: cell indices + logits.~~  Done — see
++   above: the cells are a carrier only through the *allocation state*, and the logits named the prefill row.
++8. **New (2026-11-22): which shape does the T3 gate run on?**  The strong (hash) point is only valid at full
++   residency with the pin and one allocator; the *product* shape (partial arena) can only be judged by KLD +
++   class-matched text.  Confirm that a two-tier oracle is acceptable, or pick one (my recommendation: two-tier —
++   the hash is the sharp one, the KLD is the honest one where the feature lives).
+ 
+ ## Files
+ | file | what |
+@@ -248,6 +259,7 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
+ |---|---|
+ | this `README.md` | the campaign: idea, established evidence, design, landmines, tasks, gates, open questions |
+ | [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md) | **pass 1**: T1 done and measured, the emulated T2/T3 and the product numbers, the three new landmines, the server cut in code points |
++| [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) | **pass 2**: the §3.4 residual is two effects (hipBLASLt at full residency, a §89 residency class on the tier); the cell censuses that prove the two-cursor scatter and that the arms match the reference exactly with the pin + one allocation state |
+ | [`enabling-0001-second-context-shared-kv.patch`](enabling-0001-second-context-shared-kv.patch) | the second context that shares the first one's KV (text-verified, applies to `release.json`'s tree) |
+ | [`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch) | **T1**: the recurrent-state handover, device to device (+ `seq_rm_recr`, `RECR_ONLY`) |
+ | [`arms/two_arms.cpp`](arms/two_arms.cpp), [`arms/build-two-arms.sh`](arms/build-two-arms.sh) | the instrument: two arms, two threads, one KV, a request queue and the handover; references `single` / `batch-pair` / `pf-alone` / `dec-alone` |
+diff --git a/wip/prefill-decode-arms/RESULTS-2026-11-21.md b/wip/prefill-decode-arms/RESULTS-2026-11-21.md
+index cc16c8f8..5e79b67f 100644
+--- a/wip/prefill-decode-arms/RESULTS-2026-11-21.md
++++ b/wip/prefill-decode-arms/RESULTS-2026-11-21.md
+@@ -215,6 +215,13 @@ Until then: **T3's text point must compare two runs of the SAME cell layout** 
+ then **confirms the cell-index hypothesis** with a reset arm and states the fix (one allocator, the prefill arm
+ reserving and the decode arm consuming).
+ 
++> **REVISED 2026-11-22** ([`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) §3): "the host tier is refuted" holds
++> only for the *full-residency* instance of the divergence, which pass 2 shows is the hipBLASLt path (cured by
++> `ROCBLAS_USE_HIPBLASLT=0`, which these arms did not carry).  On a partial arena, **with both pins on**, the
++> 2-slot two-arm text is still stably different warm (`b79e73e3fe9f`, reps 1–3) while the single-context reference is
++> stable at `d5083bd41b4c` — and the two runs' own residency censuses differ (`h=0.8161` vs `h=0.8172`).  So the host
++> tier IS a carrier, of the `GREEDY-PURITY.md` §89 class.
++
+ ---
+ 
+ ## 4. What this changes in the campaign
+@@ -309,6 +316,15 @@ Two consequences, and they are design instructions, not just explanations:
+    so it can be found by printing the cell indices (KV and recurrent) each request holds on each arm, and
+    diffing the logits of one token decoded on A and on B.  The `src0`/`rs_z` surface is the first suspect.
+ 
++> **RESOLVED 2026-11-22** ([`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) §2, with the censuses of §1): not the
++> take, not the recurrent tail, not `src0`/`rs_z`, not the cells.  **At full residency it is the hipBLASLt solution
++> path**: the two-arm run is bit-identical to the reference (480/480 logits rows, `max|Δ| = 0`) with
++> `ROCBLAS_USE_HIPBLASLT=0`, and the divergent row is **R1's own prefill last row** (`req 1, step 0`) once ctx B has
++> decoded once — i.e. an O(1) numeric difference on the *prefill* arm.  `b79e73e3fe9f` survives the pin on the host
++> tier only, where it is the §89 residency class (see the §3.3 note above).  The cell censuses show the arms' KV
++> layout is **identical** to the single-context reference when the allocation state is shared (0 of 243 lines), and
++> scatters when it is not (192 of 243) — which is the two-cursor effect in its visible form.
++
+ ## Reproduce
+ 
+ The tree must be the WIP branch (4 commits) — `enabling-0001` + `enabling-0002` are the two `src/` commits:
+@@ -331,7 +347,10 @@ for m in single pf-alone dec-alone arms; do
+ done
+ 
+ # the oracle: full residency (no -ncmoe, no arena), no overlap control
++# NOTE 2026-11-22: ROCBLAS_USE_HIPBLASLT=0 is MANDATORY on these arms -- without it the arms' warm text diverges on
++# the hipBLASLt path alone (RESULTS-2026-11-22.md §2).  It was missing here and produced the "residual".
+ unset MOE_EXPERT_CACHE_MIB MOE_EXPERT_HEATMAP
++export ROCBLAS_USE_HIPBLASLT=0
+ ARMS_MODE=batch-pair ./two_arms -m $M -ngl 99 -c 8192 -b 2048 -ub 512 -n 192 -t 8   # the reference
+ ARMS_MODE=arms ARMS_WAIT_ALL=1 ./two_arms -m $M -ngl 99 -c 8192 -b 2048 -ub 512 -n 192 -t 8
+ 
+diff --git a/wip/prefill-decode-arms/RESULTS-2026-11-22.md b/wip/prefill-decode-arms/RESULTS-2026-11-22.md
+new file mode 100644
+index 00000000..aed1cd7a
+--- /dev/null
++++ b/wip/prefill-decode-arms/RESULTS-2026-11-22.md
+@@ -0,0 +1,212 @@
++# 2026-11-22 — pass 2: the §3.4 "residual" is TWO effects with one hash, and the censuses that prove it
++
++**Verdict.** The residual of `RESULTS-2026-11-21.md` §3.4 item 3 (R1 warm reads `b79e73e3fe9f` against the
++reference's `d5083bd41b4c`) is **not** the recurrent tail and **not** the take: it is **two independent effects
++that happen to land on the same text**.
++
++1. **At full residency it is the hipBLASLt solution path.** With `ROCBLAS_USE_HIPBLASLT=0` the two-arm run is
++   **bit-identical to the single-context reference in every sampled row of every rep** (480/480 logits rows,
++   `max|Δ| = 0.0`), warm reps included. Without the pin, R1's divergence is already present in **R1's prefill last
++   row** (`rep 1, req 1, step 0`) with `max|Δ| = 2.39` and `mean|Δ| = 0.35` — an O(1) difference, not rounding —
++   and it appears only from the first rep *after ctx B has decoded once*, then stays fixed (reps 1 = 2 = 3).
++   Pass 1's full-residency oracle block did not carry the pin (`RESULTS-2026-11-21.md` "Reproduce"); r310 already
++   requires it on a text arm, so this is an omission that manufactured a "residual".
++2. **On the host tier it survives both pins** and is a **residency-class** effect
++   (`GREEDY-PURITY.md` §89): the two runs' own censuses differ (`h=0.8161` vs `0.8172`). So pass 1's §3.3
++   "refutation of the host tier" is itself refuted — what full residency reproduced was effect (1), not this.
++
++**And the two-cursor finding of §3.4 is confirmed, and is sharper than recorded**: with the cells' allocation
++state reset at the rep boundary the arms' KV layout is **identical to the single-context reference** (0 of 243
++census lines differ, on both shapes, in every rep), while **without** the reset **192 of 243** lines differ and a
++warm rep places a sequence's decode token in a cell *below* its own prompt (pos 512 in cell **0** while the prompt
++occupies 512–1023) — a scatter, not a corruption, and it moves the numerics.
++
++All arms: 1 × R9700 (gfx1201), ROCm 10.1.0-gfx120X, **sequential**, `HIP_VISIBLE_DEVICES=0`.  Two shapes:
++**full residency** (`-ngl 99 -c 8192 -b 2048 -ub 512`) and the **product shape** (arena 5000,
++`-ncmoe 40 -lme auto -c 16384 -b 2048 -ub 512`), scenario `512:192,2048:48`, `ARMS_WAIT_ALL=1` (no overlap),
++`ARMS_RESET_CACHE=1` where stated.  Raw logs + `compare.py`: [`runs/diag-cells-2611/`](runs/diag-cells-2611/).
++
++---
++
++## 1. The instrument (what this pass added)
++
++Three diagnostics, all of which cost nothing when off, and all of which a later arm or the server cut can reuse:
++
++| where | knob | what it prints |
++|---|---|---|
++| `llama-kv-cache.cpp` (`find_slot`) | **`LLAMA_KV_DEBUG_CELLS=1`** | one line per ubatch/sequence: `seq, strm, n_tok, head_in` (the cursor the scan started from), `used`, `size`, the sequence's `pos` range and the cells as **runs** (`runs=0-511`) |
++| `llama-memory-recurrent.cpp` (`find_slot`, `seq_state_take`) | **`LLAMA_RS_DEBUG_CELLS=1`** | `head, n, min, max, rs_z, used, size` and per cell `idx:pos/src/src0/tail/seq ids`, plus every sequence's sentinel `tail/pos`; the `took` variant prints the destination rows right after a handover |
++| `arms/two_arms.cpp` | **`ARMS_LOGITS_DIR=<dir>`** | every sampled row as raw `f32` (`<mode>-r<rep>-q<req>-s<step>.f32`) + `manifest.txt` with the row's sha256, argmax and top-5 |
++
++`LLAMA_KV_CACHE_DEBUG=3` already existed and prints the whole cell map, which is 64+ lines per ubatch at `-c
++8192` and cannot be diffed; these are one line each.  The `.f32` bodies are **not** committed (1.8 GiB); the
++manifests are, and `runs/diag-cells-2611/compare.py` re-runs both comparisons from the logs.  WIP branch commit
++`c49584c60` (5th commit of `wip/prefill-overlap`).
++
++**The 2 × 2 that answers the question** (full residency, 2 reps each; reference `batch-pair` =
++`b0281be7c5a6` / `d5083bd41b4c`, stable in every rep):
++
++| arm | `ROCBLAS_USE_HIPBLASLT=0` | `ARMS_RESET_CACHE=1` | R0 (512 tok / 192 gen) | R1 (2048 tok / 48 gen) |
++|---|---|---|---|---|
++| `batch-pair` (one context, 2 slots) | — | — | `b0281be7c5a6` ×2 | `d5083bd41b4c` ×2 |
++| `arms` | no | **yes** | `b0281be7c5a6` ×4 | rep 0 match; reps 1,2,3 **`b79e73e3fe9f`** |
++| `arms` | **yes** | **yes** | `b0281be7c5a6` ×2 | **match ×2** (bit-identical rows) |
++| `arms` | **yes** | no | rep 0 match, rep 1 **`e05c6e16a136`** | rep 1 **`abe253ea957a`** |
++| `arms` | no | no | rep 0 match, rep 1 **`e05c6e16a136`** | rep 1 **`abe253ea957a`** |
++
++Read the two axes: the **pin** owns `b79e73e3fe9f` (row 2 → row 3); the **allocator state** owns
++`e05c6e16a136`/`abe253ea957a` (row 3 → row 4), and rows 4/5 are numerically identical to pass 1's no-reset table.
++The two effects are **orthogonal** and were previously superimposed.
++
++## 2. Effect 1 — full residency: the hipBLASLt path, already a project rule
++
++Logits, `batch-pair` vs `arms` (full residency, reset, no pin), 480 rows per arm (`1 + 191` for R0, `1 + 47` for
++R1; step 0 is the **prompt's last row**, i.e. prefill logits):
++
++| scope | rows | differ | first | what it means |
++|---|---|---|---|---|
++| rep 0, both requests | 240 | 0 | — | the cold rep is bit-identical, as pass 1 said |
++| rep 1, R0 | 192 | **0** | — | R0 warm is bit-identical too: the *take* and *decode on ctx B* are not the carrier |
++| rep 1, R1 | 48 | **48** | `req 1, step 0` | the divergence is in **R1's prefill**, before any decode step of that rep |
++
++Numbers on that first row: `max|Δ| = 2.385`, `mean|Δ| = 0.354`, `argmax 266 = 266`, KLD `2.2e-05`; step 1
++KLD `1.4e-03`; step 47 `argmax 408 → 159034`, KLD `23.3` (where the greedy text finally flips).  With
++`ROCBLAS_USE_HIPBLASLT=0` the same comparison reads **0 of 480 rows differ, `max|Δ| = 0.0`** on the very row that
++differed (`rep1 req1 step0`, `np.array_equal` true).
++
++So: R1's *own* warm prefill on ctx A gives a different answer once ctx B has decoded once.  Nothing about the
++handover (`seq_state_take`), the recurrent tail, or the cursors is involved — those rows are the prefill's own.
++The trigger is the second context's first decode, the effect is stable afterwards (reps 1–3 identical), and it
++disappears with the hipBLASLt path disabled.
++
++**New data point for the §44 class**: the hipBLASLt choice can change **mid-process**, not only per start — so
++"the same process" is not a purity guarantee for a text arm that adds a second context/stream.  `r310`'s pin is
++mandatory on every text arm, full residency included (pass 1's oracle block omitted it).
++
++## 3. Effect 2 — the host tier: a residency class, not a layout
++
++Product shape, **both pins on** (`MOE_EXPERT_HEATMAP=load`, `ROCBLAS_USE_HIPBLASLT=0`), `ARMS_B_BATCH=4`,
++`ARMS_RESET_CACHE=1`, 4 reps:
++
++| arm | rep 0 | rep 1 | rep 2 | rep 3 |
++|---|---|---|---|---|
++| `batch-pair` R0 / R1 | match / match | match / match | match / match | match / match |
++| `arms` R0 / R1 | match / match | match / **`b79e73e3fe9f`** | match / **`b79e73e3fe9f`** | match / **`b79e73e3fe9f`** |
++
++Stable, not a warm-up transient: the arms settle into a *different steady state*, and the run's own residency
++census says why (same session, same config):
++
++| census | `arms` | `batch-pair` |
++|---|---|---|
++| arena residency | `h=0.8161` (738846/905392 reaches) | `h=0.8172` (739891/905392) |
++| fills / evictions | 35014 / 26854 | 34984 / 26824 |
++| takeover / `get_ok` | 91704 / **99224** | 91704 / **1424** |
++| heat coverage | 73.69 % of the routed mass | 74.53 % |
++
++That is the `GREEDY-PURITY.md` §89 class name for name: residency selects the MoE kernel set and the sets are not
++bit-identical.  Two contexts warm the 5 GiB arena differently from one, so the *two-arm* run sits in a different
++kettle than the reference — which makes a cross-configuration greedy hash an invalid oracle **on the tier**, for
++this reason (not for the cursor reason pass 1 named).
++
++## 4. The two-cursor finding (§3.4) is confirmed — and it is a scatter
++
++KV cell census, `[TAG_KV_CELLS]`, aligned per ubatch:
++
++| comparison | lines | differ |
++|---|---|---|
++| `arms` (reset) rep 0 vs rep 1, full residency | 243 | **0** |
++| `arms` (reset) rep 0 vs rep 1, host tier | 243 | **0** |
++| `arms` (reset, rep 1) vs `batch-pair` (rep 1), full residency | 243 | **0** |
++| `arms` (reset, rep 1) vs `batch-pair` (rep 1), host tier | 243 | **0** |
++| `arms` (**no** reset) rep 0 vs rep 1 | 243 | **192** |
++
++Without a shared allocation state the warm rep does this (R0, the 512-token request, first decode step):
++
++```
++rep 0:  seq=0 strm=0 n_tok=512 head_in=0   used=0   runs=0-511      # prompt
++        seq=0 strm=0 n_tok=1   head_in=512 used=512 runs=512        # decode token, right after it
++rep 1:  seq=0 strm=0 n_tok=512 head_in=512 used=0   runs=512-1023   # prompt moved up (ctx A's own cursor)
++        seq=0 strm=0 n_tok=1   head_in=0   used=512 runs=0          # ctx B's cursor is 0 -> the cell at the ARRAY TOP
++```
++
++Cell 0 is **empty** there (freed when rep 0's request completed), so the scan takes it legally — but the sequence's
++cells are now non-contiguous, its `n_kv` grows to cover both ends, and the tile-FA split (index-dependent,
++`scripts/gate-spec-purity.sh`) lands elsewhere.  That is the mechanism §3.4 named, measured directly for the first
++time, and it is exactly what one allocator for the pair (T0) removes: with the cursors in one state the layout is
++byte-identical to the single-context reference on **both** shapes.
++
++Not a carrier, now excluded directly: the **recurrent** cell index.  `[TAG_RS_CELLS]` shows the arms place R1 in
++recurrent cell **0** (`used=1`) where the single context places it in cell **1** (`used=2`), and step 0 still reads
++identically (`rs_z` in steady state is `-1`; every taken row has `src = src0 = its own index`; the graph zeroes
++`rs_z`'s row before the gather).
++
++## 5. What this changes
++
++* **T3's oracle (the maintainer's question 2) is now half-answered by measurement**: at **full residency /
++  no-host-tier**, with `ROCBLAS_USE_HIPBLASLT=0`, the strong oracle — a cross-configuration greedy hash, `arms` vs
++  `batch-pair`, 2 slots, an MoE model, warm reps — is **available today** (480/480 rows bit-identical), with
++  `ARMS_RESET_CACHE` standing in for the allocator T0 will build.  So: build T0, then re-run this exact 2 × 2 and
++  drop the harness control.
++* **On a partial host-expert arena the hash stays invalid** (`b79e73e3fe9f`, stable, with every pin): the verdict
++  there is `scripts/gate-prefill-logits.sh` (KLD) plus text compared **within one residency class**.
++* **`ROCBLAS_USE_HIPBLASLT=0` goes into every text arm, full residency included** — and the campaign's reproduce
++  block is corrected (below).  A second context can move the library's choice mid-process.
++* **T0's justification is unchanged in kind and stronger in degree**: §3.1's double-allocation window stays a
++  hazard by construction, and the scatter above is its visible form (the decode arm's cursor does not know what the
++  prefill arm took, so a warm run reuses the low cells while the prompt sits above them).
++* Nothing was applied to `patches/`, no block was created or amended, no tag was cut; `~/llama.cpp` carries the
++  censuses on `wip/prefill-overlap` (5 commits, clean).
++
++## Caveats
++
++* The logits comparison is 2 reps × 2 arms per shape; the 4-rep runs (stability of `b79e73e3fe9f`) carry text
++  hashes only, and the host-tier 4-rep runs carry no cell census (the censuses are from the 2-rep pairs).
++* One process per arm, arms sequential — never in parallel (`HIP_VISIBLE_DEVICES=0`).
++* The hipBLASLt mechanism is **not** identified (workspace/stream/heuristic re-pick): what is measured is that the
++  flip needs the second context's first decode, is stable after it, and vanishes with the path disabled.
++* `ARMS_RESET_CACHE` wipes *both* contexts' cell metadata and cursors at the rep boundary; it is a harness control,
++  not the feature.  T0's publish/reserve is the product form.
++* Full residency here means `-ngl 99` with all experts in VRAM (zero gathers); the host-tier arms are the product
++  shape (arena 5000, `-ncmoe 40 -lme auto`), whose cold rep costs ~4.1 s per 512-token prompt (fill-dominated, as
++  ever — rep 0 is never quoted as a rate).
++
++## Reproduce
++
++```bash
++cd ~/llama.cpp && git checkout wip/prefill-overlap        # 5 commits (the censuses are the 5th)
++BUILD_DIR=build-2ctx JOBS=24 ~/bin/build-llama-rocm-101
++cd ~/llama-cpp-rdna-boosts/wip/prefill-decode-arms/arms && ./build-two-arms.sh
++
++export LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib HIP_VISIBLE_DEVICES=0 TWO_CTX_PF_FILE=/tmp/p4k.txt
++M=/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
++cd ../runs/diag-cells-2611
++
++# A. full residency, the 2x2 (rows 1-4 of the table in section 1); add/remove the two env vars per arm
++ARMS_SCENARIO="512:192,2048:48" ARMS_REPS=2 LLAMA_KV_DEBUG_CELLS=1 LLAMA_RS_DEBUG_CELLS=1 \
++  ARMS_MODE=batch-pair ../../arms/two_arms -m $M -ngl 99 -c 8192 -b 2048 -ub 512 -n 192 -t 8 \
++  > a-batch-pair.out 2> a-batch-pair.err
++ARMS_SCENARIO="512:192,2048:48" ARMS_REPS=2 ARMS_WAIT_ALL=1 ARMS_RESET_CACHE=1 \
++  LLAMA_KV_DEBUG_CELLS=1 LLAMA_RS_DEBUG_CELLS=1 ROCBLAS_USE_HIPBLASLT=0 \
++  ARMS_MODE=arms ../../arms/two_arms -m $M -ngl 99 -c 8192 -b 2048 -ub 512 -n 192 -t 8 \
++  > a-arms-pin-reset.out 2> a-arms-pin-reset.err
++
++# B. the product shape (arena 5000), pins on
++export MOE_EXPERT_CACHE_MIB=5000 MOE_EXPERT_HEATMAP=load ROCBLAS_USE_HIPBLASLT=0
++ARMS_SCENARIO="512:192,2048:48" ARMS_REPS=4 ARMS_B_BATCH=4 ARMS_MODE=batch-pair \
++  ../../arms/two_arms -m $M -ngl 99 -ncmoe 40 -lme auto -c 16384 -b 2048 -ub 512 -n 192 -t 8
++ARMS_SCENARIO="512:192,2048:48" ARMS_REPS=4 ARMS_B_BATCH=4 ARMS_WAIT_ALL=1 ARMS_RESET_CACHE=1 \
++  ARMS_MODE=arms ../../arms/two_arms -m $M -ngl 99 -ncmoe 40 -lme auto -c 16384 -b 2048 -ub 512 -n 192 -t 8
++
++# the logits dump (add to any arm; ~0.6 MB per sampled row)
++ARMS_LOGITS_DIR=logits-arms ...
++
++./compare.py          # the census + manifest comparisons of this file ( --f32 also diffs the row bodies )
++```
++
++## Files
++
++| file | what |
++|---|---|
++| [`runs/diag-cells-2611/`](runs/diag-cells-2611/) | every arm's stdout/stderr of this pass + the logits manifests + `compare.py` |
++| `~/llama.cpp` `c49584c60` | the two env-gated censuses (`LLAMA_KV_DEBUG_CELLS`, `LLAMA_RS_DEBUG_CELLS`) |
++| [`arms/two_arms.cpp`](arms/two_arms.cpp) | `ARMS_LOGITS_DIR` (raw row dump + sha256/argmax/top-5 manifest) |
+diff --git a/wip/prefill-decode-arms/arms/two_arms.cpp b/wip/prefill-decode-arms/arms/two_arms.cpp
+index 3ef51485..30bbcb82 100644
+--- a/wip/prefill-decode-arms/arms/two_arms.cpp
++++ b/wip/prefill-decode-arms/arms/two_arms.cpp
+@@ -43,6 +43,8 @@
+ #include <cstring>
+ #include <mutex>
+ #include <string>
++#include <sys/stat.h>
++#include <sys/types.h>
+ #include <thread>
+ #include <vector>
+ 
+@@ -198,10 +200,18 @@ static bool in_any_window(const std::vector<std::pair<double, double>> & w, doub
+ }
+ 
+ // --- greedy sampling (the campaign's text oracle is plain greedy) --------------------------------------
+-static llama_token argmax_row(llama_context * ctx, int32_t i) {
+-    const float * logits = llama_get_logits_ith(ctx, i);
+-    if (logits == nullptr) { return -1; }
+-    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++//
++// ARMS_LOGITS_DIR=<dir>: dump every row the arms SAMPLE (the prompt's last row and every decode step) as raw
++// float32 into <dir>/<mode>-r<rep>-q<req>-s<step>.f32 and append one line per row to <dir>/manifest.txt with
++// the row's sha256, its argmax and its top-5.  This is the diff instrument for RESULTS-2026-11-21.md §3.4 item
++// 3: the SAME token decoded on ctx A and on ctx B produces two rows, and the rows (not the sampled ids, which
++// are identical by construction when the text matches) carry the numeric difference.  Instrument only.
++static std::string g_logits_dir;
++static std::string g_mode_tag = "arms";
++static int         g_rep_tag  = 0;
++static std::mutex  g_logits_m;
++
++static llama_token argmax_of(const float * logits, int n_vocab) {
+     llama_token best = 0;
+     for (int v = 1; v < n_vocab; ++v) {
+         if (logits[v] > logits[best]) { best = v; }
+@@ -209,6 +219,54 @@ static llama_token argmax_row(llama_context * ctx, int32_t i) {
+     return best;
+ }
+ 
++static llama_token sample_row(llama_context * ctx, int32_t i, int req, int step) {
++    const float * logits = llama_get_logits_ith(ctx, i);
++    if (logits == nullptr) { return -1; }
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++    const llama_token best = argmax_of(logits, n_vocab);
++
++    if (g_logits_dir.empty()) { return best; }
++
++    char name[128];
++    snprintf(name, sizeof(name), "%s-r%d-q%d-s%d.f32", g_mode_tag.c_str(), g_rep_tag, req, step);
++    const std::string path = g_logits_dir + "/" + name;
++    if (FILE * fp = fopen(path.c_str(), "wb")) {
++        fwrite(logits, sizeof(float), (size_t) n_vocab, fp);
++        fclose(fp);
++    }
++
++    sha256_ctx h;
++    h.update(logits, sizeof(float) * (size_t) n_vocab);
++
++    // the top-5 of the row: the numeric difference is often invisible in the argmax
++    std::vector<int> top(5, -1);
++    for (int v = 0; v < n_vocab; ++v) {
++        for (int k = 0; k < 5; ++k) {
++            if (top[k] < 0 || logits[v] > logits[top[k]]) {
++                for (int j = 4; j > k; --j) { top[j] = top[j - 1]; }
++                top[k] = v;
++                break;
++            }
++        }
++    }
++    char tops[256];
++    tops[0] = 0;
++    for (int k = 0; k < 5 && top[k] >= 0; ++k) {
++        char one[64];
++        snprintf(one, sizeof(one), "%s%d:%.6f", k ? " " : "", top[k], (double) logits[top[k]]);
++        strncat(tops, one, sizeof(tops) - strlen(tops) - 1);
++    }
++
++    std::lock_guard<std::mutex> lk(g_logits_m);
++    if (FILE * mf = fopen((g_logits_dir + "/manifest.txt").c_str(), "a")) {
++        fprintf(mf, "ROW mode=%s rep=%d req=%d step=%d row=%d n_vocab=%d argmax=%d sha=%s top5=%s\n",
++                g_mode_tag.c_str(), g_rep_tag, req, step, (int) i, n_vocab, (int) best,
++                h.final().substr(0, 16).c_str(), tops);
++        fclose(mf);
++    }
++    return best;
++}
++
+ // --- prompt ingestion on an arm ------------------------------------------------------------------------
+ // returns false on a failed chunk
+ static bool ingest_prompt(llama_context * ctx, llama_seq_id seq, const std::vector<llama_token> & toks,
+@@ -265,7 +323,7 @@ static bool decode_loop(llama_context * ctx, std::vector<request_t> & reqs, cons
+         double t_step_done = 0.0;
+         for (int i = 0; i < (int) active.size(); ++i) {
+             auto * r = active[i];
+-            llama_token tok = argmax_row(ctx, i);   // the first row's sample synchronises the step
++            llama_token tok = sample_row(ctx, i, r->id, (int) r->generated.size());   // the first row's sample synchronises the step
+             if (t_step_done == 0.0) { t_step_done = now_ms(); }
+             if (tok < 0) { r->done = true; continue; }
+             r->generated.push_back(tok);
+@@ -293,6 +351,15 @@ int main(int argc, char ** argv) {
+     llama_backend_init();
+ 
+     const std::string mode = getenv("ARMS_MODE") ? getenv("ARMS_MODE") : "arms";
++    g_mode_tag = mode;
++    if (const char * d = getenv("ARMS_LOGITS_DIR")) {
++        g_logits_dir = d;
++        mkdir(g_logits_dir.c_str(), 0777);   // EEXIST is fine
++        if (FILE * mf = fopen((g_logits_dir + "/manifest.txt").c_str(), "a")) {
++            fprintf(mf, "# mode=%s\n", mode.c_str());
++            fclose(mf);
++        }
++    }
+     const std::string prompt_a = [&] {
+         std::string s = "The history of computing is a long and tangled story.";
+         if (const char * f = getenv("TWO_CTX_PF_FILE")) {
+@@ -403,6 +470,7 @@ int main(int argc, char ** argv) {
+         if (n_reps > 1) {
+             printf("REP %d\n", rep);
+         }
++        g_rep_tag = rep;
+ 
+         // ARMS_RESET_CACHE: wipe the cell metadata and every allocation cursor at the rep boundary, so each rep
+         // starts exactly like rep 0.  Each context owns its OWN cursor (`v_heads`) over the SAME shared cells,
+@@ -432,7 +500,7 @@ int main(int argc, char ** argv) {
+                 llama_pos pos = 0;
+                 if (!ingest_prompt(ctx_a, r.seq, toks, n_batch_a, pos)) { return 1; }
+                 r.t_prompt_done = now_ms();
+-                llama_token tok = argmax_row(ctx_a, -1);
++                llama_token tok = sample_row(ctx_a, -1, r.id, 0);
+                 if (tok < 0) { fprintf(stderr, "no logits\n"); return 1; }
+                 r.generated.push_back(tok);
+                 r.arrivals_ms.push_back(now_ms());
+@@ -470,7 +538,7 @@ int main(int argc, char ** argv) {
+ 
+                 const int n_dec = (mode == "pf-alone") ? 0 : r.n_predict;
+                 for (int i = 0; i < n_dec; ++i) {
+-                    llama_token tok = argmax_row(ctx, -1);
++                    llama_token tok = sample_row(ctx, -1, r.id, i);
+                     if (tok < 0) { fprintf(stderr, "no logits\n"); return 1; }
+                     r.generated.push_back(tok);
+                     r.arrivals_ms.push_back(now_ms());
+@@ -537,7 +605,7 @@ int main(int argc, char ** argv) {
+                 }
+ 
+                 // the first token is sampled on the arm that produced the logits
+-                llama_token tok = argmax_row(ctx_a, -1);
++                llama_token tok = sample_row(ctx_a, -1, r.id, 0);
+                 if (tok < 0) { fprintf(stderr, "req %d: no logits after the prompt\n", r.id); break; }
+                 r.generated.push_back(tok);
+                 r.arrivals_ms.push_back(now_ms());
+@@ -675,7 +743,7 @@ int main(int argc, char ** argv) {
+                     double t_step_done = 0.0;
+                     for (int i = 0; i < (int) active.size(); ++i) {
+                         auto * r = active[i];
+-                        llama_token tok = argmax_row(ctx_b, i);   // the first sample synchronises the step
++                        llama_token tok = sample_row(ctx_b, i, r->id, (int) r->generated.size());   // the first sample synchronises the step
+                         if (t_step_done == 0.0) { t_step_done = now_ms(); }
+                         if (tok < 0) { r->done = true; continue; }
+                         r->generated.push_back(tok);
+-- 
+2.56.1
+
