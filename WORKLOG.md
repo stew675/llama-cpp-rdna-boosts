@@ -44,7 +44,7 @@ read-granularity problem, and per-block launch cost is the other candidate).  If
 their box after this, the cause is the grid size rather than the scan, and the fix for that class is a smaller
 grid -- which needs their logs to size, so the reply asks them to re-test rather than claiming their number.
 
-### Gates (all on the released tree, build `ac8515642` / canonical re-cut `e695c46ce`)
+### Gates (on build `585360d19`, the tree `228628e50` that ships; see the note on the one-comment delta below)
 
 * `scripts/validate-set.sh` -- **green**: 18 default patches + 2 optional + `rdna-boosts-all.patch` checksums,
   strict apply on a fresh `919794500` tarball, applied tree **`0d2f70e6c`** == `release.json`, both optionals
@@ -81,6 +81,12 @@ grid -- which needs their logs to size, so the reply asks them to re-test rather
   changed), and blocks 10-16 were regenerated (their contexts and commit ids shift; no block changed content).
 * The gather's per-device bitmap is allocated on first use and falls back to the scan if the allocation fails,
   so a first use inside a capture is a fallback rather than a capture-time `cudaMalloc`.
+* **The gate run's tree vs the released tree is one comment digit.**  Every gate above ran on the working chain
+  build `585360d19` (tree `228628e50`).  The released tree `0d2f70e6c` (working chain `ac8515642`, canonical
+  re-cut `e695c46ce`) differs from it by exactly one character: the new comment's record pointer now says
+  `WORKLOG.md` 261122.005 instead of 261122.003 (`git diff 228628e50 0d2f70e6c` shows that one line and nothing
+  else), which cannot change codegen.  It was rebuilt (`~/bin/build-llama-rocm`, green) and the release was cut
+  from it; the gate ladder was not re-run for a comment.
 
 ## 261122.004 (r344) -- the APU arena's PINNED mapping transport is named: the issue #347 follow-up is a `--load-mode buffered` fix, not a leak
 
