@@ -1,3 +1,51 @@
+## 261122.008 (r343, no delivery change) -- wip/prefill-decode-arms: `-ib` is a single-context hack, a BIG ubatch is better on both axes, and the pair fits at 4096 now
+
+**No delivery patch changed.**  Campaign measurement + one code change in the WIP server branch (`decode_active`
+counts only prefill-arm slots).  Raised by the maintainer: `-ib` exists only because a decoder used to wait behind a
+step, so what is the prefill like with the ubatch free?
+
+### 1. Prefill vs ubatch (arena 5000, `-c 16384`, ~3700-token prompt, warm, both pins, 1 GPU)
+
+| `-b` / `-ub` / `-ib` | `lone` (one context) | **two arms** | cost | decoder in-window p50 / p95 / max |
+|---|---|---|---|---|
+| 2048 / 512 / unset (the VRAM-forced shape) | 1440.0 t/s | 1056.3 -> **1142.0** after §3 | -26.6 % -> **-20.7 %** | 49.0 / 71.0 / 114.3 ms |
+| 2048 / 2048 / 2048 | 3041.2 | **2454.5** | **-19.3 %** | 40.9 / 61.1 / 66.0 ms |
+| 4096 / 4096 / 4096 | 3884.2 | **3245.5** | **-16.4 %** | 46.2 / 56.7 / **63.3 ms** |
+
+A bigger ubatch lifts the prefill **2.7x** and the relative overlap cost **falls** (-26.6 -> -19.3 -> -16.4 %), while
+the decoder gets *smoother* (p95 71 -> 57 ms, worst 114 -> 63 ms): the maintainer's "4096 may get close to the -14 %
+prediction" is nearly there, and what is left is per-step link contention rather than policy.  **It also fits**: at
+`-ub 4096` / arena 5000 / `-c 16384` the pair runs clean with `reserve=1.50 GiB` and no OOM, which r339's landmine 8
+recorded as impossible -- r343's slab headroom is exactly the 741 MiB 2-row decode reserve that used to fail.  So
+`-ub 512` was a VRAM workaround, not a property of the design.
+
+### 2. The user-facing number at each ubatch (`interactive.py`)
+
+| `-b`/`-ub` | arm | the document | the reply's worst gap |
+|---|---|---|---|
+| 512 | single context / **two arms** | 4463 ms, 797 t/s / **2807 ms, 1252 t/s** | **390** / **95 ms** |
+| 2048 | single context / **two arms** | 1854 ms, 1961 t/s / **1448 ms, 2430 t/s** | **615** / **86 ms** |
+| 4096 | single context / **two arms** | 1291 ms, 2854 t/s / **1131 ms, 3111 t/s** | **878** / **60 ms** |
+
+The single-context stall **grows with the ubatch** (390 -> 615 -> 878 ms: one step is longer and a decoder waits the
+whole step); the two arms' stays flat at 60-95 ms while its prefill keeps improving.  On the arms path the big ubatch
+is therefore **not a trade** -- better on both axes at once.
+
+### 3. The leftover: `decode_active` counted the DECODE arm
+
+The prefill arm's `-ib` cap keyed on "some slot is GENERATING", including slots on the decode arm that no longer wait
+for this arm, so with `-ib` unset the arms' prefill was still chunked to `n_ubatch` whenever the decoder ran.  At
+`-ub 512` that cost **8.1 %** (1056.3 -> 1142.0 t/s; 10 steps of 420 ms -> 5 of 1088 ms); at `-ub >= 2048` the cap
+equalled the ubatch and was inert.  Fixed: it now counts a prefill-arm slot only
+(`slot_arm_of(slot) == SLOT_ARM_PREFILL`), with the reason in the code.  **Tier 1 re-run after the change: PASS**,
+both slots `459865c93d55cbaf` / `7dc20b0ce0bac255` (`runs/server-oracle-r343b/`) -- the ubatch *composition* is
+unchanged, only how many ubatches one step carries.
+
+### 4. Guidance that follows
+
+Run the pair at the **largest ubatch the card fits** (`-b 4096 -ub 4096` measured; the delivery's `-ub 2048` default
+is already most of the win) and **do not set `-ib`**.  The campaign's `-ub 512` advice is retired.
+
 ## 261122.007 (r343, no delivery change) -- wip/prefill-decode-arms: the interactive number, and the campaign's code on r343
 
 **No delivery patch changed** -- this is the campaign's record: its code branch was rebased onto the delivery's

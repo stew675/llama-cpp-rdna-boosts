@@ -73,7 +73,14 @@ allocation owner); **pass 5 built the server cut and tier 1 passes**.
   reports the document's TTFT, the reply's gaps **inside** the prefill window, and a per-second table of tokens
   delivered, so a freeze or a burst is visible at a glance.  First run on r343 (arena 5000, `-c 16384 -ub 512`):
   single-context **4.46 s TTFT at 797 t/s, the reply drops to 23-36 tokens/s for 5 s with 300-390 ms stalls**; two
-  arms **2.81 s at 1252 t/s, worst gap 95 ms** (`runs/interactive-2611/`).
+  arms **2.81 s at 1252 t/s, worst gap 95 ms** (`runs/interactive-2611/`) — and at the shape the pair *wants*
+  (`-b 4096 -ub 4096`, which r343 makes fit) the contrast is sharper: single-context **878 ms freeze**, two arms
+  **60 ms**, document **1131 ms at 3111 t/s**.
+* **The ubatch is the knob, `-ib` is not** (pass 5 "The ubatch answer"): at `-ub 512 -> 2048 -> 4096` the pair's
+  prefill goes **1056 -> 2455 -> 3246 t/s** (`-26.6 % -> -19.3 % -> -16.4 %` against one context, so close to the
+  -14 % prediction) while the decoder's worst in-window gap *falls* (114 -> 66 -> 63 ms).  `decode_active` no longer
+  counts a decode-arm slot (that leftover cost 8.1 % at `-ub 512`), so **`-ib` is inert on this path**: run the
+  largest ubatch the card fits and leave `-ib` unset.
 * The record: `RESULTS-2026-11-21.md` (pass 1: numbers, the three landmines, §3.4's reset experiment, §5's server
   code points, and a "Reproduce" section with the exact commands) and `RESULTS-2026-11-22.md` (pass 2: the residual
   resolved into two effects, the censuses, and the reproduce commands).  Delivery-repo commits `56443c1f`,

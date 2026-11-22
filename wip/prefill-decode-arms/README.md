@@ -164,7 +164,12 @@ line reads *smoothness delivered, cost accepted*, and the cost is **not** an ope
    default 1280 on one GPU) — with it the pair runs a ~5900-token prompt at arena 5000 / `-c 16384 -ub 512` with
    zero OOMs.  The gate's VRAM rule therefore has two levers: size the arms for their own batch, **and** leave
    enough slab headroom for the widest decode graph the pair will ever reserve.  The opt-in gate needs that rule,
-   not landmine 2's 600 MiB.
+   not landmine 2's 600 MiB.  **SUPERSEDED 2026-11-22 (r343 + the ubatch sweep, `RESULTS-2026-11-22.md` "The
+   ubatch answer")**: the shipped `GGML_CUDA_SLAB_HEADROOM_MIB` default is now 1536 MiB on one GPU, so the pair
+   runs at `-b 4096 -ub 4096` / arena 5000 / `-c 16384` with no OOM — **`-ub 512` was only ever a VRAM
+   workaround**, and at a real prefill ubatch the pair is *both* faster (`-16.4 %` prefill instead of `-26.6 %`)
+   and smoother (decoder worst gap 63 ms instead of 114).  Size the ubatch as large as the card fits; do not
+   reach for `-ib`.
 9. **A greedy hash is not an oracle for the two arms yet** (`RESULTS-2026-11-21.md` §3.3): the cold rep matches
    the sequential reference and the warm ones do not (nor each other), while the single-context 2-slot
    reference is stable across reps.  Isolated: not the handover (both paths agree), not `GGML_MOE_DEVREMAP`,
@@ -229,7 +234,7 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 | **T1** | ~~recurrent state: share it (preferred) or hand it over at a slot boundary~~ — **DONE 2026-11-21** as a device-to-device handover (`enabling-0002`), 0.5–0.7 ms, text-verified | — |
 | **T2** | ~~server skeleton: second context + second thread + routing of decode-only batches to the decode arm~~ — **DONE 2026-11-22 (pass 5)**: `llama-server --prefill-decode-arms`, `~/llama.cpp` `683deed67`, tier 1 passing cold and over 3 warm pairs (`T2-SERVER-CUT.md`'s header + `RESULTS-2026-11-22.md` pass 5) | — |
 | **T3** | handover at the request boundary, with a text oracle: a request's reply must be byte-identical to today's single-context server | **the oracle has to be chosen carefully**: it holds on a no-host-tier model and for a single handed-over request on the tier, but a 2-slot arm on a partial arena is not text-stable warm (§3.3) — use a full-residency/no-host-tier text point + KLD on the tier |
-| **T4** | policy + opt-in gate (host tier + residency deficit + the VRAM rule of §3.2), and the duty cycle's role on this path | the measured boundary: no window at full residency, so no unconditional default |
+| **T4** | policy + opt-in gate (host tier + residency deficit + the VRAM rule of §3.2), and the duty cycle's role on this path | **rules measured, gate not built**: the 2-row decode graph's **741.48 MiB** is now a shipped default (r343), so the pair fits at `-b 4096 -ub 4096` with no knob; **`-ib` is inert here** and `decode_active` no longer counts a decode-arm slot (the leftover cost 8.1 % at `-ub 512`); **bigger ubatch is better on both axes** (-16.4 % prefill and a 63 ms worst decoder gap at 4096, against -26.6 % / 114 ms at 512) |
 | **T5** | ~~measurement with `smooth.py` against the baseline table~~ — **TAKEN 2026-11-22 (pass 5 §3)**: ~47-49 ms ITL p50 / 64-78 ms p95 through a 2.0-5.3 s prefill at **-24 to -27 % prefill**; the gates of §7 are **not** run (nothing is delivery-bound) | the smoothness target is met, the <= ~14 % cost target is not; the verdict is the maintainer's |
 | **T0** | ~~the shared-KV allocator fix~~ — **DONE 2026-11-22**: `enabling-0003-shared-kv-allocator.patch`, one shared owner, per-ubatch reserve/commit/release, `llama_memory_alloc_sync()` as the handshake, `LLAMA_KV_ALLOC_SHARED=0` as the control (`RESULTS-2026-11-22.md` pass 3) | it had to land before two arms allocate cells; it also removed the scatter that moved the text |
 
