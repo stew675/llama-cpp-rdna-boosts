@@ -1,7 +1,7 @@
 # HANDOVER — `prefill-decode-arms`, state at 2026-11-22 end-of-session (passes 6-9)
 
 **For a fresh session with no context. Read this file top to bottom before touching anything.**  It supersedes the
-pass-5 handover; that one is in git history (`git -C ~/llama-cpp-rdna-boosts show 7b784bc0:wip/prefill-decode-arms/HANDOVER.md`),
+pass-5 handover; that one is in git history (`git -C ~/llama-cpp-rdna-boosts show 7b784bc0:archive/work/prefill-decode-arms/HANDOVER.md`),
 and the dated record of every pass is [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) (passes 2-8) and
 [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md) (pass 1).
 
@@ -349,7 +349,7 @@ maintainer has scoped it to the follow-up campaign.
 cd ~/llama.cpp && git checkout wip/prefill-overlap && BUILD_DIR=build-2ctx JOBS=24 ~/bin/build-llama-rocm-101
 
 # tier 1 (product shape, 35B host tier): cold, then the 3 warm pairs, then the compare
-cd ~/llama-cpp-rdna-boosts/wip/prefill-decode-arms/arms
+cd ~/llama-cpp-rdna-boosts/archive/work/prefill-decode-arms/arms
 OUT=$PWD/../runs/oracle-$(date +%H%M) ./gate-server-arms.sh --mode ref
 OUT=$PWD/../runs/oracle-$(date +%H%M) ./gate-server-arms.sh --mode arms
 ./gate-server-arms.sh --compare ../runs/oracle-HHMM/ref.txt ../runs/oracle-HHMM/arms.txt

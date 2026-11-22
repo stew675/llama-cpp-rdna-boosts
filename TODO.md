@@ -391,3 +391,79 @@ Candidates (all already documented as opt-in in `ENVIRONMENT.md`): `LLAMA_KV_N_P
 spill/window budgets (`LLAMA_KV_SPILL_RAM_PCT`, §1.2's `MOE_EXPERT_CACHE_MIB`-adjacent knobs are tuning, not
 opt-in -- check the row's class before migrating), and the `GGML_CUDA_*` opt-ins §7 lists as "opt-in, default
 OFF".  A tag is only for a feature that is **off by default**; a kill-switch is not a tag.
+
+## 364. Speculative decoding WITH the two arms (block 17) — refused today, and that is the follow-up campaign
+
+Block 17's pair **refuses** `--spec-type`: `--prefill-decode-arms-mode auto` falls back to the single-context
+server and runs MTP, `on` refuses to start.  The refusal is deliberate and measured (`pass 18`), not an oversight:
+the decode arm owns its slots' KV and the recurrent state moves at a request boundary, while a speculator needs a
+**verify batch** (a multi-row decode) on the target plus a draft context whose KV is its own.  Nothing about the
+two features is known to be incompatible; what is missing is (a) the verify batch composition on the decode arm,
+(b) the draft ring's interaction with the shared cursor (`--spec-draft-kv-window`, block 14) and (c) an oracle: the
+pair's purity claims are text comparisons, and a speculator's greedy text must equal `none`'s on the same shape
+(`GREEDY-PURITY.md` §63/§96 for the rules that a co-batched verify must obey).  Until then the refusal message
+names the reason, and the single-context server keeps MTP.
+
+## 365. A meta-aware device copy for the state handover (block 17) — a cost item, not a defect
+
+On a **hybrid** model with `-sm tensor`, a request boundary hands the sequence's recurrent state over through a
+**serialised** host round trip: measured **~74.6 ms** per boundary moving **112.57 MiB**, and it lands in TTFT.  The
+batched device-to-device take (`llama_memory_recurrent::seq_state_take()`) is 0.45-0.66 ms where a single device
+owns the rows, but a meta backend exposes no device copy hook for this buffer, so `LLAMA_RS_FORCE_SERIALISED` is
+what actually runs there — `-sm layer` and 1 GPU are unaffected.  The work is a meta/S2D copy path for that take
+(in the shape block 12's segmented tail already uses), plus an oracle that the copied state is byte-identical to
+the serialised arm's (`LLAMA_RS_VERIFY_TAKE=1` is the readback instrument that exists for this).
+
+## 366. Derive the decode context's declared reserve from the decode WIDTH (block 17)
+
+The second-context graph reserve block 17 declares is a flat **3584 MiB** (`MOE_EXPERT_CACHE_AUX_RESERVE_MIB`), the
+same flat number an embedded MTP head gets.  The measured need is much smaller and scales with the decode width:
+**1792 MiB** on Flash-Next IQ3_S, **9.52 MiB** on the 4B.  A flat reserve is the safe direction for an arena (it
+declares too much, so the second context is never refused), but on a shape where the arena is the thing being
+sized it costs arena capacity for nothing.  The fix is the draft path's own pattern: estimate from
+`n_ubatch`/`n_batch` and the model's per-layer activation terms, and keep the flat value as the floor.  The
+non-vacuity test is a host-tier load whose `SLAB_INIT ... aux=` is non-zero and whose arena still serves the pair.
+
+## 367. `GLM5-Next` on the two-arm server (block 17) — same memory module, no checkpoint on this box
+
+`GLM5-Next` uses the same `llama_memory_hybrid_idx` memory as qwen4exp (attention KV + recurrent state + lightning
+indexer KV), i.e. exactly the module whose missing shared view was block 17's P0.  The fix is module-level, so it
+should cover GLM5-Next by construction — but "should by construction" is not a measurement, and no GLM5-Next
+checkpoint exists on this box.  Whoever has one owes the coverage matrix's row: both arms, layer and tensor split,
+2 and 3 GPUs, text identical (and the `implements no shared view` warning absent from the log).
+
+## 368. The recurrent-ONLY memory has no handover (block 17) — and no such model here to measure it
+
+`llama_memory_seq_state_take()` refuses anything that is not a **hybrid**: it moves the recurrent half of a hybrid
+memory and leaves the attention cells alone (they are shared).  A pure recurrent model (a Mamba-class
+architecture with no attention KV at all) would therefore get **no state at all** on the second arm, so the pair
+would either refuse it or silently run it on an empty state.  This is a gap in the take, not in the sharing — there
+is no attention KV to share.  No model of that class exists on this box, so the row is parked until one does;
+the correct shape is the same take with the recurrent half as the whole state.
+
+## 369. Three more gate defaults still name the RETIRED Flash-Next IQ3_XXS tree — repoint them **and** re-anchor, together
+
+`gate-park-idle-slots.sh`, `gate-moe-promise.sh` and `gate-host-pool.sh` were repointed to the maintainer's
+quality-first replacement, `Qwen3.8-Flash-Next/STEW675-IQ4_NL/Qwen3.8-Flash-Next-MTP4-IQ4_NL-00001-of-00002.gguf`
+(r346; the IQ3_XXS build is gone from this box).  Three more still name it and were **deliberately not**
+repointed in that change, because each carries *recorded text/KLD anchors for the BF16-hc / all-VRAM class* —
+a new model is a new class, so a path edit alone would leave a gate that passes nothing:
+
+* `gate-hc-base-copy.sh` (MODEL default),
+* `gate-hc-fusions.sh` (`MODEL_ROOT/GSQ-IQ3_XXS/...`, and its header records the measured hashes for that class),
+* `gate-host-expert-text.sh` (its header sizes the run at 75.8 GB / ~71 GiB peak RSS).
+
+The work is one change: repoint each to the STEW675 IQ4_NL tree, re-record its anchors **on that class** (the
+`--kld`/record paths already exist), and correct the headers' numbers.  Until then those three refuse at the
+model check rather than run on a wrong anchor — which is the correct failure, not a defect.
+
+## 370. The pair's KV cells after `POST /slots/N?action=erase` (block 17)
+
+Measured with `scripts/gate-arms-soak.sh soak` (4B, `-np 3 -c 8192`, six rounds of distinct ~2600-token prompts): the cache
+fills to **8174 of 8192** cells and stays bounded (no leak -- the server keeps answering), and after erasing all three slots
+the next tiny request's ubatch reads **used=5446**, i.e. the erases released about **one** resident prompt's cells, not three.
+Two things are true and only one is a defect: `?action=erase` erases a slot's **saved state** (block 12's slot cache), not its
+KV cells, and on the pair the idle slots' cells legitimately stay resident because **parking is declined** by the co-owner
+guard.  What is open is whether the pair *should* release all three (a slot whose state is erased has no prompt to keep), and
+what the accounting should read afterwards.  The gate records the number rather than asserting it; turning it into an
+assertion is this item.

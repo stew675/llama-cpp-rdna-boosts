@@ -1,7 +1,7 @@
 # PROMOTION HANDOVER — promote `--prefill-decode-arms` as official block `0017`
 
-**For a fresh cold session. Read this top to bottom, then `wip/prefill-decode-arms/RESULTS-2026-11-22.md` passes 10-18
-(the record behind every claim here) and `wip/prefill-decode-arms/HANDOVER.md` (the technical state of the feature).**
+**For a fresh cold session. Read this top to bottom, then `archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` passes 10-18
+(the record behind every claim here) and `archive/work/prefill-decode-arms/HANDOVER.md` (the technical state of the feature).**
 
 This document is a **job ticket**, not a technical narrative. It says what to do, in what order, what "done" means,
 and which decisions are already made (so you do not re-litigate them) versus which are yours to stop and ask about.
@@ -147,7 +147,7 @@ All of these already have a runner in the campaign; the job is to make them **de
 
 | gate | acceptance |
 |---|---|
-| `wip/prefill-decode-arms/runs/coverage-matrix/matrix.sh` | **16/16 PASS** — 35B-A3B, Gemma4 26B-A4B, Flint (`-sm relaxed-tensor`), 27B × {layer, tensor} × {2, 3} GPU, arms-on text == arms-off byte for byte |
+| `archive/work/prefill-decode-arms/runs/coverage-matrix/matrix.sh` | **16/16 PASS** — 35B-A3B, Gemma4 26B-A4B, Flint (`-sm relaxed-tensor`), 27B × {layer, tensor} × {2, 3} GPU, arms-on text == arms-off byte for byte |
 | `runs/host-tier-single-gpu/verify-postfix.sh` | **8/8 PASS** — the four models at 1 GPU `-ncmoe 48` with a **default arena and no knob**, plus Flash-Next 2/3 GPU, 3 GPU tensor, and `-c 204800 --parallel 3` |
 | `runs/host-tier-single-gpu/verify-3g-cap.sh` | **3/3 PASS** with `MOE_EXPERT_CACHE_MIB=13653` (40 GiB total) — `h` **identical between arms** (0.9352 / 0.9376), i.e. residency-class matched |
 | `runs/coverage-matrix/` tier-1 reuse oracle (`arms/gate-server-reuse.sh`) | `GATE=strict` PASS on 4B/phi-4/35B, `GATE=parity` PASS everywhere, `TWO_SLOT=1` PASS, `FORK_REUSE=1` on a dense model, `CONCURRENT=1` as **stress only** (no text claim, `GREEDY-PURITY.md` §63) |

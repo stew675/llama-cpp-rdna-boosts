@@ -1921,7 +1921,7 @@ it is drawn on by *every allocation made after the extension* — including one 
 prefill transient at all.
 
 **Why it moved, measured.**  A **second context's graph** comes up mid-run (a draft context;
-`wip/prefill-decode-arms`' decode arm) and its reserve is a single large allocation.  The two-arm server's **2-row
+`archive/work/prefill-decode-arms`' decode arm) and its reserve is a single large allocation.  The two-arm server's **2-row
 decode graph asks for 741.48 MiB in ONE allocation**; at 1280 it failed with `ggml_cuda_device_malloc: 741.48 MiB
 allocation failed ... the movable-boundary slab holds the VRAM; the arena cannot yield physical back to the driver`
 → `failed to reserve graph buffers` → `ret = -2`, on the *first 2-row step* (a 1-row decode step had run for 5.5 s
@@ -1936,7 +1936,7 @@ appear then (a second/third context's graph reserve, per active-slot width), not
 `ret = -2` from `llama_process` on the first step that changes a context's batch WIDTH is this class; raising
 `GGML_CUDA_SLAB_HEADROOM_MIB` is the lever that does not cost arena on a budgeted shape.
 
-Record: `WORKLOG.md` 261122.005; `ENVIRONMENT.md` §1.3; `wip/prefill-decode-arms/RESULTS-2026-11-22.md` pass 5 §4.
+Record: `WORKLOG.md` 261122.005; `ENVIRONMENT.md` §1.3; `archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` pass 5 §4.
 
 ## r344 — on an APU GTT **arena**, the read transport is the page-cache decision, `dio` keeps the mapping, and the warning that should have named it never fired (block 15, issue #347 follow-up)
 
@@ -2007,3 +2007,62 @@ Record: `WORKLOG.md` 261122.004; `ENVIRONMENT.md` §20; `patches/README.md` bloc
 
 Record: `WORKLOG.md` 261122.005, `benchmarks/2026-11-22-gather-bitmap.md`, `patches/README.md` block 09,
 `ENVIRONMENT.md` §2 (`MOE_GATHER_MASK`, `MOE_GATHER_NSPLIT`), `GREEDY-PURITY.md` §104, issue #350.
+
+## r346 (2026-11-22, `WORKLOG.md` 261122.027) — the two-arm server: a memory module that does not implement the shared view is SILENTLY blind, a second context's reserve must be DECLARED, and the pair's residency class is the arena's (block 17)
+
+Promoted the `prefill-decode-arms` campaign as official **block 17** (`--prefill-decode-arms`,
+`--prefill-decode-arms-mode off|on|auto`, **default OFF / opt-in only**).  The engineering facts:
+
+1. **Every memory module must implement the shared view, or the pair is blind — and the failure is SILENT
+   GARBAGE, not an error.**  `create_memory()` gave the decode arm a shared view of the plain KV and the plain
+   hybrid memory; `llama_memory_hybrid_idx` (qwen4exp: attention KV + recurrent state + lightning indexer KV)
+   and `llama_kv_cache_iswa` (gemma4, sliding window) did not, while the server still printed
+   `KV shared, one allocation owner`.  The decode arm then ran on an **empty** attention cache and an empty
+   indexer cache, so an **82 615-token** request answered as if only its tail were present ("the model cannot
+   see the files") and gemma4 emitted `COCOCOCO…` on **1, 2 and 3 GPUs**.  Both are one bug class, found twice
+   (the second time by the coverage matrix, not by any gate).  The engine's
+   `W create_memory: ... implements no shared view -- this context has its OWN cache` line existed and **nothing
+   read it**; it is load-bearing now, and `mem_other_used` makes it impossible for it to lie.  A co-owner also
+   has to be **forwarded to both children** of a composite memory (an iswa pair has one allocation owner PER
+   cache, so the request-boundary handshake must ask both) and an existing **mirror** path (gemma4's assistant)
+   must keep passing `other_coowner = false`, because a mirror that touches the source's bookkeeping reads
+   garbage.  After the fix: 30 shared layers in the log, `h-on` == `h-off`, content byte-identical to the
+   single-context server.
+2. **A second context's graph reserve must be DECLARED before the arena claims the space, and a PARTIAL
+   declaration fails.**  The movable-boundary slab is created at load; the decode context's graph reserve arrives
+   after it.  On a host-expert tier that made the arena refuse the second context (`the decode arm's step
+   failed`, `SLAB_INIT ... aux=0`).  The reserve is now declared up front the same way an embedded MTP head's
+   draft context declares its own, with **no KV term** (the pair shares one cache): a flat **3584 MiB** via
+   `MOE_EXPERT_CACHE_AUX_RESERVE_MIB`, and a manually set `GGML_CUDA_SLAB_RESERVE_MIB` still wins.  It is
+   **never charged when a speculator is configured** — the pair refuses a speculator, so the reservation would
+   be pure waste (that bug would have cost an MTP run 3.5 GiB).  Measured need for the *derived* form (a
+   follow-up, `TODO` #366): 1792 MiB Flash-Next, 9.52 MiB on the 4B.
+3. **A BUDGETED arena puts both arms in one RESIDENCY CLASS; an `auto` arena does not.**  A text reference is
+   per device count, per split **and per residency class** (§89): with `MOE_EXPERT_CACHE_MIB=13653` (40 GiB
+   total) the expert cache's hit rate is **identical between arms** (`h` 0.9352 / 0.9352) and the pair's text
+   equals the single context's; against an `auto` arena the two arms land in different classes and the
+   comparison is not an oracle at all.  So a host-tier text claim must name the budget, and the maintainer's
+   `-c 204800 --parallel 3` 3-GPU tensor shape passes there too.
+4. **The indexer pool is laid out from CELLS and is PER CONTEXT, so a restore or a handover must stale it.**
+   A checkpoint restore moves a sequence's attention cells behind the pair's derived indexer pool, so a
+   `cache_prompt` repeat could not see the prefix it had just reused even after the shared view was fixed.  The
+   handover therefore re-derives it; a memory whose second cache MIRRORS the attention cells must also never be
+   told to park the attention cache alone (block 12's r146 rule, restated here because the pair reaches it).
+5. **Default OFF is bit-identical, and the oracle for that is a REPRODUCTION of the previous release's
+   record, not just an A/B.**  Flag off, both ROCm lines: prefill-logit KLD **0.000000 / 100.000 %** and the
+   same `base_sha256` as the r343-era reference (`ce8bb26f…`), 4/4 shipped shapes byte-identical, and the MTP
+   four-axis protocol reproduces the **r328 record's text hashes and acceptances exactly**
+   (`218515b89b31`/`a87c4318b649`/`27d74f92ec5c`/`6fa43035b8d9`, acceptance `0.34306`/`0.96652`/`0.63593`/
+   `0.73478`, q8_0 `3a70dd34be92`/`b29f3176fa31`/`45f5e6db9dc2`/`a87c4318b649`).  A block that touches
+   `create_memory()`, the KV allocator and the memory modules the *draft* context also uses owes all of that —
+   the MTP arm is a real risk, not a formality.
+6. **The pair's own contract, so it is not re-litigated:** the prefill/decode overlap costs **-21…-24 %**
+   prefill (flat from `-ub 2048` up; `-ub 4096` is the sweet spot) to hold a decoder at 47-49 ms p50 / 64-78 ms
+   p95 through a 2-5 s prefill where the single context stalls 300-880 ms; a `-sm tensor` hybrid state boundary
+   takes the **serialised** move (~74.6 ms, 112.57 MiB) because a meta-aware device copy is a follow-up; a
+   co-batched two-slot pair is **stress only, never a text oracle** (§63); `-ib` and `LLAMA_SERVER_PREFILL_DUTY`
+   are **deprecated and inert** on this path (both bound a stall inside a SHARED step); and the pair refuses
+   `--spec-type`, so speculative decoding with the arms is a separate campaign.
+
+Record: `WORKLOG.md` 261122.027, `patches/README.md` block 17, `ENVIRONMENT.md` §23,
+`archive/work/prefill-decode-arms/` (`RESULTS-2026-11-22.md` passes 2-18), `MANIFESTS.md` block-17 row.

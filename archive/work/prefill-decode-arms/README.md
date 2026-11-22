@@ -1,5 +1,14 @@
 # prefill-decode-arms — one prefill arm and one decode arm, both live on one GPU
 
+> **PROMOTED (r346, 2026-11-22) — this campaign is official delivery block 17.**  `--prefill-decode-arms` /
+> `--prefill-decode-arms-mode off|on|auto` ship **default OFF, opt-in only** (the maintainer's decision: the pair
+> buys a decoder's interactivity for -21…-24 % prefill, so it is an operator's trade, not a default).  The
+> delivery record is `patches/README.md` → block 17, `ENVIRONMENT.md` §23, `INVARIANTS.md` r346,
+> `GREEDY-PURITY.md` §105, `MANIFESTS.md`'s block-17 row, and `WORKLOG.md` 261122.027; `TODO` #364-#369 hold the
+> work that deliberately did not ship.  Everything below is the campaign record as it was written, kept verbatim
+> — it is the evidence behind the block, not a description of the delivery.  The two measured losers
+> (`3f2768131`, `540d442a8`) are **not** in the block and live only here.
+
 **Status: pass 10 (2026-11-22) — opt-in only, and the P0 is CLOSED.**  `llama-server --prefill-decode-arms` is the
 design (a prefill arm + a decode arm on one shared KV, a slot crossing only at a request boundary).  The last open
 blocker — on Qwen3.8-Flash-Next (`qwen4exp`) a ~70K-token prompt with five attached files answered as if the model

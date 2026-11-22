@@ -91,7 +91,7 @@ width** — a 2-row decode graph on 35B-A3B at `-ub 2048` asks 741.47 MiB, so `-
 Run it first, before writing any server code, so the baseline is in hand:
 
 ```bash
-cd wip/prefill-decode-arms/arms
+cd archive/work/prefill-decode-arms/arms
 ./gate-server-arms.sh --mode ref                               # today's single-context server
 ./gate-server-arms.sh --mode arms                              # after the cut (needs --prefill-decode-arms)
 ./gate-server-arms.sh --compare ../runs/server-oracle/ref.txt ../runs/server-oracle/arms.txt

@@ -38,14 +38,18 @@
 #
 # Environment:
 #   LLAMA_SERVER   llama-server binary   (default: ~/llama.cpp/build-rocm/bin/llama-server)
-#   MODEL          target GGUF           (default: the Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS tree)
+#   MODEL          target GGUF           (default: the Qwen3.8-Flash-Next STEW675 IQ4_NL tree, the quality-first
+#                                          replacement for the retired IQ3_XXS build; it carries an EMBEDDED MTP4
+#                                          head, so DRAFT is normally empty)
 #   DRAFT          MTP draft GGUF        (default: the sidecar next to MODEL); empty = no draft
 #   SPEC_TYPE      speculative type      (default: draft-mtp, used only when DRAFT is set)
 #   PROMPT         the long prompt       (default: prompts/prose-rdna-boosts.txt)
 #   SM             split mode            (default: tensor)
-#   NCMOE          n-cpu-moe             (default: 0)
+#   NCMOE          n-cpu-moe             (default: 48 -- the 94 GB default model needs a host tier on 3 x 32 GiB)
 #   NGPU           GPUs                  (default: 3 -> HIP_VISIBLE_DEVICES=0,1,2)
-#   CTX            context               (default: 40960)
+#   CTX            context               (default: 40960; the 94 GB default model needs `CTX=16384` or
+#                                          `NCMOE>=56` at 40960 on 3 x 32 GiB -- measured r346: the model loads
+#                                          and the CONTEXT allocation then fails, 1457 MiB short on device 0)
 #   NGEN           tokens per request    (default: 96)
 #   PORT           server port           (default: 18099)
 #   EXTRA_ARGS     extra llama-server args (default: the qwen4exp PLE placement + load flags)
@@ -56,8 +60,8 @@ set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLAMA_SERVER="${LLAMA_SERVER:-$HOME/llama.cpp/build-rocm/bin/llama-server}"
-FLASH_NEXT="${FLASH_NEXT:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS}"
-MODEL="${MODEL:-$FLASH_NEXT/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}"
+FLASH_NEXT="${FLASH_NEXT:-/llm/models/Qwen3.8/Flash-Next/STEW675-IQ4_NL}"
+MODEL="${MODEL:-$FLASH_NEXT/Qwen3.8-Flash-Next-MTP4-IQ4_NL-00001-of-00002.gguf}"
 if [ -z "${DRAFT+x}" ]; then
     DRAFT="$FLASH_NEXT/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
     [ -f "$DRAFT" ] || DRAFT=""
@@ -65,12 +69,18 @@ fi
 SPEC_TYPE="${SPEC_TYPE:-draft-mtp}"
 PROMPT="${PROMPT:-$REPO_DIR/prompts/prose-rdna-boosts.txt}"
 SM="${SM:-tensor}"
-NCMOE="${NCMOE:-0}"
+# NCMOE default 20 (r346): the repointed default model (STEW675 IQ4_NL, 94 GB) does not fit three 32 GiB
+# cards, so the shipped shape keeps a host tier.  `NCMOE=0` is still the arm for a model that fits.
+NCMOE="${NCMOE:-48}"
 NGPU="${NGPU:-3}"
 CTX="${CTX:-40960}"
 NGEN="${NGEN:-96}"
 PORT="${PORT:-18099}"
-EXTRA_ARGS="${EXTRA_ARGS:--ot per_layer_token_embd.*=CPU -lm none -lzm off}"
+# r346: the repointed default model (STEW675 IQ4_NL, an EMBEDDED MTP4 head) wants the campaign's host-tier
+# shape -- `--load-mode dio --lazy-mode on` -- NOT the retired GSQ-IQ3_XXS trio
+# (`-ot per_layer_token_embd.*=CPU -lm none -lzm off`), which forced the PLE to the CPU with lazy loading OFF
+# and made the park arms diverge on a model whose PLE placement is different.
+EXTRA_ARGS="${EXTRA_ARGS:---load-mode dio --lazy-mode on}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 mkdir -p "$KEEPOUT"
 

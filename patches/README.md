@@ -719,6 +719,7 @@ packed one on a tile-selected layout, +0.6-1.3 % pp512 there and one abort class
 | 14 | `0014-…-block-14-the-streamed-KV-a-fixed-VRAM-re` | **streamed KV** (opt-in, `--kv-window N\|auto`; the attendance pool `--kv-attendance-pool on\|off`; the MTP draft window `--spec-draft-kv-window N\|auto`, default `0`) (+ r248: the MTP draft window is a true ring for batches whose positions do not advance, a drafter failure can no longer fail a request, and the reserve reads the draft context's own ubatch — issue #297; + r264: the attendance pool is NOT SUPPORTED on a shared host/device pool (refused by design, one WARN — `TODO` #300 retired), `--fit` offers a placement only where this model+device can take it and prints the advice at WARN, and `gate-kv-residency.sh` grades the refusal, the hint and its own UMA reference arm; + r286: a region-backed buffer's 2-D state directions are **1-D only in both interfaces** (a 2-D device copy on the window's VMM region is refused by the driver on some stacks, which aborted a mixed gfx1100+gfx1201 `-sm tensor` server's prompt-cache save — issue #313), the block is gathered/scattered on the device (`ggml_cuda_cpy_2d_rows`) so a slot save+load went 4 686 → 24.5 ms on a windowed split, `--kv-window`/`--kv-attendance-pool` are common options (they were missing from `llama-bench` and every other non-server tool), `llama-bench` accepts `--kv-window`, and the spill's per-token cost is modelled on the **calibrated in-place read rate** (16-29 GB/s on gfx1201, its own measurement rather than the copy engine's, which is the number that diverges on a card reading its aperture slowly) — `ENVIRONMENT.md` §17.0, `benchmarks/2026-11-14-kv-window-313.md`); **r294: this is the block that makes a hole MAPPING-BACKED, so it carries the storage/transport split** — `host_expert_master_mapped()` (a hole set exists and `llama_mmap::SUPPORTED`) replaces five `use_mmap` tests, in `host_expert_buft`, both pool gates, `init_mappings` and the per-tensor mapped-or-read decision, so NO load mode can turn `-lme` into "pin the whole set" (measured: `-lme 30` under `--load-mode dio` pinned 48 284.6 MiB with no pool before, 31 363.7 MiB with the pool after, 0 mapping memcpys in both); **r295: the shipped text loses the superseded `11-26 %` spill cost** — `common/arg.cpp`'s `--kv-window` help line and `common/fit.cpp`'s placement hint now say the cost is linear in the depth past the window (nothing at or above the run depth), which is what the docs have said since r292 -- `TODO` #331, no computed number moves | +8004 / −971 | 51 |
 | 15 | `0015-…-block-15-the-UMA-GTT-expert-store-an-APU` | **the UMA GTT expert store** (an APU's MoE expert set in one registered, mlocked region; `-lme` sizes it and is the streaming opt-in) | new in r263: the arena tier per `-lme`, the MTP head pinned outside that budget, the direct fill, the RDNA3_5 transport start arm and prefill streaming.  A model whose weights do not fit RAM is refused at load with the fix; the store/arena is inert on a discrete GPU (measured); **r294: the PLACEMENT transport is the one decision that must NOT follow `--load-mode`,** so `MOE_HOST_POOL_BULK_DIO` is renamed `MOE_HOST_POOL_PLACEMENT_MODE=dio|buffered` and is reported once per load (`+1 675 MiB` of page cache on `dio` against `+31 796 MiB` on `buffered` for a 47.9 GiB placement, measured cold), and `-lme mirror` reaches the GTT store's budget too; **r295: the pool exchange's inertness is NAMED** — the exit census reports `sink no-demote tables (...)`, the sub-mirror pools whose demote cannot be expressed (`n_slices != 0` or `host_bytes != expert_bytes`), so a `-sm tensor` split's `0 demoted / 0 declines / 0 retirements` carries its reason -- `TODO` #334; **r337: the ARENA arm declares its hole set, so its master is the read-only model mapping** (issue #347).  The arena makes no `-lme` plan by construction, so `host_expert_master_mapped()` said "not mapped" and the loader allocated a pageable copy of the WHOLE expert set on every `--load-mode` (18 662.0 MiB / 23 649 MiB peak `RssAnon` on 35B-A3B; 46 800 MiB in the reporter's Flash-Next).  `plan_gtt_expert_store()` now records its tables in `host_experts_holes`, and the predicate accepts the arena as a hole source; the two census lines that named the discrete pool on this tier were corrected | +4949 / −368 | 16 |
 | 16 | `0016-…-block-16-the-server-s-prompt-admission-p` | **the server's prompt admission policy**: the max-min fair share of the step, the per-step `CHUNK`, the shortest-remaining `SKEW` and the prefill/decode `DUTY` cycle (moved OUT of block 12 at r301 -- `TODO` #339; `ENVIRONMENT.md` §22) | +367 / −2 | 3 |
+| 17 | `0017-…-block-17-the-two-arm-server-an-opt-in-pr` | **the two-arm server**: an opt-in prefill arm + decode arm co-owning one KV (`--prefill-decode-arms`, `--prefill-decode-arms-mode off\|on\|auto`, **default off**; `ENVIRONMENT.md` §23) | +2168 / −105 | 23 |
 | 0300 | `0300-…-block-0300-relaxed-tensor-split-mode-TEM` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` (in the default apply, but NOT an official block: it is not counted in `v<N>`) | +130 / −17 | 12 |
 
 Block 05's file count is `template-instances/*.cu` (the FA kernel instantiations); block 10 is the
@@ -6303,6 +6304,147 @@ are in `MANIFESTS.md` (30 and 31).  **What the duty cycle is not:** it is not a 
 per-step cost is dominated by a fixed term (a pooled/streamed KV), where the time cap collapses the burst to one
 or two steps and the prefill stretch is what is left; the gate reports that shape as "no room to improve"
 instead of pretending.
+
+## Block 17 — the two-arm server: a prefill arm and a decode arm co-owning one KV (**opt-in, default OFF**)
+
+`llama-server --prefill-decode-arms` keeps **two `llama_context`s on one model**: a **prefill arm** (the main
+loop, `ctx_tgt`) and a **decode arm** (`ctx_dec`, its own thread) that co-own the prefill arm's KV cells.  A slot
+crosses from one arm to the other only at a **request boundary**, and a hybrid model's recurrent state follows
+it **device to device**.  The point is a decoder's interactivity: a reply generating while another slot's prompt
+is being prefilled does not wait for the prefill's steps.
+
+```
+--prefill-decode-arms            (env LLAMA_ARG_PREFILL_DECODE_ARMS=1)   explicit: refuse to start if not honourable
+--no-prefill-decode-arms
+--prefill-decode-arms-mode M    off | on | auto            (default: off)
+```
+
+**The delivery default is `off`, and that is a decision.**  A run that does not ask for the pair allocates,
+reserves and logs exactly what the single-context server does — see *the default path is bit-identical* below.
+It is not `auto` because the pair **costs prefill** to buy a decoder's smoothness, so it is an operator's trade
+for the shape they have, not a default.  `auto` = enable when the shape can carry it (≥ 2 slots, nothing the
+pair refuses) and **fall back** to the single-context server with a warning; `on` = refuse instead, so an
+operator who asked for it is never silently downgraded.
+
+### What it contains
+
+* **The second context.**  `llama_context_params::ctx_other_share_memory`, the generic same-model `ctx_other`
+  gate, and `llama_kv_cache::other_coowner`: a second context **OWNS** cells in the shared map.  A mirror
+  (gemma4's assistant path) must keep touching nothing, because a mirror that exercised the mutable paths read
+  garbage.
+* **A shared view of the KV for every memory module the pair can reach** — plain KV, plain hybrid, `hybrid_idx`
+  (attention KV + recurrent state + lightning indexer KV, i.e. qwen4exp) and `iswa` (sliding-window, gemma4).
+  A module that does not implement the view leaves the decode arm on an **empty** cache while the server prints
+  `KV shared` — silent garbage on a long prompt (the campaign's P0: an 82 615-token request that answered as if
+  only its tail were present).  `create_memory()` now warns `implements no shared view` and that line is
+  **load-bearing**; `INVARIANTS.md` r346.
+* **One allocation owner for the co-owner pair** — `struct llama_kv_alloc`: per-ubatch
+  reserve/publish/release plus `llama_memory_alloc_sync()` as the request-boundary handshake, called on both
+  arms and asserted clean inside a quiet window.  `LLAMA_KV_ALLOC_SHARED=0` is the A/B control; the legacy path
+  let two allocating arms be handed the same cells between `find_slot()` and `apply_ubatch()`.
+* **The recurrent-state handover** — `llama_memory_recurrent::seq_state_take()`, ONE batched device-to-device
+  copy of a sequence's recurrent rows and cell metadata (0.45-0.66 ms against 34.5-36.1 ms serialised for
+  52.7 MiB), plus `llama_memory_seq_state_take()` at llama level, `seq_rm_recr()` and
+  `LLAMA_STATE_SEQ_FLAGS_RECR_ONLY` for the serialised control.
+* **The REVERSE handover** — at the return the decode arm frees nothing and the main thread takes the recurrent
+  state **back** to the prefill arm and keeps the prompt, so a finished conversation stays resident and the next
+  request on that slot reuses its prefix (measured 685 → 33 ms per appended chat turn, i.e. single-context
+  parity at 33-34 ms) instead of re-prefilling it.
+* **The indexer pool follows a handover** — qwen4exp's derived indexer pool is laid out from CELLS and is per
+  context, so a restore or a handover must stale it; otherwise a `cache_prompt` repeat cannot see the prefix it
+  has just reused.
+* **The declared second-context graph reserve** — the decode context's reserve is declared **before** the arena
+  claims the space, exactly as an embedded MTP head's draft context is: a flat 3584 MiB
+  (`MOE_EXPERT_CACHE_AUX_RESERVE_MIB` overrides; a manual `GGML_CUDA_SLAB_RESERVE_MIB` still wins).  Without it a
+  host-expert tier refused the second context because the reserve arrived after the movable-boundary slab was
+  created; it is never charged when a speculator is configured (the pair refuses one, so it would be waste).
+* **The `-sm tensor` safety work the pair needs** — the take's null-buffer views (a keys-only cache's shared
+  layer has no `v`), a serialised state-move fallback for a buffer with no device copy, and a `thread_local`
+  4-slot meta view selector so the two arms cannot race one view container.
+* **The server cut** — `ctx_dec` beside `ctx_tgt`, a second `server_batch`, `slot.arm` plus the arm handshake,
+  the handover posted to a decode thread, `post_decode`'s sample/stop/emit factored into
+  `slot_step(ctx, batch, slot, row)` and shared by both arms, and `llama_memory_alloc_sync` at every request
+  boundary.
+
+### Knobs, refusals and deprecations
+
+`ENVIRONMENT.md` §23 is the catalogue: `LLAMA_KV_ALLOC_SHARED` (A/B kill switch, default on),
+`LLAMA_RS_FORCE_SERIALISED` (force the serialised state move), and the diagnostics `LLAMA_RS_VERIFY_TAKE`,
+`LLAMA_RS_DEBUG_TAKE`, `LLAMA_RS_DEBUG_CELLS`, `LLAMA_KV_DEBUG_CELLS`, `GGML_META_DEBUG_SET` — all
+presence-gated and inert by default.
+
+**Refused** (the server exits, or `auto` falls back): `--spec-type` (speculative decoding with the arms is a
+follow-up campaign), mtmd/mmproj, TTS, realtime, embeddings/rerank/decision, LoRA adapters, `--sleep-idle`,
+backend sampling.  `-np 1` warns and stays single-context.  **`-ib` and `LLAMA_SERVER_PREFILL_DUTY` are
+reported deprecated and inert whenever the pair runs**: both bound a decoder's stall inside a SHARED step, and on
+this path the decoder has its own context and thread.  An explicit `--prefill-decode-arms` /
+`--no-prefill-decode-arms` overrides `--prefill-decode-arms-mode` (whichever comes last wins).
+
+### The measured win, and its price
+
+| shape (1 × R9700 unless stated) | single context | two arms |
+|---|---|---|
+| decoder ITL through a 2.0-5.3 s prefill (`arena 5000, -c 8192 -ub 4096 -np 2`) | stalls 300-880 ms | **47-49 ms p50, 64-78 ms p95** (worst 92-119 ms) |
+| prefill cost of the overlap | — | **-21…-24 %** (flat from `-ub 2048` up; `-ub 512` is worse at -24…-27 %) |
+| fully resident 27B (3 GPU), prefill rate | **4029 t/s at 924 ms** | **4786 t/s at 737 ms**, worst in-window gap **34.9 ms** (single: 327.3 ms), **53** vs 32 tokens through the window |
+| an appended chat turn on a resident conversation | 33-34 ms (its own reuse) | **33 ms** (parity) |
+
+`-ub`/`-b` **4096** is the sweet spot: the overlap cost is flat from 2048 up while the ubatch buys absolute
+prefill rate (+29 % from 512 to 4096), and 8192 buys a further +8 % prefill for a worse decoder tail (124.5 vs
+95.1 ms).  **The cost is accepted**, not missed: -24…-27 % beats the ~-75 % the smaller-ubatch workaround cost,
+and the campaign's point is smoothness (worst gap 95 ms against 390 ms).  Numbers of record and every caveat:
+`wip/`-era record preserved under `archive/work/prefill-decode-arms/` (`RESULTS-2026-11-22.md` passes 2-18),
+`WORKLOG.md` 261122.027, `INVARIANTS.md` r346.
+
+### The default path is bit-identical (the "opt-in only" proof, r346)
+
+With the flag **off** against the r345 tree, on both ROCm lines:
+
+* prefill-logit KLD **0.000000 / 100.000 %** (27B Q8_0 canonical point, ROCm 10.1 **and** 10.2; the 3-GPU
+  `-sm tensor` point 0.000000 / 99.990 %, which is that point's base-vs-base self-comparison);
+* same-seed greedy text **byte-identical** on 4B (1 GPU), phi-4 IQ4_XS (dense, 1 GPU), 27B (3 GPU `-sm tensor`)
+  and 35B-A3B (`-ncmoe 40` host tier);
+* the **MTP four-axis protocol** reproduces the r328 record **exactly** — text hashes `218515b89b31` /
+  `a87c4318b649` / `27d74f92ec5c` / `6fa43035b8d9` (f16) and `3a70dd34be92` / `a87c4318b649` /
+  `b29f3176fa31` / `45f5e6db9dc2` (q8_0), with draft acceptance `0.34306` / `0.96652` / `0.63593` / `0.73478`
+  — i.e. `none` == `draft-mtp` on all eight arms *and* identical to the previous release;
+* `gate-ckpt-reuse`, `gate-park-idle-slots` (incl. its indexer-cache arm), `gate-state-pipe`,
+  `gate-moe-promise`, `gate-host-pool` (59/59) and `gate-spec-purity` (both caches, 3-device `-sm tensor`,
+  plus the width probe) all PASS;
+* `check-gen-docs` GREEN (the block adds three options, so it regenerates the three generated documents) and
+  both Windows lints clean.
+
+### The feature's own oracles (flag ON, r346)
+
+The coverage matrix (`archive/work/prefill-decode-arms/runs/coverage-matrix/`) — 4 models (35B-A3B, Gemma4
+26B-A4B, Flint, 27B) × {`layer`, `tensor`} × {2, 3} GPU = **16/16** with the pair's text byte-identical to the
+single-context server's on each shape; the host-expert tier on one GPU (`-ncmoe 48`) **8/8** with a non-vacuous
+gather census; the 3-GPU capped-arena arm **3/3** with the cache hit rate **identical between arms**
+(`h` 0.9352 / 0.9352), i.e. the pair is in the same residency class as the single context; and the reuse oracle
+`GATE=strict` on 4B/phi-4/35B, `GATE=parity` everywhere, `TWO_SLOT=1`, and `FORK_REUSE=1` on a dense model.
+`CONCURRENT=1` is **stress only, never a text claim** (`GREEDY-PURITY.md` §63): a co-batched pair is not a text
+oracle.
+
+### What it does NOT cover (state it, do not imply it)
+
+* **Speculative decoding with the arms** — refused, a follow-up campaign.
+* **A meta-aware device copy** for the handover: a `-sm tensor` hybrid boundary takes the serialised state move
+  (~74.6 ms per boundary, 112.57 MiB).  Cost item, follow-up.
+* A **recurrent-only** memory (a pure Mamba-class model): `llama_memory_seq_state_take()` refuses anything that
+  is not a hybrid, and no such model exists on this box.
+* `GLM5-Next`: the same memory module as qwen4exp, no checkpoint on this box.
+* The declared decode reserve is a **flat 3584 MiB**; deriving it from the decode width is `TODO` #366.
+
+### Verification
+
+`MANIFESTS.md` — the block-17 row (both tiers) and gates 28/34 for the paths it reuses.  Gate scripts:
+`scripts/gate-spec-purity.sh`, `scripts/gate-park-idle-slots.sh`, `scripts/gate-ckpt-reuse.sh`,
+`scripts/gate-host-pool.sh`, `scripts/gate-moe-promise.sh`, `scripts/gate-state-pipe.sh`,
+`scripts/check-gen-docs.sh`, and for the feature itself
+`archive/work/prefill-decode-arms/runs/coverage-matrix/matrix.sh`, `.../host-tier-single-gpu/verify-postfix.sh`,
+`arms/gate-server-arms.sh` and `arms/gate-server-reuse.sh`.
+
+---
 
 ## Block 0300 — `-sm relaxed-tensor` for the MoE amax arches (**TEMPORARY**, expect removal)
 

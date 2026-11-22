@@ -3081,3 +3081,42 @@ because a granularity change moves the logits of every shape it reaches.
 **Record.**  This entry; `benchmarks/2026-11-21-ffn-even-split.md`; `scripts/gate-ffn-even-split.sh`;
 `patches/README.md` block 09; `WORKLOG.md` 261121.017; §3 (the per-device-count text reference) and §46 (the
 point-sensitivity calibration this extends from a kernel family to a split granularity).
+
+## 105 (r346, block 17) — a BUDGETED arena is the residency class; an `auto` arena makes a two-arm text claim vacuous, and "same text across three regimes" is an observation
+
+**Claim.**  A text comparison between the two-arm server and the single-context server is an oracle **only
+when both arms sit in the SAME residency class**.  On a host-expert tier the expert cache's admission is a
+prior-dependent, capacity-dependent STATE (§89): an `auto` arena lets the pair and the single context land in
+different classes (the pair's decode context reserves graph memory the single context does not), so the two
+texts differ for a reason that has nothing to do with the change under test.  A **budgeted** arena
+(`MOE_EXPERT_CACHE_MIB`, MiB **per device**, floor 2048) pins both arms into one class, and then the comparison
+is exact.
+
+**Rule.**  Any host-tier text claim for the pair names the arena budget and reports the **cache hit census of
+both arms**.  If the two arms' `h` differs, the pair of texts is not an oracle — re-run with a budget that puts
+them in one class (or say the claim is about a different class).  Never compare across an `auto` arena.
+
+**Numbers** (gfx1201, 3 GPU `-sm tensor`, maintainer's shape incl. `-c 204800 --parallel 3`):
+
+* **budgeted** `MOE_EXPERT_CACHE_MIB=13653` (40 GiB total): `h` **0.9352 / 0.9352** (single / pair), text
+  **identical** `121ff7b5af176297` — PASS on all 3 capped arms;
+* the same shapes with an `auto` arena: the arms differ in residency class, so the text pair is **not**
+  decidable and was recorded as such, not as a failure;
+* `-ncmoe 48` on one GPU, four models, default arena: `h` **0.6235/0.6295** (35B-A3B),
+  **0.3489/0.3492** (Flint), **0.4815/0.4840** (Gemma4 26B-A4B), **0.3413/0.3414** (Flash-Next IQ4_NL) — every
+  row non-vacuous (a `h` of 0.0000 would mean nothing was gathered and the arm proved nothing) and text
+  identical in each row.
+
+**Also recorded here:** **a co-batched two-slot pair is not a text oracle.**  Two resident conversations on
+`--kv-unified` that are *never* co-batched in one step are a valid oracle (`TWO_SLOT=1`), but two slots resuming
+**concurrently** in the same step are `CONCURRENT=1`: **stress only, no text claim** — the same rule as §63, and
+the reuse gate states it in its own help.
+
+**And a weaker one, because it will be quoted as if it were stronger:** *the same text across three residency
+regimes is an observation, not a claim.*  The campaign saw identical text at full residency, at a 40 GiB
+budgeted host tier and on a streamed shape.  Three regimes agreeing is evidence that nothing gross moved; it
+is **not** a per-regime reference, because each regime is its own class (§38, §89, this entry).  A per-regime
+claim needs the base build's own text **in that regime**.
+
+**Record.**  This entry; `archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` passes 12/17;
+`patches/README.md` block 17; `MANIFESTS.md` block-17 row; `WORKLOG.md` 261122.027; §38, §63, §89.

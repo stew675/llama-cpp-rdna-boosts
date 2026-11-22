@@ -1,3 +1,936 @@
+## 261122.027 (r346, RELEASE v18-919794500-r346) -- block 17: the two-arm server (an opt-in prefill arm + a decode arm co-owning one KV), **default OFF**; the delivery moves to 18 official blocks
+
+**Release.** `v18-919794500-r346`.  Base `919794500` (base tree `916941663346eb86004bed77f74e90fcf9c43126`), canonical tip
+**`8f88fc861`** (the value `apply-all.sh` produces from `patches/` at this base -- the chain the block was cut on
+carried the same TREE with a different tip, because those two commits were cherry-picked rather than stamped by
+`apply-all.sh`; the tree is the contract and both are `a6f877eab`), tree **`a6f877eabdf5b975ffbf2050a61f170c7e797566`**, **18 official + 1 temporary = 19 default blocks**, optional
+`0100` -> `3e33338dd` (tree `de010a165`) / `0101` -> `f4e001df4` (tree `ea2edc59e`), cumulative optional tree `4d94657f3`.  One
+block **created** (`0017`) -- the maintainer's authorisation, not a gate outcome -- and **no existing block amended**.  The
+delivery had moved to **r345** (`e2fbead3`, tree `0d2f70e6c`) while this campaign was in flight, so the block was cut against a
+**freshly re-cut r345 chain** (`e695c46ce`), not against the r343 chain the campaign's evidence was gathered on.
+
+### 1. What the block is, and why it ships OFF
+
+`llama-server --prefill-decode-arms` keeps **two `llama_context`s on one model** -- a prefill arm (the main loop) and a decode
+arm (own thread) that **co-own one KV** -- so a reply generating while another slot's prompt is prefilled does not wait for the
+prefill's steps.  A slot crosses only at a request boundary; a hybrid model's recurrent state follows it device to device.
+
+**Default OFF / opt-in only, by decision** (`--prefill-decode-arms-mode off|on|auto`, default `off`).  The pair buys a decoder's
+interactivity for **-21…-24 % prefill**, which is an operator's trade for *their* shape, not a default.  Measured (1 x R9700,
+`-ub 4096`): the decoder holds **47-49 ms p50 / 64-78 ms p95** through a 2.0-5.3 s prefill where the single context stalls
+**300-880 ms**; fully resident 27B: prefill **4786 t/s at 737 ms** against 4029 at 924, worst in-window gap **34.9 ms** against
+327.3.  `auto` is an explicit fall-back form, not a default flip.
+
+The cut: **13 of the WIP branch's 15 commits** replayed, the two measured losers (`3f2768131`, `540d442a8`) **excluded** -- 22
+code files, +2164/-105, exactly what the ticket predicted (three files were touched by the losers and nothing else).  The block
+is **ordered before `0300`** (`make-patches.sh` requires the chain to END with a 03xx block and refuses an official block after
+one); the re-ordered tree is byte-identical to the built one.  One real defect was fixed in the block on the way: the help text
+still read **"wip/prefill-decode-arms (WIP, not a delivery option)"** and "'auto' is the promotion candidate" -- rewritten for a
+shipped block, and `llama-gen-docs` folded in (the block adds `--prefill-decode-arms`, `--no-prefill-decode-arms`,
+`--prefill-decode-arms-mode`).  Final block: **23 files, +2168/-105** (`patches/0017-…`).
+
+### 2. The default path is BIT-IDENTICAL (the "opt-in only" proof) -- both ROCm lines
+
+| gate | result |
+|---|---|
+| `gate-prefill-logits.sh`, ROCm **10.1**, canonical 27B Q8_0 | **0.000000 / 100.000 %** (base PPL 5.9325, `base_sha256 ce8bb26f…` -- identical to the r343-era reference, so r345 did not move it either) |
+| the same, ROCm **10.2** (recorded base re-made from the r345 build) | **0.000000 / 100.000 %**, same sha256 |
+| the same, 10.2, **3-GPU `-sm tensor`** | **0.000000 / 99.990 %** (the point's own self-comparison floor) |
+| same-seed greedy text, 4 shipped shapes | **byte-identical**: 4B `7e6229b260f6`, phi-4 IQ4_XS `a1b7eb2ee7a6`, 27B 3-GPU tensor `da2e2d192e21`, 35B-A3B `-ncmoe 40` `461ca8cd0e88` |
+| **MTP four-axis**, `-n 3000`, f16 + q8_0 | **reproduces the r328 record exactly** -- text `218515b89b31`/`a87c4318b649`/`27d74f92ec5c`/`6fa43035b8d9` (f16) and `3a70dd34be92`/`a87c4318b649`/`b29f3176fa31`/`45f5e6db9dc2` (q8_0), acceptance **0.34306/0.96652/0.63593/0.73478**; `none` == `draft-mtp` and == the previous release |
+| `gate-spec-purity.sh --n 3000 --n-axis 3000` | PASS, 8 axes both caches + the width probe (q8_0 == r328) |
+| `gate-ckpt-reuse.sh` | PASS (keep 3 restores, 5 vs 8 checkpoints, 33.7/33.0/33.2 ms turns) |
+| `gate-park-idle-slots.sh` | PASS (6 park + 2 unpark, park == lazyoff on A-D, indexer arm, parkoff non-vacuity) |
+| the same three gates **on the repointed default model** (§5 finding 2) | `gate-park-idle-slots` PASS at `CTX=16384`; `gate-moe-promise` PASS (seq + `broken=238 repaired=238`); `gate-host-pool` **59/59** |
+| `gate-state-pipe.sh` | PASS (0.45/0.52/0.45/0.65x the synchronous arm) |
+| `gate-moe-promise.sh` | PASS (`stale=1974` non-vacuous; `broken=repaired=258`; text `c0e7e91d84c4`) |
+| `gate-host-pool.sh` | **59/59**, nine arms, text `560704192d30` / `f9f1f58c296e` (re-run on the repointed default: **59/59**, text `83d058e8af9c` / `e8e834bc572a`) |
+| `check-gen-docs.sh` / both Windows lints | GREEN / 515 files clean / 4595 paths safe |
+
+The MTP arm is the one that matters most: the block changes the memory modules the **draft** context also uses (`ctx_other`),
+and the four-axis protocol is what would see a silent MTP regression -- it reads *identical to the prior release*, not merely
+self-consistent.
+
+### 3. The feature's own oracles (flag ON)
+
+* **Coverage matrix 16/16** (`archive/work/prefill-decode-arms/runs/coverage-matrix/matrix-r345.tsv`): 35B-A3B, Gemma4 26B-A4B,
+  Flint and 27B x {`layer`, `tensor`} x {2, 3} GPU, the pair's text **byte-identical to the single-context server's** in every
+  row, on the **delivery build** (the campaign's own matrix ran on the WIP build).
+* **Host tier 8/8** (`verify-postfix.sh`, 1 GPU `-ncmoe 48`, **default auto arena, no knob**): text identical in all eight
+  rows, and 35B/Flint/Flash-Next reproduce the campaign's recorded hashes exactly (`7e641378f5f3d088`, `c15df35ea109e144`,
+  `121ff7b5af176297`).  The hit census is in one band but **not identical in every row** (`h` 0.9520/0.9279 on the 35B,
+  1.0000/0.8530 on the 3-GPU tensor) -- the pair's declared reserve costs arena, so the *class-matched* claim is the arm below
+  (`GREEDY-PURITY.md` §105).
+* **3-GPU capped 3/3** (`verify-3g-cap.sh`, `MOE_EXPERT_CACHE_MIB=13653` = 40 GiB total): text identical with **`h` identical
+  between arms in every row** (0.9352/0.9352, 0.9376/0.9376, 0.9353/0.9353), including the maintainer's
+  `-c 204800 --parallel 3` shape.  This is the residency-class-matched oracle.
+* **Reuse**: `GATE=strict` PASS on 4B, phi-4 (`FORK_REUSE=1`) and the 35B host tier; `GATE=parity` PASS on the fully resident
+  27B and the 4B; `TWO_SLOT=1` PASS on the 4B (strict) and the 27B (parity); `CONCURRENT=1` PASS as **stress only** (§63).
+
+### 4. The gate infrastructure this block owed (written here, not borrowed)
+
+* **`gate-prefill-fairness.sh --arms-band N`** -- the arms-aware ITL criterion.  The shipped form scales the *baseline's* max
+  by `chunk/b`, and on the pair the baseline's max is the decode arm's own idle step, so it reads a **10 ms** bound against a
+  correct pair whose max is 72 ms.  The pair's bound is `own step + N x one chunk of foreign prefill` (decidable from numbers
+  the gate already measures): measured **23 ms <= 124 ms** (own step 19 ms + 1.5 x 69 ms at the shape's own 7377 t/s).  The
+  superseded line is printed, not asserted, and `--self-test` still **rejects the unfixed build**.
+* **`gate-prefill-duty.sh --inert-band F`** -- a two-sided band so a mechanism that is *deliberately* a no-op reads PASS and
+  must not pay prefill for it: measured **50 -> 50 tokens (1.00x)** inside +-10 %, prefill stretch 1.00x.  On the pair the
+  gate's contended-width assertion is **vacuous by construction** (no shared step) and says so.
+* **`scripts/gate-arms-soak.sh`** (new) -- the two arms nothing reached.  `soak`: a 3-slot, 6-round run over a unified cache
+  driven to its cap with a different prompt every round; **18/18 answered**, no fault, the pair's **cold** text == a fresh
+  single-context server's, residency bounded (used 0/8168/8174 of 8192), no abort.  **The finding**: `try_clear_idle_slots()`
+  and idle-slot parking are **UNREACHABLE on this path by construction**, not merely untested -- the pair declines parking
+  (`idle slot parking: not supported by this KV cache, the idle slots stay where they are`) and the KV-full recovery never
+  fires because admission is chunked against the space the co-owner handshake reserved.  The gate therefore asserts the
+  property the clear path exists to provide, and records the erase measurement (8163 -> 5439 cells for three resident
+  prompts -- `?action=erase` clears a slot's SAVED STATE, not its cells; `TODO` #370).  `pool`: the **server-side** host-pool
+  arm `gate-host-pool.sh` (llama-cli-only) cannot reach -- the pair on `-ncmoe 48` with **takeover=960, decline_all=0,
+  broken=0 repaired=0** and text equal to the single context.  (`takeover=0` is the *fault* arms' criterion, not a healthy
+  run's -- that distinction cost this session a re-run.)
+* Two gate-hygiene defects found and fixed in the campaign's reuse harness (it is a delivery gate now): the two-slot arm's
+  slot-1 prompts were a **frankenstein slice of a chat-formatted corpus**, so round 2 answered with EOS -- one arm compared
+  two empty replies (a **vacuous pass**, which is how the recorded 27B `TWO_SLOT` "passed") and the other read a false
+  failure; it now uses two real prompt files, extends by the source's own next 2 KB, and **asserts non-vacuity** (every
+  compared reply >= 4 tokens, and round 2 really reused).  And the 27B two-slot arm moved slot 0's text under `strict` --
+  the contract that does **not** hold on a fully resident hybrid (the reference re-prefills there); it is a `parity` arm.
+
+### 5. Findings reported before shipping
+
+1. A **WORKLOG number collision**: `main` published `261122.004` (r344) and `.005` (r345) while this branch had used
+   `.004`-`.024` for the same date.  The maintainer ruled: the published numbers stand and **ours are renumbered +2**
+   (`.006`-`.026`, headers only).  The pre-r346 numbers are what the campaign's commit messages name.
+2. **Three gate defaults named a model tree that no longer exists** (the retired Flash-Next `GSQ-IQ3_XXS`):
+   `gate-park-idle-slots`, `gate-moe-promise` and `gate-host-pool` are repointed to the maintainer's quality-first
+   replacement `STEW675-IQ4_NL/Qwen3.8-Flash-Next-MTP4-IQ4_NL-00001-of-00002.gguf`.  Repointing was not a path edit: the
+   replacement is **94 GB with an embedded MTP4 head**, so each gate needed its shape re-derived on this box (all
+   measured, all documented in the gates' headers): `gate-park-idle-slots` takes `--load-mode dio --lazy-mode on`
+   (the retired model's `-ot per_layer_token_embd.*=CPU -lm none -lzm off` trio made a correct park arm read FAIL —
+   the maintainer's correction) and `CTX=16384`/`NCMOE=48`, where 40960 needs `NCMOE>=56`; `gate-moe-promise`'s fault
+   arm needed `FAULT_DEVS=0,1,2 -ncmoe 40 -lme 8` because an `auto` host pool sizes the WHOLE expert set and then
+   **breaks no promise at all** (`broken=0`, a vacuous arm) — at 8 GiB it breaks and repairs **238**; `gate-host-pool`
+   re-ran **59/59** unchanged.  Three more (`gate-hc-base-copy`, `gate-hc-fusions`, `gate-host-expert-text`) carry
+   **recorded anchors for the retired class** and are deliberately NOT repointed blind -- `TODO` #369.
+3. The block's own help text still declared itself WIP (fixed in the block, §1).
+
+### 6. Verification and release mechanics
+
+`scripts/validate-set.sh` **GREEN** at the final tip: 19 default + 2 optional artifacts, strict `git am` on a fresh tarball,
+tree `a6f877eab…`, the optional artifacts applied strictly and tree-checked (both **re-cut** against the new default tree),
+the Windows lints clean, `check-system-headers.py` clean (530 files), and the file-set reconciliation **0 unexplained**
+(`options 14 -> 17`, `envs 576 -> 585`, `defines 172 -> 174`, one new block).  The fork's `rdna-boosts` is re-cut from
+`patches/` at the base by `scripts/fork-refresh.sh --build --gates --push` (tip `8f88fc861`, tree `a6f877eab…`), and the
+container images are built **off-host** by the worker watcher -- nothing image-shaped ran on this box.
+
+Docs: `patches/README.md` block 17 + the block index row, `ENVIRONMENT.md` §23, `MANIFESTS.md` (apply order + the block-17
+verification row), `INVARIANTS.md` r346 (six facts), `GREEDY-PURITY.md` §105 (the residency class, the non-oracle pair, and
+"same text across three regimes is an observation"), `README.md` (the consumer option), `TODO` #364-#370, `scripts/README.md`
+(the new gate), and the campaign record moved to `archive/work/prefill-decode-arms/` with `wip/CAMPAIGNS.md` updated (no
+stub).  Forward work that deliberately did not ship: spec decoding with the arms (#364), a meta-aware device copy (#365), a
+derived decode reserve (#366), GLM5-Next (#367), a recurrent-only memory (#368), the three retired-model gate defaults
+(#369), the pair's erase path (#370).
+
+## 261122.026 (r343, no delivery change) -- archive/work/prefill-decode-arms: PROMOTION HANDOVER written -- block 0017 authorised by the maintainer, default OFF / opt-in, gate ladder + release mechanics for a cold session
+
+**No delivery patch changed; nothing in `patches/`, no block created, no tag, nothing pushed.**  Delivery repo
+`prefill-decode-arms` HEAD moves with this entry; `~/llama.cpp` `wip/prefill-overlap` `9b8ac957f` (clean).
+
+The maintainer has authorised the promotion as a **new official block `0017`** ("the two-arm server"), **default OFF
+and opt-in only** (`--prefill-decode-arms-mode` keeps its `off` default; no `auto` flip in this release; spec decoding
+with the arms and the meta-aware device copy stay out as follow-up campaigns).  `archive/work/prefill-decode-arms/
+PROMOTION-HANDOVER.md` is the job ticket for a fresh cold session: verified starting state (delivery `prefill-decode-
+arms`, fork `wip/prefill-overlap` `9b8ac957f`, feature delta `e6b3cd3e5..` = 15 commits), the block cut (13 IN commits;
+the two measured losers `3f2768131`/`540d442a8` are EXCLUDED and verified independent, which also drops three files
+entirely -> 22 files, not 25), `release.json` expectations (`n_blocks 17 -> 18`, `n_default 18 -> 19`), the two-tier
+gate ladder (4a default-path bit-identity incl. KLD / shipped-path text / the MTP four-axis / ckpt / park / state /
+host-pool / moe-promise / spec-purity / **check-gen-docs** for the three new options; 4b the feature's own oracles --
+coverage 16/16, host-tier 8/8, 3-GPU capped 3/3, reuse strict+parity, faults; 4c the gate *infrastructure* still owed --
+arms-aware fairness criterion, two-sided duty band, multi-turn soak, server-side host-pool arm, dense fork arm), the
+document set the block owes (patches/README, ENVIRONMENT, MANIFESTS, INVARIANTS appended, GREEDY-PURITY, README, TODO,
+WORKLOG, release.json), and the release mechanics (validate-set, fork-refresh --build --gates --push to the personal
+fork with --force-with-lease, tag, off-host container watcher).
+
+Also carried into the ticket: the landmines that cost this campaign sessions (never export `TEMP` to a GPU process;
+`kill -9` on a `timeout` wrapper leaks a server invisible to rocm-smi; `MOE_EXPERT_CACHE_MIB` is per device with a 2048
+floor; Flint needs `-sm relaxed-tensor`; `-sm tensor` + `-ncmoe` + the pair needs the declared reserve, now automatic at
+3584 MiB; the Flash-Next shape is VRAM-marginal and one load in five OOMs at the PLE table).
+
+## 261122.025 (r343, no delivery change) -- archive/work/prefill-decode-arms pass 18: "does MTP work now?" -- shipped MTP yes (unchanged), MTP *with the arms* still refused; and the reserve work had a bug that would have cost an MTP run 3.5 GiB (fixed)
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
+`wip/prefill-overlap` `9b8ac957f` (clean).  Record: `RESULTS-2026-11-22.md` pass 18.
+
+Three answers, all measured on Qwen3.8-Flash-Next, 1 GPU, `-ncmoe 48`, auto arena:
+
+1. **Shipped MTP works, and always did on this shape**: `--spec-type draft-mtp --spec-draft-n-max 3`, arms off ->
+   PASS, a `draft acceptance` line logged, slab `aux=3.50 GiB` (the DRAFT's second-context reserve).  The reserve work
+   in this campaign does not touch that path.
+2. **MTP + the arms is still refused, by design**: `create_decode_arm()` declines the pair when a speculator is
+   configured (a drafter owns its own context and per-slot checkpoint path).  `mode auto` falls back with a warning
+   and MTP runs (PASS, draft acceptance logged); `mode on` refuses to start.  Speculative decoding *with* the arms
+   stays the follow-up campaign's item.
+3. **A bug this question caught**: `common_draft_reserve_derive()` charged the arms' flat 3584 MiB reserve whenever
+   `prefill_decode_arms != 0`, including a run with a speculator, where the pair is refused and the reserve only
+   shrinks the arena of a legitimate MTP run.  Fixed by mirroring the server's refusal (no `has_dft()`/`has_mtp()`),
+   and verified: that run reports `aux=3.50 GiB` (the draft's) and no arms reserve line.
+
+## 261122.024 (r343, no delivery change) -- archive/work/prefill-decode-arms pass 17: a BUDGETED 40 GiB arena on 3 GPUs puts both arms in the SAME residency class (h identical), and the maintainer's -c 204800 shape passes there too
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp` `a7958316c`
+(clean, unchanged).  Record: `RESULTS-2026-11-22.md` pass 17;
+`runs/host-tier-single-gpu/verify-3g-cap.sh` / `verify-3g-cap.log`.
+
+Capped the 3-GPU Flash-Next arena to **40 GiB total** (13653 MiB/device -- `MOE_EXPERT_CACHE_MIB` is a per-device
+budget) so the host-resident path is the shape rather than an accident: **PASS in all three configurations**, with the
+census **identical in both arms** -- layer 0.9352/0.9352, tensor 0.9376/0.9376, and the maintainer's
+`-c 204800 --parallel 3` 0.9352/0.9352 -- text byte-identical within each pair.
+
+**This corrects pass 16's "cost".**  The single-context-resident (`h=0.000`) vs pair-deficient (`h=0.851`) difference
+is an **auto** (free-VRAM sized) arena artifact: with an explicit `MOE_EXPERT_CACHE_MIB` the arena is a budget, so the
+3584 MiB second-context reserve comes out of the slab's own unclaimed reserve and both arms stay in one residency
+class.  That is also why the campaign's gates never hit a residency-class mismatch on the tier -- their product shape
+always pinned the arena.  Consequence for the promotion gates: **a budgeted arena is the right shape for an
+arms-vs-single text comparison on a host tier**; on an auto arena the pair is legitimately one §89 class more deficient
+than the same config's single context, so their texts are not an equality oracle there.
+
+## 261122.023 (r343, no delivery change) -- archive/work/prefill-decode-arms pass 16: post-fix verification -- every host-tier shape passes with a DEFAULT arena and NO knob (incl. the maintainer's `-c 204800` 3-GPU tensor shape)
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp` `a7958316c`
+(clean).  Record: `RESULTS-2026-11-22.md` pass 16; matrix + re-run:
+`runs/host-tier-single-gpu/verify-postfix.sh` / `verify-postfix.log` / `verify-postfix.tsv`.
+
+Re-ran every host-tier shape that had failed, plus those previously only run with an explicit arena, after the
+declared-reserve fix -- with **no** MOE_EXPERT_CACHE_MIB and **no** GGML_CUDA_SLAB_RESERVE_MIB, both arms, text
+compared: **8/8 PASS**, all arms-on text byte-identical to arms-off.  35B-A3B / Flint / Gemma4 / Flash-Next at 1 GPU;
+Flash-Next at 2 GPU layer, 3 GPU layer, 3 GPU tensor, and 3 GPU tensor at **`-c 204800 --parallel 3`** (the
+maintainer's own shape).
+
+One cost the `h` census exposes: on the 3-GPU LAYER shape the single context was fully resident (`h=0.000`, nothing
+gathered) while the pair runs at `h=0.851` -- the 3584 MiB second-context reserve is withheld from the arena per
+device, so a resident shape becomes residency-deficient for the pair (text identical, prefill fine, but gathers are
+paid).  The flat 3584 MiB is the safe declaration: the measured need is 1792.00 MiB on Flash-Next's decode context and
+9.52 MiB on the 4B's.  Follow-up recorded, not done: derive the declaration from the decode width (as the draft's
+estimate is derived from its ubatch) instead of a flat constant.
+
+## 261122.022 (r343, no delivery change) -- archive/work/prefill-decode-arms pass 15: the "duplication" was WRONG (measured 0 MiB), (1) reverted; the declared reserve (2) is the fix and is in
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
+`wip/prefill-overlap` back at `a7958316c` (clean).  Record: `archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` pass 15.
+
+The maintainer directed: fix the allocation duplication (1) first, retest, and only if it still fails look into (2).
+Implemented (1) -- `llama_context_params::ctx_no_decode_reserve`, so the prefill context skips the tg layout when the
+pair will decode (a decode that lands there re-reserves on demand) -- and measured: the saving is **zero** (Flash-Next
+1504.83 MiB with and without; 4B 224.57 with and without) because the wide pp layout dominates that per-context union,
+and the pair still fails with the declaration disabled.  So pass 14's "the tg layout is reserved twice / 2.2x
+duplication" reading was **wrong**: the sizes were right, the attribution was not.  The pair's extra ~1.8 GiB is the
+decode context's own graph buffers, which two schedulers inherently need.
+
+(1) reverted, for a reason beyond "saves nothing": it would leave the fallback path (pair refused, `auto` fallback,
+cancelled handover) without a tg layout it may need, i.e. it would create the late-allocation class it was meant to
+remove, on a host tier.  `~/llama.cpp` is back at `a7958316c`; re-verified Flash-Next 1 GPU `-ncmoe 48`, auto arena, no
+knob -> PASS `h=1.00`, text identical to the single context.
+
+(2) turns out to be two implementations of one idea: *declare the second context before the arena claims the space*.
+The declaration (`aux_reserve`, flat 3584 MiB, pass 14) is implemented and verified on 1 GPU layer and 3 GPU tensor
+with an auto arena; the alternative (move the decode context's construction before the slab) is a construction-order
+refactor that would account for the same VRAM and not less.  Nothing owed on layout dedup.
+
+## 261122.021 (r343, no delivery change) -- archive/work/prefill-decode-arms pass 14: the decode context is DECLARED like a draft (host tier works with no knob); the pair still reserves ~2.2x the shipped path, and why
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
+`wip/prefill-overlap` (clean).  Record: `archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` pass 14.
+
+The maintainer asked whether the two-arm mode should differ from the shipping mode in memory allocation at all, and
+whether the original allocation path was the best one.  Measured answer:
+
+* **Shipping is not exposed**: one `llama_context` -> one scheduler -> one compute-buffer reserve that covers BOTH
+  layouts up front (`graph (pp bs=2048, tg bs=2)` = 1504.83 MiB), so a decode step -- one slot or many -- allocates
+  nothing new.  Concurrency there is more ROWS in an already-reserved graph.
+* **The shipped second context is declared**: an MTP draft sets a flat 3584 MiB second-context reserve BEFORE the slab
+  (`SLAB_INIT reserve=5.00 GiB headroom=1.50 aux=3.50 va_spare=3.50`), and pins its compute as narrow-2.  Verified
+  working on the same 1-GPU `-ncmoe 48` shape.
+* **The pair did the opposite**: its decode context (a second 1792.00 MiB reserve) arrived after the slab with nothing
+  declared (`aux=0`, `va_spare=0`), so the arena committed the VRAM and the first decode step could not allocate.  The
+  tg layout is also reserved **twice** -- inside the prefill context's 1504.83 MiB and again standalone.
+
+**Fixed (auto, no operator input):** `common_draft_reserve_derive()` charges a second-context reserve for the pair
+(flat 3584 MiB, the same constant an embedded MTP head uses; no KV term, one shared cache), charged only when the pair
+will run (`prefill_decode_arms != 0 && n_parallel >= 2` and the model has host experts, so fully resident shapes and
+`-np 1` are untouched).  `MOE_EXPERT_CACHE_AUX_RESERVE_MIB` overrides it, a manual `GGML_CUDA_SLAB_RESERVE_MIB` still
+wins, and it is documented on `--prefill-decode-arms`' help text for the manual path.  Verified with an auto arena and
+no knob: Flash-Next 1 GPU layer `h=0.78` PASS and 3 GPU tensor `h=0.85` PASS, text identical to the single context on
+both (they needed 4096 / 8192 MiB of explicit reserve before).  A partial declaration is not enough (aux 2048 ->
+reserve 3.50 GiB still failed; 4.00 GiB passed), which pins the mechanism to reserve = graph + slack.
+
+**Recorded, not implemented (the follow-up the question earned):** the pair reserves ~2.2x the shipped path's compute
+buffers (3296.83 vs 1504.83 MiB) because the tg layout is duplicated, and the second copy is late.  The shipping
+pattern (one reserve, both layouts, sized before the slab) is right; the two contained ways there are (do not
+duplicate the layout / reserve both contexts before the slab) both touch `llama_context`'s reserve path, so the shipped
+single-context behaviour is in the blast radius -- a maintainer decision.  The KV allocation handshake (T0) is *not*
+redundant: two contexts sharing one cell map need one allocation owner, and the shipped path needs no arbitration
+because it has one owner.
+
+## 261122.020 (r343, no delivery change) -- archive/work/prefill-decode-arms pass 13: on a HOST TIER the pair needs `GGML_CUDA_SLAB_RESERVE_MIB` (capacity, not state) -- Flash-Next 1/2/3-GPU + `-ncmoe 48`
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp` `423c91619`
+unchanged (no code change this pass).  Record: `archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` pass 13;
+`runs/host-tier-single-gpu/README.md` §4.
+
+Asked: does Flash-Next pass on a single GPU with `-ncmoe 48` and **no artificial capping**, and do the multi-GPU host
+tier.  Measured: the **single context** passes on 1, 2 and 3 GPUs with an auto arena; the **pair** fails on all three
+at the same place -- the decode arm's 1430.16 MiB graph reserve (`the movable-boundary slab holds the VRAM … Raise
+GGML_CUDA_SLAB_RESERVE_MIB` -> `the decode arm's step failed (ret = -2)`).  The default reserve is `headroom + the
+DRAFT context estimate`, so a second **co-owning** context is not in it.
+
+With the reserve raised the pair passes and its text is identical to the single context's everywhere:
+1 GPU auto+4096 `h=0.81`; 3-GPU layer auto+4096 `h=0.85`; **3-GPU tensor needs 8192** (`h=0.81`) because the reserve
+is per device and a tensor split divides each device's headroom.  An explicit arena does not substitute: arena 5000
+with the default reserve still fails, arena 2048 + reserve 4096 passes.
+
+**This is a promotion decision, not a gate outcome**: a consumer on the maintainer's own shape (`-sm tensor` +
+`-ncmoe`) hits `the decode arm's step failed` out of the box, i.e. on exactly the tier the arms exist for.  Either
+document the knob on the option + in `ENVIRONMENT.md`, or have the server add the decode context's graph estimate to
+the reserve when the pair is requested and let `--prefill-decode-arms-mode auto` fall back with a message.  Neither is
+implemented.
+
+Caveat recorded in the pass: the 3-GPU **layer** row with `h=0.00` is fully resident, so the genuine 3-GPU host-tier
+rows are the tensor ones (plus every 1-GPU row).
+
+## 261122.019 (r343, no delivery change) -- archive/work/prefill-decode-arms pass 12: the HOST-EXPERT tier on one GPU (`-ncmoe 48`) is 4/4 PASS with a non-vacuous gather census; no pure Mamba model exists on this box
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
+`wip/prefill-overlap` `423c91619`, clean.  Record: `archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` pass 12; matrix +
+re-run: `runs/host-tier-single-gpu/README.md`.
+
+Pass 11's matrix is fully resident, so the host-expert machinery (the arena, the gathers, the heatmap) is idle in every
+row of it.  This pass runs the regime the arms exist for: **one 32 GiB R9700, `-ncmoe 48`**, arena deliberately too
+small, both arms, text compared -> **4/4 PASS** (35B-A3B Q8_0 `h=0.62`, Flint Q8_0 `h=0.35`, Gemma4 26B-A4B
+`h=0.48`, Flash-Next IQ4_NL `h=0.34`), every row with a non-zero gather census so no row is vacuous.
+
+Two consumer-facing capacity facts fell out, both named by the engine: **`MOE_EXPERT_CACHE_MIB` has a floor of 2048
+MiB/device** (2000 aborts at load, `0` disables the cache), which is how gemma4's deficit is forced on one card; and
+**Flash-Next cannot fit a pair on one card at arena 5000** — the single context runs, the pair dies on the decode
+arm's 1430 MiB graph reserve (`the movable-boundary slab holds the VRAM … Raise GGML_CUDA_SLAB_RESERVE_MIB`) — but at
+arena 2048 + `GGML_CUDA_SLAB_RESERVE_MIB=4096` both arms run and the text is identical.  So that failure is the 100 GB
+model in 32 GiB, not the arms.
+
+Also answered: **there is no pure Mamba-class model under `/llm/models/`** (`llm_arch_is_recurrent` covers
+MAMBA/MAMBA2/RWKV6/RWKV6QWEN2/RWKV7/ARWKV7; everything here is attention-only, hybrid, or looped-attention such as
+`inkling2`/`ricursive`).  The known gap that `llama_memory_seq_state_take()` refuses a non-hybrid — so a recurrent-only
+model would get no state on the pair — therefore stays **untested, not fixed**, and is recorded that way.
+
+## 261122.018 (r343, no delivery change) -- archive/work/prefill-decode-arms pass 11: the COVERAGE MATRIX (16/16 shapes clean) and the same memory-module defect a second time, in `iswa` (gemma4)
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
+`wip/prefill-overlap` **`423c91619`**, clean.  Record: `archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` pass 11;
+matrix + re-run instructions: `archive/work/prefill-decode-arms/runs/coverage-matrix/README.md`.
+
+**The question asked was the right one.**  4 models (Qwen3.6-35B-A3B Q8_0, Gemma4 26B-A4B Q8_0, Flint Q8_0,
+Qwen3.8-27B Q8_0) x {layer, tensor} x {2, 3} GPUs = 16 configurations, **both arms each**, generated text compared
+byte for byte on the same shape: **16/16 PASS** (arms-on == arms-off, marker found everywhere).  Raw data in
+`runs/coverage-matrix/matrix.tsv`.
+
+**And it found the P0's defect class a second time.**  `gemma4`'s memory is `llama_kv_cache_iswa` (a non-SWA cache +
+an SWA cache) and `create_memory()` passed `mem_other` only in the `GEMMA4_ASSISTANT` (drafter-mirror) branch, so a
+gemma4 *pair* ran on two empty private caches and emitted `COCOCOCO...` on **1, 2 and 3 GPUs** (raw `/completion`, so
+generation, not the chat template; the chat endpoint returned a `500 ... does not match the expected peg-gemma4
+format`).  Same WARNING as qwen4exp: *"ctx_other_share_memory was requested, but this architecture's memory module
+implements no shared view"*.  Fixed: `llama_kv_cache_iswa` takes `other_coowner` and forwards it to both children (the
+assistant mirror keeps `false`), the SWA branch of `create_memory()` passes `mem_other` with an identity layer share,
+and `iswa::alloc_sync()` covers both children's allocation owners.  After the fix gemma4 is identical on/off
+(`20e9864d44112da4`) and holds at `-c 65536` on 3 GPUs in tensor split too.
+
+**Two consumer-side facts settled:** Flint's tensor arm **must** use `-sm relaxed-tensor` — plain `-sm tensor` is
+refused at load (`LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'flint'; this arch's MoE amax rescale needs
+'-sm relaxed-tensor'`), i.e. block `0300`'s reason to exist; and gemma4 3-GPU tensor split *does* work on this build
+(the earlier suspicion did not reproduce — but before the iswa fix the pair was broken on every device count).
+
+**Not covered, stated plainly:** a recurrent-only memory (a pure Mamba-class model gets no state on the pair at all:
+`llama_memory_seq_state_take()` refuses a non-hybrid), `-sm row`, a host-tier/`-ncmoe` arm of each model, and a
+multi-turn soak per model.  The lesson recorded in `HANDOVER.md` §13: **the memory modules are the hazard, and the
+matrix is the detector** — run it for any architecture added to the delivery.
+
+## 261122.017 (r343, no delivery change) -- archive/work/prefill-decode-arms pass 10: the P0 is TWO memory-module defects, both fixed (`hybrid_idx` never shared its caches; a restore moved cells behind the derived indexer pool)
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
+`wip/prefill-overlap` **`acd705146`** (6 files, +169/-14, clean tree).  Full record:
+`archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` pass 10; `HANDOVER.md` §6 is now "RESOLVED".
+
+**The P0 is reproduced, root-caused and closed.**  On the maintainer's shape (Qwen3.8-Flash-Next IQ4_NL, `-sm tensor`
+on 3 GPUs, `--kv-unified --parallel 3 -c 204800`) a single **82 615-token** request (five attached files + "perform a
+code review") was answered as if the model had seen nothing, arms only; `prompt_n` reported the whole prompt because
+the *prefill* arm's own cache really had it.  Two defects, both in the memory module:
+
+1. **`qwen4exp`'s context never shared anything.**  Its memory is `llama_memory_hybrid_idx` (attention KV + recurrent
+   state + lightning-indexer KV) and `create_memory()` passed `mem_other` to the plain `llama_memory_hybrid` branch
+   **only**, so the decode arm allocated its own attention KV *and* its own indexer KV while the server printed
+   `KV shared, one allocation owner`.  The engine had said so on every run:
+   `W create_memory: ... this architecture's memory module implements no shared view -- this context has its OWN cache
+   (qwen4exp)`.  Fix: `hybrid_idx` takes `mem_other` and wires **both** children (the base's attention sharing plus the
+   indexer cache's own `other` + identity layer-share + `other_coowner`), `alloc_sync()` covers the indexer cache's
+   allocation owner, the layer-share log line tolerates a keys-only layer (`v == nullptr` — it segfaulted on the first
+   shared layer), and `mem_other_used` is set at both `hybrid_idx` sites so the warning can no longer lie.
+2. **A checkpoint restore moved cells behind the derived indexer pool.**  qwen4exp pools consecutive *cells*, the pool
+   is per *context*, and a restore re-places the sequence: a `cache_prompt` repeat read `cache_n=6898` and answered
+   without the prefix it had just reused.  Fix: the handover notes it on the **destination**
+   (`llama_memory_seq_state_take()` -> `llama_memory_hybrid_idx::seq_state_take_note()` -> `mem_idx_stale_set(seq_id,
+   0)`), so the receiving arm re-pools from the shared raw indexer keys (one re-pool on the next batch, TTFT not ITL).
+
+**Ruled out by measurement, not argument** (so the next session does not re-derive it): not phantom prefix reuse (it
+failed on a fresh request, `cache_n=0`); not the Meta/serialised state move (`LLAMA_RS_VERIFY_TAKE=1` re-reads the
+destination and diffs it against the source: **0 of 118 039 420 bytes differ, FAITHFUL**; and forcing the serialised
+move on a 1-GPU shape that has a device copy gives correct text); not the meta path at all (`-sm layer` failed
+identically before the fix, and a 4B plain hybrid passes at 82K on `-sm tensor`).  The cheapest reproducer is
+Flash-Next at **11K tokens** (~40 s); the 4B at 82K is the control that exonerates length.
+
+**Verified after the fix, maintainer's shape, greedy:** arms OFF and arms ON both report the codename at the head of
+FILE 1 and review all five files, and their generated `content` is **byte-identical**; a `cache_prompt` repeat that
+restores checkpoint 6898 is now correct too; `-sm layer` passes; the plain-hybrid shapes (4B r1+r2) are untouched.
+
+**Two box landmines recorded** (they cost most of the session and read as defects in the change under test): exporting
+`TEMP` to a GPU process breaks the ROCm 10.1 runtime (`TEMP=0` -> `hipStreamCreateWithFlags failed` -> "out of
+memory" at context creation), and `kill -9` on a `timeout` wrapper leaves the server alive while `rocm-smi` shows the
+VRAM free (the leaked server answers `/health` and becomes the arm you think you are driving).
+
+**Still owed (promotion package, the maintainer's call):** the arms-aware fairness/duty gate criteria, a long
+multi-turn soak, a dense fork arm, a server-side `gate-host-pool` arm, `validate-set.sh` + `ENVIRONMENT.md` for the
+option, the `off` -> `auto` default flip, the measured cost of the post-handover re-pool, a `GLM5-Next` check (same
+memory module, no checkpoint on this box), and the 4-slot WebUI run.  The meta-aware device copy stays the follow-up
+campaign's item and is now purely a cost (~74.6 ms per `-sm tensor` boundary), since the move is proven faithful.
+
+## 261122.016 (r343, no delivery change) -- archive/work/prefill-decode-arms pass 9: THREE `-sm tensor` crashes found and fixed; ONE P0 OPEN BUG (a ~70K-token prompt is invisible except its tail, arms only); HANDOVER.md rewritten for a cold session
+
+**No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  The maintainer took the
+campaign's server to the WebUI on their own shape (Qwen3.8-Flash-Next IQ4_NL, `-sm tensor`, 3 GPUs, `--kv-unified
+-np 3 -c 204800`) and found both classes of problem below.  `~/llama.cpp` `wip/prefill-overlap` `b822f89fc` (clean).
+
+**Fixed (three distinct failures, all on the Meta split-state path):**
+
+1. `seq_state_take()`'s views carried **`buffer == NULL`** (an out-of-graph view is unbacked until the graph allocator
+   touches it), so the copy aborted in `ggml_backend_buffer_get_type` on the very first handover.  CUDA's batched
+   `cpy_tensor_n` goes through `view_src` and never looks — which is why every 1-GPU shape had passed.  Views now carry
+   the parent's buffer/data.
+2. That buffer type has **no device-side copy at all** and its host path cannot resolve a strided view of a split
+   tensor (`SIGSEGV` in `ggml_backend_meta_get_tensor_impl`).  The handover now falls back to the **serialised state
+   move** (`LLAMA_STATE_SEQ_FLAGS_RECR_ONLY`, the shipped prompt-cache path) when a new query
+   `ggml_backend_buffer_can_copy_tensor()` says there is none — **the two arms keep running; this is not a fallback to
+   the single-context mode**, only the per-boundary state move changes shape.  Measured cost:
+   **112.57 MiB, ~74.6 ms (39 out + 36 in) per request boundary**; single-GPU shapes never take it.
+3. A **process-global `g_meta_view_slot`** raced between the two arms (read more than once per tensor: register a
+   view's children, then look them up), so one arm flipped it in between → a null per-device child → `GGML_ASSERT(tensor)`
+   in the prefill arm's own `sched_copy_input`, or "tensor write out of bounds" on a 0-row tensor.  It landed on the
+   **second slot's first prefill**.  Now `thread_local`, `n_view_slots` 4, and a co-owner context takes the second
+   pair (slots 2/3).  Verified: 2 slots and **3 slots** with concurrent prefill+decode, **0 asserts** (192/32/32 tokens
+   at 44/35/26 tok/s).
+
+**OPEN — P0, the reason for this entry.**  On that same shape, with the arms enabled, a request carrying **5 files +
+a text prompt (~70K tokens, one request)** is answered as if the model **only saw the trailing text**; the server
+reports reading all ~70K.  Not with `--no-prefill-decode-arms`; not with `-sm layer`.  **Not reproduced yet**: a
+15.7K-token prompt on a 4B (1 GPU) is byte-correct with the arms on *and* off, including the reuse path.  Ranked
+hypotheses and four cheap tests are in `HANDOVER.md` §6 — H1 (a **phantom prefix reuse**: the reverse handover keeps
+`slot.prompt`, and if the KV behind it is gone the next request reports `cache_n`≈70K and evaluates only the tail),
+H2 (the long prompt on the serialised/meta path), H3 (context shift), H4 (the WebUI sending several requests).  A
+containment kill switch (`LLAMA_ARMS_KEEP_PROMPT=0`, clear the prompt on return = pass-6 behaviour) is **proposed but
+not implemented** — it is a behaviour change and needs the maintainer's word.
+
+**Scope ruling recorded:** this campaign ships **opt-in only**; the **meta-aware device copy** (which would remove the
+~74.6 ms boundaries) and **speculative-decoding support** are a **follow-up campaign**.
+
+`HANDOVER.md` is **rewritten for a cold session** (it supersedes the pass-5 version, which stays in git history at
+`7b784bc0`): §1 task table to T9, §2 code map with the commit list, §3 the cut + the option tri-state + the
+`-ib`/`DUTY` deprecation, §4 the two reuse contracts, §5 numbers of record, **§6 the P0 with the four tests**, §7 the
+three `-sm tensor` fixes and the remaining cost, §8 refusals, §9 the gate table, §10 the traps (a leaked server
+answering `/health`, the box's `llama-slot-proxy` on 8037-8039, a bare `wait` hanging a script, `jq --arg` vs a 190 KB
+prompt, the cold-rep §89 class), §11 working commands, §12 repo state, §13 the next steps in order.
+
+## 261122.015 (r343, no delivery change) -- archive/work/prefill-decode-arms pass 8: the DENSE and FULLY-RESIDENT cases (prefix reuse holds on both), the option's tri-state with an `auto` that falls back, and `-ib`/`DUTY` reported deprecated on this path
+
+**No delivery patch changed; nothing in `patches/`, no tag.**  The two shapes the maintainer named as the common
+end-user cases, verified before any promotion talk, plus the option semantics from D1/D3.  `~/llama.cpp`
+`51c1fb8ec` (2 files: `common/arg.cpp`, `common/common.h`, `tools/server/server-context.cpp`).
+
+* **Dense architecture** (phi-4 IQ4_XS, fully resident, one GPU): tier 1 **PASS** cold and over 3 warm pairs (both
+  slots, 32 tokens each); `gate-server-reuse.sh` **strict PASS** with **the fork below the prefix reusing**
+  (`cache_n=220`, 20.2 vs 97.0 ms) — a pure attention KV needs no checkpoint to roll back, as pass 7 predicted but
+  could not show; `FORK_REUSE=1` now enforces it.  Concurrent resume: PASS, 578 tokens reused, 64.6 vs 261.7 ms.
+* **Fully resident 27B** (Qwen3.8-27B-UD-Q4_K_XL, `-ngl 99`, no arena — the agentic-coding default): tier 1 **PASS**
+  cold + 3 warm pairs; `gate-ckpt-reuse.sh` **PASS at single-context parity** (3 restores; resumed turns 111.0 / 108.7
+  / 106.9 ms against the control's 109.7 / 106.5 / 106.8).  The reverse take moves a ~150 MiB state every boundary and
+  the result is indistinguishable from the reference server.
+* **The finding that changed a gate's contract**: on the 27B, `cache_prompt:true` and `false` give different text —
+  and the **single-context server does it too** (arms `cache` == single-context `cache` = `deda991b9954a821`; arms
+  `nocache` == single-context `nocache` = `6d350f31f83a15b8`).  So the reverse handover reproduces the reference's
+  reuse path **byte for byte**, and reuse-vs-reprefill text equality is a **delivery** property this fork does not
+  have on that model (a checkpoint-restored placement is not a re-prefilled one).  The gate now has `GATE=strict`
+  (reuse moves no token — true on the 4B, phi-4, 35B host tier) and `GATE=parity` (the arms equal the single-context
+  server's own reuse — true everywhere measured, and the contract a promotion should be judged on).
+* **Concurrent multi-agent resume on the 27B**: two slots resuming in parallel read **365.1 ms / 262.1 ms** against
+  **1295.1 / 1296.0 ms** without reuse (**3.5x / 4.9x**), no abort, no fault (the concurrent arm asserts no text:
+  different round-2 prefill lengths co-batch differently, `GREEDY-PURITY.md` §63).
+* **The option (D1)**: `--prefill-decode-arms-mode off|on|auto` (+ env), with the old flags as the explicit forms.
+  `auto` **enables when the shape can carry the pair and FALLS BACK to single-context with a warning** when it cannot;
+  an explicit `on` still refuses to start rather than degrade silently.  Verified: auto+`-np 2` creates the pair,
+  auto+`-np 1` warns and stays single, auto + a refused feature falls back **and keeps serving**, `on` + the same
+  exits 1, and with no arms flag there are no new messages at all.  `auto` is **not** the default yet — flipping it is
+  a delivery-behaviour change (it would silently move every existing delivery gate onto the arms path) and belongs to
+  the promotion decision.
+* **Deprecation (D3)**: `-ib` and `LLAMA_SERVER_PREFILL_DUTY` print a one-shot notice that they are deprecated and
+  have **no effect** on this path, only when they are set *and* the pair is running, with the measured reason in the
+  text.  Block 16's **fair-share** half is not deprecated and stays live (1.85 s -> 0.79 s).
+* **Two gate-hygiene defects found and fixed**: a leaked server answering `/health` made the next arm silently drive
+  the previous arm's server (now the gate refuses a busy port); and the **cold** host-tier rep can land in a different
+  §89 residency class (`182a9fcfe1de6a70`, h=0.6293, against the pair arm's `459865c93d55cbaf`, h=0.6905) while the
+  warm reps agree in both arms — so **the oracle is the warm pairs**, and a promotion gate must warm first.
+* **A 4-slot server is running on :8080** (27B fully resident, `--kv-unified`, `-np 4 -b/-ub 2048`, q8_0 KV, the pair
+  created, 31.9 tok/s single-stream) for the maintainer's own browser test, before the promotion path is decided.
+
+Nothing pushed anywhere; `~/llama.cpp` (`wip/prefill-overlap` `51c1fb8ec`) and this repo are clean.
+
+## 261122.014 (r343, no delivery change) -- archive/work/prefill-decode-arms pass 7: the REVERSE HANDOVER restores prefix reuse (685 -> 33 ms per appended turn, single-context parity) and a reused prefix moves no token
+
+**No delivery patch changed; nothing in `patches/`, no tag.**  The one behavioural regression pass 5 §7 recorded
+(the arms path re-prefilled from scratch after every request) is fixed at the maintainer's direction ("prefix reuse
+is absolutely essential").  `~/llama.cpp` `16e942d2f`, **1 file** (+94/-29, `tools/server/server-context.cpp`) --
+no library change: `llama_memory_seq_state_take(dst, src, id)` was already symmetric.
+
+* **the change**: the decode arm no longer frees a slot's shared cells when generation ends (or when the main loop
+  takes the slot back on a cancel); the main thread runs **`llama_memory_seq_state_take(mem_tgt, mem_dec, id)`** --
+  the mirror of the forward take, under the same `arms_quiet` bracket that guards T0's allocation handshake.  It runs
+  on the MAIN thread because its destination is the prefill arm's memory (it cannot race this arm's prepares) while
+  `arms_quiet` keeps the decode arm out of `llama_process()` (the take reads that arm's cell map).  The prompt is then
+  KEPT (`release()` keeps it for a normal task, as the single-context server does), so the sequence is resident and
+  the reuse path (`get_common_prefix`, `prompt.get_reuse`/checkpoints) works.  A **failed** take drops the sequence
+  (`prompt_clear()`): an attention half with no recurrent half is an inconsistent state and a forced re-prefill is the
+  safe failure; a dense model has nothing to move, so `false` there is not a failure.  One new flag (`dec_state`, under
+  `m_arms`) carries "the state is on the decode arm"; `arms_quiesce()`/`arms_resume()` are the factored-out bracket.
+* **`gate-ckpt-reuse.sh` on the arms path: SKIP -> PASS** (Qwen3.5-4B, `cache_prompt:true`, four growing turns):
+  **3** checkpoint restores and prompt times **724.7 / 33.9 / 32.6 / 32.9 ms** against the pass-6 arms path's
+  **729.4 / 684.2 / 686.6 / 686.3 ms** and the single-context control's 732.6 / 33.4 / 33.0 / 33.5 ms.  Text `==` on
+  every request, no GPU fault: **~20x per appended turn -> 1.0x**.
+* **new oracle `arms/gate-server-reuse.sh`** (the campaign's reuse gate): a reused prefix must be byte-identical to an
+  arm that never reuses (`cache_prompt:false`), on 35B-A3B at the product shape.  **PASS**, non-vacuously:
+  A (cold) `459865c93d55cbaf` both arms; **B (extends A) `3c4688721469b81f` in both arms, 420.5 ms with
+  `cache_n=395` against 851.4 ms with none**; C (forks BELOW A) `8a416c7447557094` both arms -- C re-prefills even
+  cached, which is the reference's hybrid behaviour without a checkpoint to roll back to.
+* **the multi-agent case** (`CONCURRENT=1`: two conversations, one per slot, both driven in parallel): **PASS** --
+  `cache_n=395` / `1476` on the two resumed turns, **424.7 vs 1352.3 ms** and **581.0 vs 1997.8 ms** (3.2x / 3.4x),
+  all four replies byte-identical, and the concurrent cold round reproduces the tier-1 hashes
+  (`459865c93d55cbaf` / `7dc20b0ce0bac255`).
+* **tier 1 unchanged** (the change's own risk): `ref` vs `arms`, cold (`runs/server-oracle-r343e/`) and over 3 warm
+  pairs (`-r343d/`), both slots `459865c93d55cbaf` / `7dc20b0ce0bac255`, `HANDSHAKE the pair shares one allocation
+  owner`, every boundary clean.
+* **the other gates re-run**: fairness (its absolute ITL criterion) **PASS** -- ITL max 30 ms, admission, 2.2x fair
+  share, text identical; duty **inert** (75 -> 73 tokens, prefill stretch 1.01x) -- it now reads 0.99x at a 1.0x
+  floor, i.e. ±2 tokens of noise, so the criterion this path needs is a two-sided band; `check-gpu-faults` clean over
+  all 18 logs.
+
+Also recorded for the promotion decision: `-ib` and `DUTY` are **deprecated when the two-arm feature is active** (the
+maintainer's ruling -- both are work-arounds for the single-threaded interleave, and both are measured inert here),
+while the **fair-share** half of block 16 stays live.  Nothing was pushed anywhere; `~/llama.cpp` (`wip/prefill-overlap`
+`16e942d2f`) and this repo are clean.
+
+## 261122.013 (r343, no delivery change) -- archive/work/prefill-decode-arms pass 6: tier 2 (KLD 0.000000) + the reachable server gates -- and the two reds are RELATIVE bounds the arms remove
+
+**No delivery patch changed; nothing in `patches/`, no tag.**  The tier-1 oracle was reproduced first (cold + 3 warm
+request pairs, both slots `459865c93d55cbaf` / `7dc20b0ce0bac255`, `HANDSHAKE the pair shares one allocation owner`,
+every boundary clean), then the delivery-bound evidence that had never been run:
+`scripts/gate-prefill-logits.sh` on the WIP build (`build-2ctx` @ `7c114eec0`), `gate-prefill-fairness.sh` +
+`--self-test`, `gate-prefill-duty.sh`, `gate-park-idle-slots.sh`, `gate-ckpt-reuse.sh`, `check-gpu-faults.sh` on
+every arm.  Record: `archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` pass 6.
+
+* **KLD: mean 0.000000 / same-top-p 100 %** against the canonical 27B Q8_0 base — the three library artifacts are
+  **bit-inert on the default single-context prefill path**.  Honest limit: `llama-perplexity` owns one context, so
+  this gate **cannot reach** the arms path; tier 1's byte-identical hash is the arms-path instrument.
+* **fairness**: red **as shipped** only on `ITL_c <= 1.75 x ITL_b x chunk/b` = **13 ms**, i.e. it asks for less than
+  the decode arm's own 28-30 ms step; **green** with the gate's own `--max-itl-ms 120` (28 ms), everything else green
+  (admission, 2.3x fair share, text identical, faults clean).  The gate's baselines on the same shape are the
+  campaign in one line: **single-context worst in-window ITL 323 ms, arms 29 ms**.  `--self-test` on the default path
+  still rejects the unfixed build.
+* **duty**: red **as shipped** on a 3x burst gain that cannot exist when the baseline **already delivers 73** tokens
+  (single-context baseline: **16**); **green** at `--min-decode-gain 1.0` — inert, 73 -> 75, prefill stretch
+  **0.99x** (the single context pays 2.09x for its 129).  So block 16's duty cycle is **redundant on this path**,
+  while its **fair-share** half stays live (1.845 s -> 0.786 s).
+* **park**: reachable, **SKIP** — a co-owner pair is not "one stream", so the cache declines by its own guard (the
+  control PASSES: 3 park moves, 1 unpark).  Also: the arms force an explicit or auto `-np`, and an explicit `-np N`
+  leaves `kv_unified = false` (only `--parallel auto` sets it) — a docs/gate item for promotion.
+* **ckpt reuse**: reachable, **SKIP** — **0** restores and `cache_n = 0` on every request, because the return frees
+  the slot's cells and clears its prompt.  Measured price of the missing prefix reuse: a chat turn appending ~9
+  tokens re-prefills 5200+, **685 ms against 33 ms** (~20x per turn, single-context control PASSES with 3 restores).
+  That is `README.md` landmine 10 with a number; the fix is the **reverse handover** and is the maintainer's call.
+* **GPU faults: clean over all 32 logs**, including every two-arm run.
+
+Read together with the retired campaign: no mechanism or gate says the two arms are wrong — the two reds are bound
+arithmetic on a design that removes the shared step, and the two SKIPs are the two behavioural consequences
+(parking's placement work and prefix reuse) that the request-boundary-only design makes unreachable.  Neither owed gate reaches this path as shipped
+(`gate-host-pool.sh` is llama-cli-only; the promise gate's `seq` arm hard-codes `-np 1`) -- but the promise gate's own
+criteria are **met by the oracle's exit census** (0 repair lines, `broken=0 repaired=0 stale=3360` cold / `10338` warm
+over two interleaving graphs), so promotion owes an **arm** for the `seq` shape, not a pass.  `~/llama.cpp` (`wip/prefill-overlap`
+`7c114eec0`) and this repo are clean; nothing was pushed anywhere.
+
+## 261122.012 (r343, no delivery change) -- archive/work/prefill-decode-arms: at FULL residency the two arms are still better on BOTH axes (the single-context server's own interleave is the expensive thing)
+
+**No delivery patch changed.**  The last tier: all 21.1 GiB of 35B-A3B Q4_K_M resident in VRAM (no `-ncmoe`, no
+`-lme`, no arena, no gathers), where the two arms compete for the same SMs and nothing hides behind a link.
+`-c 16384 -b 2048 -ub 2048`, warm, `ROCBLAS_USE_HIPBLASLT=0`.
+
+| arm | prefill | decoder tokens in the window | in-window ITL p50 / p95 / max |
+|---|---|---|---|
+| `lone` (alone) | **6320.8 t/s** | -- | -- |
+| `single` (one context, both streams) | **4129.2 t/s (-34.7 %)** | 32 | 8.8 / 46.8 / **327.3 ms** |
+| **two arms** | **4792.0 t/s (-24.2 %)** | **53** | 14.6 / 16.0 / **34.9 ms** |
+
+The user-facing version (`interactive.py`: reply streaming while a ~3600-token document is pasted): single-context
+**924 ms at 4029 t/s with a 327 ms freeze**, two arms **737 ms at 4786 t/s with a 33 ms worst gap**.
+
+### What it settles
+
+1. **The arms win on both axes here too**: +16 % prefill, a 10x tighter worst-case stall, 66 % more decoder tokens
+   through the window, and the document 20 % sooner.
+2. **It is the single-context server that does badly at full residency**, mechanically: with a live decoder its
+   prefill is served in many small steps (34 prefill steps against 4 for the arms, p50 8.7 ms) so it re-pays the
+   per-step fixed cost throughout -- -34.7 % -- **and** each step still stalls the decoder (the 327 ms spike IS one
+   prefill step).
+3. The retired campaign's "no window at full residency" is a statement about the *host-tier* window: nothing is free
+   here (the cost is a real -24.2 %), but the earlier implication that the arms lose at full residency is false on
+   the server.
+4. The arms' price is the **same order on both tiers** (-24.2 % here, -21…-24 % on the host tier), and so is the
+   smoothness gain: the design does not depend on which tier the weights sit in.
+
+With this the campaign's core question is answered on both tiers; `HANDOVER.md` §7b is the numbers-of-record table
+for the next session, and §8/§7b list the traps (tier 2 + the server gates, no cross-request prefix reuse on this
+path, the T4 gate, block 16's duty cycle, promotion).
+
+## 261122.011 (r343, no delivery change) -- archive/work/prefill-decode-arms: `-ub 8192` measured, and the "cost falls with the ubatch" reading is CORRECTED (it was a one-step artifact)
+
+**No delivery patch changed.**  The maintainer asked for `-ub 8192`; it was measured, and it refutes part of
+`261122.010`.
+
+### 1. The correction
+
+`261122.010` reported the pair's prefill cost falling `-26.6 % -> -19.3 % -> -16.4 %` as the ubatch went
+512 -> 2048 -> 4096.  That sweep used a **~3700-token** prompt, so at 4096 **and** 8192 the prompt fits in ONE step:
+those two points measure a single contended step against a single-step reference, not the same experiment as the
+512/2048 points.  Measured at `-ub 8192` on the same prompt: `lone` 3859.4 / arms 3159.9 = **-18.1 %** — i.e. going
+4096 -> 8192 *does not* improve once both are one step.
+
+### 2. The honest table: a ~8300-token prompt, several steps at every ubatch, both pins, warm
+
+arena 5000 (`-c 20480`):
+
+| `-ub` | `lone` | two arms | cost | decoder p50 / p95 / max |
+|---|---|---|---|---|
+| 4096 | 3625.4 t/s | 2866.3 t/s | **-20.9 %** | 37.8 / **50.2** / **95.1 ms** |
+| 8192 | 3836.6 | 2997.3 | **-21.9 %** | 32.7 / 63.5 / 124.5 ms |
+
+arena 4000, same prompt:
+
+| `-ub` | `lone` | two arms | cost | decoder p50 / p95 / max |
+|---|---|---|---|---|
+| 2048 | 2954.6 | 2278.9 | -22.9 % | 39.4 / 61.5 / 104.0 |
+| 4096 | 3525.6 | 2779.9 | -21.2 % | 38.1 / 54.2 / 101.5 |
+| 8192 | 3799.5 | 2892.7 | -23.9 % | 34.5 / 74.0 / 131.4 |
+
+**The relative cost is flat at -21…-24 % from 2048 up; the ubatch buys *absolute* prefill rate** (`lone` 2955 ->
+3526 -> 3800 t/s, the pair 2279 -> 2780 -> 2893, **+29 %**), which is the 2.6x over the `-ub 512` shape that the
+VRAM workaround had forced.
+
+### 3. Where 8192 lands
+
++8 % prefill over 4096 — and a **worse decoder tail**: p95 63.5 / max 124.5 ms against 50.2 / 95.1, because an
+8192-token step takes **2.2 s** (`pf_step_max`) and the driver cannot always fill a queue that long.  So
+**`-ub`/`-b` 4096 is the sweet spot**; 8192 only where prefill rate is worth more than the tail.  Both fit at arena
+5000 with `-c 20480` and `reserve=1.50 GiB`, no OOM (r343's headroom again).
+
+### 4. What still stands from 261122.010
+
+`-ib` is inert on the arms path (every arm here set `-ib` = `-ub`, so it never bound) and the `decode_active`
+leftover is fixed; `-ub 512` was a VRAM workaround, not a property of the design (2.6x the prefill at 4096 on the
+same arena).  The claim "a bigger ubatch is better on both axes" is **refuted at a multi-step prompt** and marked so
+in place in `RESULTS-2026-11-22.md`.
+
+## 261122.010 (r343, no delivery change) -- archive/work/prefill-decode-arms: `-ib` is a single-context hack, a BIG ubatch is better on both axes, and the pair fits at 4096 now
+
+**No delivery patch changed.**  Campaign measurement + one code change in the WIP server branch (`decode_active`
+counts only prefill-arm slots).  Raised by the maintainer: `-ib` exists only because a decoder used to wait behind a
+step, so what is the prefill like with the ubatch free?
+
+### 1. Prefill vs ubatch (arena 5000, `-c 16384`, ~3700-token prompt, warm, both pins, 1 GPU)
+
+| `-b` / `-ub` / `-ib` | `lone` (one context) | **two arms** | cost | decoder in-window p50 / p95 / max |
+|---|---|---|---|---|
+| 2048 / 512 / unset (the VRAM-forced shape) | 1440.0 t/s | 1056.3 -> **1142.0** after §3 | -26.6 % -> **-20.7 %** | 49.0 / 71.0 / 114.3 ms |
+| 2048 / 2048 / 2048 | 3041.2 | **2454.5** | **-19.3 %** | 40.9 / 61.1 / 66.0 ms |
+| 4096 / 4096 / 4096 | 3884.2 | **3245.5** | **-16.4 %** | 46.2 / 56.7 / **63.3 ms** |
+
+A bigger ubatch lifts the prefill **2.7x** and the relative overlap cost **falls** (-26.6 -> -19.3 -> -16.4 %), while
+the decoder gets *smoother* (p95 71 -> 57 ms, worst 114 -> 63 ms): the maintainer's "4096 may get close to the -14 %
+prediction" is nearly there, and what is left is per-step link contention rather than policy.  **It also fits**: at
+`-ub 4096` / arena 5000 / `-c 16384` the pair runs clean with `reserve=1.50 GiB` and no OOM, which r339's landmine 8
+recorded as impossible -- r343's slab headroom is exactly the 741 MiB 2-row decode reserve that used to fail.  So
+`-ub 512` was a VRAM workaround, not a property of the design.
+
+### 2. The user-facing number at each ubatch (`interactive.py`)
+
+| `-b`/`-ub` | arm | the document | the reply's worst gap |
+|---|---|---|---|
+| 512 | single context / **two arms** | 4463 ms, 797 t/s / **2807 ms, 1252 t/s** | **390** / **95 ms** |
+| 2048 | single context / **two arms** | 1854 ms, 1961 t/s / **1448 ms, 2430 t/s** | **615** / **86 ms** |
+| 4096 | single context / **two arms** | 1291 ms, 2854 t/s / **1131 ms, 3111 t/s** | **878** / **60 ms** |
+
+The single-context stall **grows with the ubatch** (390 -> 615 -> 878 ms: one step is longer and a decoder waits the
+whole step); the two arms' stays flat at 60-95 ms while its prefill keeps improving.  On the arms path the big ubatch
+is therefore **not a trade** -- better on both axes at once.
+
+### 3. The leftover: `decode_active` counted the DECODE arm
+
+The prefill arm's `-ib` cap keyed on "some slot is GENERATING", including slots on the decode arm that no longer wait
+for this arm, so with `-ib` unset the arms' prefill was still chunked to `n_ubatch` whenever the decoder ran.  At
+`-ub 512` that cost **8.1 %** (1056.3 -> 1142.0 t/s; 10 steps of 420 ms -> 5 of 1088 ms); at `-ub >= 2048` the cap
+equalled the ubatch and was inert.  Fixed: it now counts a prefill-arm slot only
+(`slot_arm_of(slot) == SLOT_ARM_PREFILL`), with the reason in the code.  **Tier 1 re-run after the change: PASS**,
+both slots `459865c93d55cbaf` / `7dc20b0ce0bac255` (`runs/server-oracle-r343b/`) -- the ubatch *composition* is
+unchanged, only how many ubatches one step carries.
+
+### 4. Guidance that follows
+
+Run the pair at the **largest ubatch the card fits** (`-b 4096 -ub 4096` measured; the delivery's `-ub 2048` default
+is already most of the win) and **do not set `-ib`**.  The campaign's `-ub 512` advice is retired.
+
+## 261122.009 (r343, no delivery change) -- archive/work/prefill-decode-arms: the interactive number, and the campaign's code on r343
+
+**No delivery patch changed** -- this is the campaign's record: its code branch was rebased onto the delivery's
+**r343**, the tier-1 oracle was **re-read** on it, and the user-facing measurement was taken with a new tool.
+
+### 1. The rebase, and why it matters
+
+`~/llama.cpp` `wip/prefill-overlap`, 7 WIP commits, rebased `923b910eb -> e6b3cd3e5` (r343's re-cut chain), new tip
+**`9bb97b741`**; tree clean.  The branch had been carrying r339's chain, so it was built on the *old*
+`GGML_CUDA_SLAB_HEADROOM_MIB` default.  On r343 it now inherits **1536 MiB on one GPU**, which is exactly what the
+campaign needed: the pair's **2-row decode graph** fits with **no env override** (pass 5 §4's finding, closed by the
+delivery rather than by an operator knob).
+
+### 2. The tier-1 oracle re-read on r343: PASS, unchanged
+
+The default shifts the slab arena by 256 MiB, so the oracle was re-read, not assumed
+(`archive/work/prefill-decode-arms/runs/server-oracle-r343/`): product shape, both pins, two concurrent ~500-token requests
+-> SLOT 0 `459865c93d55cbaf`, SLOT 1 `7dc20b0ce0bac255`, i.e. **the same values pass 4 recorded on r339**,
+`HANDSHAKE the pair shares one allocation owner`, census `h=0.6910`.  Stands with pass 5 §6's caveat: a cold
+short-prompt host-expert shape is not run-to-run text-stable in either arm and can never arbitrate a default
+change; the warm 2-slot gate shape can, and holds.
+
+### 3. The interactive number (`arms/interactive.py`, new)
+
+A reply streams on slot 0; a ~3600-token document is pasted into slot 1 0.6 s later; both are read concurrently.
+r343 tree, arena 5000, `-c 16384 -b 2048 -ub 512`, 35B-A3B, both pins, warm, 1 GPU:
+
+| arm | the document | the streaming reply |
+|---|---|---|
+| **default** (single context) | **TTFT 4463 ms**, 4.40 s at **797 t/s** | window gaps p50 18 / p95 **300** / worst **390 ms**; 119 tokens through |
+| **two arms** | **TTFT 2807 ms**, 2.80 s at **1252 t/s** | p50 44 / p95 **62** / worst **95 ms**; 63 tokens through |
+
+Tokens/s of the reply from its start (`|` = the document prefilling):
+
+```
+             0   1   2   3   4   5   6   7   8   9  10  11  12
+default:    23  32  24  25  36  42  61  59  59  60  67  59  53
+             .   |   |   |   |   |   .   .   .   .   .   .   .
+   arms:    27  22  23  35  56  60  62  61  57  61  59  60  17
+             .   |   |   |   .   .   .   .   .   .   .   .   .
+```
+
+The document lands **1.6x sooner** on the two arms and the reply **never freezes** (worst gap 95 ms vs 390 ms; p95
+62 vs 300).  The cost is rate, not liveness: 22-35 tokens/s while the document prefills against ~60/s alone.  The
+single-context server pays twice for the interleave -- its prefill is chunked by `-ib` *and* it still stalls the
+decoder -- which is why its document is slower **and** its reply is burstier.
+
+### 4. Repo hygiene (both repos)
+
+`llama-cpp-rdna-boosts`: this branch was backed up as patches (`archive/work/prefill-decode-arms/branch-backup/`), rebased
+onto `main` (r343), and its four WORKLOG entries re-inserted above main's 2026-11-22 ones (`.004`-`.006`, plus
+261121.023 unchanged) after the numbering collision the delivery's r342/r343 created.  Only `wip/` differs from
+`main` on this branch.  `~/llama.cpp` is clean at `9bb97b741`, its `rdna-boosts` branch at `.tip` `e6b3cd3e5`.
+
+## 261122.008 (r341, no delivery change) -- archive/work/prefill-decode-arms pass 5: the two-arm SERVER is built and tier 1 passes byte-identically; the smoothness target is met and the cost target is not
+
+**No delivery patch changed, no block created or amended, no tag** -- `patches/`, `release.json` and the block
+structure are untouched.  WIP only: `~/llama.cpp` `683deed67` (3 files, the 7th commit of `wip/prefill-overlap`) and
+the campaign record (`archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` pass 5, `T2-SERVER-CUT.md`'s header,
+`HANDOVER.md`, `README.md`).
+
+### 1. What it is
+
+`llama-server --prefill-decode-arms` (env `LLAMA_ARG_PREFILL_DECODE_ARMS=1`): a **prefill arm** (the main loop,
+`ctx_tgt`) and a **decode arm** (`ctx_dec`, its own thread, co-owning the prefill arm's KV cells via `ctx_other` +
+`ctx_other_share_memory`, sized `n_batch = n_ubatch = n_parallel`), with a slot crossing **only at a request
+boundary**: the prompt's last row is sampled on the prefill arm, the slot is posted, the decode arm runs
+`llama_memory_seq_state_take()` (device to device), then decodes **one token per active slot in one batch**; on stop
+it frees the shared cells once (`llama_memory_seq_rm(ctx_dec)`) and the main loop finishes the response.  The step is
+factored into `slot_step(ctx, batch, slot, row)` and shared by both arms.  `llama_memory_alloc_sync()` (T0's
+handshake) is called on **both** memories at every request boundary and **asserted clean** (a quiet window keeps
+both arms out of `llama_process()` for its duration).  Guards refuse a speculator, mtmd/TTS/realtime,
+embeddings/rerank/decision, LoRA, `--sleep-idle` and backend sampling; `-np 1` warns and stays single-context.
+
+### 2. Tier 1 (the approved oracle): PASS, cold and over 3 warm request pairs
+
+Product shape (arena 5000, `-c 8192 -ub 512 -np 2`), both purity pins, two concurrent ~500-token requests:
+
+| run | SLOT 0 | SLOT 1 |
+|---|---|---|
+| reference (pass 4's acceptance values) | `459865c93d55cbaf` | `7dc20b0ce0bac255` |
+| **two-arm server** | **`459865c93d55cbaf`** | **`7dc20b0ce0bac255`** |
+| 3 pairs in one process, reference / **two arms** | both `459…` x3 | both `7dc…` x3 |
+
+`HANDSHAKE the pair shares one allocation owner`, and 12/12 allocation handshakes clean over the warm pairs.  The
+census is recorded, never asserted (0.6853/0.6905 cold, 0.7889/0.7945 warm).
+
+### 3. The measurement (`smooth.py`, the campaign's metric, 1 x R9700, 35B-A3B, arena 5000, `-ub 512`, sequential)
+
+| shape | `lone` (no decoder) | `duty0` (shipped) | **two arms** |
+|---|---|---|---|
+| ~2900 tok, `-c 16384` | 1486.1 t/s / 2.0 s | 1280.5 / 2.3 s, p50 347 / p95 466 ms | **1100.8 / 2.7 s, 56 tokens, p50 49.4 / p95 77.5 ms** (-25.9 %) |
+| ~3750 tok, `-c 12288` | 1440.0 / 2.6 s | 1264.3 / 3.0 s, p50 342 / p95 466 ms | **1056.3 / 3.6 s, 72 tokens, p50 49.0 / p95 71.0 ms** (-26.6 %) |
+| ~5900 tok, `-c 16384` | 1483.2 / 4.0 s | -- | **1135.3 / 5.3 s, 110 tokens, p50 47.1 / p95 74.2 ms** (-23.5 %) |
+
+`duty16` on the middle shape: 706.2 t/s (-51.0 %), 136 tokens at p50 18.2 / **p95 287.5 ms** (bursty).  So the
+campaign target's **smoothness half is met** (~47-49 ms p50, 64-78 p95, 92-119 ms worst gap, at every prefill length
+tried) and its **cost half is not**: **-24 to -27 %**, against the instrument's -14.1 %.  It is not a defect and it is
+not the chunking (`-ib 0` measured inert, -25.8 %): the server's standalone decode step is ~1.6x the instrument's
+(16.9 vs 10.9 ms) so it draws ~1.6x the charge per token at the same arena, and the smoother ITL packs more tokens
+into the window.  Lead: the cost is `charge / in-window ITL`, and the charge is the arena depth (the retired
+campaign's sweep: 7.7 ms at h=0.66, 12.8 at h=0.40, 16.0 at h=0.32).
+
+### 4. Findings (for the maintainer, before anything is proposed as delivery)
+
+1. **The 2-row decode graph is a WIDTH transition, not a size.**  At arena 5000 / `-c 16384 -ub 512` with a
+   ~5900-token prompt the first 2-row decode batch fails: `741.48 MiB ... the movable-boundary slab holds the VRAM`,
+   `ret = -2` (a 1-row decode step had run for 5.5 s immediately before).  **`GGML_CUDA_SLAB_HEADROOM_MIB=1536`**
+   fixes it (the documented knob for that message; default 1280 on one GPU) and the same shape then runs clean.  T4's
+   VRAM rule therefore has two levers, and this one belongs in the gate.
+2. **The arms path does not reuse a slot's prefix across requests**: the decode arm frees the shared cells on stop and
+   the return clears the prompt (the recurrent half is still on the decode arm; moving it back needs a reverse
+   handover the scoped design does not do).  Costs nothing in the oracle (`cache_prompt:false`); it is the first fix
+   if this is ever promoted.
+3. Two defects the cut itself produced, both recorded in pass 5 §5: a **self-deadlock on the arm mutex** (a reader
+   that takes the mutex called from inside a locked block -- the GPU idle with 32 GiB still resident) and a
+   `NEXT_RESPONSE` posted from the decode arm **without an id** (`server_queue::post` asserts).
+
+### 5. Not done (deliberately)
+
+Tier 2 (the KLD point), the server-side gates of `T2-SERVER-CUT.md` §6.3, `check-gpu-faults.sh` results stand clean
+across every arm of this session, and **nothing is delivery-bound**: the flag, its default and any block remain the
+maintainer's decision.
+
+## 261122.007 (r341, no delivery change) -- archive/work/prefill-decode-arms pass 3: T0 built (ONE KV allocation owner for the co-owner pair, per-ubatch reserve + handshake), and the campaign's last text mystery was an instrument ordering bug
+
+**No delivery patch changed, no block created or amended, no tag** -- `patches/`, `release.json` and the block
+structure are untouched.  WIP-only: `~/llama.cpp` `386b7dd48` (7 files, +386/-10, the 6th commit of
+`wip/prefill-overlap`), the campaign artifact `archive/work/prefill-decode-arms/enabling-0003-shared-kv-allocator.patch`,
+the instrument's handshake/race-control knobs, and the campaign record
+(`archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` pass 3).
+
+### 1. T0, as the maintainer specified it: one owner, per-ubatch, two-sided
+
+`struct llama_kv_alloc` is shared by the co-owner pair exactly like `v_cells_impl` and is the only place a KV cell
+allocation is decided.  `find_slot()` searches from the pair's ONE cursor, marks the cells it chose as **reserved**
+(invisible to any search on either arm) and advances that cursor -- per **ubatch**, the granularity `prepare()`
+works at.  The real `apply_ubatch()` commits; `prepare()`'s dry run does not consume the reservation (it is rolled
+back, the reservation is not); a failed prepare or an abandoned batch context releases its marks and restores the
+cursor.  Every other cursor move (`seq_rm`/`seq_keep`'s pull-back to a freed hole, `seq_cp`, `seq_add`, a
+whole-cache restore, `clear()`) moves the pair's cursor too.  `llama_memory_alloc_sync()` is the request-boundary
+**handshake**: it reports reservations nothing applied instead of letting them shrink the cache silently.  The
+mutex is held across the search/bookkeeping only, never across a compute (the campaign's 2.85 s starvation).
+`LLAMA_KV_ALLOC_SHARED=0` is the A/B control (legacy per-context cursors); it will need an `ENVIRONMENT.md` row
+**when** this is proposed for delivery.
+
+### 2. Measured (1 x R9700, sequential, `ROCBLAS_USE_HIPBLASLT=0`, no harness reset)
+
+| shape | arm | R0 | R1 |
+|---|---|---|---|
+| full residency, 3 reps | `arms` (T0) | reference x3 | reference x3 |
+| full residency | `LLAMA_KV_ALLOC_SHARED=0` | rep 1 `e05c6e16a136` | reference |
+| product (arena 5000), 3 reps | `arms` (T0) | reference x3 | reference x3 |
+| product | `ALLOC_SHARED=0` | rep 1 `e05c6e16a136` | reference |
+
+* **480/480 sampled logits rows sha-identical** to the single-context reference (cross-process, same shape/env),
+  and the **KV cell census identical over all 729 lines** (both sequences, all reps).  The cross-configuration
+  hash oracle pass 1 called unavailable is available -- on the product shape too.
+* `HANDSHAKE ok=1` at every request boundary.
+
+### 3. The last mystery: it was the harness, not the design
+
+The instrument reset a request's flags per rep but not `handover_done`, so from rep 1 the prefill arm skipped its
+wait and the next prompt was prefilled **while the take was reading that arm's recurrent metadata** -- the ordering
+rule `HANDOVER` §4.2 states.  The trace: R1's prefill landed in recurrent cell 1 instead of 0 and its warm text
+moved.  `ARMS_NO_WAIT_TAKE=1` now reproduces that deliberately (it reads `b79e73e3fe9f`), so it can never again be
+re-derived as a property of the design.  **Corrected attribution of every warm-rep divergence this campaign
+chased**: the hipBLASLt path (full residency, cured by the pin); the take race (the tier, cured by the instrument
+fix); the two allocation cursors (both shapes, cured by T0); and one transient T0 bug of my own (the cursor was not
+yet mirrored at `seq_rm`'s pull-back) fixed in the same commit.
+
+### 4. Next
+
+The server cut (T2), per `RESULTS-2026-11-21.md` §5, gated by the two-tier oracle the maintainer approved (tier 1:
+the cross-configuration hash with T0 + the pin; tier 2: KLD + the residency census).  Nothing here is
+delivery-bound and nothing asks to be.
+
+## 261122.006 (r341, no delivery change) -- archive/work/prefill-decode-arms pass 2: the campaign's "residual" is TWO effects (the hipBLASLt path at full residency, a GREEDY-PURITY §89 residency class on the tier), and the two-cursor finding is confirmed by direct cell census
+
+**No delivery patch changed, no block created or amended, no tag** -- `patches/`, `release.json` and the block
+structure are untouched.  WIP-only: two env-gated diagnostics on the branch `wip/prefill-overlap` in
+`~/llama.cpp` (commit `c49584c60`), a logits-dump knob in the campaign instrument, and the campaign record.
+Full record: [`archive/work/prefill-decode-arms/RESULTS-2026-11-22.md`](archive/work/prefill-decode-arms/RESULTS-2026-11-22.md)
+(raw arms + `compare.py` in `archive/work/prefill-decode-arms/runs/diag-cells-2611/`).
+
+### 1. The instrument that was missing
+
+`LLAMA_KV_DEBUG_CELLS=1` -- one line per ubatch/sequence: the cells `find_slot()` handed out (as runs), the
+cache's used extent, and the per-context cursor the scan started from.  `LLAMA_RS_DEBUG_CELLS=1` -- the recurrent
+metadata (`head/n/min/max/rs_z/used`, per cell `pos/src/src0/tail/seq ids`), also printed for a take's destination
+rows.  Both diagnostic only, `getenv()` once, no behaviour change.  `LLAMA_KV_CACHE_DEBUG=3` already prints the
+whole cell map, which is 64+ lines per ubatch and cannot be diffed; these are one line and are what settled this.
+`ARMS_LOGITS_DIR=<dir>` in `arms/two_arms.cpp` dumps every sampled row as raw f32 plus a sha256/argmax/top-5
+manifest, so two arms' numerics can be compared row by row (480 rows per arm on the campaign's scenario).
+
+### 2. The residual (pass 1's §3.4 item 3) is two effects, and neither is the design
+
+2 x 2 over `ROCBLAS_USE_HIPBLASLT=0` and `ARMS_RESET_CACHE=1`, full residency, 2 reps, reference
+`b0281be7c5a6` / `d5083bd41b4c`:
+
+| pin | reset | R0 | R1 |
+|---|---|---|---|
+| no | yes | match x4 | rep 0 match, reps 1-3 `b79e73e3fe9f` |
+| **yes** | **yes** | match | **match** (480/480 logits rows, `max|d| = 0`) |
+| yes | no | rep 1 `e05c6e16a136` | rep 1 `abe253ea957a` |
+| no | no | rep 1 `e05c6e16a136` | rep 1 `abe253ea957a` |
+
+* **The pin owns `b79e73e3fe9f`.**  Without it the divergent row is **R1's own prefill last row** (`req 1, step 0`,
+  `max|d| = 2.39`, `mean|d| = 0.35`, same argmax) appearing only after ctx B's first decode and stable afterwards --
+  so neither the handover, nor R1's recurrent tail, nor `src0`/`rs_z` is involved.  Pass 1's full-residency oracle
+  block omitted `ROCBLAS_USE_HIPBLASLT=0` (r310 requires it); that omission manufactured the "residual".
+* **The allocation state owns `e05c6e16a136`/`abe253ea957a`.**  With one allocation state the arms' KV cell census is
+  **identical to the single-context reference** (0 of 243 lines, both shapes, every rep); without it **192 of 243**
+  differ and a warm rep places a decode token in cell **0** while the sequence's prompt sits in 512-1023 (a scatter,
+  not a corruption: cell 0 is empty there, so the scan takes it legally).  That is §3.4's two-cursor finding,
+  measured directly, and it is T0's justification.
+* **On the product shape the pinned arms still read `b79e73e3fe9f`** (reps 1-3, stable) while `batch-pair` is stable
+  at `d5083bd41b4c`, and the two runs' own residency censuses differ (`h=0.8161` vs `h=0.8172`, fills 35014 vs
+  34984) -- the §89 class.  So pass 1's "the host tier is refuted" is itself refuted: what full residency reproduced
+  was the hipBLASLt instance.
+
+### 3. What it changes for the campaign
+
+* **T3's oracle is now measured**: a cross-configuration greedy hash **is** available at full residency /
+  no-host-tier with the hipBLASLt pin **and one allocator** (pass 2 obtained it with `ARMS_RESET_CACHE` standing in
+  for T0); on a partial arena the verdict stays KLD (`scripts/gate-prefill-logits.sh`) plus text compared within one
+  residency class.
+* **`ROCBLAS_USE_HIPBLASLT=0` on every text arm, full residency included** -- the campaign's own reproduce block is
+  corrected in place.
+* T0 (one allocator for the co-owner pair) is unchanged in kind and stronger in degree; **its artifact and shape are
+  awaiting the maintainer** (`archive/work/prefill-decode-arms/README.md` §8 Q1, HANDOVER §8).
+* **Proposed, not applied**: a line in `GREEDY-PURITY.md` §44 that the hipBLASLt choice can change **mid-process**
+  when a second context/stream first runs (a per-process text comparison is not a purity guarantee).  That is a
+  rulebook change and is left for the maintainer's decision; until then the fact lives in the campaign record.
+
 ## 261122.005 (r345, RELEASE v17-919794500-r345) -- issue #350 fixed: the MoE device gather's used-expert BITMAP (block 09), so a deep split stops paying for the routing scan it already did
 
 **Release:** `v17-919794500-r345`.  Base `919794500` (base tree `916941663346eb86004bed77f74e90fcf9c43126`), canonical

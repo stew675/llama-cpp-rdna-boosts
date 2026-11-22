@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Smoothness harness for the prefill-transfer-overlap campaign (WIP; NOT part of the delivery).
 
-COPIED VERBATIM from archive/work/prefill-transfer-overlap/arms/smooth.py (2026-11-22, wip/prefill-decode-arms)
+COPIED VERBATIM from archive/work/prefill-transfer-overlap/arms/smooth.py (2026-11-22, archive/work/prefill-decode-arms)
 so the two-arm server can be measured with the campaign's metric of record and against its baseline table.  The
 ONLY addition is `--warm N`: N throwaway long-prompt requests before the measured pair, because every arm here
 starts a FRESH server and the first pass fills the expert arena (~3x slower, a cold-fill number, never quoted).

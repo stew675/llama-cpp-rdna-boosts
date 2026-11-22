@@ -16,7 +16,11 @@ WHAT IT CHECKS  (two arms on ONE binary, `-np 2`, one GPU, both slots pinned)
   arm `baseline`   LLAMA_SERVER_PREFILL_DUTY=0
   arm `candidate`  LLAMA_SERVER_PREFILL_DUTY=<--duty> (default 16 = the shipped default)
 
-  HARD  * decode tokens delivered WHILE the other slot prefills: candidate >= --min-decode-gain x baseline.
+  HARD  * decode tokens delivered WHILE the other slot prefills: candidate >= --min-decode-gain x baseline,
+          OR -- with --inert-band F -- within +-F of the baseline, in which case the mechanism is a deliberate
+          no-op on that path and must not cost prefill either.  The two-arm server (block 17) is that case: the
+          decoder has its own context and thread, so the duty cycle is DEPRECATED there and this gate runs on
+          it with --inert-band 0.10 (which is a symmetric check, so a duty cycle that LOST tokens also fails).
           This is the feature's whole claim; a latency median cannot see it (the tokens arrive in a burst).
   HARD  * the candidate's concurrent prefill wall is <= --max-prefill-stretch x the baseline's.  The design
           bounds the idle time by the previous prefill step's own duration, so the analytic bound is 2x; the
@@ -286,6 +290,13 @@ def main():
     ap.add_argument("--reps", type=int, default=400, help="long prompt repetitions (~14 tokens each)")
     ap.add_argument("--dec-n", type=int, default=400)
     ap.add_argument("--min-decode-gain", type=float, default=3.0)
+    ap.add_argument("--inert-band", type=float, default=0.0,
+                    help="two-sided INERT band (fraction): a mechanism whose decode gain is within "
+                         "[1-band, 1+band] of the baseline reads PASS as INERT (it changed nothing, so it "
+                         "cannot fail its own claim) and MUST NOT pay prefill for it.  0 = off (the strict "
+                         "one-sided criterion).  Use it where the mechanism is deliberately a no-op -- the "
+                         "two-arm server makes the duty cycle redundant, so block 17 runs it on that path "
+                         "with --inert-band 0.10")
     ap.add_argument("--max-prefill-stretch", type=float, default=2.5,
                     help="the design bounds the idle time by one prefill step (2x); the slack covers the "
                          "first, still-uncalibrated cycle")
@@ -362,11 +373,23 @@ def main():
 
     print("\n=== checks")
     gain = (c["during"] / b["during"]) if b["during"] else float("inf")
-    hard(gain >= a.min_decode_gain, "decode burst",
-         f"{b['during']} -> {c['during']} tokens delivered during the other slot's prefill ({gain:.1f}x, "
-         f"need >= {a.min_decode_gain:.1f}x)")
-
     stretch = (c["prefill_wall"] / b["prefill_wall"]) if b["prefill_wall"] else float("inf")
+    # TWO-SIDED (r346, block 17): a mechanism that is deliberately a no-op on this path must be able to read
+    # PASS.  On the two-arm server the decoder has its own context and thread, so there is nothing for a duty
+    # cycle to win: the honest outcome is "no change", and a one-sided ">= 3x" criterion calls that a failure
+    # of a CORRECT configuration.  The band is symmetric because BOTH directions matter -- a duty cycle that
+    # *lost* tokens on this path would be a defect, and prefill must not pay for an inert mechanism.
+    if a.inert_band > 0 and abs(gain - 1.0) <= a.inert_band:
+        hard(stretch <= 1.0 + a.inert_band, "decode burst (INERT)",
+             f"{b['during']} -> {c['during']} tokens ({gain:.2f}x) is inside the +-{a.inert_band:.0%} inert "
+             f"band: the mechanism changed nothing here (deprecated on this path) and the prefill must not "
+             f"pay for it")
+        warns.append("inert")
+    else:
+        hard(gain >= a.min_decode_gain, "decode burst",
+             f"{b['during']} -> {c['during']} tokens delivered during the other slot's prefill ({gain:.1f}x, "
+             f"need >= {a.min_decode_gain:.1f}x or inside the inert band)")
+
     hard(stretch <= a.max_prefill_stretch, "prefill stretch",
          f"{b['prefill_wall']:.2f} -> {c['prefill_wall']:.2f} s ({stretch:.2f}x, bound "
          f"{a.max_prefill_stretch:.1f}x -- the idle time is capped by one prefill step)")

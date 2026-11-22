@@ -189,11 +189,34 @@ run_arm() { # $1 = cache|nocache
     # never asserted; TWO_SLOT=1 is the text oracle with two resident slots.
     if [[ ${CONCURRENT:-0} == 1 || ${TWO_SLOT:-0} == 1 ]]; then
         local base0 base1 r
-        base0=$(head -c "$PROMPT_CHARS" "$PROMPT_FILE")
-        base1=$(tail -c "$PROMPT_CHARS" "$PROMPT_FILE")
+        # TWO RESIDENT CONVERSATIONS need two prompts that ASK for something.  The kld corpus is a CHAT corpus
+        # (`<|im_start|>` / `<|im_end|>` turns): slicing it and appending an instruction puts the instruction
+        # inside an ASSISTANT turn, so the model emits EOS immediately and every reply is empty -- which made the
+        # arm vacuous (both arms empty => "identical") or a false failure (one arm's degenerate stop differed).
+        # Use the delivery's own prompt files instead, which are plain continuations, and extend with a plain
+        # follow-up sentence rather than a chat turn.
+        local PF0="$HERE/../../../prompts/prose-rdna-boosts.txt" PF1="$HERE/../../../prompts/code-python.txt"
+        base0=$(head -c "$PROMPT_CHARS" "${PF0:-$PROMPT_FILE}")
+        base1=$(head -c "$PROMPT_CHARS" "${PF1:-$PROMPT_FILE}")
+        # NON-VACUITY (r346): a raw corpus concatenation ("...the tail of the corpus" + "the head of the corpus")
+        # is a degenerate prompt -- it answered EMPTY on the 27B and "..." on the 4B, so round 2's slot-1 reply
+        # was either identical-because-both-empty (vacuous) or different-because-one-took-a-degenerate-stop
+        # (a false failure).  Each round now ends with a real instruction, so every compared reply is a
+        # well-formed continuation.
+        # ROUND 2 IS A PURE CONTINUATION: the same prompt plus the NEXT 2048 characters of the same source.  A
+        # synthetic follow-up sentence ("now give the two most important points") makes this model emit EOS
+        # immediately when it follows a truncated document -- measured empty in BOTH arms, i.e. a vacuous arm
+        # dressed as a pass.  Extending the source keeps the reused prefix a real prefix and every compared
+        # reply a real continuation.
+        local ext0 ext1
+        ext0=$(head -c $((PROMPT_CHARS + 2048)) "${PF0:-$PROMPT_FILE}" 2>/dev/null | tail -c 2048)
+        ext1=$(head -c $((PROMPT_CHARS + 2048)) "${PF1:-$PROMPT_FILE}" 2>/dev/null | tail -c 2048)
+        local instr1=''
+        local instr2=''
         for r in 1 2; do
             local s0 s1
-            if [[ $r == 1 ]]; then s0=$base0; s1=$base1; else s0="$base0$(tail -c 400 "$PROMPT_FILE")"; s1="$base1$(head -c 400 "$PROMPT_FILE")"; fi
+            if [[ $r == 1 ]]; then s0="$base0$instr1"; s1="$base1$instr1"
+            else s0="$base0$ext0"; s1="$base1$ext1"; fi
             if [[ ${CONCURRENT:-0} == 1 ]]; then
                 local id0 id1
                 curl -sf "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
@@ -285,6 +308,40 @@ if [[ $mode == both ]]; then
         echo "STRESS PASS: two slots resumed concurrently, reuse happened, no abort in either arm"
         echo "  (text is NOT asserted across arms: a co-batched pair is not a text oracle, GREEDY-PURITY.md §63)"
         exit 0
+    fi
+    # TWO_SLOT non-vacuity (r346): a text oracle is only an oracle when BOTH replies are real continuations and
+    # the reuse really happened.  Both conditions are asserted here rather than left to the reader: an empty
+    # reply compares equal to an empty reply (the 27B arm used to "pass" exactly that way), and a round that
+    # reused nothing compares two full prefills.
+    if [[ ${TWO_SLOT:-0} == 1 ]]; then
+        # WHICH CONTRACT applies is the same question as for the single-slot arm, and the answer is the same:
+        # `strict` (cache vs nocache) only holds where the DELIVERY's own single-context reference reuses (the 4B,
+        # phi-4 and the 35B host tier); on the fully resident 27B the reference RE-PREFILLS there for want of a
+        # checkpoint, so a strict comparison reads a placement difference as a state difference -- measured
+        # r346: slot 0 round 2 moves, slot 1 does not.  Use GATE=parity for that model (cache vs the
+        # single-context server's own reuse path, both reusing).
+        REFARM=nocache; [[ ${GATE:-strict} == parity ]] && REFARM=ref
+        run_arm "$REFARM"
+        vac=0
+        for f in "$OUT/cache.txt" "$OUT/$REFARM.txt"; do
+            for t in r1s0 r1s1 r2s0 r2s1; do
+                n=$(awk -v t="$t" '$1 == "REPLY" && $2 == t { split($0, f2, "ntok="); split(f2[2], g, " "); print g[1]+0 }' "$f")
+                if [[ ${n:-0} -lt 4 ]]; then
+                    echo "VACUOUS: $(basename "$f") $t has ntok=${n:-0} (< 4) -- a degenerate reply cannot carry a text claim" >&2
+                    vac=1
+                fi
+            done
+        done
+        for t in r2s0 r2s1; do
+            cn=$(awk -v t="$t" '$1 == "INFO" && $2 == t { split($0, f2, "cache_n="); split(f2[2], g, " "); print g[1]+0 }' "$OUT/cache.txt")
+            if [[ ${cn:-0} -le 0 ]]; then
+                echo "VACUOUS: round 2 $t reused nothing (cache_n=${cn:-0}) -- two full prefills prove nothing" >&2
+                vac=1
+            fi
+        done
+        [[ "$vac" == 0 ]] || { echo "ORACLE VACUOUS (not a pass): the two-slot arm proved nothing on this shape" >&2; exit 2; }
+        "$0" --compare "$OUT/cache.txt" "$OUT/$REFARM.txt"
+        exit $?
     fi
     if [[ ${GATE:-strict} == parity ]]; then
         run_arm ref

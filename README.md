@@ -171,11 +171,37 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 > in `archive/docs/` (see also `archive/work/` for the closed experiments).
 > Do not mix them with the current `patches/` files.
 
-## The blocks: official `0000`-`0016` + temporary `0300` + optional `0100`/`0101`
+## The blocks: official `0000`-`0017` + temporary `0300` + optional `0100`/`0101`
 
 `release.json` (the current release).  Each row is one `git am` commit, applied in filename order:
-`0000`-`0016` then `0300`.  The optional `0100`/`0101` are **not** in this table and never in the default
+`0000`-`0017` then `0300`.  The optional `0100`/`0101` are **not** in this table and never in the default
 apply -- see [`optional/README.md`](optional/README.md).
+
+**r346 adds block 17 — the two-arm server, and it is OPT-IN.**  `llama-server --prefill-decode-arms` runs **two
+contexts on one model**: a *prefill arm* (the main loop) and a *decode arm* (its own thread) that co-own the same
+KV, so a reply generating while another slot's prompt is prefilled does not wait for the prefill's steps.  Measured
+on one R9700: the decoder keeps getting tokens every **47-49 ms** (p95 64-78 ms) through a 2-5 s prefill, where
+the single-context server stalls **300-880 ms** — for **-21…-24 %** of prefill.  That trade is why it is **off by
+default**: a run that does not ask for the pair allocates, reserves and logs exactly what the single-context
+server does (prefill-logit KLD **0.000000 / 100 %** against r345, and identical greedy text), and turning it on is
+a decision about *your* shape.
+
+```
+llama-server -m ... --parallel 2 --prefill-decode-arms            # explicit: refuse rather than degrade
+llama-server -m ... --parallel 2 --prefill-decode-arms-mode auto  # enable when it fits, else stay single-context
+```
+
+It needs **at least 2 slots** (`-np 1` warns and stays single-context), and it **refuses** a speculator
+(`--spec-type`), mmproj/mtmd, TTS, realtime, embeddings/rerank/decision, LoRA and `--sleep-idle`.  On the pair,
+`-ib` and `LLAMA_SERVER_PREFILL_DUTY` are **reported deprecated and inert** — both exist to bound a decoder's
+stall inside a *shared* step, which this mode removes.  `-ub`/`-b` **4096** is the measured sweet spot.  A hybrid
+model on `-sm tensor` pays a serialised recurrent-state move per request boundary (~75 ms, lands in TTFT).  Knobs
+and every refusal: `ENVIRONMENT.md` §23; the detail and the gate ladder: `patches/README.md` → Block 17
+(`archive/work/prefill-decode-arms/` is the campaign record).  Built out of the block: a **shared view of the KV
+for every memory module** (a module that lacks it leaves the decode arm blind *silently* — that was the campaign's
+one P0), **one allocation owner** for the pair, the **recurrent-state handover** (and the reverse one, so a
+finished conversation stays resident and its prefix is reused at single-context parity), and the **declared
+second-context graph reserve** that makes a host-expert tier work with no operator knob.
 
 **r263 adds block 15 — the UMA GTT expert store.**  On an **integrated GPU** (an APU: `gfx1151`, and any newer
 Ryzen AI part) there is no host-expert tier — "VRAM" and RAM are one pool, so `-ncmoe`/`--host-experts` are refused

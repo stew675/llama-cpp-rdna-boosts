@@ -30,7 +30,7 @@ the work: the live copy is the branch's own history.
 
 ```bash
 cd <this repo> && git checkout -b prefill-decode-arms 00b163cf     # the r341 merge base
-git am wip/prefill-decode-arms/branch-backup/00*.patch              # 14 commits, in order
+git am archive/work/prefill-decode-arms/branch-backup/00*.patch              # 14 commits, in order
 ```
 
 A rebase is the normal path and needs none of this: `git rebase --onto main 00b163cf prefill-decode-arms`

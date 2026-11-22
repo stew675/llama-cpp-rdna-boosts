@@ -32,7 +32,7 @@
 #             repeated request's text is byte-identical to its first occurrence
 #     INFO  prompt ms per request (the fix's ~12x on the short prompts).  Measured r307: 0 repairs, `stale=8178`,
 #           LONG 4277 ms, the 29-token request 283 ms -> 160 ms on the repeat (r306: 283 -> 2077)
-#   `fault` the genuine-repair control (2 devices `-sm layer -ncmoe 48 -c 8192 -ub 512`, identity arena,
+#   `fault` the genuine-repair control (3 devices `-sm layer -ncmoe $FAULT_NCMOE`, `-lme $FAULT_LME` -c 8192 -ub 512`, identity arena,
 #           `llama-cli` on the KLD corpus):
 #     HARD  * `MOE_EXPERT_TAKEOVER_FAULT=1` still repairs: `broken>0` and `repaired == broken`, `stale == 0`
 #     HARD  * its greedy text is byte-identical to the no-fault arm (r298: `595 chars sha=c0e7e91d84c4`)
@@ -68,16 +68,24 @@ set -uo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLAMA_SERVER="${LLAMA_SERVER:-$HOME/llama.cpp/build-rocm/bin/llama-server}"
 LLAMA_CLI="${LLAMA_CLI:-$(dirname "$LLAMA_SERVER")/llama-cli}"
-MODEL="${MODEL:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}"
+MODEL="${MODEL:-/llm/models/Qwen3.8/Flash-Next/STEW675-IQ4_NL/Qwen3.8-Flash-Next-MTP4-IQ4_NL-00001-of-00002.gguf}"
 SEQ_GPU="${SEQ_GPU:-0}"
 SEQ_CTX="${SEQ_CTX:-65536}"
 SEQ_UB="${SEQ_UB:-2048}"
-SEQ_NCMOE="${SEQ_NCMOE:-47}"
+SEQ_NCMOE="${SEQ_NCMOE:-48}"
 SEQ_LONG="${SEQ_LONG:-5000}"
 SEQ_SHORT="${SEQ_SHORT:-150}"
 SEQ_NGEN="${SEQ_NGEN:-32}"
-FAULT_DEVS="${FAULT_DEVS:-0,2}"
+FAULT_DEVS="${FAULT_DEVS:-0,1,2}"   # r346: the repointed 94 GB default model needs a third card for this arm
 FAULT_CTX="${FAULT_CTX:-8192}"
+# FAULT_NCMOE (r346): the fault arm is the ISSUE's shape at -ncmoe 48, which the repointed 94 GB default model
+# needs raised on this box (two 32 GiB cards at 48 did not fit the context; 56 does).  It is a knob, not a
+# different claim: the arm still needs TWO devices and an IDENTITY arena to break a promise mid-pass.
+FAULT_NCMOE="${FAULT_NCMOE:-40}"
+# FAULT_LME (r346): the fault arm needs a pool SMALLER than the host expert set, or nothing ever evicts and
+# MOE_EXPERT_TAKEOVER_FAULT=1 breaks nothing.  Measured on the repointed 94 GB model: an auto budget sizes the
+# WHOLE set and breaks 0 promises; 8 GiB on 3 devices at -ncmoe 40 breaks 238 and repairs 238.
+FAULT_LME="${FAULT_LME:-8}"    # r346: measured -- auto (whole set) broke NOTHING; 8 GiB evicts 238
 FAULT_PROMPT="${FAULT_PROMPT:-$REPO_DIR/prompts/kld-corpus-35b-in-domain.txt}"
 FAULT_NGEN="${FAULT_NGEN:-32}"
 PORT="${PORT:-18099}"
@@ -206,7 +214,7 @@ run_fault() {
         MOE_EXPERT_HEATMAP="$HEATMAP" \
         "${envs[@]}" \
         timeout 3600 "$LLAMA_CLI" -m "$MODEL" \
-        -ngl 99 -sm layer -ncmoe 48 --host-experts pool \
+        -ngl 99 -sm layer -ncmoe "$FAULT_NCMOE" --host-experts pool ${FAULT_LME:+-lme $FAULT_LME} \
         --load-mode mmap --lazy-mode auto \
         -c "$FAULT_CTX" -fa on -ctk q8_0 -ctv q8_0 \
         -ub 512 -b 512 -t 8 --temp 0 --seed 42 -n "$FAULT_NGEN" \
@@ -306,7 +314,7 @@ PY
 fi
 
 if [ "$SEQ_ONLY" -eq 0 ]; then
-    echo "-- fault: MOE_EXPERT_TAKEOVER_FAULT=1 on an IDENTITY arena (2 devices -sm layer), vs no-fault"
+    echo "-- fault: MOE_EXPERT_TAKEOVER_FAULT=1 on an IDENTITY arena ($FAULT_DEVS, -sm layer, -lme $FAULT_LME), vs no-fault"
     if run_fault ref && run_fault fault; then
         read -r rb rr rs <<<"$(census "$KEEPOUT/ref/log.txt")"
         read -r fb fr fs <<<"$(census "$KEEPOUT/fault/log.txt")"
