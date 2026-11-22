@@ -1,6 +1,6 @@
 # prefill-decode-arms — one prefill arm and one decode arm, both live on one GPU
 
-**Status: pass 7 done (2026-11-22), on the delivery's r343 — T0, T1, **T2** and the **reverse handover** (prefix reuse) CLOSED: `llama-server --prefill-decode-arms` is the design
+**Status: pass 9 (2026-11-22) — opt-in only, and there is ONE OPEN P0.**  `-sm tensor` is now crash-free (three crashes fixed: the take's null-buffer views, a serialised-state-move fallback for a buffer type with no device copy, and a process-global meta view-slot selector that raced between the two arms).  **Open P0**: on the maintainer's Flash-Next `-sm tensor` shape a ~70K-token prompt (5 attached files + a question) is answered as if only its tail were present, arms only — `HANDOVER.md` §6 has the ranked hypotheses and the four tests.  **Scope: this campaign ships opt-in; the meta-aware device copy and speculative decoding are a follow-up campaign.**  T0, T1, **T2** and the **reverse handover** (prefix reuse) are CLOSED: `llama-server --prefill-decode-arms` is the design
 (prefill arm + decode arm on one shared KV, a slot crossing only at a request boundary), **tier 1 passes cold and
 over 3 warm request pairs** (both slots byte-identical to the single-context server, every allocation handshake
 clean), and the campaign's metric is measured: **~47-49 ms ITL p50 / 64-78 ms p95 through a 2.0-5.3 s prefill** at
