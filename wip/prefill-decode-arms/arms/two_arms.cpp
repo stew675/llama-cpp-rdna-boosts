@@ -404,6 +404,15 @@ int main(int argc, char ** argv) {
             printf("REP %d\n", rep);
         }
 
+        // ARMS_RESET_CACHE: wipe the cell metadata and every allocation cursor at the rep boundary, so each rep
+        // starts exactly like rep 0.  Each context owns its OWN cursor (`v_heads`) over the SAME shared cells,
+        // so without this the two arms start a warm rep from two different places -- the single-context modes
+        // have one cursor and therefore one layout per rep.
+        if (getenv("ARMS_RESET_CACHE") && atoi(getenv("ARMS_RESET_CACHE")) != 0) {
+            if (ctx_a) { llama_memory_clear(llama_get_memory(ctx_a), false); }
+            if (ctx_b) { llama_memory_clear(llama_get_memory(ctx_b), false); }
+        }
+
         // ---------------------------------------------------------------------------------------------
         // reference modes: everything on ONE context, one request at a time
         // ---------------------------------------------------------------------------------------------
