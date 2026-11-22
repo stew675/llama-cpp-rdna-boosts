@@ -1,7 +1,8 @@
 # prefill-decode-arms — one prefill arm and one decode arm, both live on one GPU
 
-**Status: pass 2 done (2026-11-22) — T1 CLOSED, T2/T3 emulated outside the server, the §3.4 residual
-resolved (two effects, neither of them the design).  Nothing in `patches/`.**  See
+**Status: pass 3 done (2026-11-22) — T0 CLOSED (one KV allocation owner for the pair), T1 CLOSED,
+T2/T3 emulated outside the server, and the two-arm run is now bit-identical to the single-context reference on
+both shapes with no harness control.  Nothing in `patches/`.**  See
 [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) (pass 2) and [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md) (pass 1).  It inherits the conclusion of the
 retired [`archive/work/prefill-transfer-overlap/`](../../archive/work/prefill-transfer-overlap/README.md)
 (it established *what* the win is and *which mechanism* delivers it).  This campaign builds the product.
@@ -69,6 +70,7 @@ a 4932-token prompt and a 128-token decoder, warm reps.  Full detail: the retire
 | patch | what | state |
 |---|---|---|
 | [`enabling-0001-second-context-shared-kv.patch`](enabling-0001-second-context-shared-kv.patch) | `llama_context_params::ctx_other_share_memory` (one bool, default false), the generic `ctx_other` gate in `llama-context.cpp`, `llama_kv_cache::other_coowner` (a second context OWNS cells in the shared map instead of being a read-only mirror), and the plain-hybrid wiring so `qwen35moe` works | **text-verified** on dense 4B and 35B-A3B, including two contexts computing at once (no host tier, and at full residency).  Applies clean to `release.json`'s tree |
+| [`enabling-0003-shared-kv-allocator.patch`](enabling-0003-shared-kv-allocator.patch) | **T0, done 2026-11-22**: `struct llama_kv_alloc` — the co-owner pair's ONE allocation owner.  `find_slot()` reserves a ubatch's cell run from the pair's single cursor and marks it (invisible to either arm), the real `apply_ubatch()` commits, a failed/abandoned prepare releases, and `llama_memory_alloc_sync()` is the request-boundary handshake.  Every cursor move (`seq_rm`/`seq_keep`'s pull-back, `seq_cp`, `seq_add`, a restore, `clear`) moves the pair's cursor too.  `LLAMA_KV_ALLOC_SHARED=0` = the legacy two-cursor control | **7 files, +386/−10**, applies **on top of `enabling-0002`** (`~/llama.cpp` `386b7dd48`).  Result: the two-arm run is **bit-identical to the single-context reference, every rep, both shapes, no harness reset** (`RESULTS-2026-11-22.md` pass 3) |
 | [`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch) | **T1, done 2026-11-21**: `llama_memory_recurrent::seq_state_take()` (one batched device-to-device copy of a sequence's recurrent rows + cell metadata, `ggml_backend_tensor_copy_n` over per-layer views), `llama_memory_seq_state_take()` (llama level, hybrid memories), `llama_memory_i::seq_rm_recr()` / `llama_memory_seq_rm_recr()` (drop ONLY the recurrent cells — the shared attention cells must survive), and `LLAMA_STATE_SEQ_FLAGS_RECR_ONLY` (the serialised control arm; the hybrid wrapper skips its attention half on both sides, which is what makes the handover ~50 MiB instead of the whole cache) | **0.5–0.7 ms vs 36 ms serialised**; text oracle holds (see `RESULTS-2026-11-21.md` §1.2).  Applies **on top of `enabling-0001`** (it needs the co-owner flag), i.e. WIP branch `wip/prefill-overlap`, commit 4 |
 
 The WIP branch is `wip/prefill-overlap` in `~/llama.cpp` (four commits: shared KV, the recurrent handover, the
@@ -129,7 +131,9 @@ yield point, the stream-priority plumbing — the last two are recorded losers, 
 6. **The `moe_cache_pass_end` boundary is per graph** (`ggml-cuda.cu:9508`), so two arms at once means two
    graphs' pass boundaries interleave.  Measured harmless for a prefill+decode pair (text identical), but it
    is the reason landmine 1 exists and it must be re-checked when the decode arm batches many slots.
-7. **The shared KV's cell allocator is NOT concurrency-safe** (found 2026-11-21, `RESULTS-2026-11-21.md`
+7. ~~**The shared KV's cell allocator is NOT concurrency-safe**~~ — **CLOSED by T0 (2026-11-22)**: one shared owner,
+   per-ubatch reservation, marks invisible to both arms, `alloc_sync()` at a request boundary.  The history
+   (found 2026-11-21, `RESULTS-2026-11-21.md`
    §3.1): `llama_kv_cache::find_slot()` is `const` and only *searches* from `v_heads`; `apply_ubatch()`
    advances the cursor afterwards (`head = sinfo.idxs[s].back() + 1`).  Between the two the cells are not
    reserved, so two arms that search from the same cursor can be handed **the same cells** — fluent, wrong
@@ -201,7 +205,7 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 | **T3** | handover at the request boundary, with a text oracle: a request's reply must be byte-identical to today's single-context server | **the oracle has to be chosen carefully**: it holds on a no-host-tier model and for a single handed-over request on the tier, but a 2-slot arm on a partial arena is not text-stable warm (§3.3) — use a full-residency/no-host-tier text point + KLD on the tier |
 | **T4** | policy + opt-in gate (host tier + residency deficit + the VRAM rule of §3.2), and the duty cycle's role on this path | the measured boundary: no window at full residency, so no unconditional default |
 | **T5** | measurement with `smooth.py` against the baseline table + the gates (§7) | the campaign's verdict |
-| **T0** | **the shared-KV allocator fix** (`RESULTS-2026-11-21.md` §3.1) | it must land before two arms are allowed to allocate cells, i.e. before T2 runs at `-np 2` |
+| **T0** | ~~the shared-KV allocator fix~~ — **DONE 2026-11-22**: `enabling-0003-shared-kv-allocator.patch`, one shared owner, per-ubatch reserve/commit/release, `llama_memory_alloc_sync()` as the handshake, `LLAMA_KV_ALLOC_SHARED=0` as the control (`RESULTS-2026-11-22.md` pass 3) | it had to land before two arms allocate cells; it also removed the scatter that moved the text |
 
 ## 7. Gates when it becomes code
 
@@ -227,14 +231,19 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 3. **`-np 1`**: leave it single-context (no second context, no 600 MiB) — confirm.
 4. When this lands it should **retire `LLAMA_SERVER_PREFILL_DUTY` on this path** (keep it as the `F ≈ 0`
    fallback).  That is a default flip and therefore a maintainer decision at promotion time.
-5. **New (2026-11-21): may the allocator fix be its own enabling artifact?**  `RESULTS-2026-11-21.md` §3.1 is a
+5. ~~**New (2026-11-21): may the allocator fix be its own enabling artifact?**~~  **ANSWERED 2026-11-22: yes**, and
+   built as **[`enabling-0003`](enabling-0003-shared-kv-allocator.patch)** with the **per-ubatch** granularity and a
+   **two-sided handshake** (the maintainer's refinement: the decider is one shared owner both arms call, not a
+   unilateral prefill-side allocation).  See `RESULTS-2026-11-22.md` pass 3.  Historic text:  `RESULTS-2026-11-21.md` §3.1 is a
    latent defect in the *shared* cache, reachable only with two allocating contexts — and §3.4 shows it is also
    the **text** carrier of the two-arm shape.  Proposed shape (maintainer's call): the co-owner pair gets ONE
    allocation cursor, with the **prefill arm reserving a slot's cell run and the decode arm consuming it**
    (`llama_kv_cache` gains a reserve/publish API; the decode side reuses the `sinfos_in` layout the restore path
    already has).  It is a prerequisite of T2 and it changes `llama-kv-cache`, so it wants its own small artifact
    rather than hiding inside the server cut.
-6. **New: which oracle does the maintainer want for T3?**  §3.3 says a cross-configuration hash is not
+6. ~~**New: which oracle does the maintainer want for T3?**~~  **ANSWERED 2026-11-22: the two-tier oracle, in the
+   shape with the greatest coverage.**  Tier 1 = the cross-configuration hash (now valid on the product shape too,
+   with T0 + `ROCBLAS_USE_HIPBLASLT=0`); tier 2 = KLD + the residency census.  Historic text:  §3.3 says a cross-configuration hash is not
    available on a partial host-expert arena.  Proposed: text at full residency (or no host tier) + KLD on the
    tier + a same-configuration repetition to catch non-determinism.  Confirm before T2's gate is written.
 7. **New: is the 2-slot warm text instability a *bug* or a graph-bucket effect?**  **SETTLED 2026-11-22**
@@ -264,4 +273,5 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 | [`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch) | **T1**: the recurrent-state handover, device to device (+ `seq_rm_recr`, `RECR_ONLY`) |
 | [`arms/two_arms.cpp`](arms/two_arms.cpp), [`arms/build-two-arms.sh`](arms/build-two-arms.sh) | the instrument: two arms, two threads, one KV, a request queue and the handover; references `single` / `batch-pair` / `pf-alone` / `dec-alone` |
 | [`runs/2611-arms-35b-arena5000.txt`](runs/2611-arms-35b-arena5000.txt) | the raw 35B arm table behind the results file's §2.1 |
+| [`runs/t0-2611/`](runs/t0-2611/) | pass 3: every T0 arm (stdout, stderr gzipped, the logits manifests) — the oracle, the `LLAMA_KV_ALLOC_SHARED=0` control, and the `ARMS_NO_WAIT_TAKE=1` race control |
 | [`../../archive/work/prefill-transfer-overlap/`](../../archive/work/prefill-transfer-overlap/README.md) | the retired campaign: how the win was established, every measured number, and the two policies that lost |

@@ -461,6 +461,13 @@ int main(int argc, char ** argv) {
             r.t_admit_real = r.t_prompt_start = r.t_prompt_done = r.t_handover = r.t_first_tok = 0.0;
             r.handover_bytes = 0;
             r.handover_device = false;
+            // the handover flags are per REQUEST, and a stale `handover_done` from the previous rep makes the
+            // prefill arm skip its wait -- so the next prompt would be prefilled while the take is still reading
+            // this arm's recurrent metadata (the ordering rule of HANDOVER §4.2).  Reset them with the rest.
+            r.handover_posted = false;
+            r.handover_done   = false;
+            r.t_handover = 0.0;
+            r.t_first_tok = 0.0;
             r.pending = -1;
             r.pos = 0;
             r.on_decode_arm = false;
@@ -630,7 +637,14 @@ int main(int argc, char ** argv) {
                 {
                     std::unique_lock<std::mutex> lk(st.m);
                     const double t_w = now_ms();
-                    st.cv_taken.wait(lk, [&] { return r.handover_done || st.prefill_done; });
+                    // ARMS_NO_WAIT_TAKE=1 is the CONTROL for the ordering rule (HANDOVER §4.2): it lets the next
+                    // prompt be prefilled while the take is still reading this arm's recurrent metadata -- the
+                    // race that the stale `handover_done` flag used to create in warm reps.  Measured: with the
+                    // race, R1's prefill lands in recurrent cell 1 instead of 0 and its warm text moves; it is
+                    // NOT a property of the design, and it is what pass 1/2 read as a "host-tier" effect.
+                    if (!(getenv("ARMS_NO_WAIT_TAKE") && atoi(getenv("ARMS_NO_WAIT_TAKE")) != 0)) {
+                        st.cv_taken.wait(lk, [&] { return r.handover_done || st.prefill_done; });
+                    }
                     r.t_handover = now_ms() - t_w;
                 }
 
@@ -764,6 +778,15 @@ int main(int argc, char ** argv) {
 
         t_pf.join();
         t_dec.join();
+
+        // wip/prefill-decode-arms (T0): the co-owner pair's allocation HANDSHAKE, checked at the request boundary.
+        // A leaked reservation (a prepare nothing applied) would shrink the shared cache silently, so it is printed
+        // rather than hidden; the counters are the reserve/commit/release traffic of the rep.
+        {
+            const bool ok_a = ctx_a ? llama_memory_alloc_sync(llama_get_memory(ctx_a), "request-boundary") : true;
+            const bool ok_b = ctx_b ? llama_memory_alloc_sync(llama_get_memory(ctx_b), "request-boundary") : true;
+            printf("HANDSHAKE ok=%d\n", (ok_a && ok_b) ? 1 : 0);
+        }
 
         std::vector<std::pair<double, double>> windows;
         {
