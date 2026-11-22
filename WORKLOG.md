@@ -1,3 +1,31 @@
+## 261121.019 (r339, published) -- `v17-919794500-r339` is PUBLISHED: delivery repo `main` + tag, and the fork's `rdna-boosts` is re-cut at `.tip`
+
+**Published.**  Delivery repo `github.com:stew675/llama-cpp-rdna-boosts`: `main` `ecbc6dbb..aea49b7e`, annotated
+tag **`v17-919794500-r339`** -> `aea49b7e`.  The fork `git@github.com:stew675/llama.cpp.git` `rdna-boosts` moved
+`2f0d05010..41a11cf04` (force-with-lease, lease read `2f0d05010`, the previous release's tip), i.e. exactly
+`release.json.tip`, and `git ls-remote` re-read after the push confirms `41a11cf0411b04b84722b4700c6c70822b8d0522`.
+
+**Verified rather than assumed.**
+* **Fork refresh**: `scripts/fork-refresh.sh --push --yes` re-cut from `919794500` with `apply-all.sh`, asserted the
+  applied tree == `release.json.tree` (`447ce143e`) and the commit count == `n_default` (18), printed tip
+  **`41a11cf04`** (recorded; the same id the earlier `--build --gates` run in this session produced, so the
+  deterministic re-cut held across two independent re-cuts), and pushed after the lease read.
+* **Delivery artifacts**: `validate-set.sh` GREEN twice on the final set -- 18 default patches strict on a fresh
+  `919794500` tarball, applied tree `447ce143e`, both optional artifacts re-cut and applying strictly
+  (`d06460d4c` / `868cedb45`, cumulative `1c2af3677`, all three re-derived and checked), Windows portability 515
+  added files.
+* **The release gates for this change**: `gate-hc-fusions.sh` on the Q8_0-hc class on **both** toolchains (10.1
+  scratch pair and 10.2 r338-vs-r339 pair) with all ten arms byte-identical each time,
+  `gate-prefill-logits.sh` **-0.000000 / 100.000 %** from a 10.1 build (the line the base was recorded on;
+  `MANIFESTS.md` gate 4 now states that rule), the two release text anchors unmoved (`1c5d32ac537d`,
+  `c420dfe04c42`), `test-backend-ops -o HC_MIX` 30/30, and no GPU fault in the kernel journal or any arm's log.
+  Details: `benchmarks/2026-11-21-hc-mix-band-kernels.md`.
+* **Container images**: the worker watcher (`scripts/container-watch.sh` on `radiance`) polls for the tag and will
+  build and push both ROCm lines.  Nothing was built on the primary box (policy).
+* The contributor's PR #344 is answered and the submission is archived verbatim under
+  `archive/work/hc-mix-q8/pr344/` (with `FOLD-NOTES.md`: the 32-bit shuffle mask that made it uncompilable, and
+  the fix that shipped).
+
 ## 261121.018 (r339) -- **RELEASE**: contributor PR #344 -- the Q8_0 hc mixer's decode band is served from ONE weight read per row and its emulated reference butterfly becomes a fixed expression (block 11, bit-identical, `HC_MIX` 33.1 -> 21.6 us at `nt 4`)
 
 **`release.json` changed: release `v17-919794500-r338` -> `-r339`, tip `2f0d05010` -> `41a11cf04`, tree
