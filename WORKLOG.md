@@ -1,3 +1,120 @@
+## 261121.022 (r341) -- `TODO` #358 resolved: a re-base rung that lands fewer files is an INSTRUMENT now (`scripts/check-rung-file-sets.py`, gate 38), not a note in a gate table -- zero findings on 68 of 70 release transitions, and the r328 incident reproduced exactly
+
+**No delivery patch changed: `patches/*.patch`, `release.json` (base/tip/tree/counts/hashes) and the block
+structure are untouched, so this session cuts no tag** (the `261121.007`/`.009`/`.021` precedent for a
+tooling-and-records revision).  What changed: one new check (`scripts/check-rung-file-sets.py`) + its decision-row
+ledger (`patches/FILE-SET-RETIREMENTS.tsv`), three call sites (`validate-set.sh` check 9, `validate-gpu.sh` step 1b,
+`gate-rebase-release.sh` step 1), `MANIFESTS.md` gate 38, and the records.
+
+### 1. What the item asked
+
+`#358`, opened by the r331 review: *"a re-base rung can silently drop a file ... reconcile each rung's changed-file
+set against the patch it replaces and fail on a file the old patch touched and the new one does not; the 18/18
+ladder cannot see it."*  The incident behind it is issue #345: the r328 re-base landed **34 of block 00's 37
+files**, two of the three missing being D1's intended `mmf.cu`/`mmf.cuh` retirement and the third --
+`ggml/src/ggml-alloc.c` (+121/-2: `GGML_GLU_INPLACE`, the unused-view release, the `layout_fp` fingerprint) --
+accounted for by no decision at all.  r328 and r329 shipped without it while the block's own text,
+`ENVIRONMENT.md`, the per-block gate table and `tests/test-alloc.cpp` kept describing it, and r329's `test-alloc`
+aborts at `test-alloc.cpp:704`.
+
+Nothing in the release flow could see that class, and r332 settled the framing: **the per-block build ladder is
+not a gate any more** (a block is a layer on the blocks before it; the artifact is the applied set), so the answer
+could not be "walk the ladder harder" -- a missing file's hunks live *inside other files* and compile fine in
+every tree, warm or cold.  The reconciliation had to be a **comparison against the previous release**, which is
+what this session built.
+
+### 2. What the check is (and why it is item sets, not files)
+
+`scripts/check-rung-file-sets.py` reduces each block of the new set and of the release it replaces to five item
+kinds and diffs them:
+
+| kind | what | how it is read |
+|---|---|---|
+| **file** | every path the block touches, **with the number of lines it adds there** | `diff --git` / `+++ b/<path>` headers, and every `+` line attributed to the current path |
+| **define** | every macro the block adds | `^+#\s*define\s+NAME` |
+| **env** | every env var the block reads | `getenv("NAME")` / `std::getenv(...)` on an added line |
+| **option** | every long option the block adds | `"--name"` on an added line in `common/arg.cpp` |
+| **block** | the block itself | a block/artifact in the old set with no counterpart in the new one |
+
+The verdict turns on the **set's** total, not the block's, so a hunk that merely moves between blocks is not a
+finding: `LOSS` (a file the old set added lines to that no block of the new set touches, or a define/env/option
+gone from the whole set) and `SHRUNK` (a block's contribution to a file fell by `--shrink-pct`, default 50 %, and
+the set's total for that file did not grow) fail; `MOVED` (another block took it) and `NEW` are informational and
+printed with `-v`.  A deliberate disappearance is a **decision row** in `patches/FILE-SET-RETIREMENTS.tsv`
+(`<from-release> TAB <block> TAB <kind> TAB <item> TAB <reason>`), and a row is **scoped to the transition it was
+decided in**, so it can never suppress a later release's finding by coincidence; rows that do not apply are
+counted in the summary, never silently ignored.
+
+The line count is the leg that catches the *second* half of the r331 incident: a lost hunk inside a file the block
+still edits moves no file set at all, which is how `GGML_CUDA_DISABLE_ROPE_SET_ROWS` disappeared (a presence-only
+switch, invisible to every build, every op suite and every text arm).  It reads as `SHRUNK` on the file and as
+`LOSS` on its env name.
+
+Three input modes, all with the same semantics: `--old <ref|dir>` (default: the newest `v*` tag before `HEAD`) and
+`--new <ref|dir>` (default: `patches/` + `optional/`); and **`--new-chain <repo> --new-base <sha>`**, which takes
+the new side from an applied block CHAIN (the block number read from each commit's `rdna-boosts: block NNNN:`
+subject, `block 00`..`block 16` and `block 0300` all normalising to the four-digit file prefix).  The chain mode is
+the **ladder** mode -- after porting a rung, `--rung 0000` reconciles that rung alone, which is when a lost file is
+a five-minute fix instead of a two-release defect.  A chain is the DEFAULT blocks only, so chain mode drops the
+optional `01xx` artifacts from the comparison rather than reporting them GONE by construction.
+
+### 3. Verified: it reproduces the incident, and it is quiet everywhere else
+
+| arm | result |
+|---|---|
+| `--old v17-4f9dfa0e3-r325 --new v17-919794500-r328` (the re-base that dropped the file) | **8 unexplained** -- `LOSS` env `GGML_GLU_INPLACE` (block 00), `LOSS` env `GGML_CUDA_DISABLE_ROPE_SET_ROWS` (block 10), `LOSS` file `tools/server/server-task.h` (block 12), `SHRUNK` `ggml/src/ggml-alloc.c` (**block 00 adds 0 lines, was 120; set 155, was 275**), `SHRUNK` `mmf.cu` (4 -> 3) and `mmf.cuh` (14 -> 11) -- the D1 decision rows -- `SHRUNK` `mmid.cu` (**204 -> 100**, set 270 -> 165) and `SHRUNK` `server-task.cpp` (99 -> 4, the block-12 -> block-16 server split); plus 3 `MOVED` and 3 `NEW` (informational) |
+| `--old v17-919794500-r329 --new v17-919794500-r331` (the fix) | **0 unexplained**, 2 `NEW` -- exactly the two restored switches (`GGML_GLU_INPLACE`, `GGML_CUDA_DISABLE_ROPE_SET_ROWS`) |
+| `--old v18-4f9dfa0e3-r287 --new v16-4f9dfa0e3-r288` (the block re-org) | **2 unexplained** -- blocks `0016`/`0017` renumbered into the optional range, i.e. a decision (2 `GONE`, 99 `MOVED`, 68 `NEW`) |
+| **all 70 consecutive release-tag pairs, r263..r339** | `0 unexplained` on **68**; the two firings are the two rows above.  **Zero false positives across 68 routine releases** (most are `0 unexplained; 0 moved; 0 new`, i.e. a no-op on an unchanged set) |
+| steady state (`patches/` vs `v17-919794500-r339`) | **0 unexplained** -- blocks 20 -> 20, files 571, defines 172, envs 575, options 14 -- **0.29 s** |
+| chain mode: `--new-chain ~/llama.cpp --new-base 919794500` vs `v17-919794500-r339` | **0 unexplained**, and **every per-block added-line count equal** (36/1068, 4/2901, 24/1445, ... 12/130) -- the fork branch and the patch set are the same set, block by block; 0.57 s |
+| `--rung 0000` on the r325->r328 pair | the block-0000 review list only (5 findings: `GGML_GLU_INPLACE`, `ggml-alloc.c`, `mmf.cu`, `mmf.cuh`, `mmid.cu`) -- the per-rung form works |
+| a decision row for `mmf.cu`/`mmf.cuh` + the server move (5 rows) | the 4 matching findings read `SHRUNK/ALLOWED` with the reason, the 4 without a row still fail, and a row scoped to `r339` does **not** apply to `ggml-alloc.c` on a `r325` comparison (mis-scoped row honoured only for its own transition) |
+| malformed row / unknown kind / `--old` not resolvable / optional rung against a chain | exit **2** with the row and column named (usage errors never look like a finding) |
+| no previous-release tag: `--allow-skip` (the shallow CI clone) vs without | `SKIP: ...` exit 0 / `FAIL: ...` exit **2** ("a full clone with no tag is a defect, not a skip") |
+
+### 4. Wired into the flow, so it cannot be forgotten
+
+* **`scripts/validate-set.sh` check 9** -- the delivery check, run by tier-1 CI and by the release flow.  It
+  never needed a checkout of `$src`, so it runs in the delivery repo itself.  A **shallow** clone (the hosted
+  `actions/checkout`) says `SKIP` loudly -- it has no tags -- so tier 1 stays ~20 s; every full clone runs it for
+  real.  Verified in both directions: GREEN on this tree, and **RED** with a `python3` shim that fails the check
+  (`FAIL: file-set reconciliation failed: a file/symbol/block the previous release carried is missing ...`).
+* **`scripts/validate-gpu.sh` step 1b** -- tier 2, `radiance`, a full clone on every new `origin/main`: the first
+  thing after the strict apply, ~1 s, `SKIP_RECONCILE=1` to narrow.  This is the unattended net under a re-base
+  pushed without the check.
+* **`scripts/gate-rebase-release.sh` step 1 (`state`)** -- the one-command re-base verdict records `file-sets` as a
+  PASS/FAIL next to the state checks, so a re-base verdict cannot be green while a block shrank.
+* **`MANIFESTS.md` gate 38** -- the contract, with the non-vacuity numbers; the re-base paragraph now names the
+  instrument instead of describing a habit, and `AGENTS.md` (*Build the fork*, *Regenerate the patches*, the
+  gate-picker table, the `scripts/` and `patches/` layout rows), `README.md` (*When upstream master moves*, the
+  tree), `INVARIANTS.md` (a new `r341` section + the r331 rule now points at the check), `scripts/README.md` and
+  `TODO.md` (#358 retired) all point at it.
+
+### 5. What it does not cover (accepted, named)
+
+* A **hunk inside a file whose added-line count does not fall by half** is still a judgement call: the check reports
+  `MOVED`/`NEW` and prints the per-block inventory under `-v`, but a rewrite that adds as many lines as it loses is
+  only visible to a review.  The class it *was* built for (a whole file, a whole env switch, a whole block) is
+  exact.
+* **Renames** are decisions: upstream renaming a constant (r331's `GGML_CUDA_CC_DGX_SPARK` -> `GGML_CUDA_CC_GB10`)
+  is an add plus a retire, so it wants a decision row.  That is the intent -- r331's rename was in fact a *lost*
+  switch, and a row has to be written by someone who decided it.
+* It says nothing about behaviour: the per-block gate table and the release gates still own that.
+
+### 6. Verified on this box
+
+| item | result |
+|---|---|
+| `bash scripts/validate-set.sh` (full, check 9 live) | **GREEN** -- 18 default patches strict on a fresh tarball, tree `447ce143eb9d565fab78f81b780143d832af4baf`, both optional artifacts alone and cumulative (`d06460d4c`/`868cedb45`/`1c2af3677`), 515 added files Windows-clean, **reconciliation 0 unexplained** |
+| `bash scripts/validate-set.sh` with a `python3` shim failing the reconciliation | **FAIL** at check 9 with the restore-or-record message (the wiring is real) |
+| the 70-pair calibration + the five named arms above | as tabulated |
+| `bash -n` on `validate-set.sh` / `validate-gpu.sh` / `gate-rebase-release.sh`, `python3 -m py_compile` | clean |
+| GPU work | **none needed** -- no patch changed, no kernel touched, and the check reads patch text only.  The next release's gates run against the same binary this tree builds today |
+
+`release.json` is unchanged by design, so the `v17-919794500-r339` tag / fork branch / container images remain the
+current release; this revision is tooling + records.
+
 ## 261121.021 (r340) -- `TODO` #362 resolved: the per-start hipBLASLt lottery is measured on both ROCm lines, the 10.2 mapping is verified STRUCTURALLY (1 solution offered vs 18), and 10.2 is recorded as the canonical validated line
 
 **No delivery patch changed: `patches/`, `release.json` (base/tip/tree/counts/hashes) and the block structure are

@@ -1543,7 +1543,9 @@ Record: `WORKLOG.md` 261121.007, `archive/work/r328-followups/` (§3 rows and `l
   whose `ggml-alloc.c` is **byte-identical at every one of the 18 rungs** (`git show <rung>:…` compared pairwise),
   which is what proves the restore reintroduced exactly the lost content and nothing else.  Rule: reconcile each
   rung's changed-file set against the patch it replaces (same subject, previous release), and treat a shrunk set
-  as a defect until a decision row names the retirement — `TODO` #358.  Record: `WORKLOG.md` 261121.010.
+  as a defect until a decision row names the retirement — instrumented since r341 by
+  `scripts/check-rung-file-sets.py` (gate 38, decision rows in `patches/FILE-SET-RETIREMENTS.tsv`; `TODO` #358
+  retired).  Record: `WORKLOG.md` 261121.010, and 261121.022 for the check.
 
 * **An undefined `GGML_CUDA_CC_*` name in `#if __CUDA_ARCH__ == …` reads as 0: the guard is silently false, the block compiles out with no warning, and only the target arch notices (r331).**
   Upstream renamed `GGML_CUDA_CC_DGX_SPARK` → `GGML_CUDA_CC_GB10` (both `1210`, `ggml/src/ggml-cuda/common.cuh`)
@@ -1813,3 +1815,49 @@ Record: `WORKLOG.md` 261121.018; `benchmarks/2026-11-21-hc-mix-band-kernels.md`;
 
 Record: `WORKLOG.md` 261121.020 (the gate oracle) and 261121.021 (the lottery + the validated lines);
 `GREEDY-PURITY.md` §44 addendum (r340); `BASELINE.md` (*Validated ROCm lines*); `MANIFESTS.md` gate 25.
+
+## r341 — the re-base file-set reconciliation: a shrunk rung is caught by comparing ITEM SETS, not by a build, and the noisy leg is the symbol, not the line count
+
+`TODO` #358 retired.  `scripts/check-rung-file-sets.py`, wired into `validate-set.sh` (check 9) and
+`validate-gpu.sh` (step 1b); `MANIFESTS.md` gate 38; decision rows in `patches/FILE-SET-RETIREMENTS.tsv`.
+
+1. **The instrument is the item set, and the comparison is against the PREVIOUS RELEASE, not against the fork.**
+   Each block is reduced to five item kinds — the files it touches with the number of lines it *adds* to each,
+   the `#define` names it adds, the env names it reads (`getenv("NAME")`), the long options it adds to
+   `common/arg.cpp`, and the block itself — and compared with the same block of the release being replaced.
+   Restoring from the tree is the other direction and does not work: the r331 restore started from "the old
+   chain's file" and *proved* it byte-for-byte, which is only possible because the old patch still existed.  So
+   the old side defaults to the newest `v*` tag before `HEAD` (`--old` overrides), and a **shallow clone skips
+   loudly** — the hosted tier-1 checkout has no tags, tier 2 (a full clone, `radiance`) and the release flow run
+   it for real, and a full clone with no resolvable tag is a FAIL.
+2. **The file leg alone is not enough, and the r328 incident says why in three parts.**  `ggml/src/ggml-alloc.c`
+   went 275 -> 155 added lines across the set (block 00's 120 gone, blocks 09/10/12 unchanged), so a
+   "file touched by the old set and by no new block" test misses it: the file is still touched.  What fires is
+   the **block-level** file drop combined with a set total that did not grow (SHRUNK), and independently
+   `LOSS` on `GGML_GLU_INPLACE`, the env switch the lost half defines.  The same two legs catch the second r331
+   finding (a lost `GGML_CUDA_DISABLE_ROPE_SET_ROWS` switch inside a file the block still edits) — a build, the
+   set's op suites and every text arm are blind to it, because the switch is presence-only at the call site.
+   The third (a renamed `GGML_CUDA_CC_DGX_SPARK`) is a *decision* row, not a loss, which is the point of rows.
+3. **The line-count leg is calibrated, and 50 % is not a guess: 70 consecutive release transitions, two
+   firings.**  r263..r339 (every adjacent tagged pair): `0 unexplained` on **68** of them; the two exceptions are
+   r325->r328 (the real defect: 3 LOSS + 5 SHRUNK, i.e. the three r331 findings plus the block-12 -> block-16
+   server move and the D1 `mmf.cu`/`mmf.cuh` retirement) and r287->r288 (the block re-org: 2 blocks renumbered,
+   a documented decision).  A per-block-file drop of `--shrink-pct` (default 50) only counts when the *set's*
+   total for that file did not grow, so a hunk that merely moved blocks is `MOVED`/INFO and never fails; the
+   `mmid.cu 204 -> 100` re-cut lands exactly on the boundary and is a review item, which is what a re-base owes.
+4. **A decision row is scoped to the transition that made it.**  A row names the `from-release` it was decided
+   against and applies only while the check is comparing against that release, so it can never suppress a later
+   release's finding by (block, kind, item) coincidence; rows from another transition are counted in the summary
+   and printed, never silently ignored.  `patches/FILE-SET-RETIREMENTS.tsv` is therefore a **live ledger**, and
+   the durable record of the decision is the `WORKLOG.md` entry.
+5. **A chain is the DEFAULT blocks only.**  `--new-chain <repo> --new-base <sha>` reads the block chain out of a
+   llama.cpp checkout (block number from each commit's `rdna-boosts: block NNNN:` subject, `block 00`..`block 16`
+   and `block 0300` all normalising to the four-digit file prefix).  It exists for the ladder — after porting a
+   rung, `--rung NNNN` reconciles that rung alone — and it deliberately drops the optional `01xx` artifacts from
+   the comparison instead of reporting them as GONE by construction (`apply-all.sh --include-optional` is a
+   consumer action and never part of a chain).  Reconciling the fork's own `rdna-boosts` branch against the
+   release tag it was cut from reads **0 findings, every per-block added-line count equal** — an absolute oracle
+   for "the branch and the patch set are the same set", which the tree hash already gives and this now gives
+   per block.
+
+Record: `WORKLOG.md` 261121.022; `MANIFESTS.md` gate 38; `scripts/README.md`; `patches/FILE-SET-RETIREMENTS.tsv`.

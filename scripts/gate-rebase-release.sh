@@ -8,7 +8,9 @@
 # its own beyond the per-arm performance tolerance; each step delegates to the gate that owns the rule.
 #
 # WHAT IT CHECKS (each step must pass; nothing is skipped silently -- a step that cannot run FAILS):
-#   1. state      both repos clean, the fork tip/tree, `master` pinned at the fork point, the builds present
+#   1. state      both repos clean, the fork tip/tree, `master` pinned at the fork point, the builds present,
+#                 and the file-set RECONCILIATION of the delivery's patches against the release they replace
+#                 (scripts/check-rung-file-sets.py, `TODO` #358 / gate 38 -- the one class no build can see)
 #   2. build      the WHOLE applied set builds, once        -> scripts/gate-per-block-build.sh (one rung)
 #                 (r332: per-block independent buildability is NOT a requirement -- a block is a layer on the
 #                  blocks before it, and the deliverable is the applied set; the per-block ladder is now a
@@ -172,6 +174,23 @@ step_state() {
             || record WARN master-pinned "master is $mhead, expected $BASE_COMMIT -- build the attribution base from 'git checkout --detach $BASE_COMMIT', never from master"
 
         record INFO fork-tip "$(git -C "$FORK" rev-parse --short HEAD) tree $(git -C "$FORK" rev-parse --short 'HEAD^{tree}')"
+    fi
+
+    # The re-base's own file-set reconciliation (`TODO` #358, MANIFESTS gate 38): repo-only, ~1 s, and the ONE
+    # instrument that sees a block which landed FEWER FILES than the patch it replaces -- a build cannot, because
+    # the missing hunks live inside other files and compile fine (r331's ggml-alloc.c, two releases shipped).
+    # It compares the delivery's patches/ against the newest release tag before HEAD, so it must run before
+    # `make-patches.sh` has overwritten them or right after (both are correct: the old side is the TAG).
+    if [ -f "$REPO/scripts/check-rung-file-sets.py" ]; then
+        if python3 "$REPO/scripts/check-rung-file-sets.py" --repo "$REPO" > "$LOGDIR/reconcile.log" 2>&1; then
+            record PASS file-sets "$(grep -E '^==> [0-9]+ unexplained' "$LOGDIR/reconcile.log" | tail -1 | sed 's/^==> //')"
+        else
+            record FAIL file-sets "a block lost a file/define/env/option vs the release it replaces -- see $LOGDIR/reconcile.log (restore it, or record the retirement in patches/FILE-SET-RETIREMENTS.tsv)"
+            ok=0
+        fi
+    else
+        record FAIL file-sets "scripts/check-rung-file-sets.py is missing"
+        ok=0
     fi
     return $(( ok == 1 ? 0 : 1 ))
 }

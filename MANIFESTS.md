@@ -17,8 +17,10 @@ count; `release.json.n_blocks` is the **official** count that names the `v<N>` t
 `--include-optional` applies them on top, in numeric order, and the checkout is then not the release tree.
 `scripts/validate-set.sh` is green (checksums and recorded counts, then a strict 17/17 default apply on a
 fresh tarball, tree equality, a conflict-marker/subject scan of every block tree, the optional artifacts
-applied strictly and tree-checked, then the Windows portability lint of the files the set adds — issue
-#231).  **Block `0300` is temporary** (`-sm relaxed-tensor`, a local relaxation of an upstream rule, not a
+applied strictly and tree-checked, the Windows portability lint of the files the set adds — issue
+#231 — then the **file-set reconciliation** of every block against the release it replaces, `TODO` #358,
+which is what catches a re-base that landed fewer files than the patch it replaces carried — checks 1-9).
+**Block `0300` is temporary** (`-sm relaxed-tensor`, a local relaxation of an upstream rule, not a
 supported feature) -- it is applied last, kept separate, and expected to be dropped.  Each block is
 **one** `git am` commit and the series is **linear**: apply in order, never reorder, never insert.
 
@@ -92,8 +94,8 @@ cheap:
 
 | tier | where | what | trigger |
 |---|---|---|---|
-| 1 | `.github/workflows/validate.yml` (hosted, no GPU) | `validate-set.sh`: strict apply on a fresh tarball, tree/count, per-artifact sha256, the Windows path + portability lints, and a conflict-marker/subject scan of every block tree | every push and PR, ~20 s |
-| 2 | `radiance` (`scripts/validate-gpu.sh`, cron every 30 min) | re-applies the set at `origin/main` from scratch, builds the **whole applied tree once**, the seven op oracles, then `gate-prefill-logits.sh` (records a base on a fresh box, compares after) | every new `origin/main` commit, unattended |
+| 1 | `.github/workflows/validate.yml` (hosted, no GPU) | `validate-set.sh`: strict apply on a fresh tarball, tree/count, per-artifact sha256, the Windows path + portability lints, a conflict-marker/subject scan of every block tree, and the file-set reconciliation when the clone has the previous release's tag | every push and PR, ~20 s |
+| 2 | `radiance` (`scripts/validate-gpu.sh`, cron every 30 min) | re-applies the set at `origin/main` from scratch, **reconciles every block against the release it replaces**, builds the **whole applied tree once**, the seven op oracles, then `gate-prefill-logits.sh` (records a base on a fresh box, compares after) | every new `origin/main` commit, unattended |
 | 3 | a GPU box, by hand | the release flow: `all` build, coherence, MTP Protocol A, arch sweeps, the generated-docs drift check (`scripts/check-gen-docs.sh`, r329) | before a tag |
 
 Tier 2 exists because almost every block is a CUDA/HIP kernel change and a hosted runner has no ROCm, so
@@ -108,9 +110,12 @@ to remove.  The release container images are built **off-host by the worker** an
 per-block gate table below is owed **in full**, not only for the blocks whose text was edited.  The r328 re-base
 ran the ladder, the coherence arms, the prefill point and the block gates it remembered and **missed block 00's
 `gate-glu-inplace.sh`**, which is how that block's `ggml-alloc.c` half stayed dropped for two releases while its
-docs still described it (r331, issue #345, `WORKLOG.md` 261121.010).  The mechanical warning is a re-expressed block that lands
-**fewer files than the patch it replaces carried**: a build only proves that the tree *compiles*, and a missing
-file's hunks inside other files compile fine -- only the block's own gate runs the rule.
+docs still described it (r331, issue #345, `WORKLOG.md` 261121.010).  The mechanical warning for that class is now
+an **instrument**, not a habit (**gate 38**): a build only proves that the tree *compiles*, and a missing
+file's hunks inside other files compile fine, so `scripts/check-rung-file-sets.py` reconciles every block's
+change against the block it replaces (file, `#define`, env var, option and the block itself) and fails on
+anything the previous release carried and the new set does not.  Run it **per rung while the ladder is being
+climbed** — that is when a lost file is a five-minute fix — and again before the tag.
 
 `scripts/validate-set.sh` covers patch integrity only (checksums + a fresh-tarball strict apply) and runs
 in CI.  The model-level gates are manual:
@@ -941,6 +946,29 @@ in CI.  The model-level gates are manual:
     correctness signal).  `-lv 2` on the census arms only: a hash arm must run with no `-lv`.  Required for any
     change to `get_split_granularity`'s FFN branch, the `common_optional_features()` table, the `-of` handler,
     or `ffn_even_logged`'s per-model placement.
+
+38. **The file-set reconciliation — every block still carries what the patch it replaces carried** (`TODO` #358,
+    `INVARIANTS.md` r331/r341) -- `scripts/check-rung-file-sets.py`, called by `scripts/validate-set.sh`
+    (check 9) and by `scripts/validate-gpu.sh` (step 1b).  This is the ONE class no build can see: a re-base rung
+    that lands **fewer files than the patch it replaces** compiles fine, because the missing hunks live inside
+    other files -- that is how block 00's `ggml/src/ggml-alloc.c` half (+121/-2, `GGML_GLU_INPLACE` + the
+    unused-view release + the `layout_fp` fingerprint) was dropped by the r328 re-base and shipped through r328
+    and r329 while the block's own text, `ENVIRONMENT.md`, the per-block gate table and `tests/test-alloc.cpp`
+    kept describing it (issue #345).  The check compares each block against the same block of the previous
+    release on five item kinds -- **file** (with its added-line count), **define** (`#define NAME`), **env**
+    (`getenv("NAME")`), **option** (a long option added to `common/arg.cpp`) and **block** -- and exits 1 on a
+    LOSS (gone from the whole set), a SHRUNK (a file whose added-line count fell by `--shrink-pct`, default 50 %,
+    while the set's total for it did not grow) or a GONE (a block/artifact).  A disappearance that is DELIBERATE
+    is a decision row in `patches/FILE-SET-RETIREMENTS.tsv` (`<from-release> <block> <kind> <item> <reason>`),
+    scoped to the transition it was decided in; restoring the content is the normal answer otherwise.  **During a
+    re-base, run it per rung** -- `--rung NNNN --new-chain ~/llama.cpp --new-base <base>` reads the block from the
+    applied chain (a chain is the DEFAULT blocks only; `--new <ref|dir>` compares a whole release) -- and then on
+    the whole set before the tag; `--warn-only` reports without failing, for triage.  Non-vacuity is recorded: on
+    r325->r328 it reads exactly the r331 incident (LOSS `GGML_GLU_INPLACE`, LOSS
+    `GGML_CUDA_DISABLE_ROPE_SET_ROWS`, SHRUNK `ggml/src/ggml-alloc.c` 275 -> 155 added lines, plus the block-12
+    -> block-16 server move), and across the 70 consecutive release transitions r263..r339 it fires **only** there
+    and on the r287->r288 block re-org (2 blocks renumbered) -- zero findings on the other 68.  Required before any
+    tag and after every re-cut patch.
 
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 

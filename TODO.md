@@ -50,15 +50,20 @@ block `0300` and its drop condition are theirs to re-test at a re-base, and no T
 `gate-fusion-alias-copy.sh` arm-A oracle re-derived as a logit point; the unfused chain's move at the r328 base
 is block 09's host-offload relaxation, rounding level, `WORKLOG.md` 261121.020) and `#362` (the hipBLASLt lottery
 measured on both ROCm lines -- 10.2 offers ONE solution per call where 10.1 offers 18, and 10.2 is recorded as
-the canonical validated line in `BASELINE.md`; `WORKLOG.md` 261121.021).  The rows that remain are (`#116`
-parked, `#273`, `#358`, `#361`, `#363`): each carries its own re-entry condition.  A green gate ladder is still
-not permission to skip a row.
+the canonical validated line in `BASELINE.md`; `WORKLOG.md` 261121.021).
+**`r341` housekeeping (2026-11-21):** `#358` closed and left the list -- implemented, not deferred:
+`scripts/check-rung-file-sets.py` reconciles every block against the patch it replaces and fails on a file,
+`#define`, env var, option or block the previous release carried and this one does not, with decision rows in
+`patches/FILE-SET-RETIREMENTS.tsv`; it reproduces all three r331 findings on r325->r328, fires on nothing else
+across 70 consecutive release transitions (68 clean; the only other firing is the documented r288 re-org), and is wired into
+`validate-set.sh`, `validate-gpu.sh` and `MANIFESTS.md` gate 38 (`WORKLOG.md` 261121.022).  The rows that
+remain are (`#116` parked, `#273`, `#361`, `#363`): each carries its own re-entry condition.  A green gate
+ladder is still not permission to skip a row.
 
 | # | subject | kind | status |
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
-| **358** | a re-base rung can silently drop a file: block 00's `ggml-alloc.c` half was missing from r328/r329 while its text, docs and its own unit test still described it (issue #345, fixed r331) | tooling / gate (re-base flow) | **OPEN** -- reconcile each rung's changed-file set against the patch it replaces and fail on a file the old patch touched and the new one does not; the 18/18 ladder cannot see it; §358 |
 | **361** | the r334 RDNA2 items (PR #338) are validated on the contributor's V620, not on the released tree: blocks 05/08/10 now carry an RDNA2-only FA tile-cap removal, a one-warp narrow `RMS_NORM`, a `H * n_seqs` GDN chunked gate and a rows-abreast MoE K walk, and no RDNA2 device is in the maintainer's fleet | validation / external (delivery) | **WAITING on `@jstamagal`** -- re-run on the r334 tree: full `test-backend-ops` on `gfx1030` at default flags (**especially `FLASH_ATTN_EXT` with the caps gone: the failure mode is `GGML_ASSERT(max_blocks_per_sm > 0)` in `launch_fattn`, not a rate**), `MUL_MAT_ID` with `GGML_CUDA_MOE_ROWS_ABREAST` on and off, `RMS_NORM*` in the default/`NARROW=0`/`VEC=1` arms, a model-level decode+prefill (a GDN model for the chunked gate, a MoE for the K walk) and an MTP-acceptance run; **it should also confirm that PR #339's BF16 `RMS_NORM + MUL (+ ADD)` abort is gone there** (fixed at r328 by the re-base, `archive/work/can-fuse-bf16-rms-norm-r324/` -- `RMS_NORM_MUL_ADD` now includes `type=bf16,type_w=f32` and `type=bf16,type_w=f32,type_add=bf16` arms); §361 |
 | **363** | `-of`/`--optional-features` exists with ONE tag (`tp-ffn-even`); the delivery's other env-only opt-in features are still environment-only, so a user who reads `--help` still cannot find them | tooling / docs (delivery) | **OPEN** -- migrate them one at a time: add the row to `common_optional_features()` with its switch, confirm the tag produces exactly what the env var produces (the arm `gate-ffn-even-split.sh` C-section runs), and delete the row if the feature gets a first-class option; candidates are the opt-in switches `ENVIRONMENT.md` already marks as such (§4 `LLAMA_KV_N_PAD_MIN`, §7.6 `--wmma-verify`-adjacent switches are options already, §1.2's arena knobs, block 14's `LLAMA_KV_SPILL_RAM_PCT`); §363 |
 

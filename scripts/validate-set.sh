@@ -33,6 +33,17 @@
 #      instrument -- a consumer's `--include-optional` then refused the artifact
 #      at apply time, which is the worst place to learn it).  The numeric order
 #      is the contract `apply-all.sh --include-optional-all` gives a consumer.
+#   9. every block is RECONCILED against the block it replaces: no file, define,
+#      env var, option or block that the previous release's set carried may be
+#      missing from this one without a decision row in
+#      patches/FILE-SET-RETIREMENTS.tsv (`TODO` #358, INVARIANTS r331: the r328
+#      re-base silently dropped block 00's ggml-alloc.c half and r328/r329
+#      shipped without it).  A build cannot see that class -- the missing hunks
+#      live inside other files and compile fine.  The old side is the newest
+#      `v*` tag before HEAD; a SHALLOW clone (the hosted CI checkout) does not
+#      have it and the check says SKIP -- tier 2 (`scripts/validate-gpu.sh`,
+#      a full clone) and the release flow run it for real, and a full clone with
+#      no resolvable tag is a FAIL, not a skip.
 #
 # Checks 3-5 are the ones that would have caught the 2026-09-13 CI break (a
 # stale fork point) in a minute instead of after three failed matrix jobs.
@@ -252,5 +263,25 @@ fi
 echo "==> scanning the files the delivery adds for Windows-hostile POSIX calls"
 bash "$REPO_DIR/scripts/check-windows-portability.sh" --root "$src" --diff-from "HEAD~$n_default" \
   || fail "Windows portability scan failed (see above)"
+
+# 9. The re-base file-set reconciliation (TODO #358, INVARIANTS r331).  This is the only check that can
+# see a block that landed FEWER FILES than the patch it replaces -- a missing file's hunks inside other
+# files compile fine, so neither this script's apply nor any build notices.  It compares the delivery's
+# own patches (not $src) against the previous release, so it runs here, in the delivery repo.
+echo "==> reconciling every block against the release it replaces (TODO #358)"
+if ! command -v python3 >/dev/null; then
+  fail "python3 is required by scripts/check-rung-file-sets.py"
+fi
+# A hosted CI checkout is shallow and has no previous-release tag: say SKIP there (tier 2 and the release
+# flow run it against a full clone).  A FULL clone with no resolvable tag is a real defect, so no skip.
+if [ "$(git -C "$REPO_DIR" rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
+  python3 "$REPO_DIR/scripts/check-rung-file-sets.py" --repo "$REPO_DIR" --allow-skip \
+    || fail "file-set reconciliation failed (see above)"
+else
+  python3 "$REPO_DIR/scripts/check-rung-file-sets.py" --repo "$REPO_DIR" \
+    || fail "file-set reconciliation failed: a file/symbol/block the previous release carried is missing
+       from this set.  Restore it, or record the retirement in patches/FILE-SET-RETIREMENTS.tsv
+       (TODO #358, INVARIANTS r331)."
+fi
 
 echo "==> OK: base $base, $n_blocks official + ${n_temporary:-0} temporary = $n_default default blocks, $n_optional optional; applied tree ${tree:-$got}"

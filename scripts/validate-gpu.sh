@@ -16,6 +16,11 @@
 # WHAT IT DOES (each step is skippable; see the env list)
 #   1. materialises the set: delivery repo checked out at REV, `apply-all.sh` in LLAMA_REPO,
 #      applied tree == that rev's `release.json.tree` (strict `git am`);
+#   1b. reconciles every block against the release it replaces (`scripts/check-rung-file-sets.py`,
+#      `TODO` #358): a block that landed FEWER FILES than the patch it replaces is invisible to this
+#      script's apply, to the build in step 2 and to every gate below -- a missing file's hunks live
+#      inside other files and compile fine (r331's ggml-alloc.c, issues #345).  Cheap (~1 s), needs the
+#      previous release's tag (this box has a full clone); `SKIP_RECONCILE=1` narrows it;
 #   2. builds the WHOLE applied tree once (the delivery's contract since r332: the set applies and builds as
 #      a set -- per-block independent buildability is not a gate; see scripts/gate-per-block-build.sh);
 #   3. builds the tip's test-binary and runs the op oracles (`FLASH_ATTN_EXT`,
@@ -56,7 +61,7 @@
 #                                    (a missing path is skipped); GDN_WIDTH_P ("3584 4096"),
 #                                    GDN_WIDTH_RUNS (3), GDN_WIDTH_TEXT, GDN_WIDTH_ALWAYS=1
 #      SKIP_BUILD=1 (alias SKIP_LADDER=1) / SKIP_OPTESTS=1 / SKIP_KLD=1 / SKIP_HC=1 / SKIP_GDN_WIDTH=1
-#                                        narrow the run
+#                                        narrow the run (SKIP_RECONCILE=1 skips step 1b)
 #      MAX_ATTEMPTS (3, per rev)         KEEP_RUNS (5)
 #      KLD_ALWAYS=1                      run the prefill-logit gate even when the applied tree
 #                                        did not touch a prefill path (see below)
@@ -269,6 +274,25 @@ applied="$(git -C "$LLAMA_REPO" rev-parse HEAD^{tree})"
 [ "$applied" = "$tree" ] || fail "applied tree $applied != release.json.tree $tree"
 tip="$(git -C "$LLAMA_REPO" rev-parse HEAD)"
 say "apply    : strict, tree $applied == release.json.tree"
+
+# --- 1b. the re-base file-set reconciliation (TODO #358) ---------------------------------------
+# The only check that sees a block that landed FEWER FILES than the patch it replaces: a missing file's
+# hunks inside other files compile fine, so step 1's apply and step 2's build are both blind to it (r331:
+# block 00's ggml-alloc.c half, two releases shipped).  The old side is the newest v* tag before REV, which
+# a full clone has; HEAD here is REV (detached), so the script's own default resolves it.
+if [ "${SKIP_RECONCILE:-0}" = 1 ]; then
+    say "reconcile: skipped (SKIP_RECONCILE=1)"
+else
+    rec_log="$RUN/reconcile.log"
+    if python3 "$REPO/scripts/check-rung-file-sets.py" --repo "$REPO" >"$rec_log" 2>&1; then
+        say "reconcile: $(grep -E '^==> [0-9]+ unexplained' "$rec_log" | tail -1 | sed 's/^==> //')"
+    else
+        say "reconcile: FAIL -- $(grep -E '^  (LOSS|GONE|SHRUNK)' "$rec_log" | head -5 | tr '\n' ';')"
+        cp "$rec_log" "$STATE_DIR/last-reconcile-fail.log"
+        fail "file-set reconciliation (log: $rec_log; a file/symbol/block the previous release carried is
+       missing -- restore it, or record the retirement in patches/FILE-SET-RETIREMENTS.tsv)"
+    fi
+fi
 
 # --- 2. the whole-set build -------------------------------------------------------------------
 # r332: the per-block ladder is NOT a gate any more -- the deliverable is the applied SET, and a block is a

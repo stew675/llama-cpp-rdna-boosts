@@ -1,0 +1,34 @@
+# FILE-SET-RETIREMENTS.tsv -- the decision rows for scripts/check-rung-file-sets.py (TODO #358).
+#
+# That check reconciles every block of the delivery against the block it replaces and FAILS on a file,
+# define, env var, option or whole block that the previous release carried and the new set does not
+# (INVARIANTS.md, r331: block 00's ggml-alloc.c half went missing at the r328 re-base and shipped that
+# way for two releases).  Restoring the content is the normal answer.  When the disappearance is
+# DELIBERATE -- upstream absorbed the feature, a file was retired with a named replacement, a block was
+# renumbered, a hunk moved to another block and no longer needs its old home -- record it here with a
+# reason, in the same change, and say where it went.
+#
+# FORMAT, one row per line, TAB separated, `#` lines and blank lines ignored:
+#
+#     <from-release>	<block>	<kind>	<item>	<reason>
+#
+#   from-release   the tag of the release being replaced -- the `old` side the check printed.  `*` applies
+#                  to any transition (use it only for a one-off local run, never in a commit).
+#   block          a block number (`0000`, `0300`, `0100`) or `*` for any block.
+#   kind           file | define | env | option | block
+#   item           the path (`ggml/src/ggml-cuda/mmf.cu`), the macro (`GGML_GLU_INPLACE`), the env var
+#                  (`GGML_CUDA_DISABLE_ROPE_SET_ROWS`), the long option (`--kv-window`), or the block
+#                  number for `block`.
+#   reason         one line: why it is gone, and where its content went.  Required.
+#
+# A ROW IS SCOPED TO ITS TRANSITION: it only applies while the check is comparing against the
+# `from-release` it names, so a row can never suppress a later release's finding by coincidence.
+# Prune rows for a transition once its WORKLOG.md entry records the decision -- the WORKLOG is the
+# durable record, this file is the live ledger for the re-base in flight.  Rows that do not apply are
+# counted in the check's summary ("N row(s) from another transition (not applied)"), never ignored
+# silently.
+#
+# Example (the r328 re-base's intended retirements; not applied today, they record a closed transition):
+#
+#   v17-4f9dfa0e3-r325	0000	file	ggml/src/ggml-cuda/mmf.cu	D1: mmf.cu/mmf.cuh retired, replaced by upstream #32505
+#   v17-4f9dfa0e3-r325	0000	file	ggml/src/ggml-cuda/mmf.cuh	D1: mmf.cu/mmf.cuh retired, replaced by upstream #32505
