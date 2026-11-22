@@ -512,6 +512,10 @@ same caches).  The two padded extents then differ whenever the movement crosses 
 for a prompt ubatch), which is why this is rare and why it needs a large prefill plus a request boundary: the boundary is
 when the decode arm gains a sequence and starts applying, and 70K of cells is what puts `used` next to an 8192 multiple.
 
+> **NEXT SESSION:** see [`HANDOVER-365-and-release.md`](HANDOVER-365-and-release.md) -- the self-contained plan for
+> `TODO` #365 (the meta-aware device copy) and the block-17 amendment + release wrap-up, with the current repo state,
+> the fix branch, the re-validation commands and the landmines.
+
 ### UPDATE 2026-11-22 (late): BOTH configurations clean -- the fourth defect (the VMM pool's peer grant) fixed
 
 `WORKLOG.md` 261122.034.  Adding to the three fixes below:
