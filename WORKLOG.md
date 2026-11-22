@@ -30,8 +30,10 @@ every arm.  Record: `wip/prefill-decode-arms/RESULTS-2026-11-22.md` pass 6.
 
 Read together with the retired campaign: no mechanism or gate says the two arms are wrong — the two reds are bound
 arithmetic on a design that removes the shared step, and the two SKIPs are the two behavioural consequences
-(parking's placement work and prefix reuse) that the request-boundary-only design makes unreachable.  Still owed
-before promotion: `scripts/gate-host-pool.sh` and `scripts/gate-moe-promise.sh`.  `~/llama.cpp` (`wip/prefill-overlap`
+(parking's placement work and prefix reuse) that the request-boundary-only design makes unreachable.  Neither owed gate reaches this path as shipped
+(`gate-host-pool.sh` is llama-cli-only; the promise gate's `seq` arm hard-codes `-np 1`) -- but the promise gate's own
+criteria are **met by the oracle's exit census** (0 repair lines, `broken=0 repaired=0 stale=3360` cold / `10338` warm
+over two interleaving graphs), so promotion owes an **arm** for the `seq` shape, not a pass.  `~/llama.cpp` (`wip/prefill-overlap`
 `7c114eec0`) and this repo are clean; nothing was pushed anywhere.
 
 ## 261122.010 (r343, no delivery change) -- wip/prefill-decode-arms: at FULL residency the two arms are still better on BOTH axes (the single-context server's own interleave is the expensive thing)

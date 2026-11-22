@@ -243,7 +243,7 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 | **T3** | handover at the request boundary, with a text oracle: a request's reply must be byte-identical to today's single-context server | **the oracle has to be chosen carefully**: it holds on a no-host-tier model and for a single handed-over request on the tier, but a 2-slot arm on a partial arena is not text-stable warm (§3.3) — use a full-residency/no-host-tier text point + KLD on the tier |
 | **T4** | policy + opt-in gate (host tier + residency deficit + the VRAM rule of §3.2), and the duty cycle's role on this path | **rules measured, gate not built**: the 2-row decode graph's **741.48 MiB** is now a shipped default (r343), so the pair fits at `-b 4096 -ub 4096` with no knob; **`-ib` is inert here** and `decode_active` no longer counts a decode-arm slot (the leftover cost 8.1 % at `-ub 512`); **4096 is the sweet spot** (-21 % cost at a multi-step prompt, best decoder tail 50/95 ms); the ubatch buys
 absolute prefill rate (+29 % from 2048 to 8192) but not relative cost, and past 4096 the decoder's *tail* degrades |
-| **T5** | ~~measurement with `smooth.py` against the baseline table~~ — **TAKEN 2026-11-22 (pass 5 §3)**: ~47-49 ms ITL p50 / 64-78 ms p95 through a 2.0-5.3 s prefill at **-24 to -27 % prefill** (cost **accepted**, §3b); **the reachable gates of §7 are RUN (pass 6)** — KLD 0.000000, fairness/duty green under their own absolute/inert criterion and red only on a relative bound the arms remove, park + ckpt SKIP by construction, faults clean on 32 logs | the smoothness target is met; what remains is two gates not yet run (`gate-host-pool`, `gate-moe-promise`) and the maintainer's verdict |
+| **T5** | ~~measurement with `smooth.py` against the baseline table~~ — **TAKEN 2026-11-22 (pass 5 §3)**: ~47-49 ms ITL p50 / 64-78 ms p95 through a 2.0-5.3 s prefill at **-24 to -27 % prefill** (cost **accepted**, §3b); **the reachable gates of §7 are RUN (pass 6)** — KLD 0.000000, fairness/duty green under their own absolute/inert criterion and red only on a relative bound the arms remove, park + ckpt SKIP by construction, faults clean on 32 logs | the smoothness target is met; what remains is an arms arm for `gate-moe-promise`'s `seq` shape + a server-side pool arm, and the maintainer's verdict |
 | **T0** | ~~the shared-KV allocator fix~~ — **DONE 2026-11-22**: `enabling-0003-shared-kv-allocator.patch`, one shared owner, per-ubatch reserve/commit/release, `llama_memory_alloc_sync()` as the handshake, `LLAMA_KV_ALLOC_SHARED=0` as the control (`RESULTS-2026-11-22.md` pass 3) | it had to land before two arms allocate cells; it also removed the scatter that moved the text |
 
 ## 7. Gates when it becomes code
@@ -252,7 +252,10 @@ absolute prefill rate (+29 % from 2048 to 8192) but not relative cost, and past 
   `MOE_EXPERT_HEATMAP=load` + `ROCBLAS_USE_HIPBLASLT=0`; plus `scripts/gate-prefill-logits.sh` for the
   prefill path.
 * **The expert tier**: `scripts/gate-host-pool.sh` (fill faults, rollback, `takeover=0`, its census) and
-  `scripts/gate-moe-promise.sh` if a pass boundary moves.
+  `scripts/gate-moe-promise.sh` if a pass boundary moves.  **Neither reaches the arms path as shipped** (the pool
+  gate is llama-cli-only; the promise gate's `seq` arm hard-codes `-np 1`), but the promise gate's own criteria are
+  **met by the oracle's exit census** (pass 6 §7b: 0 repairs, `broken=0 repaired=0 stale=3360` cold / `10338` warm,
+  over two interleaving graphs) -- so what is owed is an arm for the `seq` shape, not a pass.
 * **The server**: `scripts/gate-prefill-fairness.sh` and `scripts/gate-prefill-duty.sh` (admission moves),
   `scripts/gate-park-idle-slots.sh` if slot parking is touched, `scripts/gate-ckpt-reuse.sh` if a slot's
   checkpoint path crosses the arms.
