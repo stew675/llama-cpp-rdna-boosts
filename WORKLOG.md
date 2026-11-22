@@ -1,3 +1,45 @@
+## 261122.028 (no delivery change) -- block 17's follow-ups become an OPEN campaign, and the prefill/decode balance gets its own handle (`TODO` #371)
+
+**No delivery patch changed, no block created or amended, no tag, `release.json` untouched.**  Housekeeping for the work
+that block 17 deliberately did not ship (`v18-919794500-r346` is the release).
+
+**What was wrong with the state.**  The eight follow-ups existed only as `TODO` #364-#370, i.e. as one-line handles with
+no design, no acceptance oracles and no record of what had already been tried.  A cold session would have re-derived all
+of it, and the cost items (the 74.6 ms handover, the flat 3584 MiB reserve) read like trivia rather than like work with a
+measurement attached.
+
+**What exists now.**  `wip/prefill-decode-arms-followups/` (open, indexed in `wip/CAMPAIGNS.md`) documents each item as
+`W1`-`W7` plus `G1`: what exists today, what is missing, the design, the acceptance oracles, the risks, and the
+dependencies.  `TODO` #364-#370 now point at their section.  Ordering suggestion: `G1` + `W7` + `W3` (small, close out
+what is "recorded but not asserted") -> `W6` -> `W2` -> `W1`, with `W4` whenever a GLM5-Next checkpoint appears and `W5`
+parked until a Mamba-class model exists.
+
+**New: `TODO` #371, the prefill/decode SPEED BALANCE** (the maintainer's idea of 2026-11-22): while the decode arm has
+pending work, the prefill arm **skips one or more submission opportunities**, so the decoder runs a burst of
+uninterrupted steps before the prefill arm grabs the device again.  It is a cross-arm **submission** policy at the batch
+level, which is why the campaign's three measured losers (a mid-gather yield, stream priorities, block 16's duty cycle)
+do not already settle it.
+
+Two things about that item are worth recording here because they cost nothing now and would cost a session later:
+
+1. **The naive mechanism is already contradicted by the numbers.**  The decoder's worst in-window gap is 95 / 60 /
+   34.9 ms at `-ub` 512 / 4096 / fully resident, while the prefill arm's own step on the same shapes is 771 / 1227 / 339
+   ms p50.  The decoder does **not** wait a whole ubatch, so the gap's composition (device time-slicing, internal
+   chunking, or the harness's step granularity) has to be measured before a policy is written.  The item is therefore a
+   measurement campaign with a **Pareto curve** as the deliverable, and a **refutation is an acceptable outcome**.
+2. **Its constraints are the purity rulebook's, not engineering taste.**  Counters not clocks (a time-keyed policy is not
+   reproducible); it changes WHEN the decode arm runs, never WHAT it batches (batch composition is a numerics carrier,
+   `GREEDY-PURITY.md` §36/§63); never skip with nothing decoding and never on a request's first prefill step; bound the
+   streak so prefill cannot starve; `--prefill-decode-arms-skip N` defaults to **0 = off**.
+
+Also recorded: three gates (`gate-hc-base-copy`, `gate-hc-fusions`, `gate-host-expert-text`) still name the retired
+Flash-Next `GSQ-IQ3_XXS` tree and are **not** repointed blind, because each carries recorded anchors for that class
+(`G1`, `TODO` #369); and the pair's slot-erase cell accounting stays recorded-not-asserted (`W7`, `TODO` #370).
+
+Docs touched: `TODO.md` (#371 + the campaign pointer in every item, and the handle-numbering note moved to #372),
+`wip/prefill-decode-arms-followups/README.md` (new), `wip/CAMPAIGNS.md` (the open row), `patches/README.md` (block 17's
+"not covered" list points at the campaign), this entry.
+
 ## 261122.027 (r346, RELEASE v18-919794500-r346) -- block 17: the two-arm server (an opt-in prefill arm + a decode arm co-owning one KV), **default OFF**; the delivery moves to 18 official blocks
 
 **Release.** `v18-919794500-r346`.  Base `919794500` (base tree `916941663346eb86004bed77f74e90fcf9c43126`), canonical tip

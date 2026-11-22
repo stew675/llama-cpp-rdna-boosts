@@ -6427,13 +6427,18 @@ oracle.
 
 ### What it does NOT cover (state it, do not imply it)
 
-* **Speculative decoding with the arms** — refused, a follow-up campaign.
+**All of the items below are work items in `wip/prefill-decode-arms-followups/`** (`TODO` #364-#371), which carries each
+one's design, acceptance oracles and risks.
+
+* **Speculative decoding with the arms** — refused, a follow-up campaign (`W1`).
 * **A meta-aware device copy** for the handover: a `-sm tensor` hybrid boundary takes the serialised state move
   (~74.6 ms per boundary, 112.57 MiB).  Cost item, follow-up.
 * A **recurrent-only** memory (a pure Mamba-class model): `llama_memory_seq_state_take()` refuses anything that
   is not a hybrid, and no such model exists on this box.
 * `GLM5-Next`: the same memory module as qwen4exp, no checkpoint on this box.
-* The declared decode reserve is a **flat 3584 MiB**; deriving it from the decode width is `TODO` #366.
+* The declared decode reserve is a **flat 3584 MiB**; deriving it from the decode width is `TODO` #366 (`W3`).
+* The **prefill/decode speed balance** is not tuned at all: `TODO` #371 (`W6`) evaluates a prefill-arm turn-skip
+  policy as a Pareto curve, with a refutation an acceptable result.
 
 ### Verification
 
