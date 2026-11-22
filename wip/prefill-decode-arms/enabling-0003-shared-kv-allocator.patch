@@ -1,0 +1,707 @@
+From 386b7dd488f8b5f2b27d5b2c5af161e2e4f37adc Mon Sep 17 00:00:00 2001
+From: campaign <campaign@local>
+Date: Sun, 22 Nov 2026 04:12:12 -0600
+Subject: [PATCH] WIP prefill-decode-arms T0: ONE allocation owner for the
+ co-owner KV pair (per-ubatch reserve/publish, consumed by the other arm under
+ the shared cursor)
+
+A co-owner pair shares the cells but each cache kept its own search cursor (v_heads), and find_slot() only
+searches while apply_ubatch() moves the cursor afterwards.  Two allocating arms could therefore be handed the
+same cells in that window, and -- measured -- a warm run scattered a sequence's cells (pos 512 placed in cell 0
+while its prompt sat in 512-1023), which moves this fork's tile-FA numerics.
+
+llama_kv_alloc, shared by the pair exactly like v_cells_impl, is now the only place an allocation is decided:
+find_slot() searches from the pair's ONE cursor, marks the cells it chose as reserved (invisible to any search,
+either arm) and advances that cursor; the real apply_ubatch() commits (prepare()'s dry run does not consume, so
+the reservation survives until the ubatch is really applied); a failed prepare or an abandoned batch context
+releases its marks.  Every other place that moves a cursor (seq_rm/seq_keep's pull-back to a freed hole, seq_cp's
+stream copy, seq_add, a whole-cache restore, clear) moves the pair's one cursor too.
+
+The handshake: the mutex is held across the search/bookkeeping only (microseconds at a ubatch boundary), never
+across a compute -- the campaign measured a 2.85 s starvation from a lock held across a decode step.
+llama_memory_alloc_sync() is the request-boundary check either arm may call: it reports reservations nothing
+applied (a leaked prepare) instead of letting them shrink the cache silently.
+
+LLAMA_KV_ALLOC_SHARED=0 is the A/B kill switch (the legacy two-cursor path).  With it, warm reps scatter and the
+text moves (e05c6e16a136); with the shared owner the two-arm run is bit-identical to the single-context
+reference in every rep, on both the full-residency shape and the product shape (arena 5000): 480/480 sampled
+logits rows, KV cell census identical over all 729 lines, handshake clean at every boundary.
+---
+ include/llama.h             |  11 ++
+ src/llama-context.cpp       |  10 ++
+ src/llama-kv-cache.cpp      | 275 ++++++++++++++++++++++++++++++++++--
+ src/llama-kv-cache.h        |  86 ++++++++++-
+ src/llama-memory-hybrid.cpp |   5 +
+ src/llama-memory-hybrid.h   |   3 +
+ src/llama-memory.h          |   6 +
+ 7 files changed, 386 insertions(+), 10 deletions(-)
+
+diff --git a/include/llama.h b/include/llama.h
+index 1b127def9..a3395dabc 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -924,6 +924,17 @@ extern "C" {
+                  llama_pos p0,
+                  llama_pos p1);
+ 
++    // wip/prefill-decode-arms [EXPERIMENTAL]: the co-owner pair's KV allocation HANDSHAKE, called at a request
++    // boundary (never inside a step) by either arm.  A pair shares ONE allocation owner: the arm that computes a
++    // ubatch reserves that ubatch's cell run and publishes it, and the other arm never searches or advances the
++    // shared cursor over a reserved cell -- so two allocating arms cannot be handed the same cells, and the cell
++    // layout is a function of the request sequence alone rather than of which arm allocated first.  Returns false
++    // (and logs) when the pair still holds a reservation nothing applied, i.e. a leaked prepare; true when clean
++    // or when this memory has no such pair.
++    LLAMA_API bool llama_memory_alloc_sync(
++            llama_memory_t mem,
++                const char * tag);
++
+     // wip/prefill-decode-arms [EXPERIMENTAL]: MOVE seq_id's recurrent state from `src` to `mem`, device to
+     // device, and release it in `src`.  This is the handover between two contexts of the same model that share
+     // their attention KV (`llama_context_params::ctx_other_share_memory`): the KV cells are already the same
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 016de46ec..e37b6bd40 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -7105,6 +7105,16 @@ void llama_memory_seq_rm_recr(
+     mem->seq_rm_recr(seq_id, p0, p1);
+ }
+ 
++bool llama_memory_alloc_sync(
++        llama_memory_t mem,
++        const char * tag) {
++    if (!mem) {
++        return true;
++    }
++
++    return mem->alloc_sync(tag == nullptr ? "alloc_sync" : tag);
++}
++
+ bool llama_memory_seq_state_take(
+         llama_memory_t mem,
+         llama_memory_t src,
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index bfc2eb96d..83779c0ba 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -514,6 +514,18 @@ static uint32_t kv_n_pad_prefill_default(const llama_model & model) {
+     return multi_device ? 8192u : 0u;
+ }
+ 
++// wip/prefill-decode-arms (T0): `LLAMA_KV_ALLOC_SHARED=0` is the A/B kill switch for the co-owner pair's ONE
++// allocation owner (see struct llama_kv_alloc).  Default ON: it is a correctness fix -- the legacy path lets two
++// allocating arms be handed the same cells between find_slot() and apply_ubatch(), and it scatters a sequence's
++// cells over a warm run.  getenv() once (issue #273).
++static bool llama_kv_alloc_shared() {
++    static const bool on = [] {
++        const char * e = getenv("LLAMA_KV_ALLOC_SHARED");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return on;
++}
++
+ llama_kv_cache::llama_kv_cache(
+         const llama_model & model,
+                      bool   no_alloc,
+@@ -602,6 +614,29 @@ llama_kv_cache::llama_kv_cache(
+         v_cells[s].resize(kv_size);
+     }
+ 
++    // wip/prefill-decode-arms (T0): ONE allocation owner for a co-owner pair.  The owner (`other == nullptr`)
++    // creates the state and the co-owner shares it, exactly like `v_cells_impl`; the state is only used while a
++    // co-owner is attached, so a single context keeps today's per-context cursor and no lock at all.
++    // `LLAMA_KV_ALLOC_SHARED=0` is the A/B kill switch (the legacy two-cursor path, for a gate's control arm).
++    if (other == nullptr) {
++        v_alloc_impl = std::make_shared<llama_kv_alloc>();
++    } else if (other_coowner && llama_kv_alloc_shared()) {
++        // attach to the source cache's state (created above when the source was constructed)
++        if (other->v_alloc_impl == nullptr) {
++            other->v_alloc_impl = std::make_shared<llama_kv_alloc>();
++        }
++        v_alloc_impl = other->v_alloc_impl;
++        v_alloc_impl->init(n_stream, kv_size);
++
++        // the shared state only becomes ACTIVE once a co-owner is attached: the owner alone keeps the legacy
++        // path, so a plain single-context run is bit-for-bit what it was (no lock, no reserved bitmap)
++        other->v_alloc_active = true;
++        v_alloc_active = true;
++
++        LLAMA_LOG_INFO("%s: the co-owner pair shares ONE KV allocation owner (%u stream(s), %u cells/stream; "
++                "LLAMA_KV_ALLOC_SHARED=0 disables it)\n", __func__, n_stream, kv_size);
++    }
++
+     // by default, all sequence ids are mapped to the 0th stream
+     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
+ 
+@@ -1321,6 +1356,17 @@ void llama_kv_cache::clear(bool data) {
+         v_heads[s] = 0;
+     }
+ 
++    // wip/prefill-decode-arms (T0): a clear wipes the shared cells, so the pair's cursor and the reservation marks
++    // go with them (either arm may clear; the state is shared)
++    if (llama_kv_alloc * const v_alloc = alloc()) {
++        std::lock_guard<std::mutex> lk(v_alloc->m);
++
++        std::fill(v_alloc->heads.begin(), v_alloc->heads.end(), 0u);
++        for (auto & r : v_alloc->reserved) {
++            std::fill(r.begin(), r.end(), 0);
++        }
++    }
++
+     parked.clear();
+ 
+     if (data) {
+@@ -1378,6 +1424,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+         // If we freed up a slot, set head to it so searching can start there.
+         if (new_head != cells.size() && new_head < head) {
+             head = new_head;
++            alloc_head_pull(seq_to_stream[seq_id], new_head);   // T0: the pair's one cursor too
+         }
+ 
+         if (parked.count(seq_id) > 0) {
+@@ -1407,6 +1454,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+             // If we freed up a slot, set head to it so searching can start there.
+             if (new_head != cells.size() && new_head < head) {
+                 head = new_head;
++                alloc_head_pull(s, new_head);   // T0: the pair's one cursor too
+             }
+         }
+ 
+@@ -1508,6 +1556,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
+     }
+ 
+     v_heads[s1] = v_heads[s0];
++    alloc_head_copy(s1, s0);   // T0: the pair's one cursor too
+ 
+     //for (uint32_t s = 0; s < n_stream; ++s) {
+     //    LLAMA_LOG_WARN("%s: seq %d: min = %d, max = %d\n", __func__, s, v_cells[s].seq_pos_min(s), v_cells[s].seq_pos_max(s));
+@@ -1542,6 +1591,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+     // If we freed up a slot, set head to it so searching can start there.
+     if (new_head != cells.size() && new_head < head) {
+         head = new_head;
++        alloc_head_pull(seq_to_stream[seq_id], new_head);   // T0: the pair's one cursor too
+     }
+ }
+ 
+@@ -1897,6 +1947,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
+     // If we freed up a slot, set head to it so searching can start there.
+     // Otherwise we just start the next search from the beginning.
+     head = new_head != cells.size() ? new_head : 0;
++    alloc_head_set(seq_to_stream[seq_id], head);   // T0: the pair's one cursor too
+ }
+ 
+ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+@@ -2112,6 +2163,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
+ 
+         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
+ 
++        // wip/prefill-decode-arms (T0): the co-owner pair's shared cursor before this ubatch reserved its cells, so
++        // a failed prepare leaves no trace (the reservations themselves are released below)
++        std::vector<uint32_t> alloc_heads_old;
++
+         std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+     };
+ 
+@@ -2121,6 +2176,16 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
+     bool success = true;
+ 
+     for (const auto & ubatch : ubatches) {
++        // wip/prefill-decode-arms (T0): the pair's shared cursor BEFORE this ubatch reserves (find_slot moves it)
++        const std::vector<uint32_t> alloc_heads_old = [&] {
++            std::vector<uint32_t> h;
++            if (llama_kv_alloc * const v_alloc = alloc()) {
++                std::lock_guard<std::mutex> lk(v_alloc->m);
++                h = v_alloc->heads;
++            }
++            return h;
++        }();
++
+         // only find a suitable slot for the ubatch. don't modify the cells yet
+         const auto sinfo_new = find_slot(ubatch, false);
+         if (sinfo_new.empty()) {
+@@ -2133,7 +2198,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
+ 
+         // store the old state of the cells in the recovery stack
+         {
+-            state_t state = { sinfo_new, v_heads, {} };
++            state_t state = { sinfo_new, v_heads, alloc_heads_old, {} };
+ 
+             for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
+                 auto & cells = v_cells[sinfo_new.strm[s]];
+@@ -2144,8 +2209,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
+             states.push_back(std::move(state));
+         }
+ 
+-        // now emplace the ubatch
+-        apply_ubatch(sinfo_new, ubatch);
++        // now emplace the ubatch.  wip/prefill-decode-arms (T0): this is the DRY RUN -- it is rolled back below,
++        // so it must not consume the cells' reservation (the real apply does that)
++        apply_ubatch(sinfo_new, ubatch, /* trial = */ true);
+     }
+ 
+     GGML_ASSERT(!states.empty() || !success);
+@@ -2164,6 +2230,26 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
+     }
+ 
+     if (!success) {
++        // wip/prefill-decode-arms (T0): a prepare that could not place every ubatch releases the cells it had
++        // reserved, and puts the pair's cursor back where it was -- no cell, and no cursor position, survives it.
++        if (llama_kv_alloc * const v_alloc = alloc()) {
++            std::lock_guard<std::mutex> lk(v_alloc->m);
++
++            for (const auto & st : states) {
++                for (uint32_t s = 0; s < st.sinfo.n_stream(); ++s) {
++                    for (uint32_t idx : st.sinfo.idxs[s]) {
++                        if (v_alloc->reserved[st.sinfo.strm[s]][idx]) {
++                            v_alloc->reserved[st.sinfo.strm[s]][idx] = 0;
++                        }
++                    }
++                }
++            }
++            if (!states.empty()) {
++                v_alloc->heads = states.front().alloc_heads_old;
++            }
++            v_alloc->n_release++;
++        }
++
+         return {};
+     }
+ 
+@@ -2261,7 +2347,16 @@ static bool kv_debug_cells() {
+     return on;
+ }
+ 
+-llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
++llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) {
++
++    // wip/prefill-decode-arms (T0): one search cursor for the pair, and the reservation marks -- both under the
++    // pair's mutex, which is the handshake between the two arms.  It is held across the SEARCH only (microseconds
++    // at a ubatch boundary), never across a compute.
++    llama_kv_alloc * const v_alloc = alloc();
++    std::unique_lock<std::mutex> alloc_lk;
++    if (v_alloc != nullptr) {
++        alloc_lk = std::unique_lock<std::mutex>(v_alloc->m);
++    }
+ 
+     if (debug > 0) {
+         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+@@ -2348,6 +2443,10 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+ 
+     res.resize(n_seqs);
+ 
++    // the cursor each sequence's scan started from (the census below reports it; scans move `head_cur`).
++    // `v_heads` is only a MIRROR when the pair shares one cursor, so printing it would be misleading.
++    std::vector<uint32_t> head_start(n_seqs, 0);
++
+     for (uint32_t s = 0; s < n_seqs; ++s) {
+         const auto seq_id = ubatch.seq_id_unq[s];
+ 
+@@ -2364,7 +2463,11 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+ 
+         const auto & cells = v_cells[seq_to_stream[seq_id]];
+ 
+-        uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
++        const uint32_t strm = seq_to_stream[seq_id];
++
++        // T0: the pair's shared cursor (the per-context `v_heads` is only a mirror in that mode)
++        uint32_t head_cur = v_alloc != nullptr ? v_alloc->heads[strm] : v_heads[strm];
++        head_start[s] = head_cur;
+ 
+         // with parked sequences (seq_park), the search covers only the cells below them
+         const uint32_t n_cells = parked.empty() ? cells.size() : park_bound();
+@@ -2450,6 +2553,12 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+                         }
+                     }
+ 
++                    // T0: a cell reserved by EITHER arm (this batch's own reservations included -- they are
++                    // consumed by apply_ubatch, not by a second search) is not available
++                    if (can_use && v_alloc != nullptr && v_alloc->reserved[strm][idx]) {
++                        can_use = false;
++                    }
++
+                     if (can_use) {
+                         res.idxs[s].push_back(idx);
+                     } else {
+@@ -2531,6 +2640,20 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+ 
+     assert(res.s1 >= res.s0);
+ 
++    // T0: RESERVE.  The cells are now invisible to every other search (either arm) until apply_ubatch() commits
++    // them or a failed/abandoned prepare releases them, and the pair's one cursor moves past them -- so the layout
++    // is a function of the request sequence alone, not of which arm happened to allocate.
++    if (v_alloc != nullptr) {
++        for (uint32_t s = 0; s < n_seqs; ++s) {
++            const uint32_t strm = res.strm[s];
++            for (uint32_t idx : res.idxs[s]) {
++                v_alloc->reserved[strm][idx] = 1;
++            }
++            v_alloc->heads[strm] = res.idxs[s].back() + 1;
++        }
++        v_alloc->n_reserve++;
++    }
++
+     // wip/prefill-decode-arms: a COMPACT, parseable census of the cells this ubatch was given, one line per
+     // sequence -- which cells a slot occupies is an input to this fork's numerics (the tile-FA decode split is
+     // index-dependent), so a two-arm comparison needs to diff it.  LLAMA_KV_CACHE_DEBUG=3 prints the whole map,
+@@ -2551,7 +2674,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+                 i = j;
+             }
+             LLAMA_LOG_DEBUG("[TAG_KV_CELLS] seq=%d strm=%u n_tok=%u head_in=%u used=%u size=%u pos=[%d,%d] runs=%s\n",
+-                    (int) seq_id, strm, n_tokens, v_heads[strm], v_cells[strm].get_used(), get_size(),
++                    (int) seq_id, strm, n_tokens, head_start[s], v_cells[strm].get_used(), get_size(),
+                     (int) v_cells[strm].seq_pos_min(seq_id), (int) v_cells[strm].seq_pos_max(seq_id), runs.c_str());
+         }
+     }
+@@ -2559,7 +2682,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+     return res;
+ }
+ 
+-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
++void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool trial) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (is_mirror()) {
+         return;
+@@ -2648,6 +2771,122 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
+ 
+         head = sinfo.idxs[s].back() + 1;
+     }
++
++    // wip/prefill-decode-arms (T0): COMMIT (or, in `prepare()`'s dry run, leave the reservation alone -- the dry run
++    // is rolled back and the real apply is still to come, so releasing here would reopen the window the
++    // reservation exists to close).  The shared cursor is set to the same value as the mirror, so a rollback that
++    // restored the mirror cannot leave the pair's cursor behind.
++    if (llama_kv_alloc * const v_alloc = alloc()) {
++        std::lock_guard<std::mutex> lk(v_alloc->m);
++
++        if (!trial) {
++            for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
++                for (uint32_t idx : sinfo.idxs[s]) {
++                    v_alloc->reserved[sinfo.strm[s]][idx] = 0;
++                }
++                v_alloc->heads[sinfo.strm[s]] = sinfo.idxs[s].back() + 1;
++            }
++            v_alloc->n_commit++;
++        }
++    }
++}
++
++//
++// wip/prefill-decode-arms (T0): the co-owner pair's allocation handshake
++//
++
++void llama_kv_cache::alloc_release(const slot_info_vec_t & sinfos, size_t from) {
++    llama_kv_alloc * const v_alloc = alloc();
++    if (v_alloc == nullptr) {
++        return;
++    }
++
++    std::lock_guard<std::mutex> lk(v_alloc->m);
++
++    // a batch context that is destroyed before it applied every ubatch gives those cells back, so a cancelled or
++    // failed step cannot shrink the cache silently.  Un-marking a cell that was already committed is a no-op.
++    size_t n_rel = 0;
++    for (size_t i = from; i < sinfos.size(); ++i) {
++        const auto & sinfo = sinfos[i];
++        if (sinfo.empty()) {
++            continue;
++        }
++        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
++            for (uint32_t idx : sinfo.idxs[s]) {
++                if (v_alloc->reserved[sinfo.strm[s]][idx]) {
++                    v_alloc->reserved[sinfo.strm[s]][idx] = 0;
++                    n_rel++;
++                }
++            }
++        }
++    }
++    if (n_rel > 0) {
++        v_alloc->n_release++;
++    }
++}
++
++void llama_kv_cache::alloc_head_pull(uint32_t strm, uint32_t v) {
++    llama_kv_alloc * const v_alloc = alloc();
++    if (v_alloc == nullptr) {
++        return;
++    }
++
++    std::lock_guard<std::mutex> lk(v_alloc->m);
++
++    if (v < v_alloc->heads[strm]) {
++        v_alloc->heads[strm] = v;
++    }
++}
++
++void llama_kv_cache::alloc_head_copy(uint32_t strm_dst, uint32_t strm_src) {
++    llama_kv_alloc * const v_alloc = alloc();
++    if (v_alloc == nullptr) {
++        return;
++    }
++
++    std::lock_guard<std::mutex> lk(v_alloc->m);
++
++    v_alloc->heads[strm_dst] = v_alloc->heads[strm_src];
++}
++
++void llama_kv_cache::alloc_head_set(uint32_t strm, uint32_t v) {
++    llama_kv_alloc * const v_alloc = alloc();
++    if (v_alloc == nullptr) {
++        return;
++    }
++
++    std::lock_guard<std::mutex> lk(v_alloc->m);
++
++    v_alloc->heads[strm] = v;
++}
++
++bool llama_kv_cache::alloc_sync(const char * tag) {
++    llama_kv_alloc * const v_alloc = alloc();
++    if (v_alloc == nullptr) {
++        return true;
++    }
++
++    std::lock_guard<std::mutex> lk(v_alloc->m);
++
++    size_t n_reserved = 0;
++    for (const auto & r : v_alloc->reserved) {
++        n_reserved += std::count(r.begin(), r.end(), 1);
++    }
++
++    // outstanding marks are LEGAL while a batch is prepared-but-not-yet-applied; at a request boundary they are a
++    // leaked prepare, which is what this call exists to say out loud
++    if (n_reserved != 0) {
++        LLAMA_LOG_WARN("%s: the KV allocation handshake still holds %zu reserved cell(s) at a request boundary "
++                "(reserve=%llu commit=%llu release=%llu)\n",
++                tag, n_reserved, (unsigned long long) v_alloc->n_reserve,
++                (unsigned long long) v_alloc->n_commit, (unsigned long long) v_alloc->n_release);
++        return false;
++    }
++
++    LLAMA_LOG_DEBUG("%s: KV allocation handshake clean (reserve=%llu commit=%llu release=%llu)\n",
++            tag, (unsigned long long) v_alloc->n_reserve, (unsigned long long) v_alloc->n_commit,
++            (unsigned long long) v_alloc->n_release);
++    return true;
+ }
+ 
+ bool llama_kv_cache::get_can_shift() const {
+@@ -2679,6 +2918,19 @@ bool llama_kv_cache_context::is_streaming(uint32_t n_kv_asked) const {
+ }
+ 
+ llama_kv_cache::~llama_kv_cache() {
++    // wip/prefill-decode-arms (T0): a co-owner that goes away takes the pair's handshake with it -- the owner falls
++    // back to the legacy single-arm path (one cursor, no lock) rather than keeping a shared state nobody shares.
++    if (other_coowner && other != nullptr && other->v_alloc_impl == v_alloc_impl) {
++        if (llama_kv_alloc * const v_alloc = alloc()) {
++            std::lock_guard<std::mutex> lk(v_alloc->m);
++
++            for (auto & r : v_alloc->reserved) {
++                std::fill(r.begin(), r.end(), 0);
++            }
++        }
++        other->v_alloc_active = false;
++    }
++
+     // wip/kv-residency (TODO #118) B-A: the pool's own accounting -- hit rate per id, fills per resolve,
+     // evictions.  `LLAMA_KV_POOL_STATS=1` makes it one line at teardown (never default-on: reading the
+     // counters back synchronises the device).
+@@ -4612,6 +4864,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
+         }
+ 
+         head = 0;
++        alloc_head_set(strm, 0);   // T0: the pair's one cursor too
+     }
+ 
+     return true;
+@@ -4938,7 +5191,13 @@ llama_kv_cache_context::llama_kv_cache_context(
+         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+ }
+ 
+-llama_kv_cache_context::~llama_kv_cache_context() = default;
++llama_kv_cache_context::~llama_kv_cache_context() {
++    // wip/prefill-decode-arms (T0): give back the cells of ubatches that were prepared but never applied, so an
++    // abandoned batch cannot leave the co-owner pair's cache short of cells.
++    if (kv != nullptr && !sinfos.empty()) {
++        kv->alloc_release(sinfos, i_cur);
++    }
++}
+ 
+ bool llama_kv_cache_context::next() {
+     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 77e435e7d..e1dafc7a9 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -6,6 +6,8 @@
+ #include "llama-memory.h"
+ 
+ #include <map>
++#include <memory>
++#include <mutex>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -18,6 +20,51 @@ struct llama_context;
+ // llama_kv_cache
+ //
+ 
++// wip/prefill-decode-arms (T0, `RESULTS-2026-11-22.md` §4): the co-owner pair's ONE allocation owner.
++//
++// A co-owner pair SHARES the cells (`v_cells_impl`) but each cache had its own search cursor (`v_heads`), and
++// `find_slot()` only searches -- `apply_ubatch()` moves the cursor afterwards.  Two allocating arms therefore
++// (a) could be handed the SAME cells in the window between the two calls (a silent wrong answer), and (b) placed a
++// slot in different cells depending on which arm allocated first, which moves this fork's decode numerics (the
++// tile-FA split is index-dependent).  Measured: with the old per-context cursors a warm run scattered a
++// sequence's cells (pos 512 in cell 0 while its prompt sat in 512-1023).
++//
++// This state is shared by the pair the same way `v_cells_impl` is, and it is the only place an allocation is
++// decided, so BOTH arms allocate through one handshake instead of either arm deciding unilaterally:
++//
++//   reserve  `find_slot()` searches from `heads[strm]` (not from a per-context cursor), marks the cells it chose
++//            in `reserved`, and advances `heads[strm]`.  A reserved cell is invisible to every search, on either
++//            arm, so the window above does not exist.  One reservation per UBATCH (the granularity
++//            `prepare()` works at).
++//   commit   `apply_ubatch()` (the real apply, not `prepare()`'s trial run) clears the marks and installs the
++//            cell metadata as before.
++//   release  a failed or abandoned prepare clears its marks, so no cell is ever stranded.
++//
++// `m` is held for the bookkeeping only -- NEVER across a compute: the campaign measured a 2.85 s prefill
++// starvation when a decode arm held a lock across its step loop.  Held here it is a few microseconds at a ubatch
++// boundary, and it is the handshake: while one arm reserves, the other waits and then sees the reservation.
++struct llama_kv_alloc {
++    mutable std::mutex m;
++
++    // the ONE search cursor, per stream
++    std::vector<uint32_t> heads;
++
++    // per stream, per cell: 1 = reserved by an arm, not yet committed (or released)
++    std::vector<std::vector<uint8_t>> reserved;
++
++    // handshake census (diagnostic -- `alloc_sync()` prints it): reservations by either arm since the pair formed
++    uint64_t n_reserve = 0;
++    uint64_t n_commit  = 0;
++    uint64_t n_release = 0;
++
++    void init(uint32_t n_stream, uint32_t size) {
++        heads.assign(n_stream, 0);
++        reserved.assign(n_stream, std::vector<uint8_t>(size, 0));
++    }
++
++    bool ready() const { return !reserved.empty(); }
++};
++
+ class llama_kv_cache : public llama_memory_i {
+ public:
+     struct stream_copy_info {
+@@ -166,6 +213,13 @@ public:
+     // returning an error.  A no-op unless the KV is region-backed (LLAMA_KV_REGION).
+     void grow_regions(uint32_t n_kv, uint32_t n_kv_used) const;
+ 
++    // wip/prefill-decode-arms (T0): the co-owner pair's allocation handshake.  Called by an arm at a REQUEST
++    // boundary (never inside a step): reports whether any reservation is still outstanding (a prepare that was
++    // never applied -- the leak the reservation marks exist to make visible instead of silent), and a census of
++    // reserves/commits/releases.  Returns true when nothing is outstanding.  A no-op (true) when this cache is
++    // not part of a pair.
++    bool alloc_sync(const char * tag = "sync") override;
++
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+     void seq_keep(llama_seq_id seq_id)                                                          override;
+@@ -304,10 +358,25 @@ public:
+     // find a slot of kv cells that can hold the ubatch
+     // if cont == true, then the slot must be continuous
+     // return empty slot_info on failure
+-    slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
++    // T0: search from the pair's shared cursor and reserve the cells (see struct llama_kv_alloc).  Not const: it
++    // reserves.  `cont` has the classic meaning (a contiguous run for the whole ubatch).
++    slot_info find_slot(const llama_ubatch & ubatch, bool cont);
+ 
+     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
+-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
++    // `trial` = `prepare()`'s dry run: it must NOT consume the cells' reservation, because the real apply comes
++    // later (the dry run is rolled back, the reservation is not -- releasing it here would reopen the window).
++    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool trial = false);
++
++    // T0: release every reservation a batch context still holds (prepared but never applied), from ubatch `from`
++    void alloc_release(const slot_info_vec_t & sinfos, size_t from);
++
++    // T0: EVERY place that moves a stream's search cursor has to move the PAIR's one cursor too, or the layout
++    // depends on which arm moved last (that is the scatter `RESULTS-2026-11-22.md` §4 measured).  These mirror the
++    // legacy `v_heads` writes: a pull back to a freed hole (seq_rm / seq_keep), a stream copy (seq_cp), a reset
++    // (seq_add / state_read_meta).  No-ops when this cache is not part of a pair.
++    void alloc_head_pull(uint32_t strm, uint32_t v);            // if (v < head) head = v
++    void alloc_head_copy(uint32_t strm_dst, uint32_t strm_src);
++    void alloc_head_set (uint32_t strm, uint32_t v);
+ 
+     //
+     // input API
+@@ -479,8 +548,21 @@ private:
+ 
+     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
+     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
++    // T0: a MIRROR of the shared cursor when this cache is part of a co-owner pair -- the search reads
++    // `v_alloc_impl->heads` and `apply_ubatch()` writes both, so the legacy per-context reads stay coherent.
+     std::vector<uint32_t> v_heads;
+ 
++    // wip/prefill-decode-arms (T0): non-null only for a CO-OWNER PAIR with the shared allocator on (the default,
++    // `LLAMA_KV_ALLOC_SHARED=0` disables it for an A/B).  Created by the owner and shared into the co-owner at its
++    // construction, exactly like `v_cells_impl`.  `v_alloc_active` says whether the pair actually attached: an
++    // owner that never gets a co-owner keeps the legacy path (no lock, no bitmap), so a single-context run is
++    // unchanged.
++    std::shared_ptr<llama_kv_alloc> v_alloc_impl;
++    bool v_alloc_active = false;
++
++    llama_kv_alloc * alloc() const { return v_alloc_active && v_alloc_impl ? v_alloc_impl.get() : nullptr; }
++
++
+     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
+     llama_kv_cache * other;
+ 
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index e2bcbbb55..40256ddd5 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -181,6 +181,11 @@ void llama_memory_hybrid::seq_rm_recr(llama_seq_id seq_id, llama_pos p0, llama_p
+     mem_recr->seq_rm(seq_id, p0, p1);
+ }
+ 
++bool llama_memory_hybrid::alloc_sync(const char * tag) {
++    // wip/prefill-decode-arms (T0): the attention cache is the one that owns the shared cells
++    return mem_attn->alloc_sync(tag);
++}
++
+ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+index 210b9f9fd..15edc9f94 100644
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -70,6 +70,9 @@ public:
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+     // wip/prefill-decode-arms: the recurrent half only -- the attention cache may be shared with another context
+     void seq_rm_recr(llama_seq_id seq_id,                           llama_pos p0, llama_pos p1) override;
++
++    // wip/prefill-decode-arms (T0): the attention cache owns the cells, so it owns the handshake
++    bool alloc_sync(const char * tag) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+     void seq_keep(llama_seq_id seq_id)                                                          override;
+     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index 7a95c3b0e..0e2684319 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -164,6 +164,12 @@ struct llama_memory_i {
+     // attention KV) does nothing here.
+     virtual void seq_rm_recr(llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/) {}
+ 
++    // wip/prefill-decode-arms (T0): the co-owner pair's allocation HANDSHAKE, checked at a REQUEST boundary (never
++    // inside a step).  A pair that shares one allocation owner (see struct llama_kv_alloc) must end every request
++    // with nothing reserved-but-unapplied; this returns false and says so when a prepare leaked its cells.
++    // A memory module with no such owner (everything except a co-owner pair) returns true.
++    virtual bool alloc_sync(const char * /*tag*/) { return true; }
++
+     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+ 
+     // wip/kv-residency (TODO #118) B-A: the ATTENDANCE POOL's footprint -- the compact device pool that is
+-- 
+2.56.1
+

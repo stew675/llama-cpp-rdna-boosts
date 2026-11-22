@@ -21,11 +21,11 @@ started.
 | task | state |
 |---|---|
 | **T1 — the state handover** | **DONE.** `enabling-0002-recurrent-handover.patch`: one sequence's recurrent state moves between the arms **device-to-device in 0.45–0.66 ms** (1.9–2.3 ms on a process's first handover) against **34.5–36.1 ms** for the serialised path (52.7 MiB).  Text-exact on a no-host-tier 4B in every mode/repetition and on the 35B host tier for a single handed-over request (3/3 warm reps) |
-| **T2 — the server skeleton** | **NOT STARTED.**  Its design is now measured outside the server (the instrument below) and written out in code points: `RESULTS-2026-11-21.md` §5 |
+| **T2 — the server skeleton** | **NEXT.**  Its design is measured outside the server (the instrument below) and written out in code points: `RESULTS-2026-11-21.md` §5.  T0 landed, so the prefill/decode pair can share cells safely |
 | **T3 — the request-boundary handover + its oracle** | The handover is built and exercised in the instrument; **the oracle is now measured, not hypothesised** — see §3, T3, and [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) |
 | **T4 — the opt-in gate** | Not started; its two rules are now measured (VRAM per slot width, the allocator) |
 | **T5 — measurement + gates** | Not started (the instrument's numbers are the target T5 must beat) |
-| **T0 — one allocator for the pair** (new, 2026-11-21) | **NOT STARTED, and it is the next code task.**  It is a *blocker* (a correctness hazard) and it is also the text carrier of the two-arm shape — `RESULTS-2026-11-21.md` §3.1 + §3.4, and `RESULTS-2026-11-22.md` §4 shows the scatter directly.  **Waiting on the maintainer's approval of the artifact and its shape (HANDOVER §8, Q1).** |
+| **T0 — one allocator for the pair** (new, 2026-11-21) | **DONE 2026-11-22 (pass 3).**  [`enabling-0003-shared-kv-allocator.patch`](enabling-0003-shared-kv-allocator.patch) (7 files, +386/−10, `~/llama.cpp` `386b7dd48`): ONE shared owner, **per-ubatch** reserve/commit/release, with `llama_memory_alloc_sync()` as the request-boundary handshake.  `LLAMA_KV_ALLOC_SHARED=0` is the A/B control.  Measured: the two-arm run is **bit-identical to the single-context reference in every rep on both shapes**, no harness control (`RESULTS-2026-11-22.md` pass 3). |
 
 ## 2. What exists as code (do not re-derive any of it)
 
@@ -62,8 +62,9 @@ started.
 
 ## 3. The state of each open question (the crux of this handover)
 
-### T0 — one allocator for the pair.  NEXT, awaiting the maintainer's answer to Q1.  Read `RESULTS-2026-11-21.md`
-### §3.1 and §3.4, then `RESULTS-2026-11-22.md` §4 (the scatter, measured).
+### T0 — one allocator for the pair.  **DONE (pass 3).**  Read `RESULTS-2026-11-22.md` pass 3 §1 for the shape that
+was built and §2 for the numbers; `~/llama.cpp` `386b7dd48`; the artifact is `enabling-0003-shared-kv-allocator.patch`.
+Do not re-derive the scatter: with `LLAMA_KV_ALLOC_SHARED=0` it comes back in one warm rep, which is the control.
 
 Two contexts co-own the KV cells (`v_cells` is shared through `v_cells_impl`) but each has its **own allocation
 cursor** (`v_heads`, and its own `n`/`head`).  `llama_kv_cache::find_slot()` is `const` and only *searches* from
@@ -104,10 +105,11 @@ artifact — do **not** bury it in the server cut):
   exists.**  `arms` vs `batch-pair` (2 slots, an MoE model, warm reps) read **bit-identically** — 480/480 sampled
   logits rows, `max|Δ| = 0`, both requests, every rep.  Pass 2 got that with `ARMS_RESET_CACHE=1` standing in for
   T0's allocator; once T0 lands the control can be dropped.
-* **On a partial host-expert arena a cross-configuration hash is still not an oracle** — but for the *residency
-  class* reason (`GREEDY-PURITY.md` §89, the two runs' censuses differ: `h=0.8161` vs `h=0.8172`), not for the
-  cursor reason pass 1 named.  There the verdict is `scripts/gate-prefill-logits.sh` (KLD) plus text compared
-  **within one residency class**.
+* **Pass 3 changed this**: with T0 in, the hash oracle holds **on the product shape too** (arena 5000, both pins,
+  3 reps, both requests) — pass 2's "§89 residency class" on the tier was the instrument's take race
+  (`ARMS_NO_WAIT_TAKE=1` reproduces it deliberately).  **Tier 1 = the cross-configuration hash on `arms` vs
+  `batch-pair`** (fixed shape pins + `ROCBLAS_USE_HIPBLASLT=0` + T0), **tier 2 = KLD + the residency census**,
+  kept as insurance for shapes this campaign has not run (the maintainer asked for the greatest coverage).
 * **`ROCBLAS_USE_HIPBLASLT=0` is mandatory on EVERY text arm, full residency included.**  The second context's
   first decode can move the hipBLASLt choice **mid-process** (stable afterwards); pass 1's full-residency oracle
   block omitted the pin and that omission manufactured the `b79e73e3fe9f` "residual".
@@ -143,7 +145,10 @@ only: `slots[]`, `batch`, `ctx_tgt`, `spec`, `checkpoints`, the prompt cache.  B
    keep that.
 2. **The take must be POSTED to the decode arm**, never taken under a lock by the prefill thread (2.85 s
    starvation, §3 T0).  Also: only one prompt in flight on the prefill arm, and it waits for the handover to
-   complete before starting the next one (the take reads that arm's memory metadata).
+   complete before starting the next one (the take reads that arm's memory metadata).  **Pass 3: breaking that
+   second rule is not subtle — it silently changes the next prompt's recurrent cell index and the reply's text**
+   (it was a stale `handover_done` flag in the instrument, and it produced the value pass 1/2 chased as a
+   "host-tier" effect).  `ARMS_NO_WAIT_TAKE=1` is the deliberate control arm; do not remove the wait.
 3. **`n_parallel` / `n_ctx_seq`**: `n_ctx_seq = n_ctx / n_seq_max`, so raising `n_seq_max` for warm reps shrinks
    each sequence's context and a 4932-token prompt stops fitting.  Reuse the same seq ids across reps instead
    (that is what a server does with slot ids).
