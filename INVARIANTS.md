@@ -1982,7 +1982,8 @@ Record: `WORKLOG.md` 261122.004; `ENVIRONMENT.md` §20; `patches/README.md` bloc
    arm — the ordering issue #350 reports (~19 % on their Windows box, 2.8 % here).  One bitmap pass
    (`moe_cache_gather_mask_kernel`, per-block shared-memory bitmap + one atomic per WORD; a global atomic per id
    measured 0.11 ms/call) makes 32 the BEST arm: **1741.0** (+4.1 % over the shipped default), and on the
-   released tree with no knobs **1748.5/1751.3** (+4.4 %).  At 84 % residency (35B-A3B Q8_0, 256 experts) 32 goes
+   released tree with no knobs **+3.6 to +4.4 %** across two 3-pair sets (1669.4/1668.3/1674.5 ->
+   1740.8/1730.4/1720.2 and 1676.5 -> 1748.5/1751.3).  At 84 % residency (35B-A3B Q8_0, 256 experts) 32 goes
    3722.3 -> **3777.6** (+1.5 %).
 2. **The bitmap is a TEST replacement, not a copy change, and the text says so byte for byte.**  `172 chars
    sha=de61b9b1bed7` (low-residency shape) and `206 chars sha=cf7f8b23f404` (high-residency shape) are identical

@@ -1,7 +1,8 @@
 ## 261122.005 (r345, RELEASE v17-919794500-r345) -- issue #350 fixed: the MoE device gather's used-expert BITMAP (block 09), so a deep split stops paying for the routing scan it already did
 
 **Release:** `v17-919794500-r345`.  Base `919794500` (base tree `916941663346eb86004bed77f74e90fcf9c43126`), canonical
-tip **`585360d19`** (tree **`228628e50bec140b25be27966844404ee41a1da2`**), 17 official + 1 temporary = 18 default
+tip **`b0bd1940a`** (the re-cut `apply-all.sh` produces; the working chain tip `585360d19` is a DIFFERENT
+commit with the same tree **`228628e50bec140b25be27966844404ee41a1da2`**, which is the contract), 17 official + 1 temporary = 18 default
 blocks, optional `0100` -> `151c3b84e` / `0101` -> `5377f93d0` (cumulative `db7c6be40`).  **No block created,
 split or renumbered**: one same-block amendment, **block 09** (`ggml/src/ggml-cuda/moe-expert-cache.cu`,
 `moe_cache_gather_host` + `moe_cache_gather_kernel`), plus the census wording of block 12's `device gather:` line
@@ -31,8 +32,8 @@ magnitude below the threshold) never adds a launch.
 | **54.7 % residency**, Flash-Next IQ3_XXS 512 experts, 17 624-token prompt | 1671.7 | **1741.0** | **+4.1 %** |
 | 84.0 % residency, 35B-A3B Q8_0 256 experts, 5246-token prompt | 3722.3 | **3777.6** | +1.5 % |
 
-And on the released tree with no env knobs: **+4.4 %** (1676.5 -> 1748.5/1751.3) at 54.7 % and **+0.8 %** at
-84 %.  The bitmap also turns `n_split` 64 at 84 % residency from **3412.6 t/s (a 8 % regression)** into
+And on the released tree with no env knobs, three interleaved pairs: **+3.6 %** (1669.4/1668.3/1674.5 ->
+1740.8/1730.4/1720.2) at 54.7 % and **+0.8 %** at 84 %.  The bitmap also turns `n_split` 64 at 84 % residency from **3412.6 t/s (a 8 % regression)** into
 **3817.8 (+12 % over the same arm)** -- which is the proof that the cost was the scan, not the copy shape, and
 that the answer is the mechanism rather than a different constant.  Full matrix:
 `benchmarks/2026-11-22-gather-bitmap.md`.
@@ -43,7 +44,7 @@ read-granularity problem, and per-block launch cost is the other candidate).  If
 their box after this, the cause is the grid size rather than the scan, and the fix for that class is a smaller
 grid -- which needs their logs to size, so the reply asks them to re-test rather than claiming their number.
 
-### Gates (all on the released tree, build `585360d19`)
+### Gates (all on the released tree, build `585360d19` / canonical re-cut `b0bd1940a`)
 
 * `scripts/validate-set.sh` -- **green**: 18 default patches + 2 optional + `rdna-boosts-all.patch` checksums,
   strict apply on a fresh `919794500` tarball, applied tree **`228628e50`** == `release.json`, both optionals

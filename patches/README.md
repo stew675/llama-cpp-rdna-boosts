@@ -2014,8 +2014,8 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 > in ONE pass (per-block shared-memory bitmap, one atomic per WORD) and every block reads one word, engaged when
 > the scan volume it replaces (`n_experts * n_split * n_used * n_tok` ids) is at least `1e8` -- below that the
 > pass is critical-path latency (-1.2..-2.3 % measured), so `n_split` 4-8 are exactly the pre-r345 path and the
-> decode/verify band never adds a launch.  Measured on the released tree: **+4.4 %** prefill at 54.7 % residency
-> (1676.5 -> 1748.5/1751.3) and **+0.8 %** at 84 % (3732.5 -> 3737.2/3787.8), decode unchanged, greedy text
+> decode/verify band never adds a launch.  Measured on the released tree: **+3.6 to +4.4 %** prefill at 54.7 % residency
+> (1676.5 -> 1748.5/1751.3, and 1669.4/1668.3/1674.5 -> 1740.8/1730.4/1720.2) and **+0.8 %** at 84 % (3732.5 -> 3737.2/3787.8), decode unchanged, greedy text
 > byte-identical (`172 chars sha=de61b9b1bed7` / `206 chars sha=cf7f8b23f404`) and
 > `gate-prefill-logits.sh --ab "MOE_GATHER_MASK=0"` reads mean KLD -0.000000 / 100.000 % top-p.  `n_split` 64 at
 > 84 % residency goes from -8 % to +12 %, which localises the cost to the scan.  The bitmap buffer is allocated

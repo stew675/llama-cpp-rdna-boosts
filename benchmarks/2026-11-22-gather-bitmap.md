@@ -71,11 +71,13 @@ a 12 % win, which is why the bitmap — not a different constant — is the fix.
 
 ## 3. The shipped default, on the released tree
 
-`release.json` tree `228628e50` (build `585360d19`), no env knobs:
+`release.json` tree `228628e50` (the working chain's build `585360d19`; the canonical re-cut is `b0bd1940a`),
+no env knobs, three interleaved pairs:
 
 | shape | shipped (bitmap at 32) | `MOE_GATHER_MASK=0` (pre-r345) | delta |
 |---|---:|---:|---:|
-| low residency 54.7 % (IQ3_XXS, 17 624 tokens) | **1748.5 / 1751.3** | 1676.5 | **+4.4 %** |
+| low residency 54.7 % (IQ3_XXS, 17 624 tokens) | **1740.8 / 1730.4 / 1720.2** | 1669.4 / 1668.3 / 1674.5 | **+3.6 %** |
+| the same shape, an earlier 1-pair set on the working chain build | **1748.5 / 1751.3** | 1676.5 | **+4.4 %** |
 | high residency 84.0 % (35B-A3B Q8_0, 5246 tokens) | **3737.2 / 3787.8** | 3732.5 | +0.8 % |
 | decode, low-residency shape, `-n 128` | 49.7 t/s | 49.5 t/s | noise |
 
