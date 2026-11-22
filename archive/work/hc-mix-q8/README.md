@@ -96,3 +96,13 @@ brings it to 3-4:
 * A merged `hc_down_inject` **Q8_0 inject** would take `n_inject_q8` on the down grid — the same path the separate
   Q8_0-inject class takes (covered by `test-backend-ops`' `inject=2` arm), but again only through a synthetic
   shape, not a real file.
+
+## PR #344 — the same op's band kernels, r339
+
+The contributor's follow-up ([`pr344/`](pr344/), `wip/hc-mix-q8-r325/`) is **also folded into block 11** (r339):
+the down dots serve every token of the decode/verify band from one block per weight row, and the up+collapse
+computes each row's gate from the reference's two chunk partials directly instead of emulating eight reference
+blocks.  Bit-identical, `HC_MIX` 33.1 -> 21.6 us/run at `nt 4`, default-on with `GGML_CUDA_HC_DOWN_MT=0` /
+`GGML_CUDA_HC_UP_ROWS=0`.  Its five 32-bit shuffle masks did not compile against any ROCm line here and were
+replaced with the delivery's `ggml_cuda_shfl*` wrappers in the fold — see [`pr344/FOLD-NOTES.md`](pr344/FOLD-NOTES.md).
+Record: `benchmarks/2026-11-21-hc-mix-band-kernels.md`, `INVARIANTS.md` r339, `WORKLOG.md` 261121.018.

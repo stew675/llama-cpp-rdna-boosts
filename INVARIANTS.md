@@ -1736,3 +1736,49 @@ Rules:
 
 Record: `WORKLOG.md` 261121.017; `benchmarks/2026-11-21-ffn-even-split.md`; `scripts/gate-ffn-even-split.sh`
 (`MANIFESTS.md` gate 37); `GREEDY-PURITY.md` §104; `ENVIRONMENT.md` §4.1.
+
+## r339 — the hc mixer's band kernels: a per-token grid is redundant work, and the emulated butterfly is a fixed expression (block 11, contributor PR #344)
+
+**The Q8_0 `GGML_OP_HC_MIX` (`hc_mix_q8`) is a decode/verify-band op (`nt <= 8`), and two of its three kernels
+were re-deriving per token what the band shares.**  `hc_mix_down_dots` ran one block per `(row, token)`, i.e. it
+re-read the whole 3.5 MB `w_down` once per token; `hc_mix_up_collapse_q8` emulated eight reference blocks per
+fused block, holding 16 KB of LDS partials and running a butterfly per `(warp, token, row)` for a sum that has
+only two non-zero terms.  Restructured (`hc_mix_down_dots_mt<NT>`, `hc_mix_up_collapse_q8_rows<NT>`), the op
+reads **33.1 -> 21.6 us/run at `nt 4`** and the output is **bit-identical**.  Both are default-on with the kill
+switches `GGML_CUDA_HC_DOWN_MT=0` / `GGML_CUDA_HC_UP_ROWS=0`.
+
+Rules:
+
+1. **A band op may serve the band from one weight read; the reduction order is what must be preserved, not the
+   grid.**  In the multi-token down kernel the per-token item order, the dp4a dot, the warp butterfly and the
+   fixed-order sum of the 8 warp partials are the per-token kernel's, so `lo`/`inject`/`y_v` are unchanged.  The
+   F32 inject rows deliberately keep one block per `(row, token)`: they read a whole `hc_dim` row (~10x a down
+   row) and a token loop there would set the kernel's tail.
+2. **A completion counter's SCOPE follows what it guards, not its previous allocation.**  The `v = silu(lo/hc)`
+   quantize needs all 32 rows of a q8_1 group; with one block serving every token it can count per GROUP instead
+   of per `(token, group)` -- because each block writes `lo` for every token before it increments, so the 32nd
+   increment implies all NT groups are complete.  `y_v` stays bit-identical, and the per-stream persistent
+   counters still reset in the block that completes the group.
+3. **An emulated reference reduction is a fixed expression, and deriving it is cheaper than running it.**  In
+   the reference (rpb 16, vdr 2, lane `4*g + p`, items `8*warp + g + 64*m`) a row's 10 items fall in **exactly
+   two** 8-item chunks -- one warp's partial each; every other lane contributes its initial `+0.0`, which cannot
+   change a sum.  So the gate is the xor-16/8/4 tree over `g` then the xor 2/1 tree over `p`, per chunk, then
+   their sum, and only the `4x32` gates per token need LDS.  A static_assert pins the geometry (`vdr == 2`,
+   4 lanes/item): a future dense VDR must revisit this kernel rather than silently mis-index it.
+4. **`GGML_CUDA_HC_UP_FUSE` is subordinate to the rows kernel.**  With `HC_UP_ROWS` on (the default) the
+   sub-block count is not read -- the rows kernel is one 512-thread shape -- so `HC_UP_FUSE=2/3` no longer
+   changes the launch.  `HC_UP_FUSE=0` (the two-launch path) is unaffected.  A tuning knob that a newer default
+   shadows must say so where the knob is documented, not just in the code.
+5. **A 32-bit shuffle mask is not a portable mask.**  The submission's five `__shfl*_sync(0xFFFFFFFF, ...)`
+   calls are a HARD build error against HIP's `amd_warp_sync_functions.h` (`sizeof(MaskT) == 8`) on ROCm 10.1,
+   10.2 **and** 7.14 -- the delivery's `ggml_cuda_shfl()`/`ggml_cuda_shfl_xor()` wrappers (64-bit full mask,
+   same lane moves as the DPP-XOR path) are the only sanctioned form.  "Measured on ROCm 10.1" in a submission
+   is a claim about a build; check that the build exists.
+6. **The instrument for a band-op change is the perf table plus the acceptance census, not an end-to-end t/s on
+   a host-expert shape.**  This box has no fully-resident Q8_0-hc qwen4exp config (the only two are 106/130 GB),
+   so `tg128` reads **+2.3 %** against the op's real win; the four-axis `draft-mtp` acceptance is identical to
+   the digit (0.96652 / 0.36678 / 0.63463 / 0.78675 with equal totals and mean lengths) while generation moves
+   +3.7 to +6.3 %.
+
+Record: `WORKLOG.md` 261121.018; `benchmarks/2026-11-21-hc-mix-band-kernels.md`; `ENVIRONMENT.md` §7.7;
+`archive/work/hc-mix-q8/pr344/` (the submission verbatim, with the mask fix marked).

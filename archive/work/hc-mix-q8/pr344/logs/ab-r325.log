@@ -1,0 +1,46 @@
+# server A/B: stock r325 (st), patched (pr), patched + GGML_CUDA_HC_DOWN_MT=0 GGML_CUDA_HC_UP_ROWS=0 (pr0); UD-IQ4_XS, pool settings, -c 65536
+### prhcab325 7:24 PM stock 78fecc486 PR ab226630f
+=== st 7:24 PM
+   smallpf: 8 prompts, 3092 tok in 153622 ms = 20.1 t/s (19202.8 ms each)
+   first prefill 31537 tok in 89.5 s = 352.4 t/s
+   greedy: sha 83f0d1eea4a3 60.6 t/s draft 274/375
+   pdecs fresh: 512 tok, windows of 64 (t/s): 60 68 59 67 66 84 72 | first 64 tok 1.16 s | server 65.9 t/s | sha 2de8befebfb0
+   midpf: 4363 tok prompts, prompt 288 t/s, decode 77.2 t/s, wall 134.7 s, sha 3c5bb60f06cd
+   prefill 31537 tok in 61.7 s = 511.2 t/s
+   depth prhcab325-st n=650: prompt 30297 tok, gen 256, sha 30660390ac51
+   greedy: sha 83f0d1eea4a3 76.8 t/s draft 274/375
+   faults 0
+=== pr 7:42 PM
+   smallpf: 8 prompts, 3092 tok in 154418 ms = 20.0 t/s (19302.2 ms each)
+   first prefill 31537 tok in 90.1 s = 349.9 t/s
+   greedy: sha 83f0d1eea4a3 58.4 t/s draft 274/375
+   pdecs fresh: 512 tok, windows of 64 (t/s): 62 74 65 73 70 86 73 | first 64 tok 1.12 s | server 69.5 t/s | sha 2de8befebfb0
+   midpf: 4363 tok prompts, prompt 293 t/s, decode 79.5 t/s, wall 132.2 s, sha 3c5bb60f06cd
+   prefill 31537 tok in 60.5 s = 521.2 t/s
+   depth prhcab325-pr n=650: prompt 30297 tok, gen 256, sha 30660390ac51
+   greedy: sha 83f0d1eea4a3 83.0 t/s draft 274/375
+   faults 0
+=== pr0 8:00 PM
+   smallpf: 8 prompts, 3092 tok in 153412 ms = 20.2 t/s (19176.5 ms each)
+   first prefill 31537 tok in 89.2 s = 353.4 t/s
+   greedy: sha 83f0d1eea4a3 60.8 t/s draft 274/375
+   pdecs fresh: 512 tok, windows of 64 (t/s): 57 68 58 67 67 84 69 | first 64 tok 1.20 s | server 64.9 t/s | sha 2de8befebfb0
+   midpf: 4363 tok prompts, prompt 290 t/s, decode 77.7 t/s, wall 133.6 s, sha 3c5bb60f06cd
+   prefill 31537 tok in 61.3 s = 514.6 t/s
+   depth prhcab325-pr0 n=650: prompt 30297 tok, gen 256, sha 30660390ac51
+   greedy: sha 83f0d1eea4a3 77.8 t/s draft 274/375
+   faults 0
+### prhcab325 DONE 8:19 PM
+
+## test-backend-ops -o HC_MIX -b ROCm0 (patched build, ROCm 10.1, HIP_VISIBLE_DEVICES=0)
+  30/30 tests passed
+2/2 backends passed
+
+## test-backend-ops perf -o HC_MIX -b ROCm0, us/run (q8_0 / bf16), n_embd=2560 hc=4 hc_lr=320 inject=1
+| n_tokens | stock q8_0 | patched q8_0 | patched, GGML_CUDA_HC_DOWN_MT=0 GGML_CUDA_HC_UP_ROWS=0 | stock bf16 | patched bf16 |
+| 1 | 20.64 | 16.03 | 20.70 | 15.84 | 15.91 |
+| 2 | 23.68 | 18.25 | 23.15 | 18.42 | 18.51 |
+| 3 | 27.45 | 19.50 | 27.22 | 22.26 | 22.01 |
+| 4 | 31.19 | 22.01 | 31.24 | 26.33 | 26.49 |
+| 5 | 35.40 | 24.57 | 35.62 | 30.96 | 31.02 |
+| 8 | 49.27 | 31.24 | 49.40 | 43.41 | 43.55 |

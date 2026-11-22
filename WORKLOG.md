@@ -1,3 +1,97 @@
+## 261121.018 (r339) -- **RELEASE**: contributor PR #344 -- the Q8_0 hc mixer's decode band is served from ONE weight read per row and its emulated reference butterfly becomes a fixed expression (block 11, bit-identical, `HC_MIX` 33.1 -> 21.6 us at `nt 4`)
+
+**`release.json` changed: release `v17-919794500-r338` -> `-r339`, tip `2f0d05010` -> `41a11cf04`, tree
+`3d7017fbb` -> `447ce143e`; base, block count and the release prefix do not move** (17 official blocks + the
+temporary `0300` = 18 default patches, base `919794500`).  **Block 11 is amended** (`ggml/src/ggml-cuda/hc-mix.cu`
+only, +316/-1); blocks 00-10 are byte-identical and blocks 12-16 and `0300` change id only through their parent.
+The optional `0100`/`0101` are re-cut against the new default tree (alone -> `d06460d4c` / `868cedb45`, cumulative
+`1c2af3677`), both apply **strictly**.  `scripts/validate-set.sh` green (18/18 fresh-tarball strict apply, both
+optional artifacts alone + cumulative, Windows portability lint over 515 added files).
+
+### 1. What shipped, and why it is default-on
+
+PR #344 (`@briansp2020`, `wip/hc-mix-q8-r325/`) restructures the two Q8_0 `GGML_OP_HC_MIX` kernels -- the op every
+unsloth UD qwen4exp file takes, i.e. the class r313's PR #326 built:
+
+* **`hc_mix_down_dots_mt<NT>`** runs **one block per weight row for the whole band** (grid `rows x 1` instead of
+  `rows x NT`), so the 3.5 MB `w_down` is read once per call instead of once per token.  Per token the item order,
+  the dp4a dot, the warp butterfly and the fixed-order sum of the 8 warp partials are the per-token kernel's; the
+  F32 inject rows keep one block per `(row, token)` (each reads a whole `hc_dim` row, ~10x a down row, so a token
+  loop there would set the grid's tail); and the `v = silu(lo/hc)` quantize counts **per q8_1 group** instead of
+  per `(token, group)`, which is sound because every block writes `lo` for all NT tokens before it increments --
+  the group's 32nd increment then means all NT groups are complete, so `y_v` is unchanged.
+* **`hc_mix_up_collapse_q8_rows<NT>`** drops the reference-block emulation: in the reference (rpb 16, vdr 2,
+  lane `4*g + p`, items `8*warp + g + 64*m`) a row's 10 items fall in **exactly two** 8-item chunks -- one warp's
+  partial each, every other lane holding only its initial `+0.0` -- so each gate is the xor-16/8/4 tree over `g`,
+  then the xor 2/1 tree over `p`, per chunk, then their sum.  One thread per `(row, p)` preloads the row's 10
+  weight items, dots them per token from a `0.0f` start (the reference's accumulator), does the `g`-levels in
+  registers and the `p`-levels with two lane xors; only the `4x32` gates per token go through LDS.  The collapse
+  and its Q8_1 epilogue are unchanged.
+
+Default-ON per the default-on policy (bit-identical, and the win is the new code), with `GGML_CUDA_HC_DOWN_MT=0` /
+`GGML_CUDA_HC_UP_ROWS=0` as kill switches.  Side effect documented rather than left to be discovered: with
+`HC_UP_ROWS` on, `GGML_CUDA_HC_UP_FUSE` no longer selects the sub-block count (the rows kernel is one 512-thread
+shape); `HC_UP_FUSE=0` (the two launches) is unaffected.
+
+### 2. The submission does not build -- fixed in the fold, not filed
+
+Five calls passed a **32-bit** mask literal (`__shfl_sync(0xFFFFFFFF, prev, 0, 32)` and four
+`__shfl_xor_sync(0xFFFFFFFF, ...)`), which HIP's `hip/amd_detail/amd_warp_sync_functions.h` rejects outright
+(`static_assert(sizeof(MaskT) == 8, "The mask must be a 64-bit integer ...")`).  Reproduced by compiling the
+patched `hc-mix.cu` alone against **ROCm 10.1.0, 10.2.0 and 7.14.1** -- a hard error on every line we ship, so the
+submission's "measured on ROCm 10.1" cannot describe the code as submitted.  The fold uses the delivery's
+`ggml_cuda_shfl()` / `ggml_cuda_shfl_xor()` wrappers (64-bit `GGML_CUDA_FULL_THREAD_MASK`, the same lane moves as
+the DPP-XOR path `warp_reduce_sum()` takes), so the values are unchanged; every number below is with that form.
+Three review notes went into the records instead of into a TODO: the `static_assert(vdr == 2)` makes the file
+uncompilable for any future dense `VDR != 2` (today an unconditional 2); the rows kernel has no `nrows` bound
+guard, safe only under the existing `fuse` predicate (which the PR states); and the LDS gate sum is
+`wa + wb` where the emulation added zeros in warp order -- equal for finite values, and the text identity is the
+proof.
+
+### 3. Verified rather than assumed (gfx1201)
+
+* **Per op** (`test-backend-ops perf -o HC_MIX`, one R9700, base vs patched, same tree): 20.20/22.37/27.04/
+  **33.13**/37.67/51.33 -> 16.65/18.80/19.59/**21.62**/24.34/32.67 us/run at `nt` 1/2/3/4/5/8; `wtype=bf16`
+  unchanged; the both-kill-switches arm reproduces the base column (the win is the code, not the environment);
+  `test-backend-ops -o HC_MIX` **30/30**.
+* **Text byte-identical on every arm that reaches the op** (both builds, interleaved): plain greedy (`431
+  9a72cc49804d`), the `draft-mtp` verify band (`444 455791ba340b`, and with both kill switches off), a 5246-token
+  prose prompt (`489 35d0945cd4e3`), **Q4_K_M's Q8_0 *inject* rows** (`436 d32a66bfd8c2`) -- the branch
+  `test-backend-ops` never covers -- `GGML_CUDA_HC_MIX_PREQ=0` and `GGML_CUDA_HC_UP_FUSE=3` (`431 9a72cc49804d`).
+* **`gate-hc-fusions.sh` on the Q8_0-hc class, run on BOTH builds and on BOTH toolchains: all ten arms read the
+  same sha each time.**  ROCm 10.1 (scratch tree): `chain_chain`/`comb_op`/`cuda_fuse_off` `450 e91d0e8c106e`,
+  `mix_op`/`both_ops` `433 8cd639da2fbf` (= r313's recorded value), `dsv4_pre` `452 5e4258c26236`, `dsv4_post`
+  `448 ecbc57182a59`, `all_ops`/`ops_no_post`/`defaults` `460 2f9c4b5da28b`.  ROCm 10.2 (r338 build
+  `build-rocm-r338` vs the r339 release build): `442 23d3d237af9d` / `439 e50a19238893` / `436 d32a66bfd8c2` /
+  `457 f7439634f50d` / `431 df42686290aa`.  The two rows are different because a generated text is per-toolchain;
+  each row is a base-to-change comparison, which is what the claim needs.
+* **The verify band is numerically the same band**: the four-axis `draft-mtp` protocol (`n_max 7`, so the verify
+  width sweeps 2-8) on the class that builds the op reads an acceptance census **identical to the digit** --
+  0.96652 (433/448) / 0.36678 (647/1764) / 0.63463 (733/1155) / 0.78675 (760/966) on K/R/P/C, with equal totals
+  and mean lengths (7.77 / 3.57 / 5.44 / 6.51).
+* **Rate**: `tg128` **49.73/49.75 -> 50.89/50.96 t/s (+2.3 %)** on 3-device UD-Q4_K_XL (host-expert dominated, so
+  a lower bound); generation on the four axes **+3.7 / +6.2 / +4.7 / +6.3 %**.  `llama-batched-bench -npl 1,4,8`
+  on the dense 27B (a graph that never builds the op) is unchanged; the same instrument on the host-expert shape
+  is unusable (the same binary scored 175/162/106 t/s at B=8 across three loads -- residency, not kernels), which
+  is why the per-op table is the instrument of record.
+* **Release anchors unmoved**: coherence 4B Q8_0 3-dev `-sm tensor` **`100 chars 1c5d32ac537d`** (the value at
+  every rung since r327) and the 2-device Flash-Next GSQ IQ3_S prose arm **`653 chars c420dfe04c42`** (r338's
+  recorded value).  `gate-prefill-logits.sh` **-0.000000 / 100.000 %** against the r338-recorded base (built on
+  the **10.1** line, which the base was recorded on: `~/bin/build-llama-rocm-101`, `BUILD_DIR=build-rocm-101`;
+  the release `build-rocm` is 10.2, and the gate refuses a cross-toolchain compare by design).  No GPU fault in
+  the kernel journal or any arm's log.
+
+### 4. Not claimed
+
+NVIDIA/CUDA, Windows, gfx1151 and gfx1100 are untested (as submitted) -- the code is backend-neutral after the
+mask fix but a build is not a measurement.  The merged `hc_*_down_inject` (post-#31028) layout with Q8_0 hc
+weights still has no file here (r313's accepted limitation stands).  The BF16 hc path (`hc_mix_bf16_*`) is
+untouched, so nothing is claimed for it beyond "its per-op number did not move".
+
+Records: `benchmarks/2026-11-21-hc-mix-band-kernels.md`; `INVARIANTS.md` r339; `ENVIRONMENT.md` §7.7 (two new
+kill switches + the `HC_UP_FUSE` interaction); `patches/README.md` block 11; `archive/work/hc-mix-q8/pr344/` (the
+submission verbatim, plus `FOLD-NOTES.md` with the mask defect and the fix).
+
 ## 261121.017 (r338) -- **RELEASE**: contributor PR #342 ships as an **OPT-IN** `-of tp-ffn-even` even FFN split in **block 09**, and `--optional-features`/`-of` becomes the discoverable spelling for an env-only switch -- the delivery default stays bit-identical
 
 **`release.json` changed: release `v17-919794500-r337` -> `-r338`, tip `ccd813376` -> `2f0d05010`, tree

@@ -1,4 +1,4 @@
-From 927dcff8600615cc965fb6e196efdb550e348a67 Mon Sep 17 00:00:00 2001
+From 00475a62b0186860f1a1e2869175cabd3d25d358 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/17] rdna-boosts: block 11: qwen4exp (model,
@@ -113,6 +113,46 @@ r243 (contributor PR #289, bsp2020): the host PLE gather fans out over --threads
   is 16, so it is 65 536 rows / 41.9 MB, and 98 304 / 62.9 MB at `-ub 6144`), and their field-shape deltas do not
   reproduce here; their `-ub 4096` numbers do, and that is the delivery's own shape.  Record:
   archive/work/ple-gather/, WORKLOG 261109.008, INVARIANTS r243, ENVIRONMENT.md.
+
+Q8_0 hc MIXER decode band (r339, contributor PR #344, @briansp2020): the down dots serve every token
+of the band from ONE block per row, and the up+collapse computes each row's gate directly instead of
+emulating the reference's eight blocks.  Both are ON by default (a bit-identical decode win).
+
+hc_mix_down_dots_mt<NT> runs one block per weight row for the whole band (grid rows x 1 instead of
+rows x NT), so the 3.5 MB w_down is read once per call instead of once per token.  Per token the
+thread item order, the dp4a dot, the warp butterfly and the fixed-order sum of the 8 warp partials are
+the per-token kernel's; the F32 inject rows keep one block per (row, token) (each reads a whole hc_dim
+row, ~10x a down row, so a token loop there would set the grid's tail); and the v = silu(lo/hc)
+quantize takes one completion counter per q8_1 GROUP instead of one per (token, group) -- every block
+writes lo for all NT tokens before it increments, so the group's 32nd increment means all NT groups are
+complete, so y_v is bit-identical.
+
+hc_mix_up_collapse_q8_rows<NT> drops the reference-block emulation from hc_mix_up_collapse_q8: in the
+reference (rpb 16, vdr 2, lane = 4*g + p, items it = 8*warp + g + 64*m) a row's 10 items fall in
+exactly two 8-item chunks -- each one warp's partial, every other lane and warp holding only its
+initial +0.0, which does not change the sum -- so the gate is the xor-16/8/4 tree over g and the xor
+2/1 tree over p, per chunk, then their sum.  One thread per (row, p) preloads the row's 10 weight
+items, dots them per token from a 0.0f start value (the reference's accumulator), does the g-levels in
+registers and the p-levels with two lane xors; only the 4x32 gates per token go through LDS, and the
+collapse and its Q8_1 epilogue are unchanged.  GGML_CUDA_HC_DOWN_MT=0 / GGML_CUDA_HC_UP_ROWS=0 restore
+the per-token down grid and the S-sub-block emulation.  With HC_UP_ROWS on, GGML_CUDA_HC_UP_FUSE no
+longer selects the sub-block count (the rows kernel is one 512-thread shape); HC_UP_FUSE=0 (the two
+launches) is unaffected.
+
+The submission did not build against ROCm 10.1, 10.2 or 7.14: its five shuffle calls passed a 32-bit
+0xFFFFFFFF mask, which HIP's amd_warp_sync_functions.h rejects with a static_assert ("the mask must be
+a 64-bit integer").  They use ggml_cuda_shfl() / ggml_cuda_shfl_xor() here -- the same lane moves, so
+the same values.  Verified bit-identical to r338 on every arm that reaches the op: plain greedy, the
+MTP verify band, a 5246-token prompt, Q4_K_M (the Q8_0 inject rows, which test-backend-ops does not
+cover), HC_MIX_PREQ=0, HC_UP_FUSE=3 and both kill switches; all ten gate-hc-fusions.sh arms read the
+same sha on both builds (Q8_0-hc class, 3-device -sm tensor); the four-axis draft-mtp protocol reads
+the acceptance census identical to the digit (0.96652 / 0.36678 / 0.63463 / 0.78675, same totals and
+mean lengths) with generation +3.7 / +6.2 / +4.7 / +6.3 %.  Per op (HC_MIX, nt 1/2/3/4/5/8):
+20.2/22.4/27.0/33.1/37.7/51.3 -> 16.7/18.8/19.6/21.6/24.3/32.7 us/run; tg128 +2.3 % on the 3-device
+host-expert shape (the host tier dilutes it).  BF16 hc weights are untouched (they use hc_mix_bf16_*).
+Measured: benchmarks/2026-11-21-hc-mix-band-kernels.md.
+
+Co-authored-by: brian <bsp2020@gmail.com>
 ---
  common/arg.cpp                           |    3 +-
  ggml/include/ggml-rpc.h                  |    7 +-
@@ -130,7 +170,7 @@ r243 (contributor PR #289, bsp2020): the host PLE gather fans out over --threads
  ggml/src/ggml-cuda/fattn-qsa3.cu         |  774 +++++++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |  166 +-
  ggml/src/ggml-cuda/ggml-cuda.cu          |  234 ++
- ggml/src/ggml-cuda/hc-mix.cu             | 1865 ++++++++++++++++
+ ggml/src/ggml-cuda/hc-mix.cu             | 2180 +++++++++++++++++++
  ggml/src/ggml-cuda/hc-mix.cuh            |    8 +
  ggml/src/ggml-cuda/hyperconn.cu          | 1195 ++++++++++
  ggml/src/ggml-cuda/hyperconn.cuh         |   77 +
@@ -166,7 +206,7 @@ r243 (contributor PR #289, bsp2020): the host PLE gather fans out over --threads
  tests/test-backend-ops.cpp               |  503 +++++
  tests/test-lazy-reader.cpp               |  264 +++
  tests/test-llama-archs.cpp               |  146 +-
- 52 files changed, 13556 insertions(+), 508 deletions(-)
+ 52 files changed, 13871 insertions(+), 508 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
@@ -3559,10 +3599,10 @@ index 3d7ab187c..1804a7207 100644
          case GGML_OP_OPT_STEP_ADAMW:
 diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
 new file mode 100644
-index 000000000..d824b9c69
+index 000000000..b63986114
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/hc-mix.cu
-@@ -0,0 +1,1865 @@
+@@ -0,0 +1,2180 @@
 +// Fused hyper-connection mixer tail for qwen4exp (decode/verify band).
 +//
 +// Replaces the unfused decode chain (SCALE, SILU, MUL_MAT up, SIGMOID, MUL,
@@ -3945,6 +3985,147 @@ index 000000000..d824b9c69
 +        // this block made the group's 32nd and last increment: reset the counter for the next launch, so a
 +        // persistent (zero-once) counter buffer needs no memset per call
 +        done[t*blocks_up + kb] = 0;
++    }
++}
++
++// hc_mix_down_dots with every token of the band in one block: grid (rows, 1) instead of
++// (rows, NT), so each weight row is read once per call instead of once per token.  Per token the thread item
++// order, the dp4a dot (vec_dot_q8_0_q8_1's v/u loads and impl), the warp butterfly and the fixed-order sum of
++// the 8 warp partials are the per-token kernel's, so lo / inject / y_v are bit-identical to it.  The done
++// counters stay per (token, q8 group); this block increments the counter of every token and finishes the
++// groups it completes.  GGML_CUDA_HC_DOWN_MT=0: the per-token grid.
++template <int NT>
++static __global__ void hc_mix_down_dots_mt(
++        const block_q8_0 * w_down, float * lo, const int nrows_down,
++        const block_q8_0 * w_inject, float * inject, const int nrows_inject,
++        const block_q8_1 * y, const int blocks_per_row,
++        const int64_t y_stride_t, const int64_t lo_stride_t, const int64_t inject_stride_t,
++        block_q8_1 * y_v, const int blocks_up, const float inv_hc, unsigned int * done,
++        const float * xn, const float * w_inject_f32, const int nrows_inject_f32, const int ncols2, const int64_t xn_stride_t) {
++    // the F32 inject rows keep one block per (row, token): each reads a whole hc_dim row (~10x a down row), so a
++    // token loop there would set the grid's tail; they are the first nrows_inject_f32*NT blocks
++    const int row = (int) blockIdx.x - nrows_inject_f32*NT;
++    const int tid = 32*threadIdx.y + threadIdx.x;
++    if (row < 0) {
++        // the per-token kernel's F32 inject block verbatim
++        const int r = (int) blockIdx.x / NT;
++        const int t = (int) blockIdx.x % NT;
++        const float2 * x2 = (const float2 *) (xn + (int64_t) t*xn_stride_t);
++        const float2 * w2 = (const float2 *) (w_inject_f32 + (int64_t) r*2*ncols2);
++        float sumf = 0.0f;
++        for (int col2 = tid; col2 < ncols2; col2 += 256) {
++            const float2 tmpx = x2[col2];
++            const float2 tmpw = w2[col2];
++            sumf += tmpx.x*tmpw.x;
++            sumf += tmpx.y*tmpw.y;
++        }
++        sumf = warp_reduce_sum<32>(sumf);
++        __shared__ float buf[32];
++        if (tid < 32) {
++            buf[tid] = 0.0f;
++        }
++        __syncthreads();
++        buf[tid/32] = sumf;
++        __syncthreads();
++        if (tid < 32) {
++            sumf = buf[tid];
++            sumf = warp_reduce_sum<32>(sumf);
++            if (tid == 0) {
++                inject[(int64_t) t*inject_stride_t + r] = sumf * inv_hc;
++            }
++        }
++        return;
++    }
++    const bool is_inject = row >= nrows_down;
++    const int r = is_inject ? row - nrows_down : row;
++    const block_q8_0 * w = (is_inject ? w_inject : w_down) + (int64_t) r*blocks_per_row;
++
++    constexpr int qi  = QI8_0;             // 8
++    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
++    const int n_groups = 8*32 / (qi/vdr);
++    const int kqs = vdr * (tid % (qi/vdr));
++
++    float acc[NT];
++#pragma unroll
++    for (int t = 0; t < NT; ++t) {
++        acc[t] = 0.0f;
++    }
++    for (int it = tid / (qi/vdr); it < blocks_per_row; it += n_groups) {
++        const block_q8_0 * bq8_0 = w + it;
++        int v[vdr];
++#pragma unroll
++        for (int i = 0; i < vdr; ++i) {
++            v[i] = get_int_b2(bq8_0->qs, kqs + i);
++        }
++        const float d0 = bq8_0->d;
++#pragma unroll
++        for (int t = 0; t < NT; ++t) {
++            const block_q8_1 * bq8_1 = y + (int64_t) t*y_stride_t + it;
++            int u[vdr];
++#pragma unroll
++            for (int i = 0; i < vdr; ++i) {
++                u[i] = get_int_b4(bq8_1->qs, kqs + i);
++            }
++            acc[t] += vec_dot_q8_0_q8_1_impl<float, vdr>(v, u, d0, __low2half(bq8_1->ds));
++        }
++    }
++
++    __shared__ float tmp_shared[7][NT];
++#pragma unroll
++    for (int t = 0; t < NT; ++t) {
++        acc[t] = warp_reduce_sum<32>(acc[t]);
++        if (threadIdx.y > 0 && threadIdx.x == 0) {
++            tmp_shared[threadIdx.y-1][t] = acc[t];
++        }
++    }
++    __syncthreads();
++    if (threadIdx.y > 0) {
++        return;
++    }
++#pragma unroll
++    for (int t = 0; t < NT; ++t) {
++#pragma unroll
++        for (int l = 0; l < 7; ++l) {
++            acc[t] += tmp_shared[l][t];
++        }
++        if (threadIdx.x == 0) {
++            float * dst = is_inject ? inject + (int64_t) t*inject_stride_t : lo + (int64_t) t*lo_stride_t;
++            dst[r] = is_inject ? acc[t] * inv_hc : acc[t];
++        }
++    }
++    if (y_v == nullptr || is_inject) {
++        return;
++    }
++    // one counter per q8_1 group (done[kb]), not per (token, group): this block wrote lo[t][r] for every token
++    // above, so the group's 32nd increment means all NT groups are complete; y_v depends on lo only (bit-identical)
++    const int kb   = r / 32;
++    const int lane = threadIdx.x;
++    unsigned int prev = 0;
++    if (lane == 0) {
++        __threadfence();
++        prev = atomicAdd(&done[kb], 1u);
++    }
++    prev = ggml_cuda_shfl(prev, 0, 32);
++    if (prev != 31) {
++        return;
++    }
++    __threadfence();
++#pragma unroll
++    for (int t = 0; t < NT; ++t) {
++        const float x = ggml_cuda_op_silu_single(__builtin_nontemporal_load(&lo[(int64_t) t*lo_stride_t + kb*32 + lane]) * inv_hc);
++        float amax = fabsf(x);
++        float sum  = x;
++        amax = warp_reduce_max<32>(amax);
++        sum  = warp_reduce_sum<32>(sum);
++        const float  d = amax / 127.0f;
++        const int8_t q = amax == 0.0f ? 0 : (int8_t) roundf(x / d);
++        y_v[t*blocks_up + kb].qs[lane] = q;
++        if (lane == 0) {
++            y_v[t*blocks_up + kb].ds = make_half2(d, sum);
++        }
++    }
++    if (lane == 0) {
++        done[kb] = 0;   // reset for the next launch (zero-once persistent counters)
 +    }
 +}
 +
@@ -4496,6 +4677,143 @@ index 000000000..d824b9c69
 +    y->qs[lane] = q;
 +    if (lane == 0) {
 +        y->ds = make_half2(d, d * isum);
++    }
++}
++
++// hc_mix_up_collapse_q8 without the reference-block emulation.  In the reference (the mmvq rpb=16
++// band kernel, vdr 2, 8 warps, items it = 8*warp + g + 64*m, lane = 4*g + p) the 10 items of row i (it = 10*i + k)
++// fall in exactly two 8-item chunks, each one warp's partial: chunk a = (10*i)/8 holds k < 8-o at g = o+k, chunk
++// a+1 holds the rest at g = k-(8-o), with o = (10*i)%8.  Every other lane contributes the +0.0 its acc starts from,
++// so a chunk's warp sum is the butterfly (xor 16, 8, 4 over g, then 2, 1 over p) with zero leaves, and the gate is
++// the sum of the two chunk partials (the other warps add +0.0; IEEE addition is commutative, so the warp order of the
++// two does not matter).  Here one thread holds one (row, phase p): its 10 weight items preloaded, 10 dots per token
++// as leaves 0.0f + dot, the g-levels of the butterfly in registers and the p-levels by two lane xors among the 4
++// lanes of the row.  Grid n_embd/32 x 512 threads: warp = (stream c, column octet), lane = 4*column + p.  The
++// collapse and its Q8_1 epilogue are hc_mix_up_collapse_q8's.  GGML_CUDA_HC_UP_ROWS=0: hc_mix_up_collapse_q8.
++template <int O>
++static __device__ __forceinline__ void hc_rows_chunks(const float (&d)[10], float & wa, float & wb) {
++    // chunk a: g = O..7 <- k = g-O; chunk b: g = 0..O+1 <- k = g+8-O; absent leaves are +0.0
++    float la[8], lb[8];
++#pragma unroll
++    for (int g = 0; g < 8; ++g) {
++        la[g] = g >= O ? d[g - O] : 0.0f;
++        lb[g] = g + 8 - O < 10 ? d[g + 8 - O] : 0.0f;
++    }
++    wa = ((la[0] + la[4]) + (la[2] + la[6])) + ((la[1] + la[5]) + (la[3] + la[7]));
++    wb = ((lb[0] + lb[4]) + (lb[2] + lb[6])) + ((lb[1] + lb[5]) + (lb[3] + lb[7]));
++}
++
++template <int NT>
++static __global__ void __launch_bounds__(512, 1) hc_mix_up_collapse_q8_rows(
++        const block_q8_1 * y_pre, const block_q8_0 * w, const float * xn, float * dst,
++        const int n_embd, const int hc, const float inv_hc,
++        const int64_t xn_stride_t, const int64_t dst_stride_t, block_q8_1 * q8, const int64_t q8_stride_t) {
++    constexpr int BPR = 10;
++    constexpr int HC  = 4;
++    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
++    static_assert(vdr == 2 && QI8_0/vdr == 4, "the chunk geometry assumes 4 lanes per item (vdr 2)");
++    extern __shared__ block_q8_1 y_s[];   // [NT][BPR]
++    __shared__ float gate_s[NT][HC][32];
++    const int lane = threadIdx.x;
++    const int c    = threadIdx.y / 4;
++    const int col  = 8*(threadIdx.y % 4) + lane/4;
++    const int p    = lane % 4;
++    const int kqs  = vdr*p;
++    const int row  = c*n_embd + 32*blockIdx.x + col;
++
++    int   wq[BPR][vdr];
++    float wd[BPR];
++    const block_q8_0 * wr = w + (int64_t) row*BPR;
++#pragma unroll
++    for (int k = 0; k < BPR; ++k) {
++#pragma unroll
++        for (int j = 0; j < vdr; ++j) {
++            wq[k][j] = get_int_b2(wr[k].qs, kqs + j);
++        }
++        wd[k] = wr[k].d;
++    }
++    {
++        const int * src = (const int *) y_pre;
++        int * dstw = (int *) y_s;
++        constexpr int nw = NT*BPR*sizeof(block_q8_1)/sizeof(int);
++        for (int k = 32*threadIdx.y + lane; k < nw; k += 32*16) {
++            dstw[k] = src[k];
++        }
++    }
++    __syncthreads();
++
++    const int o = (10*(row % 16)) % 8;
++#pragma unroll
++    for (int t = 0; t < NT; ++t) {
++        float d[BPR];
++#pragma unroll
++        for (int k = 0; k < BPR; ++k) {
++            const block_q8_1 * yb = &y_s[t*BPR + k];
++            int u[vdr];
++#pragma unroll
++            for (int j = 0; j < vdr; ++j) {
++                u[j] = get_int_b4(yb->qs, kqs + j);
++            }
++            float acc = 0.0f;
++            acc += vec_dot_q8_0_q8_1_impl<float, vdr>(wq[k], u, wd[k], __low2half(yb->ds));
++            d[k] = acc;
++        }
++        float wa, wb;
++        switch (o) {
++            case 0:  hc_rows_chunks<0>(d, wa, wb); break;
++            case 2:  hc_rows_chunks<2>(d, wa, wb); break;
++            case 4:  hc_rows_chunks<4>(d, wa, wb); break;
++            default: hc_rows_chunks<6>(d, wa, wb); break;
++        }
++        wa += ggml_cuda_shfl_xor(wa, 2, 32);
++        wb += ggml_cuda_shfl_xor(wb, 2, 32);
++        wa += ggml_cuda_shfl_xor(wa, 1, 32);
++        wb += ggml_cuda_shfl_xor(wb, 1, 32);
++        if (p == 0) {
++            gate_s[t][c][col] = wa + wb;
++        }
++    }
++    __syncthreads();
++    if (threadIdx.y >= NT) {
++        return;
++    }
++    const int t = threadIdx.y;
++    const int j = 32*blockIdx.x + lane;
++    const float * xn_t = xn + (int64_t) t*xn_stride_t;
++    float * dst_t = dst + (int64_t) t*dst_stride_t;
++    float gate[HC];
++#pragma unroll
++    for (int cc = 0; cc < HC; ++cc) {
++        gate[cc] = gate_s[t][cc][lane];
++    }
++    // hc_mix_up_collapse_q8's collapse and Q8_1 epilogue verbatim
++    float xi;
++    {
++#pragma clang fp contract(off)
++        float pp[8];
++        for (int cc = 0; cc < hc; ++cc) {
++            const float g = 1.0f / (1.0f + expf(-gate[cc]));
++            pp[cc] = xn_t[cc*n_embd + j] * g;
++        }
++        float sum = pp[0];
++        for (int cc = 1; cc < hc; ++cc) {
++            sum = sum + pp[cc];
++        }
++        xi = sum * inv_hc;
++    }
++    dst_t[j] = xi;
++    if (q8 == nullptr) {
++        return;
++    }
++    float amax = fabsf(xi);
++    amax = warp_reduce_max<QK8_1>(amax);
++    const float  dd = amax / 127.0f;
++    const int8_t q  = amax == 0.0f ? 0 : roundf(xi / dd);
++    const int  isum = warp_reduce_sum<QK8_1>((int) q);
++    block_q8_1 * y = q8 + (int64_t) t*q8_stride_t + j/QK8_1;
++    y->qs[lane] = q;
++    if (lane == 0) {
++        y->ds = make_half2(dd, dd * isum);
 +    }
 +}
 +
@@ -5162,7 +5480,28 @@ index 000000000..d824b9c69
 +            done = done_alloc.get();
 +        }
 +    }
-+    {
++    static const bool down_mt = [] { const char * e = getenv("GGML_CUDA_HC_DOWN_MT"); return !e || std::atoi(e); }();
++    if (down_mt && n_tokens >= 1 && n_tokens <= 8) {
++        const dim3 block_nums(hc_lr + n_inject_q8 + (inj_f32_down ? hc*n_tokens : 0), 1);
++        const ggml_cuda_kernel_launch_params launch_params = {block_nums, dim3(32, 8), 0, stream};
++#define HC_DOWN_MT(NT) ggml_cuda_kernel_launch(hc_mix_down_dots_mt<NT>, launch_params, \
++                (const block_q8_0 *) w_down->data, lo, (int) hc_lr, \
++                n_inject_q8 ? (const block_q8_0 *) w_inject->data : nullptr, inject, n_inject_q8, \
++                y_xn, blocks_down, (int64_t) blocks_down, (int64_t) hc_lr, inject_stride_t, \
++                pre ? y_v : nullptr, blocks_up, 1.0f / (float) hc, done, \
++                (const float *) xn, inj_f32_down ? (const float *) w_inject->data : nullptr, inj_f32_down ? (int) hc : 0, (int) (hc_dim / 2), hc_dim)
++        switch (n_tokens) {
++            case 1: HC_DOWN_MT(1); break;
++            case 2: HC_DOWN_MT(2); break;
++            case 3: HC_DOWN_MT(3); break;
++            case 4: HC_DOWN_MT(4); break;
++            case 5: HC_DOWN_MT(5); break;
++            case 6: HC_DOWN_MT(6); break;
++            case 7: HC_DOWN_MT(7); break;
++            default: HC_DOWN_MT(8); break;
++        }
++#undef HC_DOWN_MT
++    } else {
 +        const dim3 block_nums(hc_lr + n_inject_q8 + (inj_f32_down ? hc : 0), n_tokens);
 +        const dim3 block_dims(32, 8);
 +        const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
@@ -5202,6 +5541,22 @@ index 000000000..d824b9c69
 +            case 2: ggml_cuda_kernel_launch(hc_mix_up_collapse_q8<NT, 2>, ggml_cuda_kernel_launch_params{block_nums, dim3(32, 16), smem, stream}, y_v, (const block_q8_0 *) w_up->data, xn, dst_d, (int) n_embd, (int) hc_dim, hc, 1.0f / (float) hc, hc_dim, mixed_stride_t, q8, q8_stride_t); break; \
 +            default: ggml_cuda_kernel_launch(hc_mix_up_collapse_q8<NT, 1>, ggml_cuda_kernel_launch_params{block_nums, dim3(32, 8), smem, stream}, y_v, (const block_q8_0 *) w_up->data, xn, dst_d, (int) n_embd, (int) hc_dim, hc, 1.0f / (float) hc, hc_dim, mixed_stride_t, q8, q8_stride_t); break; \
 +        } } while (0)
++        static const bool up_rows = [] { const char * e = getenv("GGML_CUDA_HC_UP_ROWS"); return !e || std::atoi(e); }();
++        if (up_rows) {
++            const ggml_cuda_kernel_launch_params lp = {block_nums, dim3(32, 16), smem, stream};
++#define HC_UP_ROWS(NT) ggml_cuda_kernel_launch(hc_mix_up_collapse_q8_rows<NT>, lp, y_v, (const block_q8_0 *) w_up->data, xn, dst_d, (int) n_embd, hc, 1.0f / (float) hc, hc_dim, mixed_stride_t, q8, q8_stride_t)
++            switch (n_tokens) {
++                case 1: HC_UP_ROWS(1); break;
++                case 2: HC_UP_ROWS(2); break;
++                case 3: HC_UP_ROWS(3); break;
++                case 4: HC_UP_ROWS(4); break;
++                case 5: HC_UP_ROWS(5); break;
++                case 6: HC_UP_ROWS(6); break;
++                case 7: HC_UP_ROWS(7); break;
++                default: HC_UP_ROWS(8); break;
++            }
++#undef HC_UP_ROWS
++        } else
 +        switch (n_tokens) {
 +            case 1: HC_UP_FUSE(1); break;
 +            case 2: HC_UP_FUSE(2); break;

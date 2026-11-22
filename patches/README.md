@@ -155,6 +155,36 @@
 > `INVARIANTS.md` r313, `ENVIRONMENT.md` §7.7, `benchmarks/2026-11-18-hc-mix-q8-decode.md`,
 > `archive/work/hc-mix-q8/` (the submission, kept verbatim).
 >
+> **r339: the Q8_0 hc mixer's DECODE BAND is served from one weight read, and its emulated reference butterfly becomes a fixed expression (contributor PR #344, `briansp2020`), a second amendment to block 11.**
+> `hc_mix_down_dots` ran one block per `(row, token)`, so the whole 3.5 MB `w_down` was read once per token of the
+> band; `hc_mix_up_collapse_q8` emulated eight reference blocks per fused block (16 KB of LDS partials, a butterfly
+> per `(warp, token, row)`) for a sum that has only two non-zero terms.  Now: `hc_mix_down_dots_mt<NT>` runs **one
+> block per weight row for the whole band** (grid `rows x 1`), with the per-token item order, dp4a dot, warp
+> butterfly and fixed-order 8-warp sum of the per-token kernel kept verbatim, the F32 inject rows still one block per
+> `(row, token)` (they read a whole `hc_dim` row and would set the tail), and the `v = silu(lo/hc)` quantize counted
+> **per q8_1 group** instead of per `(token, group)` (every block writes `lo` for all NT tokens before it increments,
+> so the 32nd increment means all NT groups are complete — `y_v` unchanged).  And `hc_mix_up_collapse_q8_rows<NT>`:
+> in the reference (rpb 16, vdr 2, lane `4*g + p`, items `8*warp + g + 64*m`) a row's 10 items fall in exactly two
+> 8-item chunks, one warp's partial each, every other lane holding only its initial `+0.0` — so the gate is the
+> xor-16/8/4 tree over `g`, then the xor 2/1 tree over `p`, per chunk, then their sum; one thread per `(row, p)`
+> preloads the row's 10 weight items, dots them per token from a `0.0f` start and does the `g`-levels in registers,
+> with only the `4x32` gates going through LDS (the collapse and its Q8_1 epilogue are unchanged).
+> **Default-on** with `GGML_CUDA_HC_DOWN_MT=0` / `GGML_CUDA_HC_UP_ROWS=0`; note that with the rows kernel on (the
+> default) `GGML_CUDA_HC_UP_FUSE` no longer selects the sub-block count (`HC_UP_FUSE=0`, the two launches, is
+> unaffected).  **Output is bit-identical** on every arm that reaches the op: plain greedy, the MTP verify band (its
+> draft acceptance is identical to the digit on all four axes and with equal totals), a 5246-token prompt,
+> **Q4_K_M's Q8_0 inject rows** (which `test-backend-ops` never covers), `HC_MIX_PREQ=0`, `HC_UP_FUSE=3`, both kill
+> switches, and all ten `gate-hc-fusions.sh` arms (same sha on the base and the patched build).  `HC_MIX`
+> **33.1 -> 21.6 us/run at `nt 4`** (20.2/22.4/27.0/37.7/51.3 -> 16.7/18.8/19.6/24.3/32.7 at 1/2/3/5/8); bf16
+> untouched; `HC_MIX` 30/30.  `tg128` +2.3 % on the (host-expert dominated) 3-device shape, +3.7..+6.3 % generation
+> on the four-axis `draft-mtp` arms.  **The submission did not build**: five `__shfl*_sync(0xFFFFFFFF, …)` calls pass
+> a 32-bit mask, which HIP's `amd_warp_sync_functions.h` rejects (`sizeof(MaskT) == 8`) on ROCm 10.1, 10.2 **and**
+> 7.14 — the fold uses `ggml_cuda_shfl()`/`ggml_cuda_shfl_xor()`, the same lane moves.  Accepted limits as at r313:
+> NVIDIA/Windows/gfx1151/gfx1100 untested, the merged `hc_*_down_inject` layout has no file here, and the BF16 path
+> is untouched.  Record: `WORKLOG.md` 261121.018, `INVARIANTS.md` r339, `ENVIRONMENT.md` §7.7,
+> `benchmarks/2026-11-21-hc-mix-band-kernels.md`, `archive/work/hc-mix-q8/pr344/` (the submission verbatim plus
+> `FOLD-NOTES.md`).
+>
 > **r307: the MoE take-over PROMISE is scoped to its staging pass (GitHub issue #327, `DanoPTT`), an amendment to block 10.**
 > A take-over hook tells the scheduler "do not fill this `input_cpy`, the consumer reads the table out of the arena",
 > and the promise was recorded as a bare **address**.  The scheduler recycles those addresses across graphs and across
