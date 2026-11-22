@@ -1,3 +1,54 @@
+## 261122.031 (no delivery change) -- CRASH REPORT (P0): a qwen4exp abort at a request boundary on the pair, `qwen4exp.cpp:1138`
+
+**No delivery patch changed, no tag.**  A user-facing abort in the shipped block 17, reproduced by the maintainer while
+running `/llm/models/Qwen3.8/Flash-Next/STEW675-IQ4_NL/runme` (that script's own shape: `-c 204800 --parallel 3
+--kv-unified -sm tensor`, 3 x R9700, `q8_0` K/V, `-ub 2048`, `--prefill-decode-arms-mode auto`, the 94 GB STEW675 IQ4_NL
+model fully on the cards).  Log and backtrace: `/llm/models/Qwen3.8/Flash-Next/STEW675-IQ4_NL/server-logs`.
+
+**The abort.**
+
+```
+/home/stew675/llama.cpp/src/models/qwen4exp.cpp:1138: GGML_ASSERT(mctx_idx->get_n_kv() ==
+    inp->mctx->get_attn()->get_n_kv() && "the indexer cache must track the attention cache cell for cell") failed
+```
+
+`ggml_abort` <- `llama_model_qwen4exp::graph::graph` <- `build_arch_graph` <- `build_graph` <-
+`llama_context::process_ubatch` <- `decode` <- `update_slots()`, i.e. on the **prefill arm's** thread.  At the time: slot
+0 decoding, slot 1 prefilling **70 986** tokens, slot 2 prefilling **23 003** tokens; the abort came ~0.4 s after slot 1
+printed `progress = 1.00`, so at the **request boundary** where its sequence was handed to the decode arm.
+
+**The assert is upstream, not ours** (`git log -S` on the message: `6c84c7d5d`, "model: add Qwen3.8-Flash-Next
+(qwen4exp) (#27742)", 2026-08-27, carried in by block 11).  So this configuration violates an invariant the model has
+always had; the pair is what makes it reachable.
+
+**Mechanism (leading hypothesis, with the evidence for it).**  `get_n_kv()` is the PADDED extent the attention views use,
+`max over streams of min(size, max(pad, PAD(used, pad)))`, where `pad` is 256 normally and `LLAMA_KV_N_PAD_PREFILL` =
+**8192** by default on a multi-device split for prompt-sized ubatches.  The two children of `llama_memory_hybrid_idx`
+compute that value **separately and in sequence**, each right after its own `apply_ubatch` (see
+`llama_memory_hybrid_idx_context::apply()`: the attention child applies and computes, then the indexer child applies and
+computes).  Single-context, nothing runs between those two reads.  **With the pair they are two threads on one shared
+cache**, so the decode arm can publish cells in between, and the two values then differ exactly when the movement crosses
+a pad boundary.  That explains the shape of the report: it needs a LARGE prefill (70K of cells puts `used` next to an 8192
+multiple) AND a request boundary (the moment the decode arm gains a sequence and starts applying), which is why it is rare
+and why nothing in the gate set has hit it.  Corroborating details from the log: only one `handshake clean at the
+'handover' boundary` line precedes the abort; parking is declined on this cache (`idle slot parking: not supported by this
+KV cache`), so the park bound is not involved; and both children are built from the SAME `sinfos` and `ubatches`
+(`heads_idx = heads_attn` in `init_batch`), so the inputs are identical and only the timing can differ.
+
+**Discriminator and repro hint.**  The same 3-slot workload with `--prefill-decode-arms-mode off` settles whether the arms
+are required.  `LLAMA_KV_N_PAD_MIN=256 LLAMA_KV_N_PAD_PREFILL=0` shrinks the pad buckets and turns smaller timing
+differences into a visible mismatch, so it should make a repro more likely rather than less.
+
+**Fix direction.**  Derive the indexer's `n_kv` from the attention's for the pair rather than computing it twice: the
+invariant already states they are equal, and `init_batch` already gives the indexer the attention's slot layout, so making
+the value follow the layout removes the disagreement by construction.  If some case legitimately needs them independent,
+hold the arms' quiet window across BOTH children of `apply()` instead.  Either way a gate arm is owed: three slots, two
+prefills in flight and one decode, on a qwen4exp hybrid, pad buckets shrunk, repeated N times.
+
+**Severity.**  An abort, not silent corruption, and **opt-in only** (block 17 is default off and the shipped
+single-context server has no second thread to race), so `v18-919794500-r346` stands.  It is a P0 for the feature and a
+blocker for any default-on decision.  Recorded as `TODO` #373 and campaign `W9`.
+
 ## 261122.030 (no delivery change) -- the premise history behind W8 corrected: prefill multi-slot batching arrived WITH block 16's fair share, and the shortest-prompt droop is default-off tuning, not dead code
 
 **No delivery patch changed, no tag.**  A correction to the framing of `WORKLOG.md` 261122.029 (which described the

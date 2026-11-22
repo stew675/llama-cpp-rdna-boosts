@@ -86,11 +86,12 @@ are open work) and they are written up in one campaign, `wip/prefill-decode-arms
 | **370** | the pair's cell accounting after `POST /slots/N?action=erase`: with three resident prompts the erases release about **one** prompt's cells (used 8174 -> 5446 of 8192), and parking is declined by the co-owner guard so idle cells legitimately stay resident | correctness / accounting (delivery, block 17) | **OPEN** -- decide whether a slot whose saved state is erased should release all its cells, then turn the recorded number into an assertion in `scripts/gate-arms-soak.sh`. Campaign §W7 |
 | **371** | the prefill/decode **speed balance** is untuned: the pair trades -21..-24 % prefill for a decoder that keeps moving, and the worst in-window gap is 95.5 / 86.5 / 60.5 / 32.8 ms on the recorded shapes; the idea is for the prefill arm to **skip one or more submission opportunities** while a decoder is active, so decode runs a burst of uninterrupted steps | tuning (delivery, block 17) | **OPEN** -- a measurement campaign, not a patch: the gap is four to twenty times SMALLER than the prefill arm's own step, so the mechanism must be identified first, and the deliverable is a Pareto curve for K in {0,1,2,4,8} with a **refutation acceptable** (bound stated up front: >= 50 % fewer worst-gap ms for <= 3 pp prefill). Campaign §W6 |
 | **372** | multi-slot prefill batching: with several slots prefilling, does each slot really re-scan the full weight set per chunk, and can a "layer-major" schedule across slots batch them for better prefill throughput? | tuning / architecture (delivery, block 17) | **OPEN** -- the premise needs checking first: `share_prompt_budget()` already puts **every** active prompt into one step and one ubatch is one graph, so co-batchable slots already share the weight pass and the real cost is the **ubatch SPLIT** (which `-ub` moves: 1440 -> 3041 -> 3884 t/s at 512/2048/4096).  First task is a composition census (`LLAMA_KV_DEBUG_CELLS`), then a two-slot aggregate-scaling table.  **Do NOT merge the two arms' layer passes**: that is the shared step the feature exists to remove.  Campaign §W8 |
+| **373** | **P0 (reported 2026-11-22): a qwen4exp ABORT at a request boundary** with 3 concurrent slots on the pair.  `qwen4exp.cpp:1138` `GGML_ASSERT(mctx_idx->get_n_kv() == inp->mctx->get_attn()->get_n_kv())` fired within ~0.4 s of a 70 986-token prompt finishing (slot 0 decoding, slot 2 prefilling 23 003 tokens).  The assert is upstream (#27742), so this configuration violates an invariant the model always had | **P0 / correctness (delivery, block 17)** | **OPEN** -- leading hypothesis is a **co-owner race**: `llama_memory_hybrid_idx_context::apply()` computes the attention child's padded `n_kv` and then the indexer child's, each after its own `apply_ubatch`, and the decode arm can apply in between (so the two disagree once the movement crosses an 8192 pad boundary).  **Discriminator: the same workload with `--prefill-decode-arms-mode off`.**  Fix direction: derive the indexer's `n_kv` from the attention's (the assert's own contract), or hold the quiet window across both children.  Campaign §W9 |
 
 
 ## Handle numbering
 
-**New handles append after the highest issued so far, so the next free handle is `#373` (`#364`-`#372` were issued
+**New handles append after the highest issued so far, so the next free handle is `#374` (`#364`-`#372` were issued
 for the block-17 follow-ups at r346); a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
 subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
 
@@ -399,6 +400,43 @@ work, which is exactly the 300-880 ms stall block 17 was built to delete.
 **Done =** a composition census, an aggregate-scaling table for a two-slot prefill at four ubatches on a dense and a
 host-expert MoE, and either a scheduler change that keeps more slots in the same ubatch (purity green) or a recorded
 conclusion that the `-ub` knob already captures the available gain.  A refutation is a legitimate result.
+
+## 373. P0: a qwen4exp abort at a request boundary on the two-arm server (indexer vs attention padded extent)
+
+**Campaign:** `wip/prefill-decode-arms-followups/` §W9 (evidence, mechanism, fix direction, gate arm).
+**Report:** `/llm/models/Qwen3.8/Flash-Next/STEW675-IQ4_NL/server-logs`.
+
+```
+/home/stew675/llama.cpp/src/models/qwen4exp.cpp:1138: GGML_ASSERT(mctx_idx->get_n_kv() ==
+    inp->mctx->get_attn()->get_n_kv() && "the indexer cache must track the attention cache cell for cell") failed
+```
+
+Shape: `-c 204800 --parallel 3 --kv-unified -sm tensor` on 3 x R9700, `q8_0` K/V, `-ub 2048`, the 94 GB STEW675 IQ4_NL
+model, `--prefill-decode-arms-mode auto`.  Workload: slot 0 decoding, slot 1 prefilling **70 986** tokens, slot 2
+prefilling **23 003**; the abort came ~0.4 s after slot 1 reported `progress = 1.00`, i.e. at the **request boundary**
+where its sequence was handed to the decode arm.  The backtrace is `ggml_abort <- qwen4exp::graph::graph <- ... <-
+update_slots()` on the **prefill arm's** thread.
+
+The assert is **upstream** (#27742), so it is not new in r346: this configuration is violating an invariant the model has
+always had.  `get_n_kv()` is the **padded** extent the views use (256, or `LLAMA_KV_N_PAD_PREFILL` = **8192** by default on
+a multi-device split, for prompt ubatches), and the two children compute it **separately and in sequence**, each after its
+own `apply_ubatch` (see `llama_memory_hybrid_idx_context::apply()`).  With the pair those two reads are **two threads on
+one shared cache**, so the decode arm can publish cells between them; the values then differ exactly when the movement
+crosses a pad boundary, which is why this needs a large prefill and a boundary at the same time.
+
+**Leading hypothesis:** a co-owner race on the two children's `n_kv` computation.  Supporting facts: the abort is on the
+prefill arm while the decode arm is live, one `handshake clean at the 'handover' boundary` line immediately precedes it,
+parking is declined (so the park bound is not involved), and both children are built from the SAME `sinfos`/`ubatches`
+(`heads_idx = heads_attn`), so only timing can differ.  **Discriminator:** the same workload with
+`--prefill-decode-arms-mode off`; a repro can be widened with `LLAMA_KV_N_PAD_MIN=256 LLAMA_KV_N_PAD_PREFILL=0`.
+
+**Fix direction:** derive the indexer's `n_kv` from the attention's for the pair (that is the assert's own contract, and
+`init_batch` already shares the slot layout), or hold the arms' quiet window across both children of `apply()`.  Either
+way a gate arm is owed: 3 slots, two prefills in flight and one decode, on a qwen4exp hybrid, with the pad buckets shrunk
+and repeated N times.  Nothing in the current gate set drives that shape, which is how it reached a user.
+
+**Severity:** an abort, not silent corruption, and **opt-in only** (default off; the single-context server has no second
+thread to race), so `v18-919794500-r346` stands.  It is a P0 for the feature and a blocker for default-on.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

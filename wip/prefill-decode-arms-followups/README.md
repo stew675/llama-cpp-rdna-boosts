@@ -41,6 +41,7 @@ documented "no"; it is also the one the maintainer asked for by name.**
 | **W6** | the **prefill/decode speed balance**: the prefill arm SKIPS turns while a decoder is active | tuning | #371 | medium | none; measure first (§7.1) |
 | **W7** | the pair's **slot erase and cell accounting** | correctness (narrow) | #370 | small | none |
 | **W8** | **multi-slot prefill batching** ("layer-major" across active prefill slots) | tuning / architecture | #372 | medium | read the premise check first (§11.1) |
+| **W9** | **P0: a qwen4exp abort at a request boundary** (`the indexer cache must track the attention cache cell for cell`) with 3 concurrent slots | **correctness (P0)** | #373 | small if the hypothesis holds | none; needs a 70K+40K+decode repro |
 | **G1** | gate debt: three gates still anchored to the retired Flash-Next model | tooling | #369 | small | none |
 
 Ordering suggestion: **G1, W7, W3** (small, close out loose ends) → **W6** (the one the maintainer wants measured) →
@@ -456,6 +457,85 @@ A composition census showing where the rows actually land, an aggregate-scaling 
 ubatches on two model classes, and **either** a scheduler change that keeps more slots in the same ubatch (with purity
 green) **or** a recorded conclusion that the ubatch knob already captures the available gain and no scheduler change is
 owed.  As with W6, **a refutation is a legitimate result**.
+
+---
+
+## 9b. W9 (TODO #373, P0) — a qwen4exp ABORT at a request boundary: the indexer's padded extent and the attention cache's disagree
+
+**Reported by the maintainer 2026-11-22, on the released block 17 (`--prefill-decode-arms-mode auto`).**  Log and
+backtrace: `/llm/models/Qwen3.8/Flash-Next/STEW675-IQ4_NL/server-logs`.
+
+### The crash
+
+```
+/home/stew675/llama.cpp/src/models/qwen4exp.cpp:1138: GGML_ASSERT(mctx_idx->get_n_kv() ==
+    inp->mctx->get_attn()->get_n_kv() && "the indexer cache must track the attention cache cell for cell") failed
+```
+
+Backtrace: `ggml_abort` <- `llama_model_qwen4exp::graph::graph` <- `build_arch_graph` <- `build_graph` <-
+`llama_context::process_ubatch` <- `decode` <- **`server_context_impl::update_slots()`** (the PREFILL arm's thread, not
+the decode arm's).  Shape: `--ctx-size 204800 --parallel 3 --kv-unified`, `-sm tensor` on 3 x R9700, `q8_0` K/V,
+`--ubatch-size 2048`, the 94 GB STEW675 IQ4_NL model, all layers on the GPU, `--prefill-decode-arms-mode auto`.
+Workload at the time: slot 0 decoding, slot 1 prefilling a **70 986**-token prompt, slot 2 prefilling **23 003** tokens.
+The abort came within ~0.4 s of slot 1 printing `progress = 1.00` (its prompt finished and was handed to the decode arm).
+The assertion is **pre-existing**, from upstream #27742 (commit `6c84c7d5d`, 2026-08-27), carried in by block 11: this
+configuration is violating an invariant the model has always demanded, not a new one introduced by the block.
+
+### Why the invariant is worth keeping, and why it is fragile
+
+`get_n_kv()` is the **padded** extent the attention views use:
+`max over streams of min(cache.size(), max(pad, PAD(used, pad)))`, with `pad` = 256 normally and
+`LLAMA_KV_N_PAD_PREFILL` (**8192 by default on a multi-device split**) for prompt-sized ubatches.  The indexer cache must
+mirror the attention cache cell for cell, so the two padded extents must be equal.
+
+They are computed **separately and in sequence**, and each is computed *after that child's own* `apply_ubatch`:
+
+```
+llama_memory_hybrid_idx_context::apply()
+    llama_memory_hybrid_context::apply();   // attention child: apply_ubatch(), then n_kv = get_n_kv(...)
+    ctx_idx->apply();                       // indexer child:   apply_ubatch(), then n_kv = get_n_kv(...)
+```
+
+In a single-context server nothing runs between those two lines, so the two reads see one state.  **With the pair they
+are two threads on one shared cache**: the decode arm may `apply_ubatch` between the attention child's `n_kv` read and
+the indexer child's, which moves the used-cell count (the co-owner allocator publishes the decode arm's cells into the
+same caches).  The two padded extents then differ whenever the movement crosses a **pad boundary** (a multiple of 8192
+for a prompt ubatch), which is why this is rare and why it needs a large prefill plus a request boundary: the boundary is
+when the decode arm gains a sequence and starts applying, and 70K of cells is what puts `used` next to an 8192 multiple.
+
+**Leading hypothesis, stated as such:** a **co-owner race on the two children's `n_kv` computation**, not a stale indexer
+pool and not the pad formula itself.  Two facts support it and one would settle it:
+
+* the abort is on the prefill arm's thread while the decode arm is live, and only ONE
+  `allocation handshake clean at the 'handover' boundary` line precedes it (the boundary that gave the decode arm its
+  new sequence, immediately before the crash);
+* parking is declined on this cache (`idle slot parking: not supported by this KV cache`), so the park bound in
+  `get_n_kv()` is not involved, and both children are constructed from the SAME `sinfos` and `ubatches`
+  (`heads_idx = heads_attn` in `init_batch`), so the *inputs* are identical and only the *timing* can differ;
+* **the discriminator:** the same 3-slot workload with `--prefill-decode-arms-mode off`.  If it stops aborting, the race
+  is the cause.  A repro can also be made *more* likely by shrinking the pad buckets
+  (`LLAMA_KV_N_PAD_MIN=256 LLAMA_KV_N_PAD_PREFILL=0`), which turns smaller timing differences into a visible mismatch.
+
+### Fix direction (preferred first)
+
+1. **Derive the indexer's `n_kv` from the attention's** for the pair instead of computing it twice.  The invariant already
+   *says* they are equal, and `init_batch` already gives the indexer the attention's slot layout (`heads_idx = heads_attn`),
+   so making the value follow the layout removes the possibility of disagreement by construction.  The read-side already
+   behaves that way elsewhere (`qsa_n_kv_window()` reads `get_idx()->get_n_kv()`).
+2. If (1) turns out to be wrong for a legitimate reason (a real case where the two caches differ), then the quiet window
+   must cover the whole `llama_memory_hybrid_idx_context::apply()`, i.e. the arms' handshake held across both children,
+   and the assert becomes a check inside that window.
+3. Either way, a **gate arm**: 3 slots, one long prefill and one medium prefill and one decode on a qwen4exp hybrid, with
+   the pad buckets shrunk so the window is wide, repeated N times.  Nothing in the current gate set drives three slots
+   through a boundary with two prefills in flight, which is why this reached a user.
+
+### Severity and scope
+
+It is an **abort, not silent corruption**: the server dies instead of emitting wrong text, which is the benign failure
+mode.  It affects **opt-in users only** (block 17 is default off, and the shipped single-context server has no second
+thread to race), so it does not invalidate `v18-919794500-r346`.  It **is** a P0 for the feature and a blocker for any
+default-on decision, and it is the strongest argument yet for a soak gate that drives a real mixed workload rather than
+two slots.
 
 ---
 
