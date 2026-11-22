@@ -10,8 +10,15 @@ instrument's -14.1 % — pass 5 §6 reads that honestly).
 
 Three things differ from the plan below and are recorded in pass 5 §1: a `wait_handover_taken()` at the top of
 `pre_decode()` as the second line of defence for the ordering rule, `arm_release()` for a cancel/abort that lands on
-a slot the decode arm owns, and `finish_returned_slots()` clearing the slot's prompt on the return (so the arms path
-does **not** reuse a slot's prefix across requests — pass 5 §7).
+a slot the decode arm owns, and `finish_returned_slots()` owning the response's lifecycle on the main loop.
+
+**AMENDED 2026-11-22 (pass 7): the return now does the REVERSE HANDOVER.**  Pass 5's cut cleared the slot's prompt
+and let the decode arm free the shared cells, which cost a full re-prefill on the next request (measured 685 ms
+against 33 ms).  The maintainer's direction is that prefix reuse is essential, so the return takes the recurrent
+state **back** to the prefill arm and keeps the prompt (see `RESULTS-2026-11-22.md` pass 7 for the code points, the
+two oracles and the numbers).  §2's "the decode arm calls `llama_memory_seq_rm(...)` — the shared cells are freed
+once, here" is superseded: nothing is freed on a normal stop or a cancel, and only a failed take or a failed decode
+step drops the sequence.
 
 Original scope note (2026-11-22, against `tools/server/server-context.cpp` as it stood on `wip/prefill-overlap`):
 

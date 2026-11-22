@@ -1,3 +1,46 @@
+## 261122.012 (r343, no delivery change) -- wip/prefill-decode-arms pass 7: the REVERSE HANDOVER restores prefix reuse (685 -> 33 ms per appended turn, single-context parity) and a reused prefix moves no token
+
+**No delivery patch changed; nothing in `patches/`, no tag.**  The one behavioural regression pass 5 §7 recorded
+(the arms path re-prefilled from scratch after every request) is fixed at the maintainer's direction ("prefix reuse
+is absolutely essential").  `~/llama.cpp` `16e942d2f`, **1 file** (+94/-29, `tools/server/server-context.cpp`) --
+no library change: `llama_memory_seq_state_take(dst, src, id)` was already symmetric.
+
+* **the change**: the decode arm no longer frees a slot's shared cells when generation ends (or when the main loop
+  takes the slot back on a cancel); the main thread runs **`llama_memory_seq_state_take(mem_tgt, mem_dec, id)`** --
+  the mirror of the forward take, under the same `arms_quiet` bracket that guards T0's allocation handshake.  It runs
+  on the MAIN thread because its destination is the prefill arm's memory (it cannot race this arm's prepares) while
+  `arms_quiet` keeps the decode arm out of `llama_process()` (the take reads that arm's cell map).  The prompt is then
+  KEPT (`release()` keeps it for a normal task, as the single-context server does), so the sequence is resident and
+  the reuse path (`get_common_prefix`, `prompt.get_reuse`/checkpoints) works.  A **failed** take drops the sequence
+  (`prompt_clear()`): an attention half with no recurrent half is an inconsistent state and a forced re-prefill is the
+  safe failure; a dense model has nothing to move, so `false` there is not a failure.  One new flag (`dec_state`, under
+  `m_arms`) carries "the state is on the decode arm"; `arms_quiesce()`/`arms_resume()` are the factored-out bracket.
+* **`gate-ckpt-reuse.sh` on the arms path: SKIP -> PASS** (Qwen3.5-4B, `cache_prompt:true`, four growing turns):
+  **3** checkpoint restores and prompt times **724.7 / 33.9 / 32.6 / 32.9 ms** against the pass-6 arms path's
+  **729.4 / 684.2 / 686.6 / 686.3 ms** and the single-context control's 732.6 / 33.4 / 33.0 / 33.5 ms.  Text `==` on
+  every request, no GPU fault: **~20x per appended turn -> 1.0x**.
+* **new oracle `arms/gate-server-reuse.sh`** (the campaign's reuse gate): a reused prefix must be byte-identical to an
+  arm that never reuses (`cache_prompt:false`), on 35B-A3B at the product shape.  **PASS**, non-vacuously:
+  A (cold) `459865c93d55cbaf` both arms; **B (extends A) `3c4688721469b81f` in both arms, 420.5 ms with
+  `cache_n=395` against 851.4 ms with none**; C (forks BELOW A) `8a416c7447557094` both arms -- C re-prefills even
+  cached, which is the reference's hybrid behaviour without a checkpoint to roll back to.
+* **the multi-agent case** (`CONCURRENT=1`: two conversations, one per slot, both driven in parallel): **PASS** --
+  `cache_n=395` / `1476` on the two resumed turns, **424.7 vs 1352.3 ms** and **581.0 vs 1997.8 ms** (3.2x / 3.4x),
+  all four replies byte-identical, and the concurrent cold round reproduces the tier-1 hashes
+  (`459865c93d55cbaf` / `7dc20b0ce0bac255`).
+* **tier 1 unchanged** (the change's own risk): `ref` vs `arms`, cold (`runs/server-oracle-r343e/`) and over 3 warm
+  pairs (`-r343d/`), both slots `459865c93d55cbaf` / `7dc20b0ce0bac255`, `HANDSHAKE the pair shares one allocation
+  owner`, every boundary clean.
+* **the other gates re-run**: fairness (its absolute ITL criterion) **PASS** -- ITL max 30 ms, admission, 2.2x fair
+  share, text identical; duty **inert** (75 -> 73 tokens, prefill stretch 1.01x) -- it now reads 0.99x at a 1.0x
+  floor, i.e. ±2 tokens of noise, so the criterion this path needs is a two-sided band; `check-gpu-faults` clean over
+  all 18 logs.
+
+Also recorded for the promotion decision: `-ib` and `DUTY` are **deprecated when the two-arm feature is active** (the
+maintainer's ruling -- both are work-arounds for the single-threaded interleave, and both are measured inert here),
+while the **fair-share** half of block 16 stays live.  Nothing was pushed anywhere; `~/llama.cpp` (`wip/prefill-overlap`
+`16e942d2f`) and this repo are clean.
+
 ## 261122.011 (r343, no delivery change) -- wip/prefill-decode-arms pass 6: tier 2 (KLD 0.000000) + the reachable server gates -- and the two reds are RELATIVE bounds the arms remove
 
 **No delivery patch changed; nothing in `patches/`, no tag.**  The tier-1 oracle was reproduced first (cold + 3 warm

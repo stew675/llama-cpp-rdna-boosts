@@ -23,6 +23,7 @@ allocation owner); **pass 5 built the server cut and tier 1 passes**.
 | **T1 — the state handover** | **DONE.** `enabling-0002-recurrent-handover.patch`: one sequence's recurrent state moves between the arms **device-to-device in 0.45-0.66 ms** (1.9-2.3 ms on a process's first handover) against **34.5-36.1 ms** for the serialised path (52.7 MiB).  Text-exact on a no-host-tier 4B in every mode/repetition and on the 35B host tier for a single handed-over request (3/3 warm reps) |
 | **T2 — the server skeleton** | **DONE 2026-11-22 (pass 5).**  `llama-server --prefill-decode-arms` is the design, not an emulation: a prefill arm (main loop, `ctx_tgt`) + a decode arm (`ctx_dec`, its own thread, co-owning the prefill arm's KV), a slot crossing only at a request boundary.  **Tier 1 passes cold and over 3 warm request pairs** (both slots byte-identical, every allocation handshake clean).  `~/llama.cpp` `683deed67`; built in `T2-SERVER-CUT.md`'s code points + three small deviations; see [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) pass 5 |
 | **T3 — the request-boundary handover + its oracle** | **DONE, both tiers (tier 2 2026-11-22, pass 6).**  Tier 1: the server reproduces the reference text exactly, cold and over 3 warm pairs.  Tier 2: `scripts/gate-prefill-logits.sh` on the WIP build reads **mean KLD 0.000000 / same-top-p 100 %** (the artifacts are bit-inert on the default path) -- with the honest limit that `llama-perplexity` has one context and so cannot reach the arms path (pass 6 §2) |
+| **T6 — the REVERSE handover (prefix reuse)** | **DONE 2026-11-22 (pass 7), at the maintainer's direction.**  The decode arm no longer frees the slot's shared cells at the return: the main thread takes the recurrent state **back** to the prefill arm (`llama_memory_seq_state_take(mem_tgt, mem_dec, id)`, under the same `arms_quiet` bracket) and keeps the prompt, so a finished conversation stays resident and the next request reuses its prefix.  `~/llama.cpp` `16e942d2f` (1 file, +94/-29).  Measured: `gate-ckpt-reuse.sh` on the arms path goes **SKIP -> PASS** (3 restores, **33 ms** turns instead of 685 ms, i.e. single-context parity); the new `arms/gate-server-reuse.sh` proves a reused prefix **moves no token** (grow, and a fork below the prefix), and its `CONCURRENT=1` arm does it for two slots reusing at once (3.2x / 3.4x on the resumed turns).  Tier 1 unchanged (`459865c93d55cbaf` / `7dc20b0ce0bac255`, cold + 3 warm pairs) |
 | **T4 — the opt-in gate** | Not started; its rules are now measured *in the server*: the 2-row decode graph asks **741.48 MiB** and does not fit at arena 5000 next to a grown prefill graph unless **`GGML_CUDA_SLAB_HEADROOM_MIB=1536`** (pass 5 §4) |
 | **T5 — measurement + gates** | **The measurement is taken** (pass 5 §3): the smoothness target is met (~47-49 ms p50 through a 2.0-5.3 s prefill), the cost target was **accepted** (README §3b; -24 to -27 %, pass 5 §6 explains why).  **The gates that are reachable are RUN (pass 6, `RESULTS-2026-11-22.md` §3-§7)**: fairness + `--self-test`, duty, park, ckpt, `check-gpu-faults` on 32 logs.  Fairness and duty are red **as shipped** on a *relative* bound that the arms remove (and green under the gate's own absolute / inert-floor criterion); park and ckpt **SKIP by construction**.  Owed before promotion: an arms **arm** in the promise gate's `seq` shape + a server-side pool arm (neither gate reaches this path as shipped -- pass 6 §7b, where the promise gate's own criteria are MET by the oracle's exit census) |
 | **T0 — one allocator for the pair** (new, 2026-11-21) | **DONE 2026-11-22 (pass 3).**  [`enabling-0003-shared-kv-allocator.patch`](enabling-0003-shared-kv-allocator.patch) (7 files, +386/-10, `~/llama.cpp` `386b7dd48`): ONE shared owner, **per-ubatch** reserve/commit/release, with `llama_memory_alloc_sync()` as the request-boundary handshake.  `LLAMA_KV_ALLOC_SHARED=0` is the A/B control.  Measured: the two-arm run is **bit-identical to the single-context reference in every rep on both shapes**, no harness control (`RESULTS-2026-11-22.md` pass 3).  **In the server it is called on both arms at every request boundary and asserted clean** (pass 5 §1/§2) |
@@ -315,9 +316,12 @@ remaining reds are *relative* bounds (`chunk/b`, `3x the baseline`) that a desig
 lever to satisfy.  Park and ckpt **SKIP by construction** (a co-owner pair is not one stream; the arms path has no
 cross-request prefix reuse).
 
-Still open (the traps): **no prefix reuse across requests on the arms path** — now with a number: a chat turn that
-appends ~9 tokens costs **685 ms instead of 33 ms** (`gate-ckpt-reuse` on the 4B, pass 6 §6), needing a **reverse
-handover**; the two gates that cannot reach this path as shipped (`gate-host-pool.sh` is llama-cli-only, and
+**Prefix reuse is fixed (pass 7).**  The reverse handover takes the recurrent state back to the prefill arm at the
+return, so a finished conversation stays resident: `gate-ckpt-reuse.sh` on the arms path is **SKIP -> PASS** (3
+restores, a turn appending ~9 tokens costs **33 ms, not 685 ms** — single-context parity), and a reused prefix moves
+**no token** (`arms/gate-server-reuse.sh`, also with two slots reusing concurrently).
+
+Still open (the traps): the two gates that cannot reach this path as shipped (`gate-host-pool.sh` is llama-cli-only, and
 `gate-moe-promise.sh`'s `seq` arm hard-codes `-np 1`) -- though the promise gate's criteria ARE met by the oracle's
 exit census, pass 6 §7b: 0 repair lines, `broken=0 repaired=0 stale=3360` cold / `10338` warm over two interleaving
 graphs; the T4 gate itself (its rules
@@ -327,13 +331,12 @@ promotion (a block needs the maintainer's explicit go-ahead plus the full ladder
 
 ## 8. The one-line summary of what is left
 
-**The server cut is built, both tiers of the oracle pass, and the smoothness target is met at an accepted cost.**
-What is left is not another mechanism: it is (a) an arms **arm** for the promise gate's `seq` shape and a server-side pool arm (neither owed gate reaches
-this path as shipped)
-and the *arms* that two existing gates need instead of a flag (fairness' ITL criterion, duty's inertness criterion —
-pass 6 §7), (b) the reverse handover (prefix reuse) **if the maintainer wants it**, (c) T4's opt-in gate — with the
+**The server cut is built, both tiers of the oracle pass, prefix reuse is restored, and the smoothness target is met
+at an accepted cost.**  What is left is not another mechanism: it is (a) an arms **arm** for the promise gate's `seq`
+shape and a server-side pool arm (neither owed gate reaches this path as shipped), plus the *arms* that two existing gates need instead of a flag (fairness' ITL criterion, duty's inertness criterion —
+pass 6 §7), (b) T4's opt-in gate — with the
 measured VRAM rule (`741.48 MiB` for the 2-row decode graph, `GGML_CUDA_SLAB_HEADROOM_MIB` now a shipped default) and
-the `-np`/`--kv-unified` interaction, and (d) the maintainer's decision on what this is worth:
+the `-np`/`--kv-unified` interaction, and (c) the maintainer's decision on what this is worth:
 **-24…-27 % prefill for an ITL p95 of 64-78 ms** against the shipped duty cycle's 519-568 ms at -30 %
 (`RESULTS-2026-11-22.md` pass 5 §3/§6).  Nothing here is delivery-bound, and a block is a question, never a gate
 outcome.

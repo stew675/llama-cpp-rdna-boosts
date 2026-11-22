@@ -1,6 +1,6 @@
 # prefill-decode-arms — one prefill arm and one decode arm, both live on one GPU
 
-**Status: pass 5 done (2026-11-22), on the delivery's r343 — T0, T1 and **T2** CLOSED: `llama-server --prefill-decode-arms` is the design
+**Status: pass 7 done (2026-11-22), on the delivery's r343 — T0, T1, **T2** and the **reverse handover** (prefix reuse) CLOSED: `llama-server --prefill-decode-arms` is the design
 (prefill arm + decode arm on one shared KV, a slot crossing only at a request boundary), **tier 1 passes cold and
 over 3 warm request pairs** (both slots byte-identical to the single-context server, every allocation handshake
 clean), and the campaign's metric is measured: **~47-49 ms ITL p50 / 64-78 ms p95 through a 2.0-5.3 s prefill** at
@@ -198,15 +198,18 @@ line reads *smoothness delivered, cost accepted*, and the cost is **not** an ope
    480/480 logits rows, and the divergent row is R1's own *prefill* row), and on a partial arena it is a **§89
    residency class** (`h=0.8161` vs `h=0.8172`) that survives every pin.  [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md).
 
-10. **The arms path does not reuse a slot's prefix across requests (pass 5 §7)**: when generation ends, the decode
-   arm frees the slot's shared cells and the return clears its prompt, because the recurrent half still lives on the
-   decode arm and moving it *back* is a reverse handover the scoped design does not do.  The reference server keeps
-   the KV and does reuse it.  It costs nothing in the oracle (`cache_prompt:false`) and it is the first thing to fix
-   if this is promoted.  **MEASURED (pass 6 §6)**: `scripts/gate-ckpt-reuse.sh` on Qwen3.5-4B reads **0** checkpoint
-   restores and `cache_n = 0` on every request — four growing chat turns cost **729 / 684 / 687 / 686 ms** of prompt
-   time against the single-context server's **733 / 33 / 33 / 34 ms** (three restores), i.e. a turn that appends ~9
-   tokens re-prefills 5200+ tokens: **~20x per turn**.  The gate SKIPs on this path for exactly that reason, so it is
-   evidence for the decision, not a gate to pass.
+10. ~~**The arms path does not reuse a slot's prefix across requests**~~ — **FIXED 2026-11-22 (pass 7), the
+   maintainer's direction: prefix reuse is essential.**  The regression was that the decode arm freed the slot's
+   shared cells at the return and the return cleared the prompt (measured: **685 ms** for a turn appending ~9 tokens
+   to 5200, against the single-context server's 33 ms).  The fix is the **REVERSE HANDOVER**: the decode arm frees
+   nothing on stop/cancel, and the main thread takes the recurrent state **back** to the prefill arm
+   (`llama_memory_seq_state_take(mem_tgt, mem_dec, id)`) under the same `arms_quiet` bracket that guards the
+   allocation handshake, then keeps the prompt — so a finished conversation stays resident and is reused exactly like
+   the single-context server.  A failed take DROPS the sequence instead (an attention half with no recurrent half is
+   an inconsistent state, and a forced re-prefill is the safe failure).  `~/llama.cpp` `16e942d2f`; measured
+   `gate-ckpt-reuse.sh` **SKIP -> PASS** (3 restores, 33 ms turns), a reused prefix moves **no token** against a
+   never-reusing arm (grow and fork; two slots reusing concurrently at 3.2x/3.4x), and tier 1 is unchanged.  A
+   cancelled conversation keeps its prefix too.
 ## 5. The reusable harness
 
 [`archive/work/prefill-transfer-overlap/arms/two_ctx.cpp`](../../archive/work/prefill-transfer-overlap/arms/two_ctx.cpp)
@@ -276,8 +279,11 @@ build;
 (the single context delivers 16); it is **green** at `--min-decode-gain 1.0` (inert: 73 -> 75, prefill stretch
 0.99x).  So block 16's duty cycle is **redundant on this path** while its fair-share half stays live;
 * **park** is reachable but **SKIPs**: a co-owner pair is not "one stream", so the cache declines by its own guard;
-* **ckpt reuse** is reachable but **SKIPs**: the arms path has no prefix reuse — measured as **685 ms vs 33 ms** per
-  appended turn (landmine 10's price, in `gate-ckpt-reuse` terms);
+* **duty**, re-run after the reverse handover, reads 0.99x at a 1.0x floor — that is the ±2-token noise of an inert
+  mechanism, so the criterion this path needs is a **two-sided band**, not a one-sided gain;
+* **ckpt reuse** was **SKIP** until pass 7 and is now **PASS**: the reverse handover restores prefix reuse — 3
+  checkpoints restored, **33 ms** turns instead of 685 ms (landmine 10), and `arms/gate-server-reuse.sh` proves a
+  reused prefix moves no token;
 * an operator who pins `-np N` **loses the unified cache** (`--parallel auto` sets it; an explicit N does not) — that
   is a docs/gate item for promotion, not a defect.
 
