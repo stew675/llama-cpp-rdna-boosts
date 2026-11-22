@@ -207,15 +207,22 @@ curve does not justify a knob"**.  It is written up as a measurement campaign fo
 ### 7.1 The problem, stated with the numbers we have
 
 Today the pair's Pareto point is fixed: **-21…-24 % prefill** buys a decoder that keeps moving.  The worst in-window
-gap is what a user still feels, and it does not vanish:
+gap is what a user still feels, and it does not vanish.  Every pair below is the **same shape and the same run family**, so the two columns are comparable (the step series is
+`arms/smooth.py`'s `arms*/pf` row, the gap is `arms/interactive.py`'s `gap_max` for the same ubatch):
 
-| shape | prefill arm's own steps | decoder's worst in-window gap |
+| shape | prefill arm's own step, p50 (step count) | decoder's worst gap during the document prefill |
 |---|---|---|
-| host tier `-ub 512` (`-ncmoe 40`, arena 5000) | p50 **771 ms**, max 835 ms (7 steps) | **95 ms** |
-| host tier `-ub 4096` | p50 1227 ms, max 1277 ms (5 steps) | **60 ms** |
-| fully resident, `-c 16384` | p50 **339 ms**, max 432 ms (4 steps) | **34.9 ms** |
+| host tier, `-ub 512` (`-ncmoe 40`, arena 5000) | not recorded as a step series | **95.5 ms** |
+| host tier, `-ub 2048` | **771 ms** (7 steps) | **86.5 ms** |
+| host tier, `-ub 4096` | 1227 ms (5 steps) | **60.5 ms** |
+| fully resident, `-c 16384`, `-ub 2048` | **339 ms** (4 steps) | **32.8 ms** |
 
-**Read that table carefully before designing anything: the decoder's worst gap is much SMALLER than one prefill step.**
+**Read that table carefully before designing anything: the decoder's worst gap is much SMALLER than one prefill step**,
+by a factor of four to twenty on every row where both are recorded.
+
+An earlier draft paired the gap of one ubatch with the step of another, which is exactly the mis-pairing a shape-keyed
+reference makes easy (a timing reference is per model, per split, per device count **and per ubatch**, `AGENTS.md`
+rule 6 and `GREEDY-PURITY.md` §38); the table above is the corrected pairing.
 So the naive model ("the decoder waits for one whole prefill ubatch") is **wrong on this build**, and whatever the real
 mechanism is, it must be identified before a policy is written.  Candidate mechanisms, in the order they should be
 tested (each is cheap):

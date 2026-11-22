@@ -22,9 +22,10 @@ do not already settle it.
 
 Two things about that item are worth recording here because they cost nothing now and would cost a session later:
 
-1. **The naive mechanism is already contradicted by the numbers.**  The decoder's worst in-window gap is 95 / 60 /
-   34.9 ms at `-ub` 512 / 4096 / fully resident, while the prefill arm's own step on the same shapes is 771 / 1227 / 339
-   ms p50.  The decoder does **not** wait a whole ubatch, so the gap's composition (device time-slicing, internal
+1. **The naive mechanism is already contradicted by the numbers.**  On the shapes where both are recorded the decoder's
+   worst gap is four to twenty times smaller than the prefill arm's own step: 86.5 ms against 771 ms p50 at `-ub 2048`,
+   60.5 against 1227 ms at `-ub 4096`, 32.8 against 339 ms fully resident (95.5 ms at `-ub 512`, whose step series was
+   not recorded).  The decoder does **not** wait a whole ubatch, so the gap's composition (device time-slicing, internal
    chunking, or the harness's step granularity) has to be measured before a policy is written.  The item is therefore a
    measurement campaign with a **Pareto curve** as the deliverable, and a **refutation is an acceptable outcome**.
 2. **Its constraints are the purity rulebook's, not engineering taste.**  Counters not clocks (a time-keyed policy is not
