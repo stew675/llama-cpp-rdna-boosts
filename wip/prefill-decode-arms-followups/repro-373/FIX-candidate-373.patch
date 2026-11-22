@@ -1,9 +1,9 @@
 From 00a568fba2e756f3d4a36e9f5598f90e4d168584 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 22 Nov 2026 16:04:47 -0600
-Subject: [PATCH] crash #373 fix (candidate): one apply lock per memory GROUP
- -- the pair's two arms mutate one KV cell map from two threads, which is the
- qwen4exp n_kv abort AND a std::set/tree corruption in
+Subject: [PATCH 1/2] crash #373 fix (candidate): one apply lock per memory
+ GROUP -- the pair's two arms mutate one KV cell map from two threads, which
+ is the qwen4exp n_kv abort AND a std::set/tree corruption in
  llama_kv_cache::prepare()'s rollback snapshot; plus set the meta view slot on
  every sched_alt_select (hardening, unproven)
 
@@ -197,6 +197,234 @@ index 7d1b577c2..fabf0a041 100644
      struct sigaction sigint_action;
      sigint_action.sa_handler = signal_handler;
      sigemptyset (&sigint_action.sa_mask);
+-- 
+2.56.1
+
+
+From 7ea83092273d0e738f544949e0dcb3ab0e832c04 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Sun, 22 Nov 2026 16:40:11 -0600
+Subject: [PATCH 2/2] crash #373 fix (candidate), part 2: the Meta split-state
+ cache is per VIEW SLOT (two co-owner contexts resolved the shared KV's views
+ through one rotating unordered_map -- the released build's SIGSEGV in
+ ggml-backend-meta.cpp), the view slot is bound for EVERY graph build/alloc
+ (not only on an alt-state change), and the async-input ring waits per ORIGIN
+ stream instead of cudaDeviceSynchronize (illegal while a peer arm captures a
+ graph -- measured 'operation not permitted when stream is capturing')
+
+Validated: the 71k/23k/800 three-slot shape, 3 rounds clean (0 asserts, 0 ROCm errors, 0 segfaults);
+pair OFF clean; gate-arms-soak.sh soak --quick PASS 11/11 including the class-matched text oracle.
+Still blocked on the host tier (-ncmoe 48): a pre-existing abort in ggml_cuda_pool_vmm::alloc's peer grant
+(cuMemSetAccess 'invalid argument'), pair-only, needs the best-effort-grant treatment the slab already has.
+---
+ ggml/src/ggml-backend-meta.cpp  | 53 +++++++++++++++++++++------------
+ ggml/src/ggml-cuda/ggml-cuda.cu | 23 +++++++++++++-
+ src/llama-context.cpp           | 27 ++++++++++++-----
+ src/llama-context.h             |  2 ++
+ 4 files changed, 77 insertions(+), 28 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 6ded91b14..fd41e635d 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -890,10 +890,21 @@ struct ggml_backend_meta_buffer_context {
+             return std::hash<const void *>()(k.first) ^ (size_t) k.second;
+         }
+     };
+-    std::unordered_map<std::pair<const ggml_tensor *, bool>, split_state_entry, split_state_key_hash> split_state_cache[n_split_state_caches];
+-    int      split_state_cache_cur = 0;
+-    uint64_t split_state_cache_used[n_split_state_caches] = {0};
+-    uint64_t split_state_cache_tick = 0;
++    // crash #373 (TODO #373): the cache is per VIEW SLOT, not per buffer.  A co-owner pair (two `llama_context`s of
++    // one model on two threads) resolves the split state of the VIEWS OF THEIR SHARED KV CACHE through the SAME buffer
++    // context -- ~10k lookups per decode step each -- and the rotation below mutates `cur`, `used` and `tick` and
++    // CLEARS a whole version.  Two threads doing that to one `unordered_map` corrupts the hash table: measured as a
++    // SIGSEGV inside `ggml_backend_meta_get_split_state` and inside `set_tensor_async`'s lookup, on the 3-device
++    // `-sm tensor` pair, in the released build.  The simple-tensor containers next door keep one container per view
++    // slot for exactly the same reason, so the slot (`g_meta_view_slot`) is the discriminator here too: the owner's
++    // graphs use slot 0/1, the co-owner's 2/3, and no version of any slot is visible to the other arm.
++    // A single context never leaves slot 0 (sched_alt_for() is false without ctx_other), so it keeps the rotation
++    // across its own graph shapes exactly as before.
++    using split_state_map = std::unordered_map<std::pair<const ggml_tensor *, bool>, split_state_entry, split_state_key_hash>;
++    split_state_map split_state_cache     [n_view_slots][n_split_state_caches];
++    int             split_state_cache_cur [n_view_slots] = {0};
++    uint64_t        split_state_cache_used[n_view_slots][n_split_state_caches] = {0};
++    uint64_t        split_state_cache_tick[n_view_slots] = {0};
+ 
+     ggml_backend_meta_buffer_context(
+             ggml_backend_meta_simple_tensor_container & stc_static,
+@@ -2083,9 +2094,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+ 
+     // Current-version cache test, used only to prune the walk (a false negative just visits a node that
+     // the nested lookup then resolves from another version, so pruning is always safe).
++    // crash #373: this lookup resolves through the slot of the CONTEXT doing the work, never the peer's
++    const int ss_slot = g_meta_view_slot;
++    GGML_ASSERT(ss_slot >= 0 && ss_slot < ggml_backend_meta_buffer_context::n_view_slots);
++
+     auto ss_cached = [&](const ggml_tensor * t) -> bool {
+         const std::pair k = std::make_pair(t, true);
+-        const auto & c = buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
++        const auto & c = buf_ctx->split_state_cache[ss_slot][buf_ctx->split_state_cache_cur[ss_slot]];
+         const auto itc = c.find(k);
+         return itc != c.end() && memcmp(itc->second.bytes, (const char *) t, sizeof(itc->second.bytes)) == 0;
+     };
+@@ -2094,10 +2109,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+     // other versions for an entry byte-identical to the tensor, else a recycle of the least recently used
+     // one; under the pin a nested lookup only invalidates its own stale entry instead.
+     const std::pair key = std::make_pair(tensor, assume_sync);
+-    auto * cache = &buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
++    auto * cache = &buf_ctx->split_state_cache[ss_slot][buf_ctx->split_state_cache_cur[ss_slot]];
+     auto it = cache->end();
+     auto ss_resolve = [&]() {
+-        cache = &buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
++        cache = &buf_ctx->split_state_cache[ss_slot][buf_ctx->split_state_cache_cur[ss_slot]];
+         it = cache->find(key);
+         if (it == cache->end() || memcmp(it->second.bytes, (const char *) tensor, sizeof(it->second.bytes)) == 0) {
+             return;
+@@ -2111,27 +2126,27 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+         }
+         // the tensor changed: switch to the cache version in which it is unchanged, else recycle the least recently used one
+         int k_new = -1;
+-        for (int k = 0; k < buf_ctx->n_split_state_caches && k_new < 0; k++) {
+-            if (k == buf_ctx->split_state_cache_cur) {
++        for (int k = 0; k < ggml_backend_meta_buffer_context::n_split_state_caches && k_new < 0; k++) {
++            if (k == buf_ctx->split_state_cache_cur[ss_slot]) {
+                 continue;
+             }
+-            auto it_k = buf_ctx->split_state_cache[k].find(key);
+-            if (it_k != buf_ctx->split_state_cache[k].end() && memcmp(it_k->second.bytes, (const char *) tensor, sizeof(it_k->second.bytes)) == 0) {
++            auto it_k = buf_ctx->split_state_cache[ss_slot][k].find(key);
++            if (it_k != buf_ctx->split_state_cache[ss_slot][k].end() && memcmp(it_k->second.bytes, (const char *) tensor, sizeof(it_k->second.bytes)) == 0) {
+                 k_new = k;
+             }
+         }
+         if (k_new < 0) {
+-            for (int k = 0; k < buf_ctx->n_split_state_caches; k++) {
+-                if (k != buf_ctx->split_state_cache_cur &&
+-                        (k_new < 0 || buf_ctx->split_state_cache_used[k] < buf_ctx->split_state_cache_used[k_new])) {
++            for (int k = 0; k < ggml_backend_meta_buffer_context::n_split_state_caches; k++) {
++                if (k != buf_ctx->split_state_cache_cur[ss_slot] &&
++                        (k_new < 0 || buf_ctx->split_state_cache_used[ss_slot][k] < buf_ctx->split_state_cache_used[ss_slot][k_new])) {
+                     k_new = k;
+                 }
+             }
+-            buf_ctx->split_state_cache[k_new].clear();
++            buf_ctx->split_state_cache[ss_slot][k_new].clear();
+         }
+-        buf_ctx->split_state_cache_cur = k_new;
+-        buf_ctx->split_state_cache_used[k_new] = ++buf_ctx->split_state_cache_tick;
+-        cache = &buf_ctx->split_state_cache[k_new];
++        buf_ctx->split_state_cache_cur[ss_slot] = k_new;
++        buf_ctx->split_state_cache_used[ss_slot][k_new] = ++buf_ctx->split_state_cache_tick[ss_slot];
++        cache = &buf_ctx->split_state_cache[ss_slot][k_new];
+         it = cache->find(key);
+     };
+     ss_resolve();
+@@ -2200,7 +2215,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             ss_verify_active = false;
+         }
+         // the calculation recurses into the sources and may have switched the current version
+-        cache = &buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
++        cache = &buf_ctx->split_state_cache[ss_slot][buf_ctx->split_state_cache_cur[ss_slot]];
+         auto & entry = (*cache)[key];
+         entry.set(ss, n_bufs);
+         memcpy(entry.bytes, tensor, sizeof(entry.bytes));
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 965b43981..ec5569136 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2187,7 +2187,28 @@ static bool ggml_cuda_async_input_set(int device, void * dst, const void * src,
+                 ggml_cuda_async_input_drain_locked(d, e);
+             }
+         }
+-        CUDA_CHECK(cudaDeviceSynchronize());
++        // crash #373: wait on the ORIGINS' own streams, never the whole device.  The ring bytes can only be read by
++        // an origin's own uploads -- its `ev`/`flush_ev` are recorded on its stream -- so a `cudaStreamSynchronize`
++        // of each origin's stream is exactly the guarantee the wrap needs, and unlike `cudaDeviceSynchronize()` it is
++        // not a device-wide barrier (it does not also wait for this context's graph compute, nor a peer's).
++        //
++        // Why that matters: the two-arm server (`--prefill-decode-arms`, block 17) captures a graph on ONE arm while
++        // the other arm stages inputs, and a host-side device sync is ILLEGAL while any capture is in flight on the
++        // device.  Measured on the 3-device `-sm tensor` pair: `ROCm error: operation not permitted when stream is
++        // capturing` from this very line, then every launch on the device failed (`operation failed due to a previous
++        // error during capture`) and the request died.  If even the per-origin wait is refused, clear the error, leave
++        // the ring untouched and report "not staged": the caller then takes the synchronous upload path for this copy,
++        // and a later wrap (after the capture ends) resets the ring.
++        for (auto & kv : d.origins) {
++            ggml_cuda_async_input_origin & e = kv.second;
++            if (e.stream == nullptr) {
++                continue;
++            }
++            if (cudaStreamSynchronize(e.stream) != cudaSuccess) {
++                (void) cudaGetLastError();
++                return false;
++            }
++        }
+         for (auto & kv : d.origins) {
+             kv.second.pending   = false;
+             kv.second.has_flush = false;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 153105d6b..92ec39c84 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1556,18 +1556,22 @@ void llama_context::sched_new(const sched_params & params) {
+     sched_params_cur = params;
+ }
+ 
++// crash #373: tell the meta backend which view slot THIS context's graphs belong to.  The owner of a shared cache
++// uses 0/1, a co-owner (block 17's decode arm) 2/3, and `alt` picks within the pair so a context's main and alternate
++// graph never share a container with each other either.  `g_meta_view_slot` is `thread_local` (`ggml-backend-meta.cpp`):
++// a process-global let the other arm flip it mid-graph and register a view in one container while looking it up in
++// another.  It is therefore bound from the arm's OWN thread, at every point that builds or allocates a graph.
++void llama_context::meta_bind_view_slot(bool alt) const {
++    ggml_backend_meta_set_view_slot((cparams.ctx_other != nullptr ? 2 : 0) + (alt ? 1 : 0));
++}
++
+ void llama_context::sched_alt_select(bool alt) {
+     // a CO-OWNER context (the decode arm) takes the second pair of view slots, so two contexts computing at the
+     // same time never share a meta view container (wip/prefill-decode-arms).
+     //
+-    // crash #373: set it on EVERY call, not only when the alt state changes.  `g_meta_view_slot` is thread_local and
+-    // starts at 0, and `sched_alt_in_use` starts false -- so a context that never switches schedulers returned below
+-    // on its first graph and kept slot 0, i.e. the SAME slot as its co-owner.  Both arms then registered and looked
+-    // up the per-graph VIEWS of their shared KV cache (an external view uses the buffer of its view source, see
+-    // ggml_backend_meta_buffer_context) in one rotating container, each clearing it under the other: measured as a
+-    // SIGSEGV inside libstdc++/libggml-base on `std::set`/`std::unordered_map` nodes, and as the `simple_tensor ==
+-    // null` / `tensor write out of bounds` aborts the process-global slot used to cause.
+-    ggml_backend_meta_set_view_slot((cparams.ctx_other != nullptr ? 2 : 0) + (alt ? 1 : 0));
++    // crash #373: bind the context's Meta view slot on EVERY call, not only when the alt state changes (see
++    // meta_bind_view_slot() and graph_reserve()).
++    meta_bind_view_slot(alt);
+ 
+     if (alt == sched_alt_in_use) {
+         return;
+@@ -4539,6 +4543,13 @@ static void ubatch_prepare_reserve(
+ ggml_cgraph * llama_context::graph_reserve(
+         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs_l, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
+         bool packed_kq_mask, bool reserve_injection) {
++    // crash #373: EVERY graph construction/allocation runs under this context's Meta view slot.  The slot decides which
++    // per-context containers the meta backend registers a graph's VIEWS in, and which version of its split-state cache
++    // it resolves them through -- so a graph built under the peer's slot is a corrupted (and corrupting) lookup.  It is
++    // bound here rather than only in sched_alt_select() because a reserve can happen without an alt-state change (the
++    // first graph of a context, sched_reserve(), a new ubatch shape) and the slot is thread_local.
++    meta_bind_view_slot();
++
+     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs_l);
+     GGML_ASSERT(n_outputs_l >= 1);
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 9ab266537..d96b8ec91 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -362,6 +362,8 @@ private:
+ 
+     // swap the second scheduler (and its graph-reuse state) in or out of `sched`, creating it on first use
+     void sched_alt_select(bool alt);
++    // crash #373: bind this context's Meta view slot (thread_local) before any graph build/alloc; see the definition
++    void meta_bind_view_slot(bool alt = false) const;
+ 
+     // whether this ubatch is the draft context's second graph (the draft step) rather than its ingest /
+     // KV-injection graph; the batch kind, not `n_outputs`, is the discriminator for DFlash/DFlash2
 -- 
 2.56.1
 

@@ -41,7 +41,7 @@ documented "no"; it is also the one the maintainer asked for by name.**
 | **W6** | the **prefill/decode speed balance**: the prefill arm SKIPS turns while a decoder is active | tuning | #371 | medium | none; measure first (§7.1) |
 | **W7** | the pair's **slot erase and cell accounting** | correctness (narrow) | #370 | small | none |
 | **W8** | **multi-slot prefill batching** ("layer-major" across active prefill slots) | tuning / architecture | #372 | medium | read the premise check first (§11.1) |
-| **W9** | **P0: the pair mutates ONE KV cell map from TWO threads with no lock** -- the qwen4exp assert *and* a libstdc++ RB-tree SIGSEGV (`prepare()`'s snapshot); plus two more shared-state defects behind them (a shared meta buffer, a HIP capture/staging conflict).  **REPRODUCED 2026-11-22** in ~30 s (`repro-373/`); the memory-group apply lock is written+validated but NOT shipped | **correctness (P0)** | #373 | lock = small (done); the Meta + capture defects = a campaign | **done**: `repro-373/` (3 slots, two prefills + a decode) |
+| **W9** | **P0: the pair mutates THREE shared structures from TWO threads with no lock** -- the KV cell map (`init_batch`'s snapshot + `apply()`), the **Meta split-state cache** (per buffer, so shared through the KV cache's buffer: the released build's SIGSEGV), and the **async-input ring's** device-wide sync (illegal during a peer's graph capture).  **REPRODUCED 2026-11-22** in ~30 s (`repro-373/`); **all three FIXED and validated** on the scratch branch (3 rounds clean on the 71k/23k shape, soak gate 11/11) but NOT shipped | **correctness (P0)** | #373 | memory lock = small (done); Meta + ring = done; **host tier blocked** on a VMM peer-grant abort (needs a design decision) | **done**: `repro-373/` (3 slots, two prefills + a decode) |
 | **G1** | gate debt: three gates still anchored to the retired Flash-Next model | tooling | #369 | small | none |
 
 Ordering suggestion: **G1, W7, W3** (small, close out loose ends) → **W6** (the one the maintainer wants measured) →
@@ -502,6 +502,37 @@ the indexer child's, which moves the used-cell count (the co-owner allocator pub
 same caches).  The two padded extents then differ whenever the movement crosses a **pad boundary** (a multiple of 8192
 for a prompt ubatch), which is why this is rare and why it needs a large prefill plus a request boundary: the boundary is
 when the decode arm gains a sequence and starts applying, and 70K of cells is what puts `used` next to an 8192 multiple.
+
+### UPDATE 2026-11-22 (evening): the THREE fixes, and the one the host tier still needs
+
+`WORKLOG.md` 261122.033.  Implemented on the scratch branch (`~/llama.cpp` `crash373-fix`), exported for review as
+`repro-373/FIX-candidate-373.patch` (2 commits, 206 insertions, 7 files), **not shipped** (block 17 is the target, so it
+is a same-block amendment, and that is the maintainer's call):
+
+1. **One apply lock per memory GROUP** (`llama_memory_i::apply_mutex()`, shared through `create_memory()`), taken at the
+   engine's memory entry points: `init_batch` (the rollback snapshot!), `apply`, `clear`, `state_write/read`, the
+   `llama_memory_*` seq ops and park.  Worst critical section **783-1161 us**, once per prefill step.
+2. **The Meta split-state cache is per VIEW SLOT** (`split_state_cache[4][8]` + `cur[4]`/`used[4][8]`/`tick[4]`,
+   indexed by `g_meta_view_slot`), and the slot is bound for **every** graph build/alloc
+   (`llama_context::meta_bind_view_slot()`, from `graph_reserve()` and `sched_alt_select()`) instead of only when the alt
+   scheduler state changed.  This is the class that SIGSEGVs the *released* build: two arms, one per-buffer
+   `unordered_map`, `clear()`/rehash under a peer's `find`.
+3. **The async-input ring waits per ORIGIN stream**, not `cudaDeviceSynchronize()` -- which is illegal while the peer arm
+   captures a graph (`operation not permitted when stream is capturing`, then every launch on the device fails).  If even
+   the per-origin wait is refused the copy reports "not staged" and the caller takes its synchronous path.
+
+**Validated:** 3 slots x (71k + 23k + 800-token generation), fully resident, **3 rounds clean** (0 asserts, 0 ROCm
+errors, 0 segfaults; pre-fix it died in 20-55 s every run); pair OFF clean; `gate-arms-soak.sh soak --quick` **11/11**
+with the class-matched text oracle, i.e. no number moved.
+
+**Still open, and it blocks the host tier:** with `-ncmoe 48` the pair aborts ~2 s in inside
+`ggml_cuda_pool_vmm::alloc` -> `cuMemSetAccess` ("HipVMM Failure: invalid argument") -- the **P2P grant** for the second
+context's pool growth, refused because the arena has taken the VRAM.  The slab already treats that grant as best-effort
+(`peer_mask` + `ggml_cuda_slab_peer_copy_ok()` staging); the VMM pool still `CU_CHECK`s it.  Pair OFF at the same shape
+is clean.  Two designs, **a decision for the maintainer**: (A) the slab's pattern applied to the pool (best-effort grant,
+per-pool `peer_mask`, pool ranges in the peer-copy predicate), or (B) warm the decode arm's pools at context creation, the
+way r346 already declares its graph reserve before the arena claims the space.  `TODO` #365 (the device copy for the
+state handover) comes after that.
 
 ### UPDATE 2026-11-22: REPRODUCED, DIAGNOSED, and it is bigger than one bug
 

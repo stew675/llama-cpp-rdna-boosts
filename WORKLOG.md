@@ -1,3 +1,100 @@
+## 261122.033 (no delivery change) -- crash #373, the FIX: three defects in the pair's shared state, all three written and validated on the maintainer's own shape; the host tier is blocked on a fourth (a VMM peer-grant abort)
+
+**No delivery patch changed, no tag.**  Continuation of `261122.032`, on the maintainer's instruction to do the *true*
+fix for block 17 (in block 17, not in pieces) together with the Meta work of `TODO` #365.  The fix is on a scratch
+branch (`~/llama.cpp` `crash373-fix`, **not pushed**), exported for review as
+`wip/prefill-decode-arms-followups/repro-373/FIX-candidate-373.patch` (2 commits, 206 insertions, 7 files).  Block 17 is
+the target, so it becomes a same-block amendment once the maintainer says so (`AGENTS.md` rule 13).
+
+### What the pair actually shares, and what was racing
+
+Three separate structures were being mutated from the two arms' threads with no common lock.  Each was measured, not
+inferred, and each has its own fix:
+
+1. **The KV cell map** (`261122.032`): `apply()` and `init_batch()` (whose `prepare()` snapshots the map for rollback)
+   run on both arms.  **Fix: one apply lock per memory GROUP** -- `llama_memory_i::apply_mutex()`, shared through
+   `create_memory()` by exactly the condition that decides the shared view, taken at the engine's memory entry points
+   (`init_batch`, `apply`, `clear`, `state_write/read`, the `llama_memory_*` seq ops and park; `alloc_sync` and
+   `seq_state_take` stay unlocked -- request-boundary only).  Worst critical section measured **783-1161 us**, once per
+   prefill step.
+2. **The Meta split-state cache** (`ggml-backend-meta.cpp`) -- the released build's SIGSEGV, and the reason the P0 was
+   not just the assert.  `ggml_backend_meta_buffer_context` keeps **8 rotating versions** of a
+   `unordered_map<(tensor, assume_sync) -> split-state>`, plus `cur`, `used[]` and a `tick`, and *every* tensor of *every*
+   graph allocation resolves through it (~10k lookups per decode step).  It was **per buffer**, and the two arms share
+   one buffer -- the **KV cache's** -- so one arm's version switch, `clear()`, or insert under the other's `find` is a
+   corrupted hash table.  It surfaced as a SIGSEGV in `ggml_backend_meta_get_split_state` and in `set_tensor_async`'s
+   lookup, *pre-fix and on the release*.
+   **Fix: the cache is per VIEW SLOT** (`split_state_cache[4][8]`, `cur[4]`, `used[4][8]`, `tick[4]`), indexed by
+   `g_meta_view_slot` -- the same discriminator the simple-tensor containers next door already use, and the reason they
+   were already `stc_compute[4][2]` ("a co-owner pair runs two graphs on two threads and each needs its own pair").  A
+   single context never leaves slot 0 (`sched_alt_for()` is false without `ctx_other`), so its own rotation across graph
+   shapes is unchanged.
+   **And the slot is now bound for EVERY graph build/alloc** (`llama_context::meta_bind_view_slot()`, called from
+   `graph_reserve()` and `sched_alt_select()`): it is `thread_local`, and it used to be set only when the *alt scheduler
+   state changed*, so a context's first graph -- or a `sched_reserve()` / new-shape reserve -- could run under the
+   thread's default slot 0, i.e. the co-owner's slot as the owner's.
+3. **The async-input ring** (`ggml_cuda_async_input_set`, the H2D staging of small graph inputs, default ON).  On the
+   ring-wrap path it drained every origin and then called **`cudaDeviceSynchronize()`** -- a device-wide host
+   synchronisation, which is **illegal while any capture is in flight on the device**.  The pair captures on one arm
+   while the other stages, so HIP returned `operation not permitted when stream is capturing`, and every subsequent
+   launch on the device failed (`operation failed due to a previous error during capture`) -- measured as a dead request
+   with four `ROCm error` lines and no assertion at all.
+   **Fix: wait on the ORIGINS' own streams, never the device.**  A ring slot can only be read by an origin's own
+   uploads (its `ev`/`flush_ev` are recorded on its stream), so `cudaStreamSynchronize(e.stream)` per origin is exactly
+   the guarantee the wrap needs, and it is not a device-wide barrier (it also no longer waits for the graph compute of
+   either arm).  If even that is refused, the error is cleared, the ring is left untouched and the copy reports "not
+   staged" so the caller takes its synchronous path; a later wrap, after the capture ends, resets the ring.
+
+### Validated (all on `build-2ctx`, ROCm 10.1, 3 x R9700, the maintainer's `runme` shape)
+
+| arm | result |
+|---|---|
+| 3 slots, 71 231 + 22 940 tokens + an 800-token generation, **fully resident**, 3 rounds | **all OK**, 0 asserts, 0 `ROCm error`, 0 segfaults (the pre-fix build aborted in ~20-55 s, every run) |
+| the same shape, pair OFF | all OK (the control) |
+| `scripts/gate-arms-soak.sh soak --quick` | **PASS 11/11**, including the class-matched text oracle (the pair's cold answer equals the single-context server's) and `check-gpu-faults.sh` clean -- so the three fixes move no numbers |
+| 3 slots, 20 k + 6 k + a 300-token generation | 4/4 rounds clean |
+
+### NOT fixed: the host tier (`-ncmoe 48`) is blocked by a FOURTH defect, and it is not the pair's own
+
+With `--n-cpu-moe 48` the pair aborts ~2 s in, **before** any of the three above can matter:
+
+```
+ggml-cuda.cu: HipVMM Failure: invalid argument     <- ggml_cuda_pool_vmm::alloc -> cuMemSetAccess
+   <- ggml_cuda_mul_mat_q <- mul_mat_id <- compute_forward <- graph_compute
+```
+
+`cuMemSetAccess` is the **P2P grant for the pool's mapping**, and the file already documents this exact refusal for the
+slab: *"the grant is best effort and does get refused on a box whose slabs take nearly all VRAM ... and `cuMemSetAccess`
+returns `invalid argument`"*.  The **slab** handles it (`peer_mask` + `ggml_cuda_slab_peer_copy_ok()`, staging through
+pinned host memory for the pairs the driver refused); the **VMM pool** still `CU_CHECK`s it, so a refused grant is an
+abort.  Measured: the *second* context's pool growth is the one that fails (the decode arm's pools are created after the
+arena is claimed; the first context's grants succeeded earlier in the same run at the same free VRAM, ~2.76 GiB), it is
+the last device of three, and the **pair OFF at the same shape is clean** (100 s of prefill+decode).  A smaller arena
+budget (`MOE_EXPERT_CACHE_MIB=8192`) does not help, so it is not simply "leave more VRAM free".
+
+Two candidate designs, for the maintainer (this needs a decision, not a gate):
+
+* **A -- the slab's own pattern, applied to the pool:** make the grant best-effort, record a per-pool `peer_mask`, and
+  extend the peer-copy predicate (today `ggml_cuda_slab_peer_copy_ok()`) to cover pool ranges so the copies that pair
+  cannot make stage through the host.  Correct and consistent, and it is ~100 lines in the CUDA backend touching a hot
+  predicate.
+* **B -- declare the second context's pool footprint before the arena claims the space**, the way r346 already
+  declared the decode context's graph reserve (`MOE_EXPERT_CACHE_AUX_RESERVE_MIB`): warm the decode arm's pools at
+  context creation so their grants happen while VRAM is still available.  Smaller, but it is a timing cure for a
+  resource that is documented as best-effort.
+
+Doing neither leaves the host tier unusable for the pair, which the maintainer has said must also be validated, so this
+is the next item -- not a deferred nit.  **`TODO` #365** (a meta-aware device copy for the state handover, ~74.6 ms
+serialised today) is *independent* of the three fixes above and still open; it touches the same Meta buffer, so it is
+cleanest done after A or B lands.
+
+### State
+
+`~/llama.cpp` is back on `rdna-boosts` at `8f88fc861` with `build-2ctx` rebuilt from it; the fix lives on
+`crash373-fix` (2 commits on top of the WIP instrumentation commit `ccfd7042f`, which must not travel).  The repro
+harness and the exported patch are in `wip/prefill-decode-arms-followups/repro-373/`.  Nothing was regenerated, no
+block was amended, and nothing was pushed: the block decision is the maintainer's.
+
 ## 261122.032 (no delivery change) -- crash #373 REPRODUCED and diagnosed: the pair mutates ONE cell map from TWO threads with no lock (3 defects, 2 fixed in a scratch tree); the handover's pad-boundary condition is NOT needed
 
 **No delivery patch changed, no tag.**  A debugging session on `TODO` #373 / campaign `W9`, the P0 from `261122.031`.
