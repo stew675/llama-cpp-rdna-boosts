@@ -1,3 +1,28 @@
+## 261122.024 (r343, no delivery change) -- wip/prefill-decode-arms: PROMOTION HANDOVER written -- block 0017 authorised by the maintainer, default OFF / opt-in, gate ladder + release mechanics for a cold session
+
+**No delivery patch changed; nothing in `patches/`, no block created, no tag, nothing pushed.**  Delivery repo
+`prefill-decode-arms` HEAD moves with this entry; `~/llama.cpp` `wip/prefill-overlap` `9b8ac957f` (clean).
+
+The maintainer has authorised the promotion as a **new official block `0017`** ("the two-arm server"), **default OFF
+and opt-in only** (`--prefill-decode-arms-mode` keeps its `off` default; no `auto` flip in this release; spec decoding
+with the arms and the meta-aware device copy stay out as follow-up campaigns).  `wip/prefill-decode-arms/
+PROMOTION-HANDOVER.md` is the job ticket for a fresh cold session: verified starting state (delivery `prefill-decode-
+arms`, fork `wip/prefill-overlap` `9b8ac957f`, feature delta `e6b3cd3e5..` = 15 commits), the block cut (13 IN commits;
+the two measured losers `3f2768131`/`540d442a8` are EXCLUDED and verified independent, which also drops three files
+entirely -> 22 files, not 25), `release.json` expectations (`n_blocks 17 -> 18`, `n_default 18 -> 19`), the two-tier
+gate ladder (4a default-path bit-identity incl. KLD / shipped-path text / the MTP four-axis / ckpt / park / state /
+host-pool / moe-promise / spec-purity / **check-gen-docs** for the three new options; 4b the feature's own oracles --
+coverage 16/16, host-tier 8/8, 3-GPU capped 3/3, reuse strict+parity, faults; 4c the gate *infrastructure* still owed --
+arms-aware fairness criterion, two-sided duty band, multi-turn soak, server-side host-pool arm, dense fork arm), the
+document set the block owes (patches/README, ENVIRONMENT, MANIFESTS, INVARIANTS appended, GREEDY-PURITY, README, TODO,
+WORKLOG, release.json), and the release mechanics (validate-set, fork-refresh --build --gates --push to the personal
+fork with --force-with-lease, tag, off-host container watcher).
+
+Also carried into the ticket: the landmines that cost this campaign sessions (never export `TEMP` to a GPU process;
+`kill -9` on a `timeout` wrapper leaks a server invisible to rocm-smi; `MOE_EXPERT_CACHE_MIB` is per device with a 2048
+floor; Flint needs `-sm relaxed-tensor`; `-sm tensor` + `-ncmoe` + the pair needs the declared reserve, now automatic at
+3584 MiB; the Flash-Next shape is VRAM-marginal and one load in five OOMs at the PLE table).
+
 ## 261122.023 (r343, no delivery change) -- wip/prefill-decode-arms pass 18: "does MTP work now?" -- shipped MTP yes (unchanged), MTP *with the arms* still refused; and the reserve work had a bug that would have cost an MTP run 3.5 GiB (fixed)
 
 **No delivery patch changed; nothing in `patches/`, no block, no tag, nothing pushed.**  `~/llama.cpp`
