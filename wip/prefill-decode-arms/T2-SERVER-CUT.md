@@ -69,7 +69,22 @@ speculator (`spec`), mtmd, TTS, realtime, embeddings, rerank, decision, LoRA, sl
 width** — a 2-row decode graph on 35B-A3B at `-ub 2048` asks 741.47 MiB, so `-ub 512` is the shape that fits on a
 32 GiB card.  `auto` (enable on a measured residency deficit) vs a flag is **the maintainer's call** (README §8 Q1).
 
-## 6. The gate (the two-tier oracle the maintainer approved)
+## 6. The gate (the two-tier oracle the maintainer approved) — **tier 1 is already built**
+
+Run it first, before writing any server code, so the baseline is in hand:
+
+```bash
+cd wip/prefill-decode-arms/arms
+./gate-server-arms.sh --mode ref                               # today's single-context server
+./gate-server-arms.sh --mode arms                              # after the cut (needs --prefill-decode-arms)
+./gate-server-arms.sh --compare ../runs/server-oracle/ref.txt ../runs/server-oracle/arms.txt
+```
+
+**The acceptance values are measured** (`RESULTS-2026-11-22.md` pass 4): product shape, two concurrent ~500-token
+requests, `n_predict 32`, `temp 0`, `seed 42`, both purity pins → SLOT 0 `459865c93d55cbaf`, SLOT 1
+`7dc20b0ce0bac255`, tier-2 census `h=0.6853`.  Those are deterministic across separate server processes, and the
+gate is proven to fire (`-ub 256` moves slot 0 to `182a9fcfe1de6a70`).  The compare asserts the **text** only, with a
+vacuity guard; the census is recorded, never asserted.
 
 1. **Tier 1 — the cross-configuration hash**, which T0 made available on the product shape too: same prompt, same
    seed, `-np 2`, `ROCBLAS_USE_HIPBLASLT=0`, `MOE_EXPERT_HEATMAP=load`, `LLAMA_KV_ALLOC_SHARED` at its default;
