@@ -85,11 +85,12 @@ are open work) and they are written up in one campaign, `wip/prefill-decode-arms
 | **369** | three gates still name the RETIRED Flash-Next `GSQ-IQ3_XXS` tree (`gate-hc-base-copy`, `gate-hc-fusions`, `gate-host-expert-text`) and were deliberately NOT repointed at r346, because each carries recorded text/KLD anchors for that class | tooling (delivery) | **OPEN** -- repoint each AND re-record its anchors on the new class (the STEW675 IQ4_NL tree) in the same change, then run each once. Campaign §G1 |
 | **370** | the pair's cell accounting after `POST /slots/N?action=erase`: with three resident prompts the erases release about **one** prompt's cells (used 8174 -> 5446 of 8192), and parking is declined by the co-owner guard so idle cells legitimately stay resident | correctness / accounting (delivery, block 17) | **OPEN** -- decide whether a slot whose saved state is erased should release all its cells, then turn the recorded number into an assertion in `scripts/gate-arms-soak.sh`. Campaign §W7 |
 | **371** | the prefill/decode **speed balance** is untuned: the pair trades -21..-24 % prefill for a decoder that keeps moving, and the worst in-window gap is 95.5 / 86.5 / 60.5 / 32.8 ms on the recorded shapes; the idea is for the prefill arm to **skip one or more submission opportunities** while a decoder is active, so decode runs a burst of uninterrupted steps | tuning (delivery, block 17) | **OPEN** -- a measurement campaign, not a patch: the gap is four to twenty times SMALLER than the prefill arm's own step, so the mechanism must be identified first, and the deliverable is a Pareto curve for K in {0,1,2,4,8} with a **refutation acceptable** (bound stated up front: >= 50 % fewer worst-gap ms for <= 3 pp prefill). Campaign §W6 |
+| **372** | multi-slot prefill batching: with several slots prefilling, does each slot really re-scan the full weight set per chunk, and can a "layer-major" schedule across slots batch them for better prefill throughput? | tuning / architecture (delivery, block 17) | **OPEN** -- the premise needs checking first: `share_prompt_budget()` already puts **every** active prompt into one step and one ubatch is one graph, so co-batchable slots already share the weight pass and the real cost is the **ubatch SPLIT** (which `-ub` moves: 1440 -> 3041 -> 3884 t/s at 512/2048/4096).  First task is a composition census (`LLAMA_KV_DEBUG_CELLS`), then a two-slot aggregate-scaling table.  **Do NOT merge the two arms' layer passes**: that is the shared step the feature exists to remove.  Campaign §W8 |
 
 
 ## Handle numbering
 
-**New handles append after the highest issued so far, so the next free handle is `#372` (`#364`-`#371` were issued
+**New handles append after the highest issued so far, so the next free handle is `#373` (`#364`-`#372` were issued
 for the block-17 follow-ups at r346); a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
 subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
 
@@ -362,6 +363,37 @@ every `K`, and a stated bound accepted up front (**>= 50 % fewer worst-gap milli
 extra prefill**).  **A flat or dominated curve is a legitimate result**: record it here and in `GREEDY-PURITY.md`, and
 retire this handle rather than shipping a knob with no win.
 
+
+## 372. Multi-slot prefill batching: does each prefilling slot really re-scan the weight set, and would a layer-major schedule help?
+
+**Campaign:** `wip/prefill-decode-arms-followups/` §W8 (the premise check with code references, where the idea has teeth,
+the measurement plan and the acceptance).
+
+**The question (the maintainer's, 2026-11-22):** with several slots prefilling concurrently, "each slot scans through
+the full set of layer weights per ubatch chunk"; what if the prefilling were processed layer by layer with each active
+slot handling its ubatch for the active layer, so the slots share the weight read?
+
+**The premise is mostly already the mechanism.**  `share_prompt_budget()` gives **every** active prompt a share of the
+step's window ("nobody fills n_batch first and every active prompt is admitted to every step"), the resulting batch is
+split into `n_ubatch` chunks, and **each chunk is one graph**, so the linear ops read the weights once for all slots'
+rows in that chunk.  What is left, and is the real cost, is the **split**: a step whose admitted tokens exceed
+`n_ubatch` becomes several chunks, and each re-reads the full weight set.  That is what `-ub` moves, and it is measured:
+the pair's prefill reads **1440 -> 3041 -> 3884 t/s** at `-ub` 512 / 2048 / 4096, with 8192 buying only +8 % and a
+worse decoder tail.
+
+**Where the idea still has teeth** (and this is the work): (a) the fair share *admits* every prompt but does not make
+them *arrive together*, so the composition of a real ubatch has to be censused before any scheduler change is designed;
+(b) a host-expert MoE amortises the **union** of routed experts over the rows in the chunk, which is the one place
+multi-slot batching is superlinear; (c) a cross-chunk layer-major schedule degenerates into a bigger ubatch, because it
+needs several chunks' activations live at once.
+
+**What must NOT be done:** merging the two **arms'** layer passes (decode rows plus prefill rows in one weight read)
+would genuinely halve the weight traffic, and would also put the decode row's latency back inside the prefill layer's
+work, which is exactly the 300-880 ms stall block 17 was built to delete.
+
+**Done =** a composition census, an aggregate-scaling table for a two-slot prefill at four ubatches on a dense and a
+host-expert MoE, and either a scheduler change that keeps more slots in the same ubatch (purity green) or a recorded
+conclusion that the `-ub` knob already captures the available gain.  A refutation is a legitimate result.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

@@ -1,3 +1,38 @@
+## 261122.029 (no delivery change) -- design answer: multi-slot prefill is ALREADY batched per ubatch, so "layer-major across slots" is the `-ub` knob, not a new schedule (`TODO` #372)
+
+**No delivery patch changed, no block created or amended, no tag.**  A design question from the maintainer, answered from
+the code and the measurements, and recorded as campaign item `W8`.
+
+**The question.**  With several slots prefilling concurrently, "each slot scans through the full set of layer weights per
+ubatch chunk"; would processing the prefill **layer by layer**, with each active slot handling its ubatch for the active
+layer, batch them for better prefill throughput?
+
+**The answer: within one step the slots already share the weight pass.**  `share_prompt_budget()`
+(`tools/server/server-context.cpp`, block 16's fair share) gives **every** slot that still has prompt tokens a share of the
+step's window, with its own stated goal: "nobody fills n_batch first and every active prompt is admitted to every step".
+That one `llama_batch` is split into `n_ubatch` chunks, and **each chunk is one graph**, so the linear ops see a single 2-D
+tensor of all rows in it and the weights are read **once per chunk for every slot in it**, not once per slot.  On the arms
+path the chunk cap that could shrink a slot's contribution is inert by construction (`-ib` bounds a step only when a decoder
+is waiting on that arm, and a slot on the decode arm is not).
+
+**What is left is the SPLIT, and that is the `-ub` knob.**  A step whose admitted tokens exceed `n_ubatch` becomes several
+chunks, each re-reading the whole weight set.  Measured on the pair: `-ub` 512 -> 2048 -> 4096 reads **1440 -> 3041 -> 3884
+t/s**, and 8192 buys +8 % more prefill for a worse decoder tail (124.5 vs 95.1 ms).  A layer-major schedule across *chunks*
+would need several chunks' activations live at once, which is the definition of a bigger ubatch, so the idea degenerates
+into the knob the delivery has already tuned.
+
+**Three things the item does owe.**  (1) A **composition census**, because the fair share admits every prompt but does not
+make them *arrive together*: `LLAMA_KV_DEBUG_CELLS=1` prints one line per sequence per ubatch, so grouping those lines says
+whether real ubatches hold one sequence or several; if they hold one, the headroom is scheduler-side.  (2) A **two-slot
+aggregate-scaling table** at four ubatches on a dense model and on a host-expert MoE, where a routed expert read amortises
+the **union** of the experts its rows route to and batching is therefore superlinear.  (3) A recorded **"do not"**: merging
+the two **arms'** layer passes (decode rows plus prefill rows in one weight read) would halve the weight traffic and would
+also put the decode row's latency back inside the prefill layer's work, which is precisely the 300-880 ms stall block 17
+exists to remove.
+
+Record: campaign `wip/prefill-decode-arms-followups/` §W8, `TODO` #372, and the note that W6 and W8 must be measured as ONE
+curve ("worst in-window gap against prefill rate"), since they pull the same axis in opposite directions.
+
 ## 261122.028 (no delivery change) -- block 17's follow-ups become an OPEN campaign, and the prefill/decode balance gets its own handle (`TODO` #371)
 
 **No delivery patch changed, no block created or amended, no tag, `release.json` untouched.**  Housekeeping for the work

@@ -40,6 +40,7 @@ documented "no"; it is also the one the maintainer asked for by name.**
 | **W5** | a **recurrent-only** memory handover | capability | #368 | medium | needs a Mamba-class model |
 | **W6** | the **prefill/decode speed balance**: the prefill arm SKIPS turns while a decoder is active | tuning | #371 | medium | none; measure first (§7.1) |
 | **W7** | the pair's **slot erase and cell accounting** | correctness (narrow) | #370 | small | none |
+| **W8** | **multi-slot prefill batching** ("layer-major" across active prefill slots) | tuning / architecture | #372 | medium | read the premise check first (§11.1) |
 | **G1** | gate debt: three gates still anchored to the retired Flash-Next model | tooling | #369 | small | none |
 
 Ordering suggestion: **G1, W7, W3** (small, close out loose ends) → **W6** (the one the maintainer wants measured) →
@@ -346,7 +347,88 @@ handshake reserved).  The soak asserts the property the clear path exists to pro
 
 ---
 
-## 9. G1 (TODO #369) — gate debt: three gates still anchored to the retired Flash-Next model
+## 9. W8 (TODO #372, NEW) — multi-slot prefill batching: is the prefill arm's ubatch already a multi-slot batch, and what does the ubatch SPLIT cost?
+
+**The question (maintainer, 2026-11-22).**  "If there are concurrent slots actively prefilling, each slot scans through
+the full set of layer weights per ubatch chunk.  What if, with multiple active prefill slots, we processed the prefilling
+layer by layer with each active prefill slot processing its ubatch for the active layer?  Could that give batched or
+concurrent prefilling for better throughput?"
+
+### 9.1 The premise check: within one step, the slots ALREADY share the weight pass
+
+Read the scheduler before designing anything, because the mechanism the question proposes is what the prefill arm
+already does **up to one ubatch**:
+
+* `share_prompt_budget()` (`tools/server/server-context.cpp`, the `wip/session-scheduling` fair share that block 16
+  shipped) splits the step's prompt window max-min across **every slot that still has prompt tokens**, with the stated
+  result: *"nobody fills n_batch first and every active prompt is admitted to every step"*.  So two prefilling slots
+  put rows into **one** `llama_batch`, and the mask machinery keeps each sequence's attention separate.
+* that batch is then split into `n_ubatch`-sized ubatches (`split_equal`), and **each ubatch is one graph**: the linear
+  ops see a single 2-D tensor of all rows in it, so the weight read is **once per ubatch for all slots' rows in it**,
+  not once per slot.
+* on the arms path the chunk cap that would shrink a slot's contribution is **inert by construction**: `-ib` bounds a
+  step only when a **decoder is waiting on this arm**, and a slot on the decode arm does not (the code says so at the
+  `-ib` comment: *"the prefill takes the whole window and `-ib` is inert"*).
+
+So "each slot scans the full weight set per chunk" is **not** what happens for co-batchable slots.  What *is* true, and
+is the real cost, is the **ubatch split**: a step whose admitted tokens exceed `n_ubatch` becomes N ubatches, and each
+one re-reads the whole weight set.  That is the axis `-ub` moves, and it is already measured: `-ub` 512 -> 2048 -> 4096
+lifted the pair's prefill **1440 -> 3041 -> 3884 t/s** on the reference arm, and 8192 buys only a further +8 % with a
+worse decoder tail (124.5 vs 95.1 ms).  A bigger ubatch is exactly "process more slots' rows per weight pass", so the
+proposal, applied inside the prefill arm, **is the ubatch knob**.
+
+### 9.2 Where the idea does have teeth
+
+1. **Prove the co-batching actually happens.**  The fair share *admits* every active prompt but does not make them
+   arrive together: a newcomer is admitted to the next step, and a short prompt finishes while a long one runs.  If in
+   practice the long prompt is alone in its ubatches for most steps, the aggregate gain the idea promises is not being
+   collected, and the fix is scheduler-side (admit together) rather than kernel-side.  **This is cheap to measure and
+   is the first task:** `LLAMA_KV_DEBUG_CELLS=1` prints one line per sequence per ubatch
+   (`[TAG_KV_CELLS] seq=.. n_tok=..`), so grouping those lines by ubatch gives the real composition.
+2. **Host-expert MoE is where batching rows multiplies.**  A routed MoE reads the **union** of the experts its rows
+   route to, so doubling the rows per ubatch does not double the expert traffic; it is the one place where multi-slot
+   batching is superlinear (`GREEDY-PURITY.md` §89/§105: the arena hit rate and the t/s both scale with prompt length).
+   A two-slot concurrent prefill on the host tier is the arm that would show it.
+3. **A cross-chunk layer-major schedule** (for layer L, serve several *chunks* before moving to L+1) would only help if
+   the chunks' activations can be held simultaneously, which is the definition of a bigger `-ub`.  It therefore
+   degenerates into (1) and `-ub`, and the worth-measuring version is "how far does `-ub` scale before activations bind
+   on this card", which the delivery has partly measured (4096 sweet spot; 8192 worse on decode).
+
+### 9.3 Where it must NOT be applied: across the two ARMS
+
+The tempting extension is to do the layer pass once for **both** arms' rows (decode rows plus prefill rows), which would
+genuinely read the weights once instead of twice per layer.  **That is the shared step the feature exists to remove**:
+it puts the decode row's latency back inside the prefill layer's work, which is precisely the 300-880 ms stall block 17
+was built to delete.  Recorded here so it is not proposed as an optimisation later.
+
+### 9.4 Measurement plan
+
+1. **Composition census** (the premise check): two slots with long prompts on the pair, `LLAMA_KV_DEBUG_CELLS=1`, and
+   count distinct `seq=` per ubatch.  If the median ubatch holds one sequence, the headroom is scheduler-side.
+2. **Aggregate scaling**: two concurrent prefills against one at the same total tokens, at `-ub` 512 / 2048 / 4096 /
+   8192, on a dense model and on the host-expert MoE.  Report tokens/s for the *pair of requests* and the per-request
+   TTFT, because a two-slot prefill trades one request's latency for the other's throughput.
+3. **Expert-reuse effect** (§9.2 item 2): the same sweep on `-ncmoe 48` with the arena census, so the claim is a
+   measured hit-rate change, not an inference.
+4. **Purity**: batching more sequences per ubatch changes the ubatch **composition**, which is a numerics carrier
+   (`GREEDY-PURITY.md` §36, §63, §105).  A two-slot concurrent prefill is **not** a text oracle; the oracle is each
+   slot run **alone** at the same shape, compared across the policy change, plus `gate-prefill-fairness.sh --arms-band`
+   and `gate-prefill-logits.sh` for the prefill path.
+5. **Coupling to W6.**  Both items move along the **same Pareto axis**: more prefill work submitted per step (bigger
+   ubatch) versus fewer, shorter prefill steps (turn skipping, smaller ubatch).  Measure them on one curve, not as two
+   independent wins: the deliverable of the pair is "worst in-window gap against prefill rate", and each item is a point
+   on it.
+
+### 9.5 Acceptance ("done")
+
+A composition census showing where the rows actually land, an aggregate-scaling table for a two-slot prefill at four
+ubatches on two model classes, and **either** a scheduler change that keeps more slots in the same ubatch (with purity
+green) **or** a recorded conclusion that the ubatch knob already captures the available gain and no scheduler change is
+owed.  As with W6, **a refutation is a legitimate result**.
+
+---
+
+## 10. G1 (TODO #369) — gate debt: three gates still anchored to the retired Flash-Next model
 
 `gate-park-idle-slots.sh`, `gate-moe-promise.sh` and `gate-host-pool.sh` were **repointed** at r346 to the maintainer's
 quality-first replacement, `Qwen3.8-Flash-Next/STEW675-IQ4_NL/Qwen3.8-Flash-Next-MTP4-IQ4_NL-00001-of-00002.gguf`, and
@@ -364,11 +446,13 @@ rather than a wrong anchor.
 
 ---
 
-## 10. Ordering, dependencies, and the path to a default-on decision
+## 11. Ordering, dependencies, and the path to a default-on decision
 
 1. **G1 + W7 + W3** are small, independent, and close out everything that is currently "recorded but not asserted".
-2. **W6** is next because it is the maintainer's question and because its result changes what "the pair's Pareto point"
-   means for everything after it.  A refutation is a legitimate outcome and should be recorded as such.
+2. **W6 and W8 together**, because they move along the **same Pareto axis** (more prefill work per step versus fewer,
+   shorter prefill steps) and their results only mean something measured as one curve: "worst in-window gap against
+   prefill rate".  W6 is the maintainer's turn-skip idea, W8 is the maintainer's layer-major multi-slot idea; each is a
+   point on that curve, and a refutation of either is a legitimate outcome that gets recorded as such.
 3. **W2** then **W1**: the device copy is a prerequisite in practice for a speculator on a `-sm tensor` hybrid
    (a 75 ms boundary plus a verify batch is a TTFT problem), though not formally blocking.
 4. **W4** whenever a GLM5-Next checkpoint appears; **W5** parked until a Mamba-class model exists on the box.
