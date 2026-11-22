@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 23:41:57 -0600
+Subject: [PATCH] wip/prefill-decode-arms: note that enabling-0002 applies on
+ top of enabling-0001
+
+---
+ wip/prefill-decode-arms/README.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/wip/prefill-decode-arms/README.md b/wip/prefill-decode-arms/README.md
+index 1fbdd2cb..6cb135ef 100644
+--- a/wip/prefill-decode-arms/README.md
++++ b/wip/prefill-decode-arms/README.md
+@@ -68,7 +68,7 @@ a 4932-token prompt and a 128-token decoder, warm reps.  Full detail: the retire
+ | patch | what | state |
+ |---|---|---|
+ | [`enabling-0001-second-context-shared-kv.patch`](enabling-0001-second-context-shared-kv.patch) | `llama_context_params::ctx_other_share_memory` (one bool, default false), the generic `ctx_other` gate in `llama-context.cpp`, `llama_kv_cache::other_coowner` (a second context OWNS cells in the shared map instead of being a read-only mirror), and the plain-hybrid wiring so `qwen35moe` works | **text-verified** on dense 4B and 35B-A3B, including two contexts computing at once (no host tier, and at full residency).  Applies clean to `release.json`'s tree |
+-| [`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch) | **T1, done 2026-11-21**: `llama_memory_recurrent::seq_state_take()` (one batched device-to-device copy of a sequence's recurrent rows + cell metadata, `ggml_backend_tensor_copy_n` over per-layer views), `llama_memory_seq_state_take()` (llama level, hybrid memories), `llama_memory_i::seq_rm_recr()` / `llama_memory_seq_rm_recr()` (drop ONLY the recurrent cells — the shared attention cells must survive), and `LLAMA_STATE_SEQ_FLAGS_RECR_ONLY` (the serialised control arm; the hybrid wrapper skips its attention half on both sides, which is what makes the handover ~50 MiB instead of the whole cache) | **0.5–0.7 ms vs 36 ms serialised**; text oracle holds (see `RESULTS-2026-11-21.md` §1.2).  WIP branch `wip/prefill-overlap`, commit 4 |
++| [`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch) | **T1, done 2026-11-21**: `llama_memory_recurrent::seq_state_take()` (one batched device-to-device copy of a sequence's recurrent rows + cell metadata, `ggml_backend_tensor_copy_n` over per-layer views), `llama_memory_seq_state_take()` (llama level, hybrid memories), `llama_memory_i::seq_rm_recr()` / `llama_memory_seq_rm_recr()` (drop ONLY the recurrent cells — the shared attention cells must survive), and `LLAMA_STATE_SEQ_FLAGS_RECR_ONLY` (the serialised control arm; the hybrid wrapper skips its attention half on both sides, which is what makes the handover ~50 MiB instead of the whole cache) | **0.5–0.7 ms vs 36 ms serialised**; text oracle holds (see `RESULTS-2026-11-21.md` §1.2).  Applies **on top of `enabling-0001`** (it needs the co-owner flag), i.e. WIP branch `wip/prefill-overlap`, commit 4 |
+ 
+ The WIP branch is `wip/prefill-overlap` in `~/llama.cpp` (four commits: shared KV, the recurrent handover, the
+ yield point, the stream-priority plumbing — the last two are recorded losers, kept as the record).
+-- 
+2.56.1
+

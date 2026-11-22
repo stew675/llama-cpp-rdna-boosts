@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 04:14:00 -0600
+Subject: [PATCH] wip/prefill-decode-arms: the T2 server cut, scoped in
+ verified code points (contexts, handover/return, the step to factor,
+ ownership, guards, the two-tier gate)
+
+---
+ wip/prefill-decode-arms/HANDOVER.md      |  2 +-
+ wip/prefill-decode-arms/README.md        |  3 +-
+ wip/prefill-decode-arms/T2-SERVER-CUT.md | 96 ++++++++++++++++++++++++
+ 3 files changed, 99 insertions(+), 2 deletions(-)
+ create mode 100644 wip/prefill-decode-arms/T2-SERVER-CUT.md
+
+diff --git a/wip/prefill-decode-arms/HANDOVER.md b/wip/prefill-decode-arms/HANDOVER.md
+index 851c055c..bf70a5b3 100644
+--- a/wip/prefill-decode-arms/HANDOVER.md
++++ b/wip/prefill-decode-arms/HANDOVER.md
+@@ -21,7 +21,7 @@ started.
+ | task | state |
+ |---|---|
+ | **T1 — the state handover** | **DONE.** `enabling-0002-recurrent-handover.patch`: one sequence's recurrent state moves between the arms **device-to-device in 0.45–0.66 ms** (1.9–2.3 ms on a process's first handover) against **34.5–36.1 ms** for the serialised path (52.7 MiB).  Text-exact on a no-host-tier 4B in every mode/repetition and on the 35B host tier for a single handed-over request (3/3 warm reps) |
+-| **T2 — the server skeleton** | **NEXT.**  Its design is measured outside the server (the instrument below) and written out in code points: `RESULTS-2026-11-21.md` §5.  T0 landed, so the prefill/decode pair can share cells safely |
++| **T2 — the server skeleton** | **NEXT, and scoped**: [`T2-SERVER-CUT.md`](T2-SERVER-CUT.md) has the cut in verified code points (contexts, the handover/return, the step to factor, ownership, guards, the gate).  Its design is measured outside the server (the instrument below) and written out in code points: `RESULTS-2026-11-21.md` §5.  T0 landed, so the prefill/decode pair can share cells safely |
+ | **T3 — the request-boundary handover + its oracle** | The handover is built and exercised in the instrument; **the oracle is now measured, not hypothesised** — see §3, T3, and [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) |
+ | **T4 — the opt-in gate** | Not started; its two rules are now measured (VRAM per slot width, the allocator) |
+ | **T5 — measurement + gates** | Not started (the instrument's numbers are the target T5 must beat) |
+diff --git a/wip/prefill-decode-arms/README.md b/wip/prefill-decode-arms/README.md
+index 35ff2158..dcf602a4 100644
+--- a/wip/prefill-decode-arms/README.md
++++ b/wip/prefill-decode-arms/README.md
+@@ -268,7 +268,8 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
+ |---|---|
+ | this `README.md` | the campaign: idea, established evidence, design, landmines, tasks, gates, open questions |
+ | [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md) | **pass 1**: T1 done and measured, the emulated T2/T3 and the product numbers, the three new landmines, the server cut in code points |
+-| [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) | **pass 2**: the §3.4 residual is two effects (hipBLASLt at full residency, a §89 residency class on the tier); the cell censuses that prove the two-cursor scatter and that the arms match the reference exactly with the pin + one allocation state |
++| [`T2-SERVER-CUT.md`](T2-SERVER-CUT.md) | the server cut, scoped against the real `server-context.cpp` (contexts, handover/return, the step to factor, ownership, guards, the two-tier gate) |
++| [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) | **passes 2-3**: the §3.4 residual is two effects (hipBLASLt at full residency, a §89 residency class on the tier); the cell censuses that prove the two-cursor scatter and that the arms match the reference exactly with the pin + one allocation state |
+ | [`enabling-0001-second-context-shared-kv.patch`](enabling-0001-second-context-shared-kv.patch) | the second context that shares the first one's KV (text-verified, applies to `release.json`'s tree) |
+ | [`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch) | **T1**: the recurrent-state handover, device to device (+ `seq_rm_recr`, `RECR_ONLY`) |
+ | [`arms/two_arms.cpp`](arms/two_arms.cpp), [`arms/build-two-arms.sh`](arms/build-two-arms.sh) | the instrument: two arms, two threads, one KV, a request queue and the handover; references `single` / `batch-pair` / `pf-alone` / `dec-alone` |
+diff --git a/wip/prefill-decode-arms/T2-SERVER-CUT.md b/wip/prefill-decode-arms/T2-SERVER-CUT.md
+new file mode 100644
+index 00000000..560277bf
+--- /dev/null
++++ b/wip/prefill-decode-arms/T2-SERVER-CUT.md
+@@ -0,0 +1,96 @@
++# T2 — the server cut, in verified code points
++
++**Status: NOT STARTED (scope verified 2026-11-22, against `tools/server/server-context.cpp` as it stands on
++`wip/prefill-overlap`).**  Everything T2 depends on has landed: `enabling-0001` (second context, shared KV),
++`enabling-0002` (the recurrent handover), **`enabling-0003` (T0, one allocation owner + the handshake)**.  This file
++is the plan so the next session starts cold but exact; every line number below was read, not remembered.
++
++The design is unchanged from `RESULTS-2026-11-21.md` §5: **one server with two arms**, where the decode arm owns
++its slots' generation and nothing else.  The target is the instrument's own numbers: a decoder getting a token every
++**~50 ms** through a **~2 s** prefill for **≤ ~14 %** of prefill (`RESULTS-2026-11-21.md` §2.1).
++
++## 1. Contexts and batches (the plumbing)
++
++| anchor | what to do |
++|---|---|
++| `llama_context * ctx_tgt` member (~1118), created ~1415-1700 | create **`ctx_dec`** right after it, from the same `llama_model_params`/`cparams`, with `cparams.ctx_other = ctx_tgt`, `ctx_other_share_memory = true`, `n_batch = n_ubatch = <decode width>` (the instrument's `ARMS_B_BATCH`), `n_seq_max = n_parallel`, `n_outputs_max = n_parallel`.  Refuse to create it when the opt-in is off, so a default server allocates nothing new |
++| `struct server_batch` (151), the `batch` member | add **`batch_dec`** — the decode arm builds its own batch and never touches `batch` |
++| `slot.ctx_tgt` wiring (~1829) | add `slot.ctx_dec` and `slot.arm` (`PREFILL`/`DECODE`); default `PREFILL` |
++| `pre_decode()` (4329) — the slot loop at ~4409 | **skip `DECODE` slots entirely**: they are not the prefill arm's work any more |
++| `post_decode()` (5502) — `slot.state = SLOT_STATE_GENERATING` at ~5562 | this is the **handover point**: see §2 |
++
++## 2. The handover and the return
++
++* **Out (prefill → decode)**: at the point `post_decode()` would set `SLOT_STATE_GENERATING`, instead post the
++  slot to the decode arm (a queue + condvar), which executes
++  `llama_memory_seq_state_take(llama_get_memory(ctx_dec), llama_get_memory(ctx_tgt), slot.id)`
++  **under its own step mutex** (never under a lock the prefill thread waits on — measured 2.85 s starvation), then
++  sets `slot.arm = DECODE`.  `llama_memory_alloc_sync(llama_get_memory(ctx_*), "boundary")` at the boundary is the
++  T0 handshake and must return clean.
++* **Back (decode → prefill)**: when the decode arm stops a slot (`n_predict`, EOG, abort, or a client disconnect),
++  it calls `llama_memory_seq_rm(llama_get_memory(ctx_dec), slot.id, -1, -1)` — **the shared cells are freed once,
++  here** — sets `slot.arm = PREFILL`, and wakes the main loop for `release()` / `send_final_response()`.  The decode
++  arm does **not** own a response's lifecycle; it produces tokens.
++* **Ordering rule (hard-won, `RESULTS-2026-11-22.md` pass 3 §3)**: the prefill arm must wait for a posted handover
++  to complete before it starts the next prompt on that memory, or the take reads metadata a live prefill is
++  writing — that silently changes the next prompt's recurrent cell and the reply's text.
++
++## 3. The decode step (what to factor)
++
++`post_decode()`'s per-slot work — `common_sampler_sample(slot.smpl.get(), ctx, i)`, the stop conditions, the
++`generated`/stream emit, and the metrics — must become **one function taking an explicit context + batch + slot**, so
++the two arms share it:
++
++```
++slot_step(llama_context * ctx, server_batch & batch, server_slot & slot, int32_t i)   // samples, emits, stops
++```
++
++The decode arm's loop is then: for each `DECODE` slot, add one token (`slot.pending`, `slot.pos`) to `batch_dec`,
++`llama_process(ctx_dec, LLAMA_PROCESS_TYPE_DECODE, ...)`, then `slot_step(ctx_dec, batch_dec, slot, i)` per row.
++**One token per active slot in one batch** — that is what keeps ITL flat (`RESULTS-2026-11-21.md` §2).
++
++## 4. Ownership (the invariants the thread split must not break)
++
++* **Main thread only**: `slots[]`, `batch`, `ctx_tgt`, `spec`, `checkpoints`, the prompt cache, mtmd, TTS, realtime,
++  embeddings/rerank/decision, LoRA application, `send_final_response()`.
++* **Decode thread only**: `ctx_dec`, `batch_dec`, the `DECODE` slots' `generated`/stream path.
++* A slot is owned by exactly one arm at a time → **a per-slot mutex** (or the queue's ordering) covers the transition;
++  the decode arm never calls `prompt_save`/`prompt_load`, `common_speculative_*`, or anything in the main-thread list.
++* `llama_memory_seq_rm` on the decode arm frees the *shared* attention cells, so the main thread must not batch that
++  slot again until the return is observed — the arm flag is the handshake, and the main loop's slot loop must read it
++  under the slot mutex.
++
++## 5. Guards (the opt-in gate, T4)
++
++Refuse `--prefill-decode-arms` (working name; the flag and its default are a maintainer decision) when any of: a
++speculator (`spec`), mtmd, TTS, realtime, embeddings, rerank, decision, LoRA, sleep/wake (`--sleep-idle`), or
++`n_parallel < 2` is in play.  `-np 1` stays single-context.  The VRAM rule is measured
++(`RESULTS-2026-11-21.md` §3.2): the pair needs the arena **+ one prefill graph + one decode graph per admitted slot
++width** — a 2-row decode graph on 35B-A3B at `-ub 2048` asks 741.47 MiB, so `-ub 512` is the shape that fits on a
++32 GiB card.  `auto` (enable on a measured residency deficit) vs a flag is **the maintainer's call** (README §8 Q1).
++
++## 6. The gate (the two-tier oracle the maintainer approved)
++
++1. **Tier 1 — the cross-configuration hash**, which T0 made available on the product shape too: same prompt, same
++   seed, `-np 2`, `ROCBLAS_USE_HIPBLASLT=0`, `MOE_EXPERT_HEATMAP=load`, `LLAMA_KV_ALLOC_SHARED` at its default;
++   `--prefill-decode-arms` must read **byte-identical** text to the single-context server, for both slots, over
++   ≥ 3 warm request pairs.  `llama_memory_alloc_sync()` must be clean at every request boundary.
++2. **Tier 2 — KLD + the residency census**: `scripts/gate-prefill-logits.sh` for the prefill path, plus the
++   `MoE expert cache: h=…` census reported (not asserted) — the §89 hazard is a risk for shapes this campaign has
++   not run.
++3. Server-side gates that follow from the touched code: `scripts/gate-prefill-fairness.sh` +
++   `scripts/gate-prefill-duty.sh` (admission is now the prefill arm's alone), `scripts/gate-park-idle-slots.sh` if
++   slot parking is reached, `scripts/gate-ckpt-reuse.sh` if a checkpoint crosses the arms,
++   `scripts/check-gpu-faults.sh` on **every** arm (a two-arm race shows as a fault, not as a wrong token).
++4. The measurement of record: the retired campaign's `arms/smooth.py` (`itl_d_p50`/`itl_d_p95` inside the prefill
++   window, `pf_tps`), against its baseline table.
++
++## 7. What NOT to do (each of these cost a session already)
++
++* Do not put the take (or the handover) under a lock the prefill thread waits on while the decoder steps: post it.
++* Do not let the prefill arm start the next prompt before a posted take completed.
++* Do not run **two decode** contexts (the decode-band `GGML_MOE_DEVREMAP` map is per table, per process — pass 10 of
++  the retired campaign).
++* Do not re-enable the per-gather yield hook, a rate gate or stream priority on the hot path: all three are measured
++  losers (`archive/work/prefill-transfer-overlap/RESULTS-2026-11-20.md` pass 12).
++* Do not size the decode context for prefill (`ARMS_B_BATCH`-style widths only), and do not assume `-ub 2048` fits.
+-- 
+2.56.1
+

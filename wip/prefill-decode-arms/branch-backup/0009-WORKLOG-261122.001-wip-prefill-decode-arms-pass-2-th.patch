@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 03:55:17 -0600
+Subject: [PATCH] =?UTF-8?q?WORKLOG=20261122.001:=20wip/prefill-decode-arms?=
+ =?UTF-8?q?=20pass=202=20--=20the=20residual=20is=20two=20effects=20(hipBL?=
+ =?UTF-8?q?ASLt=20at=20full=20residency,=20a=20=C2=A789=20residency=20clas?=
+ =?UTF-8?q?s=20on=20the=20tier),=20the=20two-cursor=20scatter=20measured?=
+ =?UTF-8?q?=20directly;=20no=20delivery=20change?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ WORKLOG.md | 58 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/WORKLOG.md b/WORKLOG.md
+index 8438a676..0cf223ce 100644
+--- a/WORKLOG.md
++++ b/WORKLOG.md
+@@ -1,3 +1,61 @@
++## 261122.001 (r341, no delivery change) -- wip/prefill-decode-arms pass 2: the campaign's "residual" is TWO effects (the hipBLASLt path at full residency, a GREEDY-PURITY §89 residency class on the tier), and the two-cursor finding is confirmed by direct cell census
++
++**No delivery patch changed, no block created or amended, no tag** -- `patches/`, `release.json` and the block
++structure are untouched.  WIP-only: two env-gated diagnostics on the branch `wip/prefill-overlap` in
++`~/llama.cpp` (commit `c49584c60`), a logits-dump knob in the campaign instrument, and the campaign record.
++Full record: [`wip/prefill-decode-arms/RESULTS-2026-11-22.md`](wip/prefill-decode-arms/RESULTS-2026-11-22.md)
++(raw arms + `compare.py` in `wip/prefill-decode-arms/runs/diag-cells-2611/`).
++
++### 1. The instrument that was missing
++
++`LLAMA_KV_DEBUG_CELLS=1` -- one line per ubatch/sequence: the cells `find_slot()` handed out (as runs), the
++cache's used extent, and the per-context cursor the scan started from.  `LLAMA_RS_DEBUG_CELLS=1` -- the recurrent
++metadata (`head/n/min/max/rs_z/used`, per cell `pos/src/src0/tail/seq ids`), also printed for a take's destination
++rows.  Both diagnostic only, `getenv()` once, no behaviour change.  `LLAMA_KV_CACHE_DEBUG=3` already prints the
++whole cell map, which is 64+ lines per ubatch and cannot be diffed; these are one line and are what settled this.
++`ARMS_LOGITS_DIR=<dir>` in `arms/two_arms.cpp` dumps every sampled row as raw f32 plus a sha256/argmax/top-5
++manifest, so two arms' numerics can be compared row by row (480 rows per arm on the campaign's scenario).
++
++### 2. The residual (pass 1's §3.4 item 3) is two effects, and neither is the design
++
++2 x 2 over `ROCBLAS_USE_HIPBLASLT=0` and `ARMS_RESET_CACHE=1`, full residency, 2 reps, reference
++`b0281be7c5a6` / `d5083bd41b4c`:
++
++| pin | reset | R0 | R1 |
++|---|---|---|---|
++| no | yes | match x4 | rep 0 match, reps 1-3 `b79e73e3fe9f` |
++| **yes** | **yes** | match | **match** (480/480 logits rows, `max|d| = 0`) |
++| yes | no | rep 1 `e05c6e16a136` | rep 1 `abe253ea957a` |
++| no | no | rep 1 `e05c6e16a136` | rep 1 `abe253ea957a` |
++
++* **The pin owns `b79e73e3fe9f`.**  Without it the divergent row is **R1's own prefill last row** (`req 1, step 0`,
++  `max|d| = 2.39`, `mean|d| = 0.35`, same argmax) appearing only after ctx B's first decode and stable afterwards --
++  so neither the handover, nor R1's recurrent tail, nor `src0`/`rs_z` is involved.  Pass 1's full-residency oracle
++  block omitted `ROCBLAS_USE_HIPBLASLT=0` (r310 requires it); that omission manufactured the "residual".
++* **The allocation state owns `e05c6e16a136`/`abe253ea957a`.**  With one allocation state the arms' KV cell census is
++  **identical to the single-context reference** (0 of 243 lines, both shapes, every rep); without it **192 of 243**
++  differ and a warm rep places a decode token in cell **0** while the sequence's prompt sits in 512-1023 (a scatter,
++  not a corruption: cell 0 is empty there, so the scan takes it legally).  That is §3.4's two-cursor finding,
++  measured directly, and it is T0's justification.
++* **On the product shape the pinned arms still read `b79e73e3fe9f`** (reps 1-3, stable) while `batch-pair` is stable
++  at `d5083bd41b4c`, and the two runs' own residency censuses differ (`h=0.8161` vs `h=0.8172`, fills 35014 vs
++  34984) -- the §89 class.  So pass 1's "the host tier is refuted" is itself refuted: what full residency reproduced
++  was the hipBLASLt instance.
++
++### 3. What it changes for the campaign
++
++* **T3's oracle is now measured**: a cross-configuration greedy hash **is** available at full residency /
++  no-host-tier with the hipBLASLt pin **and one allocator** (pass 2 obtained it with `ARMS_RESET_CACHE` standing in
++  for T0); on a partial arena the verdict stays KLD (`scripts/gate-prefill-logits.sh`) plus text compared within one
++  residency class.
++* **`ROCBLAS_USE_HIPBLASLT=0` on every text arm, full residency included** -- the campaign's own reproduce block is
++  corrected in place.
++* T0 (one allocator for the co-owner pair) is unchanged in kind and stronger in degree; **its artifact and shape are
++  awaiting the maintainer** (`wip/prefill-decode-arms/README.md` §8 Q1, HANDOVER §8).
++* **Proposed, not applied**: a line in `GREEDY-PURITY.md` §44 that the hipBLASLt choice can change **mid-process**
++  when a second context/stream first runs (a per-process text comparison is not a purity guarantee).  That is a
++  rulebook change and is left for the maintainer's decision; until then the fact lives in the campaign record.
++
+ ## 261121.023 (r341, no delivery change) -- wip/prefill-decode-arms pass 1: the slot HANDOVER exists (T1, 0.5-0.7 ms device-to-device against 36 ms serialised) and is text-exact; the emulated two-arm server reproduces the campaign's physics; three new landmines, one a blocker
+ 
+ **No delivery patch changed, no block created or amended, no tag** -- `patches/`, `release.json` and the block
+-- 
+2.56.1
+

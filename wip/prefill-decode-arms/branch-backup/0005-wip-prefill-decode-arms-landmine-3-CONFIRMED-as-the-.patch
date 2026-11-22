@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 03:34:57 -0600
+Subject: [PATCH] wip/prefill-decode-arms: landmine 3 CONFIRMED as the two
+ allocation cursors, and the fix is one allocator (prefill reserves, decode
+ consumes)
+
+ARMS_RESET_CACHE=1 wipes the cell metadata and both per-context cursors at each rep boundary.  With that, the
+first request is byte-identical to the single-context reference in every rep, on both the host tier (arena 5000)
+and at full residency, and the second request's residual difference collapses into one stable value (rep 1 ==
+rep 2).  So the carrier of the warm-rep divergence is the two independent v_heads cursors over the shared cells
+-- the same defect class as the double-allocation hazard.
+
+Design instruction recorded: one allocator for the co-owner pair.  The PREFILL arm reserves a slot's cell run at
+the handover and publishes it; the DECODE arm consumes the reservation and never searches or advances the shared
+cursor (llama_kv_cache::state_read_sinfo(..., sinfos_in) is the existing machinery for a caller-chosen layout).
+The take is NOT the setup: it moves the recurrent rows and touches no KV cell, so moving it to the prefill
+thread alone changes nothing -- but with a reservation the decode arm does no allocation at all, so there is no
+lock on its hot path (a direct mutex take starves the prefill for 2.85 s).  Residual: the second concurrent slot
+is now deterministic but still different warm; the next instrument is printing the cell indices per request.
+---
+ WORKLOG.md                                    | 22 +++++---
+ wip/CAMPAIGNS.md                              |  2 +-
+ wip/prefill-decode-arms/README.md             | 32 ++++++++----
+ wip/prefill-decode-arms/RESULTS-2026-11-21.md | 51 ++++++++++++++++++-
+ wip/prefill-decode-arms/arms/two_arms.cpp     |  9 ++++
+ 5 files changed, 95 insertions(+), 21 deletions(-)
+
+diff --git a/WORKLOG.md b/WORKLOG.md
+index a4e9ccb0..8438a676 100644
+--- a/WORKLOG.md
++++ b/WORKLOG.md
+@@ -57,13 +57,21 @@ prefill** (6.75 ms charged per decoder token against the retired campaign's 7.7
+    (no overlap) and the batch width all leave it unchanged, and the **host tier was refuted** -- the 35B-A3B
+    reproduces it at full residency and the dense 4B does not.  Also refuted afterwards: `n_kv` (pinned with
+    `LLAMA_KV_N_PAD_MIN=8192` at `-c 8192`) and the decode context's buffer layout (`ARMS_B_BATCH=512`).  The
+-   leading hypothesis, which fits every row: **the physical KV cell INDICES** -- the KV cells are shared but the
+-   allocation cursor (`v_heads`) is per-context, so a slot sits in different cells on the two arms, and this
+-   fork's tile-FA decode launcher splits the KV extent by index (`ggml_cuda_fattn_band_wmma_split` /
+-   `parallel_blocks`, the thing `gate-spec-purity.sh` pins).  Consequence: T3's gate must compare two runs with
+-   the same cell layout (or the pair needs ONE allocation cursor, which the allocator fix above wants anyway)
+-   and add the KLD point -- the campaign's original "byte-identical to today's single-context server" is not
+-   available as a hash comparison on an MoE model.
++   leading hypothesis was **the two allocation cursors**: the KV cells are shared but `v_heads` is per-context,
++   so a slot sits in different cells on the two arms.  **Then CONFIRMED** with a reset arm
++   (`ARMS_RESET_CACHE=1`: wipe the cell metadata + both cursors at each rep boundary, nothing live there): the
++   first request becomes **byte-identical to the single-context reference in every rep, on both the host tier
++   and at full residency**, and the second request's residual difference collapses to one stable value (no
++   longer run-to-run).  Design instruction: **ONE allocator for the pair -- the prefill arm reserves a slot's
++   cell run at handover and publishes it, the decode arm consumes it and never searches or advances the shared
++   cursor** (removes this class, removes the double-allocation hazard above, and takes a `find_slot()` scan off
++   the decoder's hot path; `llama_kv_cache::state_read_sinfo(..., sinfos_in)` is the existing machinery for a
++   caller-chosen layout).  The **take is not the setup** -- it moves the recurrent rows and touches no KV cell,
++   so moving it to the prefill thread alone would change nothing; the prefill owns the allocation, the decode
++   arm still applies the publish (a posted message -- a direct mutex take starves the prefill for 2.85 s).
++   Residual: the second concurrent slot still reads one stable-but-different value warm (deterministic now, so
++   it is findable by printing the cell indices).  T3's gate compares runs with the same cell layout and adds the
++   KLD point.
+ 
+ ### 4. Also recorded (not fixed, not validated)
+ 
+diff --git a/wip/CAMPAIGNS.md b/wip/CAMPAIGNS.md
+index 2ef6a277..edddbab9 100644
+--- a/wip/CAMPAIGNS.md
++++ b/wip/CAMPAIGNS.md
+@@ -55,7 +55,7 @@ is the signature of a stub, not of a campaign.
+ 
+ | directory | what | status |
+ |---|---|---|
+-| [`prefill-decode-arms/`](prefill-decode-arms/README.md) | **one prefill arm and one decode arm, both live on one GPU.**  `llama-server` today runs ONE context on ONE thread and builds ONE batch per step, so a prompt and a reply take turns inside the same graph and the decoder inherits the whole prefill step as its inter-token latency.  Instead: a **prefill arm** (own thread, own context, multiplexing the admitted prompt slots with block 16's existing admission policy) and a **decode arm** (own thread, own context, continuous batching of the generating slots), both live, the GPU scheduling them, and a slot crossing between them only at a **request boundary**.  Every number behind this is measured in the retired [`prefill-transfer-overlap`](../archive/work/prefill-transfer-overlap/README.md): two contexts free-running read decoder p95 **50 ms** during a 2.27 s prefill for a prefill cost of **-11.3 %**, against the shipped duty cycle's **519-568 ms at -30 %** — and every host-side policy on top (rate gate, per-gather yield, stream priority) is neutral or worse, so the design deliberately has **no policy in the hot path**.  Bounded to a **residency-deficient host-expert tier** (zero window at full residency) | **OPEN — pass 1 done (2026-11-21), T1 CLOSED, nothing in `patches/`.**  [`RESULTS-2026-11-21.md`](prefill-decode-arms/RESULTS-2026-11-21.md): the **recurrent-state handover** exists (`enabling-0002-recurrent-handover.patch`, **0.5-0.7 ms device-to-device** against 36 ms serialised) and its text oracle holds on a no-host-tier model in every mode/repetition and on the 35B host tier for a single handed-over request (3/3 warm reps).  T2/T3 are **emulated outside the server** (`arms/two_arms.cpp`: two contexts, one KV, two threads, a request queue, the handover at the request boundary) and reproduce the physics: **38 decoder tokens through a 2.08 s prefill at ITL p50 53.7 / p95 71.6 ms for +14.1 % prefill** (6.75 ms charged per decoder token).  Three new landmines, one a blocker: **the shared KV's cell allocator is not concurrency-safe** (`find_slot` searches from `v_heads`, `apply_ubatch` advances it afterwards — two arms can be handed the same cells); the second arm's VRAM is a graph reserve **per active-slot width** (741 MiB for 2 rows, so arena 5000 + `-ub 2048` does not fit on a 32 GiB card); and **a 2-slot two-arm decode is not text-stable across warm reps** (cold rep matches the sequential reference, warm ones do not — and the host tier, `n_kv` and the decode context's buffer layout were ALL refuted; the leading hypothesis is the physical KV cell indices -- a per-context allocation cursor feeding an index-dependent tile-FA split), so T3's oracle must compare runs with the same cell layout and add KLD.  Next: the allocator fix (T0), then the server cut (the code points are in the results file §5) |
++| [`prefill-decode-arms/`](prefill-decode-arms/README.md) | **one prefill arm and one decode arm, both live on one GPU.**  `llama-server` today runs ONE context on ONE thread and builds ONE batch per step, so a prompt and a reply take turns inside the same graph and the decoder inherits the whole prefill step as its inter-token latency.  Instead: a **prefill arm** (own thread, own context, multiplexing the admitted prompt slots with block 16's existing admission policy) and a **decode arm** (own thread, own context, continuous batching of the generating slots), both live, the GPU scheduling them, and a slot crossing between them only at a **request boundary**.  Every number behind this is measured in the retired [`prefill-transfer-overlap`](../archive/work/prefill-transfer-overlap/README.md): two contexts free-running read decoder p95 **50 ms** during a 2.27 s prefill for a prefill cost of **-11.3 %**, against the shipped duty cycle's **519-568 ms at -30 %** — and every host-side policy on top (rate gate, per-gather yield, stream priority) is neutral or worse, so the design deliberately has **no policy in the hot path**.  Bounded to a **residency-deficient host-expert tier** (zero window at full residency) | **OPEN — pass 1 done (2026-11-21), T1 CLOSED, nothing in `patches/`.**  [`RESULTS-2026-11-21.md`](prefill-decode-arms/RESULTS-2026-11-21.md): the **recurrent-state handover** exists (`enabling-0002-recurrent-handover.patch`, **0.5-0.7 ms device-to-device** against 36 ms serialised) and its text oracle holds on a no-host-tier model in every mode/repetition and on the 35B host tier for a single handed-over request (3/3 warm reps).  T2/T3 are **emulated outside the server** (`arms/two_arms.cpp`: two contexts, one KV, two threads, a request queue, the handover at the request boundary) and reproduce the physics: **38 decoder tokens through a 2.08 s prefill at ITL p50 53.7 / p95 71.6 ms for +14.1 % prefill** (6.75 ms charged per decoder token).  Three new landmines, one a blocker: **the shared KV's cell allocator is not concurrency-safe** (`find_slot` searches from `v_heads`, `apply_ubatch` advances it afterwards — two arms can be handed the same cells); the second arm's VRAM is a graph reserve **per active-slot width** (741 MiB for 2 rows, so arena 5000 + `-ub 2048` does not fit on a 32 GiB card); and **a 2-slot two-arm decode is not text-stable across warm reps** (cold rep matches the sequential reference, warm ones do not — and the host tier, `n_kv` and the decode context's buffer layout were ALL refuted, and a reset-cursor arm CONFIRMED the carrier: the two per-context allocation cursors over the shared cells (`v_heads` is per-context).  Design instruction: ONE allocator for the pair -- the prefill arm reserves a slot's cell run and the decode arm consumes it, so the decoder never searches or advances the shared cursor; that also removes the double-allocation hazard.  T3's oracle then compares runs with the same cell layout and adds KLD.  Next: the allocator fix (T0), then the server cut (the code points are in the results file §5) |
+ | [`kv-residency-cleanup/`](kv-residency-cleanup/README.md) | the **residue** of the KV-residency campaign (`TODO` **#118**, archived as [`archive/work/kv-residency/`](../archive/work/kv-residency/CLOSEOUT.md)): the residency gate (`P0` — **BUILT 2026-11-01**, `scripts/gate-kv-residency.sh`), O1's go/no-go, a window for a *separate* draft model, a pool-size policy above ~200k, and the close-outs those imply | **OPEN — decisions, no new mechanism.**  Goals A (window), B (attendance pool) and C (MTP draft window) all ship in block 15 (r178/r190/r193, +r196/r197); `TODO` #121-#125, #129 and #122 are closed; #124 (the `-sm tensor` window) shipped in r204 and the missing residency gate (P0) landed in r206 as repo tooling, so what is left here is O1, the separate-draft window, the pool-size policy and the close-outs |
+ | [`moe-cpu-overlap/`](moe-cpu-overlap/README.md) | CPU/GPU expert-pool overlap in the Strata shape (`TODO` **#36**, retired r144) | **RETAINED DELIBERATELY — do not delete.**  The campaign closed on 2026-10-26 with a measured refutation (the MoE miss traffic is 0.1-0.4 % of a decode token at the delivered arena, 7 % at the 2 048 MiB/device floor), and this directory is kept *in `wip/`* on the maintainer's instruction (2026-10-29) as the record that the investigation happened and was rejected, so it is not repeated.  It is a byte-identical copy of the archived record's `README.md`; the full evidence and `RESOLUTION.md` are in [`archive/work/moe-cpu-overlap/`](../archive/work/moe-cpu-overlap/) |
+ | [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 (`TODO` **#116**) | PARKED (2026-09-26) — rebased and building, fully RDNA4-gated, but **gate 2 failed** (the fp8 4B is 0.69x Q8_0 where cllm had 1.16x, because the delivery's MMB/GEMM work made Q8_0 +32 % and the fp8 WMMA path did not follow).  Resume actions are in `PLAN.md`.  Not closed — paused behind the delivery work |
+diff --git a/wip/prefill-decode-arms/README.md b/wip/prefill-decode-arms/README.md
+index 6cb135ef..ded1665b 100644
+--- a/wip/prefill-decode-arms/README.md
++++ b/wip/prefill-decode-arms/README.md
+@@ -145,14 +145,21 @@ yield point, the stream-priority plumbing — the last two are recorded losers,
+    not `MOE_EXPERT_PREFILL_IN_PLACE`, not the overlap (`ARMS_WAIT_ALL`), not the batch width, and **not the
+    host tier** — the 35B-A3B reproduces it at full residency and the dense 4B does not.  The outcomes come
+    from a small set and the single-context text itself moves with `LLAMA_KV_N_PAD_MIN`, so it is a
+-   graph-bucket / numerics effect, not corrupted state — and `n_kv` (pinned with `LLAMA_KV_N_PAD_MIN`) and the
+-   decode context's buffer layout (`ARMS_B_BATCH=512`) were then eliminated too.  **The leading hypothesis is
+-   the physical KV cell INDICES**: the KV `v_cells` are shared but the allocation cursor (`v_heads`) is
+-   per-context, so a slot sits in different cells on the two arms, and this fork's tile-FA decode launcher
+-   splits the KV extent by index (`ggml_cuda_fattn_band_wmma_split` / `parallel_blocks` — what
+-   `scripts/gate-spec-purity.sh` pins).  T3's text point must therefore compare two runs with the **same cell
+-   layout** (or the pair must share one allocation cursor, which the §3.1 allocator fix wants anyway), plus
+-   `scripts/gate-prefill-logits.sh` (KLD) for the prefill path.
++   graph-bucket / numerics effect, not corrupted state — `n_kv` (pinned with `LLAMA_KV_N_PAD_MIN`) and the
++   decode context's buffer layout (`ARMS_B_BATCH=512`) were then eliminated too.  **CONFIRMED (results file
++   §3.4): it is the two ALLOCATION CURSORS.**  The KV `v_cells` are shared but `v_heads` is per-context, so the
++   two arms place a slot in different cells; give both arms the same allocation state at every rep boundary and
++   the first request becomes **byte-identical to the single-context reference in every rep, on both the host tier
++   and at full residency**.  **Design instruction, not just a diagnosis**: one allocator for the pair — **the
++   prefill arm reserves the slot's cell run at handover and publishes it, the decode arm consumes it and never
++   searches or advances the shared cursor**.  That removes this class, removes the §3.1 double-allocation
++   hazard, and takes a `find_slot()` scan off the decoder's hot path; the machinery to run a batch into a
++   caller-chosen cell set exists (`llama_kv_cache::state_read_sinfo(..., sinfos_in)`, the "mirrored slot layout").
++   Note the **take is not the setup**: it moves the recurrent rows and touches no KV cell, so moving it to the
++   prefill thread alone changes nothing here — what the prefill must own is the *allocation*, while the decode
++   arm still applies the publish (a posted message, never a lock the prefill waits on: a direct mutex take
++   starves the prefill for 2.85 s, results file §2).  Residual: the *second* concurrent slot still reads one
++   stable-but-different value warm (results file §3.4 item 3).
+ 
+ ## 5. The reusable harness
+ 
+@@ -217,9 +224,12 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
+ 4. When this lands it should **retire `LLAMA_SERVER_PREFILL_DUTY` on this path** (keep it as the `F ≈ 0`
+    fallback).  That is a default flip and therefore a maintainer decision at promotion time.
+ 5. **New (2026-11-21): may the allocator fix be its own enabling artifact?**  `RESULTS-2026-11-21.md` §3.1 is a
+-   latent defect in the *shared* cache (reserve-at-`find_slot` or a partitioned scan), reachable only with two
+-   allocating contexts.  It is a prerequisite of T2 and it changes `llama-kv-cache`, so it wants its own small
+-   artifact rather than hiding inside the server cut.
++   latent defect in the *shared* cache, reachable only with two allocating contexts — and §3.4 shows it is also
++   the **text** carrier of the two-arm shape.  Proposed shape (maintainer's call): the co-owner pair gets ONE
++   allocation cursor, with the **prefill arm reserving a slot's cell run and the decode arm consuming it**
++   (`llama_kv_cache` gains a reserve/publish API; the decode side reuses the `sinfos_in` layout the restore path
++   already has).  It is a prerequisite of T2 and it changes `llama-kv-cache`, so it wants its own small artifact
++   rather than hiding inside the server cut.
+ 6. **New: which oracle does the maintainer want for T3?**  §3.3 says a cross-configuration hash is not
+    available on a partial host-expert arena.  Proposed: text at full residency (or no host tier) + KLD on the
+    tier + a same-configuration repetition to catch non-determinism.  Confirm before T2's gate is written.
+diff --git a/wip/prefill-decode-arms/RESULTS-2026-11-21.md b/wip/prefill-decode-arms/RESULTS-2026-11-21.md
+index 15e6bb5f..cc16c8f8 100644
+--- a/wip/prefill-decode-arms/RESULTS-2026-11-21.md
++++ b/wip/prefill-decode-arms/RESULTS-2026-11-21.md
+@@ -211,7 +211,9 @@ its ubatches) and the resulting `get_n_kv()`/`parallel_blocks`, and diff the **l
+ on A and on B.  The fix direction is then either a **shared allocation cursor across the co-owner pair** (one
+ counter for both arms, which the allocator fix of §3.1 wants anyway) or making the FA split index-independent.
+ Until then: **T3's text point must compare two runs of the SAME cell layout** — which is why the campaign's
+-"byte-identical to today's single-context server" is not available as a hash comparison on an MoE model.
++"byte-identical to today's single-context server" is not available as a hash comparison on an MoE model.  §3.4
++then **confirms the cell-index hypothesis** with a reset arm and states the fix (one allocator, the prefill arm
++reserving and the decode arm consuming).
+ 
+ ---
+ 
+@@ -263,6 +265,50 @@ generation and nothing else.
+    / `gate-prefill-duty.sh` (the prefill arm keeps block 16's admission and the duty cycle becomes the `F ≈ 0`
+    fallback).
+ 
++## 3.4 The carrier of §3.3 is the TWO ALLOCATION CURSORS — measured
++
++The leading hypothesis of §3.3 (`v_cells` shared, `v_heads` per-context, so the arms place a slot in different
++cells) was tested by giving every rep the *same* allocation state as rep 0: `ARMS_RESET_CACHE=1` wipes the cell
++metadata and both cursors at the rep boundary (`llama_memory_clear(mem, false)` on both contexts — nothing is
++live there).  Two requests, 3 reps, `ARMS_WAIT_ALL` (no overlap), reference `b0281be7c5a6` / `d5083bd41b4c`
++which `batch-pair` reads in all three reps of both shapes:
++
++| shape | request | rep 0 | rep 1 | rep 2 |
++|---|---|---|---|---|
++| **host tier, arena 5000** (no reset) | R0 512 tok / 192 gen | match | `e05c6e16a136` | `fc7d8e55fd40` |
++| | R1 2048 tok / 48 gen | match | `abe253ea957a` | `d5083bd41b4c` |
++| **host tier, arena 5000, RESET** | R0 | **match** | **match** | **match** |
++| | R1 | match | `b79e73e3fe9f` | `b79e73e3fe9f` |
++| **full residency, RESET** | R0 | **match** | **match** | **match** |
++| | R1 | match | `b79e73e3fe9f` | `b79e73e3fe9f` |
++
++So: **with one allocation state the first request is byte-identical to the single-context reference in every rep,
++on both shapes** — the two independent cursors are the carrier, exactly as the hypothesis said, and the residual
++difference for the *second* request collapses into one stable value (rep 1 == rep 2), i.e. it is a layout/state
++difference and no longer run-to-run non-determinism.
++
++Two consequences, and they are design instructions, not just explanations:
++
++1. **A single allocator for the pair removes this class entirely** — and it is the same change the §3.1 blocker
++   needs.  For the server the shape is: **the prefill arm reserves the slot's cell run at handover and publishes
++   it; the decode arm CONSUMES it and never searches or advances the shared cursor.**  That is one owner for
++   every allocation decision (the layout is then a function of the request sequence alone), no lock on the
++   decoder's hot path (so the "queue depth, not phase" lesson survives), no `find_slot()` scan per decode step,
++   and the double-allocation hazard of §3.1 is gone by construction.  The machinery to run a batch into a
++   caller-chosen cell set already exists: `llama_kv_cache::state_read_sinfo(..., sinfos_in)` — the "mirrored slot
++   layout" path the draft/restore code uses.
++2. **The take is not the setup.**  It moves the recurrent rows and touches **no** KV cell, so moving the take to
++   the prefill thread changes nothing about this.  What the prefill arm must own is the *allocation for the
++   decode arm's future tokens*; what the decode arm must own is the *mutation of its own memory module* at a step
++   boundary (the take's metadata write included).  Concretely: prefill computes the reservation + the state copy
++   on its own stream, **posts** it, and the decode arm applies the publish at its next step boundary — a posted
++   message, never a lock the prefill thread waits on (measured: a direct mutex take starves the prefill arm for
++   **2.85 s**, §2).
++3. Orthogonal residual, and it is the next thread: R1 (the second concurrent slot, whose recurrent tail was moved
++   by a take instead of allocated by its own prefill) still reads `b79e73e3fe9f` warm.  It is now *deterministic*,
++   so it can be found by printing the cell indices (KV and recurrent) each request holds on each arm, and
++   diffing the logits of one token decoded on A and on B.  The `src0`/`rs_z` surface is the first suspect.
++
+ ## Reproduce
+ 
+ The tree must be the WIP branch (4 commits) — `enabling-0001` + `enabling-0002` are the two `src/` commits:
+@@ -298,7 +344,8 @@ ARMS_SCENARIO="4932:32@0" ARMS_MODE=handover ./two_arms -m $M -ngl 99 -ncmoe 40
+ Knobs the instrument adds: `ARMS_MODE` (`single|batch-pair|arms|handover|pf-alone|dec-alone`), `ARMS_SCENARIO`
+ (`<prompt_tokens>:<n_predict>@<admit_ms>,…`), `ARMS_REPS` (warm reps; rep 0 pays the cold arena), `ARMS_B_BATCH`
+ (the decode arm's `n_batch = n_ubatch`), `ARMS_WAIT_ALL=1` (no prefill/decode overlap: the step loop holds until
+-every handover is done), `ARMS_HANDOVER=device|copy`.
++every handover is done), `ARMS_HANDOVER=device|copy`, `ARMS_RESET_CACHE=1` (wipe the cell metadata and both
++allocation cursors at each rep boundary — the §3.4 control: it makes every rep start like rep 0).
+ 
+ ## Files
+ 
+diff --git a/wip/prefill-decode-arms/arms/two_arms.cpp b/wip/prefill-decode-arms/arms/two_arms.cpp
+index 2b4a6416..3ef51485 100644
+--- a/wip/prefill-decode-arms/arms/two_arms.cpp
++++ b/wip/prefill-decode-arms/arms/two_arms.cpp
+@@ -404,6 +404,15 @@ int main(int argc, char ** argv) {
+             printf("REP %d\n", rep);
+         }
+ 
++        // ARMS_RESET_CACHE: wipe the cell metadata and every allocation cursor at the rep boundary, so each rep
++        // starts exactly like rep 0.  Each context owns its OWN cursor (`v_heads`) over the SAME shared cells,
++        // so without this the two arms start a warm rep from two different places -- the single-context modes
++        // have one cursor and therefore one layout per rep.
++        if (getenv("ARMS_RESET_CACHE") && atoi(getenv("ARMS_RESET_CACHE")) != 0) {
++            if (ctx_a) { llama_memory_clear(llama_get_memory(ctx_a), false); }
++            if (ctx_b) { llama_memory_clear(llama_get_memory(ctx_b), false); }
++        }
++
+         // ---------------------------------------------------------------------------------------------
+         // reference modes: everything on ONE context, one request at a time
+         // ---------------------------------------------------------------------------------------------
+-- 
+2.56.1
+

@@ -1,0 +1,1686 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 23:40:15 -0600
+Subject: [PATCH] wip/prefill-decode-arms pass 1: T1 (the slot handover) done
+ and text-exact, the two arms emulated outside the server, three new landmines
+
+T1: enabling-0002-recurrent-handover.patch -- one sequence's recurrent state moves between the two arms
+device-to-device in 0.5-0.7 ms (36 ms serialised, 52.7 MiB through host memory).  Text oracle: exact on a
+no-host-tier 4B in every mode/repetition, and on the 35B host tier for a single handed-over request (3/3 warm
+reps).
+
+The instrument arms/two_arms.cpp is the server's shape without the server (two contexts, one KV, two threads, a
+request queue, the handover at the request boundary) and reproduces the campaign's physics: 38 decoder tokens
+through a 2.08 s prefill at ITL p50 53.7 / p95 71.6 ms for +14.1 % prefill (6.75 ms charged per decoder token,
+against the retired campaign's 7.7 ms at the same arena).
+
+Landmines: (1) the shared KV's cell allocator is not concurrency-safe (find_slot searches from v_heads,
+apply_ubatch advances it afterwards -- two allocating arms can be handed the same cells); (2) the second arm's
+VRAM is a graph reserve per arm AND per active-slot width (741 MiB for 2 rows), so arena 5000 + -ub 2048 does not
+fit on a 32 GiB card; (3) a 2-slot two-arm decode is not text-stable across warm reps -- isolated against the
+handover, DEVREMAP, PREFILL_IN_PLACE, the overlap and the host tier, so T3's gate must pin the shape and add the
+KLD point.
+
+No delivery patch changed, no block created or amended, no tag.  ~/llama.cpp carries the change on the WIP
+branch wip/prefill-overlap only.
+---
+ WORKLOG.md                                    |  80 ++
+ wip/CAMPAIGNS.md                              |   2 +-
+ wip/prefill-decode-arms/README.md             |  71 +-
+ wip/prefill-decode-arms/RESULTS-2026-11-21.md | 255 ++++++
+ wip/prefill-decode-arms/arms/.gitignore       |   1 +
+ .../arms/build-two-arms.sh                    |  25 +
+ wip/prefill-decode-arms/arms/two_arms.cpp     | 742 ++++++++++++++++++
+ .../enabling-0002-recurrent-handover.patch    | 371 +++++++++
+ 8 files changed, 1537 insertions(+), 10 deletions(-)
+ create mode 100644 wip/prefill-decode-arms/RESULTS-2026-11-21.md
+ create mode 100644 wip/prefill-decode-arms/arms/.gitignore
+ create mode 100755 wip/prefill-decode-arms/arms/build-two-arms.sh
+ create mode 100644 wip/prefill-decode-arms/arms/two_arms.cpp
+ create mode 100644 wip/prefill-decode-arms/enabling-0002-recurrent-handover.patch
+
+diff --git a/WORKLOG.md b/WORKLOG.md
+index c9b17353..16661ef7 100644
+--- a/WORKLOG.md
++++ b/WORKLOG.md
+@@ -1,3 +1,83 @@
++## 261121.023 (r341, no delivery change) -- wip/prefill-decode-arms pass 1: the slot HANDOVER exists (T1, 0.5-0.7 ms device-to-device against 36 ms serialised) and is text-exact; the emulated two-arm server reproduces the campaign's physics; three new landmines, one a blocker
++
++**No delivery patch changed, no block created or amended, no tag** -- `patches/`, `release.json` and the block
++structure are untouched.  This is WIP work on the branch `wip/prefill-overlap` in `~/llama.cpp` plus the campaign
++record; the two artifacts are `wip/prefill-decode-arms/enabling-0002-recurrent-handover.patch` (new) and the
++campaign's instrument `wip/prefill-decode-arms/arms/two_arms.cpp` (new).  Full record:
++[`wip/prefill-decode-arms/RESULTS-2026-11-21.md`](wip/prefill-decode-arms/RESULTS-2026-11-21.md).
++
++### 1. T1, the campaign's blocking task, is closed
++
++The KV cells already belong to both arms, so only the **recurrent** (GDN/conv) state has to follow a slot -- and
++the shipped serialised state path already carried exactly that, because `llama_kv_cache::state_write/read` return
++immediately for a co-owner (`other != nullptr`).  What was missing: a way to drop only the recurrent half on the
++arm giving the slot away, and a transfer that does not bounce the rows through host memory.
++
++* `llama_memory_recurrent::seq_state_take()` -- one contiguous destination block via the same `find_slot()`
++  path `state_read_meta()` uses, then **one batched `ggml_backend_tensor_copy_n`** over per-layer `ggml_view_2d`
++  row ranges (memcpy for a host-buffer memory), then the source rows are released.  Semantics are
++  `state_write()`+`state_read()`'s, which the campaign's oracle had already verified.
++* `llama_memory_seq_state_take()` (llama level), `llama_memory_i::seq_rm_recr()` /
++  `llama_memory_seq_rm_recr()` (drop ONLY the recurrent cells -- `llama_memory_seq_rm()` would free the shared
++  attention cells), `LLAMA_STATE_SEQ_FLAGS_RECR_ONLY` (the serialised control arm).
++* **Measured** (1 x R9700, 35B-A3B Q4_K_M, 4932-token prompt): **0.45-0.66 ms** warm / 1.9-2.3 ms on a
++  process's first handover, against **34.5-36.1 ms** for the serialised path (52.7 MiB, ~100 small synchronised
++  tensor copies, latency-bound at ~1.5 GB/s).  The whole state (attention + recurrent) is 66.3 MiB / 44-50 ms.
++* **Text oracle**: identical to the single-context run on a no-host-tier 4B in every mode and repetition
++  (`single` / `batch-pair` / `arms`, 2 reps, both requests), and on the 35B host tier for a **single**
++  handed-over request (3/3 warm reps).
++
++### 2. T2/T3 emulated outside the server, and the physics reproduces
++
++`arms/two_arms.cpp`: two contexts (one KV), two threads, a request queue, a handover at the request boundary,
++one token per active slot in one batch.  Ordering learnt the hard way: the take must be **posted to the decode
++arm** (under its step mutex), never taken by the prefill thread -- a direct mutex take starved the prefill arm
++for 2.85 s behind the decoder's step loop.
++
++35B-A3B, arena 5000, `-c 16384 -b 2048 -ub 512`, warm reps, a 512-token request decoding while a 2048-token
++prompt is prefilled: **38 decoder tokens through a 2.08 s prefill at ITL p50 53.7 / p95 71.6 ms for +14.1 %
++prefill** (6.75 ms charged per decoder token against the retired campaign's 7.7 ms at the same arena;
++`DUTY=0` on the same harness family is one token per prefill step at p95 568 ms).
++
++### 3. Three landmines, and one is a blocker
++
++1. **The shared KV's cell allocator is not concurrency-safe.**  `llama_kv_cache::find_slot()` is `const` and only
++   *searches* from `v_heads`; `apply_ubatch()` advances the cursor afterwards (`head = sinfo.idxs[s].back() +
++   1`).  Between the two the cells are not reserved, so two allocating arms can be handed the same cells --
++   fluent, wrong text, non-deterministically.  `v_heads` is per-context, `v_cells` shared.  The measured arms did
++   not visibly hit it; it must be fixed (reserve at `find_slot` time, or a partitioned per-arm scan range; a
++   mutex across prepare->apply serialises the compute and defeats the feature) before two arms allocate.
++2. **The second arm's VRAM is a graph reserve per arm AND per active-slot width**: 741.47 MiB for a 2-row decode
++   graph on 35B-A3B at `-ub 2048`, on top of the prefill graph.  At arena 5000 / `-c 16384` / `-ub 2048` the pair
++   does not fit on a 32 GiB card (the prefill graph's reserve fails); `-ub 512` does.  The opt-in gate needs that
++   rule, not the campaign's "~600 MiB".
++3. **A cross-configuration greedy hash is not an oracle for the two arms yet.**  The cold rep matches the
++   sequential reference; warm reps do not (nor each other), while the single-context 2-slot reference is stable.
++   Isolated: both handover paths agree, `GGML_MOE_DEVREMAP=0`, `MOE_EXPERT_PREFILL_IN_PLACE=0`, `ARMS_WAIT_ALL`
++   (no overlap) and the batch width all leave it unchanged, and the **host tier was refuted** -- the 35B-A3B
++   reproduces it at full residency and the dense 4B does not.  The outcomes come from a small set and the
++   single-context text itself moves with `LLAMA_KV_N_PAD_MIN`, so it is a graph-bucket / numerics effect (the
++   `LLAMA_KV_N_PAD_*` + §44 family), not corrupted state.  The next instrument is a **logits** diff, stated in
++   the results file §3.3.  Consequence: T3's gate must pin the shape (both arms in one `n_kv` bucket) and add
++   the KLD point -- the campaign's original "byte-identical to today's single-context server" is not available
++   as a hash comparison.
++
++### 4. Also recorded (not fixed, not validated)
++
++`seq_state_take()` sets the destination rows' `src0` as well as `src`: `src0` is what the graph reads
++(`llama_memory_recurrent_context::s_copy`) and `find_slot()` leaves it at `rs_z`, which is the cell itself only
++while nothing else names it as a source.  No observable change on any measured arm; the corresponding change in
++`state_read_meta()` was reverted, because it is the shipped prompt-cache/checkpoint path and no arm here can
++validate it.
++
++### 5. Next, in order
++
++The allocator fix (the campaign's new T0, and open question 5 -- it changes `llama-kv-cache`, so it wants its own
++enabling artifact), the logits diff of §3.3, then the server cut -- the code points are
++`RESULTS-2026-11-21.md` §5: `ctx_dec` beside `ctx_tgt` with `ctx_other_share_memory`, a `slot.arm` flag, the take
++in `post_decode()` posted to the decode thread, the return through `llama_memory_seq_rm(ctx_dec)`, and guards
++that refuse spec/mtmd/TTS/embeddings/LoRA/sleep and `-np 1`.
++
+ ## 261121.022 (r341) -- `TODO` #358 resolved: a re-base rung that lands fewer files is an INSTRUMENT now (`scripts/check-rung-file-sets.py`, gate 38), not a note in a gate table -- zero findings on 68 of 70 release transitions, and the r328 incident reproduced exactly
+ 
+ **No delivery patch changed: `patches/*.patch`, `release.json` (base/tip/tree/counts/hashes) and the block
+diff --git a/wip/CAMPAIGNS.md b/wip/CAMPAIGNS.md
+index 9cbfd25f..f41049d7 100644
+--- a/wip/CAMPAIGNS.md
++++ b/wip/CAMPAIGNS.md
+@@ -55,7 +55,7 @@ is the signature of a stub, not of a campaign.
+ 
+ | directory | what | status |
+ |---|---|---|
+-| [`prefill-decode-arms/`](prefill-decode-arms/README.md) | **one prefill arm and one decode arm, both live on one GPU.**  `llama-server` today runs ONE context on ONE thread and builds ONE batch per step, so a prompt and a reply take turns inside the same graph and the decoder inherits the whole prefill step as its inter-token latency.  Instead: a **prefill arm** (own thread, own context, multiplexing the admitted prompt slots with block 16's existing admission policy) and a **decode arm** (own thread, own context, continuous batching of the generating slots), both live, the GPU scheduling them, and a slot crossing between them only at a **request boundary**.  Every number behind this is measured in the retired [`prefill-transfer-overlap`](../archive/work/prefill-transfer-overlap/README.md): two contexts free-running read decoder p95 **50 ms** during a 2.27 s prefill for a prefill cost of **-11.3 %**, against the shipped duty cycle's **519-568 ms at -30 %** — and every host-side policy on top (rate gate, per-gather yield, stream priority) is neutral or worse, so the design deliberately has **no policy in the hot path**.  Bounded to a **residency-deficient host-expert tier** (zero window at full residency) and it costs ~600 MiB of graph buffers + 126 MiB RS, taken from the expert arena | **OPEN — NEW CAMPAIGN, opened 2026-11-20, nothing implemented.**  The enabling change exists and is text-verified (`enabling-0001-second-context-shared-kv.patch`: a second context sharing the first one's KV; `qwen35moe` included).  **First task: share (or hand over) the hybrid model's RECURRENT state** — a slot cannot cross arms without it.  Then the server skeleton (T2), the boundary handover with a per-request text oracle (T3), the opt-in gate (T4) and the `smooth.py` measurement + gates (T5).  Landmines already measured and written down: two DECODE-band contexts on a partial arena corrupt each other through the per-table, per-process `GGML_MOE_DEVREMAP` map (a prefill+decode pair is safe), the second context's 548-600 MiB does not fit beside an 8 GiB arena on a 32 GiB card, and a cold arena dominates a short prompt.  Open questions for the maintainer: opt-in vs auto, and the duty cycle's retirement on this path |
++| [`prefill-decode-arms/`](prefill-decode-arms/README.md) | **one prefill arm and one decode arm, both live on one GPU.**  `llama-server` today runs ONE context on ONE thread and builds ONE batch per step, so a prompt and a reply take turns inside the same graph and the decoder inherits the whole prefill step as its inter-token latency.  Instead: a **prefill arm** (own thread, own context, multiplexing the admitted prompt slots with block 16's existing admission policy) and a **decode arm** (own thread, own context, continuous batching of the generating slots), both live, the GPU scheduling them, and a slot crossing between them only at a **request boundary**.  Every number behind this is measured in the retired [`prefill-transfer-overlap`](../archive/work/prefill-transfer-overlap/README.md): two contexts free-running read decoder p95 **50 ms** during a 2.27 s prefill for a prefill cost of **-11.3 %**, against the shipped duty cycle's **519-568 ms at -30 %** — and every host-side policy on top (rate gate, per-gather yield, stream priority) is neutral or worse, so the design deliberately has **no policy in the hot path**.  Bounded to a **residency-deficient host-expert tier** (zero window at full residency) | **OPEN — pass 1 done (2026-11-21), T1 CLOSED, nothing in `patches/`.**  [`RESULTS-2026-11-21.md`](prefill-decode-arms/RESULTS-2026-11-21.md): the **recurrent-state handover** exists (`enabling-0002-recurrent-handover.patch`, **0.5-0.7 ms device-to-device** against 36 ms serialised) and its text oracle holds on a no-host-tier model in every mode/repetition and on the 35B host tier for a single handed-over request (3/3 warm reps).  T2/T3 are **emulated outside the server** (`arms/two_arms.cpp`: two contexts, one KV, two threads, a request queue, the handover at the request boundary) and reproduce the physics: **38 decoder tokens through a 2.08 s prefill at ITL p50 53.7 / p95 71.6 ms for +14.1 % prefill** (6.75 ms charged per decoder token).  Three new landmines, one a blocker: **the shared KV's cell allocator is not concurrency-safe** (`find_slot` searches from `v_heads`, `apply_ubatch` advances it afterwards — two arms can be handed the same cells); the second arm's VRAM is a graph reserve **per active-slot width** (741 MiB for 2 rows, so arena 5000 + `-ub 2048` does not fit on a 32 GiB card); and **a 2-slot two-arm decode is not text-stable across warm reps** (cold rep matches the sequential reference, warm ones do not — and the host tier was refuted: the 35B-A3B reproduces it at full residency and the single-context text itself moves with `LLAMA_KV_N_PAD_MIN`, so it is a graph-bucket/numerics effect), so T3's oracle must pin the shape and add KLD.  Next: the allocator fix (T0), then the server cut (the code points are in the results file §5) |
+ | [`kv-residency-cleanup/`](kv-residency-cleanup/README.md) | the **residue** of the KV-residency campaign (`TODO` **#118**, archived as [`archive/work/kv-residency/`](../archive/work/kv-residency/CLOSEOUT.md)): the residency gate (`P0` — **BUILT 2026-11-01**, `scripts/gate-kv-residency.sh`), O1's go/no-go, a window for a *separate* draft model, a pool-size policy above ~200k, and the close-outs those imply | **OPEN — decisions, no new mechanism.**  Goals A (window), B (attendance pool) and C (MTP draft window) all ship in block 15 (r178/r190/r193, +r196/r197); `TODO` #121-#125, #129 and #122 are closed; #124 (the `-sm tensor` window) shipped in r204 and the missing residency gate (P0) landed in r206 as repo tooling, so what is left here is O1, the separate-draft window, the pool-size policy and the close-outs |
+ | [`moe-cpu-overlap/`](moe-cpu-overlap/README.md) | CPU/GPU expert-pool overlap in the Strata shape (`TODO` **#36**, retired r144) | **RETAINED DELIBERATELY — do not delete.**  The campaign closed on 2026-10-26 with a measured refutation (the MoE miss traffic is 0.1-0.4 % of a decode token at the delivered arena, 7 % at the 2 048 MiB/device floor), and this directory is kept *in `wip/`* on the maintainer's instruction (2026-10-29) as the record that the investigation happened and was rejected, so it is not repeated.  It is a byte-identical copy of the archived record's `README.md`; the full evidence and `RESOLUTION.md` are in [`archive/work/moe-cpu-overlap/`](../archive/work/moe-cpu-overlap/) |
+ | [`fp8-support/`](fp8-support/README.md) | native FP8 E4M3 for RDNA4 (`TODO` **#116**) | PARKED (2026-09-26) — rebased and building, fully RDNA4-gated, but **gate 2 failed** (the fp8 4B is 0.69x Q8_0 where cllm had 1.16x, because the delivery's MMB/GEMM work made Q8_0 +32 % and the fp8 WMMA path did not follow).  Resume actions are in `PLAN.md`.  Not closed — paused behind the delivery work |
+diff --git a/wip/prefill-decode-arms/README.md b/wip/prefill-decode-arms/README.md
+index 5ac7a587..aaf59b35 100644
+--- a/wip/prefill-decode-arms/README.md
++++ b/wip/prefill-decode-arms/README.md
+@@ -1,9 +1,24 @@
+ # prefill-decode-arms — one prefill arm and one decode arm, both live on one GPU
+ 
+-**Status: NEW CAMPAIGN, opened 2026-11-20; nothing implemented, nothing in `patches/`.**  It inherits the
+-conclusion of the retired [`archive/work/prefill-transfer-overlap/`](../../archive/work/prefill-transfer-overlap/README.md)
++**Status: pass 1 done (2026-11-21) — T1 CLOSED, T2/T3 emulated outside the server, three new landmines.
++Nothing in `patches/`.**  See [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md).  It inherits the conclusion of the
++retired [`archive/work/prefill-transfer-overlap/`](../../archive/work/prefill-transfer-overlap/README.md)
+ (it established *what* the win is and *which mechanism* delivers it).  This campaign builds the product.
+ 
++* **T1 (the blocking task) is done**: [`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch)
++  moves one sequence's recurrent state between the two arms **device-to-device in 0.5–0.7 ms** (the serialised
++  path is 36 ms); the text oracle holds byte-for-byte on a no-host-tier model in every mode/repetition, and on
++  the 35B host tier for a single handed-over request (3/3 warm reps).
++* **T2/T3 are emulated, not in the server**: [`arms/two_arms.cpp`](arms/two_arms.cpp) is the server's shape
++  (two contexts, one KV, two threads, a request queue, a handover at the request boundary) and reproduces the
++  campaign's physics — **38 decoder tokens through a 2.08 s prefill at ITL p50 53.7 / p95 71.6 ms** for
++  **+14.1 %** prefill (6.75 ms charged per decoder token, against the retired campaign's 7.7 ms at the same
++  arena).  §5 of the results file is the server cut in code points.
++* **Read the results file before touching this**: §3.1 (the shared KV's cell allocator is not
++  concurrency-safe — a blocker), §3.2 (the second arm's VRAM is a graph reserve *per active-slot width*: 741 MiB
++  for 2 rows, so the pair does not fit at arena 5000 + `-ub 2048`), §3.3 (the 2-slot two-arm text is **not**
++  stable across warm reps on a partial arena — a greedy hash is not a valid oracle on the tier).
++
+ ## 0. The idea, in one paragraph
+ 
+ `llama-server` today runs **one** `llama_context` on **one** thread and builds **one** batch per step, so a
+@@ -53,10 +68,10 @@ a 4932-token prompt and a 128-token decoder, warm reps.  Full detail: the retire
+ | patch | what | state |
+ |---|---|---|
+ | [`enabling-0001-second-context-shared-kv.patch`](enabling-0001-second-context-shared-kv.patch) | `llama_context_params::ctx_other_share_memory` (one bool, default false), the generic `ctx_other` gate in `llama-context.cpp`, `llama_kv_cache::other_coowner` (a second context OWNS cells in the shared map instead of being a read-only mirror), and the plain-hybrid wiring so `qwen35moe` works | **text-verified** on dense 4B and 35B-A3B, including two contexts computing at once (no host tier, and at full residency).  Applies clean to `release.json`'s tree |
+-| (not written) recurrent state | `llama_memory_hybrid`'s **recurrent** memory is not shared: the second context allocates its own 125.6 MiB RS buffer.  Coherent while each sequence stays on one context; **a slot cannot cross arms without it** | **the campaign's first task** |
++| [`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch) | **T1, done 2026-11-21**: `llama_memory_recurrent::seq_state_take()` (one batched device-to-device copy of a sequence's recurrent rows + cell metadata, `ggml_backend_tensor_copy_n` over per-layer views), `llama_memory_seq_state_take()` (llama level, hybrid memories), `llama_memory_i::seq_rm_recr()` / `llama_memory_seq_rm_recr()` (drop ONLY the recurrent cells — the shared attention cells must survive), and `LLAMA_STATE_SEQ_FLAGS_RECR_ONLY` (the serialised control arm; the hybrid wrapper skips its attention half on both sides, which is what makes the handover ~50 MiB instead of the whole cache) | **0.5–0.7 ms vs 36 ms serialised**; text oracle holds (see `RESULTS-2026-11-21.md` §1.2).  WIP branch `wip/prefill-overlap`, commit 4 |
+ 
+-The WIP branch is `wip/prefill-overlap` in `~/llama.cpp` (three commits: shared KV, the yield point, the
+-stream-priority plumbing — the last two are recorded losers, kept as the record).
++The WIP branch is `wip/prefill-overlap` in `~/llama.cpp` (four commits: shared KV, the recurrent handover, the
++yield point, the stream-priority plumbing — the last two are recorded losers, kept as the record).
+ 
+ ## 3. The design to build
+ 
+@@ -113,6 +128,26 @@ stream-priority plumbing — the last two are recorded losers, kept as the recor
+ 6. **The `moe_cache_pass_end` boundary is per graph** (`ggml-cuda.cu:9508`), so two arms at once means two
+    graphs' pass boundaries interleave.  Measured harmless for a prefill+decode pair (text identical), but it
+    is the reason landmine 1 exists and it must be re-checked when the decode arm batches many slots.
++7. **The shared KV's cell allocator is NOT concurrency-safe** (found 2026-11-21, `RESULTS-2026-11-21.md`
++   §3.1): `llama_kv_cache::find_slot()` is `const` and only *searches* from `v_heads`; `apply_ubatch()`
++   advances the cursor afterwards (`head = sinfo.idxs[s].back() + 1`).  Between the two the cells are not
++   reserved, so two arms that search from the same cursor can be handed **the same cells** — fluent, wrong
++   text, non-deterministically.  The measured arms did not visibly hit it; **fix it before two arms allocate**
++   (reserve at `find_slot` time, or partition each arm's scan range, or a mutex across prepare→apply which
++   serialises the compute and defeats the feature).
++8. **The second arm's VRAM is a graph reserve per arm AND per active-slot width**: a 2-row decode graph on
++   35B-A3B at `-ub 2048` asks for **741.47 MiB** on top of the 1-row one.  At arena 5000 / `-c 16384` /
++   `-ub 2048` the pair does **not** fit on a 32 GiB card (the *prefill* graph's reserve fails); `-ub 512` does.
++   The opt-in gate needs that rule, not landmine 2's 600 MiB.
++9. **A greedy hash is not an oracle for the two arms yet** (`RESULTS-2026-11-21.md` §3.3): the cold rep matches
++   the sequential reference and the warm ones do not (nor each other), while the single-context 2-slot
++   reference is stable across reps.  Isolated: not the handover (both paths agree), not `GGML_MOE_DEVREMAP`,
++   not `MOE_EXPERT_PREFILL_IN_PLACE`, not the overlap (`ARMS_WAIT_ALL`), not the batch width, and **not the
++   host tier** — the 35B-A3B reproduces it at full residency and the dense 4B does not.  The outcomes come
++   from a small set and the single-context text itself moves with `LLAMA_KV_N_PAD_MIN`, so it is a
++   graph-bucket / numerics effect (the `LLAMA_KV_N_PAD_*` + §44 family), not corrupted state.  T3's gate is
++   therefore: text on a shape with both arms in ONE `n_kv` bucket (a high `LLAMA_KV_N_PAD_MIN`), a
++   same-configuration repetition, and `scripts/gate-prefill-logits.sh` (KLD) for the prefill path.
+ 
+ ## 5. The reusable harness
+ 
+@@ -145,11 +180,12 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
+ 
+ | # | task | why first |
+ |---|---|---|
+-| **T1** | recurrent state: share it (preferred) or hand it over at a slot boundary | without it a slot cannot cross arms, i.e. no server design exists |
+-| **T2** | server skeleton: second context + second thread + routing of decode-only batches to the decode arm; slots pinned to an arm for a request's lifetime | this alone reproduces the measured win (steady ITL during a prefill) |
+-| **T3** | handover at the request boundary, with a text oracle: a request's reply must be byte-identical to today's single-context server | the correctness gate for the whole design |
+-| **T4** | policy + opt-in gate (host tier + residency deficit), and the duty cycle's role on this path | the measured boundary: no window at full residency, so no unconditional default |
++| **T1** | ~~recurrent state: share it (preferred) or hand it over at a slot boundary~~ — **DONE 2026-11-21** as a device-to-device handover (`enabling-0002`), 0.5–0.7 ms, text-verified | — |
++| **T2** | server skeleton: second context + second thread + routing of decode-only batches to the decode arm; slots pinned to an arm for a request's lifetime | this alone reproduces the measured win (steady ITL during a prefill).  The design is now measured outside the server (`RESULTS-2026-11-21.md` §2 + §5's code points) and its cost/VRAM rules are §3.1/§3.2 |
++| **T3** | handover at the request boundary, with a text oracle: a request's reply must be byte-identical to today's single-context server | **the oracle has to be chosen carefully**: it holds on a no-host-tier model and for a single handed-over request on the tier, but a 2-slot arm on a partial arena is not text-stable warm (§3.3) — use a full-residency/no-host-tier text point + KLD on the tier |
++| **T4** | policy + opt-in gate (host tier + residency deficit + the VRAM rule of §3.2), and the duty cycle's role on this path | the measured boundary: no window at full residency, so no unconditional default |
+ | **T5** | measurement with `smooth.py` against the baseline table + the gates (§7) | the campaign's verdict |
++| **T0** | **the shared-KV allocator fix** (`RESULTS-2026-11-21.md` §3.1) | it must land before two arms are allowed to allocate cells, i.e. before T2 runs at `-np 2` |
+ 
+ ## 7. Gates when it becomes code
+ 
+@@ -175,10 +211,27 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
+ 3. **`-np 1`**: leave it single-context (no second context, no 600 MiB) — confirm.
+ 4. When this lands it should **retire `LLAMA_SERVER_PREFILL_DUTY` on this path** (keep it as the `F ≈ 0`
+    fallback).  That is a default flip and therefore a maintainer decision at promotion time.
++5. **New (2026-11-21): may the allocator fix be its own enabling artifact?**  `RESULTS-2026-11-21.md` §3.1 is a
++   latent defect in the *shared* cache (reserve-at-`find_slot` or a partitioned scan), reachable only with two
++   allocating contexts.  It is a prerequisite of T2 and it changes `llama-kv-cache`, so it wants its own small
++   artifact rather than hiding inside the server cut.
++6. **New: which oracle does the maintainer want for T3?**  §3.3 says a cross-configuration hash is not
++   available on a partial host-expert arena.  Proposed: text at full residency (or no host tier) + KLD on the
++   tier + a same-configuration repetition to catch non-determinism.  Confirm before T2's gate is written.
++7. **New: is the 2-slot warm text instability a *bug* or a graph-bucket effect?**  This pass could not settle
++   it (the isolation matrix is in the results file §3.3).  It **refuted** the host-tier explanation (full
++   residency reproduces it), and the single-context text itself moves with `LLAMA_KV_N_PAD_MIN`, so it is a
++   shape/numerics effect of some kind.  Next instrument: a **logits** diff (the same token decoded on A and on
++   B), printing `n_kv`/`used`/recr `head`/`rs_z`/the destination row from both arms, then a high
++   `LLAMA_KV_N_PAD_MIN` to put both arms in one bucket.
+ 
+ ## Files
+ | file | what |
+ |---|---|
+ | this `README.md` | the campaign: idea, established evidence, design, landmines, tasks, gates, open questions |
++| [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md) | **pass 1**: T1 done and measured, the emulated T2/T3 and the product numbers, the three new landmines, the server cut in code points |
+ | [`enabling-0001-second-context-shared-kv.patch`](enabling-0001-second-context-shared-kv.patch) | the second context that shares the first one's KV (text-verified, applies to `release.json`'s tree) |
++| [`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch) | **T1**: the recurrent-state handover, device to device (+ `seq_rm_recr`, `RECR_ONLY`) |
++| [`arms/two_arms.cpp`](arms/two_arms.cpp), [`arms/build-two-arms.sh`](arms/build-two-arms.sh) | the instrument: two arms, two threads, one KV, a request queue and the handover; references `single` / `batch-pair` / `pf-alone` / `dec-alone` |
++| [`runs/2611-arms-35b-arena5000.txt`](runs/2611-arms-35b-arena5000.txt) | the raw 35B arm table behind the results file's §2.1 |
+ | [`../../archive/work/prefill-transfer-overlap/`](../../archive/work/prefill-transfer-overlap/README.md) | the retired campaign: how the win was established, every measured number, and the two policies that lost |
+diff --git a/wip/prefill-decode-arms/RESULTS-2026-11-21.md b/wip/prefill-decode-arms/RESULTS-2026-11-21.md
+new file mode 100644
+index 00000000..b61bdb2a
+--- /dev/null
++++ b/wip/prefill-decode-arms/RESULTS-2026-11-21.md
+@@ -0,0 +1,255 @@
++# 2026-11-21 — pass 1: the handover exists (T1), the harness is the server's shape (T2/T3), and three landmines
++
++**Verdict.**  T1 is **done and measured**: one sequence's recurrent state moves between the two arms
++device-to-device in **0.5–0.7 ms** (36 ms serialised), and the text oracle holds byte-for-byte wherever the
++shape lets it be measured (a no-host-tier model in **all** modes and reps; the campaign's 35B host tier for a
++**single** handed-over request, 3/3 warm reps).  T2/T3 are **emulated outside the server** (a prefill arm and a
++decode arm on their own threads, its own context each, one KV, a request queue and a handover at the request
++boundary) and the campaign's physics reproduces on it.  Three things were found that the campaign did not
++know, and one of them is a hard blocker for the server cut:
++
++1. **The shared KV's cell allocator is not concurrency-safe** (`llama_kv_cache::find_slot` searches from
++   `v_heads` and only `apply_ubatch` advances it — two contexts that both allocate can be handed the same
++   cells).  Measured arms got away with it; it is a *silent wrong answer* class and must be fixed before two
++   arms are allowed to allocate.
++2. **The two-arm VRAM cost is one graph reserve per arm AND per active-slot count** — 741 MiB for a 2-row
++   decode graph on 35B-A3B at `-ub 2048`, on top of the prefill graph.  At arena 5000 / `-c 16384` / `-ub 2048`
++   the pair does **not** fit on a 32 GiB card; `-ub 512` does.
++3. **On a partial host-expert arena the 2-slot two-arm arm is not text-stable across warm reps** (it matches
++   the sequential reference in the cold rep and diverges in the warm ones, both from the reference and from
++   itself), while the single-context 2-slot reference is stable.  Isolated as far as time allowed — and the
++   host tier was then **refuted** as the carrier: the 35B-A3B reproduces it at full residency.  See §3.3
++   (shape/graph-bucket family, not state corruption).  The consequence for the campaign's gates is concrete:
++   **a cross-configuration greedy hash is not a valid oracle for this design yet** — `GREEDY-PURITY.md` §89's
++   rule applies, and the T3 gate needs a pinned shape plus a KLD point.
++
++All arms: 1 × R9700 (gfx1201), ROCm 10.1.0-gfx120X, sequential (never in parallel).  `HIP_VISIBLE_DEVICES=0`.
++Source: the WIP branch `wip/prefill-overlap` in `~/llama.cpp` (built as `build-2ctx`); the two new artifacts are
++[`enabling-0002-recurrent-handover.patch`](enabling-0002-recurrent-handover.patch) (this pass) and
++[`enabling-0001-second-context-shared-kv.patch`](enabling-0001-second-context-shared-kv.patch) (pass 10-13 of
++the retired campaign).  The instrument is [`arms/two_arms.cpp`](arms/two_arms.cpp) (`arms/build-two-arms.sh`).
++
++---
++
++## 1. T1 — the handover
++
++### 1.1 What it is
++
++The KV cells already belong to both arms (the co-owner work of `enabling-0001`), so the only state that has to
++follow a slot is the **recurrent** state (GDN conv + SSM, `llama_memory_recurrent`).  The shipped serialised
++path (`llama_state_seq_get_data_ext` + `set_data_ext`) already carried exactly that, because
++`llama_kv_cache::state_write/read` **return immediately when `other != nullptr`** (`llama-kv-cache.cpp`,
++`[TAG_KV_CACHE_SHARE_CELLS]`) — i.e. a co-owner context contributes no KV bytes to the stream.  So T1 was
++"already possible"; what was missing was (a) a way to drop only the *recurrent* half on the arm that gives the
++slot away, and (b) a transfer that does not go through host memory.
++
++| what | measured |
++|---|---|
++| `llama_state_seq_get_size_ext(..., RECR_ONLY)` | **52 691 548 B (50.3 MiB)** at a 4932-token prompt (35B-A3B) |
++| the whole state (attention + recurrent, `FLAGS_NONE`) | 69 481 272 B (66.3 MiB) — the 16 MiB difference is the seq's attention K/V |
++| serialised handover, `RECR_ONLY` (`ARMS_HANDOVER=copy`) | **34.5 / 36.1 ms** (35B, 2 reps) — ~100 small synchronised tensor copies, latency-bound at ~1.5 GB/s |
++| serialised handover, whole state | 44–50 ms |
++| **device-to-device handover (`llama_memory_seq_state_take`)** | **0.45 – 0.66 ms** warm, 1.9–2.3 ms on a process's first handover |
++| same, dense 512-token prompt (4B) | 0.33–2.1 ms vs 36 ms serialised |
++
++The new code (`enabling-0002`, 7 files, +274/−2):
++
++* `llama_memory_recurrent::seq_state_take(src, seq)` — one contiguous destination block via the same
++  `find_slot()` path `state_read_meta()` uses, then **one batched `ggml_backend_tensor_copy_n`** over per-layer
++  `ggml_view_2d` row ranges (a host-buffer memory takes a `memcpy` instead), then release the source rows.
++* `llama_memory_seq_state_take(mem, src, seq)` — the llama-level entry (hybrid memories only).
++* `llama_memory_i::seq_rm_recr()` / `llama_memory_seq_rm_recr()` — drop **only** the recurrent cells.  Needed
++  because `llama_memory_seq_rm()` on the handing-over arm would free the **shared** attention cells.
++* `LLAMA_STATE_SEQ_FLAGS_RECR_ONLY` — the serialised control arm (the hybrid wrapper skips its attention half
++  on both sides).
++
++### 1.2 The text oracle for the handover
++
++| shape | mode | result |
++|---|---|---|
++| **4B Q8_0, no host tier** (`-c 4096`, 512 + 256-token prompts, 64 tokens each, 2 reps) | `single` / `batch-pair` / `arms` | **all identical**, both requests, both reps (`03601256ed3a`, `dbbc1b5c148b`) |
++| **35B-A3B Q4_K_M, arena 5000**, one request (4932-token prompt, 32 tokens), 3 reps | `single` vs `handover` | **identical** (`7a13c4ea9e6b`), 3/3 |
++| **35B-A3B, arena 5000**, two requests, 2-slot decode arm | `single` / `batch-pair` stable; `arms` **warm reps differ** | see §4 |
++
++Handover cost inside a live run (35B, two requests): **0.42–2.2 ms** (the take runs on the *decode* arm's
++thread, so it is queued behind at most one decode step — the 15–20 ms outliers are a take that landed behind a
++cold-arena prefill step).
++
++---
++
++## 2. T2/T3 — the design, emulated (the instrument is the server shape)
++
++[`arms/two_arms.cpp`](arms/two_arms.cpp): one process, one model,
++
++* **prefill arm**: `ctx A`, `n_batch = n_ubatch = -ub`, owns the prompts, samples the prompt's last row, posts
++  the slot;
++* **decode arm**: `ctx B`, `ctx_other = A`, `ctx_other_share_memory = true`, `n_batch = n_ubatch = ARMS_B_BATCH`,
++  owns the sampled tokens, steps **one token per active slot in one batch** (continuous batching);
++* a **request queue** between them and a **handover at the request boundary** (the take runs *on the decode
++  arm*, under the same mutex as its steps, and the prefill arm waits only for that one handover to complete
++  before it starts the next prompt — so a take never reads a memory module the prefill arm is allocating in);
++* modes `single` (text reference), `batch-pair` (one context, the same 2-slot decode loop — the
++  **width-matched** reference), `arms`, `handover`, `pf-alone`, `dec-alone`; `ARMS_REPS` for warm reps,
++  `ARMS_WAIT_ALL` for the no-overlap control, `ARMS_HANDOVER=device|copy`.
++
++**Ordering matters and it is measurable**: the first version had the *prefill* thread take the mem_mutex
++directly, and the decode thread's tight step loop starved it for **2.85 s** (the campaign's "queue depth, not
++phase" in a new form).  Posting the take to the decode arm's loop removed it entirely.
++
++### 2.1 The product numbers (35B-A3B Q4_K_M, arena 5000, `-c 16384 -b 2048 -ub 512`, 2 requests: a 512-token
++prompt with 192 decode tokens, then a 2048-token prompt with 48, warm reps)
++
++| arm | request-1 prefill | decoder tokens **inside** the prefill | ITL p50 / p95 inside | handover |
++|---|---|---|---|---|
++| `pf-alone` (no second context) | **1820.1 ms** = 1125.1 t/s | — | — | — |
++| `arms` rep 1 | 2076.5 ms = 986.3 t/s (**+14.1 %**) | **38** | **53.7 / 71.6 ms** | 0.47 ms |
++| `arms` rep 2 | 1980.1 ms = 1034.3 t/s (**+8.8 %**) | **37** | **49.0 / 77.7 ms** | 0.42 ms |
++
++Read: **6.75 ms charged per decoder token** against the campaign's 7.7 ms at arena 5000 — the interleave's
++price reproduces on the product shape, and the decoder keeps getting a token every ~50 ms through a 2 s
++prefill instead of one burst per step.  (The campaign's `DUTY=0` row on this harness family: one token per
++prefill step, p95 **568 ms**.)
++
++Caveats, stated: `-ub 512` (see §3.2 — the pair does not fit at `-ub 2048`), so the prefill rate is ~1000 t/s
++against the campaign's 2172; `pf-alone` has no second context (the campaign measured its presence at **~3 %**,
++which is inside the +8.8 % of rep 2); the p50/p95 come from 37–38 samples.
++
++---
++
++## 3. Landmines this pass adds (each is a blocker or a cost, none is theoretical)
++
++### 3.1 The shared KV's cell allocator is not concurrency-safe
++
++Two contexts that co-own the cells both allocate in them, and the allocator is a **two-step, unlocked**
++read-modify-write:
++
++* `llama_kv_cache::find_slot(ubatch, cont)` is **const** — it only *searches*, from
++  `uint32_t head_cur = v_heads[seq_to_stream[seq_id]]` (`llama-kv-cache.cpp`, ~line 2360), and returns
++  `sinfo.idxs`;
++* `llama_kv_cache::apply_ubatch()` **then** advances the cursor: `head = sinfo.idxs[s].back() + 1`
++  (`llama-kv-cache.cpp` ~2615).
++
++Between those two calls the cells are *not reserved*.  Two arms that search from the same `v_heads` value are
++both handed the same cells, and both publish `head = last + 1`.  The result is two sequences writing one KV
++cell — fluent, wrong text, non-deterministically.  (`v_cells` is shared through `v_cells_impl`; `v_heads`,
++`used`-bookkeeping and the per-context `n`/`head` are not.)
++
++The measured arms did **not** visibly hit it (the text is stable *within* a configuration), but it is
++unavoidable in principle and it is the first thing the server cut must fix.  Three candidates, cheapest
++first: (a) reserve at `find_slot()` time (advance `v_heads` at prepare and make `apply_ubatch` not re-set it —
++needs a rollback path for a failed/abandoned prepare); (b) **partition**: give each arm its own cell range and
++bound `find_slot`'s scan to it (each arm then has a private cursor — this is the contained fix, and it also
++makes the extent/`get_n_kv` a per-arm quantity); (c) a mutex across prepare→apply, which serialises the two
++graphs' compute and **defeats the feature**.
++
++### 3.2 The second arm's VRAM is a graph reserve per arm *and per active-slot width*
++
++The campaign's figure ("a second context costs ~548–600 MiB of graph buffers + 125.6 MiB of RS") is the cost of a
++context that decodes **one** slot.  The decode arm's reserve is **per graph shape**, and a 2-row decode graph on
++35B-A3B asks for **741.47 MiB** (`ggml_gallocr_reserve_n_impl: failed to allocate ROCm0 buffer of size
++706806016` when it does not fit — the scheduler keeps the 1-row graph *and* reserves the 2-row one).  Measured,
++in order: arena 5000 + `-c 24576`/`-ub 2048` → the *prefill* graph's reserve fails; arena 4000 + `-c 8192` +
++`-ub 2048` → same; arena 5000 + `-c 16384` + **`-ub 512`** → fits and runs.  So: **N generating slots cost a
++per-N reserve, and the pair needs roughly one prefill-graph of headroom** on a 32 GiB card.  The server's
++opt-in gate should therefore be "arena + one prefill graph + one decode graph per admitted slot width", not
++"arena + 600 MiB".
++
++### 3.3 The 2-slot two-arm text is not stable warm on a partial arena
++
++Isolation matrix (35B-A3B, arena 5000, `-c 16384 -ub 512`, two requests, 3 reps; reference
++`b0281be7c5a6` / `d5083bd41b4c`, which `single` and `batch-pair` both read in **all three** reps):
++
++| arm | rep 0 | rep 1 | rep 2 |
++|---|---|---|---|
++| `batch-pair` (one context, 2 slots) | match | **match** | **match** |
++| `single` (sequential) | match | match | match |
++| `arms` + `WAIT_ALL` (no overlap at all) | match | `e05c6e16a136` / `abe253ea957a` | `fc7d8e55fd40` / `d5083bd41b4c` |
++| `arms` (free-running) | match | `e05c6e16a136` / `abe253ea957a` | `fc7d8e55fd40` / `6f5362913a44` |
++| `arms`, `ARMS_HANDOVER=copy` | match | same as device | same |
++| `arms`, `GGML_MOE_DEVREMAP=0` | match | same | same |
++| `arms`, `MOE_EXPERT_PREFILL_IN_PLACE=0` | match | same | same |
++| 4B (no host tier) | match | match | match |
++| 35B, **one** request | match | match | match |
++| **35B, FULL residency** (no `-ncmoe`, no arena) | match | `e05c6e16a136` / `abe253ea957a` | — |
++| 35B full residency, `LLAMA_KV_N_PAD_MIN=8192` | match | `fc7d8e55fd40` / `abe253ea957a` | — |
++
++So the carrier is **the second context doing the decoding**, not the move (both handover implementations
++agree), not the remap, not the in-place prefill path, not the overlap (`WAIT_ALL`), not the batch width
++(`batch-pair` is stable at the same widths), and **not the host-expert tier**: the 35B-A3B reproduces it at
++**full residency** (no `-ncmoe`, no arena), the dense 4B does not.  Cold rep → identical; warm reps →
++different **and different from each other**, but from a *small set* of outcomes (`b0281be7c5a6` /
++`e05c6e16a136` / `fc7d8e55fd40` for request 0), which is the signature of a **shape/graph-bucket** effect rather
++than of state corruption.  Two further data points point the same way and are worth recording:
++
++* the *single-context* reference's own text **changes with the KV pad**: `batch-pair` reads `b0281be7c5a6` at the
++default pad and `649c8596467d` with `LLAMA_KV_N_PAD_MIN=8192`, stable in both.  So this fork's decode numerics do
++depend on the graph's `n_kv` bucket (the `LLAMA_KV_N_PAD_*` family exists for exactly that reason);
++* the two arms do **not** share a cell cursor (`v_heads` is per-context, only `v_cells` is shared), so after one
++rep the two arms' KV extents and their recurrent destination rows differ from the single-context run's — even
++with no overlap at all.
++
++Not resolved in this pass, and the earlier "it is the arena settle / residency" reading is **refuted** by the
++full-residency row.  Remaining candidates, in order: (a) the two arms' `n_kv` bucket plus the recurrent
++destination row (both are *address/index* inputs to the graph), (b) the second context's compute-buffer
++addresses changing the GEMM solution (`GREEDY-PURITY.md` §44's family).  The instrument that settles it is a
++**logits** diff, not a hash: after the take, decode the same token on A and on B and diff the rows, and print
++`n_kv`, `used`, the recr `head`/`rs_z` and the destination row from both arms; then pin `LLAMA_KV_N_PAD_MIN`
++high enough that both arms sit in one bucket and re-diff.  `h = 0` is already done and does not fix it.
++
++---
++
++## 4. What this changes in the campaign
++
++* **T1 is closed** (see §1); the artifact is `enabling-0002-recurrent-handover.patch`, and the serialised
++  `RECR_ONLY` path stays as the control arm of the handover's own gate.
++* **T2 has a shape that is measured, not hypothesised**: post the take to the decode arm (never take a lock
++  the decoder holds in a loop), step one token per active slot in one batch, and wait for the handover only at
++  the request boundary.  §5 is the server cut, with the code points.
++* **T3's gate cannot be a cross-configuration hash yet** (§3.3 — two arms, warm reps, MoE model: the divergence
++  survives full residency and every kill switch tried, so it is a shape/bucket effect and needs the logits
++diff): text on a *pinned shape* (KV pad high enough that both arms sit in one `n_kv` bucket), a
++  same-configuration repetition to catch non-determinism, and `scripts/gate-prefill-logits.sh` (KLD) for the
++  prefill path.
++* **T4's opt-in gate needs the VRAM rule of §3.2** and the allocator fix of §3.1 before it can be default-on
++  anywhere.
++* Nothing was applied to `patches/`, no block was created or amended, and `~/llama.cpp` carries the changes on
++  the WIP branch `wip/prefill-overlap` only (4 commits, tree clean).
++
++## 5. The server cut (T2), in code points
++
++The design is *not* "two servers": it is one server with **two arms**, where the decode arm owns its slots'
++generation and nothing else.
++
++1. **Contexts** (`tools/server/server-context.cpp`, `load_model`/`init`, around `ctx_tgt` at ~1134 and the
++   `slot.ctx_tgt`/`slot.ctx_dft` wiring at ~1857): create `ctx_dec` after `ctx_tgt` with
++   `cparams.ctx_other = ctx_tgt`, `ctx_other_share_memory = true`, `n_batch = n_ubatch = <decode width>`,
++   `n_seq_max = n_parallel`, `n_outputs_max = n_parallel`.  A second `server_batch` for it.
++2. **Ownership**: `slot.arm` (`PREFILL`/`DECODE`) plus a per-slot mutex.  `pre_decode()`'s slot loop skips
++   `DECODE` slots; the decode thread touches only `DECODE` slots.  `slots[]` itself, `batch`, `ctx_tgt`,
++   `spec`, `checkpoints` and the prompt cache stay **main-thread only** — the decode arm must never call
++   `prompt_save`/`prompt_load`, `common_speculative_*`, mtmd, TTS, embeddings, rerank or decision paths.
++3. **Handover** (in `post_decode()`, where the prompt's last row is sampled and the slot becomes
++   `SLOT_STATE_GENERATING`): `llama_memory_seq_state_take(llama_get_memory(ctx_dec), llama_get_memory(ctx_tgt),
++   slot.id)`, set `slot.arm = DECODE`, wake the decode thread.  The take must run **on the decode arm's
++   thread** under its step mutex (a prefill-side take starves: §2).
++4. **Return** (the decode arm finishes a slot): `llama_memory_seq_rm(llama_get_memory(ctx_dec), slot.id, -1,
++   -1)` (the shared cells are freed once, here), `slot.arm = PREFILL`, and the slot goes back to the main loop
++   for `release()`/`send_final_response()` — i.e. the decode arm does **not** own the response lifecycle, it
++   only produces tokens into the slot's `generated`/stream path.
++5. **The decode step**: `llama_process(ctx_dec, LLAMA_PROCESS_TYPE_DECODE, batch)` over one token per `DECODE`
++   slot, then `common_sampler_sample(slot.smpl, ctx_dec, i)` per row and the same stop/emit logic `post_decode`
++   uses (factor it into a function that takes an explicit context + batch + slot, so the two arms share it).
++6. **Guards** (the opt-in gate): `--prefill-decode-arms` (or the arena+residency rule of §3.2 auto), and refuse
++   when any of `spec`, `mctx`, TTS, embeddings/rerank/decision, LoRA, sleep/wake or `n_parallel < 2` is in play;
++   `-np 1` stays single-context.
++7. **Blockers before any default flip**: §3.1 (allocator), §3.3 (which oracle), and `scripts/gate-prefill-fairness.sh`
++   / `gate-prefill-duty.sh` (the prefill arm keeps block 16's admission and the duty cycle becomes the `F ≈ 0`
++   fallback).
++
++## Files
++
++| file | what |
++|---|---|
++| `arms/two_arms.cpp`, `arms/build-two-arms.sh` | the instrument (this pass): the two arms, the handover, the references (`single`, `batch-pair`, `pf-alone`, `dec-alone`) |
++| `enabling-0002-recurrent-handover.patch` | T1 (WIP branch `wip/prefill-overlap`, commit 4) |
++| `runs/2611-arms-35b-arena5000.txt` | the raw arm table of §2.1 (+ `single` / `pf-alone` / `dec-alone`) |
+diff --git a/wip/prefill-decode-arms/arms/.gitignore b/wip/prefill-decode-arms/arms/.gitignore
+new file mode 100644
+index 00000000..5aa5ffed
+--- /dev/null
++++ b/wip/prefill-decode-arms/arms/.gitignore
+@@ -0,0 +1 @@
++two_arms
+diff --git a/wip/prefill-decode-arms/arms/build-two-arms.sh b/wip/prefill-decode-arms/arms/build-two-arms.sh
+new file mode 100755
+index 00000000..4d015734
+--- /dev/null
++++ b/wip/prefill-decode-arms/arms/build-two-arms.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++# Build the prefill-decode-arms instrument (arms/two_arms.cpp) against the campaign's llama.cpp build tree.
++# WIP tool -- not part of the delivery, links the campaign's candidate build, never installed.
++#
++#   ./build-two-arms.sh [BUILD_DIR]        (default: ~/llama.cpp/build-2ctx)
++set -euo pipefail
++
++HERE=$(cd "$(dirname "$0")" && pwd)
++SRC=${SRC:-$HOME/llama.cpp}
++BUILD=${1:-$SRC/build-2ctx}
++
++if [[ ! -f $BUILD/bin/libllama.so && ! -f $BUILD/src/libllama.a && ! -f $BUILD/bin/libllama.so.0 ]]; then
++    echo "no llama build in $BUILD (build it first: BUILD_DIR=$(basename "$BUILD") ~/bin/build-llama-rocm)" >&2
++    exit 1
++fi
++
++CXX=${CXX:-g++}
++# -lcommon pulls common_params_parse / common_tokenize; the llama libs are the delivered shared objects
++$CXX -std=c++17 -O2 -g0 -o "$HERE/two_arms" "$HERE/two_arms.cpp" \
++    -I"$SRC/common" -I"$SRC/include" -I"$SRC/ggml/include" \
++    -L"$BUILD/bin" -lllama-common \
++    -lllama -lggml -lggml-base \
++    -Wl,-rpath,"$BUILD/bin"
++
++echo "built $HERE/two_arms against $BUILD"
+diff --git a/wip/prefill-decode-arms/arms/two_arms.cpp b/wip/prefill-decode-arms/arms/two_arms.cpp
+new file mode 100644
+index 00000000..2b4a6416
+--- /dev/null
++++ b/wip/prefill-decode-arms/arms/two_arms.cpp
+@@ -0,0 +1,742 @@
++// two_arms -- WIP instrument for the prefill-decode-arms campaign (NOT part of the delivery).
++//
++// It is the campaign's design WITHOUT the server: one process, one model, ONE prefill arm (its own context +
++// thread) and ONE decode arm (its own context + thread, sharing the prefill arm's KV), with a request queue
++// between them and the sequence state handed over at the request boundary.
++//
++//   prefill arm  ctx A  n_batch = n_ubatch = (the model's prefill width)   owns the prompts
++//   decode arm   ctx B  n_batch = n_ubatch = ARMS_B_BATCH (decode only)    owns the sampled tokens
++//
++// The handover is the campaign's T1: A's llama_state_seq_get_data_ext() writes the sequence's ATTENTION KV and
++// its RECURRENT state; B (a co-owner of the KV, `ctx_other_share_memory`) SKIPS the KV half on read -- its
++// llama_kv_cache returns early with `other != nullptr` -- so what actually crosses the boundary is exactly the
++// recurrent state.  That is the whole of T1, and `ARMS_MODE=handover` verifies it against the single-context
++// text oracle before anything else runs.
++//
++// Modes (ARMS_MODE):
++//   single   : ONE context (ctx A only), every request run sequentially -- the TEXT REFERENCE
++//   arms     : ctx A prefills a request's prompt, hands the sequence to ctx B, ctx B decodes it; the next
++//              request's prompt is prefilled on A WHILE B decodes == the campaign's product shape
++//   handover : one request; prefill on A, hand over, decode on B (the T1/T3 oracle, with the handover timed)
++//   pf-alone : ctx A alone runs the prompts (the prefill reference wall)
++//   dec-alone: ctx B alone runs the decoder's generation (the decode reference wall)
++//
++// Scenario: ARMS_SCENARIO="<prompt_tokens>:<n_predict>@<admit_delay_ms>,..." -- each item is one request.  The
++// prompt is two_ctx's 4932-token one (TWO_CTX_PF_FILE / arms/p4k prompt), repeated if a request asks for more.
++//
++// Text oracle: every request's generated token ids are hashed; `arms`/`handover` must read the same hashes as
++// `single` for the same scenario.  Purity pins for a host-expert arm: MOE_EXPERT_HEATMAP=load and
++// ROCBLAS_USE_HIPBLASLT=0 (r310).
++//
++// Build: ./build-two-arms.sh   (links ~/llama.cpp/build-2ctx of the campaign's WIP branch)
++
++#include "common.h"
++#include "arg.h"
++#include "llama.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++// --- tiny sha256 (FIPS 180-4), so the tool needs no external crypto lib -------------------------------
++struct sha256_ctx {
++    uint32_t h[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
++                     0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
++    uint64_t len = 0;
++    uint8_t buf[64] = {0};
++    size_t buflen = 0;
++
++    static uint32_t rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
++
++    void block(const uint8_t * p) {
++        static const uint32_t k[64] = {
++            0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
++            0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
++            0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
++            0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
++            0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
++            0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
++            0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
++            0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u};
++        uint32_t w[64];
++        for (int i = 0; i < 16; ++i) {
++            w[i] = (uint32_t(p[4*i]) << 24) | (uint32_t(p[4*i+1]) << 16) | (uint32_t(p[4*i+2]) << 8) | uint32_t(p[4*i+3]);
++        }
++        for (int i = 16; i < 64; ++i) {
++            uint32_t s0 = rotr(w[i-15], 7) ^ rotr(w[i-15], 18) ^ (w[i-15] >> 3);
++            uint32_t s1 = rotr(w[i-2], 17) ^ rotr(w[i-2], 19)  ^ (w[i-2] >> 10);
++            w[i] = w[i-16] + s0 + w[i-7] + s1;
++        }
++        uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
++        for (int i = 0; i < 64; ++i) {
++            uint32_t S1 = rotr(e,6) ^ rotr(e,11) ^ rotr(e,25);
++            uint32_t ch = (e & f) ^ (~e & g);
++            uint32_t t1 = hh + S1 + ch + k[i] + w[i];
++            uint32_t S0 = rotr(a,2) ^ rotr(a,13) ^ rotr(a,22);
++            uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
++            uint32_t t2 = S0 + mj;
++            hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
++        }
++        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
++    }
++
++    void update(const void * data, size_t n) {
++        const uint8_t * p = (const uint8_t *) data;
++        len += n;
++        while (n > 0) {
++            const size_t take = std::min(n, sizeof(buf) - buflen);
++            memcpy(buf + buflen, p, take);
++            buflen += take; p += take; n -= take;
++            if (buflen == 64) { block(buf); buflen = 0; }
++        }
++    }
++
++    std::string final() {
++        const uint64_t bits = len * 8;
++        uint8_t pad = 0x80;
++        update(&pad, 1);
++        uint8_t z = 0;
++        while (buflen != 56) { update(&z, 1); }
++        uint8_t lenb[8];
++        for (int i = 0; i < 8; ++i) { lenb[i] = uint8_t((bits >> (56 - 8*i)) & 0xff); }
++        update(lenb, 8);
++        char out[65];
++        for (int i = 0; i < 8; ++i) { snprintf(out + 8*i, 9, "%08x", h[i]); }
++        return std::string(out);
++    }
++};
++
++static std::string sha_of(const std::vector<llama_token> & toks) {
++    sha256_ctx c;
++    for (auto t : toks) {
++        const int32_t v = (int32_t) t;
++        c.update(&v, sizeof(v));
++    }
++    return c.final();
++}
++
++static double now_ms() { return ggml_time_us() / 1000.0; }
++
++static double ipct(std::vector<double> xs, double p) {
++    if (xs.empty()) { return 0.0; }
++    std::sort(xs.begin(), xs.end());
++    const size_t k = std::min(xs.size() - 1, (size_t) (p / 100.0 * (xs.size() - 1) + 0.5));
++    return xs[k];
++}
++
++static double vmax(const std::vector<double> & xs) {
++    return xs.empty() ? 0.0 : *std::max_element(xs.begin(), xs.end());
++}
++
++// --- one request ---------------------------------------------------------------------------------------
++struct request_t {
++    int  id = 0;
++    size_t n_prompt_tok = 0;   // how many prompt tokens to use
++    int  n_predict = 32;
++    double admit_ms = 0.0;     // absolute, when the request becomes available to the prefill arm
++
++    llama_seq_id seq = -1;
++    double t_admit_real = 0.0; // absolute, when the prefill arm actually picked it up
++    double t_prompt_start = 0.0;
++    double t_prompt_done = 0.0;
++    double t_handover = 0.0;   // handover wall
++    size_t handover_bytes = 0;
++    bool   handover_device = false;
++    // the handover is EXECUTED by the decode arm (see arms_t): the prefill arm only posts it, and waits for
++    // handover_done before it starts the next prompt (so a take never reads a memory the prefill arm is
++    // allocating cells in)
++    bool   handover_posted = false;
++    bool   handover_done   = false;
++    double t_first_tok = 0.0;
++
++    // decode-arm bookkeeping
++    llama_token pending = -1;  // token to ingest next
++    llama_pos   pos = 0;       // position of `pending`
++    bool        on_decode_arm = false;
++    bool        done = false;
++
++    std::vector<llama_token> generated;
++    std::vector<double>      arrivals_ms;
++};
++
++// --- the shared state between the two arms -------------------------------------------------------------
++struct arms_t {
++    std::mutex              m;
++    std::condition_variable cv_ready;    // the decode arm waits for a handed-over sequence
++    std::condition_variable cv_done;     // the prefill arm waits for the decode arm to drain at the end
++    std::condition_variable cv_taken;    // the prefill arm waits for a posted handover to be executed
++    size_t n_taken = 0;                  // handovers executed
++    bool   wait_all = false;             // ARMS_WAIT_ALL: do not step until all handovers are done
++    std::vector<request_t> * reqs = nullptr;
++    size_t   n_prefilled = 0;
++    bool     prefill_done = false;
++    bool     decode_done  = false;
++
++    // the handover must not run while the decode arm is mutating ITS memory module's cell metadata (the two
++    // memories are separate objects: only the attention KV cells are shared).  A step is short (one token per
++    // active slot), so the prefill arm waits at most one step at a request boundary.
++    std::mutex mem_m;
++
++    // prefill windows for the "ITL during a prefill" metric
++    std::mutex pf_m;
++    std::vector<std::pair<double, double>> pf_windows;
++};
++
++static bool in_any_window(const std::vector<std::pair<double, double>> & w, double t) {
++    for (const auto & p : w) {
++        if (t >= p.first && t <= p.second) { return true; }
++    }
++    return false;
++}
++
++// --- greedy sampling (the campaign's text oracle is plain greedy) --------------------------------------
++static llama_token argmax_row(llama_context * ctx, int32_t i) {
++    const float * logits = llama_get_logits_ith(ctx, i);
++    if (logits == nullptr) { return -1; }
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
++    llama_token best = 0;
++    for (int v = 1; v < n_vocab; ++v) {
++        if (logits[v] > logits[best]) { best = v; }
++    }
++    return best;
++}
++
++// --- prompt ingestion on an arm ------------------------------------------------------------------------
++// returns false on a failed chunk
++static bool ingest_prompt(llama_context * ctx, llama_seq_id seq, const std::vector<llama_token> & toks,
++                          int n_batch, llama_pos & pos_out) {
++    n_batch = std::min(n_batch, (int) llama_n_batch(ctx));
++    llama_pos pos = 0;
++    for (size_t off = 0; off < toks.size(); off += (size_t) n_batch) {
++        const size_t end = std::min(toks.size(), off + (size_t) n_batch);
++        common_batch batch(ctx);
++        for (size_t i = off; i < end; ++i) {
++            batch.add(toks[i], pos++, seq, end == toks.size() && i + 1 == end);
++        }
++        const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
++        if (rc != 0) {
++            fprintf(stderr, "seq %d: prompt chunk failed (rc=%d)\n", (int) seq, rc);
++            return false;
++        }
++    }
++    // llama_process() is ASYNC: the prompt's wall is only over after a synchronise.  Without this every
++    // prefill number is an enqueue time (a warm 512-token prompt "takes" 3 ms instead of ~115 ms).
++    llama_synchronize(ctx);
++    pos_out = pos;
++    return true;
++}
++
++
++// --- the decode arm's step loop -------------------------------------------------------------------
++// One token per active slot in ONE batch per step (continuous batching of the generating slots).  Used by
++// the two-arm modes and by `batch-pair` (the same loop on a single context), so the batch WIDTHS match.
++// Returns false on a failed step.
++static bool decode_loop(llama_context * ctx, std::vector<request_t> & reqs, const llama_vocab * vocab,
++                        std::mutex * mem_m) {
++    for (;;) {
++        std::vector<request_t *> active;
++        for (auto & r : reqs) {
++            if (r.on_decode_arm && !r.done) { active.push_back(&r); }
++        }
++        if (active.empty()) {
++            return true;
++        }
++
++        std::unique_lock<std::mutex> lk;
++        if (mem_m) { lk = std::unique_lock<std::mutex>(*mem_m); }
++
++        common_batch batch(ctx);
++        for (auto * r : active) {
++            batch.add(r->pending, r->pos, r->seq, true);
++        }
++        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
++            fprintf(stderr, "decode arm: step failed (batch of %zu)\n", active.size());
++            return false;
++        }
++
++        double t_step_done = 0.0;
++        for (int i = 0; i < (int) active.size(); ++i) {
++            auto * r = active[i];
++            llama_token tok = argmax_row(ctx, i);   // the first row's sample synchronises the step
++            if (t_step_done == 0.0) { t_step_done = now_ms(); }
++            if (tok < 0) { r->done = true; continue; }
++            r->generated.push_back(tok);
++            r->arrivals_ms.push_back(t_step_done);
++            r->pos += 1;
++            r->pending = tok;
++            const bool stop = llama_vocab_is_eog(vocab, tok) || (int) r->generated.size() >= r->n_predict;
++            if (stop) {
++                r->done = true;
++                r->on_decode_arm = false;
++                llama_memory_seq_rm(llama_get_memory(ctx), r->seq, -1, -1);
++            }
++        }
++    }
++}
++
++int main(int argc, char ** argv) {
++    common_params params;
++    params.n_parallel = 4;
++
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
++        return 1;
++    }
++
++    llama_backend_init();
++
++    const std::string mode = getenv("ARMS_MODE") ? getenv("ARMS_MODE") : "arms";
++    const std::string prompt_a = [&] {
++        std::string s = "The history of computing is a long and tangled story.";
++        if (const char * f = getenv("TWO_CTX_PF_FILE")) {
++            FILE * fp = fopen(f, "rb");
++            if (fp == nullptr) { fprintf(stderr, "cannot open TWO_CTX_PF_FILE %s\n", f); return s; }
++            char buf[65536];
++            size_t n;
++            s.clear();
++            while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) { s.append(buf, n); }
++            fclose(fp);
++        }
++        return s;
++    }();
++
++    // scenario: "<prompt_tokens>:<n_predict>@<admit_delay_ms>,..."
++    std::vector<request_t> reqs;
++    {
++        const std::string sc = getenv("ARMS_SCENARIO") ? getenv("ARMS_SCENARIO") : "4932:128@0";
++        size_t i = 0;
++        while (i < sc.size()) {
++            size_t j = sc.find(',', i);
++            if (j == std::string::npos) { j = sc.size(); }
++            const std::string item = sc.substr(i, j - i);
++            i = j + 1;
++            if (item.empty()) { continue; }
++            request_t r;
++            r.id = (int) reqs.size();
++            const size_t c1 = item.find(':');
++            const size_t c2 = item.find('@');
++            r.n_prompt_tok = (size_t) atoll(item.substr(0, c1).c_str());
++            r.n_predict    = atoi(item.substr(c1 + 1, c2 == std::string::npos ? std::string::npos : c2 - c1 - 1).c_str());
++            r.admit_ms     = c2 == std::string::npos ? 0.0 : atof(item.substr(c2 + 1).c_str());
++            if (r.n_prompt_tok == 0) { r.n_prompt_tok = 64; }
++            if (r.n_predict   <= 0) { r.n_predict = 32; }
++            reqs.push_back(r);
++        }
++    }
++    // one sequence per request (a slot); n_ctx_seq = n_ctx / n_seq_max, so do not over-allocate
++    const int n_parallel = std::max<int>(2, (int) reqs.size());
++
++    auto mparams = common_model_params_to_llama(params);
++    llama_model * model = common_model_load(params.model.get_paths(), mparams);
++    if (model == nullptr) {
++        fprintf(stderr, "failed to load the model\n");
++        return 1;
++    }
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++
++    // the prompt every request draws its tokens from
++    std::vector<llama_token> pf_tokens = common_tokenize(vocab, prompt_a, true, false);
++
++    const int n_reps = getenv("ARMS_REPS") ? std::max(1, atoi(getenv("ARMS_REPS"))) : 1;
++
++    // A rep reuses the SAME sequence ids: a request's KV and recurrent state are freed when it finishes, and
++    // n_ctx_seq = n_ctx / n_seq_max, so raising n_seq_max for the reps would shrink each sequence's context
++    // (the campaign's 4932-token prompt needs n_ctx_seq > 4932).  This is also what a server does with its
++    // slots -- the id is a slot, not a request.
++    auto cparams = common_context_params_to_llama(params);
++    cparams.n_seq_max     = n_parallel;
++    cparams.n_outputs_max = n_parallel;
++
++    const bool want_a = mode != "dec-alone";
++    const bool want_b = mode != "single" && mode != "pf-alone" && mode != "batch-pair";
++
++    llama_context * ctx_a = nullptr;
++    llama_context * ctx_b = nullptr;
++
++    if (want_a) {
++        ctx_a = llama_init_from_model(model, cparams);
++        if (!ctx_a) { fprintf(stderr, "ctx A failed\n"); return 1; }
++    }
++    if (want_b) {
++        llama_context_params cparams_b = cparams;
++        // the DECODE context is sized for decode: a 1-token-per-slot batch needs neither the prefill width
++        // nor its compute buffers (the campaign's §2: this is what makes the pair fit at arena 5000)
++        const int b_batch = getenv("ARMS_B_BATCH") ? atoi(getenv("ARMS_B_BATCH")) : 8;
++        cparams_b.n_batch  = b_batch;
++        cparams_b.n_ubatch = b_batch;
++        if (ctx_a != nullptr) {
++            cparams_b.ctx_other              = ctx_a;
++            cparams_b.ctx_other_share_memory = true;
++        }
++        ctx_b = llama_init_from_model(model, cparams_b);
++        if (!ctx_b) { fprintf(stderr, "ctx B failed\n"); return 1; }
++    }
++
++    printf("MODE %s  ctx A %s  ctx B %s  n_parallel %d\n", mode.c_str(),
++           ctx_a ? "on" : "off",
++           ctx_b ? (ctx_a ? "on (KV shared with A)" : "on") : "off", n_parallel);
++
++    const int n_batch_a = (int) params.n_batch;
++
++    for (int rep = 0; rep < n_reps; ++rep) {
++        // a rep is the whole scenario again on fresh sequence ids: the FIRST rep pays the cold expert arena
++        // (~3x slower, ~13000 fills for 120 tables), so only rep >= 1 is a warm number
++        for (auto & r : reqs) {
++            r.generated.clear();
++            r.arrivals_ms.clear();
++            r.t_admit_real = r.t_prompt_start = r.t_prompt_done = r.t_handover = r.t_first_tok = 0.0;
++            r.handover_bytes = 0;
++            r.handover_device = false;
++            r.pending = -1;
++            r.pos = 0;
++            r.on_decode_arm = false;
++            r.done = false;
++            r.seq = (llama_seq_id) r.id;
++        }
++        if (n_reps > 1) {
++            printf("REP %d\n", rep);
++        }
++
++        // ---------------------------------------------------------------------------------------------
++        // reference modes: everything on ONE context, one request at a time
++        // ---------------------------------------------------------------------------------------------
++        if (mode == "batch-pair") {
++            // the single-context reference for a CONCURRENT decode set: every prompt is prefilled first, then
++            // the same decode loop as the decode arm runs all slots in one batch.  The batch widths match the
++            // two-arm arm only when that arm's slots are all handed over before it steps (ARMS_WAIT_ALL=1).
++            for (auto & r : reqs) {
++                std::vector<llama_token> toks(pf_tokens.begin(),
++                        pf_tokens.begin() + std::min(pf_tokens.size(), r.n_prompt_tok));
++                while (toks.size() < r.n_prompt_tok) {
++                    const size_t take = std::min(pf_tokens.size(), (size_t) r.n_prompt_tok - toks.size());
++                    toks.insert(toks.end(), pf_tokens.begin(), pf_tokens.begin() + take);
++                }
++                r.n_prompt_tok = toks.size();
++                r.t_admit_real = r.t_prompt_start = now_ms();
++                llama_pos pos = 0;
++                if (!ingest_prompt(ctx_a, r.seq, toks, n_batch_a, pos)) { return 1; }
++                r.t_prompt_done = now_ms();
++                llama_token tok = argmax_row(ctx_a, -1);
++                if (tok < 0) { fprintf(stderr, "no logits\n"); return 1; }
++                r.generated.push_back(tok);
++                r.arrivals_ms.push_back(now_ms());
++                r.pending = tok;
++                r.pos     = pos;
++                r.on_decode_arm = true;
++            }
++            if (!decode_loop(ctx_a, reqs, vocab, nullptr)) { return 1; }
++            for (const auto & r : reqs) {
++                printf("REQ %d sha=%s gen=%zu prompt_tokens=%zu pf_ms=%.1f pf_tps=%.1f\n",
++                       r.id, sha_of(r.generated).substr(0, 12).c_str(), r.generated.size(), r.n_prompt_tok,
++                       r.t_prompt_done - r.t_prompt_start,
++                       1000.0 * (double) r.n_prompt_tok / (r.t_prompt_done - r.t_prompt_start));
++            }
++            continue;
++        }
++
++        if (mode == "single" || mode == "pf-alone" || mode == "dec-alone") {
++            llama_context * ctx = (mode == "dec-alone") ? ctx_b : (ctx_a ? ctx_a : ctx_b);
++
++            for (auto & r : reqs) {
++                std::vector<llama_token> toks(pf_tokens.begin(),
++                        pf_tokens.begin() + std::min(pf_tokens.size(), r.n_prompt_tok));
++                while (toks.size() < r.n_prompt_tok) {
++                    const size_t take = std::min(pf_tokens.size(), (size_t) r.n_prompt_tok - toks.size());
++                    toks.insert(toks.end(), pf_tokens.begin(), pf_tokens.begin() + take);
++                }
++                const double t0 = now_ms();
++                r.t_admit_real   = t0;
++                r.t_prompt_start = t0;
++                llama_pos pos = 0;
++                if (!ingest_prompt(ctx, r.seq, toks, n_batch_a, pos)) { return 1; }
++                r.t_prompt_done = now_ms();
++                r.n_prompt_tok  = toks.size();
++
++                const int n_dec = (mode == "pf-alone") ? 0 : r.n_predict;
++                for (int i = 0; i < n_dec; ++i) {
++                    llama_token tok = argmax_row(ctx, -1);
++                    if (tok < 0) { fprintf(stderr, "no logits\n"); return 1; }
++                    r.generated.push_back(tok);
++                    r.arrivals_ms.push_back(now_ms());
++                    if (llama_vocab_is_eog(vocab, tok) || i + 1 == n_dec) { break; }
++                    common_batch batch(ctx);
++                    batch.add(tok, pos++, r.seq, true);
++                    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
++                        fprintf(stderr, "decode failed\n"); return 1;
++                    }
++                }
++                llama_memory_seq_rm(llama_get_memory(ctx), r.seq, -1, -1);
++                r.done = true;
++            }
++
++            for (const auto & r : reqs) {
++                const std::string sha = sha_of(r.generated);
++                const double pf_ms = r.t_prompt_done - r.t_prompt_start;
++                printf("REQ %d sha=%s gen=%zu prompt_tokens=%zu pf_ms=%.1f pf_tps=%.1f\n",
++                       r.id, sha.substr(0, 12).c_str(), r.generated.size(), r.n_prompt_tok, pf_ms,
++                       pf_ms > 0 ? 1000.0 * (double) r.n_prompt_tok / pf_ms : 0.0);
++                if (mode == "single") {
++                    printf("TEXT %d: %s\n", r.id, common_detokenize(vocab, r.generated, false).c_str());
++                }
++            }
++            continue;
++        }
++
++        // ---------------------------------------------------------------------------------------------
++        // the two arms
++        // ---------------------------------------------------------------------------------------------
++        arms_t st;
++        st.reqs     = &reqs;
++        st.wait_all = getenv("ARMS_WAIT_ALL") && atoi(getenv("ARMS_WAIT_ALL")) != 0;
++
++        std::atomic<bool> prefill_done_flag{false};   // (kept for symmetry with the campaign's other tools)
++
++        std::thread t_pf([&] {
++            const double t_origin = now_ms();
++            for (auto & r : reqs) {
++                const double due = t_origin + r.admit_ms;
++                while (now_ms() < due) { std::this_thread::sleep_for(std::chrono::microseconds(500)); }
++
++                std::vector<llama_token> toks(pf_tokens.begin(),
++                        pf_tokens.begin() + std::min(pf_tokens.size(), r.n_prompt_tok));
++                while (toks.size() < r.n_prompt_tok) {
++                    const size_t take = std::min(pf_tokens.size(), (size_t) r.n_prompt_tok - toks.size());
++                    toks.insert(toks.end(), pf_tokens.begin(), pf_tokens.begin() + take);
++                }
++                r.n_prompt_tok = toks.size();
++
++                r.t_admit_real   = now_ms();
++                r.t_prompt_start = now_ms();
++                {
++                    std::lock_guard<std::mutex> lk(st.pf_m);
++                    st.pf_windows.emplace_back(r.t_prompt_start, 0.0);
++                }
++
++                llama_pos pos = 0;
++                if (!ingest_prompt(ctx_a, r.seq, toks, n_batch_a, pos)) { break; }
++                r.t_prompt_done = now_ms();
++                {
++                    std::lock_guard<std::mutex> lk(st.pf_m);
++                    st.pf_windows.back().second = r.t_prompt_done;
++                }
++
++                // the first token is sampled on the arm that produced the logits
++                llama_token tok = argmax_row(ctx_a, -1);
++                if (tok < 0) { fprintf(stderr, "req %d: no logits after the prompt\n", r.id); break; }
++                r.generated.push_back(tok);
++                r.arrivals_ms.push_back(now_ms());
++                r.t_first_tok = r.arrivals_ms.back();
++
++                // the decode arm ingests this token at the prompt's end (position = prompt length)
++                r.pending = tok;
++                r.pos     = pos;
++
++                // ---- HANDOVER: post the slot to the decode arm --------------------------------------
++                // The decode arm executes the state take at the top of its next step (under mem_m), so the
++                // handover is serialised with the decode steps and the prefill arm never waits on a lock the
++                // decoder holds in a loop.  The prefill arm DOES wait for the take to complete before it starts
++                // the next prompt: the take reads this arm's recurrent cell metadata, which the next prompt's
++                // find_slot() would be mutating.
++                r.t_handover = 0.0;
++                {
++                    std::lock_guard<std::mutex> lk(st.m);
++                    r.handover_posted = true;
++                    st.cv_ready.notify_all();
++                }
++                {
++                    std::unique_lock<std::mutex> lk(st.m);
++                    const double t_w = now_ms();
++                    st.cv_taken.wait(lk, [&] { return r.handover_done || st.prefill_done; });
++                    r.t_handover = now_ms() - t_w;
++                }
++
++                r.pending       = tok;
++                r.pos           = pos;
++
++                {
++                    std::lock_guard<std::mutex> lk(st.m);
++                    st.n_prefilled++;
++                    st.cv_ready.notify_all();
++                }
++            }
++
++            {
++                std::lock_guard<std::mutex> lk(st.m);
++                st.prefill_done = true;
++                st.cv_ready.notify_all();
++            }
++            prefill_done_flag.store(true);
++        });
++
++        std::thread t_dec([&] {
++            for (;;) {
++                std::vector<request_t *> active;
++                std::vector<request_t *> taking;
++                {
++                    std::unique_lock<std::mutex> lk(st.m);
++                    st.cv_ready.wait(lk, [&] {
++                        for (auto & r : reqs) {
++                            if ((r.on_decode_arm || r.handover_posted) && !r.done) { return true; }
++                        }
++                        return st.prefill_done;
++                    });
++                    for (auto & r : reqs) {
++                        if (r.handover_posted) { taking.push_back(&r); }
++                        else if (r.on_decode_arm && !r.done) { active.push_back(&r); }
++                    }
++                    if (st.wait_all && st.n_taken < reqs.size()) {
++                        active.clear();   // hold every step until the whole set has been handed over
++                    }
++                    if (active.empty() && taking.empty()) {
++                        if (!st.prefill_done) {
++                            // the prefill arm still has requests to come (a prompt in flight, or a handover
++                            // it has not posted yet): this arm must NOT exit
++                            continue;
++                        }
++                        st.decode_done = true;
++                        st.cv_done.notify_all();
++                        return;
++                    }
++                }
++
++                if (!taking.empty()) {
++                    std::lock_guard<std::mutex> lk(st.mem_m);
++                    for (auto * r : taking) {
++                        const double t_h0 = now_ms();
++                        bool taken = false;
++                        if (std::strcmp(getenv("ARMS_HANDOVER") ? getenv("ARMS_HANDOVER") : "device", "copy") != 0) {
++                            taken = llama_memory_seq_state_take(llama_get_memory(ctx_b), llama_get_memory(ctx_a), r->seq);
++                        }
++                        if (!taken) {
++                            const size_t sz = llama_state_seq_get_size_ext(ctx_a, r->seq, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
++                            std::vector<uint8_t> buf(sz);
++                            const size_t nw = llama_state_seq_get_data_ext(ctx_a, buf.data(), sz, r->seq, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
++                            if (nw == 0) { fprintf(stderr, "req %d: state get failed\n", r->id); exit(1); }
++                            const size_t nr = llama_state_seq_set_data_ext(ctx_b, buf.data(), nw, r->seq, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
++                            if (nr != nw) { fprintf(stderr, "req %d: state set failed (%zu != %zu)\n", r->id, nr, nw); exit(1); }
++                            r->handover_bytes = nw;
++                            llama_memory_seq_rm_recr(llama_get_memory(ctx_a), r->seq, -1, -1);
++                        }
++                        r->t_handover      = now_ms() - t_h0;
++                        r->handover_device = taken;
++                    }
++                    {
++                        std::lock_guard<std::mutex> lk2(st.m);
++                        for (auto * r : taking) {
++                            r->handover_posted = false;
++                            r->handover_done   = true;
++                            r->on_decode_arm   = true;
++                            st.n_taken++;
++                        }
++                        st.cv_taken.notify_all();
++                        st.cv_ready.notify_all();
++                    }
++                    continue;   // collect the (now larger) active set on the next pass
++                }
++
++                // one step: one token per active slot.  mem_m keeps a concurrent handover out of this
++                // memory module's cell metadata (the memories are separate objects; only the KV cells are
++                // shared -- see the campaign's README, landmine 7).
++                {
++                    std::lock_guard<std::mutex> lk(st.mem_m);
++
++                    common_batch batch(ctx_b);
++                    for (auto * r : active) {
++                        batch.add(r->pending, r->pos, r->seq, true);
++                    }
++                    if (llama_process(ctx_b, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
++                        fprintf(stderr, "decode arm: step failed -- releasing every active sequence\n");
++                        for (auto * r : active) {
++                            llama_memory_seq_rm(llama_get_memory(ctx_b), r->seq, -1, -1);
++                            r->done = true;
++                            r->on_decode_arm = false;
++                        }
++                        std::lock_guard<std::mutex> lk2(st.m);
++                        st.decode_done = true;
++                        st.cv_done.notify_all();
++                        return;
++                    }
++                    double t_step_done = 0.0;
++                    for (int i = 0; i < (int) active.size(); ++i) {
++                        auto * r = active[i];
++                        llama_token tok = argmax_row(ctx_b, i);   // the first sample synchronises the step
++                        if (t_step_done == 0.0) { t_step_done = now_ms(); }
++                        if (tok < 0) { r->done = true; continue; }
++                        r->generated.push_back(tok);
++                        r->arrivals_ms.push_back(t_step_done);
++                        r->pos += 1;
++                        r->pending = tok;
++                        const bool stop = llama_vocab_is_eog(vocab, tok) ||
++                                          (int) r->generated.size() >= r->n_predict;
++                        if (stop) {
++                            r->done = true;
++                            r->on_decode_arm = false;
++                            llama_memory_seq_rm(llama_get_memory(ctx_b), r->seq, -1, -1);
++                        }
++                    }
++                }
++            }
++        });
++
++        t_pf.join();
++        t_dec.join();
++
++        std::vector<std::pair<double, double>> windows;
++        {
++            std::lock_guard<std::mutex> lk(st.pf_m);
++            windows = st.pf_windows;
++        }
++
++        double pf_total_ms = 0.0;
++        size_t pf_total_tok = 0;
++        for (const auto & r : reqs) {
++            const std::string sha = sha_of(r.generated);
++            const double pf_ms = r.t_prompt_done - r.t_prompt_start;
++            pf_total_ms  += pf_ms;
++            pf_total_tok += r.n_prompt_tok;
++            const std::string hb = r.handover_device
++                    ? std::string("device")
++                    : std::string("copy,") + std::to_string(r.handover_bytes) + "B";
++            printf("REQ %d sha=%s gen=%zu prompt_tokens=%zu pf_ms=%.1f pf_tps=%.1f "
++                   "handover_ms=%.2f(%s) ttft_ms=%.1f wall_ms=%.1f\n",
++                   r.id, sha.substr(0, 12).c_str(), r.generated.size(), r.n_prompt_tok, pf_ms,
++                   pf_ms > 0 ? 1000.0 * (double) r.n_prompt_tok / pf_ms : 0.0,
++                   r.t_handover, hb.c_str(),
++                   r.t_first_tok > 0 ? r.t_first_tok - r.t_admit_real : 0.0,
++                   r.arrivals_ms.empty() ? 0.0 : r.arrivals_ms.back() - r.t_admit_real);
++        }
++        printf("TOTAL prefill_tokens=%zu prefill_ms=%.1f pf_tps=%.1f\n",
++               pf_total_tok, pf_total_ms, pf_total_ms > 0 ? 1000.0 * (double) pf_total_tok / pf_total_ms : 0.0);
++
++        std::vector<double> all, during;
++        for (const auto & r : reqs) {
++            for (size_t i = 1; i < r.arrivals_ms.size(); ++i) {
++                const double d = r.arrivals_ms[i] - r.arrivals_ms[i - 1];
++                all.push_back(d);
++                if (in_any_window(windows, r.arrivals_ms[i])) { during.push_back(d); }
++            }
++        }
++        size_t n_in_window = 0;
++        for (const auto & r : reqs) {
++            for (double a : r.arrivals_ms) {
++                if (in_any_window(windows, a)) { n_in_window++; }
++            }
++        }
++        printf("ITL all=%zu p50=%.1f p95=%.1f max=%.1f | during_prefill=%zu tokens=%zu p50=%.1f p95=%.1f max=%.1f\n",
++               all.size(), ipct(all, 50), ipct(all, 95), vmax(all),
++               during.size(), n_in_window, ipct(during, 50), ipct(during, 95), vmax(during));
++    }
++
++    if (ctx_b) { llama_free(ctx_b); }
++    if (ctx_a) { llama_free(ctx_a); }
++    llama_model_free(model);
++    llama_backend_free();
++    return 0;
++}
+diff --git a/wip/prefill-decode-arms/enabling-0002-recurrent-handover.patch b/wip/prefill-decode-arms/enabling-0002-recurrent-handover.patch
+new file mode 100644
+index 00000000..492a7fe9
+--- /dev/null
++++ b/wip/prefill-decode-arms/enabling-0002-recurrent-handover.patch
+@@ -0,0 +1,371 @@
++diff --git a/include/llama.h b/include/llama.h
++index 4534967ba..1b127def9 100644
++--- a/include/llama.h
+++++ b/include/llama.h
++@@ -913,6 +913,29 @@ extern "C" {
++                  llama_pos p0,
++                  llama_pos p1);
++ 
+++    // wip/prefill-decode-arms [EXPERIMENTAL]: drop only the RECURRENT part of a sequence's state (a hybrid
+++    // model's GDN/conv state).  In a context pair that shares its attention KV
+++    // (llama_context_params::ctx_other_share_memory) the KV cells belong to BOTH contexts, so
+++    // llama_memory_seq_rm() on the arm that hands a slot over would free the cells the other arm is about to
+++    // read.  A handover moves the recurrent state only, so this is what the handing-over arm uses.
+++    LLAMA_API void llama_memory_seq_rm_recr(
+++            llama_memory_t mem,
+++              llama_seq_id seq_id,
+++                 llama_pos p0,
+++                 llama_pos p1);
+++
+++    // wip/prefill-decode-arms [EXPERIMENTAL]: MOVE seq_id's recurrent state from `src` to `mem`, device to
+++    // device, and release it in `src`.  This is the handover between two contexts of the same model that share
+++    // their attention KV (`llama_context_params::ctx_other_share_memory`): the KV cells are already the same
+++    // cells on both sides, so the recurrent rows are all that has to follow the slot.  Equivalent to
+++    // llama_state_seq_get_data_ext() + llama_state_seq_set_data_ext() with LLAMA_STATE_SEQ_FLAGS_RECR_ONLY,
+++    // minus the host round trip (~50-65 MiB, latency-bound).  Returns false (nothing changed) when the two
+++    // memories do not carry the same recurrent state -- a caller then falls back to the serialised path.
+++    LLAMA_API bool llama_memory_seq_state_take(
+++            llama_memory_t mem,
+++            llama_memory_t src,
+++              llama_seq_id seq_id);
+++
++     // Copy all tokens that belong to the specified sequence to another sequence
++     // p0 < 0 : [0,  p1]
++     // p1 < 0 : [p0, inf)
++@@ -1054,6 +1077,12 @@ extern "C" {
++ // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
++ #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
++ 
+++// wip/prefill-decode-arms: the RECURRENT part only -- a hybrid model's GDN/conv state, leaving a shared attention
+++// KV alone.  A context pair that shares its KV (llama_context_params::ctx_other_share_memory) hands a slot over
+++// by moving exactly this: the KV cells are already visible to both arms, and serialising them would copy the whole
+++// cache through host memory on every handover.
+++#define LLAMA_STATE_SEQ_FLAGS_RECR_ONLY 4
+++
++     typedef uint32_t llama_state_seq_flags;
++ 
++     LLAMA_API size_t llama_state_seq_get_size_ext(
++diff --git a/src/llama-context.cpp b/src/llama-context.cpp
++index 1b378f451..016de46ec 100644
++--- a/src/llama-context.cpp
+++++ b/src/llama-context.cpp
++@@ -7093,6 +7093,38 @@ bool llama_memory_seq_rm(
++     return mem->seq_rm(seq_id, p0, p1);
++ }
++ 
+++void llama_memory_seq_rm_recr(
+++        llama_memory_t mem,
+++          llama_seq_id seq_id,
+++             llama_pos p0,
+++             llama_pos p1) {
+++    if (!mem) {
+++        return;
+++    }
+++
+++    mem->seq_rm_recr(seq_id, p0, p1);
+++}
+++
+++bool llama_memory_seq_state_take(
+++        llama_memory_t mem,
+++        llama_memory_t src,
+++          llama_seq_id seq_id) {
+++    if (!mem || !src || mem == src) {
+++        return false;
+++    }
+++
+++    // only a hybrid memory carries a recurrent state that has to follow a slot; a plain attention KV is
+++    // already shared (the same cells), so it has nothing to move
+++    auto * dst_hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+++    auto * src_hybrid = dynamic_cast<llama_memory_hybrid *>(src);
+++
+++    if (dst_hybrid == nullptr || src_hybrid == nullptr) {
+++        return false;
+++    }
+++
+++    return dst_hybrid->get_mem_recr()->seq_state_take(*src_hybrid->get_mem_recr(), seq_id);
+++}
+++
++ void llama_memory_seq_cp(
++         llama_memory_t mem,
++           llama_seq_id seq_id_src,
++diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
++index 8f3b4ce9d..e2bcbbb55 100644
++--- a/src/llama-memory-hybrid.cpp
+++++ b/src/llama-memory-hybrid.cpp
++@@ -175,6 +175,12 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
++     return mem_attn->seq_rm(seq_id, p0, p1);
++ }
++ 
+++void llama_memory_hybrid::seq_rm_recr(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+++    // wip/prefill-decode-arms: the attention cells of a co-owner pair belong to BOTH contexts, so a handover
+++    // must not free them -- only this context's recurrent rows move to the other arm.
+++    mem_recr->seq_rm(seq_id, p0, p1);
+++}
+++
++ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
++     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
++     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
++@@ -223,12 +229,20 @@ uint32_t llama_memory_hybrid::graph_extra_entries() const {
++ }
++ 
++ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
++-    mem_attn->state_write(io, seq_id, flags);
+++    // wip/prefill-decode-arms: a handover between two contexts that share the attention KV moves the RECURRENT
+++    // state only -- the KV cells are the same cells on both sides, and serialising them would copy the whole
+++    // cache through host memory on every request boundary.
+++    if (!(flags & LLAMA_STATE_SEQ_FLAGS_RECR_ONLY)) {
+++        mem_attn->state_write(io, seq_id, flags);
+++    }
++     mem_recr->state_write(io, seq_id, flags);
++ }
++ 
++ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
++-    mem_attn->state_read(io, seq_id, flags);
+++    // see state_write(): with RECR_ONLY the attention half is neither written nor read
+++    if (!(flags & LLAMA_STATE_SEQ_FLAGS_RECR_ONLY)) {
+++        mem_attn->state_read(io, seq_id, flags);
+++    }
++ 
++     try {
++         mem_recr->state_read(io, seq_id, flags);
++diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
++index e0f517f68..210b9f9fd 100644
++--- a/src/llama-memory-hybrid.h
+++++ b/src/llama-memory-hybrid.h
++@@ -68,6 +68,8 @@ public:
++     void clear(bool data) override;
++ 
++     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+++    // wip/prefill-decode-arms: the recurrent half only -- the attention cache may be shared with another context
+++    void seq_rm_recr(llama_seq_id seq_id,                           llama_pos p0, llama_pos p1) override;
++     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
++     void seq_keep(llama_seq_id seq_id)                                                          override;
++     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
++diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
++index 4048d27f5..b582830ad 100644
++--- a/src/llama-memory-recurrent.cpp
+++++ b/src/llama-memory-recurrent.cpp
++@@ -774,6 +774,185 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
++     return n >= n_seqs;
++ }
++ 
+++// wip/prefill-decode-arms: the device-to-device handover of one sequence's recurrent state.
+++//
+++// Semantics are exactly state_write(LLAMA_STATE_SEQ_FLAGS_RECR_ONLY) followed by state_read() on the other
+++// memory (see state_read_meta()), which is the shape the campaign's text oracle verified:
+++//   * the destination's cells for this seq are dropped first (the destination may have served a previous
+++//     request with the same seq id),
+++//   * the source's cells are placed into ONE contiguous destination block, whose `pos` is the last one,
+++//   * the rows are copied (source cells may map to logical rows through `src`, the pending-rollback plane),
+++//   * every destination row is marked as its own source (`cells[i].src = i`), which is what state_read_meta()
+++//     leaves behind, and the per-seq rollback index is reset.
+++// The rows are what make this a handover: r (and the PLE conv row where the model has one) first, then s.
+++bool llama_memory_recurrent::seq_state_take(llama_memory_recurrent & src, llama_seq_id seq_id) {
+++    if (&src == this) {
+++        return true;
+++    }
+++
+++    const int32_t n_layer = hparams.n_layer();
+++
+++    if ((int32_t) src.r_l.size() != n_layer || (int32_t) src.s_l.size() != n_layer ||
+++        (int32_t) src.p_l.size() != n_layer || n_rs_seq != src.n_rs_seq) {
+++        return false;
+++    }
+++
+++    auto same_tensor = [](const ggml_tensor * a, const ggml_tensor * b) {
+++        if (a == nullptr || b == nullptr) {
+++            return a == b;
+++        }
+++        return a->type == b->type && a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1];
+++    };
+++
+++    for (int32_t il = 0; il < n_layer; ++il) {
+++        if (!same_tensor(r_l[il], src.r_l[il]) || !same_tensor(s_l[il], src.s_l[il]) ||
+++            !same_tensor(p_l[il], src.p_l[il])) {
+++            return false;
+++        }
+++    }
+++
+++    if (seq_id < 0 || (size_t) seq_id >= (size_t) n_seq_max) {
+++        return false;
+++    }
+++
+++    // the source's cells for this sequence, in cell order, with the logical row each one holds
+++    std::vector<uint32_t>  srows;
+++    std::vector<llama_pos> spos;
+++    {
+++        const uint32_t plane = n_rs_seq != 0 && (size_t) seq_id < src.rs_idx.size() ? src.rs_idx[seq_id] : 0;
+++
+++        for (uint32_t i = 0; i < src.size; ++i) {
+++            const auto & cell = src.cells[i];
+++            if (!cell.has_seq_id(seq_id)) {
+++                continue;
+++            }
+++            srows.push_back(plane * src.size + (uint32_t) (cell.src >= 0 ? cell.src : (int32_t) i));
+++            spos.push_back(cell.pos);
+++        }
+++    }
+++
+++    // the destination may still hold cells of a previous request that used this seq id
+++    seq_rm(seq_id, -1, -1);
+++
+++    if (srows.empty()) {
+++        src.seq_rm(seq_id, -1, -1);
+++        return true;
+++    }
+++
+++    if (srows.size() > size) {
+++        return false;
+++    }
+++
+++    // one contiguous destination block, allocated exactly the way state_read_meta() does it
+++    llama_batch_allocr balloc(hparams.n_pos_per_embd());
+++
+++    llama_ubatch ubatch = balloc.ubatch_reserve((uint32_t) srows.size(), 1);
+++    for (size_t i = 0; i < srows.size(); ++i) {
+++        ubatch.pos[i] = spos[i];
+++    }
+++    ubatch.n_seq_id[0] = 1;
+++    ubatch.seq_id[0]   = &seq_id;
+++
+++    if (!find_slot(ubatch)) {
+++        return false;
+++    }
+++
+++    const uint32_t dst_row0 = head;
+++
+++    if (dst_row0 + srows.size() > size) {
+++        return false;
+++    }
+++
+++    // views for the batched device copy (one sync for the whole handover); a host buffer takes a plain memcpy
+++    ggml_init_params vparams = {
+++        /*.mem_size   =*/ (size_t) 2*3*n_layer*ggml_tensor_overhead(),
+++        /*.mem_buffer =*/ nullptr,
+++        /*.no_alloc   =*/ true,
+++    };
+++
+++    ggml_context * vctx = ggml_init(vparams);
+++    if (vctx == nullptr) {
+++        return false;
+++    }
+++
+++    std::vector<const ggml_tensor *> csrc;
+++    std::vector<ggml_tensor *>       cdst;
+++    csrc.reserve(3*n_layer);
+++    cdst.reserve(3*n_layer);
+++
+++    auto copy_tensor_rows = [&](ggml_tensor * dst, ggml_tensor * s, size_t row_size) {
+++        const bool s_host = ggml_backend_buffer_is_host(s->buffer);
+++        const bool d_host = ggml_backend_buffer_is_host(dst->buffer);
+++
+++        size_t i = 0;
+++        while (i < srows.size()) {
+++            size_t j = i + 1;
+++            while (j < srows.size() && srows[j] == srows[j - 1] + 1) {
+++                ++j;   // a run that is contiguous on the source side
+++            }
+++
+++            const uint32_t n_rows = (uint32_t) (j - i);
+++            const uint32_t s_row  = srows[i];
+++            const uint32_t d_row  = dst_row0 + (uint32_t) i;
+++
+++            if (s_host && d_host) {
+++                memcpy((char *) dst->data + d_row*row_size, (const char *) s->data + s_row*row_size,
+++                        (size_t) n_rows*row_size);
+++            } else {
+++                csrc.push_back(ggml_view_2d(vctx, s,   s->ne[0],   n_rows, s->nb[1],   s_row*row_size));
+++                cdst.push_back(ggml_view_2d(vctx, dst, dst->ne[0], n_rows, dst->nb[1], d_row*row_size));
+++            }
+++
+++            i = j;
+++        }
+++    };
+++
+++    for (int32_t il = 0; il < n_layer; ++il) {
+++        if (r_l[il] == nullptr) {
+++            continue;
+++        }
+++
+++        copy_tensor_rows(r_l[il], src.r_l[il], ggml_row_size(r_l[il]->type, hparams.n_embd_r()));
+++
+++        if (p_l[il] != nullptr) {
+++            copy_tensor_rows(p_l[il], src.p_l[il], ggml_row_size(p_l[il]->type, hparams.ple_conv_state()));
+++        }
+++    }
+++
+++    for (int32_t il = 0; il < n_layer; ++il) {
+++        if (s_l[il] == nullptr) {
+++            continue;
+++        }
+++
+++        copy_tensor_rows(s_l[il], src.s_l[il], ggml_row_size(s_l[il]->type, hparams.n_embd_s()));
+++    }
+++
+++    if (!csrc.empty()) {
+++        ggml_backend_tensor_copy_n(csrc.data(), cdst.data(), csrc.size());
+++    }
+++
+++    ggml_free(vctx);
+++
+++    // the restored rows are their own source (what state_read_meta() leaves behind): BOTH fields, because
+++    // find_slot() set `src0` to `rs_z`, which is this cell only while no other cell names it as a source
+++    for (size_t i = 0; i < srows.size(); ++i) {
+++        cells[dst_row0 + i].src  = (int32_t) (dst_row0 + i);
+++        cells[dst_row0 + i].src0 = (int32_t) (dst_row0 + i);
+++    }
+++
+++    if (n_rs_seq != 0) {
+++        set_rs_idx(seq_id, 0);
+++    }
+++
+++    // release the source rows -- the copy above has completed (the batched copy syncs, the memcpy is immediate)
+++    src.seq_rm(seq_id, -1, -1);
+++
+++    LLAMA_LOG_DEBUG("%s: took seq %d: %zu row(s) from row %u -> %u\n", __func__, (int) seq_id, srows.size(),
+++            srows[0], dst_row0);
+++
+++    return true;
+++}
+++
++ bool llama_memory_recurrent::get_can_shift() const {
++     // shifting the pos is trivial for recurrent models
++     return true;
++diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
++index e0e0cfc71..346645f1b 100644
++--- a/src/llama-memory-recurrent.h
+++++ b/src/llama-memory-recurrent.h
++@@ -63,6 +63,15 @@ public:
++ 
++     bool get_can_shift() const override;
++ 
+++    // wip/prefill-decode-arms: MOVE seq_id's recurrent state from `src` into this memory, device to device, and
+++    // release it there.  Two contexts of the same model that share their attention KV
+++    // (llama_context_params::ctx_other_share_memory) hand a slot over with this: the KV cells are already the
+++    // same cells on both sides, so only the recurrent rows have to follow.  It is the D2D form of
+++    // state_write(RECR_ONLY)+state_read(), which instead bounces the rows through host memory (~50-65 MiB, and
+++    // latency-bound at ~35 ms in the campaign's measurement).  Returns false, having changed nothing, when the
+++    // two memories do not describe the same state (a fallback to the serialised path is then the caller's job).
+++    bool seq_state_take(llama_memory_recurrent & src, llama_seq_id seq_id);
+++
++     // state write/load
++ 
++     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
++diff --git a/src/llama-memory.h b/src/llama-memory.h
++index 395c0a5c2..7a95c3b0e 100644
++--- a/src/llama-memory.h
+++++ b/src/llama-memory.h
++@@ -157,6 +157,13 @@ struct llama_memory_i {
++     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
++     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
++ 
+++    // wip/prefill-decode-arms: drop only the RECURRENT part of a sequence's state.  In a context pair that
+++    // shares its attention KV (llama_context_params::ctx_other_share_memory) the KV cells are the shared truth
+++    // -- a handover moves only the recurrent state between the arms -- so seq_rm() on the arm handing a slot
+++    // over would free cells the other arm is about to read.  A memory module with no recurrent state (a plain
+++    // attention KV) does nothing here.
+++    virtual void seq_rm_recr(llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/) {}
+++
++     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
++ 
++     // wip/kv-residency (TODO #118) B-A: the ATTENDANCE POOL's footprint -- the compact device pool that is
+-- 
+2.56.1
+

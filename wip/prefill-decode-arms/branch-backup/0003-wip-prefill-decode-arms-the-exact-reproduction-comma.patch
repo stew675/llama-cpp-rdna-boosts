@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 23:41:52 -0600
+Subject: [PATCH] wip/prefill-decode-arms: the exact reproduction commands in
+ the results file, and drop a broken early run
+
+---
+ wip/prefill-decode-arms/RESULTS-2026-11-21.md | 37 +++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/wip/prefill-decode-arms/RESULTS-2026-11-21.md b/wip/prefill-decode-arms/RESULTS-2026-11-21.md
+index 2f120159..15e6bb5f 100644
+--- a/wip/prefill-decode-arms/RESULTS-2026-11-21.md
++++ b/wip/prefill-decode-arms/RESULTS-2026-11-21.md
+@@ -263,6 +263,43 @@ generation and nothing else.
+    / `gate-prefill-duty.sh` (the prefill arm keeps block 16's admission and the duty cycle becomes the `F ≈ 0`
+    fallback).
+ 
++## Reproduce
++
++The tree must be the WIP branch (4 commits) — `enabling-0001` + `enabling-0002` are the two `src/` commits:
++
++```bash
++cd ~/llama.cpp && git checkout wip/prefill-overlap
++BUILD_DIR=build-2ctx JOBS=24 ~/bin/build-llama-rocm-101     # 10.1.0-gfx120X, the line every number here is on
++cd ~/llama-cpp-rdna-boosts/wip/prefill-decode-arms/arms && ./build-two-arms.sh
++head -200 ../../../prompts/kld-corpus-35b-in-domain.txt > /tmp/p4k.txt   # the 4932-token prompt
++
++export LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib HIP_VISIBLE_DEVICES=0 TWO_CTX_PF_FILE=/tmp/p4k.txt
++M=/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
++
++# the host-tier shape of §2.1 (arena 5000, the ubatch the pair fits at)
++export MOE_EXPERT_CACHE_MIB=5000 MOE_EXPERT_HEATMAP=load ROCBLAS_USE_HIPBLASLT=0 \
++       ARMS_SCENARIO="512:192@0,2048:48@0" ARMS_B_BATCH=4 ARMS_REPS=3
++for m in single pf-alone dec-alone arms; do
++  ARMS_MODE=$m ./two_arms -m $M -ngl 99 -ncmoe 40 -lme auto -c 16384 -b 2048 -ub 512 -n 192 -t 8 2>&1 \
++    | grep -E "^REP |^REQ |^TOTAL|^ITL"
++done
++
++# the oracle: full residency (no -ncmoe, no arena), no overlap control
++unset MOE_EXPERT_CACHE_MIB MOE_EXPERT_HEATMAP
++ARMS_MODE=batch-pair ./two_arms -m $M -ngl 99 -c 8192 -b 2048 -ub 512 -n 192 -t 8   # the reference
++ARMS_MODE=arms ARMS_WAIT_ALL=1 ./two_arms -m $M -ngl 99 -c 8192 -b 2048 -ub 512 -n 192 -t 8
++
++# the handover itself, one request, 3 warm reps (single vs handover: the hashes must match)
++ARMS_SCENARIO="4932:32@0" ARMS_MODE=single   ./two_arms -m $M -ngl 99 -ncmoe 40 -lme auto -c 24576 -b 2048 -ub 2048 -n 32 -t 8
++ARMS_SCENARIO="4932:32@0" ARMS_MODE=handover ./two_arms -m $M -ngl 99 -ncmoe 40 -lme auto -c 24576 -b 2048 -ub 2048 -n 32 -t 8
++# ARMS_HANDOVER=copy forces the serialised path (the control arm of the take)
++```
++
++Knobs the instrument adds: `ARMS_MODE` (`single|batch-pair|arms|handover|pf-alone|dec-alone`), `ARMS_SCENARIO`
++(`<prompt_tokens>:<n_predict>@<admit_ms>,…`), `ARMS_REPS` (warm reps; rep 0 pays the cold arena), `ARMS_B_BATCH`
++(the decode arm's `n_batch = n_ubatch`), `ARMS_WAIT_ALL=1` (no prefill/decode overlap: the step loop holds until
++every handover is done), `ARMS_HANDOVER=device|copy`.
++
+ ## Files
+ 
+ | file | what |
+-- 
+2.56.1
+
