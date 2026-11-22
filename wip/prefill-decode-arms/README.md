@@ -1,9 +1,12 @@
 # prefill-decode-arms — one prefill arm and one decode arm, both live on one GPU
 
-**Status: pass 3 done (2026-11-22) — T0 CLOSED (one KV allocation owner for the pair), T1 CLOSED,
-T2/T3 emulated outside the server, and the two-arm run is now bit-identical to the single-context reference on
-both shapes with no harness control.  Nothing in `patches/`.**  See
-[`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) (pass 2) and [`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md) (pass 1).  It inherits the conclusion of the
+**Status: pass 5 done (2026-11-22) — T0, T1 and **T2** CLOSED: `llama-server --prefill-decode-arms` is the design
+(prefill arm + decode arm on one shared KV, a slot crossing only at a request boundary), **tier 1 passes cold and
+over 3 warm request pairs** (both slots byte-identical to the single-context server, every allocation handshake
+clean), and the campaign's metric is measured: **~47-49 ms ITL p50 / 64-78 ms p95 through a 2.0-5.3 s prefill** at
+**-24 to -27 % prefill** (the smoothness target is met, the <= ~14 % cost target is not — pass 5 §6).  Nothing in
+`patches/`.**  See [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) (passes 2-5) and
+[`RESULTS-2026-11-21.md`](RESULTS-2026-11-21.md) (pass 1).  It inherits the conclusion of the
 retired [`archive/work/prefill-transfer-overlap/`](../../archive/work/prefill-transfer-overlap/README.md)
 (it established *what* the win is and *which mechanism* delivers it).  This campaign builds the product.
 
@@ -143,7 +146,13 @@ yield point, the stream-priority plumbing — the last two are recorded losers, 
 8. **The second arm's VRAM is a graph reserve per arm AND per active-slot width**: a 2-row decode graph on
    35B-A3B at `-ub 2048` asks for **741.47 MiB** on top of the 1-row one.  At arena 5000 / `-c 16384` /
    `-ub 2048` the pair does **not** fit on a 32 GiB card (the *prefill* graph's reserve fails); `-ub 512` does.
-   The opt-in gate needs that rule, not landmine 2's 600 MiB.
+   **Confirmed in the server (pass 5 §4), and it is a WIDTH transition, not a size**: the 1-row decode step runs
+   fine, and the failure lands on the first 2-row batch (`741.48 MiB ... the movable-boundary slab holds the VRAM`,
+   `ret = -2`).  The lever is `GGML_CUDA_SLAB_HEADROOM_MIB=1536` (the documented knob for exactly that message;
+   default 1280 on one GPU) — with it the pair runs a ~5900-token prompt at arena 5000 / `-c 16384 -ub 512` with
+   zero OOMs.  The gate's VRAM rule therefore has two levers: size the arms for their own batch, **and** leave
+   enough slab headroom for the widest decode graph the pair will ever reserve.  The opt-in gate needs that rule,
+   not landmine 2's 600 MiB.
 9. **A greedy hash is not an oracle for the two arms yet** (`RESULTS-2026-11-21.md` §3.3): the cold rep matches
    the sequential reference and the warm ones do not (nor each other), while the single-context 2-slot
    reference is stable across reps.  Isolated: not the handover (both paths agree), not `GGML_MOE_DEVREMAP`,
@@ -169,6 +178,11 @@ yield point, the stream-priority plumbing — the last two are recorded losers, 
    480/480 logits rows, and the divergent row is R1's own *prefill* row), and on a partial arena it is a **§89
    residency class** (`h=0.8161` vs `h=0.8172`) that survives every pin.  [`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md).
 
+10. **The arms path does not reuse a slot's prefix across requests (pass 5 §7)**: when generation ends, the decode
+   arm frees the slot's shared cells and the return clears its prompt, because the recurrent half still lives on the
+   decode arm and moving it *back* is a reverse handover the scoped design does not do.  The reference server keeps
+   the KV and does reuse it.  It costs nothing in the oracle (`cache_prompt:false`) and it is the first thing to fix
+   if this is promoted.
 ## 5. The reusable harness
 
 [`archive/work/prefill-transfer-overlap/arms/two_ctx.cpp`](../../archive/work/prefill-transfer-overlap/arms/two_ctx.cpp)
@@ -201,10 +215,10 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 | # | task | why first |
 |---|---|---|
 | **T1** | ~~recurrent state: share it (preferred) or hand it over at a slot boundary~~ — **DONE 2026-11-21** as a device-to-device handover (`enabling-0002`), 0.5–0.7 ms, text-verified | — |
-| **T2** | server skeleton: second context + second thread + routing of decode-only batches to the decode arm; slots pinned to an arm for a request's lifetime | this alone reproduces the measured win (steady ITL during a prefill).  The design is now measured outside the server (`RESULTS-2026-11-21.md` §2 + §5's code points) and its cost/VRAM rules are §3.1/§3.2 |
+| **T2** | ~~server skeleton: second context + second thread + routing of decode-only batches to the decode arm~~ — **DONE 2026-11-22 (pass 5)**: `llama-server --prefill-decode-arms`, `~/llama.cpp` `683deed67`, tier 1 passing cold and over 3 warm pairs (`T2-SERVER-CUT.md`'s header + `RESULTS-2026-11-22.md` pass 5) | — |
 | **T3** | handover at the request boundary, with a text oracle: a request's reply must be byte-identical to today's single-context server | **the oracle has to be chosen carefully**: it holds on a no-host-tier model and for a single handed-over request on the tier, but a 2-slot arm on a partial arena is not text-stable warm (§3.3) — use a full-residency/no-host-tier text point + KLD on the tier |
 | **T4** | policy + opt-in gate (host tier + residency deficit + the VRAM rule of §3.2), and the duty cycle's role on this path | the measured boundary: no window at full residency, so no unconditional default |
-| **T5** | measurement with `smooth.py` against the baseline table + the gates (§7) | the campaign's verdict |
+| **T5** | ~~measurement with `smooth.py` against the baseline table~~ — **TAKEN 2026-11-22 (pass 5 §3)**: ~47-49 ms ITL p50 / 64-78 ms p95 through a 2.0-5.3 s prefill at **-24 to -27 % prefill**; the gates of §7 are **not** run (nothing is delivery-bound) | the smoothness target is met, the <= ~14 % cost target is not; the verdict is the maintainer's |
 | **T0** | ~~the shared-KV allocator fix~~ — **DONE 2026-11-22**: `enabling-0003-shared-kv-allocator.patch`, one shared owner, per-ubatch reserve/commit/release, `llama_memory_alloc_sync()` as the handshake, `LLAMA_KV_ALLOC_SHARED=0` as the control (`RESULTS-2026-11-22.md` pass 3) | it had to land before two arms allocate cells; it also removed the scatter that moved the text |
 
 ## 7. Gates when it becomes code
@@ -275,4 +289,8 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 | [`arms/two_arms.cpp`](arms/two_arms.cpp), [`arms/build-two-arms.sh`](arms/build-two-arms.sh) | the instrument: two arms, two threads, one KV, a request queue and the handover; references `single` / `batch-pair` / `pf-alone` / `dec-alone` |
 | [`runs/2611-arms-35b-arena5000.txt`](runs/2611-arms-35b-arena5000.txt) | the raw 35B arm table behind the results file's §2.1 |
 | [`runs/t0-2611/`](runs/t0-2611/) | pass 3: every T0 arm (stdout, stderr gzipped, the logits manifests) — the oracle, the `LLAMA_KV_ALLOC_SHARED=0` control, and the `ARMS_NO_WAIT_TAKE=1` race control |
+| [`arms/gate-server-arms.sh`](arms/gate-server-arms.sh) | the T2 gate (tier 1): the two-arm server's reply must be byte-identical to the single-context server's, both slots; `REPS=N` makes it N request pairs in ONE process (the warm reps), `--compare` is the oracle |
+| [`arms/smooth.py`](arms/smooth.py) | the retired campaign's smoothness harness, **verbatim** + `--warm N`: a decoder's ITL *inside* the prefill's window (`itl_d_p50/p95`), the tokens it got through, and the prefill's own `pf_tps` |
+| [`runs/server-oracle/`](runs/server-oracle/) | pass 4/5: the reference and the two-arm server (one pair each) + `warm/` (3 pairs in one process) |
+| [`runs/smooth-2611b/`](runs/smooth-2611b/) … [`runs/smooth-2611e/`](runs/smooth-2611e/) | pass 5: the four measurement runs — `smooth.tsv` + the per-arm JSON + the gzipped server logs (2611 is the failed one: the 2-row decode-graph OOM) |
 | [`../../archive/work/prefill-transfer-overlap/`](../../archive/work/prefill-transfer-overlap/README.md) | the retired campaign: how the win was established, every measured number, and the two policies that lost |

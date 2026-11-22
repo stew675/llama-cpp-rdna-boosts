@@ -1,9 +1,19 @@
 # T2 — the server cut, in verified code points
 
-**Status: NOT STARTED (scope verified 2026-11-22, against `tools/server/server-context.cpp` as it stands on
-`wip/prefill-overlap`).**  Everything T2 depends on has landed: `enabling-0001` (second context, shared KV),
-`enabling-0002` (the recurrent handover), **`enabling-0003` (T0, one allocation owner + the handshake)**.  This file
-is the plan so the next session starts cold but exact; every line number below was read, not remembered.
+**Status: BUILT AND PASSING TIER 1 (2026-11-22, pass 5) — `~/llama.cpp` `683deed67`.**  Every code point below was
+implemented as written; the as-built notes, the two defects the cut produced, the VRAM finding (`741.48 MiB` 2-row
+decode graph, fixed with `GGML_CUDA_SLAB_HEADROOM_MIB=1536`) and the measurement are in
+[`RESULTS-2026-11-22.md`](RESULTS-2026-11-22.md) **pass 5**.  Tier 1 passes cold and over three warm request pairs
+(both slots byte-identical to the single-context server, every allocation handshake clean); the smoothness target is
+met (~47-49 ms ITL p50 through a 2.0-5.3 s prefill) and the **cost target is not** (-24 to -27 % against the
+instrument's -14.1 % — pass 5 §6 reads that honestly).
+
+Three things differ from the plan below and are recorded in pass 5 §1: a `wait_handover_taken()` at the top of
+`pre_decode()` as the second line of defence for the ordering rule, `arm_release()` for a cancel/abort that lands on
+a slot the decode arm owns, and `finish_returned_slots()` clearing the slot's prompt on the return (so the arms path
+does **not** reuse a slot's prefix across requests — pass 5 §7).
+
+Original scope note (2026-11-22, against `tools/server/server-context.cpp` as it stood on `wip/prefill-overlap`):
 
 The design is unchanged from `RESULTS-2026-11-21.md` §5: **one server with two arms**, where the decode arm owns
 its slots' generation and nothing else.  The target is the instrument's own numbers: a decoder getting a token every
