@@ -289,6 +289,30 @@ picked by the arm: a text/hash arm takes **no** `-lv`, a census arm takes **`-lv
    policies that lost (rate gate, per-gather yield, stream priority); do not rebuild them;
 6. `INVARIANTS.md` r305-r310 and `GREEDY-PURITY.md` §44/§89 — the purity traps this campaign keeps meeting.
 
+## 7b. Where the numbers of record stand (end of 2026-11-22, r343)
+
+**T2 is built and its oracle passes**; the campaign's question is answered on both weight tiers.  All numbers: 1 x
+R9700 (gfx1201), 35B-A3B Q4_K_M, warm, sequential, `ROCBLAS_USE_HIPBLASLT=0` (and `MOE_EXPERT_HEATMAP=load` on the
+host-tier arms).
+
+| | host tier (arena 5000, `-ncmoe 40 -lme auto`) | full residency (no arena, no gathers) |
+|---|---|---|
+| prefill alone | 6321 -> **3800 t/s** depending on `-ub`/prompt | **6320.8 t/s** |
+| **prefill cost of the overlap** | **-21…-24 %** (flat from `-ub 2048` up; `-ub 512` is -26.6 %) | **-24.2 %** |
+| single-context server, same run | -34.7…-35 % (chunked) and a 300-880 ms stall | **-34.7 %** and a **327 ms** stall |
+| two arms, decoder's worst in-window gap | 60-131 ms | **34.9 ms** |
+| the pasted document (interactive) | 2.81 s / 1252 t/s at `-ub 512`; **1.13 s / 3111 t/s at 4096** | **737 ms / 4786 t/s** |
+
+Read it as: **the arms are better than the single-context server on both axes on both tiers**, the prefill cost is
+~-21…-24 % (accepted by the maintainer, `README.md` §3b), the decoder's worst case is 34-131 ms instead of 327-878,
+and **`-ub`/`-b` 4096 is the sweet spot** (`-ib` inert; 8192 buys +8 % prefill for a worse tail).
+
+Still open (the traps): tier 2 (KLD) + the server gates of `T2-SERVER-CUT.md` §6.3; **no prefix reuse across requests
+on the arms path** (`finish_returned_slots()` clears the prompt — a reverse handover would be needed); the T4 gate
+itself (its rules are measured, `README.md` landmine 8 + §3b); what happens to block 16's duty cycle on this path (it
+is redundant: `-ib` cannot bind and the bursts it exists to create are already gone); and promotion (a block needs
+the maintainer's explicit go-ahead plus the full ladder).
+
 ## 8. The one-line summary of what is left
 
 **The server cut is built and tier 1 passes; the smoothness target is met and the cost target is not.**  What is

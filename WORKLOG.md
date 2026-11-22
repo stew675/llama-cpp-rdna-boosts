@@ -1,3 +1,36 @@
+## 261122.010 (r343, no delivery change) -- wip/prefill-decode-arms: at FULL residency the two arms are still better on BOTH axes (the single-context server's own interleave is the expensive thing)
+
+**No delivery patch changed.**  The last tier: all 21.1 GiB of 35B-A3B Q4_K_M resident in VRAM (no `-ncmoe`, no
+`-lme`, no arena, no gathers), where the two arms compete for the same SMs and nothing hides behind a link.
+`-c 16384 -b 2048 -ub 2048`, warm, `ROCBLAS_USE_HIPBLASLT=0`.
+
+| arm | prefill | decoder tokens in the window | in-window ITL p50 / p95 / max |
+|---|---|---|---|
+| `lone` (alone) | **6320.8 t/s** | -- | -- |
+| `single` (one context, both streams) | **4129.2 t/s (-34.7 %)** | 32 | 8.8 / 46.8 / **327.3 ms** |
+| **two arms** | **4792.0 t/s (-24.2 %)** | **53** | 14.6 / 16.0 / **34.9 ms** |
+
+The user-facing version (`interactive.py`: reply streaming while a ~3600-token document is pasted): single-context
+**924 ms at 4029 t/s with a 327 ms freeze**, two arms **737 ms at 4786 t/s with a 33 ms worst gap**.
+
+### What it settles
+
+1. **The arms win on both axes here too**: +16 % prefill, a 10x tighter worst-case stall, 66 % more decoder tokens
+   through the window, and the document 20 % sooner.
+2. **It is the single-context server that does badly at full residency**, mechanically: with a live decoder its
+   prefill is served in many small steps (34 prefill steps against 4 for the arms, p50 8.7 ms) so it re-pays the
+   per-step fixed cost throughout -- -34.7 % -- **and** each step still stalls the decoder (the 327 ms spike IS one
+   prefill step).
+3. The retired campaign's "no window at full residency" is a statement about the *host-tier* window: nothing is free
+   here (the cost is a real -24.2 %), but the earlier implication that the arms lose at full residency is false on
+   the server.
+4. The arms' price is the **same order on both tiers** (-24.2 % here, -21…-24 % on the host tier), and so is the
+   smoothness gain: the design does not depend on which tier the weights sit in.
+
+With this the campaign's core question is answered on both tiers; `HANDOVER.md` §7b is the numbers-of-record table
+for the next session, and §8/§7b list the traps (tier 2 + the server gates, no cross-request prefix reuse on this
+path, the T4 gate, block 16's duty cycle, promotion).
+
 ## 261122.009 (r343, no delivery change) -- wip/prefill-decode-arms: `-ub 8192` measured, and the "cost falls with the ubatch" reading is CORRECTED (it was a one-step artifact)
 
 **No delivery patch changed.**  The maintainer asked for `-ub 8192`; it was measured, and it refutes part of
