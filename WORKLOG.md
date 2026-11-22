@@ -1,3 +1,39 @@
+## 261122.011 (r343, no delivery change) -- wip/prefill-decode-arms pass 6: tier 2 (KLD 0.000000) + the reachable server gates -- and the two reds are RELATIVE bounds the arms remove
+
+**No delivery patch changed; nothing in `patches/`, no tag.**  The tier-1 oracle was reproduced first (cold + 3 warm
+request pairs, both slots `459865c93d55cbaf` / `7dc20b0ce0bac255`, `HANDSHAKE the pair shares one allocation owner`,
+every boundary clean), then the delivery-bound evidence that had never been run:
+`scripts/gate-prefill-logits.sh` on the WIP build (`build-2ctx` @ `7c114eec0`), `gate-prefill-fairness.sh` +
+`--self-test`, `gate-prefill-duty.sh`, `gate-park-idle-slots.sh`, `gate-ckpt-reuse.sh`, `check-gpu-faults.sh` on
+every arm.  Record: `wip/prefill-decode-arms/RESULTS-2026-11-22.md` pass 6.
+
+* **KLD: mean 0.000000 / same-top-p 100 %** against the canonical 27B Q8_0 base — the three library artifacts are
+  **bit-inert on the default single-context prefill path**.  Honest limit: `llama-perplexity` owns one context, so
+  this gate **cannot reach** the arms path; tier 1's byte-identical hash is the arms-path instrument.
+* **fairness**: red **as shipped** only on `ITL_c <= 1.75 x ITL_b x chunk/b` = **13 ms**, i.e. it asks for less than
+  the decode arm's own 28-30 ms step; **green** with the gate's own `--max-itl-ms 120` (28 ms), everything else green
+  (admission, 2.3x fair share, text identical, faults clean).  The gate's baselines on the same shape are the
+  campaign in one line: **single-context worst in-window ITL 323 ms, arms 29 ms**.  `--self-test` on the default path
+  still rejects the unfixed build.
+* **duty**: red **as shipped** on a 3x burst gain that cannot exist when the baseline **already delivers 73** tokens
+  (single-context baseline: **16**); **green** at `--min-decode-gain 1.0` — inert, 73 -> 75, prefill stretch
+  **0.99x** (the single context pays 2.09x for its 129).  So block 16's duty cycle is **redundant on this path**,
+  while its **fair-share** half stays live (1.845 s -> 0.786 s).
+* **park**: reachable, **SKIP** — a co-owner pair is not "one stream", so the cache declines by its own guard (the
+  control PASSES: 3 park moves, 1 unpark).  Also: the arms force an explicit or auto `-np`, and an explicit `-np N`
+  leaves `kv_unified = false` (only `--parallel auto` sets it) — a docs/gate item for promotion.
+* **ckpt reuse**: reachable, **SKIP** — **0** restores and `cache_n = 0` on every request, because the return frees
+  the slot's cells and clears its prompt.  Measured price of the missing prefix reuse: a chat turn appending ~9
+  tokens re-prefills 5200+, **685 ms against 33 ms** (~20x per turn, single-context control PASSES with 3 restores).
+  That is `README.md` landmine 10 with a number; the fix is the **reverse handover** and is the maintainer's call.
+* **GPU faults: clean over all 32 logs**, including every two-arm run.
+
+Read together with the retired campaign: no mechanism or gate says the two arms are wrong — the two reds are bound
+arithmetic on a design that removes the shared step, and the two SKIPs are the two behavioural consequences
+(parking's placement work and prefix reuse) that the request-boundary-only design makes unreachable.  Still owed
+before promotion: `scripts/gate-host-pool.sh` and `scripts/gate-moe-promise.sh`.  `~/llama.cpp` (`wip/prefill-overlap`
+`7c114eec0`) and this repo are clean; nothing was pushed anywhere.
+
 ## 261122.010 (r343, no delivery change) -- wip/prefill-decode-arms: at FULL residency the two arms are still better on BOTH axes (the single-context server's own interleave is the expensive thing)
 
 **No delivery patch changed.**  The last tier: all 21.1 GiB of 35B-A3B Q4_K_M resident in VRAM (no `-ncmoe`, no

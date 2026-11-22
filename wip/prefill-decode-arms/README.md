@@ -202,7 +202,11 @@ line reads *smoothness delivered, cost accepted*, and the cost is **not** an ope
    arm frees the slot's shared cells and the return clears its prompt, because the recurrent half still lives on the
    decode arm and moving it *back* is a reverse handover the scoped design does not do.  The reference server keeps
    the KV and does reuse it.  It costs nothing in the oracle (`cache_prompt:false`) and it is the first thing to fix
-   if this is promoted.
+   if this is promoted.  **MEASURED (pass 6 §6)**: `scripts/gate-ckpt-reuse.sh` on Qwen3.5-4B reads **0** checkpoint
+   restores and `cache_n = 0` on every request — four growing chat turns cost **729 / 684 / 687 / 686 ms** of prompt
+   time against the single-context server's **733 / 33 / 33 / 34 ms** (three restores), i.e. a turn that appends ~9
+   tokens re-prefills 5200+ tokens: **~20x per turn**.  The gate SKIPs on this path for exactly that reason, so it is
+   evidence for the decision, not a gate to pass.
 ## 5. The reusable harness
 
 [`archive/work/prefill-transfer-overlap/arms/two_ctx.cpp`](../../archive/work/prefill-transfer-overlap/arms/two_ctx.cpp)
@@ -239,7 +243,7 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 | **T3** | handover at the request boundary, with a text oracle: a request's reply must be byte-identical to today's single-context server | **the oracle has to be chosen carefully**: it holds on a no-host-tier model and for a single handed-over request on the tier, but a 2-slot arm on a partial arena is not text-stable warm (§3.3) — use a full-residency/no-host-tier text point + KLD on the tier |
 | **T4** | policy + opt-in gate (host tier + residency deficit + the VRAM rule of §3.2), and the duty cycle's role on this path | **rules measured, gate not built**: the 2-row decode graph's **741.48 MiB** is now a shipped default (r343), so the pair fits at `-b 4096 -ub 4096` with no knob; **`-ib` is inert here** and `decode_active` no longer counts a decode-arm slot (the leftover cost 8.1 % at `-ub 512`); **4096 is the sweet spot** (-21 % cost at a multi-step prompt, best decoder tail 50/95 ms); the ubatch buys
 absolute prefill rate (+29 % from 2048 to 8192) but not relative cost, and past 4096 the decoder's *tail* degrades |
-| **T5** | ~~measurement with `smooth.py` against the baseline table~~ — **TAKEN 2026-11-22 (pass 5 §3)**: ~47-49 ms ITL p50 / 64-78 ms p95 through a 2.0-5.3 s prefill at **-24 to -27 % prefill**; the gates of §7 are **not** run (nothing is delivery-bound) | the smoothness target is met, the <= ~14 % cost target is not; the verdict is the maintainer's |
+| **T5** | ~~measurement with `smooth.py` against the baseline table~~ — **TAKEN 2026-11-22 (pass 5 §3)**: ~47-49 ms ITL p50 / 64-78 ms p95 through a 2.0-5.3 s prefill at **-24 to -27 % prefill** (cost **accepted**, §3b); **the reachable gates of §7 are RUN (pass 6)** — KLD 0.000000, fairness/duty green under their own absolute/inert criterion and red only on a relative bound the arms remove, park + ckpt SKIP by construction, faults clean on 32 logs | the smoothness target is met; what remains is two gates not yet run (`gate-host-pool`, `gate-moe-promise`) and the maintainer's verdict |
 | **T0** | ~~the shared-KV allocator fix~~ — **DONE 2026-11-22**: `enabling-0003-shared-kv-allocator.patch`, one shared owner, per-ubatch reserve/commit/release, `llama_memory_alloc_sync()` as the handshake, `LLAMA_KV_ALLOC_SHARED=0` as the control (`RESULTS-2026-11-22.md` pass 3) | it had to land before two arms allocate cells; it also removed the scatter that moved the text |
 
 ## 7. Gates when it becomes code
@@ -255,6 +259,24 @@ absolute prefill rate (+29 % from 2048 to 8192) but not relative cost, and past 
 * **GPU health**: `scripts/check-gpu-faults.sh` on every arm (a two-arm race shows up as a fault, not a wrong
   token).
 * **Delivery**: `scripts/validate-set.sh` when the change becomes a patch.
+
+**Pass 6 measured what is actually reachable here** (`RESULTS-2026-11-22.md` §3-§7) — read it before quoting any of
+the above as pass/fail:
+
+* the KLD point reads **0.000000 / 100 %** on the WIP build, but `llama-perplexity` has one context, so it **cannot
+  reach the arms path**; §7's text oracle is the arms-path instrument;
+* **fairness** is red **as shipped** on `ITL_c <= 1.75 x ITL_b x chunk/b` = **13 ms**, which is below the decode arm's
+own 28-30 ms step; it is **green** with the gate's own `--max-itl-ms 120`.  Its baseline numbers are the campaign in
+one line: single-context worst in-window ITL **323 ms**, arms **29 ms**.  `--self-test` still rejects the unfixed
+build;
+* **duty** is red **as shipped** on a 3x burst gain that cannot exist when the baseline **already delivers 73** tokens
+(the single context delivers 16); it is **green** at `--min-decode-gain 1.0` (inert: 73 -> 75, prefill stretch
+0.99x).  So block 16's duty cycle is **redundant on this path** while its fair-share half stays live;
+* **park** is reachable but **SKIPs**: a co-owner pair is not "one stream", so the cache declines by its own guard;
+* **ckpt reuse** is reachable but **SKIPs**: the arms path has no prefix reuse — measured as **685 ms vs 33 ms** per
+  appended turn (landmine 10's price, in `gate-ckpt-reuse` terms);
+* an operator who pins `-np N` **loses the unified cache** (`--parallel auto` sets it; an explicit N does not) — that
+  is a docs/gate item for promotion, not a defect.
 
 ## 8. Open questions for the maintainer
 
