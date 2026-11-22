@@ -19,13 +19,23 @@
 #                                        rollback case: on a hybrid the reference re-prefills there for want of a
 #                                        checkpoint, so it is a text comparison only)
 #   arm `nocache`  cache_prompt false  -- every request re-prefills: the reference for the same three replies
-#   HARD  * all three replies are byte-identical between the arms
+# TWO CONTRACTS (they are not the same claim -- do not conflate them):
+#   GATE=strict (default)   `cache` vs `nocache`: a REUSED prefix must move no token.  This is the strong claim, and
+#                           it only holds where the DELIVERY itself has it -- measured true on the 4B (hybrid), phi-4
+#                           (dense) and the 35B-A3B host tier; NOT on the fully resident 27B, where the reference
+#                           server diverges too (see `--gate parity` below and RESULTS-2026-11-22.md pass 8 §3).
+#   GATE=parity             `cache` vs `ref` (the SAME requests with reuse on the SINGLE-CONTEXT server): the arms'
+#                           reuse path must be byte-identical to the reference server's own reuse path.  This holds
+#                           everywhere and is the contract a promotion can be judged on.
+#   HARD  * all three replies are byte-identical between the two arms
 #   HARD  * the cached arm really reused: `cache_n > 0` on request 2 (otherwise the comparison is vacuous)
 #   HARD  * no abort in either log, and `scripts/check-gpu-faults.sh` clean over both
 #   INFO  prompt_ms and cache_n per request per arm (that is the feature's own number)
 #
 # Usage:
 #   ./gate-server-reuse.sh                    # both arms + the comparison (the gate)
+#   ./gate-server-reuse.sh                    # GATE=strict (default)
+#   GATE=parity ./gate-server-reuse.sh        # the arms-vs-single-context reuse contract
 #   ./gate-server-reuse.sh --mode cache       # one arm only (writes $OUT/cache.txt)
 #   ./gate-server-reuse.sh --mode nocache
 #   ./gate-server-reuse.sh --compare CACHED REFERENCE   # the FIRST file is the cached arm
@@ -55,6 +65,7 @@ NCMOE=${NCMOE:-40}
 ARENA=${ARENA:-5000}
 CTX=${CTX:-8192}
 UB=${UB:-512}
+B=${B:-2048}
 NP=${NP:-2}
 NPREDICT=${NPREDICT:-32}
 PORT=${PORT:-8124}
@@ -90,6 +101,14 @@ if [[ ${#compare[@]} -gt 0 ]]; then
         echo "ORACLE ERROR: the cached arm reused nothing on a grown prompt (cache_n = 0) -- vacuous"
         rm -rf "$tmp"; exit 2
     fi
+    # FORK_REUSE=1 (a DENSE model: a pure attention KV, so rolling back below the prefix needs no checkpoint): the
+    # fork must reuse as well -- that is the dense case's own claim, and it is not covered by the grow check
+    if [[ ${FORK_REUSE:-0} == 1 && ${GATE:-strict} == strict ]]; then
+        if ! awk '$1 == "INFO" && $2 == "C" { split($0, f, "cache_n="); split(f[2], g, " "); exit (g[1]+0 <= 0) }' "$a"; then
+            echo "ORACLE ERROR: the dense-model fork did not reuse (C: cache_n = 0) -- the rollback path is untested"
+            rm -rf "$tmp"; exit 2
+        fi
+    fi
     if diff -q "$tmp/a" "$tmp/b" > /dev/null; then
         echo "ORACLE PASS: a reused prefix (grow + shrink) moved no token"
         rm -rf "$tmp"; exit 0
@@ -105,14 +124,17 @@ mkdir -p "$OUT"
 
 export LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib
 export HIP_VISIBLE_DEVICES=0
-export MOE_EXPERT_CACHE_MIB="$ARENA" MOE_EXPERT_HEATMAP=load ROCBLAS_USE_HIPBLASLT=0
+export MOE_EXPERT_HEATMAP=load ROCBLAS_USE_HIPBLASLT=0
+export MOE_EXPERT_CACHE_MIB="$ARENA"
 
 run_arm() { # $1 = cache|nocache
     local arm=$1 cache_prompt
+    local server_args=$SERVER_ARGS
     case $arm in
         cache)   cache_prompt=true  ;;
         nocache) cache_prompt=false ;;
-        *) echo "--mode must be cache|nocache" >&2; exit 2 ;;
+        ref)     cache_prompt=true; server_args=${SERVER_ARGS_REF:-} ;;   # the single-context server, reuse ON
+        *) echo "--mode must be cache|nocache|ref" >&2; exit 2 ;;
     esac
     local log="$OUT/$arm.log" res="$OUT/$arm.txt"
 
@@ -126,12 +148,30 @@ run_arm() { # $1 = cache|nocache
     pB="$pA$(tail -c $((PROMPT_CHARS / 4)) "$PROMPT_FILE")"
     pC=$(head -c "$SHRINK_CHARS" "$PROMPT_FILE")
 
-    echo "== $arm: starting the server ($SERVER_ARGS, arena $ARENA, -c $CTX -ub $UB -np $NP)" >&2
-    timeout 1800 "$SERVER" -m "$MODEL" -ngl "$NGL" -ncmoe "$NCMOE" -lme auto \
-        -c "$CTX" -b 2048 -ub "$UB" -np "$NP" -t 8 --host 127.0.0.1 --port "$PORT" -lv 4 \
-        $SERVER_ARGS > "$log" 2>&1 &
+    # NO_HOST_TIER=1: fully resident (no expert arena, no -ncmoe) -- the common single-GPU end-user shape, and the
+    # only shape a dense MoE-free model accepts
+    local tier_args=()
+    if [[ ${NO_HOST_TIER:-0} == 1 ]]; then
+        unset MOE_EXPERT_CACHE_MIB
+        tier_args=(-ngl "$NGL")
+    else
+        tier_args=(-ngl "$NGL" -ncmoe "$NCMOE" -lme auto)
+    fi
+    # a leftover server from a previous arm ANSWERS THE HEALTH PROBE and this gate would then silently drive the
+    # WRONG arm (measured 2026-11-22 on the 27B: the "nocache" arm hit the leaked cached-arm server and the
+    # comparison read as a state failure).  Refuse instead -- the park/ckpt gates do the same.
+    if curl -sf -m 2 "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then
+        echo "ERROR: something is already listening on port $PORT (a leaked server? set PORT=...)" >&2
+        pgrep -af "llama-server.*--port $PORT" >&2 || true
+        exit 2
+    fi
+
+    echo "== $arm: starting the server (${server_args:-single-context}, ${NO_HOST_TIER:+no host tier }-c $CTX -ub $UB -np $NP)" >&2
+    timeout 1800 "$SERVER" -m "$MODEL" "${tier_args[@]}" \
+        -c "$CTX" -b "$B" -ub "$UB" -np "$NP" -t 8 --host 127.0.0.1 --port "$PORT" -lv 4 \
+        $server_args > "$log" 2>&1 &
     local srv=$!
-    trap 'kill $srv 2>/dev/null || true' EXIT
+    trap 'kill ${srv:-} 2>/dev/null || true' EXIT
 
     for _ in $(seq 1 900); do
         curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1 && break
@@ -141,28 +181,42 @@ run_arm() { # $1 = cache|nocache
 
     : > "$res"
 
-    # CONCURRENT=1: the MULTI-AGENT case -- two conversations, one per slot, each in two rounds (the second round
-    # extends the first), the two slots driven in PARALLEL in each round.  That is the shape that interleaves a
-    # forward take with a reverse one, so it is the test the request-boundary handshake has to survive.
-    if [[ ${CONCURRENT:-0} == 1 ]]; then
+    # CONCURRENT=1 / TWO_SLOT=1: the MULTI-AGENT case -- two conversations, one per slot, each in two rounds (the
+    # second extends the first).  TWO_SLOT=1 drives them strictly SEQUENTIALLY (two resident conversations, never
+    # co-batched), which keeps the text a valid oracle: GREEDY-PURITY.md §63 / issue #234 -- a pair of CONCURRENT
+    # requests is NOT a text oracle, because co-batching changes the ubatch shape and hence the kernel family.  So
+    # CONCURRENT=1 is the STRESS arm (concurrent takes: it must not abort or fault) and its warm text is recorded,
+    # never asserted; TWO_SLOT=1 is the text oracle with two resident slots.
+    if [[ ${CONCURRENT:-0} == 1 || ${TWO_SLOT:-0} == 1 ]]; then
         local base0 base1 r
         base0=$(head -c "$PROMPT_CHARS" "$PROMPT_FILE")
         base1=$(tail -c "$PROMPT_CHARS" "$PROMPT_FILE")
         for r in 1 2; do
             local s0 s1
             if [[ $r == 1 ]]; then s0=$base0; s1=$base1; else s0="$base0$(tail -c 400 "$PROMPT_FILE")"; s1="$base1$(head -c 400 "$PROMPT_FILE")"; fi
-            local id0 id1
-            curl -sf "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
-                -d "$(jq -nc --arg p "$s0" --argjson n "$NPREDICT" --argjson c "$cache_prompt" \
-                        '{prompt:$p, n_predict:$n, temperature:0, top_k:1, seed:42, cache_prompt:$c,
-                          id_slot:0, stream:false}')" > "$OUT/.r${r}s0.json" &
-            id0=$!
-            curl -sf "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
-                -d "$(jq -nc --arg p "$s1" --argjson n "$NPREDICT" --argjson c "$cache_prompt" \
-                        '{prompt:$p, n_predict:$n, temperature:0, top_k:1, seed:42, cache_prompt:$c,
-                          id_slot:1, stream:false}')" > "$OUT/.r${r}s1.json" &
-            id1=$!
-            wait "$id0" "$id1" || { echo "a concurrent request failed (see $log)" >&2; exit 1; }
+            if [[ ${CONCURRENT:-0} == 1 ]]; then
+                local id0 id1
+                curl -sf "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
+                    -d "$(jq -nc --arg p "$s0" --argjson n "$NPREDICT" --argjson c "$cache_prompt" \
+                            '{prompt:$p, n_predict:$n, temperature:0, top_k:1, seed:42, cache_prompt:$c,
+                              id_slot:0, stream:false}')" > "$OUT/.r${r}s0.json" &
+                id0=$!
+                curl -sf "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
+                    -d "$(jq -nc --arg p "$s1" --argjson n "$NPREDICT" --argjson c "$cache_prompt" \
+                            '{prompt:$p, n_predict:$n, temperature:0, top_k:1, seed:42, cache_prompt:$c,
+                              id_slot:1, stream:false}')" > "$OUT/.r${r}s1.json" &
+                id1=$!
+                wait "$id0" "$id1" || { echo "a concurrent request failed (see $log)" >&2; exit 1; }
+            else
+                local sl prompt_s
+                for sl in 0 1; do
+                    [[ $sl == 0 ]] && prompt_s=$s0 || prompt_s=$s1
+                    curl -sf "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
+                        -d "$(jq -nc --arg p "$prompt_s" --argjson n "$NPREDICT" --argjson c "$cache_prompt" --argjson s "$sl" \
+                                '{prompt:$p, n_predict:$n, temperature:0, top_k:1, seed:42, cache_prompt:$c,
+                                  id_slot:$s, stream:false}')" > "$OUT/.r${r}s${sl}.json"
+                done
+            fi
             for sl in 0 1; do
                 local tag="r${r}s${sl}" f="$OUT/.r${r}s${sl}.json" content ntok sha pms cn
                 content=$(jq -r '.content' "$f")
@@ -219,8 +273,26 @@ run_arm() { # $1 = cache|nocache
 
 if [[ $mode == both ]]; then
     run_arm cache
-    run_arm nocache
-    "$0" --compare "$OUT/cache.txt" "$OUT/nocache.txt"
+    if [[ ${CONCURRENT:-0} == 1 ]]; then
+        # the STRESS arm: two slots taking concurrently.  No text claim is made across arms -- the two arms' round-2
+        # prefills have different lengths, so they co-batch differently, and GREEDY-PURITY.md §63 says a co-batched
+        # pair is not a text oracle.  What it does assert: every request returned, the resume really reused, and
+        # nothing aborted (checked per arm above and below).
+        run_arm nocache
+        if ! awk '$1 == "INFO" && $2 == "r2s0" { split($0, f, "cache_n="); split(f[2], g, " "); exit (g[1]+0 <= 0) }' "$OUT/cache.txt"; then
+            echo "STRESS FAIL: the concurrent resume reused nothing (r2s0 cache_n = 0) -- vacuous"; exit 2
+        fi
+        echo "STRESS PASS: two slots resumed concurrently, reuse happened, no abort in either arm"
+        echo "  (text is NOT asserted across arms: a co-batched pair is not a text oracle, GREEDY-PURITY.md §63)"
+        exit 0
+    fi
+    if [[ ${GATE:-strict} == parity ]]; then
+        run_arm ref
+        "$0" --compare "$OUT/cache.txt" "$OUT/ref.txt"
+    else
+        run_arm nocache
+        "$0" --compare "$OUT/cache.txt" "$OUT/nocache.txt"
+    fi
 else
     run_arm "$mode"
 fi

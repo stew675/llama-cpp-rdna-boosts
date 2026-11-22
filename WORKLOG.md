@@ -1,3 +1,46 @@
+## 261122.013 (r343, no delivery change) -- wip/prefill-decode-arms pass 8: the DENSE and FULLY-RESIDENT cases (prefix reuse holds on both), the option's tri-state with an `auto` that falls back, and `-ib`/`DUTY` reported deprecated on this path
+
+**No delivery patch changed; nothing in `patches/`, no tag.**  The two shapes the maintainer named as the common
+end-user cases, verified before any promotion talk, plus the option semantics from D1/D3.  `~/llama.cpp`
+`51c1fb8ec` (2 files: `common/arg.cpp`, `common/common.h`, `tools/server/server-context.cpp`).
+
+* **Dense architecture** (phi-4 IQ4_XS, fully resident, one GPU): tier 1 **PASS** cold and over 3 warm pairs (both
+  slots, 32 tokens each); `gate-server-reuse.sh` **strict PASS** with **the fork below the prefix reusing**
+  (`cache_n=220`, 20.2 vs 97.0 ms) — a pure attention KV needs no checkpoint to roll back, as pass 7 predicted but
+  could not show; `FORK_REUSE=1` now enforces it.  Concurrent resume: PASS, 578 tokens reused, 64.6 vs 261.7 ms.
+* **Fully resident 27B** (Qwen3.8-27B-UD-Q4_K_XL, `-ngl 99`, no arena — the agentic-coding default): tier 1 **PASS**
+  cold + 3 warm pairs; `gate-ckpt-reuse.sh` **PASS at single-context parity** (3 restores; resumed turns 111.0 / 108.7
+  / 106.9 ms against the control's 109.7 / 106.5 / 106.8).  The reverse take moves a ~150 MiB state every boundary and
+  the result is indistinguishable from the reference server.
+* **The finding that changed a gate's contract**: on the 27B, `cache_prompt:true` and `false` give different text —
+  and the **single-context server does it too** (arms `cache` == single-context `cache` = `deda991b9954a821`; arms
+  `nocache` == single-context `nocache` = `6d350f31f83a15b8`).  So the reverse handover reproduces the reference's
+  reuse path **byte for byte**, and reuse-vs-reprefill text equality is a **delivery** property this fork does not
+  have on that model (a checkpoint-restored placement is not a re-prefilled one).  The gate now has `GATE=strict`
+  (reuse moves no token — true on the 4B, phi-4, 35B host tier) and `GATE=parity` (the arms equal the single-context
+  server's own reuse — true everywhere measured, and the contract a promotion should be judged on).
+* **Concurrent multi-agent resume on the 27B**: two slots resuming in parallel read **365.1 ms / 262.1 ms** against
+  **1295.1 / 1296.0 ms** without reuse (**3.5x / 4.9x**), no abort, no fault (the concurrent arm asserts no text:
+  different round-2 prefill lengths co-batch differently, `GREEDY-PURITY.md` §63).
+* **The option (D1)**: `--prefill-decode-arms-mode off|on|auto` (+ env), with the old flags as the explicit forms.
+  `auto` **enables when the shape can carry the pair and FALLS BACK to single-context with a warning** when it cannot;
+  an explicit `on` still refuses to start rather than degrade silently.  Verified: auto+`-np 2` creates the pair,
+  auto+`-np 1` warns and stays single, auto + a refused feature falls back **and keeps serving**, `on` + the same
+  exits 1, and with no arms flag there are no new messages at all.  `auto` is **not** the default yet — flipping it is
+  a delivery-behaviour change (it would silently move every existing delivery gate onto the arms path) and belongs to
+  the promotion decision.
+* **Deprecation (D3)**: `-ib` and `LLAMA_SERVER_PREFILL_DUTY` print a one-shot notice that they are deprecated and
+  have **no effect** on this path, only when they are set *and* the pair is running, with the measured reason in the
+  text.  Block 16's **fair-share** half is not deprecated and stays live (1.85 s -> 0.79 s).
+* **Two gate-hygiene defects found and fixed**: a leaked server answering `/health` made the next arm silently drive
+  the previous arm's server (now the gate refuses a busy port); and the **cold** host-tier rep can land in a different
+  §89 residency class (`182a9fcfe1de6a70`, h=0.6293, against the pair arm's `459865c93d55cbaf`, h=0.6905) while the
+  warm reps agree in both arms — so **the oracle is the warm pairs**, and a promotion gate must warm first.
+* **A 4-slot server is running on :8080** (27B fully resident, `--kv-unified`, `-np 4 -b/-ub 2048`, q8_0 KV, the pair
+  created, 31.9 tok/s single-stream) for the maintainer's own browser test, before the promotion path is decided.
+
+Nothing pushed anywhere; `~/llama.cpp` (`wip/prefill-overlap` `51c1fb8ec`) and this repo are clean.
+
 ## 261122.012 (r343, no delivery change) -- wip/prefill-decode-arms pass 7: the REVERSE HANDOVER restores prefix reuse (685 -> 33 ms per appended turn, single-context parity) and a reused prefix moves no token
 
 **No delivery patch changed; nothing in `patches/`, no tag.**  The one behavioural regression pass 5 §7 recorded
