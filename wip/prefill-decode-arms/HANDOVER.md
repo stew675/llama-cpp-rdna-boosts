@@ -80,7 +80,11 @@ allocation owner); **pass 5 built the server cut and tier 1 passes**.
   prefill goes **1056 -> 2455 -> 3246 t/s** (`-26.6 % -> -19.3 % -> -16.4 %` against one context, so close to the
   -14 % prediction) while the decoder's worst in-window gap *falls* (114 -> 66 -> 63 ms).  `decode_active` no longer
   counts a decode-arm slot (that leftover cost 8.1 % at `-ub 512`), so **`-ib` is inert on this path**: run the
-  largest ubatch the card fits and leave `-ib` unset.
+  **`-ub`/`-b` 4096** and leave `-ib` unset.  **Correction (the 8192 measurement)**: that "cost falls with the
+  ubatch" reading was a **one-step artifact** — at a ~8300-token prompt (several steps at every size) the cost is
+  **flat at -21…-24 %** from 2048 up, and the ubatch buys *absolute* prefill rate (`lone` 2955 -> 3526 -> 3800 t/s,
+  +29 %), not relative cost.  8192 adds +8 % prefill over 4096 but degrades the decoder's **tail** (p95 63.5 / max
+  124.5 ms against 50.2 / 95.1: a 8192-token step is 2.2 s long), so 4096 is the sweet spot.
 * The record: `RESULTS-2026-11-21.md` (pass 1: numbers, the three landmines, §3.4's reset experiment, §5's server
   code points, and a "Reproduce" section with the exact commands) and `RESULTS-2026-11-22.md` (pass 2: the residual
   resolved into two effects, the censuses, and the reproduce commands).  Delivery-repo commits `56443c1f`,
