@@ -145,14 +145,21 @@ yield point, the stream-priority plumbing — the last two are recorded losers, 
    not `MOE_EXPERT_PREFILL_IN_PLACE`, not the overlap (`ARMS_WAIT_ALL`), not the batch width, and **not the
    host tier** — the 35B-A3B reproduces it at full residency and the dense 4B does not.  The outcomes come
    from a small set and the single-context text itself moves with `LLAMA_KV_N_PAD_MIN`, so it is a
-   graph-bucket / numerics effect, not corrupted state — and `n_kv` (pinned with `LLAMA_KV_N_PAD_MIN`) and the
-   decode context's buffer layout (`ARMS_B_BATCH=512`) were then eliminated too.  **The leading hypothesis is
-   the physical KV cell INDICES**: the KV `v_cells` are shared but the allocation cursor (`v_heads`) is
-   per-context, so a slot sits in different cells on the two arms, and this fork's tile-FA decode launcher
-   splits the KV extent by index (`ggml_cuda_fattn_band_wmma_split` / `parallel_blocks` — what
-   `scripts/gate-spec-purity.sh` pins).  T3's text point must therefore compare two runs with the **same cell
-   layout** (or the pair must share one allocation cursor, which the §3.1 allocator fix wants anyway), plus
-   `scripts/gate-prefill-logits.sh` (KLD) for the prefill path.
+   graph-bucket / numerics effect, not corrupted state — `n_kv` (pinned with `LLAMA_KV_N_PAD_MIN`) and the
+   decode context's buffer layout (`ARMS_B_BATCH=512`) were then eliminated too.  **CONFIRMED (results file
+   §3.4): it is the two ALLOCATION CURSORS.**  The KV `v_cells` are shared but `v_heads` is per-context, so the
+   two arms place a slot in different cells; give both arms the same allocation state at every rep boundary and
+   the first request becomes **byte-identical to the single-context reference in every rep, on both the host tier
+   and at full residency**.  **Design instruction, not just a diagnosis**: one allocator for the pair — **the
+   prefill arm reserves the slot's cell run at handover and publishes it, the decode arm consumes it and never
+   searches or advances the shared cursor**.  That removes this class, removes the §3.1 double-allocation
+   hazard, and takes a `find_slot()` scan off the decoder's hot path; the machinery to run a batch into a
+   caller-chosen cell set exists (`llama_kv_cache::state_read_sinfo(..., sinfos_in)`, the "mirrored slot layout").
+   Note the **take is not the setup**: it moves the recurrent rows and touches no KV cell, so moving it to the
+   prefill thread alone changes nothing here — what the prefill must own is the *allocation*, while the decode
+   arm still applies the publish (a posted message, never a lock the prefill waits on: a direct mutex take
+   starves the prefill for 2.85 s, results file §2).  Residual: the *second* concurrent slot still reads one
+   stable-but-different value warm (results file §3.4 item 3).
 
 ## 5. The reusable harness
 
@@ -217,9 +224,12 @@ The metric of record for the server-side result is `wip/prefill-transfer-overlap
 4. When this lands it should **retire `LLAMA_SERVER_PREFILL_DUTY` on this path** (keep it as the `F ≈ 0`
    fallback).  That is a default flip and therefore a maintainer decision at promotion time.
 5. **New (2026-11-21): may the allocator fix be its own enabling artifact?**  `RESULTS-2026-11-21.md` §3.1 is a
-   latent defect in the *shared* cache (reserve-at-`find_slot` or a partitioned scan), reachable only with two
-   allocating contexts.  It is a prerequisite of T2 and it changes `llama-kv-cache`, so it wants its own small
-   artifact rather than hiding inside the server cut.
+   latent defect in the *shared* cache, reachable only with two allocating contexts — and §3.4 shows it is also
+   the **text** carrier of the two-arm shape.  Proposed shape (maintainer's call): the co-owner pair gets ONE
+   allocation cursor, with the **prefill arm reserving a slot's cell run and the decode arm consuming it**
+   (`llama_kv_cache` gains a reserve/publish API; the decode side reuses the `sinfos_in` layout the restore path
+   already has).  It is a prerequisite of T2 and it changes `llama-kv-cache`, so it wants its own small artifact
+   rather than hiding inside the server cut.
 6. **New: which oracle does the maintainer want for T3?**  §3.3 says a cross-configuration hash is not
    available on a partial host-expert arena.  Proposed: text at full residency (or no host tier) + KLD on the
    tier + a same-configuration repetition to catch non-determinism.  Confirm before T2's gate is written.
