@@ -1,4 +1,4 @@
-From 7e70bcf7436bce61153dd66b4ecede86544f5dfc Mon Sep 17 00:00:00 2001
+From eb980ac4677e7e8900f234df1314be3752d9f2f2 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/17] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -27725,7 +27725,7 @@ index 5acc46e4c..31f65dc75 100644
              return false;
          }
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 22827187d..a82752948 100644
+index 42828be78..661c6eff1 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -427,7 +427,46 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
@@ -27776,7 +27776,7 @@ index 22827187d..a82752948 100644
      const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
          (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
      const bool is_glm5_next = ud->model->arch == LLM_ARCH_GLM5_NEXT;
-@@ -2672,6 +2711,26 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
+@@ -2713,6 +2752,26 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
      return ret;
  }
  
@@ -27803,7 +27803,7 @@ index 22827187d..a82752948 100644
  uint64_t llama_model::n_elements() const {
      return pimpl->n_elements;
  }
-@@ -4455,9 +4514,8 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
+@@ -4496,9 +4555,8 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
  //   * an explicit `--tensor-split` zero share is a placement choice, not a defect -- skip it;
  //   * `GGML_TENSOR_SPLIT_ALLOW_DEGENERATE=1` is the escape hatch (an explicit "I know what this shape is"
  //     for a measurement, not a default).
@@ -27815,7 +27815,7 @@ index 22827187d..a82752948 100644
  void llama_model::check_host_expert_split_shares() const {
      static const bool allow_degenerate = [] {
          const char * e = getenv("GGML_TENSOR_SPLIT_ALLOW_DEGENERATE");
-@@ -4536,22 +4594,6 @@ void llama_model::check_host_expert_split_shares() const {
+@@ -4577,22 +4635,6 @@ void llama_model::check_host_expert_split_shares() const {
      }
  }
  
@@ -27842,10 +27842,10 @@ index 22827187d..a82752948 100644
 +
 +
 diff --git a/src/llama-model.h b/src/llama-model.h
-index a6fac6f8d..d9bd3b56c 100644
+index 2a4620d49..fba734e29 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -1031,9 +1031,14 @@ struct llama_model {
+@@ -1034,9 +1034,14 @@ struct llama_model {
  
      std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
  

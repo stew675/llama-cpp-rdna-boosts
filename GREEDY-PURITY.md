@@ -2993,3 +2993,49 @@ retired (they were per-placement coin flips, not baselines).
 
 **Record.**  This entry; `scripts/gate-server-arms.sh` (header + invocation); `TODO` #349 retired;
 `WORKLOG.md` 261121.012; §38 (the rule this applies) and §82 (its oracle clause).
+
+## 104. A split GRANULARITY is the reduction's grouping: judge it against that point's own reorder control, and ship it opt-in when it is above "rounding level" (r338, block 09, contributor PR #342)
+
+**Claim.**  `-sm tensor` splits an FFN tensor at granularity `lcm(blck_size, 128)`, so a 640-wide expert set at
+two devices splits **256 / 384** and the light GPU waits in every MoE layer's all-reduce.  Lowering the
+granularity to `lcm(blck_size, 64)` when the size divides evenly splits it **320 / 320** and buys **+7 %
+`draft-mtp` decode / +4 % prefill** on a 2-device Flash-Next host-expert shape — and must stay **opt-in**,
+because a granularity change moves the logits of every shape it reaches.
+
+**Rule.**
+
+1. **A granularity (or a `-ts`, or an `-ub`) is a reduction ORDER, not an approximation.**  Nothing is rounded
+   differently; the same quantized products are summed in a different grouping.  Do not gate it as a kernel
+   change ("is the kernel right?") — gate it as a reordering ("is this within the point's reorder noise?").
+2. **The instrument is a same-point control, not the absolute limit.**  Record the fallback arm and a control
+   that is the SAME kernel at a different ubatch, then compare (`gate-prefill-logits.sh --family-switch`, or
+   `--record --ab` + a second compare).  If the candidate is no worse than the control on **both** metrics, the
+   change is a reordering; if it is within the limits on its own, it is rounding-level.
+3. **Above "rounding level" is opt-in, and the switch is only reachable by name.**  The default set must not
+   carry a shift a consumer cannot see; `-of <tag>` is the discoverable spelling of the switch
+   (`ENVIRONMENT.md` §4.1), and the env var keeps working on its own.
+4. **Re-record what the text reference is.**  A greedy text is a per-device-count reference (§3), so an enabled
+   arm's text is a NEW reference, recorded next to the default one — never a `same as before` claim, and never
+   both arms collapsed into one hash.
+5. **Do not call a control "the" calibration when it is weak.**  A 6 %-of-tokens ubatch step is not the same
+   perturbation as a granularity change that touches every token; say which comparison decided the question.
+
+**Numbers** (r338 tree, gfx1201, ROCm 10.2, `HIP_VISIBLE_DEVICES=0,2`, Flash-Next GSQ-RCO IQ3_S,
+`-ncmoe 47 -lme 47 --load-mode dio -ub 4096`, `gate-prefill-logits.sh --ctx 8192 --chunks 3`):
+
+* change vs the recorded base: mean KLD **0.013963** / same-top-p **96.467 %** (the gate's limit is
+  0.005 / 98 %) — 2.8x the limit, so NOT rounding-level;
+* control (same kernel, `-ub 4096` vs `-ub 3840`): **0.015248 / 96.516 %**, base PPL 2.6963 -> 2.7290
+  (+1.21 %); the candidate's own PPL moved +0.59 %, i.e. **half** the control's;
+* so the change is *below* the point's reorder floor on KLD and inside the top-p CI (+-0.164 pp), which is what
+  made it decidable — and 3-device points agree in class: `gpt-oss-20B` 0.033744 vs its control 0.032810
+  (wikitext, base PPL 5754, so that point cannot decide anything on its own — §46), `gemma-4-26B-A4B`
+  0.059479 / 95.350 % vs a **weak** control 0.049446 / 96.160 % (only the last 6 % of each chunk's tokens see
+  the different ubatch), so that one is recorded as "same class, not resolved";
+* the DEFAULT is bit-identical after the promotion: **-0.000000 / 100.000 %**, text `c420dfe04c42` unchanged;
+* the enabled arm's references: 2-dev Flash-Next `-n 128` **`cbdb63954bbb`**, `draft-mtp -n 256`
+  **`af7114ee8a62`**; 3-dev `gpt-oss-20B` `-n 128` **`78b0f879122c`**.
+
+**Record.**  This entry; `benchmarks/2026-11-21-ffn-even-split.md`; `scripts/gate-ffn-even-split.sh`;
+`patches/README.md` block 09; `WORKLOG.md` 261121.017; §3 (the per-device-count text reference) and §46 (the
+point-sensitivity calibration this extends from a kernel family to a split granularity).

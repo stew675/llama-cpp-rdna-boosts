@@ -1,4 +1,4 @@
-From 48fbd240c2aaaff2c5166e692544d7c6ef893769 Mon Sep 17 00:00:00 2001
+From e929833f3427e91a005eab2ed309af584607fd05 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 08:35:47 -0600
 Subject: [PATCH 15/17] rdna-boosts: block 15: the UMA GTT expert store -- an
@@ -94,10 +94,10 @@ onto the TODO #87 note).
  create mode 100644 ggml/src/ggml-cuda/gtt-expert-store.cuh
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index f5173e6bc..19f2310c0 100644
+index 32525c72c..f7cd72d85 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2804,23 +2804,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2825,23 +2825,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
      ));
      add_opt(common_arg(
          {"-lme", "--limit-host-experts"}, "auto|mirror|N",
@@ -146,7 +146,7 @@ index f5173e6bc..19f2310c0 100644
          [](common_params & params, const std::string & value) {
              if (value == "auto") {
                  params.host_experts_limit_gib = 0;
-@@ -2843,9 +2862,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2864,9 +2883,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.host_experts_limit_gib = (int64_t) n;
              params.host_experts_mode      = LLAMA_HOST_EXPERTS_MODE_AUTO;
              if (n > 0) {
@@ -161,7 +161,7 @@ index f5173e6bc..19f2310c0 100644
                  FILE * mi = fopen("/proc/meminfo", "r");
                  long long avail_mib = -1;
                  if (mi != nullptr) {
-@@ -2855,11 +2876,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2876,11 +2897,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                      }
                      fclose(mi);
                  }

@@ -57,6 +57,7 @@ re-entry condition.  A green gate ladder is still not permission to skip a row.
 | **359** | `gate-fusion-alias-copy.sh`'s arm A oracle (`fused == GGML_CUDA_DISABLE_FUSION=1` text at `-ub 14`) broke at the r328 re-base: the UNFUSED chain moved, the fused arm still reproduces the r239 anchor `3fab4da87774` | tooling / gate (issue #287 gate) | **OPEN** -- re-derive the oracle (a logit/KLD compare at that shape rather than text): r329 and r331 both read `a_chain` 194/`dfe59c9c5257` vs `a_fused` 193/`3fab4da87774`, and pinning `GGML_GLU_INPLACE=0` changes neither arm, so neither the r331 restore nor the allocator is the cause; §359 |
 | **361** | the r334 RDNA2 items (PR #338) are validated on the contributor's V620, not on the released tree: blocks 05/08/10 now carry an RDNA2-only FA tile-cap removal, a one-warp narrow `RMS_NORM`, a `H * n_seqs` GDN chunked gate and a rows-abreast MoE K walk, and no RDNA2 device is in the maintainer's fleet | validation / external (delivery) | **WAITING on `@jstamagal`** -- re-run on the r334 tree: full `test-backend-ops` on `gfx1030` at default flags (**especially `FLASH_ATTN_EXT` with the caps gone: the failure mode is `GGML_ASSERT(max_blocks_per_sm > 0)` in `launch_fattn`, not a rate**), `MUL_MAT_ID` with `GGML_CUDA_MOE_ROWS_ABREAST` on and off, `RMS_NORM*` in the default/`NARROW=0`/`VEC=1` arms, a model-level decode+prefill (a GDN model for the chunked gate, a MoE for the K walk) and an MTP-acceptance run; **it should also confirm that PR #339's BF16 `RMS_NORM + MUL (+ ADD)` abort is gone there** (fixed at r328 by the re-base, `archive/work/can-fuse-bf16-rms-norm-r324/` -- `RMS_NORM_MUL_ADD` now includes `type=bf16,type_w=f32` and `type=bf16,type_w=f32,type_add=bf16` arms); §361 |
 | **362** | §44's doctrine rests on a per-start hipBLASLt solution lottery that ROCm 10.2 should no longer have (`c50ea60130f` ships as hipBLASLt 1.5), and the delivery has never verified that on the 10.2 line -- `README.md`, `GREEDY-PURITY.md` §44 and the r336 note all still say "pin below 10.2" without a 10.2 arm | validation (ROCm line) | **OPEN** -- on `/opt/rocm-10.2.0-gfx120X`, run the two documented call sites from §44 (a gemma-4-26B-A4B F32 MoE-router MTP config and the 35B-A3B GDN `ssm_alpha`/`ssm_beta` GEMM) over N fresh starts with hipBLASLt **left enabled**: one logits/greedy class over N (N >= 18 and N >= 8 respectively, the r-2026-10-21 counts) retires the pin from the *tester's* doctrine on that line, and a spread means the fix is not in 10.2 as assumed.  Also decide whether 10.2 becomes a **validated line** (a `baseline`-style note in `BASELINE.md` + a build script sibling of `~/bin/build-llama-rocm`), which is what would let a 10.2 arm be quoted rather than a one-off; §362 |
+| **363** | `-of`/`--optional-features` exists with ONE tag (`tp-ffn-even`); the delivery's other env-only opt-in features are still environment-only, so a user who reads `--help` still cannot find them | tooling / docs (delivery) | **OPEN** -- migrate them one at a time: add the row to `common_optional_features()` with its switch, confirm the tag produces exactly what the env var produces (the arm `gate-ffn-even-split.sh` C-section runs), and delete the row if the feature gets a first-class option; candidates are the opt-in switches `ENVIRONMENT.md` already marks as such (§4 `LLAMA_KV_N_PAD_MIN`, §7.6 `--wmma-verify`-adjacent switches are options already, §1.2's arena knobs, block 14's `LLAMA_KV_SPILL_RAM_PCT`); §363 |
 
 
 ## Handle numbering
@@ -403,3 +404,19 @@ wrong `qk`/`vdr` in the ksplit body for that type (the arithmetic is the body's,
 per-row dot product is unchanged by construction).  Do not add a KLD arm for it before the mechanism line is
 observed: an arm that never fires passes vacuously.  The same gap is recorded in the r304 release entry and in
 the PR #322 reply, so it is a stated limitation, not a claim.
+
+## 363. `-of` / `--optional-features` has one tag; migrate the rest of the env-only opt-in switches
+
+The tag layer exists (`common/common.cpp`, `common_optional_features()`; documented in `ENVIRONMENT.md` §4.1) and
+carries exactly one tag, `tp-ffn-even` (r338, `WORKLOG.md` 261121.017).  Every other opt-in delivery feature is
+still reached only by an environment variable, which `--help` cannot show.
+
+**The migration is a table row, not a new mechanism**: `{ "tag", "ENV", "1", "one paragraph" }`, then confirm the
+tag produces exactly what the variable produces (the C section of `scripts/gate-ffn-even-split.sh` is the shape:
+all spellings must read one text).  Do **not** add a second switch or a second code path; when a feature earns a
+first-class option, delete its row instead.
+
+Candidates (all already documented as opt-in in `ENVIRONMENT.md`): `LLAMA_KV_N_PAD_MIN` (§4), the block-14
+spill/window budgets (`LLAMA_KV_SPILL_RAM_PCT`, §1.2's `MOE_EXPERT_CACHE_MIB`-adjacent knobs are tuning, not
+opt-in -- check the row's class before migrating), and the `GGML_CUDA_*` opt-ins §7 lists as "opt-in, default
+OFF".  A tag is only for a feature that is **off by default**; a kill-switch is not a tag.

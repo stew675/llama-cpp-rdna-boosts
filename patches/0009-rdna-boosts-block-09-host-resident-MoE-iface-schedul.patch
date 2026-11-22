@@ -1,4 +1,4 @@
-From 29b5d560354c4943e72e57d3a63d25b83df90f44 Mon Sep 17 00:00:00 2001
+From fdfd2ee58b9b22c36ecbbb51cd7afbb1545d8f28 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/17] rdna-boosts: block 09: host-resident MoE (iface,
@@ -51,11 +51,33 @@ achieved count and only a capacity that GROWS re-derives it.  Kill switch
 MOE_EXPERT_CACHE_STEADY_REARM=0 is bit-for-bit the old behaviour.  Measured on r291:
 1 x R9700 -ub 16384 +8.2 %, -ub 32768 +31.9 %, partial pool +36.8 %; 24 GiB gfx1100 +19.5 %;
 text/acceptance byte-identical everywhere.
+
+OPT-IN `-of tp-ffn-even` (r338, contributor PR #342, @briansp2020), and the `--optional-features`/`-of`
+tag layer in common/.  `-sm tensor` splits an FFN tensor with granularity lcm(blck_size,128), so a
+640-wide expert set at two devices floors the per-device share to 256 and splits 256/384 -- the light
+GPU waits in every MoE layer's all-reduce.  With the feature ON, no (or an equal) -ts, and a size that
+divides by the device count, the granularity drops toward lcm(blck_size,64): the same shape splits
+320/320 (2-device Flash-Next: +7 % draft-mtp decode, +4 % prefill).  The floor is 64 because MMB
+declines a non-64 K on the down; gate/up/down take blck_size from the down (tensor_axis_0), so their
+split-axis boundaries stay identical and only the grouping changes.
+
+It IS the reduction's grouping, so enabling it moves the logits of every shape it reaches: 2-device
+Flash-Next measures mean KLD 0.0140 / same-top-p 96.47 % against the recorded base -- below that point's
+own `-ub 4096` vs `-ub 3840` reordering control (0.0152 / 96.52 %), so a reordering and not a defect, but
+far outside the prefill-logit gate's rounding-level limit (0.005 / 98 %).  Hence OFF by default, reached
+only by name: `-of tp-ffn-even` (or `LLAMA_TP_FFN_EVEN=1`, the same switch).  `-of` is the discoverable
+name for a feature whose switch stays in the environment -- `-of list` prints the tags, an unknown tag is
+refused with the list, and `LLAMA_ARG_OPTIONAL_FEATURES` is the arg's own env form.  A tag ENABLES only.
+
+Inert below 2 devices, with an uneven -ts, and wherever no even split at 64 exists (Flash-Next at 3 and 4
+devices; every 3-GPU shape the delivery validates: 35B-A3B 512-wide, 27B 17408-wide and the rest).  Gate:
+scripts/gate-ffn-even-split.sh (default inert, tag reaches the split, four spellings agree, unknown tag
+refused, 3-device arm untouched).  Measured: benchmarks/2026-11-21-ffn-even-split.md.
 ---
  common/CMakeLists.txt                         |    2 +
- common/arg.cpp                                |   75 +-
- common/common.cpp                             |  258 +-
- common/common.h                               |   65 +-
+ common/arg.cpp                                |   96 +-
+ common/common.cpp                             |  337 +-
+ common/common.h                               |   92 +-
  common/draft-reserve.cpp                      |  236 +
  common/draft-reserve.h                        |   44 +
  common/fit.cpp                                |  501 +-
@@ -115,14 +137,14 @@ text/acceptance byte-identical everywhere.
  src/llama-mmap.h                              |    5 +
  src/llama-model-loader.cpp                    |  700 +-
  src/llama-model-loader.h                      |  118 +-
- src/llama-model.cpp                           |  266 +-
- src/llama-model.h                             |   11 +
+ src/llama-model.cpp                           |  307 +-
+ src/llama-model.h                             |   14 +
  src/llama-quant.cpp                           |    2 +-
  src/llama.cpp                                 |   16 +-
  tests/test-backend-tensor.cpp                 |    3 +
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 70 files changed, 18265 insertions(+), 547 deletions(-)
+ 70 files changed, 18436 insertions(+), 547 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -147,10 +169,38 @@ index e38485ca0..688639a72 100644
      fit.h
      file-lock.cpp
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 65ffbac2b..17798e24d 100644
+index 65ffbac2b..85bd56e58 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2706,6 +2706,74 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -1448,6 +1448,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             exit(0);
+         }
+     ));
++    add_opt(common_arg(
++        {"-of", "--optional-features"}, "TAG[,TAG...]",
++        "enable OPT-IN delivery features by tag, comma-separated (default: none).  A tag names a feature that is "
++        "OFF by default and has no first-class option yet; it sets the switch the feature already reads, so the "
++        "documented environment variable keeps working on its own.  Every tag ENABLES -- there is no 'off' form, "
++        "drop the tag, and a tag wins over a switch given at the same time.  Run with 'list' to print the tags and "
++        "what each one does",
++        [](common_params & params, const std::string & value) {
++            GGML_UNUSED(params);
++            if (value == "list") {
++                printf("%s", common_optional_features_help().c_str());
++                exit(0);
++            }
++            std::string err;
++            if (!common_apply_optional_features(value, err)) {
++                throw std::invalid_argument(string_format(
++                    "unknown --optional-features tag '%s'.  Known tags (all OFF by default):\n%s",
++                    err.c_str(), common_optional_features_help().c_str()));
++            }
++        }
++    ).set_env("LLAMA_ARG_OPTIONAL_FEATURES"));
+     add_opt(common_arg(
+         {"--completion-bash"},
+         "print source-able bash completion script for llama.cpp",
+@@ -2706,6 +2727,74 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              else { throw std::invalid_argument("invalid value"); }
          }
      ).set_env("LLAMA_ARG_LOAD_MODE"));
@@ -225,7 +275,7 @@ index 65ffbac2b..17798e24d 100644
      add_opt(common_arg(
          {"-lzm", "--lazy-mode"}, "MODE",
          "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
-@@ -2778,11 +2846,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2778,11 +2867,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
      ).set_env("LLAMA_ARG_CPU_MOE"));
      add_opt(common_arg(
          {"-ncmoe", "--n-cpu-moe"}, "N",
@@ -240,7 +290,7 @@ index 65ffbac2b..17798e24d 100644
              llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
          }
      ).set_env("LLAMA_ARG_N_CPU_MOE"));
-@@ -4230,11 +4300,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4230,11 +4321,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
      add_opt(common_arg(
          {"--spec-draft-n-cpu-moe", "--spec-draft-ncmoe", "-ncmoed", "--n-cpu-moe-draft"}, "N",
@@ -255,7 +305,7 @@ index 65ffbac2b..17798e24d 100644
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
 diff --git a/common/common.cpp b/common/common.cpp
-index b71a0b05e..b4393b7d0 100644
+index b71a0b05e..b5bd5e3d1 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -7,6 +7,7 @@
@@ -266,7 +316,93 @@ index b71a0b05e..b4393b7d0 100644
  #include "fit.h"
  #include "log.h"
  #include "llama.h"
-@@ -1145,6 +1146,7 @@ struct common_init_result::impl {
+@@ -963,6 +964,85 @@ void common_set_env(const std::string & name, const std::string & value) {
+ #endif
+ }
+ 
++//
++// OPT-IN delivery features (`-of`).  See common.h for the contract; the rows are the feature list.
++//
++// DATED DECISION, r338: a feature whose benefit is real but whose numerics are not "rounding level" ships
++// OPT-IN, and the switch stays in the environment -- the risk this table removes is not that a feature is
++// opt-in, it is that nobody finds it, because an environment variable does not appear in `--help`.
++const std::vector<common_optional_feature> & common_optional_features() {
++    static const std::vector<common_optional_feature> table = {
++        { "tp-ffn-even", "LLAMA_TP_FFN_EVEN", "1",
++          "even FFN / shared-expert `-sm tensor` split: with no -ts (or an equal one) and a size that divides by the "
++          "device count, the FFN granularity drops from lcm(blck_size,128) toward lcm(blck_size,64), so an "
++          "evenly-divisible FFN really splits evenly (Flash-Next's 640-wide experts on 2 GPUs: 320/320 instead of "
++          "256/384; worth +7 % `draft-mtp` decode and +4 % prefill there).  The granularity IS the reduction's "
++          "grouping, so the text of every shape it reaches moves (2-device Flash-Next: mean KLD 0.0140 against the "
++          "recorded base, GREEDY-PURITY.md §104), and a non-128 gate/up slice loses the fused MMQ gate/up kernel in "
++          "prefill.  Inert below 2 devices, with an uneven -ts, and where no even split at 64 exists (Flash-Next at "
++          "3 and 4 devices; every 3-GPU shape the delivery validates)" },
++    };
++    return table;
++}
++
++std::string common_optional_features_help() {
++    // tag on its own line, then the description wrapped under it: an option's --help entry is laid out by the
++    // usage formatter, which rewraps embedded newlines, so the long text lives only in the `-of list` output.
++    std::string out;
++    const std::string indent = "      ";
++    const size_t      width  = 96;
++    for (const auto & f : common_optional_features()) {
++        out += string_format("    %s\n", f.tag);
++        std::istringstream words(f.doc);
++        std::string w;
++        std::string line = indent;
++        while (words >> w) {
++            if (line.size() + 1 + w.size() > width && line.size() > indent.size()) {
++                out += line + "\n";
++                line = indent;
++            }
++            if (line.size() > indent.size()) {
++                line += ' ';
++            }
++            line += w;
++        }
++        if (line.size() > indent.size()) {
++            out += line + "\n";
++        }
++    }
++    return out;
++}
++
++bool common_apply_optional_features(const std::string & tags_csv, std::string & err) {
++    size_t pos = 0;
++    while (pos <= tags_csv.size()) {
++        const size_t comma = tags_csv.find(',', pos);
++        std::string tag = tags_csv.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
++        const size_t first = tag.find_first_not_of(" \t");
++        const size_t last  = tag.find_last_not_of(" \t");
++        tag = first == std::string::npos ? std::string() : tag.substr(first, last - first + 1);
++        if (!tag.empty()) {
++            const common_optional_feature * hit = nullptr;
++            for (const auto & f : common_optional_features()) {
++                if (tag == f.tag) {
++                    hit = &f;
++                    break;
++                }
++            }
++            if (hit == nullptr) {
++                err = tag;
++                return false;
++            }
++            common_set_env(hit->env, hit->value);
++        }
++        if (comma == std::string::npos) {
++            break;
++        }
++        pos = comma + 1;
++    }
++    return true;
++}
++
+ #if !defined(_WIN32)
+ static std::filesystem::path get_home_directory() {
+     std::filesystem::path home = common_get_env("HOME");
+@@ -1145,6 +1225,7 @@ struct common_init_result::impl {
      common_threadpools threadpools;
  
      llama_model_ptr   model;
@@ -274,7 +410,7 @@ index b71a0b05e..b4393b7d0 100644
      llama_context_ptr context;
  
      std::vector<llama_adapter_lora_ptr> lora;
-@@ -1235,6 +1237,30 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
+@@ -1235,6 +1316,30 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
      return info;
  }
  
@@ -305,7 +441,7 @@ index b71a0b05e..b4393b7d0 100644
  void common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
      if (!params.fit_params) {
          return;
-@@ -1243,10 +1269,11 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
+@@ -1243,10 +1348,11 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
      COM_TRC("%s", "fitting params to device memory ...\n");
      COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
  
@@ -320,7 +456,7 @@ index b71a0b05e..b4393b7d0 100644
  
      common_params params_dft = common_base_params_to_speculative(params);
  
-@@ -1262,6 +1289,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
+@@ -1262,6 +1368,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
          /*.mparams      =*/ &mparams_dft,
          /*.cparams      =*/ &cparams_dft,
          /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
@@ -328,7 +464,7 @@ index b71a0b05e..b4393b7d0 100644
      };
  
      common_fit_params(params.model.get_paths(), &mparams, &cparams,
-@@ -1273,7 +1301,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
+@@ -1273,7 +1380,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
          params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
  }
  
@@ -337,7 +473,7 @@ index b71a0b05e..b4393b7d0 100644
      pimpl(new impl{}) {
      auto mparams = common_model_params_to_llama(params);
      auto cparams = common_context_params_to_llama(params);
-@@ -1286,7 +1314,6 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1286,7 +1393,6 @@ common_init_result::common_init_result(common_params & params, bool model_only)
      }
  
      pimpl->model.reset(model);
@@ -345,7 +481,7 @@ index b71a0b05e..b4393b7d0 100644
      if (model_only) {
          return;
      }
-@@ -1388,10 +1415,82 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1388,10 +1494,82 @@ common_init_result::common_init_result(common_params & params, bool model_only)
          cparams.n_samplers = pimpl->samplers_seq_config.size();
      }
  
@@ -429,7 +565,7 @@ index b71a0b05e..b4393b7d0 100644
              return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; })) {
          gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
          if (gguf_context * g = gguf_init_from_file(params.speculative.draft.mparams.path.c_str(), gp)) {
-@@ -1410,6 +1509,55 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1410,6 +1588,55 @@ common_init_result::common_init_result(common_params & params, bool model_only)
          }
      }
  
@@ -485,7 +621,7 @@ index b71a0b05e..b4393b7d0 100644
      llama_context * lctx = llama_init_from_model(model, cparams);
      llama_model_set_embeddings_layer_inp_preset(model, nullptr, 0); // only this context: not an MTP draft context made later
      if (lctx == NULL) {
-@@ -1419,6 +1567,28 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+@@ -1419,6 +1646,28 @@ common_init_result::common_init_result(common_params & params, bool model_only)
  
      pimpl->context.reset(lctx);
  
@@ -514,7 +650,7 @@ index b71a0b05e..b4393b7d0 100644
      set_process_priority(params.cpuparams.priority);
  
      pimpl->threadpools.init(lctx, params);
-@@ -1428,6 +1598,14 @@ llama_model * common_init_result::model() {
+@@ -1428,6 +1677,14 @@ llama_model * common_init_result::model() {
      return pimpl->model.get();
  }
  
@@ -529,7 +665,7 @@ index b71a0b05e..b4393b7d0 100644
  llama_context * common_init_result::context() {
      return pimpl->context.get();
  }
-@@ -1457,7 +1635,7 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model
+@@ -1457,7 +1714,7 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model
      }
  }
  
@@ -538,7 +674,7 @@ index b71a0b05e..b4393b7d0 100644
      // --spec-draft-n-max is capped at 15 (a clamp, not an error).  There are two independent
      // bounds, and they have different severities:
      //
-@@ -1528,7 +1706,57 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
+@@ -1528,7 +1785,57 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
          }
      }
  
@@ -597,7 +733,7 @@ index b71a0b05e..b4393b7d0 100644
  
      llama_model * model = res->model();
      if (model == NULL) {
-@@ -1822,6 +2050,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1822,6 +2129,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.split_mode      = params.split_mode;
      mparams.load_mode       = params.load_mode;
      mparams.lazy_mode = params.lazy_mode;
@@ -617,7 +753,7 @@ index b71a0b05e..b4393b7d0 100644
      mparams.tensor_split    = params.tensor_split;
      mparams.check_tensors   = params.check_tensors;
      mparams.use_extra_bufts = !params.no_extra_bufts;
-@@ -1898,6 +2139,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1898,6 +2218,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.op_offload        = !params.no_op_offload;
      cparams.swa_full          = params.swa_full;
      cparams.kv_unified        = params.kv_unified;
@@ -626,7 +762,7 @@ index b71a0b05e..b4393b7d0 100644
      // issue #238: a multimodal projector feeds 2-D (M-RoPE) positions into this context, and the packed KQ
      // mask must be part of the compute reserve for those.  Without a projector the context only ever sees
 diff --git a/common/common.h b/common/common.h
-index c686d1258..dd5d5656e 100644
+index c686d1258..fae3744ad 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -20,6 +20,7 @@
@@ -714,7 +850,41 @@ index c686d1258..dd5d5656e 100644
      bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
      bool verbose_prompt    = false; // print prompt tokens before generation
      bool display_prompt    = true;  // print prompt before generation
-@@ -1039,12 +1089,21 @@ common_gguf_info common_get_gguf_info(const std::string & fname);
+@@ -962,6 +1012,33 @@ std::string wstring_to_utf8(const std::wstring & str);
+ std::string common_get_env(const std::string & name);
+ void        common_set_env(const std::string & name, const std::string & value);
+ 
++//
++// OPT-IN delivery features (`-of <tag>[,<tag>...]` / `--optional-features`)
++//
++// A tag is the DISCOVERABLE name of a feature the delivery ships OFF by default and that has no first-class
++// option yet; the row is the bridge from that name to the switch the feature already reads (an environment
++// variable, so the library, the CUDA backend and the model loader need no new plumbing).  The table is the
++// SINGLE place a tag exists: `-of` validates against it, `--help` lists it, and giving a feature a real option
++// later means deleting its row.
++//
++// A tag ENABLES only -- every feature here is off by default, so there is nothing to disable.  If a tag and its
++// switch are both given, the tag wins: it is the more explicit of the two.
++struct common_optional_feature {
++    const char * tag;   // the name the user types
++    const char * env;   // the switch the tag drives
++    const char * value; // the value that turns it on
++    const char * doc;   // one paragraph, printed by --help, by `-of list` and by an unknown-tag error
++};
++
++const std::vector<common_optional_feature> & common_optional_features();
++
++// the tag list formatted for --help (one indented entry per tag), empty if there are none
++std::string common_optional_features_help();
++
++// Applies a comma-separated tag list.  On an unknown tag, returns false and names it in `err` (the caller adds
++// the list).  An empty list, and empty entries (a trailing comma), are no-ops.
++bool common_apply_optional_features(const std::string & tags_csv, std::string & err);
++
+ //
+ // Filesystem utils
+ //
+@@ -1039,12 +1116,21 @@ common_gguf_info common_get_gguf_info(const std::string & fname);
  
  // note: defines the model, context, samplers, ets. lifetimes
  struct common_init_result {
@@ -737,7 +907,7 @@ index c686d1258..dd5d5656e 100644
      common_sampler * sampler(llama_seq_id seq_id);
      void reset_samplers();
  
-@@ -1057,7 +1116,7 @@ private:
+@@ -1057,7 +1143,7 @@ private:
  
  using common_init_result_ptr = std::unique_ptr<common_init_result>;
  
@@ -746,7 +916,7 @@ index c686d1258..dd5d5656e 100644
  
  struct llama_model_params   common_model_params_to_llama  (      common_params & params);
  struct llama_context_params common_context_params_to_llama(const common_params & params);
-@@ -1324,6 +1383,8 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
+@@ -1324,6 +1410,8 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
  inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vector<llama_model_tensor_buft_override> & overrides) {
      // keep strings alive and avoid leaking memory by storing them in a static list
      static std::list<std::string> buft_override_strings;
@@ -21332,10 +21502,58 @@ index 3c7e1c11b..c94af98d8 100644
      void unmap_weight(const llama_tensor_weight & w) const;
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 3c766cc75..22827187d 100644
+index 3c766cc75..42828be78 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1820,9 +1820,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -956,6 +956,47 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+             const int64_t blck_size_perf = std::lcm(blck_size, 128);
+             GGML_ASSERT(segments.size() == 1);
++            // Even FFN split (OPT-IN: `-of tp-ffn-even`, or LLAMA_TP_FFN_EVEN=1): with no -ts (or an equal one)
++            // and a size that divides by the device count, lower the granularity until each device's share is a
++            // multiple of it, but never below lcm(blck_size, 64) (MMB needs K % 64 on the down).
++            //
++            // WHY: Flash-Next's 640-wide experts / shared expert otherwise split 256 / 384 at two devices -- the
++            // light GPU waits in every MoE layer's all-reduce.  Gate, up and down all take blck_size from the down
++            // (tensor_axis_0), so their SPLIT-AXIS boundaries stay identical and only the grouping changes.
++            //
++            // WHY OPT-IN (r338): the granularity IS the reduction's grouping, so enabling this moves the logits of
++            // every shape it reaches.  On the 2-device Flash-Next point it measures mean KLD 0.0140 / same-top-p
++            // 96.47 % against the recorded base (the gate's limit is 0.005 / 98 %), which is BELOW that point's own
++            // `-ub 4096` vs `-ub 3840` reordering control (0.0152 / 96.52 %) -- i.e. a reordering, not a defect, but
++            // far above "rounding level", so a default run must not carry it (GREEDY-PURITY.md §104).  A 320-row
++            // gate/up slice also takes MMQ's bounds-checked variant (ggml_cuda_mmq_needs_fallback: nrows % 128), so
++            // it loses the fused gate/up kernel in prefill.  Worth +7 % `draft-mtp` decode and +4 % prefill on that
++            // shape: `benchmarks/2026-11-21-ffn-even-split.md`.
++            static const bool ffn_even = [] { const char * e = getenv("LLAMA_TP_FFN_EVEN"); return e != nullptr && atoi(e) != 0; }();
++            if (ffn_even) {
++                const float * ts = ud->model->tensor_split();
++                bool equal_ts = true;
++                for (size_t j = 1; ts != nullptr && j < ud->n_devices; j++) {
++                    equal_ts = equal_ts && ts[j] == ts[0];
++                }
++                const int64_t ne_s = segments[0].first;
++                if (equal_ts && ud->n_devices > 1 && ne_s % (int64_t) ud->n_devices == 0) {
++                    const int64_t share = ne_s / (int64_t) ud->n_devices;
++                    const int64_t g_min = std::lcm(blck_size, (int64_t) 64);
++                    int64_t g = blck_size_perf;
++                    while (g > g_min && share % g != 0) {
++                        g /= 2;
++                    }
++                    if (g != blck_size_perf && g % blck_size == 0 && share % g == 0) {
++                        if (!ud->ffn_even_logged) {
++                            ud->ffn_even_logged = true;
++                            LLAMA_LOG_WARN("%s: tensor split: FFN granularity %lld -> %lld so %s splits %lld / device (opt-in: -of tp-ffn-even)\n",
++                                    __func__, (long long) blck_size_perf, (long long) g, tensor_name.c_str(), (long long) share);
++                        }
++                        return {g};
++                    }
++                }
++            }
+             return {blck_size_perf};
+         }
+ 
+@@ -1820,9 +1861,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          return {dev, &pimpl->gpu_buft_list.at(dev)};
      };
  
@@ -21360,7 +21578,7 @@ index 3c766cc75..22827187d 100644
  
      // assign the repeating layers to the devices according to the splits
      pimpl->dev_layer.resize(n_layer_all);
-@@ -1848,6 +1860,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1848,6 +1901,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
          layers.resize(n_layer_all);
  
@@ -21376,7 +21594,7 @@ index 3c766cc75..22827187d 100644
          // call the per-model loading function
          load_arch_tensors(ml);
  
-@@ -2043,6 +2064,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2043,6 +2105,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          }
      }
  
@@ -21386,7 +21604,7 @@ index 3c766cc75..22827187d 100644
      // per-tensor activation precision policy
      prec_policy.load(ml, *this);
  
-@@ -2118,6 +2142,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2118,6 +2183,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                      bufs.emplace_back(buf);
                  }
              }
@@ -21403,7 +21621,7 @@ index 3c766cc75..22827187d 100644
          } else {
              ggml_backend_buffer_t buf;
              if (ml.no_alloc) {
-@@ -2220,6 +2254,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2220,6 +2295,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
      load_tensors_hadamard();
  
@@ -21419,7 +21637,7 @@ index 3c766cc75..22827187d 100644
      return true;
  }
  
-@@ -3619,7 +3662,10 @@ llama_model_params llama_model_default_params() {
+@@ -3619,7 +3703,10 @@ llama_model_params llama_model_default_params() {
          /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
          /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
          /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
@@ -21430,7 +21648,7 @@ index 3c766cc75..22827187d 100644
          /*.tensor_split                =*/ nullptr,
          /*.progress_callback           =*/ nullptr,
          /*.progress_callback_user_data =*/ nullptr,
-@@ -3630,6 +3676,7 @@ llama_model_params llama_model_default_params() {
+@@ -3630,6 +3717,7 @@ llama_model_params llama_model_default_params() {
          /*.no_host                     =*/ false,
          /*.no_alloc                    =*/ false,
          /*.load_mtp                    =*/ false,
@@ -21438,7 +21656,7 @@ index 3c766cc75..22827187d 100644
      };
  
      return result;
-@@ -4090,6 +4137,102 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
+@@ -4090,6 +4178,102 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
      return model->tensors_by_name;
  }
  
@@ -21541,7 +21759,7 @@ index 3c766cc75..22827187d 100644
  int32_t llama_model_n_expert(const struct llama_model * model) {
      return model->hparams.n_expert;
  }
-@@ -4295,3 +4438,120 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
+@@ -4295,3 +4479,120 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
  
      return n_tokens * (uint32_t) tensor->ne[0];
  }
@@ -21626,7 +21844,7 @@ index 3c766cc75..22827187d 100644
 +            if (!zero_at.empty()) {
 +                n_bad++;
 +                if (worst.empty()) {
-+                    worst = format("%s (axis %d: %lld columns over %zu devices, granularity %lld) -> device %s holds 0",
++                    worst = format("%s (axis %d: %lld columns over %zu devices, granularity <= %lld) -> device %s holds 0",
 +                            t->name, (int) ss.axis, (long long) t->ne[ss.axis], n_devs,
 +                            (long long) std::lcm((int64_t) ggml_blck_size(t->type), (int64_t) 128), zero_at.c_str());
 +                }
@@ -21663,10 +21881,20 @@ index 3c766cc75..22827187d 100644
 +    return max_bytes;
 +}
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 1aa9b1261..a6fac6f8d 100644
+index 1aa9b1261..2a4620d49 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -995,6 +995,9 @@ struct llama_model {
+@@ -732,6 +732,9 @@ struct llama_device {
+ struct llama_meta_device_get_split_state_userdata {
+     size_t                     n_devices;
+     const struct llama_model * model;
++    // Once per model: the fitting pass loads its own model with logging silenced, so a process-wide flag would
++    // hide the `-of tp-ffn-even` line.  Per-model state lives here rather than in a file-static for that reason.
++    mutable bool               ffn_even_logged = false;
+ };
+ 
+ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
+@@ -995,6 +998,9 @@ struct llama_model {
      // for quantize-stats only
      std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
  
@@ -21676,7 +21904,7 @@ index 1aa9b1261..a6fac6f8d 100644
      // for keeping track of associated LoRA adapters
      std::unordered_set<llama_adapter_lora *> loras;
  
-@@ -1030,6 +1033,14 @@ struct llama_model {
+@@ -1030,6 +1036,14 @@ struct llama_model {
  
      // total number of parameters in the model
      uint64_t n_elements() const;

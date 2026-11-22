@@ -1700,3 +1700,39 @@ Record: `WORKLOG.md` 261121.007, `archive/work/r328-followups/` (§3 rows and `l
   in-place admission's bound is `|used| <= slots` and a ~3548-token ubatch routes nearly every expert
   (`LME=60` default ubatch = 564 declines / 0 calls against 120 calls at `-ub 512`), so `LME=85` is the arm to
   run.  Record: `WORKLOG.md` 261121.016, `patches/README.md` block 15.
+
+## r338 — an FFN split granularity is a reduction order; the delivery default stays at `lcm(blck_size,128)` and the even split is opt-in (block 09, contributor PR #342)
+
+**`-sm tensor` splits an FFN tensor at `lcm(blck_size, 128)`, and at 2 devices that floors a 640-wide expert
+set's share from 320 to 256 (256/384).**  Lowering the granularity to `lcm(blck_size, 64)` when the size divides
+evenly gives 320/320 and measured **+7 % `draft-mtp` decode / +4 % prefill** on 2-device Flash-Next; it is
+`-of tp-ffn-even` (`LLAMA_TP_FFN_EVEN=1`), **default OFF**.
+
+Rules:
+
+1. **The granularity is the grouping, so it is a reduction-order change and must be judged as one.**  On the
+   2-device Flash-Next point it reads mean KLD **0.013963 / 96.467 %** against the recorded base — 2.8x the
+   prefill-logit limit — but the same point's `-ub 4096` vs `-ub 3840` reordering control reads
+   **0.015248 / 96.516 %** and moves base PPL +1.21 % against the change's +0.59 %.  A reordering, not an
+   approximate path; still far above "rounding level", so it is opt-in (`GREEDY-PURITY.md` §104).
+2. **The 64 floor is MMB's, not a preference.**  `mmb_supported_mm`/`_mmid` decline `K % 64 != 0`, so a lower
+   floor would silently drop MMB on the down projection.  At the *affected* MoE shapes MMB is not on the down
+   anyway (`routed=0`; the census shows only the F32 routers), so the floor currently protects dense shapes.
+3. **The reach is arithmetic and must be enumerated, never assumed to be one model.**  On this box it fires for
+   every Flash-Next quant and its MTP drafts at **2** devices, `gpt-oss-20B-MXFP4_MOE` at **3**, and
+   gemma-4-26B-A4B / Inkling-2-Mini at 3-4.  It is **inert** for every 3-GPU shape the delivery validates
+   (35B-A3B 512-wide, 27B 17408-wide, 4B/9B/122B, DeepSeek-V4, Gemma4 12B/31B/E4B) and for Flash-Next at 3 and
+   4 devices (640 % 3 != 0; 160 % 64 != 0).
+4. **The tag layer is the discoverable spelling of an env-only switch.**  `-of <tag>` sets the switch the
+   feature already reads; the table in `common/common.cpp` is the single place a tag exists, and giving a
+   feature a real option later means deleting its row.  A tag ENABLES only — there is no "off" form, because
+   every tag's feature is off by default — and `LLAMA_ARG_OPTIONAL_FEATURES` is the arg's own env form.
+5. **A default run must remain bit-identical, and that is the gate.**  After promotion the prefill-logit point
+   reads **-0.000000 / 100.000 %** and the 2-device greedy text is unchanged (`c420dfe04c42`).  The enabled
+   arm's text is a *separate* per-device-count reference (`cbdb63954bbb`), never a both-arms-equal claim.
+6. **The generated docs are owed by the block that adds the option, and land in the last official block that
+   touches `common/arg.cpp` (block 16), never in the temporary `0300`.**  `scripts/check-gen-docs.sh` is the
+   check (r329).
+
+Record: `WORKLOG.md` 261121.017; `benchmarks/2026-11-21-ffn-even-split.md`; `scripts/gate-ffn-even-split.sh`
+(`MANIFESTS.md` gate 37); `GREEDY-PURITY.md` §104; `ENVIRONMENT.md` §4.1.

@@ -650,7 +650,7 @@ paragraph).  What moved, per block, that a reader would notice:
 | 06 | unions only; MMB follows upstream's few-row MMQ precedence (compiled out under HIP) |
 | 07 | both `mmvq.cu` conflicts unioned; the RDNA3_5 `ne11` gate is adopted as a dispatch threshold |
 | 08 | **D4** additive; four forced fixes, incl. a silent `force_tiling` → `has_gate` template artifact |
-| 09 | `seq_rm` adopted; the offload relaxation is block 09's own (issue #294's rule) |
+| 09 | `seq_rm` adopted; the offload relaxation is block 09's own (issue #294's rule); r338 adds the **opt-in** `-of tp-ffn-even` FFN split + the `-of` tag layer |
 | 10 | the fusion dispatcher reconciled into `ggml-cuda-try-fuse.cu` — upstream's `#32454` `{NORM,MUL}` pair were the only missing arms, and they are D4's |
 | 11 | **D13** carried (upstream's FP8 PLE scale + the delivery's lazy reader coexist); the five merge sites |
 | 12 | the speculator class merged onto upstream's `dflash_options`/`init(opt)` seam — **D17: the delivery's DFlash feature set stays**, measured |
@@ -1922,6 +1922,33 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 
 ## Block 09 — host-resident MoE: iface, scheduler, expert cache, staging rings
 
+> **r338 amendment: OPT-IN `-of tp-ffn-even` — an even FFN / shared-expert `-sm tensor` split — and the
+> `--optional-features` tag layer it is the first entry of** (contributor PR #342, `@briansp2020`).  The meta split
+> floors an FFN tensor's per-device share to granularity `lcm(blck_size,128)`, so a 640-wide expert set at **two**
+> devices splits **256 / 384** and the light GPU waits in every MoE layer's all-reduce.  With the feature on (and
+> no `-ts`, or an equal one, and a size that divides by the device count) the granularity drops toward
+> `lcm(blck_size,64)` and the same shape splits **320 / 320**: **+7 % `draft-mtp` decode, +4 % prefill** on
+> 2-device Flash-Next, +9 % prefill on the IQ4_NL shape, ~1 % at 3 devices (`gpt-oss-20B` 2880-wide:
+> 896/1024/960 -> 960x3).  The floor of 64 is MMB's (`K % 64`, else MMB declines the down); gate, up and down
+> take `blck_size` from the down, so their split-axis boundaries stay identical and only the grouping changes; the
+> host-expert slices follow, because the split state is the single source.
+>
+> **Why it is opt-in.**  The granularity IS the reduction's grouping, so enabling it moves the logits of every
+> shape it reaches: on the delivery's own 2-device Flash-Next point mean KLD **0.0140** / same-top-p 96.47 %
+> against the recorded base — 2.8x the prefill-logit limit, and *below* that point's own `-ub 4096` vs `-ub 3840`
+> reordering control (**0.0152** / 96.52 %, base PPL +1.21 % against the change's +0.59 %).  A reordering and not
+> a defect, but far above "rounding level", so the **default path is bit-identical** (`-0.000000 / 100.000 %`,
+> text `c420dfe04c42` unchanged) and the feature is reached only by name: `-of tp-ffn-even`, or
+> `LLAMA_TP_FFN_EVEN=1`, which is the same switch.  Inert below 2 devices, with an uneven `-ts`, and wherever no
+> even split at 64 exists (Flash-Next at 3 and 4 devices; every 3-GPU shape the delivery validates).
+>
+> **`-of` / `--optional-features`** is the new, generic spelling for an opt-in switch that would otherwise be
+> environment-only: a comma-separated tag list, `-of list` to print the tags, an unknown tag refused with the
+> list, and `LLAMA_ARG_OPTIONAL_FEATURES` as the arg's own env form.  A tag ENABLES only (drop it to disable) and
+> wins over a switch given at the same time; the table in `common/common.cpp` is the single place a tag exists,
+> so a later first-class option deletes its row.  `ENVIRONMENT.md` §4 / §4.1; `GREEDY-PURITY.md` §104;
+> `INVARIANTS.md` r338; gate `scripts/gate-ffn-even-split.sh` (`MANIFESTS.md` 37);
+> `benchmarks/2026-11-21-ffn-even-split.md`; `WORKLOG.md` 261121.017.
 > **r325 amendment: the MoE device gather's launch shape is sized for the PREFILL band (`MOE_GATHER_NSPLIT`).**
 > `moe_cache_gather_host` launched `moe_cache_gather_kernel<<<n_experts * n_split, ...>>>` with `n_split = 8`, a
 > constant chosen for the **decode** band's shape ("~64 concurrent blocks for the usual 8 routed experts").  A

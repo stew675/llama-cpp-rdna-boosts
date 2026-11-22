@@ -1,4 +1,4 @@
-From ccd813376f65adf5b4c37f8e2d5e22c5816e328f Mon Sep 17 00:00:00 2001
+From 2f0d050107a90d53b350103f9ec3ad5006d7f280 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 25 Oct 2026 10:25:16 -0500
 Subject: [PATCH 17/17] rdna-boosts: block 0300: relaxed-tensor split mode
@@ -84,10 +84,10 @@ needed.  Exit verified on this tree (gfx1201, ROCm 10.1.0, VMM build):
  12 files changed, 130 insertions(+), 17 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 42ecb183d..c041d8406 100644
+index ee0bbac3e..dedf56bf4 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -3060,12 +3060,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -3081,12 +3081,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          }
      ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
      add_opt(common_arg(
@@ -106,7 +106,7 @@ index 42ecb183d..c041d8406 100644
          [](common_params & params, const std::string & value) {
              if (value == "none") {
                  params.split_mode = LLAMA_SPLIT_MODE_NONE;
-@@ -3075,6 +3079,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -3096,6 +3100,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                  params.split_mode = LLAMA_SPLIT_MODE_ROW;
              } else if (value == "tensor") {
                  params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
@@ -402,7 +402,7 @@ index 884dca647..f72c29d30 100644
  static inline dst_t llama_cast(src_t v) {
      if constexpr (std::is_same_v<src_t, dst_t>) {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index a59a1d0cf..0ad57f94c 100644
+index 030e43796..d6cd012f4 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -410,7 +410,13 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param

@@ -1,4 +1,4 @@
-From f41a00642878ec46e926e7d86e59e778869177f9 Mon Sep 17 00:00:00 2001
+From f752eeefa0f33df658ffeef0b019d167a86a68f9 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Mon, 16 Nov 2026 23:43:27 -0600
 Subject: [PATCH 16/17] rdna-boosts: block 16: the server's prompt admission
@@ -35,20 +35,25 @@ With a decoder already generating, the prefilling slot's step list is IDENTICAL 
 is 137 tokens per 2.18 s at -ib 512 against 69 per 1.48 s at -ib 2048 (worst gap 89 vs
 276 ms).  Flash-Next IQ3_XXS with host-resident experts (1 GPU, -ncmoe 47, -b/-ub 16384,
 8401 tokens): 18 x 512 = 683.7 t/s against 2 x 8400 = 1885.8 t/s (2.76x).
+
+The three GENERATED documents (tools/cli, tools/completion, tools/server) are regenerated at r338 for the
+`-of`/`--optional-features` option the block-09 tag layer adds (`llama-gen-docs`, checked by
+scripts/check-gen-docs.sh).  They live here because this is the last official block that touches
+common/arg.cpp -- never in the temporary 0300.
 ---
  common/arg.cpp                  |  17 ++
  common/common.h                 |  10 +
- tools/cli/README.md             |  17 +-
- tools/completion/README.md      |  13 +-
- tools/server/README.md          |  18 +-
+ tools/cli/README.md             |  18 +-
+ tools/completion/README.md      |  14 +-
+ tools/server/README.md          |  19 +-
  tools/server/server-context.cpp | 342 +++++++++++++++++++++++++++++++-
- 6 files changed, 401 insertions(+), 16 deletions(-)
+ 6 files changed, 404 insertions(+), 16 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 19f2310c0..42ecb183d 100644
+index f7cd72d85..ee0bbac3e 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2640,6 +2640,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2661,6 +2661,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.cont_batching = value;
          }
      ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
@@ -73,7 +78,7 @@ index 19f2310c0..42ecb183d 100644
          {"-mm", "--mmproj"}, "FILE",
          "path to a multimodal projector file. see tools/mtmd/README.md\n"
 diff --git a/common/common.h b/common/common.h
-index f166fe37c..6a49f1017 100644
+index db6133522..727840f63 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -762,6 +762,16 @@ struct common_params {
@@ -94,10 +99,18 @@ index f166fe37c..6a49f1017 100644
      bool        server_connect      = false;
      std::string server_connect_code = "";
 diff --git a/tools/cli/README.md b/tools/cli/README.md
-index 785ebeaab..680268d06 100644
+index 785ebeaab..237b00861 100644
 --- a/tools/cli/README.md
 +++ b/tools/cli/README.md
-@@ -32,6 +32,8 @@
+@@ -13,6 +13,7 @@
+ | `-h, --help, --usage` | print usage and exit |
+ | `--version` | show version and build info |
+ | `-cl, --cache-list` | show list of models in cache |
++| `-of, --optional-features TAG[,TAG...]` | enable OPT-IN delivery features by tag, comma-separated (default: none).  A tag names a feature that is OFF by default and has no first-class option yet; it sets the switch the feature already reads, so the documented environment variable keeps working on its own.  Every tag ENABLES -- there is no 'off' form, drop the tag, and a tag wins over a switch given at the same time.  Run with 'list' to print the tags and what each one does<br/>(env: LLAMA_ARG_OPTIONAL_FEATURES) |
+ | `--completion-bash` | print source-able bash completion script for llama.cpp |
+ | `-t, --threads N` | number of CPU threads to use during generation (default: -1)<br/>(env: LLAMA_ARG_THREADS) |
+ | `-tb, --threads-batch N` | number of threads to use during batch and prompt processing (default: same as --threads) |
+@@ -32,6 +33,8 @@
  | `-ub, --ubatch-size N` | physical maximum batch size (default: 512)<br/>(env: LLAMA_ARG_UBATCH) |
  | `--keep N` | number of tokens to keep from the initial prompt (default: 0, -1 = all) |
  | `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
@@ -106,7 +119,7 @@ index 785ebeaab..680268d06 100644
  | `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
  | `-p, --prompt PROMPT` | prompt to start generation with; for system message, use -sys |
  | `--perf, --no-perf` | whether to enable internal libllama performance timings (default: false)<br/>(env: LLAMA_ARG_PERF) |
-@@ -50,23 +52,26 @@
+@@ -50,23 +53,26 @@
  | `-kvo, --kv-offload, -nkvo, --no-kv-offload` | whether to enable KV cache offloading (default: enabled)<br/>(env: LLAMA_ARG_KV_OFFLOAD) |
  | `--repack, -nr, --no-repack` | whether to enable weight repacking (default: enabled)<br/>(env: LLAMA_ARG_REPACK) |
  | `--no-host` | bypass host buffer allowing extra buffers to be used<br/>(env: LLAMA_ARG_NO_HOST) |
@@ -137,7 +150,7 @@ index 785ebeaab..680268d06 100644
  | `-ts, --tensor-split N0,N1,N2,...` | fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1<br/>(env: LLAMA_ARG_TENSOR_SPLIT) |
  | `-mg, --main-gpu INDEX` | the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: 0)<br/>(env: LLAMA_ARG_MAIN_GPU) |
  | `-fit, --fit [on\|off]` | whether to adjust unset arguments to fit in device memory ('on' or 'off', default: 'on')<br/>(env: LLAMA_ARG_FIT) |
-@@ -198,10 +203,12 @@
+@@ -198,10 +204,12 @@
  | `--spec-draft-poll-batch, --poll-batch-draft <0\|1>` | Use polling to wait for draft model work (default: --poll-draft) |
  | `--spec-draft-override-tensor, -otd, --override-tensor-draft <tensor name pattern>=<buffer type>,...` | override tensor buffer type for draft model |
  | `--spec-draft-cpu-moe, -cmoed, --cpu-moe-draft` | keep all Mixture of Experts (MoE) weights in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_CPU_MOE) |
@@ -152,10 +165,18 @@ index 785ebeaab..680268d06 100644
  | `--spec-draft-n-start N` | initial adaptive MTP draft depth: the first verify round of each generation starts here instead of the default cold start.  Clamped to [--spec-draft-n-min-adaptive, --spec-draft-n-max].  Use it to start deeper when the workload settles high (e.g. verbatim recall) or shallower for a short generation at a deep context, where a wide verify batch costs more.  Unset: three steps below the ceiling, bounded by the floor.<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_START) |
  | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
 diff --git a/tools/completion/README.md b/tools/completion/README.md
-index 8c87eeea8..30381355e 100644
+index 8c87eeea8..5c141a81c 100644
 --- a/tools/completion/README.md
 +++ b/tools/completion/README.md
-@@ -115,6 +115,8 @@ llama-completion.exe -m models\gemma-1.1-7b-it.Q4_K_M.gguf --ignore-eos -n -1
+@@ -96,6 +96,7 @@ llama-completion.exe -m models\gemma-1.1-7b-it.Q4_K_M.gguf --ignore-eos -n -1
+ | `-h, --help, --usage` | print usage and exit |
+ | `--version` | show version and build info |
+ | `-cl, --cache-list` | show list of models in cache |
++| `-of, --optional-features TAG[,TAG...]` | enable OPT-IN delivery features by tag, comma-separated (default: none).  A tag names a feature that is OFF by default and has no first-class option yet; it sets the switch the feature already reads, so the documented environment variable keeps working on its own.  Every tag ENABLES -- there is no 'off' form, drop the tag, and a tag wins over a switch given at the same time.  Run with 'list' to print the tags and what each one does<br/>(env: LLAMA_ARG_OPTIONAL_FEATURES) |
+ | `--completion-bash` | print source-able bash completion script for llama.cpp |
+ | `-t, --threads N` | number of CPU threads to use during generation (default: -1)<br/>(env: LLAMA_ARG_THREADS) |
+ | `-tb, --threads-batch N` | number of threads to use during batch and prompt processing (default: same as --threads) |
+@@ -115,6 +116,8 @@ llama-completion.exe -m models\gemma-1.1-7b-it.Q4_K_M.gguf --ignore-eos -n -1
  | `-ub, --ubatch-size N` | physical maximum batch size (default: 512)<br/>(env: LLAMA_ARG_UBATCH) |
  | `--keep N` | number of tokens to keep from the initial prompt (default: 0, -1 = all) |
  | `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
@@ -164,7 +185,7 @@ index 8c87eeea8..30381355e 100644
  | `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
  | `-p, --prompt PROMPT` | prompt to start generation with; for system message, use -sys |
  | `--perf, --no-perf` | whether to enable internal libllama performance timings (default: false)<br/>(env: LLAMA_ARG_PERF) |
-@@ -133,23 +135,26 @@ llama-completion.exe -m models\gemma-1.1-7b-it.Q4_K_M.gguf --ignore-eos -n -1
+@@ -133,23 +136,26 @@ llama-completion.exe -m models\gemma-1.1-7b-it.Q4_K_M.gguf --ignore-eos -n -1
  | `-kvo, --kv-offload, -nkvo, --no-kv-offload` | whether to enable KV cache offloading (default: enabled)<br/>(env: LLAMA_ARG_KV_OFFLOAD) |
  | `--repack, -nr, --no-repack` | whether to enable weight repacking (default: enabled)<br/>(env: LLAMA_ARG_REPACK) |
  | `--no-host` | bypass host buffer allowing extra buffers to be used<br/>(env: LLAMA_ARG_NO_HOST) |
@@ -196,10 +217,18 @@ index 8c87eeea8..30381355e 100644
  | `-mg, --main-gpu INDEX` | the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: 0)<br/>(env: LLAMA_ARG_MAIN_GPU) |
  | `-fit, --fit [on\|off]` | whether to adjust unset arguments to fit in device memory ('on' or 'off', default: 'on')<br/>(env: LLAMA_ARG_FIT) |
 diff --git a/tools/server/README.md b/tools/server/README.md
-index 3c89ff19d..f084a54b7 100644
+index 3c89ff19d..f5b262254 100644
 --- a/tools/server/README.md
 +++ b/tools/server/README.md
-@@ -53,6 +53,8 @@ For the full list of features, please refer to [server's changelog](https://gith
+@@ -34,6 +34,7 @@ For the full list of features, please refer to [server's changelog](https://gith
+ | `-h, --help, --usage` | print usage and exit |
+ | `--version` | show version and build info |
+ | `-cl, --cache-list` | show list of models in cache |
++| `-of, --optional-features TAG[,TAG...]` | enable OPT-IN delivery features by tag, comma-separated (default: none).  A tag names a feature that is OFF by default and has no first-class option yet; it sets the switch the feature already reads, so the documented environment variable keeps working on its own.  Every tag ENABLES -- there is no 'off' form, drop the tag, and a tag wins over a switch given at the same time.  Run with 'list' to print the tags and what each one does<br/>(env: LLAMA_ARG_OPTIONAL_FEATURES) |
+ | `--completion-bash` | print source-able bash completion script for llama.cpp |
+ | `-t, --threads N` | number of CPU threads to use during generation (default: -1)<br/>(env: LLAMA_ARG_THREADS) |
+ | `-tb, --threads-batch N` | number of threads to use during batch and prompt processing (default: same as --threads) |
+@@ -53,6 +54,8 @@ For the full list of features, please refer to [server's changelog](https://gith
  | `-ub, --ubatch-size N` | physical maximum batch size (default: 512)<br/>(env: LLAMA_ARG_UBATCH) |
  | `--keep N` | number of tokens to keep from the initial prompt (default: 0, -1 = all) |
  | `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
@@ -208,7 +237,7 @@ index 3c89ff19d..f084a54b7 100644
  | `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
  | `--perf, --no-perf` | whether to enable internal libllama performance timings (default: false)<br/>(env: LLAMA_ARG_PERF) |
  | `-e, --escape, --no-escape` | whether to process escapes sequences (\n, \r, \t, \', \", \\) (default: true) |
-@@ -68,22 +70,25 @@ For the full list of features, please refer to [server's changelog](https://gith
+@@ -68,22 +71,25 @@ For the full list of features, please refer to [server's changelog](https://gith
  | `-kvo, --kv-offload, -nkvo, --no-kv-offload` | whether to enable KV cache offloading (default: enabled)<br/>(env: LLAMA_ARG_KV_OFFLOAD) |
  | `--repack, -nr, --no-repack` | whether to enable weight repacking (default: enabled)<br/>(env: LLAMA_ARG_REPACK) |
  | `--no-host` | bypass host buffer allowing extra buffers to be used<br/>(env: LLAMA_ARG_NO_HOST) |
@@ -238,7 +267,7 @@ index 3c89ff19d..f084a54b7 100644
  | `-ts, --tensor-split N0,N1,N2,...` | fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1<br/>(env: LLAMA_ARG_TENSOR_SPLIT) |
  | `-mg, --main-gpu INDEX` | the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: 0)<br/>(env: LLAMA_ARG_MAIN_GPU) |
  | `-fit, --fit [on\|off]` | whether to adjust unset arguments to fit in device memory ('on' or 'off', default: 'on')<br/>(env: LLAMA_ARG_FIT) |
-@@ -177,6 +182,7 @@ For the full list of features, please refer to [server's changelog](https://gith
+@@ -177,6 +183,7 @@ For the full list of features, please refer to [server's changelog](https://gith
  | `--pooling {none,mean,cls,last,rank}` | pooling type for embeddings, use model default if unspecified<br/>(env: LLAMA_ARG_POOLING) |
  | `-np, --parallel N` | number of server slots (default: -1, -1 = auto)<br/>(env: LLAMA_ARG_N_PARALLEL) |
  | `-cb, --cont-batching, -nocb, --no-cont-batching` | whether to enable continuous batching (a.k.a dynamic batching) (default: enabled)<br/>(env: LLAMA_ARG_CONT_BATCHING) |
@@ -246,7 +275,7 @@ index 3c89ff19d..f084a54b7 100644
  | `-mm, --mmproj FILE` | path to a multimodal projector file. see tools/mtmd/README.md<br/>note: if -hf is used, this argument can be omitted<br/>(env: LLAMA_ARG_MMPROJ) |
  | `-mmu, --mmproj-url URL` | URL to a multimodal projector file. see tools/mtmd/README.md<br/>(env: LLAMA_ARG_MMPROJ_URL) |
  | `--mmproj-auto, --no-mmproj, --no-mmproj-auto` | whether to use multimodal projector file (if available), useful when using -hf (default: enabled)<br/>(env: LLAMA_ARG_MMPROJ_AUTO) |
-@@ -265,10 +271,12 @@ For the full list of features, please refer to [server's changelog](https://gith
+@@ -265,10 +272,12 @@ For the full list of features, please refer to [server's changelog](https://gith
  | `--spec-draft-poll-batch, --poll-batch-draft <0\|1>` | Use polling to wait for draft model work (default: --poll-draft) |
  | `--spec-draft-override-tensor, -otd, --override-tensor-draft <tensor name pattern>=<buffer type>,...` | override tensor buffer type for draft model |
  | `--spec-draft-cpu-moe, -cmoed, --cpu-moe-draft` | keep all Mixture of Experts (MoE) weights in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_CPU_MOE) |

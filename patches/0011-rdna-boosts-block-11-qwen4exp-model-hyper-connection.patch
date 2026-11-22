@@ -1,4 +1,4 @@
-From daa48e33843e4e3faf438d3f74052fa9f10c97d5 Mon Sep 17 00:00:00 2001
+From 927dcff8600615cc965fb6e196efdb550e348a67 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/17] rdna-boosts: block 11: qwen4exp (model,
@@ -183,10 +183,10 @@ r243 (contributor PR #289, bsp2020): the host PLE gather fans out over --threads
  create mode 100644 tests/test-lazy-reader.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 17798e24d..605a22c8b 100644
+index 85bd56e58..f36b39cf0 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2778,7 +2778,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2799,7 +2799,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          {"-lzm", "--lazy-mode"}, "MODE",
          "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
          "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
@@ -11708,10 +11708,10 @@ index c94af98d8..74379b025 100644
          // file-mapped.  An explicit `--lazy-mode off` overrides the mmap-backed buffer for
          // the tensors the arch marks TENSOR_READ_LAZY (the PLE / engram tables): without
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index a82752948..c72999030 100644
+index 661c6eff1..cce380945 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -3437,10 +3437,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3478,10 +3478,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
          default:
              {
                  // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
@@ -11764,7 +11764,7 @@ index a82752948..c72999030 100644
  
                  const bool mtp_on_hybrid_nemotron =
                      params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
-@@ -4321,7 +4362,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
+@@ -4362,7 +4403,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
      TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
      TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
      TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
@@ -11775,10 +11775,10 @@ index a82752948..c72999030 100644
  ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
      GGML_ASSERT(ml != nullptr);
 diff --git a/src/llama-model.h b/src/llama-model.h
-index d9bd3b56c..6ed88323e 100644
+index fba734e29..14bde0611 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -1114,6 +1114,7 @@ struct llama_model_base : public llama_model {
+@@ -1117,6 +1117,7 @@ struct llama_model_base : public llama_model {
      const int TENSOR_SKIP_IF_VIRTUAL;
      const int TENSOR_ALLOW_RESHAPE;
      const int TENSOR_READ_LAZY;

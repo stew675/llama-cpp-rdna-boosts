@@ -1,4 +1,4 @@
-From 7079157d6f8c5f71f959b2ff87d969954a2b9713 Mon Sep 17 00:00:00 2001
+From 15f7927b759a1432b6adafa9f46f22fdb99d3527 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 14/17] rdna-boosts: block 14: the streamed KV -- a fixed-VRAM
@@ -171,10 +171,10 @@ is unchanged) and divided by MiB only for display.
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cuh
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 16f5b1f5b..f5173e6bc 100644
+index c0d9cfc7d..32525c72c 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -1710,6 +1710,72 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -1731,6 +1731,72 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.kv_unified = value;
          }
      ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
@@ -247,7 +247,7 @@ index 16f5b1f5b..f5173e6bc 100644
      add_opt(common_arg(
          {"--cache-idle-slots"},
          {"--no-cache-idle-slots"},
-@@ -4378,6 +4444,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4399,6 +4465,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_ubatch = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
@@ -284,10 +284,10 @@ index 16f5b1f5b..f5173e6bc 100644
          {"--spec-draft-n-min-adaptive"}, "N",
          string_format("minimum adaptive MTP draft depth; the depth never drops below it (the default cold start is three steps below --spec-draft-n-max, bounded by this floor) (default: %d)", params.speculative.draft.n_min_adaptive),
 diff --git a/common/common.cpp b/common/common.cpp
-index 278483ead..017f5da44 100644
+index fb3c50d0a..3a08ee05c 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1254,11 +1254,42 @@ static common_draft_reserve common_draft_reserve_derive(const common_params & pa
+@@ -1333,11 +1333,42 @@ static common_draft_reserve common_draft_reserve_derive(const common_params & pa
      }
      // `n_ctx == 0` ("from the model") is resolved inside the estimator from the draft GGUF's own
      // `context_length`: estimating with 0 would UNDER-estimate the reserve, the dangerous direction.
@@ -333,7 +333,7 @@ index 278483ead..017f5da44 100644
  }
  
  void common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
-@@ -2152,6 +2183,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -2231,6 +2262,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.swa_full          = params.swa_full;
      cparams.kv_unified        = params.kv_unified;
      cparams.drop_compute_buffers = params.drop_compute_buffers;
@@ -345,7 +345,7 @@ index 278483ead..017f5da44 100644
      // issue #238: a multimodal projector feeds 2-D (M-RoPE) positions into this context, and the packed KQ
      // mask must be part of the compute reserve for those.  Without a projector the context only ever sees
 diff --git a/common/common.h b/common/common.h
-index c649ae7b5..f166fe37c 100644
+index 725f4abf7..db6133522 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -379,6 +379,14 @@ struct common_params_speculative_draft {
@@ -10479,10 +10479,10 @@ index 3a1dfd3d6..559064d3e 100644
      bool host_expert_is_pinned(const char * name) const {
          return host_experts_plan_done && name != nullptr && host_experts_pinned.count(std::string(name)) > 0;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index abe30af28..a59a1d0cf 100644
+index 7ec8ad341..030e43796 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1912,6 +1912,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1953,6 +1953,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          // NB: the `-ncmoe` tail bound is `hparams.n_layer()` (the TRUNK layers), not `n_layer_all` (which
          // also counts the appended nextn/MTP head): `create_tensor` uses the trunk count, so using the other
          // here would shift the tail by one layer and plan a pinned MTP head that is never hosted.
@@ -10508,7 +10508,7 @@ index abe30af28..a59a1d0cf 100644
          ml.plan_host_expert_placement((int) hparams.n_layer());
  
          // call the per-model loading function
-@@ -2172,7 +2191,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2213,7 +2232,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          // pool is the only non-swappable tier, and every GPU read is served through it -- so a host
          // expert set larger than RAM runs by streaming from disk.  The buffer type still carries this
          // device, so the expert op stays on the GPU and nothing about the schedule changes.
@@ -10517,7 +10517,7 @@ index abe30af28..a59a1d0cf 100644
              buft == ggml_backend_dev_moe_host_master_buft(dev);
  
          if (host_master_mapped) {
-@@ -2327,6 +2346,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2368,6 +2387,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          }
      }
  
@@ -10543,7 +10543,7 @@ index abe30af28..a59a1d0cf 100644
      if (use_mmap_buffer) {
          for (auto & mapping : ml.mappings) {
              pimpl->mappings.emplace_back(std::move(mapping));
-@@ -2813,6 +2851,17 @@ size_t llama_model::max_host_expert_slice_bytes() const {
+@@ -2854,6 +2892,17 @@ size_t llama_model::max_host_expert_slice_bytes() const {
      return max_slice;
  }
  
@@ -10561,7 +10561,7 @@ index abe30af28..a59a1d0cf 100644
  uint64_t llama_model::n_elements() const {
      return pimpl->n_elements;
  }
-@@ -3313,6 +3362,85 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
+@@ -3354,6 +3403,85 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
      return layers[il].rope_short;
  }
  
@@ -10647,7 +10647,7 @@ index abe30af28..a59a1d0cf 100644
  llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
      llama_memory_i * res;
  
-@@ -3822,7 +3950,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3863,7 +3991,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
                              /* filter_recr       */ std::move(filter_recr),
@@ -10658,7 +10658,7 @@ index abe30af28..a59a1d0cf 100644
                      } else {
                          res = new llama_memory_hybrid(
                              /* model             */ *this,
-@@ -3842,7 +3972,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3883,7 +4013,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* offload           */ cparams.offload_kqv,
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
@@ -10669,7 +10669,7 @@ index abe30af28..a59a1d0cf 100644
                      }
                  } else {
                      llama_kv_cache::layer_filter_cb filter = nullptr;
-@@ -3922,6 +4054,69 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3963,6 +4095,69 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                      } else {
                          GGML_ASSERT(!hparams.is_swa_any());
  
@@ -10739,7 +10739,7 @@ index abe30af28..a59a1d0cf 100644
                          res = new llama_kv_cache(
                                  *this,
                                  params.no_alloc,
-@@ -3931,14 +4126,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3972,14 +4167,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                                  !cparams.flash_attn,
                                  cparams.offload_kqv,
                                  cparams.kv_unified,
@@ -10764,7 +10764,7 @@ index abe30af28..a59a1d0cf 100644
                      }
                  }
              }
-@@ -4592,6 +4793,10 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
+@@ -4633,6 +4834,10 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
      return model->hparams.n_expert;
  }
  
@@ -10776,10 +10776,10 @@ index abe30af28..a59a1d0cf 100644
      return (int32_t)model->devices.size();
  }
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 68e0a8b5f..a3a266fca 100644
+index 84e7a3683..0bbb1b585 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -1061,6 +1061,13 @@ struct llama_model {
+@@ -1064,6 +1064,13 @@ struct llama_model {
      // slot has to hold, and the split is not necessarily even (it is granularity-rounded).
      size_t max_host_expert_slice_bytes() const;
  

@@ -1,3 +1,77 @@
+## 261121.017 (r338) -- **RELEASE**: contributor PR #342 ships as an **OPT-IN** `-of tp-ffn-even` even FFN split in **block 09**, and `--optional-features`/`-of` becomes the discoverable spelling for an env-only switch -- the delivery default stays bit-identical
+
+**`release.json` changed: release `v17-919794500-r337` -> `-r338`, tip `ccd813376` -> `2f0d05010`, tree
+`d5961692a` -> `3d7017fbb`; base, block count and the release prefix do not move** (17 official blocks + the
+temporary `0300` = 18 default patches, base `919794500`).  **Block 09 is amended**; block 16 carries the
+regenerated documents (the last official block that touches `common/arg.cpp`).  Blocks 10-15 and `0300` change
+id only through their parents.  The optional `0100`/`0101` are re-cut against the new default tree (alone ->
+`73ca520d6` / `2c044aa09`, cumulative `4b6403362`), both apply **strictly**.  `scripts/validate-set.sh` green.  The recorded `.tip` is the **re-cut** tip
+(`fork-refresh.sh`'s output), not the working chain's: the fold was done by a rebase, whose amended commits
+carry wall-clock committer dates, so the working tip (`cea47c7e4`) had the same tree and a different id --
+AGENTS.md's tip trap (a), never recorded.
+
+### 1. The decision, and why it is not default-on
+
+PR #342 (`@briansp2020`, `wip/tp-ffn-even-r325/`) lowers the `-sm tensor` FFN split granularity from
+`lcm(blck_size,128)` toward `lcm(blck_size,64)` when the split-axis size divides evenly, so a 640-wide expert set
+at **two** devices splits **320/320** instead of **256/384**.  The mechanism, the 64 floor (MMB's `K % 64`), the
+fused gate/up loss on a non-128 slice (`ggml_cuda_mmq_needs_fallback`) and the arithmetic reach all verified.
+It reproduces here: **+7.1 % `draft-mtp` decode** and **+4.2 % prefill** on the 2-device Flash-Next host-expert
+shape (+9.1 % prefill on the IQ4_NL shape, ~+1.5 % on 3-device `gpt-oss-20B`).
+
+**The granularity is the reduction's grouping, so enabling it moves the logits of every shape it reaches**: on
+the delivery's own 2-device Flash-Next point mean KLD **0.013963 / 96.467 %** against the recorded base -- 2.8x
+the prefill-logit gate's limit (0.005 / 98 %).  It is a reordering and not a defect: the same point's
+`-ub 4096` vs `-ub 3840` **control** reads **0.015248 / 96.516 %**, and the change's PPL effect (+0.59 %) is half
+the control's (+1.21 %).  But "below the point's reorder floor" is not the gate's criterion, so the maintainer
+took the safe route: **opt-in**, default OFF, with the tag layer below.  The default path is consequently
+**bit-identical** (`gate-prefill-logits.sh` **-0.000000 / 100.000 %**, greed text `c420dfe04c42` unchanged).
+
+### 2. `--optional-features` / `-of` (new, `common/`)
+
+A feature that is off by default and reached only through an environment variable is invisible to a user who
+reads `--help` -- so the switch keeps working, and gains a name: `-of TAG[,TAG...]`, `-of list` to print the
+tags, an unknown tag refused **with** the list, and `LLAMA_ARG_OPTIONAL_FEATURES` as the arg's own env form.
+Every tag ENABLES (drop it to disable) and wins over a switch given at the same time.  The table in
+`common/common.cpp` (`common_optional_features()`) is the single place a tag exists, so the followup that gives a
+feature a first-class option deletes its row rather than adding a second mechanism (`TODO` #363).  First tag:
+**`tp-ffn-even`** -> `LLAMA_TP_FFN_EVEN=1`.
+
+### 3. Reach, enumerated from the GGUFs (not assumed to be one model)
+
+Fires for every Flash-Next quant **and its MTP drafts** at 2 devices (640 wide), `gpt-oss-20B-MXFP4_MOE` at 3
+(2880: 896/1024/960 -> 960x3), `gemma-4-26B-A4B` at 3-4 (2112/2816), `Inkling-2-Mini` at 2/4 (1152/2304).  **Inert**
+for every 3-GPU shape the delivery validates (35B-A3B 512-wide, 27B 17408, 4B/9B/122B, DeepSeek-V4, Gemma4
+12B/31B/E4B, Ripple, phi-4, Qwen3-Coder) and for Flash-Next at 3 and 4 devices.  So no 3-GPU reference of ours
+moves; the 2-device Flash-Next point does, and the enabled arm's text is a NEW per-device-count reference.
+
+### 4. Gates (r338 tree `3d7017fbb`, gfx1201 / ROCm 10.2)
+
+* `scripts/gate-ffn-even-split.sh` **new, PASS** (`MANIFESTS.md` 37): default inert, the tag reaches
+  `128 -> 64` / `320 / device`, the four spellings agree, `-of nope` refused and listed, `-of list` prints, the
+  3-device 512-wide arm untouched; `--perf` 66.0 -> 73.5 t/s (one interleaved pair; the 2-rep medians are
+  70.4 -> 75.4).
+* `gate-prefill-logits.sh` **PASS -0.000000 / 100.000 %** on the 2-device Flash-Next point (the promotion gate:
+  the default did not move).
+* `validate-set.sh` GREEN (18/18 fresh-tarball strict apply, both optional artifacts alone + cumulative, the
+  Windows portability lint over 515 added files); `check-gen-docs.sh` GREEN; no GPU faults in the journal or any
+  arm's log.
+* The control measurements that decided it: `pr342-ffn-even.kld` (+ `-control-ub3840`) and the 3-device points
+  `pr342-oss3.kld` / `pr342-gemma3.kld` under `~/.cache/rdna-boosts/gates/` (the `pr342-` prefix marks a scratch
+  point, not a delivery reference).
+
+### 5. What the contributor's report got wrong, and what it got right
+
+Right: the 256/384 split, the alternating heavy GPU, the +7 % draft-mtp decode, the fused-kernel trade-off, the
+64 floor, "the switch off is identical to stock".  Wrong or missing: the reach is **not** "Flash-Next on 2 GPUs"
+(`gpt-oss-20B` at 3 devices and gemma/Inkling fire too); their 4-GPU example ("960 wide on 4 GPUs") does **not**
+balance (240 % 64 != 0 -- the rule correctly refuses it); the 64 floor protects a path MMB does not actually take
+on the affected MoE shapes (`routed=0`); and the PR never states that the **default** would change numerics.
+Their "+24 % on 8 short prompts" did not reproduce here (+4.2 % on a 5.2 k prompt).
+
+Record: `benchmarks/2026-11-21-ffn-even-split.md`; `GREEDY-PURITY.md` §104; `INVARIANTS.md` r338;
+`patches/README.md` block 09; `ENVIRONMENT.md` §4 / §4.1; `TODO` #363.
+
 ## 261121.016 (r337) -- **RELEASE**: GitHub issue #347 -- the APU GTT arena MATERIALISED the whole expert set as a pageable copy, because the arena makes holes but no plan; the arena's hole set is now a hole set like any other
 
 **`release.json` changed: release `v17-919794500-r336` -> `-r337`, tip `fb97954bd` -> `ccd813376`, tree
