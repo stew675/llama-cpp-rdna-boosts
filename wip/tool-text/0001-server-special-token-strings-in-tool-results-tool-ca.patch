@@ -1,0 +1,433 @@
+From f8fe6b4cf4a761bcffda8907c51180b0bc47b507 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 01:41:38 +0800
+Subject: [PATCH] server: special-token strings in tool results, tool-call
+ arguments and assistant text stay text (LLAMA_SERVER_TOOL_TEXT, on unless 0)
+
+A tool result (a "tool" / "function" message) or the arguments of an assistant's tool call carry data from outside: a
+file, a web page, a database row, or text the model copied from one.  The rendered prompt was tokenized as one string
+with parse_special, so "<|im_end|>", "</tool_call>", "<tool_response>" or "<think>" in that data became the real tokens
+and could forge a turn, a tool call or a tool result (parse_special = false would not help: USER_DEFINED tokens such as
+Qwen's <think> and <tool_call> are matched either way).  An assistant's own text (content, content parts,
+reasoning_content) can carry such a string too: the model can copy one from a tool result as ordinary characters, and
+the client sends it back in the next request.
+
+- Protected strings: every CONTROL / UNKNOWN token's text, and the USER_DEFINED ones the chat template itself uses (the
+  rest are vocabulary, e.g. whitespace runs), listed once at load from the vocab and the template.  In assistant text
+  only the CONTROL / UNKNOWN ones (the turn boundaries): a real one never reaches the reply text unless --special is
+  given (and then assistant text is left alone), while a USER_DEFINED one such as <think> or <tool_call> can be a real
+  token the model generated.
+- Before the template is applied, each protected string there is wrapped in two marks (U+FDD0 / U+FDD1,
+  noncharacters; a client's copy is dropped).  After it, the prompt is tokenized as before except that each marked
+  string is ordinary text: cut after its first character and tokenized without special tokens.
+  The model reads the same characters; a request without such strings is tokenized exactly as before.
+- The marks are trusted only when they come through the template intact and, outside them, the prompt holds as many
+  protected strings as the same request rendered with the strings broken; otherwise, and for a multimodal prompt or a
+  vocab that is not byte-level BPE, the strings are broken with a space after their first character instead.
+- /apply-template shows such a prompt as its text.  LLAMA_SERVER_TOOL_TEXT=0 restores the previous behaviour;
+  LLAMA_SERVER_TOOL_TEXT_CENSUS=1 logs one line per request (mode, strings, tool results, tool calls, assistant replies,
+  prompt and special token counts).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/server/server-common.cpp  | 299 +++++++++++++++++++++++++++++++-
+ tools/server/server-common.h    |   8 +
+ tools/server/server-context.cpp |  30 +++-
+ 3 files changed, 334 insertions(+), 3 deletions(-)
+
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index eb5781e74..fd33013e1 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1484,6 +1484,258 @@ server_tokens tokenize_oai_content_array(const llama_vocab * vocab, mtmd_context
+     return process_mtmd_prompt(mctx, prompt, files, init_opt);
+ }
+ 
++//
++// Tool text: a tool result (a "tool" / "function" message) or the arguments of an assistant's tool call is data that
++// came from outside -- a file, a web page, a database row, or text the model copied from one.  A special-token string
++// in it ("<|im_end|>", "</tool_call>", "<think>", ...) must stay that text: as a token it would end the tool result and
++// forge a turn, a tool call or a tool result of its own.  Before the template is applied every protected string there
++// is wrapped in two marks; after it, the tokenizer takes the marked strings as ordinary text (split after their first
++// character, so that no piece holds a whole one) and the rest of the prompt as before.  An assistant's own text (content
++// and reasoning) can carry such a string too -- the model can copy one from a tool result as ordinary characters -- so
++// there the control-token strings (the turn boundaries) stay text as well; a real control token never reaches the reply
++// text unless --special is given, and then assistant text is left alone.  The model reads the same characters, and a
++// request without such strings is tokenized exactly as before.  Where the marks cannot reach the
++// tokenizer (a multimodal prompt, a vocab that is not byte-level BPE, a template that rewrote them) the strings are
++// broken with a space after their first character instead.  LLAMA_SERVER_TOOL_TEXT=0: off.
++// LLAMA_SERVER_TOOL_TEXT_CENSUS=1: one line per request.
++//
++
++// U+FDD0 / U+FDD1: Unicode noncharacters, never part of interchanged text (a client's copy is dropped)
++static const std::string TOOL_TEXT_OPEN  = "\xEF\xB7\x90";
++static const std::string TOOL_TEXT_CLOSE = "\xEF\xB7\x91";
++
++std::vector<std::string> server_tool_text_protected(const llama_vocab * vocab, const common_chat_templates * tmpls, bool control_only) {
++    const std::string src = common_chat_templates_source(tmpls, "") + "\n" + common_chat_templates_source(tmpls, "tool_use");
++    std::vector<std::string> out;
++    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
++    for (llama_token t = 0; t < n_vocab; ++t) {
++        const llama_token_attr attr = llama_vocab_get_attr(vocab, t);
++        const bool special = attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_UNKNOWN);
++        const bool user    = attr & LLAMA_TOKEN_ATTR_USER_DEFINED;
++        if (!special && (!user || control_only)) {
++            continue;
++        }
++        const char *      text = llama_vocab_get_text(vocab, t);
++        const std::string s    = text ? text : "";
++        if (s.find_first_not_of(" \t\r\n") == std::string::npos) {
++            continue; // empty or whitespace only
++        }
++        if (!special && src.find(s) == std::string::npos) {
++            continue; // a user-defined token the template does not use is vocabulary
++        }
++        out.push_back(s);
++    }
++    std::sort(out.begin(), out.end(), [](const std::string & a, const std::string & b) {
++        return a.size() != b.size() ? a.size() > b.size() : a < b;
++    });
++    out.erase(std::unique(out.begin(), out.end()), out.end());
++    return out;
++}
++
++// the protected strings by their first byte, longest first
++struct tool_text_matcher {
++    std::array<std::vector<const std::string *>, 256> by_first;
++
++    explicit tool_text_matcher(const std::vector<std::string> & prot) {
++        for (const auto & p : prot) {
++            by_first[(uint8_t) p[0]].push_back(&p);
++        }
++    }
++
++    // the length of the protected string at s[i], or 0
++    size_t at(const std::string & s, size_t i) const {
++        for (const std::string * p : by_first[(uint8_t) s[i]]) {
++            if (s.compare(i, p->size(), *p) == 0) {
++                return p->size();
++            }
++        }
++        return 0;
++    }
++};
++
++static size_t tool_text_char_len(const char c) {
++    const uint8_t b = (uint8_t) c;
++    return b < 0x80 ? 1 : (b >> 5) == 0x6 ? 2 : (b >> 4) == 0xE ? 3 : (b >> 3) == 0x1E ? 4 : 1;
++}
++
++static void tool_text_strip(std::string & s) {
++    for (const std::string * mark : { &TOOL_TEXT_OPEN, &TOOL_TEXT_CLOSE }) {
++        for (size_t pos = s.find(*mark); pos != std::string::npos; pos = s.find(*mark, pos)) {
++            s.erase(pos, mark->size());
++        }
++    }
++}
++
++enum tool_text_mode { TOOL_TEXT_COUNT, TOOL_TEXT_MARK, TOOL_TEXT_SPACE };
++
++// counts the protected strings in s and, unless counting, wraps each in the marks or breaks it with a space
++static size_t tool_text_apply(std::string & s, const tool_text_matcher & m, const tool_text_mode mode) {
++    size_t      n    = 0;
++    size_t      last = 0;
++    std::string out;
++    for (size_t i = 0; i < s.size();) {
++        const size_t len = m.at(s, i);
++        if (len == 0) {
++            ++i;
++            continue;
++        }
++        ++n;
++        if (mode != TOOL_TEXT_COUNT) {
++            out.append(s, last, i - last);
++            if (mode == TOOL_TEXT_MARK) {
++                out += TOOL_TEXT_OPEN;
++                out.append(s, i, len);
++                out += TOOL_TEXT_CLOSE;
++            } else {
++                const size_t c = std::min(tool_text_char_len(s[i]), len);
++                out.append(s, i, c);
++                out += ' ';
++                out.append(s, i + c, len - c);
++            }
++            last = i + len;
++        }
++        i += len;
++    }
++    if (mode != TOOL_TEXT_COUNT && n > 0) {
++        out.append(s, last, std::string::npos);
++        s = std::move(out);
++    }
++    return n;
++}
++
++struct tool_text_count {
++    size_t strings = 0; // protected strings found
++    size_t results = 0; // tool results that hold one
++    size_t args    = 0; // tool calls whose arguments hold one
++    size_t replies = 0; // assistant messages whose text holds a control-token string
++};
++
++// drops any client copy of the marks from every message and tool, then treats the tool results and tool-call arguments
++// (m: all protected strings) and the assistant text (mc: the control-token strings)
++static tool_text_count tool_text_inputs(common_chat_templates_inputs & inputs, const tool_text_matcher & m,
++                                        const tool_text_matcher & mc, const tool_text_mode mode) {
++    tool_text_count c;
++    for (auto & tool : inputs.tools) {
++        tool_text_strip(tool.name);
++        tool_text_strip(tool.description);
++        tool_text_strip(tool.parameters);
++    }
++    for (auto & msg : inputs.messages) {
++        tool_text_strip(msg.content);
++        tool_text_strip(msg.reasoning_content);
++        tool_text_strip(msg.tool_name);
++        tool_text_strip(msg.tool_call_id);
++        tool_text_strip(msg.extra_json);
++        for (auto & part : msg.content_parts) {
++            tool_text_strip(part.text);
++        }
++        for (auto & tc : msg.tool_calls) {
++            tool_text_strip(tc.name);
++            tool_text_strip(tc.arguments);
++            tool_text_strip(tc.id);
++        }
++        if (msg.role == "tool" || msg.role == "function") {
++            size_t k = tool_text_apply(msg.content, m, mode);
++            for (auto & part : msg.content_parts) {
++                k += tool_text_apply(part.text, m, mode);
++            }
++            c.strings += k;
++            c.results += k > 0;
++        } else if (msg.role == "assistant") {
++            size_t k = tool_text_apply(msg.content, mc, mode) + tool_text_apply(msg.reasoning_content, mc, mode);
++            for (auto & part : msg.content_parts) {
++                k += tool_text_apply(part.text, mc, mode);
++            }
++            c.strings += k;
++            c.replies += k > 0;
++            for (auto & tc : msg.tool_calls) {
++                const size_t k = tool_text_apply(tc.arguments, m, mode);
++                c.strings += k;
++                c.args    += k > 0;
++            }
++        }
++    }
++    return c;
++}
++
++// the protected strings in s
++static size_t tool_text_count_in(const std::string & s, const tool_text_matcher & m) {
++    size_t n = 0;
++    for (size_t i = 0; i < s.size();) {
++        const size_t len = m.at(s, i);
++        n += len > 0;
++        i += len > 0 ? len : 1;
++    }
++    return n;
++}
++
++// whether the marks came through the template: every OPEN is closed before the next mark, and outside the marked strings
++// the prompt holds as many protected strings as prompt_space, the same request rendered with the strings broken (that
++// is, the template's own special tokens) -- a template that escaped, split or dropped a mark fails one of the two
++static bool tool_text_marks_intact(const std::string & prompt, const tool_text_matcher & m, const std::string & prompt_space) {
++    size_t outside = 0;
++    for (size_t i = 0; i < prompt.size();) {
++        if (prompt.compare(i, TOOL_TEXT_OPEN.size(), TOOL_TEXT_OPEN) == 0) {
++            const size_t b = i + TOOL_TEXT_OPEN.size();
++            const size_t e = prompt.find(TOOL_TEXT_CLOSE, b);
++            if (e == std::string::npos || prompt.substr(b, e - b).find(TOOL_TEXT_OPEN) != std::string::npos) {
++                return false;
++            }
++            i = e + TOOL_TEXT_CLOSE.size();
++            continue;
++        }
++        if (prompt.compare(i, TOOL_TEXT_CLOSE.size(), TOOL_TEXT_CLOSE) == 0) {
++            return false; // a CLOSE without its OPEN
++        }
++        const size_t len = m.at(prompt, i);
++        outside += len > 0;
++        i       += len > 0 ? len : 1;
++    }
++    return outside == tool_text_count_in(prompt_space, m);
++}
++
++// s as ordinary text: cut after the first character of every protected string in it, so that no piece holds a whole
++// one, and tokenize the pieces without special tokens (parse_special = false still matches USER_DEFINED ones)
++static void tool_text_tokenize_plain(const llama_vocab * vocab, const std::string & s, const tool_text_matcher & m, llama_tokens & out) {
++    size_t last = 0;
++    for (size_t i = 0; i < s.size(); ++i) {
++        if (m.at(s, i) > 0) {
++            const size_t cut = i + tool_text_char_len(s[i]);
++            const auto   t   = common_tokenize(vocab, s.substr(last, cut - last), false, false);
++            out.insert(out.end(), t.begin(), t.end());
++            last = cut;
++            i    = cut - 1;
++        }
++    }
++    const auto t = common_tokenize(vocab, s.substr(last), false, false);
++    out.insert(out.end(), t.begin(), t.end());
++}
++
++// the marked prompt as common_tokenize(vocab, prompt, true, true) would tokenize it, except that each marked string is
++// ordinary text (a byte-level BPE vocab: a piece adds no prefix, so the pieces decode to the same characters)
++static llama_tokens tool_text_tokenize(const llama_vocab * vocab, const std::string & prompt, const tool_text_matcher & m) {
++    llama_tokens out;
++    if (llama_vocab_get_add_bos(vocab)) {
++        out.push_back(llama_vocab_bos(vocab));
++    }
++    for (size_t i = 0; i < prompt.size();) {
++        const size_t o = prompt.find(TOOL_TEXT_OPEN, i);
++        const auto   t = common_tokenize(vocab, prompt.substr(i, o == std::string::npos ? std::string::npos : o - i), false, true);
++        out.insert(out.end(), t.begin(), t.end());
++        if (o == std::string::npos) {
++            break;
++        }
++        const size_t b = o + TOOL_TEXT_OPEN.size();
++        const size_t e = prompt.find(TOOL_TEXT_CLOSE, b); // tool_text_marks_intact() checked the pairs
++        tool_text_tokenize_plain(vocab, prompt.substr(b, e - b), m, out);
++        i = e + TOOL_TEXT_CLOSE.size();
++    }
++    if (llama_vocab_get_add_eos(vocab)) {
++        out.push_back(llama_vocab_eos(vocab));
++    }
++    return out;
++}
++
+ // used by /chat/completions endpoint
+ json oaicompat_chat_params_parse(
+     const llama_vocab * vocab,
+@@ -1656,12 +1908,57 @@ json oaicompat_chat_params_parse(
+ 
+     inputs.force_pure_content = opt.force_pure_content;
+ 
++    // tool text (see above): count first, then mark (or break) only when there is something to protect
++    static const bool tool_text_on     = [] { const char * e = getenv("LLAMA_SERVER_TOOL_TEXT"); return e == nullptr || atoi(e) != 0; }();
++    static const bool tool_text_census = [] { const char * e = getenv("LLAMA_SERVER_TOOL_TEXT_CENSUS"); return e != nullptr && atoi(e) != 0; }();
++    const tool_text_matcher tt_match(opt.tool_text_protected);
++    const tool_text_matcher tt_control(opt.tool_text_control);
++    const tool_text_count   tt_count = tool_text_inputs(inputs, tt_match, tt_control, TOOL_TEXT_COUNT);
++    // the marks reach the tokenizer only with a text prompt and a byte-level BPE vocab (no prefix on a piece)
++    const bool tt_marks = vocab != nullptr && llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_BPE &&
++                          !opt.allow_image && !opt.allow_audio && !opt.allow_video;
++    const char * tt_mode = tt_count.strings == 0 ? "none" : !tool_text_on ? "off" : tt_marks ? "text" : "space";
++    common_chat_templates_inputs inputs_plain;
++    if (tt_count.strings > 0 && tool_text_on) {
++        if (tt_marks) {
++            inputs_plain = inputs; // for the fallback
++        }
++        tool_text_inputs(inputs, tt_match, tt_control, tt_marks ? TOOL_TEXT_MARK : TOOL_TEXT_SPACE);
++    }
++
+     // Apply chat template to the list of messages
+     common_chat_session_params session_params;
+     session_params.echo = json_value(body, "echo", false);
+     out_session = common_chat_session(opt.tmpls.get(), vocab, inputs, session_params);
+ 
+-    llama_params["prompt"] = out_session.prompt().str();
++    std::string prompt = out_session.prompt().str();
++    if (tt_count.strings > 0 && tool_text_on && tt_marks) {
++        // the same request with the strings broken: the template's own special tokens, and the fallback
++        tool_text_inputs(inputs_plain, tt_match, tt_control, TOOL_TEXT_SPACE);
++        common_chat_session session_space(opt.tmpls.get(), vocab, inputs_plain, session_params);
++        const std::string   prompt_space = session_space.prompt().str();
++        if (tool_text_marks_intact(prompt, tt_match, prompt_space)) {
++            llama_params["prompt"] = tool_text_tokenize(vocab, prompt, tt_match);
++        } else {
++            // the template rewrote a mark (e.g. a tojson that escapes it): keep the strings broken instead
++            tt_mode     = "space (the template changed the marks)";
++            out_session = std::move(session_space);
++            prompt      = prompt_space;
++            llama_params["prompt"] = prompt;
++        }
++    } else {
++        llama_params["prompt"] = prompt;
++    }
++    if (tool_text_census && vocab != nullptr) {
++        const llama_tokens toks = llama_params.at("prompt").is_array() ? llama_params.at("prompt").get<llama_tokens>()
++                                                                       : common_tokenize(vocab, prompt, true, true);
++        size_t n_special = 0;
++        for (const llama_token t : toks) {
++            n_special += (llama_vocab_get_attr(vocab, t) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_UNKNOWN | LLAMA_TOKEN_ATTR_USER_DEFINED)) != 0;
++        }
++        SRV_INF("tool_text: mode=%s strings=%zu tool_results=%zu tool_args=%zu replies=%zu prompt_tokens=%zu special_tokens=%zu\n",
++                tt_mode, tt_count.strings, tt_count.results, tt_count.args, tt_count.replies, toks.size(), n_special);
++    }
+ 
+     // Reasoning budget: pass parameters through to sampling layer
+     {
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 911bb31d7..ce6c588c6 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -393,8 +393,16 @@ struct server_chat_params {
+     std::string media_path;
+     bool media_allow_private_urls = false;
+     bool force_pure_content = false;
++    std::vector<std::string> tool_text_protected; // server_tool_text_protected(), longest first
++    std::vector<std::string> tool_text_control;   // the CONTROL / UNKNOWN ones, for assistant text (empty with --special)
+ };
+ 
++// The special-token texts that a tool result or a tool call's arguments must not turn into tokens: every CONTROL and
++// UNKNOWN token, and the USER_DEFINED tokens the chat template itself uses (the rest are vocabulary, e.g. whitespace
++// runs); with control_only, only the CONTROL and UNKNOWN ones (for assistant text).  oaicompat_chat_params_parse()
++// keeps them as ordinary text there (LLAMA_SERVER_TOOL_TEXT=0: off).
++std::vector<std::string> server_tool_text_protected(const llama_vocab * vocab, const common_chat_templates * tmpls, bool control_only);
++
+ // used by /completions endpoint
+ json oaicompat_completion_params_parse(const json & body);
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 60d3feec3..a7ffe9cf1 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2075,9 +2075,22 @@ private:
+                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
+                 /* media_path            */ params_base.media_path,
+                 /* media_allow_private   */ params_base.media_allow_private_urls,
+-                /* force_pure_content    */ params_base.force_pure_content_parser
++                /* force_pure_content    */ params_base.force_pure_content_parser,
++                /* tool_text_protected   */ {},
++                /* tool_text_control     */ {}
+             };
+ 
++            // the special-token strings kept as text in tool results and tool-call arguments, and the control-token
++            // strings kept as text in assistant text unless --special puts real ones there (oaicompat_chat_params_parse)
++            chat_params.tool_text_protected = server_tool_text_protected(vocab, chat_params.tmpls.get(), false);
++            if (!params_base.special) {
++                chat_params.tool_text_control = server_tool_text_protected(vocab, chat_params.tmpls.get(), true);
++            }
++            SRV_INF("tool text: %zu special-token strings are kept as text in tool results and tool-call arguments, "
++                    "%zu in assistant text%s\n",
++                    chat_params.tool_text_protected.size(), chat_params.tool_text_control.size(),
++                    [] { const char * e = getenv("LLAMA_SERVER_TOOL_TEXT"); return e == nullptr || atoi(e) != 0; }() ? "" : " (off: LLAMA_SERVER_TOOL_TEXT=0)");
++
+             {
+                 auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
+                 auto it = params_base.default_template_kwargs.find("preserve_reasoning");
+@@ -7082,7 +7095,20 @@ void server_routes::init_routes() {
+             meta->chat_params,
+             files,
+             session);
+-        res->ok({{ "prompt", std::move(data.at("prompt")) }});
++        // a prompt with tool text kept as text comes back as tokens: show it as the text it is, without the BOS / EOS the
++        // tokenizer added (the rendered text never holds them)
++        json & prompt = data.at("prompt");
++        if (prompt.is_array()) {
++            llama_tokens toks = prompt.get<llama_tokens>();
++            if (!toks.empty() && llama_vocab_get_add_eos(ctx_server.vocab) && toks.back() == llama_vocab_eos(ctx_server.vocab)) {
++                toks.pop_back();
++            }
++            if (!toks.empty() && llama_vocab_get_add_bos(ctx_server.vocab) && toks.front() == llama_vocab_bos(ctx_server.vocab)) {
++                toks.erase(toks.begin());
++            }
++            prompt = common_detokenize(ctx_server.vocab, toks, true);
++        }
++        res->ok({{ "prompt", std::move(prompt) }});
+         return res;
+     };
+ 
+-- 
+2.43.0
+
