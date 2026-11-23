@@ -412,6 +412,17 @@ cmake --build build -j
 > **Do not use `git apply` on the concatenated 1-11 series** — it silently
 > drops hunks (30 files / 2483 lines vs the correct 35 / 6094, verified
 > 2026-08-29). `git am` (or `scripts/apply-all.sh`) is the required flow.
+>
+> **Every HIP configuration builds, including the stock one.**  `GGML_HIP_NO_VMM` defaults to **ON** upstream,
+> so a plain `-DGGML_HIP=ON` build is the *no-VMM* configuration, not the one this repo develops on.  r347-r350
+> shipped a no-VMM link break (`undefined reference to ggml_cuda_pool_peer_copy_ok` in every executable, which a
+> shared library is allowed to hide and lld tolerates --
+> [issue #353](https://github.com/stew675/llama-cpp-rdna-boosts/issues/353)); **r351** fixes it, and that
+> configuration is now built and run on every release, checked by `scripts/check-shlib-symbols.sh` (`ldd -r` over
+> every shipped library, `MANIFESTS.md` gate 40).  The switch selects the per-context allocation **pool** only:
+> the movable-boundary slab and the host-expert tiers use the driver's VMM calls directly and are reached in both
+> configurations -- measured on 35B-A3B `-ncmoe 48` / 1 GPU, the two builds print an identical slab and
+> host-pool census and read the same pinned text (`47 chars sha=49bf8044ec4b`, 2/2 each).
 
 ### Windows: use the ROCm (TheRock) HIP runtime, not the display driver's
 

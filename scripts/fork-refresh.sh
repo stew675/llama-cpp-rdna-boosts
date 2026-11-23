@@ -17,7 +17,8 @@
 #      `n_default`, and reports the tip (`apply-all.sh` pins the committer identity and date,
 #      so the tip is reproducible).  The branch is the DEFAULT tree only: the temporary 0300 is
 #      in it, the optional 01xx artifacts are not.
-#   4. with --build, builds the branch; with --gates, runs the coherence + prefill-logit gates
+#   4. with --build, builds the branch; with --gates, runs the shared-library symbol check (issue #353,
+#      `check-shlib-symbols.sh`) plus the coherence and prefill-logit gates
 #   5. with --push, force-with-lease pushes to the PERSONAL FORK ONLY (the url is checked
 #      against an allow-list; there is no code path that pushes anywhere else)
 #
@@ -27,6 +28,7 @@
 # Environment:
 #   LLAMA_REPO   checkout to re-cut in        (default $HOME/llama.cpp)
 #   BUILD_CMD    build command for --build    (default $HOME/bin/build-llama-rocm)
+#   SHLIB_DIR    --gates: the build's bin/ dir (default $LLAMA/build-rocm; `skip` opts out)
 #   ALLOW_REMOTE allowed push target          (default git@github.com:stew675/llama.cpp.git)
 #
 # Exit: 0 ok, 1 a check failed, 2 usage/prerequisite error.
@@ -126,6 +128,15 @@ if [ "$DO_BUILD" -eq 1 ]; then
     ( cd "$LLAMA" && "$BUILD_CMD" )
 fi
 if [ "$DO_GATES" -eq 1 ]; then
+    # Unresolved symbols in a shipped library FIRST (issue #353, MANIFESTS gate 40): a `.so` may carry an
+    # undefined symbol, the failure lands in a CONSUMER's executable link, and lld (this box) does not refuse
+    # what GNU ld.bfd does -- so a green build is not the evidence.  Seconds, and it is the only step between
+    # "the library target built" and "a user can link it".  SHLIB_DIR overrides the build dir (the default is
+    # BUILD_CMD's, $LLAMA/build-rocm); SHLIB_DIR=skip opts out.
+    if [ "${SHLIB_DIR:-}" != "skip" ]; then
+        echo "==> shared-library symbol check (${SHLIB_DIR:-$LLAMA/build-rocm})"
+        ( cd "$REPO_DIR" && ./scripts/check-shlib-symbols.sh "${SHLIB_DIR:-$LLAMA/build-rocm}" )
+    fi
     echo "==> coherence gate (same-seed greedy text)"
     HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" "$LLAMA/build-rocm/bin/llama-cli" \
         -m "${COHERENCE_MODEL:-/llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf}" \

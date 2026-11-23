@@ -1007,6 +1007,26 @@ in CI.  The model-level gates are manual:
     target-context read, the draft ingest's `arms_quiet` bracket, `spec_slot_reset()`, the speculative round in
     `decode_arm_loop`/`accept_draft_round`, or the arms+draft reserve sum (`common_draft_reserve_derive`).
 
+40. **A shipped shared library must RESOLVE its symbols, and a guard change owes the other configuration's
+    build** (r351, issues #353/#354) -- `scripts/check-shlib-symbols.sh`.  r347-r350 shipped a `libggml-hip.so`
+    carrying `U ggml_cuda_pool_peer_copy_ok`: the DEFINITION sat inside `#if defined(GGML_USE_VMM)`, its CALLER
+    (`ggml_cuda_peer_copy_ok()` in ggml-cuda-slab.cu, a backend-shared file) did not, and a `GGML_HIP_NO_VMM=ON`
+    build -- the HIP **default**, so every stock packager build -- linked the library and then failed every
+    executable that linked it (`ld.bfd: ... undefined reference to ggml_cuda_pool_peer_copy_ok`).  Two facts kept
+    the ladder blind and are why this is an instrument, not a habit: a **shared library is allowed to carry
+    undefined symbols** (the failure lands in the consumer's link, and `cmake --build` reported the library target
+    as built -- the stale executables were simply not relinked), and **which linker refuses differs** -- GNU
+    ld.bfd checks a shlib's undefined symbols by default, lld (what ROCm's clang drives on this box) does not, so
+    the same no-VMM build links clean here and fails on the reporter's `x86_64-linux-gnu-ld.bfd`.  The check runs
+    `ldd -r` -- the loader's own relocation report, linker-independent -- over every shipped library in
+    `<build>/bin` and FAILS on any `undefined symbol:` or `not found`.  Negative-tested on the tree before the fix
+    (it names the symbol on the no-VMM build, whose default-VMM sibling is clean) and green on every library of
+    both builds after it.  A **guard** change (`#if defined(GGML_USE_VMM)`, a backend/config `#if`) still owes a
+    build of the OTHER configuration: a caller and its definition both behind the same `#if` compile out
+    together, and neither this check nor any single build can see that.  Required after the release's `all`
+    build, and for any change to a conditional-compilation guard, a function a header declares for every
+    configuration, or a header-shared API.
+
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 
 ## Verification per block

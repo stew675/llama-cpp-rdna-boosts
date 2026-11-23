@@ -1,3 +1,91 @@
+## 261123.001 (r351, BLOCK-17 AMENDMENT 4: cut, validated, committed and tagged) -- two user reports on block 17's plumbing: a `.so` that links with a symbol nobody defines (#353) and two fallbacks that call themselves (#354), plus the symbol check the first one earned
+
+Two reports against block 17's crash-#373 work (#373, r347).  Neither is reachable in a configuration this repo
+validates, both are real for a consumer, and both ship **inside block 17** (same block, no renumbering, no new
+block — the maintainer's decision).
+
+### 1. #353 — `ggml_cuda_pool_peer_copy_ok`: defined behind a guard, called without it
+
+`ggml_cuda_pool_peer_copy_ok()` was added to `ggml-cuda-vmm.h` (declared for every configuration) and DEFINED in
+`ggml-cuda.cu` inside `#if defined(GGML_USE_VMM)`; `ggml_cuda_peer_copy_ok()` in `ggml-cuda-slab.cu` — a
+backend-shared file, so the call is in **every** configuration — calls it unconditionally.  `GGML_USE_VMM` is off
+when `GGML_HIP_NO_VMM` is set, and that option's CMake default is **ON**, i.e. the stock `-DGGML_HIP=ON` build
+every packager and user makes.  So r347..r350 shipped a `libggml-hip.so` that linked (a shared library is allowed
+to carry undefined symbols) and then broke every executable linking it:
+
+```
+ld.bfd: ../bin/libggml-hip.so.1.0.0: undefined reference to `ggml_cuda_pool_peer_copy_ok(void const*, unsigned long)'
+```
+
+Ryan He reproduced it on gfx1103 / ROCm 7.16 / GCC 15.2 at `v18-919794500-r349` and diagnosed it correctly; the
+same break existed on the NVIDIA `GGML_CUDA_NO_VMM=ON` path.
+
+**Why the ladder was green — two reasons, and both are traps.**  (a) This repo's own build is
+`-DGGML_HIP_NO_VMM=OFF` (`~/bin/build-llama-rocm`), which compiles the VMM definition.  (b) Even reproduced, the
+default-VMM/no-VMM pair does not fail here: **which linker refuses differs**.  Measured on the pre-fix tree, both
+arms of one `GGML_HIP_NO_VMM=ON` build: `nm -DC libggml-hip.so` reads `U ggml_cuda_pool_peer_copy_ok`,
+`clang -fuse-ld=bfd` on a two-line `int main()` against it fails with the reporter's exact message, and the same
+link with the default linker (lld, which ROCm's clang drives) **succeeds** — and `cmake --build` of the whole set
+returned 0, because the library target was relinked and the executables were simply up to date.  So a green
+`all` build here is not evidence that a consumer's link works.
+
+**Fix** (the reporter's, which is the right one): without VMM there is no pool, so no pool range can hold a
+peer-copy destination and the pool half answers "fine" — the same answer the slab already gives for a destination
+outside every range.  The definition is now unconditional (the VMM arm keeps its real one).
+
+**The instrument it earned** — `scripts/check-shlib-symbols.sh` (`MANIFESTS.md` **gate 40**): `ldd -r`, the
+loader's own relocation report and therefore linker-independent, over every shipped library in `<build>/bin`,
+failing on any `undefined symbol:` / `not found`.  Negative control on the pre-fix tree: it names
+`_Z27ggml_cuda_pool_peer_copy_okPKvm` in `libggml-hip.so` and in every library that links it (the default-VMM
+build of the same tree is clean), exit 1; after the fix both builds are clean, exit 0.  It cannot see a
+SYMMETRIC guard (caller and definition both behind the same `#if` compile out together), which is why a guard
+change still owes a build of the other configuration — stated in the gate entry.
+
+### 2. #354 — `ggml_cuda_host_stream()`'s fallbacks returned themselves
+
+Both "never expected" arms of the per-thread host stream (an out-of-range device id, a failed
+`cudaStreamCreateWithFlags`) returned `ggml_cuda_host_stream()`, i.e. recursion until the stack overflows, while
+the comment promised "keep the old behaviour".  The old behaviour is `cudaStreamPerThread` (what every caller
+used before #373), and that is what they return now; the failed-create arm also **caches** the sentinel
+(`streams[device] = cudaStreamPerThread`) so a broken stream create is not retried on every host copy.  Brian
+noted it by reading, never hit it, and offered to test — nothing to test beyond the build, so the reply says so.
+
+### 3. Re-cut and verification
+
+Re-cut: `release.json` base `919794500`, tip **`4872868ef`**, tree
+**`8851b0d02b74060f462088617e8a7ff328c8c5ed`**, optional_tree `91f52b417643df489dcba548894b5a394ad1dc8f`; both
+optional artifacts re-cut onto the new default tree (`0100` -> `7934579…`, `0101` -> `e80a98cb…`) because their
+produced trees move with it.  Block 17's patch carries both fixes; `0300` is only re-cut (offset shift).
+
+* `scripts/validate-set.sh` **GREEN** — checksums, fresh-tarball strict apply of all 19 default patches, both
+  optional artifacts alone and cumulative, the conflict-marker/subject scan, the Windows path + portability
+  lints, the system-header check and the file-set reconciliation against the previous release tag (**0
+  unexplained**: 21 blocks / 571 files / 174 defines / 587 envs / 17 options, all unchanged).
+* **Whole-set `all` build** of the applied tip (`~/bin/build-llama-rocm`, VMM **ON**): clean.
+* **`GGML_HIP_NO_VMM=ON` whole-set build** (`BUILD_DIR=build-rocm-novmm`): clean, and it **runs** — the 4B
+  coherence arm reads the same text as the default build (`111 chars sha=7e6229b260f6`), which is the arm the
+  reporter's configuration could not reach at all.  The switch is the per-context *pool* only: on 35B-A3B
+  `-ncmoe 48` / 1 GPU the two builds print an **identical** slab + host-pool census (28.00 GiB slab, 27412.5 MiB
+  arena = 84.0 % residency, 256/256 slots = a MIRROR) and, with the host-expert text pins (`MOE_EXPERT_HEATMAP=load`,
+  `ROCBLAS_USE_HIPBLASLT=0` — the shape is not text-stable without them, and unpinned the two builds read 5463 vs
+  5460 chars), the same text `47 chars sha=49bf8044ec4b` 2/2 each.  So the no-VMM build is not a degraded class.
+* `scripts/check-shlib-symbols.sh`: FAIL on the pre-fix tree (names the symbol), PASS on both post-fix builds.
+* **Prefill-logit KLD** (27B Q8_0, 40 x 512 wikitext, ROCm 10.2 base): **0.000000 / 100.000 %**, GPU-fault scan
+  clean.
+* **Same-seed greedy coherence** (4B Q8_0, 1 GPU, `-sm tensor`): `111 chars sha=7e6229b260f6` **identical to the
+  r350 build's** (recorded before rebuilding, so the two arms are two different binaries).
+
+Not re-run, and why: **MTP Protocol A** and the batched-bench pair — the change is a link-time definition and two
+unreachable fallbacks; no decode path, no fusion, no prefill kernel and no default-visible code differs, and the
+KLD point above is the numerics verdict.  **Gate 39 / gate-17 arms** likewise: the pair's code is untouched in
+both builds (the only edited lines are the ones the recursion replaced).  **Gate 40 is now part of the release
+gates**, so the next release runs it by default.
+
+Record: `INVARIANTS.md` r351, `patches/README.md` block 17, `MANIFESTS.md` gate 40, `scripts/README.md`,
+`scripts/check-shlib-symbols.sh`, issues #353/#354 (closed on the reports).
+
+---
+
 ## 261122.040 (r350, BLOCK-17 AMENDMENT 3: cut, validated, committed and tagged) -- `TODO` #364: a SPECULATOR on the two-arm server, three-way text-pure, and the placement trap the first gate version fell into
 
 **`#364` is retired.**  Block 17 refused `--spec-type` (`auto` fell back to the single-context server and ran MTP,

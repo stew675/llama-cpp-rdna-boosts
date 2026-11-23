@@ -2249,3 +2249,47 @@ Record: `WORKLOG.md` 261122.039, `scripts/check-windows-portability.sh`, `script
 
 Record: `WORKLOG.md` 261122.040, `scripts/gate-arms-spec.sh`, `MANIFESTS.md` gate 39, `patches/README.md`
 block 17, `ENVIRONMENT.md` §23, `GREEDY-PURITY.md` §107.
+
+## r351 (2026-11-23, `WORKLOG.md` 261123.001) — a shared library LINKS with a symbol nobody defines, and which linker refuses differs: a guarded DEFINITION with an unguarded CALLER is a consumer-side break no build here sees (block 17 amendment 3, issues #353/#354)
+
+1. **A `.so` may carry undefined symbols, so "the library target built" is not a link proof.**  r347's crash-#373
+   work added `ggml_cuda_pool_peer_copy_ok()` to `ggml-cuda-vmm.h`, DEFINED it inside
+   `#if defined(GGML_USE_VMM)` in `ggml-cuda.cu`, and called it unconditionally from `ggml_cuda_peer_copy_ok()`
+   in `ggml-cuda-slab.cu` (a backend-shared file, so the call is in every configuration).  `GGML_USE_VMM` is off
+   for `GGML_HIP_NO_VMM=ON` — the HIP **default** — so from r347 to r350 a stock `-DGGML_HIP=ON` build produced a
+   `libggml-hip.so` that linked (a shared library is allowed to carry undefined symbols) and then failed every
+   executable linking it: `ld.bfd: libggml-hip.so.1.0.0: undefined reference to ggml_cuda_pool_peer_copy_ok`
+   (issue #353, gfx1103 / ROCm 7.16 / GCC 15.2; `test-backend-ops`, `test-sleep`, ... all of them).  The same
+   break existed on the NVIDIA `GGML_CUDA_NO_VMM=ON` path.  The fix is the reporter's: a no-VMM definition that
+   answers "fine" (no pool, so no pool range can hold the destination — the answer the slab already gives for a
+   destination outside every range), defined unconditionally instead of inside the VMM arm.
+2. **WHICH LINKER refuses is a property of the box, and ours does not refuse.**  GNU ld.bfd checks a shared
+   library's undefined symbols by default; lld (what ROCm's clang drives here) does **not**.  Measured on the
+   pre-fix tree, both arms of one no-VMM build: `nm -DC libggml-hip.so` reads `U ggml_cuda_pool_peer_copy_ok`,
+   `clang -fuse-ld=bfd` on a `int main()` against it FAILS with the reporter's exact message, and the same link
+   with the default (lld) **succeeds** — and `cmake --build` of the whole set returned 0 because the library
+   target was simply relinked (the executables were up to date).  So a green ladder on this box is not evidence
+   that a consumer's link works, and the class needs the loader's own report: `scripts/check-shlib-symbols.sh`
+   runs `ldd -r` (linker-independent) over every shipped library and fails on any `undefined symbol:`.  After
+   the fix every library in both builds (default VMM and no-VMM) resolves every symbol; the same check names the
+   symbol on the pre-fix tree (the negative control).
+3. **A guard that is ASYMMETRIC is a link break; a guard that is symmetric is invisible to any build.**  The
+   caller here was unconditional, which is why one configuration's build (and `ldd -r`) sees it.  A caller and a
+   definition both behind the same `#if` compile out together and no build of either configuration can notice:
+   that class still owes a build of the OTHER configuration whenever a guard, a header-declared API or a
+   configuration predicate changes (`MANIFESTS.md` gate 40).
+4. **A "never expected" fallback that returns the function it is in is a stack overflow, not a fallback.**  Both
+   of `ggml_cuda_host_stream()`'s fallbacks (an out-of-range device id, a failed `cudaStreamCreateWithFlags`)
+   returned `ggml_cuda_host_stream()` — the pre-r347 behaviour they meant to keep is `cudaStreamPerThread`, and
+   the comment even said so (issue #354).  They now return the sentinel directly, and the failed-create arm
+   CACHES it (`streams[device] = cudaStreamPerThread`) because a failed stream create is not transient: retrying
+   it on every host copy costs more than the stream it replaces.
+5. **Both r351 changes are unreachable in a default run, which is why the numbers are identical.**  The no-VMM
+   definition is not compiled in the delivery's own build (`GGML_HIP_NO_VMM=OFF`), and the fallback streams are
+   only reached where the old code recursed.  Measured: prefill-logit **mean KLD 0.000000 / same-top-p 100.000 %**
+   against the recorded 10.2 base, same-seed greedy text unchanged (`111 chars sha=7e6229b260f6` before and
+   after), and the no-VMM build reads the same text as the default build — so the fix can be judged on its own
+   terms (link + symbol) rather than against a moving number.
+
+Record: `WORKLOG.md` 261123.001, `scripts/check-shlib-symbols.sh`, `MANIFESTS.md` gate 40, `patches/README.md`
+block 17.

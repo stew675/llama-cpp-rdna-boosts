@@ -6546,6 +6546,33 @@ reuses.  Gate scripts:
 `archive/work/prefill-decode-arms/runs/coverage-matrix/matrix.sh`, `.../host-tier-single-gpu/verify-postfix.sh`,
 `arms/gate-server-arms.sh` and `arms/gate-server-reuse.sh`.
 
+### The two wiring defects a user found (r351, issues #353/#354)
+
+Both are in the crash-#373 plumbing this block added, neither is reachable in a validated configuration, and both
+ship HERE rather than in a new block (same block, no renumbering — the maintainer's decision):
+
+* **#353** — `ggml_cuda_pool_peer_copy_ok()` was declared in `ggml-cuda-vmm.h` and called unconditionally from
+  `ggml_cuda_peer_copy_ok()` (`ggml-cuda-slab.cu`, backend-shared), but **defined** only inside
+  `#if defined(GGML_USE_VMM)`.  `GGML_USE_VMM` is off for `GGML_HIP_NO_VMM=ON` — the HIP **default** — so a
+  stock build linked `libggml-hip.so` (a shared library may carry undefined symbols) and then failed every
+  executable that linked it (`undefined reference to ggml_cuda_pool_peer_copy_ok`; the reporter's
+  `v18-919794500-r349` on gfx1103/ROCm 7.16, so `test-backend-ops`, `test-sleep`, …).  This repo's build sets
+  `GGML_HIP_NO_VMM=OFF`, and lld (ROCm clang's linker here) tolerates a shlib's undefined symbols where the
+  reporter's `ld.bfd` refuses them, which is why the ladder was green.  The fix: without VMM there is no pool, so
+  no pool range can hold the destination and the answer is `true` (the answer the slab already gives for a
+  destination outside every range) — now defined unconditionally, outside the VMM arm.  The NVIDIA
+  `GGML_CUDA_NO_VMM=ON` build had the identical break.  Instrument:
+  [`../scripts/check-shlib-symbols.sh`](../scripts/check-shlib-symbols.sh) (`ldd -r`, `MANIFESTS.md` gate 40).
+* **#354** — both "never expected" fallbacks in `ggml_cuda_host_stream()` returned `ggml_cuda_host_stream()`, i.e.
+  unbounded recursion instead of the pre-#373 behaviour the comment promised.  They return `cudaStreamPerThread`
+  directly now, and the failed-`cudaStreamCreateWithFlags` arm **caches** it (a failed create is not transient;
+  retrying it per host copy costs more than the fallback).
+
+Verified: prefill-logit **0.000000 / 100.000 %** against the recorded 10.2 base; same-seed greedy text unchanged
+(`111 chars sha=7e6229b260f6`); a `GGML_HIP_NO_VMM=ON` whole-set build links **and runs** the same text as the
+default build; `check-shlib-symbols.sh` green on both builds and naming the symbol on the pre-fix tree;
+`validate-set.sh` GREEN.  `INVARIANTS.md` r351, `WORKLOG.md` 261123.001.
+
 ---
 
 ## Block 0300 — `-sm relaxed-tensor` for the MoE amax arches (**TEMPORARY**, expect removal)
