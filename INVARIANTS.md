@@ -2725,3 +2725,25 @@ r363-wip item 1, whose diagnosis was wrong.
    `compute buffer size ... does not match expectation` on the 4B `--concurrent` shape; it is present on the
    pre-change build too (verified by stashing the change and re-running the A6 arm), so it must not be read as
    a regression of this step.
+
+## r365-wip (2026-11-23, `WORKLOG.md` 261123.018) -- the VRAM outside the slab is the slab's *growth fuel*, not spare capacity, so an auxiliary compute buffer must come out of the arena (`prefill-decode-arms` v2 STEP 7b)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 7b -- a measured NEGATIVE result; 7a's pinned region stands.
+
+1. **`GGML_CUDA_SLAB_HEADROOM_MIB` is load-bearing, and it is not interchangeable with arena.**  It is what
+   `slab_extend` maps the arena's physical FROM.  Spending it on anything fixed starves arena growth.  Measured
+   (35B-A3B Q8_0 `-ncmoe 40`, np 4, pair ON, headroom 1536): an aux compute buffer of 1280 MiB taken outside the
+   slab leaves ~256 MiB, the arena cannot grow, `alloc_table_locked: arena alloc failed` fires 42 times, the cache
+   disables those tables, and the run aborts inside a graph capture (`ROCm error: operation failed due to a
+   previous error during capture`).  The same 1280 MiB taken from the ARENA (a pinned aux region) passes with one
+   transient arena failure.  So: an auxiliary context's compute buffer is charged to the arena, deliberately.
+2. **`GGML_CUDA_SLAB_NARROW2=0` is not a working fallback on a slab-armed host-tier shape.**  It places the aux
+   buffer outside the slab -- the same wrong budget as item 1 -- and the control arm aborts identically with no
+   7b code in the tree.  It remains an A/B switch for the *draft* path on shapes where the cushion is not the
+   binding constraint, not a "quick fix".
+3. **A deferred owner reserve does not help.**  The slab is created inside `llama_context`'s constructor
+   (`sched_reserve()`, `src/llama-context.cpp`), so "allocate the aux buffer before the slab exists" means
+   postponing that reserve; the aux buffer would then be allocated from the same outside VRAM (the slab has not
+   taken it yet only if the slab is also smaller), i.e. the same budget as item 1.  The only variant that keeps
+   the arena intact is a bigger *reservation* (`GGML_CUDA_SLAB_RESERVE_MIB`), which shrinks the slab at creation --
+   the same arena loss.

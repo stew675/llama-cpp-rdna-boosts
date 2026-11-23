@@ -8,6 +8,37 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — STEP 7b: the aux compute buffer allocated **outside** the slab was measured and REJECTED (`WORKLOG.md` 261123.018)
+
+The maintainer's question — "wouldn't it be better to allocate these out of anonymous memory *before* the slab
+takes the VRAM?" — was implemented as a 3-file change (`aux_alloc` prefers `ggml_cuda_device_malloc` outside the
+slab and falls back to the pinned region) and measured.  **It fails, and the reason is structural, so the code was
+reverted and 7a (the pinned region) stands.**
+
+| arms (35B-A3B Q8_0 `-ncmoe 40`, np 4, 20 rounds) | aux buffer placement | result |
+|---|---|---|
+| 7a (shipped) | pinned region, **arena** -1.25 GiB | **PASS**, `1` `arena alloc failed` line, 0 errors |
+| 7b | ANONYMOUS, **outside cushion** -1.25 GiB | **ABORTS**: `compute buffer 1280.00 MiB ANONYMOUS (outside the slab)` at 7.6 s, then **42** `alloc_table_locked: arena alloc failed`, then `ROCm error: operation failed due to a previous error during capture` and `ggml_abort`; every request fails |
+| control: `GGML_CUDA_SLAB_NARROW2=0` (**no 7b code**, same placement — the delivery's old "quick fix") | ANONYMOUS | **identical abort** (42 `arena alloc failed`) — so this is a property of the placement, not of the 7b code |
+
+**Why.**  The VRAM outside the slab (`GGML_CUDA_SLAB_HEADROOM_MIB`, 1536 MiB here) is not spare capacity: it is
+what `slab_extend` **maps the arena's physical from**.  Spending 1280 MiB of it on a compute buffer leaves ~256
+MiB, so the arena cannot grow, tables cannot be allocated, the cache disables them — and with the pair's second
+graph in flight the run dies.  The arena and the outside cushion are therefore **not interchangeable**: 1.25 GiB
+costs the same VRAM either way, but only the arena route leaves the slab able to grow.
+
+**What this retires.**  The old `GGML_CUDA_SLAB_NARROW2=0` arm ("the session's quick fix") is not a working
+configuration on a slab-armed host-tier shape: it aborts, as the control shows.  And the deferred-owner-reserve
+route (owner's first reserve postponed until the aux contexts exist) would put the aux buffer in the same wrong
+budget, so it is not the way to get this either.
+
+**So the answer to the maintainer's question is: the idea is right about the *source* but the cushion is the wrong
+one.**  The aux buffer must come out of the arena (7a), and the only thing that could make "before the slab" work
+is a bigger *reservation* (not headroom) — i.e. `GGML_CUDA_SLAB_RESERVE_MIB` raised by the aux buffers, which
+shrinks the slab at creation and is therefore the same arena loss, one eviction earlier.
+
+---
+
 ## 2026-11-23 — STEP 7a (= TASK 1): the host-tier fault is the SLAB WORK ALIAS, and each extra context gets its own pinned region (`WORKLOG.md` 261123.017)
 
 12 files (+263/-227): `ggml-cuda-slab.cu` (the aux-region stack), the three iface/API renames, `llama-context.{h,cpp}`

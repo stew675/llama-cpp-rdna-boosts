@@ -146,6 +146,10 @@ fi
 # offset 0 -> HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION in the K rope's SET_ROWS).  A GPU-resident shape
 # never arms the slab, so the check does not apply there.
 if [ "$PAIR" = 1 ] && grep -qaE 'ggml_cuda_slab_init_locked: device [0-9]+: slab ' "$LOG"; then
+    # It must NOT be the work pool's shared narrow base.  A PINNED region is the only accepted answer: an
+    # anonymous allocation outside the slab was measured (STEP 7b, 2026-11-23) and REJECTED -- the outside
+    # cushion is the slab's growth fuel (`slab_extend` maps physical from it), so taking a 1280 MiB compute
+    # buffer from it starved the arena (42 `arena alloc failed` lines) and aborted the run.
     aux="$(grep -oE 'aux narrow-[0-9]+ \(borrowing-context compute\) pinned at' "$LOG" | tail -1)"
     hard "$([ -n "$aux" ] && echo 1 || echo 0)" \
         "the slab is armed and the decode arm's compute buffer got its OWN pinned region (${aux:-<absent>})"

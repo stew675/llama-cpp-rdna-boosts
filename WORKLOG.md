@@ -1,3 +1,42 @@
+## 261123.018 (no release; `prefill-decode-arms` v2 STEP 7b) -- **the VRAM outside the slab is its growth fuel, not spare capacity**: allocating an auxiliary compute buffer there aborts a host-tier run, so the arena route (7a) stands
+
+Asked whether the two auxiliary compute buffers should instead be allocated from **anonymous memory before the
+slab takes the VRAM**, this was implemented (3 files: `aux_alloc` prefers a plain `cudaMalloc` outside the slab and
+falls back to the pinned region) and measured.  **Rejected, with the mechanism identified** -- the code is
+reverted, nothing is left in the tree.
+
+### The measurement (35B-A3B Q8_0 `-ncmoe 40`, 1 GPU, np 4, 20 rounds, pair ON, headroom 1536 MiB)
+
+| arm | aux buffer placement | result |
+|---|---|---|
+| 7a (shipped) | pinned region: **arena** -1.25 GiB | **PASS**, 1 transient `arena alloc failed`, 0 request errors |
+| 7b | ANONYMOUS: **outside cushion** -1.25 GiB | **ABORTS**: `compute buffer 1280.00 MiB ANONYMOUS (outside the slab)` at 7.6 s, **42** `alloc_table_locked: arena alloc failed ... cache disabled for this table`, then `ROCm error: operation failed due to a previous error during capture` + `ggml_abort`; all 80 requests fail |
+| control: `GGML_CUDA_SLAB_NARROW2=0` (no 7b code, same placement -- the delivery's old "quick fix") | ANONYMOUS | **identical abort**, 42 `arena alloc failed` -- a property of the *placement*, not of the new code |
+
+### The mechanism
+
+`GGML_CUDA_SLAB_HEADROOM_MIB` is not a cushion of spare bytes: it is what **`slab_extend` maps the arena's
+physical from**.  Spending 1280 MiB of it on a compute buffer leaves ~256 MiB, so the arena cannot grow, expert
+tables cannot be allocated, the cache disables them -- and with the pair's second graph in flight the run dies in a
+graph capture.  **The arena and the outside cushion are not interchangeable**: 1.25 GiB costs the same VRAM either
+way, but only the arena route leaves the slab able to grow.
+
+### What it retires, and the answer to the question
+
+* `GGML_CUDA_SLAB_NARROW2=0` is **not a working configuration** on a slab-armed host-tier shape (the control
+  aborts).  It stays an A/B switch, not a quick fix.
+* The deferred-owner-reserve variant ("create the aux contexts before the owner's first reserve") lands in the same
+  budget -- the aux buffer would still come from outside the slab -- so it does not help either.  The only variant
+  that keeps the arena intact is a larger *reservation* (`GGML_CUDA_SLAB_RESERVE_MIB`), which shrinks the slab at
+  creation: the same arena loss, one eviction earlier.
+* **So the source is the arena, deliberately (STEP 7a).**  The 1.25 GiB measured earlier is the aux context's own
+  `sched_reserve` request rounded to the 64 MiB slab chunk (Gemma4's two aux regions are 0.50 GiB each), not a
+  constant; the pinned region is charged to the arena and its cost is one eviction at load.
+
+Records: `INVARIANTS.md` r365-wip, `RUNS.md` (STEP 7b section), `ENVIRONMENT.md`'s `GGML_CUDA_SLAB_HEADROOM_MIB`
+row annotated ("not interchangeable with arena"), `HANDOVER.md` §7 item 2 answered.  Code tree: back to the 7a
+commit, `git status` clean.
+
 ## 261123.017 (no release; `prefill-decode-arms` v2 STEP 7a = TASK 1) -- **the host-expert fault is a SLAB WORK ALIAS, not the MoE remap**: two contexts' compute buffers were the same memory, and each extra context now gets its own pinned region
 
 The previous landing (261123.016) recorded a GPU fault (`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`) for the

@@ -287,7 +287,9 @@ Every number of record is in `RUNS.md` (newest first) with its command and shape
 1. **`GGML_CUDA_SLAB_NARROW2` is not in `ENVIRONMENT.md`** — it is a delivery kill switch (default on) that
    predates this campaign, and STEP 7a now applies it to a borrowing context as well as a draft.  Add the row,
    or is the catalogue deliberately scoped to variables the delivery's own gates exercise?
-2. **The two pinned aux regions cost real VRAM** (1.25 GiB on the 35B-A3B shape, taken from the arena).  With
+2. **(ANSWERED 2026-11-23, STEP 7b: the "anonymous before the slab" placement was measured and ABORTS the
+   host-tier soak -- the outside cushion is the slab's growth fuel, so it is not interchangeable with arena.
+   The pinned region stands; `RUNS.md` has the three arms.)** **The two pinned aux regions cost real VRAM** (1.25 GiB on the 35B-A3B shape, taken from the arena).  With
    the pair and a drafter both live that is 2 × 1.25 GiB, and the delivery's `COMMON_ARMS_RESERVE_MIB` (256)
    accounts for only the measured *arena shrink* of one narrow context.  Should the pair's reserve grow to the
    measured pinned size at STEP 10, or is the eviction path (which handled it here) the accepted answer?
