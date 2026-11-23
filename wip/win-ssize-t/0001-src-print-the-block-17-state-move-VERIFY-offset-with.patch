@@ -1,0 +1,43 @@
+From a421ea88c22e43c686ddac3ddfb1419b790e855a Mon Sep 17 00:00:00 2001
+From: noctrex <35490284+noctrex@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 03:19:07 +0200
+Subject: [PATCH] src: print the block-17 state-move VERIFY offset with %lld
+ and a long long cast (block 17)
+
+Block 17's serialised state-move VERIFY in llama_context::state_seq_move
+logs the first differing byte as "first at %zd" with an (ssize_t) cast
+of the size_t offset.  ssize_t is a POSIX type: the MSVC/UCRT headers
+that clang++ uses under the Windows HIP SDK never declare it, and
+llama-context.cpp includes no header that would, so a Windows build of
+the llama library stops at llama-context.cpp with
+
+    error: use of undeclared identifier 'ssize_t'
+
+(the r346 build of ggml and ggml-hip completes; the failure is the first
+src/ target, [469/722] of the default ninja set).
+
+Cast to (long long) and print with %lld instead: the value is a byte
+offset that is never negative, and the (size_t)-1 'no difference'
+sentinel keeps printing as -1.  Identical output everywhere else.
+---
+ src/llama-context.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 2bdd675..57cdda0 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -7210,8 +7210,8 @@ bool llama_memory_seq_state_take(
+             }
+         }
+         LLAMA_LOG_INFO("%s: VERIFY seq %d: %zu of %zu byte(s) differ (%zu in the %zu-byte cell metadata), "
+-                "first at %zd; the source rows are %s\n",
+-                __func__, (int) seq_id, n_diff, size, n_diff_meta, meta_size, (ssize_t) first,
++                "first at %lld; the source rows are %s\n",
++                __func__, (int) seq_id, n_diff, size, n_diff_meta, meta_size, (long long) first,
+                 n_diff == 0 ? "FAITHFUL" : (n_diff == n_diff_meta ? "re-placed (metadata only)" : "NOT the source's state"));
+ 
+         if (n_diff > n_diff_meta) {
+-- 
+2.56.1.windows.1
+
