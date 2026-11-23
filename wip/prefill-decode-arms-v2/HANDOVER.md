@@ -81,9 +81,8 @@ nothing is copied between them.**  `llama_context_params::ctx_memory` is the onl
 * STEP 7 (speculator refused on the pair) is **in place** inside `common_arms_pair_possible()`
   (`params.speculative.has_aux()` → refuse); its re-admission is STEP 10.
 * STEPs 10-12: see §3.
-* **One verification gap this landing did not close:** the **draft** slot (0) was not exercised on a
-  *slab-armed* shape (§2.6).  Slot 0's code path is identical to slot 1's and it ran, but its *routing*
-  (`ctx_other` → slot 1) has no arm here.
+* **Both aux slots are covered** (draft slot 0 *and* borrowing slot 1), see §2.6 — the arm is an external MTP
+  head on a MoE target with `-ncmoe`.
 
 ---
 
@@ -158,15 +157,20 @@ every compute-buffer alloc/release with its base offset, which is what named thi
 * A1/A2/A3 unchanged, **A4 KLD 0.000000 / 100.000 %**, A5 K axis `a87c4318b649`, A6 startup shape 13 lines
   identical, `check-shlib-symbols.sh` OK.
 
-### 2.6 Not covered by an arm here (say so, do not wave it through)
+### 2.6 Both slots, and the arm that covers them
 
-The **draft** slot (0) never pinned on a slab-armed shape in this session: an embedded-MTP arm
-(`--spec-type draft-mtp-adaptive`) allocates no second compute buffer at all, and a `--spec-type draft-dflash2`
-arm on the 35B-A3B host tier is **not text-stable** run to run (two builds × two arms gave four different
-hashes at two fixed lengths — the host tier's expert residency picks the kernel set, `GREEDY-PURITY.md` §89).
-Slot 0's code path is identical to slot 1's and slot 1 ran every arm; its *routing* (`ctx_other` → slot 1) is
-what a future arm must confirm.  The natural arm is an external-head / gemma4-assistant drafter **with
-`-ncmoe`**, which the delivery's `gate-draft-ctx.sh` / `gate-mtp-dev-rows.sh` shapes do not currently do.
+Which arm reaches which slot, so the next session does not re-derive it:
+
+| shape | slot 0 (draft) | slot 1 (borrowing) |
+|---|---|---|
+| 35B-A3B Q8_0 `-ncmoe 40`, pair (the soak) | — | **pinned** (`aux narrow-3`) |
+| **Gemma4 26B-A4B Q8_0 `-ncmoe 20` + `-md mtp-gemma-4-26B-A4B-it.gguf`** | **pinned** (`aux narrow-2`, 0.50 GiB) | **pinned** (`aux narrow-3`, 0.50 GiB) |
+| 27B (dense, no slab) | n/a — no slab | n/a |
+| 35B-A3B + `--spec-type draft-mtp-adaptive` (embedded head) | no second compute buffer at all | — |
+| 35B-A3B + `--spec-type draft-dflash2` + `-md` | no second compute buffer; **and the text is not run-stable** (four runs, four hashes at two fixed lengths — the host tier's expert residency picks the kernel set, `GREEDY-PURITY.md` §89) | — |
+
+The Gemma4 arm is the oracle: `none` == `draft-mtp` == `481 chars sha=a195d3d6953c`, stable over three cold
+`none` runs, with both regions pinned in the one run.  Numbers in `RUNS.md`.
 
 ---
 

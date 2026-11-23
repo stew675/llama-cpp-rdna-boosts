@@ -79,9 +79,32 @@ the log are the boundary moves of a second view, not the cause.
   returns `reasoning_content` and an empty `content` (measured: pair ON 13-16 empty, pair OFF 20 empty, same
   shape, all on slot 0 = `reasoning.txt`).  Not a pair property, and not a failure.
 
+### The DRAFT slot (0), closed the same day — an external MTP head on a slab-armed shape
+
+The gap named below was closable immediately: a **separate MTP head GGUF** (`-md`, arch `gemma4-assistant`) on a
+**MoE target with host experts** has a draft context with `ctx_other` *and* an armed slab, and it exercises
+**both** aux slots in one run (the head's own context is the draft, and its target-side context borrows — the
+`ctx_memory` field the pair uses):
+
+```
+shape: Gemma4 26B-A4B Q8_0 (MoE) + mtp-gemma-4-26B-A4B-it.gguf, -ncmoe 20, 1 GPU, f16 KV, -c 8192
+  aux narrow-2 (draft compute)           pinned at [18.81, 19.31] GiB (0.50 GiB, unmapped VA spare)
+  aux narrow-3 (borrowing-context compute) pinned at [18.31, 19.31] GiB (0.50 GiB, taken from the arena (tables evicted))
+  -> the arena ceiling moves 17.94 -> 17.44 GiB; the two regions stack downward, in pin order
+```
+
+**Text (the four-axis purity rule, on a slab-armed shape):** `--spec-type none` and `--spec-type draft-mtp`
+read **byte-identical** — `481 chars sha=a195d3d6953c` — and `none` reproduced `a195d3d6953c` on three
+consecutive cold runs (`MOE_EXPERT_HEATMAP=load`, `ROCBLAS_USE_HIPBLASLT=0`, `--temp 0 --seed 42`), so this
+shape IS text-stable (unlike the DFlash2-on-35B-A3B arm below).  Wall: ~35 s per arm.
+
+**Both slots are therefore green:** slot 1 (the pair's decode arm) by the host-tier soak, slot 0 (a draft
+context) by this arm, and the two in one run by this arm as well.
+
 ### Not covered here (recorded as a gap)
 
-The **draft** slot (0) was not exercised on a slab-armed shape: an embedded-MTP arm (`--spec-type
+*(Superseded by the subsection above: the draft slot WAS exercised the same day.)*  The **draft** slot (0) was
+originally not exercised on a slab-armed shape: an embedded-MTP arm (`--spec-type
 draft-mtp-adaptive`) allocates no second compute buffer, and a `--spec-type draft-dflash2` arm on the 35B-A3B
 host tier ran (`none` == `draft-dflash2` at 1961/1839 chars, but the *text* is not run-stable there: two
 builds x two arms gave two different hashes per arm at identical lengths — the host tier's expert residency
