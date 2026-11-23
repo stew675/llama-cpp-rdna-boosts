@@ -2075,7 +2075,7 @@ The engineering facts, in the order they were learned:
 
 1. **The pair runs two `llama_process()` calls on structures that were never shared before, and every one of them
    had to be given a lock or an owner.**  Five, all reproduced before they were fixed
-   (`wip/prefill-decode-arms-followups/repro-373/`): the **KV cell map** (`apply()` and `init_batch()`'s rollback
+   (`archive/work/prefill-decode-arms-followups/repro-373/`): the **KV cell map** (`apply()` and `init_batch()`'s rollback
    snapshot — the qwen4exp `qwen4exp.cpp:1138` abort with the children ~1078 cells apart, and a libstdc++
    red-black-tree SIGSEGV inside `llama_kv_cache::prepare()`); the **Meta split-state cache** (per *buffer*, hence
    shared through the KV cache's buffer: the released build's SIGSEGV in `ggml-backend-meta.cpp`); the
@@ -2135,7 +2135,7 @@ The engineering facts, in the order they were learned:
    261122.014 had the `hipStreamCreateWithFlags` face of the same landmine).
 
 Record: `WORKLOG.md` 261122.036, `patches/README.md` block 17, `ENVIRONMENT.md` §23, `MANIFESTS.md` gates 17/17b,
-`wip/prefill-decode-arms-followups/` (§W2/§W9 + `repro-373/`).
+`archive/work/prefill-decode-arms-followups/` (§W2/§W9 + `repro-373/`).
 
 ## r348 (2026-11-22, `WORKLOG.md` 261122.038) — a cross-model `ctx_other` is a DRAFT, never a memory co-owner: block 17's generic arm threw on every separate MTP head (block 17 amendment, issue #351)
 

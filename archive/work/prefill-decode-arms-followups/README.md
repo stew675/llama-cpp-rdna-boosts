@@ -1,7 +1,19 @@
 # prefill-decode-arms follow-ups — what block 17 did NOT ship, and the next round of work
 
-**Status: OPEN (2026-11-22).**  Block 17 (the two-arm server) shipped in `v18-919794500-r346`, **default OFF / opt-in
-only**.  None of the work below is in `patches/`, none of it is applied by `scripts/apply-all.sh`, and none of it is
+> **RETIRED 2026-11-23 (the maintainer's decision).**  This record is **closed and superseded**.  Its plan of work
+> is replaced by **`wip/prefill-decode-arms-v2/`**, which is a clean-slate redesign of the two-arm server and is
+> **the only sanctioned source for that feature**.  Do **not** use this directory as a plan, a design, or a
+> reference for the v2 work: its memory model (a second context that *views* and *co-owns* the first context's
+> cells, plus a device-to-device handover of the recurrent state between two `llama_memory_recurrent` modules) is
+> the thing v2 deletes.  Every `TODO.md` row that pointed here was retracted on the same date.  Kept only as the
+> historical record of the r346-r352 block 17 work (`WORKLOG.md` 261123.005).
+>
+> The design review in this directory (`DESIGN-REVIEW-2026-11-23.md`) is likewise superseded by
+> `wip/prefill-decode-arms-v2/DESIGN.md`; it is kept because it is the reading that produced the v2 decision.
+
+**Status: RETIRED (was OPEN 2026-11-22).**  Block 17 (the two-arm server) shipped in `v18-919794500-r346`,
+**default OFF / opt-in only**, and was **withdrawn from the delivery at r352** into
+`beta/prefill-decode-arms/`.  None of the work below is in `patches/`, none of it is applied by `scripts/apply-all.sh`, and none of it is
 covered by a release gate until an item is promoted into a block **with the maintainer's approval**.
 
 **Where the delivered feature lives:** `patches/README.md` → block 17, `ENVIRONMENT.md` §23,

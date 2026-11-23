@@ -1,8 +1,14 @@
 # `prefill-decode-arms` — the two-arm server, WITHDRAWN from the delivery at r352 (BETA)
 
-**Status: beta / withdrawn.**  Block 17 was in the delivery from r346 to r351 and is **not in `patches/`**
-as of **r352**.  This directory carries it as one optional candidate so it can still be built, tested and
-improved without shipping it.
+> **FROZEN 2026-11-23.**  This artifact is kept as a **reproduction** of the r346-r351 code, not as a development
+> target and not as a design.  The feature's repair is **`wip/prefill-decode-arms-v2/`** (a clean-slate redesign
+> that deletes this memory model); do not patch this artifact to fix it, and do not read it as a design reference
+> except for the three backend fixes v2 ports deliberately (v2's `PLAN.md` STEP 1 names them).  Reading its
+> `--prefill-decode-arms` design and "hard-won rules" to guide v2 is exactly the failure mode v2 exists to avoid.
+
+**Status: beta / withdrawn / frozen.**  Block 17 was in the delivery from r346 to r351 and is **not in
+`patches/`** as of **r352**.  This directory carries it as one optional candidate so it can still be built and
+reproduced without shipping it.
 
 | what | value |
 |---|---|
@@ -307,8 +313,10 @@ effect and not a pair arithmetic difference (`LLAMA_KV_DEBUG_CELLS=1` names the 
 
 ### What it does NOT cover (state it, do not imply it)
 
-**All of the items below are work items in `wip/prefill-decode-arms-followups/`** (`TODO` #365-#372), which carries each
-one's design, acceptance oracles and risks.
+**All of the items below are RETIRED with this artifact** (2026-11-23): they were block-17 follow-ups, and the
+feature's repair is now the self-contained project `wip/prefill-decode-arms-v2/`, which does not carry them because
+it deletes the mechanism they were about.  The historical write-ups are in
+`archive/work/prefill-decode-arms-followups/` — reference only; do not plan from them.
 
 * A **recurrent-only** memory (a pure Mamba-class model): `llama_memory_seq_state_take()` refuses anything that
   is not a hybrid, and no such model exists on this box.

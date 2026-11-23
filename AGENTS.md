@@ -38,6 +38,10 @@ the purity rulebook.
   `gate-draft-ctx.sh`, `gate-arms-soak.sh`, `MANIFESTS.md` gate 17/39) are beta-only, not release gates.  The
   `v<N>` prefix is `v17-` because the official set is `0000`-`0016`.  Re-admitting it is the maintainer's
   decision (the usual "ALWAYS ask before creating a block" rule) and it needs a validated window first.
+  **The artifact is FROZEN as a code reproduction (2026-11-23), and its repair is the standalone project
+  `wip/prefill-decode-arms-v2/`** — read that campaign, not the archived follow-ups or the artifact's design
+  section: v2 is a clean-slate redesign that deletes this memory model, and its `README.md` §0 says which
+  material may be read (it forbids the rest by policy, not by taste).
 * `0100`-`0199` — **optional** blocks under `optional/<name>/<NNNN>-<name>.patch`.  They are never in the
   default apply, the default tree, `rdna-boosts-all.patch`, the fork branch or the default release gates;
   `scripts/apply-all.sh --include-optional[-all]` applies them on the verified default tree in **numeric**

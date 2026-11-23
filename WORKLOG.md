@@ -1,3 +1,75 @@
+## 261123.005 (no release) -- the two-arm server's records are consolidated into one self-contained project: every block-17 `TODO` row retracted, the follow-up campaign retired to `archive/work/`, the beta artifact frozen, and `wip/prefill-decode-arms-v2/` opened as a clean-slate redesign
+
+The maintainer's decision (2026-11-23), taken after a design review of
+`beta/prefill-decode-arms/prefill-decode-arms.patch` against its own symptom record (*corrupted output, memory
+shortage, crash under multiple concurrent slots with MTP*).  **No code changed; nothing was built or run.**
+
+### 1. The finding that motivated it
+
+The feature's server-side split is not the problem: a second `llama_context` is *required* (a context is not
+reentrant, so the only way to give a decoder its own cadence is a second execution context), and the prefill arm
+already keeps the prompts, the checkpoints, the prompt cache and the response lifecycle.  The problem is the
+**memory model**: the second context was built as a co-owner of a *viewed copy* of the first's memory — its own
+`llama_kv_cache`, its own `llama_memory_recurrent`, shared cells — which forces two cell maps over one cell
+array, two search cursors, a bolt-on reservation/allocator protocol, an apply lock threaded by hand, a per-module
+"does this memory implement a shared view" taxonomy, **and a device-to-device handover of the recurrent state
+between two memory modules at every request boundary**.  Every reported symptom class comes from that duplication,
+not from the two threads: a state copy that is not byte-faithful is fluent-but-wrong text; a module that was
+never taught to share reads an empty cache while the log says `KV shared`; and the second context's arena reserve
+(a hand-tuned `3584 MiB + width tier`) is charged from `params` alone, so a shape that is then *refused* still
+shrinks the expert arena by several GiB.
+
+The alternative is one sentence: **one `llama_memory_i`, two contexts — the prefill arm owns it, the decode arm
+borrows it, and nothing is copied between them.**  It is also smaller: roughly 1 500 of the artifact's 5 968 lines
+exist only to keep two memory objects in agreement.  It needs exactly one piece of real work, which is **already
+an upstream `TODO` in the header**: `llama_memory_recurrent`'s per-batch placement (`head`/`n`/`rs_z`, plus the
+`rs_idx` reset that today happens *inside a graph-time getter*) must move into
+`llama_memory_recurrent_context`, so two contexts can build graphs against one recurrent memory.
+`llama_kv_cache` already satisfies that property, which is why the attention half can be shared today with only a
+lock.
+
+### 2. What was done (records only)
+
+* **`TODO.md` — every block-17 row retracted** (`#364`, `#365`, `#366`, `#367`, `#368`, `#370`, `#371`, `#372`,
+  `#374`): rows, detail sections, and the four housekeeping paragraphs that existed to explain them are gone, and
+  the retraction is recorded in one dated note.  The handles are **void and are never reused**.  **Two rows were
+  kept, deliberately, because their subject is the delivery and not the feature:** `#369` (three gate defaults
+  still naming the retired Flash-Next tree — delivery gate debt, and it no longer cites a campaign) and `#375`
+  (the cache-OFF host-tier GPU page fault, which reproduced at r349 *with the pair inactive*, is CLEAN on all
+  seven r352 control arms, and belongs to blocks 09/12/15).  The rationale for retracting rather than rewriting:
+  the v2 plan is an order of magnitude more specific than a TODO row, so a row could only restate it, and the
+  rows described a design the redesign deletes.
+* **`archive/work/prefill-decode-arms-followups/` retired** → `archive/work/prefill-decode-arms-followups/`, with a
+  RETIRED banner (the directory's own README still claimed "block 17 shipped" and never mentioned the r352
+  withdrawal).  It is not kept in `wip/` as a stub: `wip/CAMPAIGNS.md` carries the retirement banner and indexes
+  the new campaign instead.
+* **`beta/prefill-decode-arms/` FROZEN** as a *reproduction* of the r346-r351 code (the applied tree equals the
+  r351 release tree), never a development target and never a design reference; its "what it does NOT cover" list
+  now says the items are retired with the artifact rather than a plan.
+* **`AGENTS.md`** — block 17's paragraph now says the artifact is frozen and points at
+  `wip/prefill-decode-arms-v2/`.  The policy layer is the first thing every session reads, and leaving it saying
+  the artifact "can still be built, tested and improved" was exactly the confusion this change removes.
+* **`wip/prefill-decode-arms-v2/` created** — a self-contained project: `README.md` (scope, the reading rules,
+  the deliverables, the definition of done, this box's hygiene), `DESIGN.md` (the target, the ownership boundary,
+  invariants I1-I8, the defect register V1-V11, the deleted regions, the `llama_memory_recurrent` refactor
+  design, the server's two arms, the risk register), `PLAN.md` (STEP 0-12, each with its files, edits, do-not
+  list, oracle and exit criteria; the gate set; the failure handling).  The design review that produced the
+  decision is preserved as `archive/work/prefill-decode-arms-followups/DESIGN-REVIEW-2026-11-23.md`.
+
+**Why "self-contained" is a rule and not a preference.**  The previous attempt's documents carry a design, a set
+of "hard-won rules" and a work plan that are wrong at the root, and a session that reads them reproduces their
+assumptions instead of making the clean break.  `README.md` §0 therefore forbids reading the archived campaigns
+and the design half of the beta artifact, with **one narrow exception**: the beta patch may be opened for
+`PLAN.md` STEP 1 only (three backend/concurrency fixes worth having on their own — a per-thread host stream, the
+VMM pool's per-descriptor peer grants, and an unconditionally defined `ggml_cuda_pool_peer_copy_ok()`, without
+which a `GGML_HIP_NO_VMM=ON` build's shared library breaks every consumer's link).
+
+### 3. What this does NOT decide
+
+Nothing about the delivery: `patches/` is untouched, `release.json` is untouched, the block set is untouched, and
+**re-admitting the feature is still a new-block decision that belongs to the maintainer** — v2's STEP 12 asks, it
+does not cut.  No release, no tag.
+
 ## 261123.004 (r353, contributed PR #357 promoted into block 10) -- the GDN output-norm fold reaches the SILU gate: +0.5-0.9 % decode on the delivery's own GDN families, bit-identically
 
 `v17-919794500-r353`: contributor PR #357 (overdoingism, reported as `wip/gdn-norm-gate-silu`) widened block
@@ -641,7 +713,7 @@ stays open by decision; `#366`'s ordering hazard (the slab's aux reserve is what
 ## 261122.035 (no delivery change) -- `TODO` #366 DONE (the pair's slab reserve derived from the ubatch width), plus the capture class closed for every synchronous host path
 
 **No delivery patch changed, no tag.**  Continues `261122.034`; the fix is still on the scratch branch
-(`~/llama.cpp` `crash373-fix`, exported as `wip/prefill-decode-arms-followups/repro-373/FIX-candidate-373.patch`,
+(`~/llama.cpp` `crash373-fix`, exported as `archive/work/prefill-decode-arms-followups/repro-373/FIX-candidate-373.patch`,
 now 4 commits, 489 insertions, 10 files).  `TODO` #366 is **closed** (its row and detail are removed from `TODO.md`,
 which is forward-looking only).
 
@@ -715,7 +787,7 @@ handover), which is the last open item of the block-17 queue.
 
 **No delivery patch changed, no tag.**  Continues `261122.033` on the maintainer's instruction ("implement A", and
 "consider whether the non-two-arm approach's pre-allocation is cleaner").  Both configurations now run clean end to end
-on the scratch branch (`~/llama.cpp` `crash373-fix`, exported as `wip/prefill-decode-arms-followups/repro-373/
+on the scratch branch (`~/llama.cpp` `crash373-fix`, exported as `archive/work/prefill-decode-arms-followups/repro-373/
 FIX-candidate-373.patch`, now 3 commits, 373 insertions, 9 files).
 
 ### A: the peer grant is best effort, which the slab already knew
@@ -797,7 +869,7 @@ is what would have avoided the manual 6144.  Note the ordering hazard that campa
 **No delivery patch changed, no tag.**  Continuation of `261122.032`, on the maintainer's instruction to do the *true*
 fix for block 17 (in block 17, not in pieces) together with the Meta work of `TODO` #365.  The fix is on a scratch
 branch (`~/llama.cpp` `crash373-fix`, **not pushed**), exported for review as
-`wip/prefill-decode-arms-followups/repro-373/FIX-candidate-373.patch` (2 commits, 206 insertions, 7 files).  Block 17 is
+`archive/work/prefill-decode-arms-followups/repro-373/FIX-candidate-373.patch` (2 commits, 206 insertions, 7 files).  Block 17 is
 the target, so it becomes a same-block amendment once the maintainer says so (`AGENTS.md` rule 13).
 
 ### What the pair actually shares, and what was racing
@@ -886,7 +958,7 @@ cleanest done after A or B lands.
 
 `~/llama.cpp` is back on `rdna-boosts` at `8f88fc861` with `build-2ctx` rebuilt from it; the fix lives on
 `crash373-fix` (2 commits on top of the WIP instrumentation commit `ccfd7042f`, which must not travel).  The repro
-harness and the exported patch are in `wip/prefill-decode-arms-followups/repro-373/`.  Nothing was regenerated, no
+harness and the exported patch are in `archive/work/prefill-decode-arms-followups/repro-373/`.  Nothing was regenerated, no
 block was amended, and nothing was pushed: the block decision is the maintainer's.
 
 ## 261122.032 (no delivery change) -- crash #373 REPRODUCED and diagnosed: the pair mutates ONE cell map from TWO threads with no lock (3 defects, 2 fixed in a scratch tree); the handover's pad-boundary condition is NOT needed
@@ -903,7 +975,7 @@ rest is a campaign, and **the block decision is the maintainer's, so nothing was
 The maintainer's own shape on `build-2ctx` (ROCm 10.1, 3 x R9700, `Qwen3.8-Flash-Next-MTP4-IQ4_NL`, `-c 204800
 --parallel 3 --kv-unified -sm tensor`, `q8_0` K/V, `-ub 2048`, `--lazy-mode on`, `--prefill-decode-arms-mode auto`) with
 **three concurrent requests: a short prompt + a long generation (the decoder), one 20k prompt, one 6k prompt** aborts on
-the qwen4exp assert **within ~30 s, first try** (`wip/prefill-decode-arms-followups/repro-373/`).  A 71k + 23k + 800-token
+the qwen4exp assert **within ~30 s, first try** (`archive/work/prefill-decode-arms-followups/repro-373/`).  A 71k + 23k + 800-token
 shape reproduces in 40-55 s.  The handover called this "rare"; at three slots with two prefills in flight it is close to
 deterministic.  **Pair OFF, both shapes: clean** (2/2), which is E1 confirmed.
 
@@ -992,7 +1064,7 @@ not sufficient.  Nothing in this list is a text/numerics question: every arm is 
 The fix lives in `~/llama.cpp` on a scratch branch (`crash373`, WIP commit `ccfd7042f`, **not pushed**), together with the
 temporary instrumentation (the `[DBG_APPLY]` print + `dbg_*` accessors, the `[DBG_VIEWSLOT]` print and the `[DBG_TIMING]`
 measurement all have to come out before any patch exists).  The repro harness is
-`wip/prefill-decode-arms-followups/repro-373/` (`armload.py` + `run.sh`).  **Owed before a fix release:**
+`archive/work/prefill-decode-arms-followups/repro-373/` (`armload.py` + `run.sh`).  **Owed before a fix release:**
 
 1. the maintainer's decision on **block structure** (an r346-style amendment of block 17, or a new block) -- `AGENTS.md`
    rule 13, not a gate outcome;
@@ -1083,7 +1155,7 @@ changed rather than disappearing: "which slot gets to run" became "who gets the 
 TTFT-versus-throughput tuning that was never promoted to a default because the pathological serialisation was what needed
 fixing.
 
-Record: campaign `wip/prefill-decode-arms-followups/` §W8 (9.1), `TODO` #372, `ENVIRONMENT.md` §22
+Record: campaign `archive/work/prefill-decode-arms-followups/` §W8 (9.1), `TODO` #372, `ENVIRONMENT.md` §22
 (`LLAMA_SERVER_PREFILL_FAIR`, `LLAMA_SERVER_PREFILL_SKEW`), `patches/README.md` block 16, and the fairness gate's header
 (the pre-r300 measurement).
 
@@ -1119,7 +1191,7 @@ the two **arms'** layer passes (decode rows plus prefill rows in one weight read
 also put the decode row's latency back inside the prefill layer's work, which is precisely the 300-880 ms stall block 17
 exists to remove.
 
-Record: campaign `wip/prefill-decode-arms-followups/` §W8, `TODO` #372, and the note that W6 and W8 must be measured as ONE
+Record: campaign `archive/work/prefill-decode-arms-followups/` §W8, `TODO` #372, and the note that W6 and W8 must be measured as ONE
 curve ("worst in-window gap against prefill rate"), since they pull the same axis in opposite directions.
 
 ## 261122.028 (no delivery change) -- block 17's follow-ups become an OPEN campaign, and the prefill/decode balance gets its own handle (`TODO` #371)
@@ -1132,7 +1204,7 @@ no design, no acceptance oracles and no record of what had already been tried.  
 of it, and the cost items (the 74.6 ms handover, the flat 3584 MiB reserve) read like trivia rather than like work with a
 measurement attached.
 
-**What exists now.**  `wip/prefill-decode-arms-followups/` (open, indexed in `wip/CAMPAIGNS.md`) documents each item as
+**What exists now.**  `archive/work/prefill-decode-arms-followups/` (open, indexed in `wip/CAMPAIGNS.md`) documents each item as
 `W1`-`W7` plus `G1`: what exists today, what is missing, the design, the acceptance oracles, the risks, and the
 dependencies.  `TODO` #364-#370 now point at their section.  Ordering suggestion: `G1` + `W7` + `W3` (small, close out
 what is "recorded but not asserted") -> `W6` -> `W2` -> `W1`, with `W4` whenever a GLM5-Next checkpoint appears and `W5`
@@ -1162,7 +1234,7 @@ Flash-Next `GSQ-IQ3_XXS` tree and are **not** repointed blind, because each carr
 (`G1`, `TODO` #369); and the pair's slot-erase cell accounting stays recorded-not-asserted (`W7`, `TODO` #370).
 
 Docs touched: `TODO.md` (#371 + the campaign pointer in every item, and the handle-numbering note moved to #372),
-`wip/prefill-decode-arms-followups/README.md` (new), `wip/CAMPAIGNS.md` (the open row), `patches/README.md` (block 17's
+`archive/work/prefill-decode-arms-followups/README.md` (new), `wip/CAMPAIGNS.md` (the open row), `patches/README.md` (block 17's
 "not covered" list points at the campaign), this entry.
 
 ## 261122.027 (r346, RELEASE v18-919794500-r346) -- block 17: the two-arm server (an opt-in prefill arm + a decode arm co-owning one KV), **default OFF**; the delivery moves to 18 official blocks

@@ -25,10 +25,10 @@ still means the same subject after that item is closed and removed from this fil
 
 **Current state:** the **18-patch default set** (17 official blocks `0000`-`0016` + the temporary `0300`)
 at fork point **`919794500`**; read `.release` in `release.json` for the release id -- it is the source of
-truth, not this line.  **Block 17 (the two-arm server) was WITHDRAWN from the delivery at r352** and lives in
-`beta/prefill-decode-arms/` (apply with `--include-beta`); its follow-ups are the `#367`-`#374` rows below, and
-they are **beta work**, not delivery work -- the campaign `wip/prefill-decode-arms-followups/` is where they are
-written up.  `#375` is the cache-off host-tier GPU page fault (open, **not reproducible at r352**).  Block 14 is the **streamed KV** (the resident window, the
+truth, not this line.  **Block 17 (the two-arm server) remains WITHDRAWN from the delivery** (r352) and its
+repair is the standalone project `wip/prefill-decode-arms-v2/` -- **this file carries no row for that feature**
+(the 2026-11-23 housekeeping note below says why).  `#375` is the cache-off host-tier GPU page fault (open,
+**not reproducible at r352**) and is a *delivery* item (blocks 09/12/15), not a feature item.  Block 14 is the **streamed KV** (the resident window, the
 attendance pool and the MTP draft window -- all three opt-in, default off); block 15 is the UMA GTT expert
 store.  The **mixed K/V cache types** are **optional block `0101`** since the r288 block-number re-org (they
 were numbered block 17 in r287, PR #312 -- a different block from today's `0017`; the one native pair, head 256
@@ -43,6 +43,18 @@ left in this file.  The r236 re-base
 (`archive/work/upstream-rebase-261108/`) is superseded and closed.
 
 ## The open list
+
+**`2026-11-23` housekeeping -- the block-17 rows were RETRACTED (the maintainer's decision).**  Every row whose
+subject was the **two-arm server** left this file: `#364`, `#365`, `#366`, `#367`, `#368`, `#370`, `#371`, `#372`
+and `#374`.  The feature is **withdrawn from the delivery** (r352) and is now a **standalone, self-contained
+project**, `wip/prefill-decode-arms-v2/`, which carries its own goals, design, defect register and step-by-step
+plan (`README.md`, `DESIGN.md`, `PLAN.md`).  It is a clean-slate redesign rather than a repair, so its work does
+**not** live in this file: a forward-looking row here would duplicate a plan that is already five times more
+specific, and the retracted rows described a design (a second context that *views* and *co-owns* the first's
+cells, with the recurrent state copied between two memory modules) that the redesign deletes.  The numbers are
+**void and never reused**; `#369` stays because its subject is **delivery gate debt** (three gate defaults
+affected by a retired model tree), not the feature, and it no longer cites a campaign.  The old follow-up
+campaign is archived at `archive/work/prefill-decode-arms-followups/` (`WORKLOG.md` 261123.005).
 
 **`r333` housekeeping (2026-11-21):** three rows left the list at r333 and none is tracked any more -- `#349`
 (gate-server-arms' two-slot text was a `--kv-unified` artifact, `GREEDY-PURITY.md` §38; fixed and its anchor
@@ -63,39 +75,13 @@ across 70 consecutive release transitions (68 clean; the only other firing is th
 remain are (`#116` parked, `#273`, `#361`, `#363`): each carries its own re-entry condition.  A green gate
 ladder is still not permission to skip a row.
 
-**`r346` housekeeping (2026-11-22):** eight rows were opened for the follow-ups of **block 17** (the two-arm
-server, `v18-919794500-r346`): `#364` (speculative decoding with the arms), `#365` (a meta-aware device copy),
-`#366` (a derived decode reserve), `#367` (GLM5-Next), `#368` (a recurrent-only memory), `#369` (three gate
-defaults still anchored to the retired Flash-Next model), `#370` (the pair's slot erase and cell accounting) and
-`#371` (the prefill/decode speed balance, the maintainer's turn-skip idea).
-
-**`r350` housekeeping (2026-11-22):** `#364` closed and left the list -- **implemented, not deferred**: a
-speculator now runs ON the two-arm server (`draft-mtp`, `draft-mtp-adaptive`, `draft-simple` and the n-gram
-family; the layer-input drafters and a gemma4 assistant are still refused, each because its target side is bound
-to one context), the drafter reads the target's hidden rows from the context that ran the batch, the decode arm is
-sized for the verify width, and the slab reserve is the sum of the decode arm's and the draft context's.  The
-oracle is `scripts/gate-arms-spec.sh` (MANIFESTS gate 39): a **three-way cold** text claim
-(`pair+draft-mtp` == `pair+none` == `single+draft-mtp`) at 3 devices f16 / 3 devices q8_0 / 2 devices f16, plus
-the adaptive controller, the four-axis protocol on the pair and a concurrency arm -- **32/32**, and every arm pins
-`LLAMA_SERVER_PARK_IDLE_SLOTS=0` because the co-owner guard declines parking on the pair while the single context
-parks by default (`GREEDY-PURITY.md` §107).  `WORKLOG.md` 261122.040; campaign `wip/prefill-decode-arms-followups/`
-§W1 is now DONE.
-
-**`r347` housekeeping (2026-11-22):** `#365` and `#366` are **closed** (both shipped in the block-17 amendment:
-the Meta buffer's per-child `cpy_tensor_n` and the width-keyed decode reserve — `WORKLOG.md` 261122.036), and the
-crash row filed as `#373` is **closed** too (the five shared-state defects shipped with the same amendment; the
-owed gate arm is `gate-arms-soak.sh boundary`).  `#374` (the vacuous `pool` arm) stays **open**.  Each has its detail section **before**
-the accepted limitations (they were briefly appended after it, which read as if they were accepted limitations; they
-are open work) and they are written up in one campaign, `wip/prefill-decode-arms-followups/`, as `W1`-`W7` plus
-`G1`.  `#363` was in the same wrong place and moved up with them.
-
 **`r352` housekeeping (2026-11-23):** **block 17 (the two-arm server) was WITHDRAWN from the delivery** and moved
-to `beta/prefill-decode-arms/` -- every row below whose kind says `block 17` is now **beta work**: parked with the
-artifact, not release work, and re-admission is the maintainer's decision (the artifact reproduces the r351 tree
-exactly, so the code is preserved).  One new row: **`#375`**, the cache-disabled host-tier **GPU page fault**
-recorded at r350 (`WORKLOG.md` 261122.040 §3) -- it reproduced at r349 with the pair inactive and did **not**
-reproduce on any of the seven arms re-run at r352 (both builds), so it is open with a recorded control set and
-**no fix**: a gate on a fault that does not fire would be vacuous.
+to `beta/prefill-decode-arms/` -- the artifact reproduces the r351 tree exactly, so the code is preserved, and
+re-admission is the maintainer's decision.  One new row came out of that session: **`#375`**, the cache-disabled
+host-tier **GPU page fault** recorded at r350 (`WORKLOG.md` 261122.040 §3) -- it reproduced at r349 with the pair
+inactive and did **not** reproduce on any of the seven arms re-run at r352 (both builds), so it is open with a
+recorded control set and **no fix**: a gate on a fault that does not fire would be vacuous.  Its subject is the
+delivery's host-expert tier, so it stays.
 
 | # | subject | kind | status |
 |---|---|---|---|
@@ -103,20 +89,13 @@ reproduce on any of the seven arms re-run at r352 (both builds), so it is open w
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **361** | the r334 RDNA2 items (PR #338) are validated on the contributor's V620, not on the released tree: blocks 05/08/10 now carry an RDNA2-only FA tile-cap removal, a one-warp narrow `RMS_NORM`, a `H * n_seqs` GDN chunked gate and a rows-abreast MoE K walk, and no RDNA2 device is in the maintainer's fleet | validation / external (delivery) | **WAITING on `@jstamagal`** -- re-run on the r334 tree: full `test-backend-ops` on `gfx1030` at default flags (**especially `FLASH_ATTN_EXT` with the caps gone: the failure mode is `GGML_ASSERT(max_blocks_per_sm > 0)` in `launch_fattn`, not a rate**), `MUL_MAT_ID` with `GGML_CUDA_MOE_ROWS_ABREAST` on and off, `RMS_NORM*` in the default/`NARROW=0`/`VEC=1` arms, a model-level decode+prefill (a GDN model for the chunked gate, a MoE for the K walk) and an MTP-acceptance run; **it should also confirm that PR #339's BF16 `RMS_NORM + MUL (+ ADD)` abort is gone there** (fixed at r328 by the re-base, `archive/work/can-fuse-bf16-rms-norm-r324/` -- `RMS_NORM_MUL_ADD` now includes `type=bf16,type_w=f32` and `type=bf16,type_w=f32,type_add=bf16` arms); §361 |
 | **363** | `-of`/`--optional-features` exists with ONE tag (`tp-ffn-even`); the delivery's other env-only opt-in features are still environment-only, so a user who reads `--help` still cannot find them | tooling / docs (delivery) | **OPEN** -- migrate them one at a time: add the row to `common_optional_features()` with its switch, confirm the tag produces exactly what the env var produces (the arm `gate-ffn-even-split.sh` C-section runs), and delete the row if the feature gets a first-class option; candidates are the opt-in switches `ENVIRONMENT.md` already marks as such (§4 `LLAMA_KV_N_PAD_MIN`, §7.6 `--wmma-verify`-adjacent switches are options already, §1.2's arena knobs, block 14's `LLAMA_KV_SPILL_RAM_PCT`); §363 |
-| **367** | `GLM5-Next` is unvalidated on the pair: it uses the same `llama_memory_hybrid_idx` as Qwen3.8-Flash-Next (the module whose missing shared view was block 17's P0), but no checkpoint exists on this box | validation / external (delivery, block 17) | **OPEN (waiting on a model)** -- one coverage-matrix row: both arms, layer and tensor, 2 and 3 GPU, identical text, and no `implements no shared view` warning. Campaign §W4 |
-| **368** | a **recurrent-only** memory (Mamba class, no attention KV at all) gets **no state** on the second arm: `llama_memory_seq_state_take()` refuses anything that is not a hybrid | capability (delivery, block 17) | **PARKED (no model on this box)** -- the same take with the recurrent half as the whole state; implementing it without a model would be a claim with no oracle. Campaign §W5 |
-| **369** | three gates still name the RETIRED Flash-Next `GSQ-IQ3_XXS` tree (`gate-hc-base-copy`, `gate-hc-fusions`, `gate-host-expert-text`) and were deliberately NOT repointed at r346, because each carries recorded text/KLD anchors for that class | tooling (delivery) | **OPEN** -- repoint each AND re-record its anchors on the new class (the STEW675 IQ4_NL tree) in the same change, then run each once. Campaign §G1 |
-| **370** | the pair's cell accounting after `POST /slots/N?action=erase`: with three resident prompts the erases release about **one** prompt's cells (used 8174 -> 5446 of 8192), and parking is declined by the co-owner guard so idle cells legitimately stay resident | correctness / accounting (delivery, block 17) | **OPEN** -- decide whether a slot whose saved state is erased should release all its cells, then turn the recorded number into an assertion in `scripts/gate-arms-soak.sh`. Campaign §W7 |
-| **374** | the gate's **`pool` arm is VACUOUS**: `gate-arms-soak.sh pool` fails its own non-vacuity check (*no expert-access/teardown census*) with the 4B model on a 1-GPU host tier, both with the derived pair reserve and with `MOE_EXPERT_CACHE_AUX_RESERVE_MIB=3584` forced | **gate debt (block 17)** | **OPEN (found 2026-11-22)** -- the other six checks pass (`decline_all=0`, `broken=0 repaired=0`, text equals the single context's, no GPU faults), so the arm currently proves nothing about the pair's host-expert path.  Repair the census (or the arm's config, e.g. a `-ncmoe` value that really routes through the cache at this model size) before relying on it.  `WORKLOG.md` 261122.035 |
-| **371** | the prefill/decode **speed balance** is untuned: the pair trades -21..-24 % prefill for a decoder that keeps moving, and the worst in-window gap is 95.5 / 86.5 / 60.5 / 32.8 ms on the recorded shapes; the idea is for the prefill arm to **skip one or more submission opportunities** while a decoder is active, so decode runs a burst of uninterrupted steps | tuning (delivery, block 17) | **OPEN** -- a measurement campaign, not a patch: the gap is four to twenty times SMALLER than the prefill arm's own step, so the mechanism must be identified first, and the deliverable is a Pareto curve for K in {0,1,2,4,8} with a **refutation acceptable** (bound stated up front: >= 50 % fewer worst-gap ms for <= 3 pp prefill). Campaign §W6 |
-| **372** | multi-slot prefill batching: with several slots prefilling, does each slot really re-scan the full weight set per chunk, and can a "layer-major" schedule across slots batch them for better prefill throughput? | tuning / architecture (delivery, block 17) | **OPEN** -- the premise needs checking first: `share_prompt_budget()` already puts **every** active prompt into one step and one ubatch is one graph, so co-batchable slots already share the weight pass and the real cost is the **ubatch SPLIT** (which `-ub` moves: 1440 -> 3041 -> 3884 t/s at 512/2048/4096).  First task is a composition census (`LLAMA_KV_DEBUG_CELLS`), then a two-slot aggregate-scaling table.  **Do NOT merge the two arms' layer passes**: that is the shared step the feature exists to remove.  Campaign §W8 |
+| **369** | three gates still name the RETIRED Flash-Next `GSQ-IQ3_XXS` tree (`gate-hc-base-copy`, `gate-hc-fusions`, `gate-host-expert-text`) and were deliberately NOT repointed at r346, because each carries recorded text/KLD anchors for that class | tooling (delivery) | **OPEN** -- repoint each AND re-record its anchors on the new class (the STEW675 IQ4_NL tree) in the same change, then run each once. §369 |
 | **375** | the host-expert tier's **cache-OFF page fault**: `-ncmoe 48` + `MOE_EXPERT_CACHE_MIB=0` + `-sm tensor` faulted the GPU in the first prefill at r350 (a device read of a HOST page), reproduced at r349 with the pair inactive, and is **CLEAN on all seven control arms at r352** | correctness (delivery: block 09/12/15 host tier) | **OPEN, NO REPRO** -- needs a failing run's log + `dmesg` window; the tier is pageable (`ROCm_HostMap`) behind a pinned pool/bounce, so a repro must bypass `expert_host_src()` or hit a pinned refusal a caller treats as success. Recorded control arms: `beta/prefill-decode-arms/README.md`; §375 |
 
 
 ## Handle numbering
 
-**New handles append after the highest issued so far, so the next free handle is `#376` (`#375` was issued at r352 for the cache-off page fault; `#364`-`#372` were issued
-for the block-17 follow-ups at r346); a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
+**New handles append after the highest issued so far, so the next free handle is `#376` (`#375` was issued at r352 for the cache-off page fault).  `#364`-`#372` and `#374` were issued for the block-17 follow-ups and **retracted (void) on 2026-11-23**; a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
 subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
 
 * **issued and retired the same day** (2026-11-16): `#337` — the attendance pool *does* engage on
@@ -270,30 +249,10 @@ spill/window budgets (`LLAMA_KV_SPILL_RAM_PCT`, §1.2's `MOE_EXPERT_CACHE_MIB`-a
 opt-in -- check the row's class before migrating), and the `GGML_CUDA_*` opt-ins §7 lists as "opt-in, default
 OFF".  A tag is only for a feature that is **off by default**; a kill-switch is not a tag.
 
-## 367. `GLM5-Next` on the two-arm server (block 17)
-
-**Campaign:** `wip/prefill-decode-arms-followups/` §W4. — same memory module, no checkpoint on this box
-
-`GLM5-Next` uses the same `llama_memory_hybrid_idx` memory as qwen4exp (attention KV + recurrent state + lightning
-indexer KV), i.e. exactly the module whose missing shared view was block 17's P0.  The fix is module-level, so it
-should cover GLM5-Next by construction — but "should by construction" is not a measurement, and no GLM5-Next
-checkpoint exists on this box.  Whoever has one owes the coverage matrix's row: both arms, layer and tensor split,
-2 and 3 GPUs, text identical (and the `implements no shared view` warning absent from the log).
-
-## 368. The recurrent-ONLY memory has no handover (block 17)
-
-**Campaign:** `wip/prefill-decode-arms-followups/` §W5. — and no such model here to measure it
-
-`llama_memory_seq_state_take()` refuses anything that is not a **hybrid**: it moves the recurrent half of a hybrid
-memory and leaves the attention cells alone (they are shared).  A pure recurrent model (a Mamba-class
-architecture with no attention KV at all) would therefore get **no state at all** on the second arm, so the pair
-would either refuse it or silently run it on an empty state.  This is a gap in the take, not in the sharing — there
-is no attention KV to share.  No model of that class exists on this box, so the row is parked until one does;
-the correct shape is the same take with the recurrent half as the whole state.
-
 ## 369. Three more gate defaults still name the RETIRED Flash-Next IQ3_XXS tree
 
-**Campaign:** `wip/prefill-decode-arms-followups/` §G1. — repoint them **and** re-anchor, together
+**Record:** the repointing work is recorded in `WORKLOG.md` 261122.027 (the r346 change that repointed the first
+three gates); this row is the residue of it.
 
 `gate-park-idle-slots.sh`, `gate-moe-promise.sh` and `gate-host-pool.sh` were repointed to the maintainer's
 quality-first replacement, `Qwen3.8-Flash-Next/STEW675-IQ4_NL/Qwen3.8-Flash-Next-MTP4-IQ4_NL-00001-of-00002.gguf`
@@ -309,88 +268,12 @@ The work is one change: repoint each to the STEW675 IQ4_NL tree, re-record its a
 `--kld`/record paths already exist), and correct the headers' numbers.  Until then those three refuse at the
 model check rather than run on a wrong anchor — which is the correct failure, not a defect.
 
-## 370. The pair's KV cells after `POST /slots/N?action=erase` (block 17)
-
-**Campaign:** `wip/prefill-decode-arms-followups/` §W7.
-
-Measured with `scripts/gate-arms-soak.sh soak` (4B, `-np 3 -c 8192`, six rounds of distinct ~2600-token prompts): the cache
-fills to **8174 of 8192** cells and stays bounded (no leak -- the server keeps answering), and after erasing all three slots
-the next tiny request's ubatch reads **used=5446**, i.e. the erases released about **one** resident prompt's cells, not three.
-Two things are true and only one is a defect: `?action=erase` erases a slot's **saved state** (block 12's slot cache), not its
-KV cells, and on the pair the idle slots' cells legitimately stay resident because **parking is declined** by the co-owner
-guard.  What is open is whether the pair *should* release all three (a slot whose state is erased has no prompt to keep), and
-what the accounting should read afterwards.  The gate records the number rather than asserting it; turning it into an
-assertion is this item.
-
-## 371. The prefill/decode SPEED BALANCE (block 17): the prefill arm SKIPS turns while a decoder is active
-
-**Campaign:** `wip/prefill-decode-arms-followups/` §W6, which carries the mechanism table, the design constraints, the
-knob shape and the measurement plan.  This entry is the handle; that document is the work.
-
-**The idea (the maintainer's, 2026-11-22):** while the decode arm has pending work, the prefill arm **skips one or more
-submission opportunities**, so the decoder runs several uninterrupted steps (a burst of `K` tokens at its own
-uncontended step time) before the prefill arm grabs the device again.  It is a cross-arm **submission** policy at the
-batch level, which is why it is not one of the three measured losers (a mid-gather yield, stream priorities, or block
-16's duty cycle, all of which are inert or negative on this path: duty measured 50 -> 50 tokens, 1.00x).
-
-**Why it is a measurement campaign and not a patch:** on the shapes where both are recorded the decoder's worst gap is
-**four to twenty times smaller than the prefill arm's own step**: 86.5 ms against 771 ms p50 at `-ub 2048`, 60.5 against
-1227 ms at `-ub 4096`, 32.8 against 339 ms fully resident (and 95.5 ms at `-ub 512`, whose step series was not
-recorded).  So the naive model "the decoder waits for a whole ubatch" is already contradicted by the record.  The gap's actual composition
-has to be identified (device time-slicing, internal chunking, or harness step granularity) before a policy is written,
-or the patch will optimise a component that is not there.
-
-**Hard constraints:** counters not clocks (a time-keyed policy is not reproducible); it changes WHEN the decode arm runs,
-never WHAT it batches (batch composition is a numerics carrier, `GREEDY-PURITY.md` §36/§63); never skip with nothing
-decoding and never on a request's first prefill step (pure TTFT loss); bound the streak so prefill cannot starve;
-`--prefill-decode-arms-skip N` defaults to **0 = off**; `-ib` and `LLAMA_SERVER_PREFILL_DUTY` stay inert on this path.
-
-**Done =** a Pareto curve for `K` in {0, 1, 2, 4, 8} (prefill cost against worst in-window gap) with purity green at
-every `K`, and a stated bound accepted up front (**>= 50 % fewer worst-gap milliseconds for <= 3 percentage points of
-extra prefill**).  **A flat or dominated curve is a legitimate result**: record it here and in `GREEDY-PURITY.md`, and
-retire this handle rather than shipping a knob with no win.
-
-
-## 372. Multi-slot prefill batching: does each prefilling slot really re-scan the weight set, and would a layer-major schedule help?
-
-**Campaign:** `wip/prefill-decode-arms-followups/` §W8 (the premise check with code references, where the idea has teeth,
-the measurement plan and the acceptance).
-
-**The question (the maintainer's, 2026-11-22):** with several slots prefilling concurrently, "each slot scans through
-the full set of layer weights per ubatch chunk"; what if the prefilling were processed layer by layer with each active
-slot handling its ubatch for the active layer, so the slots share the weight read?
-
-**The premise is mostly already the mechanism -- since r300, and because of block 16.**  Before r300 the batch was filled
-**in slot index order**, so the lowest slot took the whole window and every other prompt waited for its entire prompt (the
-fairness gate records 1.91 s for a 7-token prompt behind a 13204-token one): a prefill step carried ONE sequence, so every
-step re-read the whole weight set for that one slot's chunk.  The **fair share** is what made the multi-slot prefill batch
-exist.  Today `share_prompt_budget()` gives **every** active prompt a share of the step's window ("nobody fills n_batch
-first and every active prompt is admitted to every step"), the resulting batch is split into `n_ubatch` chunks, and **each
-chunk is one graph**, so the linear ops read the weights once for all slots' rows in that chunk.  The shortest-prompt
-**priority droop** (`LLAMA_SERVER_PREFILL_SKEW`) is a live knob but **default 1 = the plain share**, i.e. off: its job is
-now "who gets the larger share of one window" (a TTFT-vs-throughput tuning), not "who gets to run".  What is left, and is the real cost, is the **split**: a step whose admitted tokens exceed
-`n_ubatch` becomes several chunks, and each re-reads the full weight set.  That is what `-ub` moves, and it is measured:
-the pair's prefill reads **1440 -> 3041 -> 3884 t/s** at `-ub` 512 / 2048 / 4096, with 8192 buying only +8 % and a
-worse decoder tail.
-
-**Where the idea still has teeth** (and this is the work): (a) the fair share *admits* every prompt but does not make
-them *arrive together*, so the composition of a real ubatch has to be censused before any scheduler change is designed;
-(b) a host-expert MoE amortises the **union** of routed experts over the rows in the chunk, which is the one place
-multi-slot batching is superlinear; (c) a cross-chunk layer-major schedule degenerates into a bigger ubatch, because it
-needs several chunks' activations live at once.
-
-**What must NOT be done:** merging the two **arms'** layer passes (decode rows plus prefill rows in one weight read)
-would genuinely halve the weight traffic, and would also put the decode row's latency back inside the prefill layer's
-work, which is exactly the 300-880 ms stall block 17 was built to delete.
-
-**Done =** a composition census, an aggregate-scaling table for a two-slot prefill at four ubatches on a dense and a
-host-expert MoE, and either a scheduler change that keeps more slots in the same ubatch (purity green) or a recorded
-conclusion that the `-ub` knob already captures the available gain.  A refutation is a legitimate result.
-
 ## 375. The host-expert tier's page fault with the expert cache DISABLED (r350, not reproducible at r352)
 
 **Record:** `WORKLOG.md` 261122.040 §3 (the finding), 261123.002 (the r352 re-test); the seven control arms and
-what a reproduction must supply are in `beta/prefill-decode-arms/README.md` ("The page-fault diagnosis").
+what a reproduction must supply are in `beta/prefill-decode-arms/README.md` ("The page-fault diagnosis") — that
+directory is **frozen** as a code reproduction, but its page-fault section is the record of these control arms and
+is not part of the two-arm design the v2 campaign replaces.
 
 **What was observed (r350).**  `-ncmoe 48` + `MOE_EXPERT_CACHE_MIB=0` + `-sm tensor`, 3 devices, q8_0 KV, on
 Flash-Next: a HIP memory-access fault in the first prefill, immediately after
