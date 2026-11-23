@@ -2,7 +2,7 @@
 
 *Written by Claude (AI) on behalf of noctrex.*
 
-**Applies to:** r346 (`v18-919794500-r346`, tree `a6f877eab`), `git apply --check` clean. The hunk belongs in **block 17**: that is the block that adds the serialised state-move VERIFY logging to `src/llama-context.cpp`. The two lines are present verbatim today in `patches/0017-...patch` (hunk lines 687-688), in `rdna-boosts-all.patch` (lines 101165-101166), and in the fork tree at `main` (`8817bf91`, the in-flight block-17 amendment), so the amendment can carry the fix.
+**Applies to:** r347 (`v18-919794500-r347`, tree `d4ab6461`; the block-17 amendment release, cut 261123) -- `git apply --check` clean on both the r346 tree (`a6f877eab`, hunk at `llama-context.cpp:7213-7214`) and the r347 tree (same hunk, offset 54 lines -> `7263-7268` region; the amendment added code earlier in the file, the VERIFY hunk context is verbatim). The hunk belongs in **block 17**: that is the block that adds the serialised state-move VERIFY logging to `src/llama-context.cpp`. The two lines are present verbatim in `patches/0017-...patch` and `rdna-boosts-all.patch` at `main` (r347 block-17 patch lines 2024-2025).
 
 ## The problem
 
@@ -39,5 +39,5 @@ A possible lint extension, which this PR does not make (your call how wide the s
 
 ## Verification
 
-- `git apply --check` clean on the r346 default applied tree, reconstructed from the `919794500` tarball + `scripts/apply-all.sh` (base tree `9169416` and applied tree `a6f877eab` both match `release.json` exactly).
+- `git apply --check` clean on the r346 default applied tree, reconstructed from the `919794500` tarball + `scripts/apply-all.sh` (base tree `9169416` and applied tree `a6f877eab` both match `release.json` exactly), and re-verified against the r347 tree the same way (applied tree `d4ab6461` matches `release.json`).
 - **The fix builds green on Windows.** With only these two lines changed, the same Windows build (HIP SDK 10.x clang++, repo-compile.py, default backend set) that stopped at `[469/722]` with the `ssize_t` error now completes: the resume rebuilds 238 targets from `llama-context.cpp.obj` down -- `llama.dll`, `llama-server`, `llama-cli`, `llama-mtmd-cli` and the rest of the tools -- 0 errors, `ninja` exits at `[238/238]` with every executable linked. Block 17's VERIFY path is opt-in-only code (`--prefill-decode-arms`, default OFF); the failure was compile-time on the unguarded line, and the change cannot affect non-Windows builds or output behaviour (standard cast + format swap).
