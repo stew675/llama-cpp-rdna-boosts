@@ -1,3 +1,68 @@
+## 261123.004 (r353, contributed PR #357 promoted into block 10) -- the GDN output-norm fold reaches the SILU gate: +0.5-0.9 % decode on the delivery's own GDN families, bit-identically
+
+`v17-919794500-r353`: contributor PR #357 (overdoingism, reported as `wip/gdn-norm-gate-silu`) widened block
+10's GDN output-norm fold to a SILU gate, which is what `qwen35` / `qwen35moe` / `qwen3next` / `clover-moe`
+emit (`build_norm_gated()` -> `ggml_silu`).  r102's matcher accepted a SIGMOID gate only (qwen4exp), so on the
+two GDN families the delivery validates the fold was **dead code** -- 48 GDN layers on the 27B running an
+`RMS_NORM` + `MUL` pair per decode step for nothing.  The kernel (`unary_gated_q8_1_norm_kernel<op>`),
+`ggml_cuda_op_unary_mul_q8_1`'s dispatch and `ggml_cuda_can_fuse({UNARY, MUL})` all already took SILU, so the
+change is the matcher's op predicate.  **Fold-in, not a new block**: the maintainer's decision (this session)
+is block 10, default-on, its owner.  `n_blocks` 17 / `n_default` 18, base `919794500`, **tip `089f90067` /
+tree `27db9bfd4`**.
+
+### 1. The reviewer's two amendments to the submitted form (both made before the cut)
+
+* **The decline counter moved to the gate node.**  The submitted form counted a declined SILU gate at the
+  `RMS_NORM` it hangs off, so the OFF arm ran a full matcher per norm node **and** the two census numbers had
+  different node types behind them.  r353 counts it at the gate (`ggml_cuda_gdn_norm_gate_census_decline()`,
+  called from the dispatcher next to the accept) **and only while `GGML_CUDA_FUSE_GDN_NORM_GATE_CENSUS=1`**, so
+  a passing run pays nothing for the census at all.  The counters are deliberately NOT gated on equality: the
+  census on a two-slot `--kv-unified` server reads `fused=384` against `declined=672`.
+* **No default argument on the matcher.**  `ggml_cuda_gdn_norm_gate_match()` takes `bool silu` explicitly from
+  both call sites (the dispatcher's skip and the gate), matching the file's style; the `getenv` caches stay in
+  `ggml_cuda_gdn_norm_gate_silu_on()` / `_census_on()`.
+
+### 2. Gates that ran on the final build (`089f90067`, ROCm 10.2, one GPU job at a time)
+
+| gate | result |
+|---|---|
+| `scripts/gate-gdn-norm-gate.sh --kld` (new, MANIFESTS 41) | **PASS**: census 27B `fused sigmoid=0 silu=96` at `-ub 1` / `528` at `-ub 8`, OFF `declined silu=528`; 35B-A3B `60` / `300` and `300`; text identical ON/OFF at `-ub 2/4/8/512` (27B `b9f729ecc723`, 35B-A3B `22bfcf93c0ab`); `--kld` arms **−0.000000 / 100.000 %** at `--ub 1` and `--ub 4`; GPU faults clean |
+| `--self-test` (negative test) | **PASS** against the r352 binary (`bin-r352-s`: no census line -> the mechanism check fails on it) and **FAIL** (as designed, rc 1) against the promoted build |
+| `gate-prefill-logits.sh` (canonical point, recorded base) | **PASS** 0.000000 / 100.000 % |
+| `gate-prefill-logits.sh --ab "GGML_CUDA_FUSE_GDN_NORM_GATE_SILU=0"` at the canonical point, base recorded from the **r352 build on the same line** | **0.000000 / 100.000 %** |
+| same-seed greedy text, `prompts/prose-rdna-boosts.txt`, `-n 256`, no `-lv` | 27B UD-Q4_K_XL **`1129 2d0d685256cf`**, 35B-A3B UD-Q4_K_M **`1002 abed0bf40d87`** (= the r324 anchor): **identical** r352 == promoted == switch-off |
+| 3-GPU `-sm tensor -mg 0`, `-n 96` | **`406 9051286a12ae`** identical in all three arms |
+| two-slot `--kv-unified` server, two concurrent greedy completions | `209 5cc901c01994` and `316 6f84cc5be35a`, identical ON/OFF; census non-vacuous in both arms |
+| **MTP four-axis protocol** (`-n 3000`, 27B UD-Q4_K_XL, 1 GPU `-sm layer`, bf16 KV, adaptive ceiling 7) | **`none` == `draft-mtp` byte-identical on all four axes** AND identical to the r352 build: R `11777 988e30dfb6cc` (acc 0.53656, 31.3 -> 56.8 t/s), K `2174 a87c4318b649` (0.99200, 31.4 -> 86.0), P `6789 4172642d7dc2` (0.80437, 30.9 -> 71.7), C `13219 930756b488ff` (0.86819, 31.3 -> 77.6) |
+| `llama-batched-bench -npl 1,4,8` (35B-A3B, 2 interleaved rounds) | TG **+1.1 / +0.1 / +0.05 %** ON vs OFF, pp512 flat (no regression) |
+| `llama-bench tg128 -d 0,8192` (2 interleaved rounds each) | 27B **+0.1 %** @d0 / **+0.5 %** @8192; 35B-A3B **+0.5 %** / **+0.9 %** |
+| `tests/test-fusion-gate-beta-multiseq` | 77/77, 0 failed |
+| `scripts/check-gen-docs.sh` | green (no option added; the two env vars are not CLI options) |
+| `scripts/check-shlib-symbols.sh` | 16/16 libraries resolve |
+| `scripts/check-windows-portability.sh` | clean (515 files) |
+| whole-set build (`~/bin/build-llama-rocm`, `all`) | OK at the tip |
+| `scripts/validate-set.sh` | **GREEN** (18/18 strict, tree `27db9bfd4`, both optionals alone `7974c67b0` / `c5cb865a4` + cumulative `790e050d1`, both Windows lints, file-set reconciliation: 0 unexplained, 2 new envs) |
+
+Not run, and why: **Flash-Next / qwen4exp** (the SIGMOID arm, ~100 GB, needs 3 GPUs + host experts) -- the
+SIGMOID predicate is byte-for-byte unchanged by the patch and `qwen4exp`'s path is covered by inspection plus
+the 77-shape unit test; **Windows / RDNA3 / NVIDIA** (no runner here); `gate-norm-rows-alias.sh` is a
+different fusion (`norm-gated.cu`'s narrow-row fold) and is untouched -- the analogous aliasing hazard for this
+fold is the matcher's own `m+1..s` byte-range test, which the change does not move.
+
+### 3. Mechanics of the cut (a block amendment, and what it moved)
+
+* block 10's commit was amended on a canonical chain rebuilt at `919794500`; **block 11's `ggml_cuda_try_fuse`
+  hunk lost one line** (it used to convert `GGML_CUDA_FUSE_GDN_NORM_GATE`'s two-`getenv` expression into a
+  cached lambda; block 10 now carries the lambda form, so block 11 no longer changes it).  That is the only
+  content movement outside block 10.
+* `.tip` is **`089f90067`** -- the value a fresh `apply-all.sh` prints, verified by two applications in two
+  different worktrees; the amended *working* chain tip (`bbd536416`, same tree) is not recorded, per the `.tip`
+  rule.
+* the two **optional** artifacts needed no re-cut (their files are untouched, sha256 unchanged) but their
+  **produced trees moved with the default tree**: `0100` -> `7974c67b0`, `0101` -> `c5cb865a4`, cumulative
+  `790e050d1`; both re-verified strictly by `validate-set.sh` check 8.  `beta/prefill-decode-arms/` also still
+  applies strictly (`27db9bfd4` + beta -> `4105968be`) and its README records that.
+
 ## 261123.003 (r352, release completed: pushed, fork refreshed, tag cut) -- the gate results the withdrawal actually earned, and the two gate gaps it did not close
 
 `v17-919794500-r352` is committed (`7567a48e`), tagged and pushed to

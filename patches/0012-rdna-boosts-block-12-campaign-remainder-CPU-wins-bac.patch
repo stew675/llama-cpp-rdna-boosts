@@ -1,4 +1,4 @@
-From 2c2e361a7b72f22e107804b3dfa0366e0fd4fb7b Mon Sep 17 00:00:00 2001
+From 7ac4cb6cf4d7deb20f58a6d9f1a224164dfae9ab Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/17] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -3008,7 +3008,7 @@ index 5b72804a3..01087b511 100644
                            "target=%.1f MiB boundary=%.1f MiB limit=%.1f MiB armed=%d\n",
                            device, (double) size/1048576.0, (double) want/1048576.0,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-index 679a7a265..b36478105 100644
+index 3dfe1d273..7caad189c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 @@ -1760,7 +1760,7 @@ static bool ggml_cuda_cache_blocks_fusion(ggml_backend_cuda_context * cuda_ctx,
@@ -3021,10 +3021,10 @@ index 679a7a265..b36478105 100644
          if (node->ne[2] > MOE_EXPERT_CACHE_MAX_TOK) {
              // TODO #133 / TODO #327: ABOVE the band an identity (fully resident) table is served IN PLACE -- the
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 1804a7207..73ab4231b 100644
+index d84d91906..37d6aea0c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2846,6 +2846,10 @@ struct ggml_backend_cuda_comm_context {
+@@ -2857,6 +2857,10 @@ struct ggml_backend_cuda_comm_context {
      // re-attempting or re-logging.
      bool                        ce_grow_disabled  = false;
      bool                        ce_fallback_warned = false;
@@ -3035,7 +3035,7 @@ index 1804a7207..73ab4231b 100644
      // `GGML_CUDA_ALLREDUCE=q8ce` (r259): the copy-engine large-tensor arm sends its staged payload as
      // Walsh-Hadamard-rotated q8_0 blocks instead of bf16 (see the ce_q8 kernels).  Fixed for the life of
      // the context by the chain that created it; no env variable other than the algorithm name.
-@@ -3361,42 +3365,29 @@ static bool ggml_cuda_ar_ce_single() {
+@@ -3372,42 +3376,29 @@ static bool ggml_cuda_ar_ce_single() {
      return on;
  }
  
@@ -3098,7 +3098,7 @@ index 1804a7207..73ab4231b 100644
      if (comm_ctx->ce_bytes < need) {
          // Optional scratch budget (`GGML_CUDA_AR_CE_SCRATCH_MIB`; 0 = unlimited, the default): an
          // oversized prefill degrades to the internal pipeline instead of eating the slab reserve.  CE is
-@@ -3409,6 +3400,10 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -3420,6 +3411,10 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
              // Issue #136 (item C): the scratch could not be grown (or exceeds the budget).  Return false
              // BEFORE any collective phase runs, so the dispatcher falls back cleanly to the internal
              // pipeline (`ggml_backend_cuda_comm_allreduce_tensor`).  Never a hard abort.
@@ -3109,7 +3109,7 @@ index 1804a7207..73ab4231b 100644
              if (!comm_ctx->ce_fallback_warned) {
                  comm_ctx->ce_fallback_warned = true;
                  GGML_LOG_WARN("%s: copy-engine all-reduce scratch %.2f MiB unavailable%s; falling back to the "
-@@ -3443,6 +3438,9 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -3454,6 +3449,9 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
                      if (new_tmp [j] != nullptr) comm_ctx->ce_old.push_back({ d, new_tmp [j] });
                      if (new_tmp2[j] != nullptr) comm_ctx->ce_old.push_back({ d, new_tmp2[j] });
                  }
@@ -3119,7 +3119,7 @@ index 1804a7207..73ab4231b 100644
                  if (!comm_ctx->ce_fallback_warned) {
                      comm_ctx->ce_fallback_warned = true;
                      GGML_LOG_WARN("%s: could not allocate the copy-engine all-reduce scratch (%.2f MiB on "
-@@ -3462,8 +3460,57 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -3473,8 +3471,57 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
              comm_ctx->ce_tmp [i] = new_tmp [i];
              comm_ctx->ce_tmp2[i] = new_tmp2[i];
          }
@@ -3177,7 +3177,7 @@ index 1804a7207..73ab4231b 100644
  
      to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
      to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
-@@ -3756,6 +3803,348 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
+@@ -3767,6 +3814,348 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
      return true;
  }
  
@@ -3526,7 +3526,7 @@ index 1804a7207..73ab4231b 100644
  static bool ggml_backend_cuda_comm_init_ce(ggml_backend_cuda_comm_context * ret) {
      const size_t nb = ret->backends.size();
      if (nb < 2) {
-@@ -4307,6 +4696,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+@@ -4318,6 +4707,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
      return ggml_backend_cuda_host_buffer_type_dev(0);
  }
  
@@ -3604,7 +3604,7 @@ index 1804a7207..73ab4231b 100644
  //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
  //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
  //}
-@@ -5563,6 +6023,21 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -5574,6 +6034,21 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_DUP:
              ggml_cuda_dup(ctx, dst);
              break;
@@ -3626,7 +3626,7 @@ index 1804a7207..73ab4231b 100644
          case GGML_OP_CPY:
              ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
              break;
-@@ -5961,6 +6436,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -5972,6 +6447,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
      }
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
@@ -3651,7 +3651,7 @@ index 1804a7207..73ab4231b 100644
      CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
  }
  
-@@ -6158,7 +6651,8 @@ static void ggml_cuda_peer_copy_staged(
+@@ -6169,7 +6662,8 @@ static void ggml_cuda_peer_copy_staged(
      ggml_cuda_set_device(src_device);
  }
  
@@ -3661,7 +3661,7 @@ index 1804a7207..73ab4231b 100644
      ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
      ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
  
-@@ -6212,16 +6706,25 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+@@ -6223,16 +6717,25 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
  #endif // GGML_CUDA_NO_PEER_COPY
          }
  
@@ -3694,7 +3694,7 @@ index 1804a7207..73ab4231b 100644
      } else {
          // src and dst are on the same backend
          CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
-@@ -6229,6 +6732,15 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+@@ -6240,6 +6743,15 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
      return true;
  }
  
@@ -3710,7 +3710,7 @@ index 1804a7207..73ab4231b 100644
  static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
      ggml_cuda_async_input_drain(cuda_ctx->device);
-@@ -8365,6 +8877,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8376,6 +8888,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
  }
  
  
@@ -3719,7 +3719,7 @@ index 1804a7207..73ab4231b 100644
  static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .get_name                = */ ggml_backend_cuda_get_name,
      /* .free                    = */ ggml_backend_cuda_free,
-@@ -8394,6 +8908,12 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -8405,6 +8919,12 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
      /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
      /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
      /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
@@ -3732,7 +3732,7 @@ index 1804a7207..73ab4231b 100644
  };
  
  static ggml_guid_t ggml_backend_cuda_guid() {
-@@ -8945,6 +9465,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -8956,6 +9476,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              }
          case GGML_OP_DUP:
                  return true;
@@ -3743,7 +3743,7 @@ index 1804a7207..73ab4231b 100644
          case GGML_OP_ARGMAX:
          case GGML_OP_COUNT_EQUAL:
              return true;
-@@ -9241,7 +9765,11 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+@@ -9252,7 +9776,11 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
  // tier, and it is added by block 12, which defines that buffer type -- naming it here would leave blocks 09-11
  // uncompilable (`INVARIANTS.md` r307 fact 5).
  static bool ggml_backend_buft_is_cuda_host_expert(ggml_backend_buffer_type_t buft) {
@@ -3756,7 +3756,7 @@ index 1804a7207..73ab4231b 100644
  }
  
  // Issue #323: the host-expert offload relaxation, default ON.  `GGML_MOE_HOST_OFFLOAD=0` restores the
-@@ -9395,6 +9923,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
+@@ -9406,6 +9934,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
      return moe_cache_enabled() ? moe_cache_max_tok_dev(ctx->device) : 0;
  }
  
@@ -3779,7 +3779,7 @@ index 1804a7207..73ab4231b 100644
  static bool ggml_backend_cuda_device_moe_cache_rearm(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): re-arm the expert-cache arena after a compute-buffer drop returned the VRAM.
      (void) dev;
-@@ -9414,6 +9958,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
+@@ -9425,6 +9969,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t
  
  // wip/host-expert-tier: the persisted heat prior, so the loader can fill the pinned host-master tier in
  // descending hotness.  The prior is process-global in the cache, so any CUDA device serves.
@@ -3791,7 +3791,7 @@ index 1804a7207..73ab4231b 100644
  static void ggml_backend_cuda_device_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes) {
      (void) dev;
      moe_cache_set_host_pool_budget(bytes);
-@@ -9437,6 +9986,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
+@@ -9448,6 +9997,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
      moe_cache_set_host_source(tensor_data, path, offs, n_experts, host_bytes, total_bytes);
  }
  
@@ -3811,7 +3811,7 @@ index 1804a7207..73ab4231b 100644
  static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
      // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
      // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
-@@ -9571,11 +10133,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -9582,11 +10144,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .slab_set_ring_cap         = */ ggml_backend_cuda_device_slab_set_ring_cap,
      /* .slab_enabled              = */ ggml_backend_cuda_device_slab_enabled,
      /* .slab_ring_slots           = */ ggml_backend_cuda_device_slab_ring_slots,
@@ -3826,7 +3826,7 @@ index 1804a7207..73ab4231b 100644
  };
  
  // backend reg
-@@ -9690,6 +10254,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -9701,6 +10265,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
          return (void *)ggml_backend_cuda_comm_allreduce_tensor;
      }

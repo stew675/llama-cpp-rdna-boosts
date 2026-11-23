@@ -3347,6 +3347,22 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
   so `GGML_CUDA_ASYNC_INPUT=0` left a pending done-event naming the stream the context destructor destroys
   and the next context on that device recorded on the dead handle (`invalid resource handle`).  A no-op when
   nothing is pending; both arms now give the same results.
+* **The GDN output-norm fold takes a SILU gate too** (r353, contributor PR #357).  `ggml_cuda_gdn_norm_gate_match`
+  accepted `GGML_UNARY_OP_SIGMOID` only (qwen4exp), but the qwen35 / qwen35moe / qwen3next / clover-moe gate is
+  `ggml_silu` (`build_norm_gated()`), so on the delivery's own GDN families the fold never fired: the `RMS_NORM` +
+  `MUL` of the layer's output ran as two kernels per decode step (48 GDN layers on the 27B).  The `gate -> Q8_1`
+  kernel (`unary_gated_q8_1_norm_kernel`) was already templated on the gate op and
+  `ggml_cuda_op_unary_mul_q8_1` already dispatched `SILU -> op_silu`, so the change is the matcher, the skip and
+  the `ggml_cuda_can_fuse` unary-op argument -- the SIGMOID path is byte-for-byte the predicate it was.  The
+  in-kernel norm reduces like `rms_norm_f32`'s strided path, so the fold is **bit-identical**: prefill-logit
+  `--ab` at `--ub 1` / `--ub 4` / the canonical point reads −0.000000 / 100.000 %, greedy text unchanged on 27B
+  and 35B-A3B (1 GPU and 3-GPU `-sm tensor`, plus a two-slot `--kv-unified` server), and the census
+  (`GGML_CUDA_FUSE_GDN_NORM_GATE_CENSUS=1`) proves the arm is not vacuous: `fused silu=240` against
+  `fused sigmoid=0` at default, `declined silu=240` with `GGML_CUDA_FUSE_GDN_NORM_GATE_SILU=0`.  Worth **+0.5 %**
+  tg128 at depth 8192 on the 27B and **+0.9 %** on 35B-A3B (nothing at depth 0 beyond noise; `-npl 1,4,8`
+  +1.1 / +0.1 / +0.05 %).  Gate: `scripts/gate-gdn-norm-gate.sh`; knobs: `ENVIRONMENT.md` §7.1.
+  The `xn->ne[3] != 1` shape guard is unchanged, so a multi-sequence ubatch still never matches this fold
+  (the r108 / `GREEDY-PURITY.md` §49 class); `tests/test-fusion-gate-beta-multiseq` re-run 77/77 after the change.
 * **Async graph-input ring**: batched uploads + lazy done event (PR #182), and the r90 fix that snapshots
   the source through the pinned ring — the scheduler uses `set_tensor_async` for a *CPU split's* output,
   which the next ubatch rewrites, so a direct copy from the caller's live pointer could read the next
@@ -3420,7 +3436,8 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
 `GGML_CUDA_GDN_TAIL`, `GGML_CUDA_GRAPH_MEM_GEN`, `GGML_META_SPLIT_COPY`, `GGML_META_SEG_ASYNC`,
 `GGML_CUDA_FUSE_GATE_BETA_BF16` / `GGML_CUDA_FUSE_GDN_CONV_NORM` / `GGML_CUDA_FUSE_CONT_GATE_Q8_1` /
 `GGML_CUDA_FUSE_GDN_NORM_GATE` (r102, all default-on kill-switches; the first is multi-sequence-clean since
-r108 and has a shipped regression test),
+r108 and has a shipped regression test) and its r353 SILU widening
+`GGML_CUDA_FUSE_GDN_NORM_GATE_SILU` + the `GGML_CUDA_FUSE_GDN_NORM_GATE_CENSUS` diagnostic,
 `GGML_CUDA_DISABLE_ROPE_FWHT_SET_ROWS` (now live on iSWA archs, not only on the non-iSWA builder),
 `LLAMA_KV_N_PAD_PREFILL`(+`_FROM`/`_MIN`).
 
@@ -3429,7 +3446,10 @@ empty-or-whole per device for a per-row op, for a rotated-K `mul_mat`, and for t
 multi-sequence ubatch; a split that straddles the reduction is rejected, never approximated.  Every new
 acceptance must come with the same-shape refusal for the straddling case (`GREEDY-PURITY.md` §45).
 
-**Gate.**  Debugging the slab or the arena: `GGML_CUDA_SLAB_STATS=1` (arm/drop/destructor accounting,
+**Gate.**  The GDN output-norm fold (r102, SILU since r353): `scripts/gate-gdn-norm-gate.sh` (the census
+mechanism on both GDN families at `-ub 1` and `-ub 8`, the switch's own non-vacuity, and byte-identical text
+at `-ub 2/4/8/512`; `--kld` adds the `--ub 1`/`--ub 4` exact-fallback logit points).
+Debugging the slab or the arena: `GGML_CUDA_SLAB_STATS=1` (arm/drop/destructor accounting,
 `hole=0` and `outside_failed=0` are the acceptance signals).
 
 ---

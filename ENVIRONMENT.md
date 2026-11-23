@@ -726,7 +726,7 @@ gather -- with a deferred gather the kernel reads the cache row through the gath
 `GET_ROWS` output may hold the SCALE outputs and the buffer that must not be aliased is the cache tensor,
 r320), `GGML_CUDA_FUSE_CONT_GATE_Q8_1` (the attention gate's row-strided view read in
 place by the gate -> Q8_1 kernel, so its CONT copies nothing) and `GGML_CUDA_FUSE_GDN_NORM_GATE` (qwen4exp's
-GDN output `RMS_NORM * w` computed inside the gate kernel).  Worth +0.2-0.3 % on 27B MTP and +0.7 % on
+GDN output `RMS_NORM * w` computed inside the gate kernel; **SIGMOID gates only until r353** -- see below).  Worth +0.2-0.3 % on 27B MTP and +0.7 % on
 Flash-Next 2 GPU `-sm tensor` + MTP, flat on 35B-A3B 1 GPU.  The GDN-norm pair is the only fusion in the set
 whose skip and emit are two decisions (the norm node comes before the gate that computes it): while a norm is
 pending no other fusion may start in between, so the two abort tripwires are unreachable.
@@ -755,6 +755,22 @@ kill-switch, and added a census for both families:
 The same idiom — and therefore also default-on despite the name — covers
 `GGML_CUDA_DISABLE_IDX_RELU_SUM`, `GGML_CUDA_CONCAT_VERIFY`, (r46, block 15) `GGML_CUDA_FUSE_GDN_STATE_GATHER` and
 (r183, block 10) `GGML_CUDA_DISABLE_GDN_CONV_SNAP`.
+
+**r353 (contributor PR #357) widened the GDN output-norm fold to a SILU gate**, which is what `qwen35` / `qwen35moe` /
+`qwen3next` / `clover-moe` emit (`build_norm_gated()` -> `ggml_silu`).  r102's matcher took a SIGMOID gate only, i.e.
+qwen4exp, so the fold had never fired on the two GDN families the delivery validates (census: `fused sigmoid=0`).  The
+`gate -> Q8_1` kernel (`unary_gated_q8_1_norm_kernel`) was already templated on the gate op, so the widening is a
+matcher change and nothing else: the same two launches per GDN layer per step (`RMS_NORM` + `MUL`; 48 GDN layers on the
+27B) stop running, and the result is **bit-identical** -- `gate-prefill-logits.sh --ab "GGML_CUDA_FUSE_GDN_NORM_GATE_SILU=0"`
+reads −0.000000 / 100.000 % at `--ub 1`, `--ub 4` and the canonical point, the greedy text is unchanged on 27B and
+35B-A3B at 1 GPU and 3-GPU `-sm tensor`, and a two-slot `--kv-unified` server answers identically.  Measured **+0.5 %**
+tg128 at depth 8192 (27B UD-Q4_K_XL) and **+0.9 %** (35B-A3B UD-Q4_K_M), nothing at depth 0 beyond the run-to-run
+spread, and `llama-batched-bench -npl 1,4,8` +1.1 / +0.1 / +0.05 %.  Gate: `scripts/gate-gdn-norm-gate.sh`.
+
+| variable | default | class | what |
+|---|---|---|---|
+| `GGML_CUDA_FUSE_GDN_NORM_GATE_SILU` | **on** (r353, block 10) | **kill-switch** | `0` restores the SIGMOID-only matcher, i.e. the r352 behaviour: on a SILU model the norm and its `MUL` run as their own kernels again and the census reports those gates as *declined*.  This is the A/B arm of `scripts/gate-gdn-norm-gate.sh` and of the `gate-prefill-logits.sh --ab` points above. |
+| `GGML_CUDA_FUSE_GDN_NORM_GATE_CENSUS` | unset | **diagnostic** | `1` makes the context destructor log `GDN_NORM_GATE_CENSUS dev=<d> silu=on\|off fused sigmoid=<n> silu=<n> declined silu=<n>`.  All three counters are taken **at the gate node** where the host walks the graph (so a replayed graph adds nothing), and the *declined* one is computed only while the census is on -- a passing run pays nothing for it, and a `SILU=0` arm is proved non-vacuous by `declined silu>0`.  `fused silu=0` on a SILU model means the fold did not fire; `fused sigmoid>0` on one means the matcher mis-attributed the gate op.  Presence-gated (`NULL` or `0` = off), so unlike the §7.1 switches it is OFF by default. |
 
 `GGML_CUDA_DISABLE_NORM_PAIR` is value-gated (listed with §7.2): `0` keeps the paired GDN q/k norm.
 

@@ -2338,3 +2338,39 @@ block 17.
    `v<N>` prefix is derived from it (`scripts/make-release.sh`), so removing the 18th official block moves
    the release from `v18-` to `v17-` on its own; `n_default` follows (`18`), and `validate-set.sh` /
    CI read the counts from `release.json` rather than carrying them.
+
+## r353 (2026-11-23, `WORKLOG.md` 261123.004) — a fold's matcher can be dead on the models the delivery validates, and a dead matcher moves no hash: the SILU GDN output-norm fold (block 10, contributor PR #357)
+
+1. **`ggml_cuda_gdn_norm_gate_match` accepted a SIGMOID gate only, so the fold never fired on qwen35 or
+   qwen35moe.**  r102 (PR #200) built the fold for qwen4exp's GDN output gate, which is `ggml_sigmoid`; the
+   qwen35 / qwen35moe / qwen3next / clover-moe `build_norm_gated()` emits `ggml_silu`, and the census proves
+   it: `fused sigmoid=0 silu=0` on r352 for both families, i.e. two launches per GDN layer per decode step
+   (48 layers on the 27B) ran for nothing on the delivery's own models.  The kernel
+   (`unary_gated_q8_1_norm_kernel<op>`) and `ggml_cuda_op_unary_mul_q8_1`'s dispatch already took `op_silu`,
+   and `ggml_cuda_can_fuse({UNARY, MUL})` already admitted SILU, so the missing dimension was purely the
+   matcher's op predicate (`GREEDY-PURITY.md` §108).
+2. **The widening is bit-identical, and the instrument is the exact-fallback KLD at every width the fold
+   reaches** (`GREEDY-PURITY.md` §60 rule 2): the in-kernel norm reduces like `rms_norm_f32`'s strided path, so
+   `gate-prefill-logits.sh --ab "GGML_CUDA_FUSE_GDN_NORM_GATE_SILU=0"` reads **−0.000000 / 100.000 %** at
+   `--ub 1` (the decode graph, where the fusion fires 96 times), `--ub 4` (48) and the canonical prefill point,
+   and the canonical point read against a base recorded from the r352 build on the same ROCm line is
+   **0.000000 / 100.000 %**.  Greedy text is unchanged everywhere measured: 27B UD-Q4_K_XL `2d0d685256cf`,
+   35B-A3B UD-Q4_K_M `abed0bf40d87` (the r324 anchor), 3-GPU `-sm tensor` `9051286a12ae`, and a two-slot
+   `--kv-unified` server's two concurrent greedy answers.
+3. **A dead matcher is a MECHANISM defect, so the gate is a census, and the OFF arm needs its own counter.**
+   `GGML_CUDA_FUSE_GDN_NORM_GATE_CENSUS=1` logs `fused sigmoid=<n> silu=<n> declined silu=<n>` from the context
+   destructor; on r353 the 27B reads `96` (`-ub 1`) / `528` (`-ub 8`) fused-SILU with `declined=0`, and the
+   `GGML_CUDA_FUSE_GDN_NORM_GATE_SILU=0` arm reads `fused silu=0 declined silu=528`.  Both counters are taken
+   **at the gate node** (the earlier revision counted the decline at the `RMS_NORM`, which cost a full match per
+   norm in an A/B arm) and the declined one is computed only while the census is on.  The two counts are NOT
+   required to be equal: a two-slot unified server measured `fused=384` against `declined=672`, because the arms
+   capture different numbers of graphs -- non-zero on both is the invariant.
+4. **The multi-sequence guard is unchanged and is what keeps this out of the r108 class.**  `xn->ne[3] != 1`
+   refuses a fold on a multi-sequence ubatch, so no arm of the fold reaches the shape `GREEDY-PURITY.md` §49
+   covers; `tests/test-fusion-gate-beta-multiseq` still reads 77/77, and a two-slot unified server answers
+   identically with the switch on and off.
+5. **The win is small and it is at depth, not at depth 0**: tg128 **+0.5 %** (27B UD-Q4_K_XL, d8192) and
+   **+0.9 %** (35B-A3B UD-Q4_K_M, d8192) over two interleaved rounds on one R9700 (ROCm 10.2), depth 0 within the
+   run-to-run spread (+0.1 % / +0.5 %, the 35B-A3B's first run after load being the low outlier), and
+   `llama-batched-bench -npl 1,4,8` +1.1 / +0.1 / +0.05 % with pp512 flat.  The mechanism is two launches per GDN
+   layer per step, so the win scales with a launch's cost, not with the model.

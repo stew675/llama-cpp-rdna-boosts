@@ -8,8 +8,8 @@ improved without shipping it.
 |---|---|
 | artifact | `prefill-decode-arms.patch` |
 | sha256 | `91ed992063afc61cdae0a4fa22decac897383a6e5465e27739bc5ceb012d558d` |
-| cut against | the r352 default tree (`release.json` `.tree`, `0d2f70e6c`) |
-| applied tree (alone, on that tree) | `8851b0d02b74060f462088617e8a7ff328c8c5ed` — **exactly the r351 release tree**, so this artifact restores the withdrawn block and nothing else |
+| cut against | the r352 default tree (`0d2f70e6c`); **re-verified at r353** (`git am` strict on the r353 tree `27db9bfd4ef7f41c7df60f704410de28863beac3`), unchanged, because r353 amends block 10 and none of this patch's files |
+| applied tree (alone, on that tree) | on r352 `8851b0d02b74060f462088617e8a7ff328c8c5ed` — **exactly the r351 release tree**, so this artifact restores the withdrawn block and nothing else; on r353 `4105968be4201eacf7c3327b7f500ec5b6b5d3aa` (the same relation one release later) |
 | apply | `scripts/apply-all.sh --include-beta .` (one `git am` commit on top of the verified release tree) |
 | was block | `0017` (official `00xx`, 18th block, r346-r351) |
 
