@@ -2422,3 +2422,33 @@ delivery revision that eventually carries the change, if it is promoted, is the 
    behaviour.  The non-vacuity check is structural: link the built library and assert the returned handle is
    a real stream (`0x558a…`), not `hipStreamPerThread` (`0x2`), not the default (`0x0`), stable across calls
    and distinct per device and per thread — `wip/prefill-decode-arms-v2/gates/probe-host-stream.cpp`.
+
+## r355-wip (2026-11-23, `WORKLOG.md` 261123.008) — a context can BORROW another context's `llama_memory`, and a guard written against `cparams.*` tests what the constructor DECIDED, not what the caller ASKED (`prefill-decode-arms` v2 STEP 2)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 2, nothing in `patches/` changed.
+
+1. **"Shares the KV" must be structural, not per-module.**  `llama_context_params::ctx_memory` gives a
+   context the owner's `llama_memory_i` object **itself** (`llama_get_memory(borrower) ==
+   llama_get_memory(owner)`), so every memory module — `llama_kv_cache`, `llama_memory_recurrent`,
+   `llama_memory_hybrid`, `llama_kv_cache_iswa`, the qwen4exp indexer pool, and anything added later —
+   shares by construction.  The alternative (a second module taught to *view* the first's cells) makes
+   sharing a property each module must opt into, and a module that is not taught reads an EMPTY cache
+   while the log says it is shared — fluent wrong text, no crash, no gate.  One object, one truth.
+2. **The borrower owns nothing: `llama_context` keeps `memory_own` (unique_ptr) and `memory` (raw pointer to
+   either its own or the borrowed object).**  Every graph builder and every `llama_memory_*` call reads
+   `memory`, so there is one code path and no per-context shadow of the memory's bookkeeping.  Freeing the
+   borrower must not release the memory, so teardown order is part of the API contract: **the owner
+   outlives the borrower** (verified: the owner still decodes after the borrower is freed; a borrower that
+   freed the memory fails there, one that freed it twice aborts).
+3. **A guard on `cparams.<x>` tests the constructor's DECISION, not the caller's REQUEST.**  `cparams.ctx_other`
+   is zeroed by the constructor and re-adopted only for the four architectures that need one
+   (gemma4-assistant, eagle3, dflash, qwen4exp), so a "ctx_memory and ctx_other are mutually exclusive" guard
+   written against `cparams.ctx_other` was **dead on every other model** — it would have refused the
+   contradiction exactly where `ctx_other` is meaningful and silently allowed it everywhere else.  Guards on a
+   request belong on `params.*`.  Caught by the probe, not by any text gate (both arms read the same text).
+4. **A text oracle cannot see a dead borrow either.**  Two contexts on one memory and two contexts on two
+   memories both produce identical greedy text for a single request — the difference only appears when the
+   second context reads the first's cells.  The instrument is: identity of the two `llama_get_memory()`
+   pointers, a **negative control** (two unborrowed contexts must hold *different* memories, or "the pointers
+   are equal" proves nothing about the borrow), and a decode whose rows are written by one context and read
+   by the other (`gates/probe-ctx-memory.cpp`).

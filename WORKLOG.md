@@ -1,3 +1,46 @@
+## 261123.008 (no release; `prefill-decode-arms` v2 STEP 2) -- `llama_context_params::ctx_memory`: a context that *borrows* another context's `llama_memory`, so "shares the KV" is true by construction for every module, including ones that do not exist yet
+
+`PLAN.md` STEP 2.  **Delivery untouched** (nothing in `patches/`, `release.json` unchanged); the change is
+on `~/llama.cpp` branch `arms-v2` and stored as
+[`wip/prefill-decode-arms-v2/steps/STEP-2-0002-ctx-memory-borrow.patch`](wip/prefill-decode-arms-v2/steps/STEP-2-0002-ctx-memory-borrow.patch).
+
+### 1. What the API is
+
+`llama_context_params::ctx_memory` (default `nullptr`): use **that context's `llama_memory` object itself**
+instead of creating a private one — the same cells, the same recurrent state, the same indexer cache, for the
+whole life of the borrower.  Nothing is copied, and the borrower never frees it.  Documented contracts: same
+model, the owner outlives the borrower, and `ctx_memory` and `ctx_other` are mutually exclusive on one context
+(`ctx_other` already means MTP draft target / assistant view / token_embd donor, and each of those keeps its
+own memory).  `llama_context` splits the member into `memory_own` (a `unique_ptr`, this context's own) and
+`memory` (a raw pointer to whichever object it is on), so every graph builder and every `llama_memory_*` call
+has **one** code path and there is no "which memory am I on" question anywhere.
+
+**What this buys, and why it is the whole design:** the set of memory modules that work is now *all of them*.
+The previous attempt needed every module to be taught to expose a shared *view*, and a module that was not
+taught left the second context on an empty cache while the log said the KV was shared — the silent-garbage P0.
+Here there is one object, so `llama_kv_cache`, `llama_memory_recurrent`, `llama_memory_hybrid`,
+`llama_kv_cache_iswa`, the qwen4exp indexer pool and any module added later all share for free.
+
+### 2. A finding inside the guard itself: `cparams.ctx_other` is FILTERED
+
+The first version refused the contraction by testing `cparams.ctx_other`, and the probe caught it **not
+firing**: the constructor zeroes `cparams.ctx_other` and re-adopts it only for the four architectures that
+need one (gemma4-assistant, eagle3, dflash, qwen4exp), so on every other model the guard was dead — it would
+have refused the contradiction on exactly the models where `ctx_other` is meaningful and allowed it on all the
+others.  The check is on the **requested** `params.ctx_other`.  Recorded in `INVARIANTS.md` because it is
+general: a guard written against `cparams.<x>` tests "the constructor decided", not "the caller asked".
+
+### 3. Oracles
+
+| oracle | result |
+|---|---|
+| `gates/probe-ctx-memory.cpp` (new, 4B Q8_0 + phi-4 as the second model) | **PASS**, 11/11 checks: identity (`llama_get_memory(b) == llama_get_memory(a)`, `0x55fe1f3ea260` both); the **negative control** (two unborrowed contexts hold *different* memories — without it "the pointers are equal" proves nothing); the work (a fresh pair's owner prefills, its **borrower** decodes the next two rows: `t1=11751 t2=13` — identical to the owner-only arm); both contract refusals (different model, and `ctx_other`); and teardown with the borrower freed first, after which the owner still decodes (I2) |
+| A1 / A2 | `be904e86f248` / `10a82b5559a9` — unchanged |
+| A6 (2 slots `--kv-unified`, 2 concurrent) | `{142 chars 7bd542418112, 207 chars 6ce1f88dd5f7}` — unchanged |
+| A6 **startup log shape** vs the STEP 0 anchor (`baseline/norm-log.sh`) | **byte-identical** (11 lines) — the borrow's INFO line appears only when the pair is on |
+| A4 prefill-logit KLD | **0.000000 / 100.000 %**, GPU journal clean |
+| `scripts/gate-draft-ctx.sh` (external MTP head) | text arms **PASS 5/5**: plain and two `draft-mtp` runs all read `e7aae6034b4f`, acceptance 0.81429 (the drafter really drafted, so this is not two plain runs wearing different flags) and **no** same-model refusal.  Its **census arm FAILS by construction on this tree** — it looks for block 17's `is a context of ANOTHER model (a draft head)` line, and that string exists only in `beta/prefill-decode-arms/prefill-decode-arms.patch` (the r352 withdrawal removed the generic `ctx_other` arm it belonged to; `AGENTS.md` lists this gate as **beta-only since r352**).  The STEP 2 change cannot have caused it: the message is not in the delivery source at all.  Reported with the STEP 2 landing rather than waived silently |
+
 ## 261123.007 (no release; `prefill-decode-arms` v2 STEP 1) -- three backend concurrency fixes land as one independent change: the synchronous host stream stops being the stream a graph capture owns, a refused peer descriptor stops aborting the pool, and `ggml_cuda_pool_peer_copy_ok` is defined in every configuration
 
 `PLAN.md` STEP 1 of [`wip/prefill-decode-arms-v2/`](wip/prefill-decode-arms-v2/README.md).  **Delivery
