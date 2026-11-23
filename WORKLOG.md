@@ -1,3 +1,56 @@
+## 261123.010 (no release; `prefill-decode-arms` v2 STEP 4) -- the Meta view slot becomes a per-context IDENTITY: 8 slots, a pair per context, and a selector that is thread-local because it selects state inside a shared buffer
+
+`PLAN.md` STEP 4 (defect V3).  **Delivery untouched**; the change is on `~/llama.cpp` branch `arms-v2` and
+stored as
+[`wip/prefill-decode-arms-v2/steps/STEP-4-0004-meta-view-slot-identity.patch`](wip/prefill-decode-arms-v2/steps/STEP-4-0004-meta-view-slot-identity.patch).
+
+### 1. The defect, restated as it actually was
+
+The Meta backend keeps, per (buffer, view slot), a rotating **pair** of view containers, and a graph must be
+built *and* resolved under the same slot.  The selector was posted unconditionally to `alt ? 1 : 0` -- a
+**role** ("is this the second scheduler of `ctx_other`?").  A pair with a drafter is **three** contexts and
+**two** roles, so the decode context and the draft context posted the same slot.  They are used sequentially
+on one thread today, so it worked; the container is per **buffer** (shared by every thread), so that was
+luck, not a contract.  Two further facts came out of the fix:
+
+* the selector was a plain `static int`, **not** `thread_local` -- so even with per-context slots, two contexts
+  building graphs on two threads would have overwritten each other's selection.  It is now `thread_local`;
+  the thread that builds a graph is the thread that resolves it.
+* 2 slots cannot express 3 contexts.  `n_view_slots` is **8** (four pairs), a slot's pair is created on its
+  first use (an unused slot costs nothing), and both the setter and `compute_container()` assert the range.
+
+### 2. The identity
+
+Each `llama_context` takes a pair from a process-wide counter, **once**, at construction:
+`meta_slot_base = 2 * (n % 4)`, and `meta_bind_view_slot(alt)` sets `base + alt`.  It is bound at the top of
+`sched_reserve()` (a reserve can happen with no alt-state change, so it never goes through
+`sched_alt_select()`) and in `sched_alt_select()`, i.e. on every path that can build or reserve a graph, on
+the thread that builds it.  The contract is stated where the member is declared: a context is never inside two
+graphs at once, so its two slots suffice; what must be unique per context is the **slot identity**.  A fifth
+concurrent context wraps and **warns**, naming what it collides with, rather than silently sharing.
+
+The census is on the line that only exists when it matters: the STEP 2 borrow line now carries both pairs
+(`Meta view slots 2/3 and 0/1`).  The per-context base line is **DEBUG**, deliberately: an INFO line per
+context would add a line to the startup log of every single-context run (llama-cli, llama-bench, every gate)
+for a diagnostic only a multi-context run reads -- and STEP 0's anchor says that log shape is byte-identical.
+
+### 3. Oracles
+
+| arm | shape | result |
+|---|---|---|
+| `gates/probe-meta-slots.cpp` (new) | 27B Q8_0, **3 devices `-sm tensor`** (so the Meta backend is really built), 3 contexts: owner, borrower, and a third live context | **PASS 11/11**: bases **0, 2, 4** -- distinct, even (pair boundaries), pairs inside the backend's 8; the same prefill+decode reads token **11751** with 2 contexts live and with 3 |
+| `GGML_META_DEBUG_SET=1` | 27B, 3 devices `-sm tensor`, `-n 16` | **0 `MISSING child` lines**; text `26b1dc6dd4ad` |
+| A1 / A2 | 4B 1 GPU / 27B 3 GPU tensor | `be904e86f248` / `10a82b5559a9` -- unchanged |
+| A6 + **startup shape** | 2 slots `--kv-unified`, 2 concurrent | `{142 ch 7bd542418112, 207 ch 6ce1f88dd5f7}`; `diff` empty against the STEP 0 shape (the DEBUG line is invisible) |
+| A4 | prefill-logit | **0.000000 / 100.000 %** |
+
+### 4. Note on the split-state cache
+
+`ggml_backend_meta_buffer_context`'s **versioned split-state cache** (8 versions, keyed by the tensor bytes a
+state was computed from) is *not* indexed by view slot, and does not need to be: it already survives graph
+alternation by version, which is the reason it exists (upstream's SIGSEGV fix).  Left exactly as it is; a
+per-slot index there would be a second mechanism for one job.
+
 ## 261123.009 (no release; `prefill-decode-arms` v2 STEP 3) -- one allocator and one lock: a prepared batch's cells are RESERVED (so a second context cannot take them) and every bookkeeping call takes the memory's own mutex
 
 `PLAN.md` STEP 3.  **Delivery untouched**; the change is on `~/llama.cpp` branch `arms-v2` and stored as

@@ -2493,3 +2493,29 @@ delivery revision that eventually carries the change, if it is promoted, is the 
    delivery-tooling change), and a fresh-process comparison on that shape needs **one request in flight**:
    even pinned, two concurrent 2-slot arms differed across runs (147 vs 188 chars) because the interleaving
    picks the batch composition and the batch composition picks the kernels.
+
+## r357-wip (2026-11-23, `WORKLOG.md` 261123.010) — a view slot keyed on a ROLE breaks at three contexts, a `static` selector is not a thread's, and 2 slots cannot express 3 contexts (`prefill-decode-arms` v2 STEP 4)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 4, nothing in `patches/` changed.
+
+1. **The Meta backend's view slot must be an IDENTITY (per context), never a ROLE.**  The backend keeps a
+   rotating PAIR of view containers per (buffer, slot) and a graph must be built *and* resolved under the same
+   slot.  Posting `alt ? 1 : 0` encodes "the second scheduler of `ctx_other`", and a pair plus a drafter is
+   **three contexts and two roles** -- so the decode context and the draft context shared a pair.  It works
+   today only because they are used sequentially on one thread; the container is per **buffer** (shared by
+   every thread), so sequential use is luck, not a contract.
+2. **A selector that picks state inside a BUFFER must be `thread_local`.**  `g_meta_view_slot` was a plain
+   `static int`: with per-context slots and two threads building graphs, both threads write the same selector
+   and one context resolves another's views.  The thread that builds a graph is the thread that resolves it.
+3. **2 slots cannot express 3 contexts.**  `n_view_slots` is 8 (four pairs), a pair is created on its first
+   use (an unused slot costs nothing), and both the setter and the container accessor assert the range.  A
+   fifth concurrent context must WARN that it wraps -- sharing a slot silently is the defect returning.
+4. **A reserve builds a graph too.**  Binding the slot only in the alt-scheduler switch leaves a reserve with
+   no alt-state change under whatever slot the thread last posted, so it is bound at the top of
+   `sched_reserve()` as well as in `sched_alt_select()`.
+5. **The versioned split-state cache is not a view slot and needs no per-slot index.**  It survives graph
+   alternation by VERSION (8, keyed on the tensor bytes the state was computed from), which is what upstream's
+   SIGSEGV fix introduced; indexing it per slot would be a second mechanism for one job.
+6. **A per-context diagnostic line at INFO changes every single-context startup log.**  The view-slot base is
+   logged at DEBUG, and the pair's census goes on the BORROW line (which exists only when it matters), so the
+   default path's startup shape stays byte-identical -- which is what lets that shape be an anchor at all.

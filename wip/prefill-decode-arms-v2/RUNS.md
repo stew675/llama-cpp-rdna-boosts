@@ -8,6 +8,24 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — STEP 4: the Meta view slot is a per-context identity (`WORKLOG.md` 261123.010)
+
+3 files, +74/-7 (`ggml/src/ggml-backend-meta.cpp`, `src/llama-context.{h,cpp}`).
+
+| arm | shape | result |
+|---|---|---|
+| `gates/probe-meta-slots.cpp` (new) | 27B Q8_0, 3 devices `-sm tensor` (the Meta backend is really built), 3 contexts (`owner`, `borrower`, a third live context) | **PASS 11/11**: bases **0 / 2 / 4**, distinct, even, pairs inside the backend's 8; identical token (11751) with 2 and with 3 contexts live |
+| `GGML_META_DEBUG_SET=1` | same model/shape, `-n 16` | **0 `MISSING child`** lines; text `26b1dc6dd4ad` |
+| A1 / A2 | 4B 1 GPU / 27B 3 GPU tensor | `be904e86f248` / `10a82b5559a9` |
+| A6 + startup shape | 2 slots `--kv-unified`, 2 concurrent | `{142 ch 7bd542418112, 207 ch 6ce1f88dd5f7}`, shape `diff` empty |
+| A4 | prefill-logit | 0.000000 / 100.000 % |
+
+The per-context base line is DEBUG by design (an INFO line per context would add a line to every
+single-context run's startup log, breaking the STEP 0 anchor for a diagnostic only a multi-context run
+reads); the census rides on the STEP 2 borrow line: `Meta view slots 2/3 and 0/1`.
+
+---
+
 ## 2026-11-23 — STEP 3: one allocator, one lock (`WORKLOG.md` 261123.009)
 
 13 files, +314/-19 (`src/llama-memory.h`, `src/llama-kv-cache.{h,cpp}`, the 8 composite memory headers,

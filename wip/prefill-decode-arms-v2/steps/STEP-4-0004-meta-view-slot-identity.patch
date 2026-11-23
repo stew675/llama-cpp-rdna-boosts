@@ -1,0 +1,173 @@
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index b71bc089e..1ab2c1bba 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -807,10 +807,25 @@ struct ggml_backend_meta_simple_tensor_container {
+ // The external views of a buffer live in a rotating pair of containers that assumes ONE live graph: a rebuild
+ // clears the container the previous graph used.  A second live graph (a second scheduler of the same context)
+ // selects its own view slot, so the two graphs keep separate pairs and do not clear each other's views.
+-static int g_meta_view_slot = 0;
++//
++// The slot is an IDENTITY, not a role: each llama_context owns a PAIR of slots (base, base + 1) from a
++// process-wide counter, assigned once at construction (see llama_context::meta_slot_base).  Deriving it from a
++// role -- "is this the ctx_other context?" -- gives a pair with a drafter THREE contexts and only two roles,
++// so the decode context and the draft context shared a pair; they are used sequentially on one thread today,
++// but the container is per BUFFER, so that was luck, not a contract.
++//
++// `thread_local` is load-bearing: the slot selects state inside a BUFFER (shared by every thread), so two
++// contexts building graphs on two threads must not see each other's selection.  The thread that builds the
++// graph is the thread that resolves it.
++static thread_local int g_meta_view_slot = 0;
++
++// 8 slots = 4 contexts' pairs.  Two arms + a drafter is 3; the counter refuses to promise more than it can
++// keep (llama_context warns once when it has to wrap).
++static constexpr int g_meta_n_view_slots = 8;
++static_assert(g_meta_n_view_slots % 2 == 0, "each context owns a PAIR of view slots");
+ 
+ void ggml_backend_meta_set_view_slot(int slot) {
+-    GGML_ASSERT(slot >= 0 && slot < 2);
++    GGML_ASSERT(slot >= 0 && slot < g_meta_n_view_slots);
+     g_meta_view_slot = slot;
+ }
+ 
+@@ -833,8 +848,9 @@ struct ggml_backend_meta_buffer_context {
+     // Current solution: rotating set of 2 "compute" containers to hold external views, works correctly for llama.cpp.
+     // Long-term: tie the lifetime of external views to the meta backend executing the graph instead,
+     //     currently not possible due to graph-external operations in the backend scheduler.
+-    // stc_compute[slot][2]: one rotating pair per view slot (see g_meta_view_slot); slot 1 is created on first use
+-    static constexpr int n_view_slots = 2;
++    // stc_compute[slot][2]: one rotating pair per view slot (see g_meta_view_slot); a slot's pair is created on
++    // its first use, so an unused slot costs nothing
++    static constexpr int n_view_slots = g_meta_n_view_slots;
+     ggml_backend_meta_simple_tensor_container stc_static;
+     ggml_backend_meta_simple_tensor_container stc_compute[n_view_slots][2];
+     // views created between graph evals, reset by their creator once the copies that read them are done
+@@ -922,6 +938,7 @@ struct ggml_backend_meta_buffer_context {
+     // container `index` of the current view slot, created on the slot's first use
+     ggml_backend_meta_simple_tensor_container & compute_container(int index) {
+         const int slot = g_meta_view_slot;
++        GGML_ASSERT(slot >= 0 && slot < n_view_slots);
+         if (slot > 0 && stc_compute[slot][0].ctxs.empty()) {
+             for (auto & stc : stc_compute[slot]) {
+                 stc = ggml_backend_meta_simple_tensor_container(stc_compute_params, (int) bufs.size());
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a51ca54f4..519436f18 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,5 +1,6 @@
+ // Fold (r96, PR #189): std::find in llama_state_sync_all.
+ #include <algorithm>
++#include <atomic>
+ 
+ #include "llama-context.h"
+ 
+@@ -508,6 +509,27 @@ llama_context::llama_context(
+     t_start_us = model.t_start_us;
+     t_load_us  = model.t_load_us;
+ 
++    // the Meta backend view slot PAIR this context owns (see meta_slot_base).  One counter for the process, so
++    // two contexts can never be handed the same pair; 8 slots = 4 pairs, and a fifth context wraps with a
++    // warning rather than silently sharing a slot with a live context (which is the defect this replaces).
++    {
++        static std::atomic<int> n_meta_contexts{0};
++        const int idx = n_meta_contexts.fetch_add(1);
++        const int n_bases = 4;   // 8 view slots / one pair per context
++        meta_slot_base = 2 * (idx % n_bases);
++        if (idx >= n_bases) {
++            LLAMA_LOG_WARN("%s: %d live contexts but only %d Meta view-slot pairs: this context WRAPS to base "
++                    "%d and shares its views with context %d -- a context that is freed before the next is "
++                    "created does not hold a slot, so this means several are alive at once\n",
++                    __func__, idx + 1, n_bases, meta_slot_base, idx % n_bases);
++        }
++        // DEBUG, not INFO: a per-context line at INFO would change the default-path startup log of every
++        // single-context run (llama-cli, llama-bench, every gate) for a diagnostic only a multi-context run
++        // reads -- and the pair's census belongs on the borrow line below, which exists only when it matters.
++        LLAMA_LOG_DEBUG("%s: this context %p owns Meta view slots %d/%d (context #%d of the process)\n",
++                __func__, (const void *) this, meta_slot_base, meta_slot_base + 1, idx + 1);
++    }
++
+     const auto & hparams = model.hparams;
+ 
+     llama_context_set_fa_tensor_parallel_hint(model);
+@@ -1032,10 +1054,13 @@ llama_context::llama_context(
+             // Two pointers and both widths, so a log reader can check the identity (I1) without a debugger.  This
+             // line is INFO and appears ONLY when the pair is on, so the default path's startup log is unchanged.
+             LLAMA_LOG_INFO("%s: this context %p BORROWS the memory of context %p (memory %p): one memory object, "
+-                    "two contexts; the owner must outlive this one (n_batch %u, n_ubatch %u; the owner's are %u, %u)\n",
++                    "two contexts; the owner must outlive this one (n_batch %u, n_ubatch %u; the owner's are %u, %u; "
++                    "Meta view slots %d/%d and %d/%d)\n",
+                     __func__, (const void *) this, (const void *) mem_owner, (const void *) memory,
+                     cparams.n_batch, cparams.n_ubatch, mem_owner->get_cparams().n_batch,
+-                    mem_owner->get_cparams().n_ubatch);
++                    mem_owner->get_cparams().n_ubatch,
++                    meta_slot_base, meta_slot_base + 1,
++                    mem_owner->meta_slot_base, mem_owner->meta_slot_base + 1);
+         } else {
+         llama_memory_params params_mem = {
+             /*.type_k    =*/ params.type_k,
+@@ -1602,7 +1627,7 @@ void llama_context::sched_alt_select(bool alt) {
+     std::swap(sched, sched_alt);
+     std::swap(gf_res_prev_active, gf_res_prev_active_alt);
+     sched_alt_in_use = alt;
+-    ggml_backend_meta_set_view_slot(alt ? 1 : 0);
++    meta_bind_view_slot(alt);
+ }
+ 
+ bool llama_context::sched_alt_for(const llama_ubatch & ubatch) const {
+@@ -1705,6 +1730,10 @@ void llama_context::sched_reserve() {
+         return;
+     }
+ 
++    // a reserve builds (and resolves) a graph, so it must be under THIS context's view slot -- the reserve can
++    // happen with no alt-state change, i.e. without going through sched_alt_select()
++    meta_bind_view_slot(sched_alt_in_use);
++
+     sched_need_reserve = false;
+ 
+     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
+@@ -2025,6 +2054,10 @@ llama_memory_t llama_context::get_memory() const {
+     return memory;
+ }
+ 
++int llama_context::meta_view_slot_base() const {
++    return meta_slot_base;
++}
++
+ bool llama_context::memory_update(bool optimize) {
+     if (!memory) {
+         return false;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index afa8ddf02..3d72332e2 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -82,6 +82,9 @@ struct llama_context {
+ 
+     llama_memory_t get_memory() const;
+ 
++    // The Meta backend view-slot pair this context owns (see meta_slot_base): diagnostics and the STEP 4 gate.
++    int meta_view_slot_base() const;
++
+     // return true if the memory was updated
+     bool memory_update(bool optimize);
+ 
+@@ -363,6 +366,20 @@ private:
+     // swap the second scheduler (and its graph-reuse state) in or out of `sched`, creating it on first use
+     void sched_alt_select(bool alt);
+ 
++    // The Meta backend keeps, per (buffer, view slot), a rotating pair of view containers, and a graph must be
++    // built AND resolved under the same slot.  Each CONTEXT owns a pair -- `meta_slot_base` and
++    // `meta_slot_base + 1` -- from a process-wide counter assigned once at construction, so the identity is a
++    // context, never a role (a pair plus a drafter is three contexts and only two roles, and the roles'
++    // contexts then share a slot).  `alt` picks which of the pair: the main scheduler or the second one.
++    //
++    // Contract: a llama_context is never inside two graphs at once, so its two slots suffice; what must be
++    // unique per context is the SLOT IDENTITY.  Bound at the top of sched_reserve() and in sched_alt_select(),
++    // i.e. on every path that can build or reserve a graph, on the thread that builds it.
++    int  meta_slot_base = 0;
++    void meta_bind_view_slot(bool alt) const {
++        ggml_backend_meta_set_view_slot(meta_slot_base + (alt ? 1 : 0));
++    }
++
+     // whether this ubatch is the draft context's second graph (the draft step) rather than its ingest /
+     // KV-injection graph; the batch kind, not `n_outputs`, is the discriminator for DFlash/DFlash2
+     bool sched_alt_for(const llama_ubatch & ubatch) const;
