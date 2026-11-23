@@ -25,6 +25,10 @@
 #   is why this is a reviewable lint and not a compiler.  Comments and literals are stripped first, so a
 #   documented `close(fd)` is not a finding.
 #
+#   It also rejects a POSIX-only TYPE name (`ssize_t`) on a Windows-compiled line, which the call list
+#   cannot carry: `(ssize_t) first` is a type in a cast, not a function, and the MSVC/UCRT headers never
+#   declare it (PR #352: block 17's state-move VERIFY printed `%zd` through it in llama-context.cpp, and
+#   the shipping tree stopped `src/CMakeFiles/llama.dir/llama-context.cpp.obj` on a Windows build).
 #   It also rejects a local, parameter or member named `near`, `far`, `pascal` or `cdecl` on a line
 #   compiled on Windows: <windows.h>/<minwindef.h> defines those as empty or calling-convention macros,
 #   so `const bool near = ...` expands to `const bool = ...` and is a hard compile error (issue #306,
@@ -498,6 +502,7 @@ def local_includes(rel):
 
 findings = []
 macro_findings = []
+type_findings = []
 scanned = 0
 
 # Reporting masks, one line per edited file: `<path>\t<ranges>` with ranges as `a-b,c`.  A file with no
@@ -535,6 +540,16 @@ if _mask_file:
 # lines as the POSIX calls, with comments/literals already stripped.
 WINDOWS_KEYWORD_MACROS = ("near", "far", "pascal", "cdecl")
 MACRO_RE = re.compile(r"(?<![A-Za-z0-9_.>:])(" + "|".join(WINDOWS_KEYWORD_MACROS) + r")\b")
+# POSIX-only TYPE names: the MSVC/UCRT headers never declare them, so a declaration or a cast on a
+# Windows-compiled line is a hard error with the HIP SDK's clang (`error: use of undeclared identifier
+# 'ssize_t'`).  A CALL rule cannot see this -- `(ssize_t) first` is a type in a cast, not a function --
+# so it is a NAME rule, the same shape as the keyword-macro rule above, and it scans the same
+# Windows-compiled lines.  Block 17's state-move VERIFY printed `%zd` with `(ssize_t)` in
+# src/llama-context.cpp for two releases and no check on this box could see it: a reporter's Windows
+# build log did (PR #352), which is the second time that has been the only detector (issue #231).
+# A second such type goes in this tuple.
+POSIX_ONLY_TYPES = ("ssize_t",)
+TYPE_RE = re.compile(r"(?<![A-Za-z0-9_])(" + "|".join(POSIX_ONLY_TYPES) + r")(?![A-Za-z0-9_])")
 for rel in sys.argv[1:]:
     path = os.path.join(root, rel)
     mask = MASKS.get(rel)
@@ -557,6 +572,8 @@ for rel in sys.argv[1:]:
             findings.append((rel, lineno, m.group(1), raw_lines[lineno - 1].strip()))
         for m in MACRO_RE.finditer(line):
             macro_findings.append((rel, lineno, m.group(1), raw_lines[lineno - 1].strip()))
+        for m in TYPE_RE.finditer(line):
+            type_findings.append((rel, lineno, m.group(1), raw_lines[lineno - 1].strip()))
 
 if findings:
     names = ", ".join(sorted({f[2] for f in findings}))
@@ -573,6 +590,21 @@ if findings:
   reporter's build log) was the only detector.  Please do not ship it again.""" % names)
     sys.exit(1)
 
+if type_findings:
+    names = ", ".join(sorted({f[2] for f in type_findings}))
+    print("FAIL: %d POSIX-only type name(s) in %d scanned file(s) -- these do not compile with HIP on"
+          " Windows (_WIN32):" % (len(type_findings), scanned))
+    for rel, lineno, name, text in type_findings:
+        print("  %s:%d: %s" % (rel, lineno, text))
+    print("""
+  `%s` is declared by POSIX headers only: the MSVC/UCRT STL the Windows HIP build uses never declares
+  it, so a `%s` declaration or cast is `error: use of undeclared identifier` (PR #352: block 17's
+  state-move VERIFY logged `first at %%zd` through `(ssize_t)`).  Use a portable type -- `long long` /
+  `%%lld` for a logged offset, `intptr_t` for a difference that can be negative, or the host pool's
+  `pool_ssize_t` -- and guard the POSIX-only branch with `#if !defined(_WIN32)`.  No gate on this box
+  can see this; there is no Windows runner, so a reporter's build log is otherwise the only detector.""" % (names, names))
+    sys.exit(1)
+
 if macro_findings:
     names = ", ".join(sorted({f[2] for f in macro_findings}))
     print("FAIL: %d windows.h keyword-macro collision(s) in %d scanned file(s) -- these do not compile"
@@ -587,5 +619,6 @@ if macro_findings:
   Windows runner -- so a reporter's build log is otherwise the only detector.""" % names)
     sys.exit(1)
 
-print("    OK: %d file(s) scanned, no unguarded POSIX call and no windows.h keyword-macro collision" % scanned)
+print("    OK: %d file(s) scanned, no unguarded POSIX call, no windows.h keyword-macro collision and" % scanned)
+print("        no POSIX-only type name on a Windows-compiled line")
 PY

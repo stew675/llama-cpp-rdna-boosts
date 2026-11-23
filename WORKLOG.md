@@ -1,3 +1,44 @@
+## 261122.039 (r349, BLOCK-17 AMENDMENT 2: cut, validated, NOT yet committed or tagged) -- r348 did not compile on Windows (`ssize_t` in block 17's state-move VERIFY), so it ships 20 minutes later as r349 with the lint that would have caught it
+
+**r348 is tagged and released, and this supersedes it the same evening.**  Its patch set does not build with the
+Windows HIP toolchain: block 17's serialised state-move VERIFY logs `first at %zd` through an `(ssize_t)` cast of a
+`size_t`, and `ssize_t` is a POSIX type the MSVC/UCRT headers never declare, so `src/CMakeFiles/llama.dir/
+llama-context.cpp.obj` stopped a Windows build ([PR #352](https://github.com/stew675/llama-cpp-rdna-boosts/pull/352),
+noctrex, with the object file, the line and a green build after the two-line change).  Linux/ROCm builds are
+unaffected -- that is why the whole r348 ladder passed -- so the r348 tag is kept, its GitHub release carries a
+"superseded by r349" note, and the fork branch moves to r349.
+
+### 1. The fix (block 17, `(long long)` / `%lld`)
+
+`(ssize_t) first` -> `(long long) first` and `"first at %zd"` -> `"first at %lld"`.  The value is a
+never-negative byte offset, so the cast is lossless and the `(size_t) -1` sentinel still prints `-1` through it:
+measured on the boundary arm with `LLAMA_RS_VERIFY_TAKE=1`, `VERIFY seq 0: 0 of 65864420 byte(s) differ (0 in the
+12-byte cell metadata), first at -1; the source rows are FAITHFUL` -- i.e. the sentinel and the format are right,
+and the arm still passes 9/9.
+
+### 2. The lint that was blind to it, extended (`scripts/check-windows-portability.sh`)
+
+The script knew two name rules (POSIX-only **calls**, and windows.h **keyword macros** like `near`/`far`) plus the
+include-closure check, and PR #352's own diagnosis is why neither could see this: `(ssize_t) first` is a type in a
+cast, not a call, and it is not a macro.  It is now a third rule -- **POSIX-only TYPE names** (`ssize_t`, a name
+rule on the same Windows-compiled lines, comments/strings already stripped, so the fix's own explanatory comment
+is not a hit).  Negative control: on the **r348 tree** the rule reports **exactly one** site,
+`src/llama-context.cpp:7284`, and nothing else in 515 scanned files; on the r349 tree it is clean.  `tests/` and
+the delivery's own added files are in scope, as they already were.
+`MANIFESTS.md` (the portability-gate row), `scripts/README.md` and `AGENTS.md`'s scripts row carry the rule.
+
+### 3. Re-cut and gates (r349)
+
+`release.json`: base `919794500`, tip `d8849c6dd`, tree `deee412648b472c70aa0b9a0d0dbac4ac3a93153`,
+`optional_tree` `02249af9471a03dff7275dd4e96ce798c225440a` (both optional artifacts still apply strictly;
+their recorded trees are refreshed).  Re-run on the amended tree: `validate-set.sh` **GREEN** (9 checks, strict
+19/19, tree `deee4126`, file-set reconciliation 0 unexplained, system-header check 0 unguarded, **the new type
+rule clean**), `gate-draft-ctx.sh` **11/11 on 1 device and 11/11 on 3-device `-sm tensor`**, `gate-arms-soak.sh
+soak --quick` **11/11**, `boundary --quick` **9/9** (with `LLAMA_RS_VERIFY_TAKE=1` to read the edited line),
+`gate-prefill-logits.sh` **0.000000 / 100.000 %**, `check-gen-docs.sh` green.  MTP Protocol A is **not** re-run:
+the change is a `printf` format and a cast inside a diagnostic that only `LLAMA_RS_VERIFY_TAKE=1` reaches, and
+the r348 run of it (axes P and C, `none` == `draft-mtp`) stands -- the two trees differ by that one log line.
+
 ## 261122.038 (r348, BLOCK-17 AMENDMENT: cut, validated, NOT yet committed or tagged) -- issue #351: block 17's generic `ctx_other` arm threw on every SEPARATE MTP head, so `--spec-draft-model <mtp gguf>` never started
 
 **The delivery is re-cut at `v18-919794500-r348` in the working tree: `patches/`, `rdna-boosts-all.patch` and

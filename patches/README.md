@@ -6339,7 +6339,11 @@ operator who asked for it is never silently downgraded.
   belong to the other model's layer layout).  r346's version threw on the cross-model case instead, so every
   server started with a separate MTP head died at load (`ctx_other must be a context of the same model`) even
   with the two-arm mode off; `scripts/gate-draft-ctx.sh` is the arm, because no gate was driving an external
-  head (the gates that can take one default to an embedded one).
+  head (the gates that can take one default to an embedded one).  **r349** also fixes the block's serialised
+  state-move VERIFY line: it logged its differing-byte offset as `%zd` through an `(ssize_t)` cast, a POSIX type
+  the MSVC/UCRT headers never declare, so the r348 tree did not compile on Windows (PR #352); it is `%lld`
+  through `(long long)` now, and `scripts/check-windows-portability.sh` gained the POSIX-type-name rule that
+  would have caught it.
 * **A shared view of the KV for every memory module the pair can reach** — plain KV, plain hybrid, `hybrid_idx`
   (attention KV + recurrent state + lightning indexer KV, i.e. qwen4exp) and `iswa` (sliding-window, gemma4).
   A module that does not implement the view leaves the decode arm on an **empty** cache while the server prints

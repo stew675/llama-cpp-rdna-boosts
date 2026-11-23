@@ -2178,3 +2178,28 @@ this box with the reporter's own shape.
 
 Record: `WORKLOG.md` 261122.038, `patches/README.md` block 17, `MANIFESTS.md` gates 17 (TIER A) / the block-17
 row, `scripts/gate-draft-ctx.sh`, `GREEDY-PURITY.md` §106.
+
+## r349 (2026-11-22, `WORKLOG.md` 261122.039) -- a diagnostic log line is COMPILED code on every platform: `ssize_t` is a type, so a portability lint that only knows calls and keyword macros cannot see it (block 17 amendment 2, PR #352)
+
+1. **The Windows build break was in a `LLAMA_LOG_INFO` argument list, behind an opt-in diagnostic.**  Block 17's
+   serialised state-move VERIFY prints a differing byte offset with `"first at %zd"` through `(ssize_t)`; MSVC/UCRT
+   never declares `ssize_t`, so the Windows HIP toolchain stops at `src/CMakeFiles/llama.dir/llama-context.cpp.obj`
+   with `error: use of undeclared identifier 'ssize_t'`.  Nothing on this box can compile that: every r348 gate ran
+   on Linux/ROCm, where the line is fine.  Fixed as `(long long)` / `%lld` (the offset is never negative, and the
+   `(size_t) -1` "no difference" sentinel still prints `-1` -- verified on the boundary arm with
+   `LLAMA_RS_VERIFY_TAKE=1`).
+2. **`check-windows-portability.sh` was blind to it by construction, not by an oversight in its list.**  It had a
+   CALL rule (POSIX functions), a keyword-MACRO rule (`near`/`far`/`pascal`/`cdecl` from `<windows.h>`) and the
+   separate include-closure check; `(ssize_t) first` is neither a call nor a macro, it is a *type name in a cast*.
+   So the script now carries a third rule on the same Windows-compiled lines: **POSIX-only type names**
+   (`ssize_t` today, the tuple is where a second one goes), with comments/literals already stripped (its own
+   explanatory comment is not a hit) and `pool_ssize_t` untouched (no word boundary).  Negative control: on the
+   **r348** tree it reports exactly one site (`src/llama-context.cpp:7284`); on r349 it is clean.
+3. **A "verify-only" or "log-only" line is not exempt from the build.**  The general rule this records: a change
+   review should not classify a hunk as "unreachable" because it needs an env var -- the compiler reads it on every
+   platform the file is compiled for, and the only instrument for the Windows half is
+   `scripts/check-windows-portability.sh` (run by `validate-set.sh`, checks 7/10) or a reporter's build log
+   (`issue #231`, `#306`, `#310`, now `PR #352`).
+
+Record: `WORKLOG.md` 261122.039, `scripts/check-windows-portability.sh`, `scripts/README.md`, `MANIFESTS.md`
+(the portability-gate row), `AGENTS.md` scripts row, `patches/README.md` block 17.

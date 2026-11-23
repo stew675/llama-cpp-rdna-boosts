@@ -1,4 +1,4 @@
-From 913c2857bc8118095620b62dabe65a05e55abb46 Mon Sep 17 00:00:00 2001
+From 729476e83a99a7fb0bdd95132c72a43b4add315f Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 22 Nov 2026 11:59:13 -0600
 Subject: [PATCH 17/18] rdna-boosts: block 17: the two-arm server -- an opt-in
@@ -95,7 +95,7 @@ touches common/arg.cpp owes (r329).
  ggml/src/ggml-cuda/ggml-cuda-vmm.h   |  17 +-
  ggml/src/ggml-cuda/ggml-cuda.cu      | 297 ++++++++--
  include/llama.h                      |  52 ++
- src/llama-context.cpp                | 384 +++++++++++-
+ src/llama-context.cpp                | 388 +++++++++++-
  src/llama-context.h                  |   2 +
  src/llama-cparams.h                  |   4 +
  src/llama-kv-cache-iswa.cpp          |  22 +-
@@ -113,7 +113,7 @@ touches common/arg.cpp owes (r329).
  src/llama-model.cpp                  |  66 ++-
  tools/server/README.md               |   2 +
  tools/server/server-context.cpp      | 857 +++++++++++++++++++++++++--
- 28 files changed, 3059 insertions(+), 205 deletions(-)
+ 28 files changed, 3063 insertions(+), 205 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index ee0bbac3e..ea5ba7aea 100644
@@ -1592,7 +1592,7 @@ index 7be0a9c87..3353c6078 100644
  
      LLAMA_API size_t llama_state_seq_get_size_ext(
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 70fa60eec..b17bc8bbd 100644
+index 70fa60eec..60fde3d89 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,5 +1,6 @@
@@ -1905,7 +1905,7 @@ index 70fa60eec..b17bc8bbd 100644
      mem->clear(data);
  }
  
-@@ -7029,9 +7148,234 @@ bool llama_memory_seq_rm(
+@@ -7029,9 +7148,238 @@ bool llama_memory_seq_rm(
          return true;
      }
  
@@ -2040,9 +2040,13 @@ index 70fa60eec..b17bc8bbd 100644
 +                }
 +            }
 +        }
++        // (long long)/%lld, not (ssize_t)/%zd: ssize_t is a POSIX-only type the MSVC/UCRT headers never
++        // declare, and this log line is in a file the Windows build compiles (reported as PR #352).
++        // `first` is a never-negative byte offset, so the cast is lossless and the (size_t) -1 sentinel
++        // still prints -1 through it.
 +        LLAMA_LOG_INFO("%s: VERIFY seq %d: %zu of %zu byte(s) differ (%zu in the %zu-byte cell metadata), "
-+                "first at %zd; the source rows are %s\n",
-+                __func__, (int) seq_id, n_diff, size, n_diff_meta, meta_size, (ssize_t) first,
++                "first at %lld; the source rows are %s\n",
++                __func__, (int) seq_id, n_diff, size, n_diff_meta, meta_size, (long long) first,
 +                n_diff == 0 ? "FAITHFUL" : (n_diff == n_diff_meta ? "re-placed (metadata only)" : "NOT the source's state"));
 +
 +        if (n_diff > n_diff_meta) {
@@ -2140,7 +2144,7 @@ index 70fa60eec..b17bc8bbd 100644
  void llama_memory_seq_cp(
          llama_memory_t mem,
            llama_seq_id seq_id_src,
-@@ -7042,6 +7386,8 @@ void llama_memory_seq_cp(
+@@ -7042,6 +7390,8 @@ void llama_memory_seq_cp(
          return;
      }
  
@@ -2149,7 +2153,7 @@ index 70fa60eec..b17bc8bbd 100644
      mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
  }
  
-@@ -7052,6 +7398,8 @@ void llama_memory_seq_keep(
+@@ -7052,6 +7402,8 @@ void llama_memory_seq_keep(
          return;
      }
  
@@ -2158,7 +2162,7 @@ index 70fa60eec..b17bc8bbd 100644
      mem->seq_keep(seq_id);
  }
  
-@@ -7065,6 +7413,8 @@ void llama_memory_seq_add(
+@@ -7065,6 +7417,8 @@ void llama_memory_seq_add(
          return;
      }
  
@@ -2167,7 +2171,7 @@ index 70fa60eec..b17bc8bbd 100644
      mem->seq_add(seq_id, p0, p1, delta);
  }
  
-@@ -7078,6 +7428,8 @@ void llama_memory_seq_div(
+@@ -7078,6 +7432,8 @@ void llama_memory_seq_div(
          return;
      }
  

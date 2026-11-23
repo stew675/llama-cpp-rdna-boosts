@@ -98121,7 +98121,7 @@ index e6f4be6a2..3875c56f9 100644
  private:
      void clear();
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ea41283f9..ff707d629 100644
+index ea41283f9..d317267b7 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,12 +1,21 @@
@@ -101916,7 +101916,7 @@ index ea41283f9..ff707d629 100644
      mem->clear(data);
  }
  
-@@ -4875,9 +7148,234 @@ bool llama_memory_seq_rm(
+@@ -4875,9 +7148,238 @@ bool llama_memory_seq_rm(
          return true;
      }
  
@@ -102051,9 +102051,13 @@ index ea41283f9..ff707d629 100644
 +                }
 +            }
 +        }
++        // (long long)/%lld, not (ssize_t)/%zd: ssize_t is a POSIX-only type the MSVC/UCRT headers never
++        // declare, and this log line is in a file the Windows build compiles (reported as PR #352).
++        // `first` is a never-negative byte offset, so the cast is lossless and the (size_t) -1 sentinel
++        // still prints -1 through it.
 +        LLAMA_LOG_INFO("%s: VERIFY seq %d: %zu of %zu byte(s) differ (%zu in the %zu-byte cell metadata), "
-+                "first at %zd; the source rows are %s\n",
-+                __func__, (int) seq_id, n_diff, size, n_diff_meta, meta_size, (ssize_t) first,
++                "first at %lld; the source rows are %s\n",
++                __func__, (int) seq_id, n_diff, size, n_diff_meta, meta_size, (long long) first,
 +                n_diff == 0 ? "FAITHFUL" : (n_diff == n_diff_meta ? "re-placed (metadata only)" : "NOT the source's state"));
 +
 +        if (n_diff > n_diff_meta) {
@@ -102151,7 +102155,7 @@ index ea41283f9..ff707d629 100644
  void llama_memory_seq_cp(
          llama_memory_t mem,
            llama_seq_id seq_id_src,
-@@ -4888,6 +7386,8 @@ void llama_memory_seq_cp(
+@@ -4888,6 +7390,8 @@ void llama_memory_seq_cp(
          return;
      }
  
@@ -102160,7 +102164,7 @@ index ea41283f9..ff707d629 100644
      mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
  }
  
-@@ -4898,6 +7398,8 @@ void llama_memory_seq_keep(
+@@ -4898,6 +7402,8 @@ void llama_memory_seq_keep(
          return;
      }
  
@@ -102169,7 +102173,7 @@ index ea41283f9..ff707d629 100644
      mem->seq_keep(seq_id);
  }
  
-@@ -4911,6 +7413,8 @@ void llama_memory_seq_add(
+@@ -4911,6 +7417,8 @@ void llama_memory_seq_add(
          return;
      }
  
@@ -102178,7 +102182,7 @@ index ea41283f9..ff707d629 100644
      mem->seq_add(seq_id, p0, p1, delta);
  }
  
-@@ -4924,6 +7428,8 @@ void llama_memory_seq_div(
+@@ -4924,6 +7432,8 @@ void llama_memory_seq_div(
          return;
      }
  
@@ -102187,7 +102191,7 @@ index ea41283f9..ff707d629 100644
      mem->seq_div(seq_id, p0, p1, d);
  }
  
-@@ -5165,6 +7671,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+@@ -5165,6 +7675,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
      return ctx->memory_breakdown();
  }
  
