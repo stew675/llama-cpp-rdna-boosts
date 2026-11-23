@@ -115,6 +115,8 @@ boundary.  Every defect register entry in `DESIGN.md` §5 comes from that duplic
 | `README.md` | this file: scope, reading rules, deliverables, definition of done, environment |
 | [`DESIGN.md`](DESIGN.md) | the target architecture, the ownership table, the **defect register V1-V11**, what is deleted, the `llama_memory_recurrent` refactor design, the risks |
 | [`PLAN.md`](PLAN.md) | the step-by-step: STEP 0-12, each with its files, edits, oracle and exit criteria; the gate list; the promotion path |
+| [`RUNS.md`](RUNS.md) | the dated measurement record: one section per landing, with the command, the shape and the hash/rate |
+| [`baseline/`](baseline/) | the STEP 0 anchors (`r353-anchors.md`) and the arm harnesses: `mtp-axis.sh` (one four-axis arm, GPU-locked), `server-arm.sh` (a server arm + request driver), `norm-log.sh` (a log's *shape*, for the line-identical assertions) |
 
 ---
 
@@ -145,10 +147,33 @@ Hygiene that has bitten this feature before (**mandatory**):
   `-lv` for a text/hash arm**, `-lv 4` for a census arm, never `-lv 3`;
 * pin the MoE residency prior (`MOE_EXPERT_HEATMAP=load`) and use `ROCBLAS_USE_HIPBLASLT=0` for any
   fresh-process text comparison;
-* **never two GPU jobs at once**, and size `-t` so the GPU IRQ cores stay free;
+* **never two GPU jobs at once** — and make it a mechanism, not a habit: `baseline/mtp-axis.sh` takes an
+exclusive `flock` on `~/.cache/rdna-boosts/gpu.lock` and refuses after a bounded wait (two concurrent arms
+already produced two different "same-seed" texts once, because a near-tie flipped under the interference);
+* size `-t` so the GPU IRQ cores stay free;
 * a large artifact (a KLD base) goes to `~/.cache/rdna-boosts/gates`, never `/tmp` (tmpfs here).
 
 Models live under `/llm/models/`; resolve paths against that tree, not against an old document.
+
+### Supervising a background job (mandatory — no unbounded waits)
+
+**No background job runs without a bound and a failure detector.**  Every arm in this project is either
+synchronous or explicitly supervised, and the supervisor fails fast rather than waiting:
+
+* **every wait is bounded** — readiness 60 s, a request `--max-time`, a hard `timeout` around the whole
+  arm (`timeout N …`, and `setsid` + process-group kill for a server); there is no "wait until it
+  finishes" path anywhere;
+* **a dead process fails the arm immediately** (its log tail is printed), and **a live process that stops
+  producing fails it too** — a readiness poll that has not succeeded in its window is a failure, not a
+  longer sleep;
+* **wait by PID, never `wait` with no arguments**: a bare `wait` in a shell that also backgrounded a
+  server waits for *the server*, so an arm that has already finished looks like a hang until the
+  server's own timeout expires (this cost a 4-minute idle wait at STEP 0);
+* **progress goes to stderr as each stage completes** (`healthy after N s`, `requests done in N s`), so a
+  stall is visible in the caller's output instead of silent;
+* **a timeout is a result, not a retry trigger**: an arm that times out is investigated (log, GPU fault
+  check, `check-gpu-faults.sh --since`) before it is re-run, and never simply re-run with a bigger
+  timeout.
 
 ---
 

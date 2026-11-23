@@ -1,3 +1,56 @@
+## 261123.006 (no release; `prefill-decode-arms` v2 STEP 0) -- the v2 campaign's baseline anchors are recorded on the r353 tree, and two harness defects that would have produced false results are fixed as mechanisms
+
+`PLAN.md` STEP 0 of [`wip/prefill-decode-arms-v2/`](wip/prefill-decode-arms-v2/README.md).  **No code
+changed, nothing is in `patches/`, `release.json` untouched**; the branch is `prefill-decode-arms-v2`
+(delivery) and `arms-v2` (in `~/llama.cpp`, local only).  The project's own documents are the design of
+record; this entry records the landing and the two findings.
+
+### 1. The seven anchors reproduce (the inertness reference set)
+
+Tree `v17-919794500-r353` (base `919794500`, tree `27db9bfd4`, banner `b12615-089f90067`), ROCm **10.2.0**,
+3 × gfx1201.  Full commands, prompt hashes and the server's startup shape:
+[`wip/prefill-decode-arms-v2/baseline/r353-anchors.md`](wip/prefill-decode-arms-v2/baseline/r353-anchors.md).
+
+| # | shape | result |
+|---|---|---|
+| A1 | 4B Q8_0, 1 GPU, `-n 64` | 251 chars `be904e86f248` |
+| A2 | 27B Q8_0, 3 GPU `-sm tensor -mg 0`, `-n 96` | 399 chars `10a82b5559a9` |
+| A3 | 35B-A3B Q8_0, `-ncmoe 40` host tier, `-n 64` | 262 chars `e9db5cb8db0b` |
+| A4 | prefill-logit base, default point | PPL 5.9325, self-check **KLD 0.000000 / 100.000 %** |
+| A5 | MTP four-axis, 27B Q8_0 3 GPU tensor, `-n 3000`, f16 KV, adaptive ceiling 7 | `none` == drafter **byte-identical on 4/4 axes**; pos-1 acceptance 0.725-0.986; 1.89×-3.62× |
+| A6 | server, 2 slots `--kv-unified`, 2 concurrent greedy | `{142 chars 7bd542418112, 207 chars 6ce1f88dd5f7}` + an 11-line startup shape |
+| A7 | `scripts/validate-set.sh` | OK (18 default blocks, 2 optional, reconciliation 0 unexplained) |
+
+The A5 **K-axis hash is the delivery's own** (`a87c4318b649`, `benchmarks/2026-11-21-r328-mtp-4axis.md`) and
+every `none` rate agrees with that record to ~2 %, so the recorded command reproduces the delivery
+baseline's plain arms; its *adaptive* trajectory does not (`n_min_adaptive` default vs that record's
+config), so the two tables' `draft-mtp` rates are not comparable and neither is quoted against the other.
+Numbers: [`wip/prefill-decode-arms-v2/RUNS.md`](wip/prefill-decode-arms-v2/RUNS.md).
+
+### 2. Findings (both were in the *harness*, not the code, and both are now mechanisms)
+
+1. **A bare `wait` in a server driver also waits on the server.**  With the server backgrounded in the
+   same shell, `wait` (no arguments) waited for it too, so an arm that had already finished looked like a
+   hang until the server's own `--timeout` expired — a 900 s unguarded wait behind a healthy, idle
+   process.  `baseline/server-arm.sh` now waits **by PID** and bounds everything (readiness 60 s, a
+   per-request `--max-time`, a hard server `timeout`), and fails the arm immediately with its log tail
+   when the server exits or never becomes healthy.
+2. **Two arms launched with `&` contaminated a text anchor.**  The first R-axis `none`/`draft-mtp` pair ran
+   concurrently and read *different* texts at the same seed; re-run sequentially they are identical
+   (`f27add1937e2`).  This is the "never two GPU jobs at once" rule, so it is now enforced:
+   `baseline/mtp-axis.sh` takes an exclusive `flock` on `~/.cache/rdna-boosts/gpu.lock` and refuses after
+   a bounded wait.  The project `README.md` §5 also gains the **supervision contract** (every wait
+   bounded, a dead *or* silent process fails fast, progress on stderr, a timeout is a result and never a
+   retry trigger) — a 4-minute idle wait and a contaminated anchor are the two failure modes it exists to
+   prevent.
+
+### 3. Small correction reported, not edited
+
+`~/bin/build-llama-rocm` configures **ROCm 10.2.0** (`/opt/rocm-10.2.0-gfx120X`), while `AGENTS.md`
+("Build the fork") says 10.1.0; the prefill-logit gate agrees with the script (its base file is
+`…-rocm-10.2.0-gfx120X.kld`).  `AGENTS.md` is policy and the fix is the maintainer's; recorded in
+`RUNS.md` so the anchor's ROCm line is unambiguous.
+
 ## 261123.005 (no release) -- the two-arm server's records are consolidated into one self-contained project: every block-17 `TODO` row retracted, the follow-up campaign retired to `archive/work/`, the beta artifact frozen, and `wip/prefill-decode-arms-v2/` opened as a clean-slate redesign
 
 The maintainer's decision (2026-11-23), taken after a design review of
