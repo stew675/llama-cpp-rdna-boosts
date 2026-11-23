@@ -131,7 +131,13 @@ if [ "$DO_GATES" -eq 1 ]; then
         -m "${COHERENCE_MODEL:-/llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf}" \
         -ngl 99 -sm tensor -c 4096 -p "The capital of France is" -n 24 --seed 42 --temp 0 \
         --no-display-prompt --single-turn -t 8 -lv 1 2>&1 | tail -3
-    echo "==> prefill-logit gate"
+    # The reference base is resolved PER ROCm LINE by the gate itself (its file name carries the line since
+    # 2026-11-22), so a box with two ROCm installs keeps one reference per line and this step no longer refuses
+    # the line the delivery build links -- which is what made `--gates` impossible to pass on the maintainer's
+    # box (the recorded base was the maintainer binary's 10.1 while `~/bin/build-llama-rocm` links 10.2).  A line
+    # with no base yet fails with the exact `--record` command to establish one from a known-good build;
+    # `BASE=<file>` (or the gate's own `--base`) still overrides the resolution.
+    echo "==> prefill-logit gate (the base is resolved per ROCm line; BASE=<file> overrides)"
     ( cd "$REPO_DIR" && ./scripts/gate-prefill-logits.sh )
     cat <<'EOF'
     MTP Protocol A is still required by the policy (benchmarks/mtp-adaptive-methodology.md);

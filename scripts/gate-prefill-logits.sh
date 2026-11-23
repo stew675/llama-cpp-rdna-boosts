@@ -316,6 +316,17 @@ if [ -n "$PINS" ] && [ -n "$RECORD_ENV" ]; then
 fi
 
 MODEL_STEM="$(basename "$MODEL" .gguf)"
+# the ROCm installation a binary links, by its directory name (`rocm-10.2.0-gfx120X`): the LINE a base belongs
+# to.  Read from the binary (ldd/readelf), never by loading a model, so it is cheap enough for the name block.
+rocm_line() {
+    local p
+    p="$(ldd "$LLAMA_PPL" 2>/dev/null | sed -n 's#.*=> \(/opt/rocm[^/]*\)/.*#\1#p' | head -1)"
+    if [ -z "$p" ] && command -v readelf >/dev/null 2>&1; then
+        p="$(readelf -d "$LLAMA_PPL" 2>/dev/null | sed -n 's#.*\[\(/opt/rocm[^]:]*\)[:/].*#\1#p' | head -1)"
+    fi
+    printf '%s\n' "${p##*/}"
+}
+
 if [ -z "$BASE" ]; then
     mkdir -p "$BASE_DIR" || die "cannot create base dir: $BASE_DIR"
     # A family-switch judgement uses its own in-domain corpus/context, so it gets its own
@@ -349,7 +360,27 @@ if [ -z "$BASE" ]; then
         dev_tag="-dev$(printf '%s' "$DEVICE" | tr ',' '-')"
         sm_tag="-sm${SM:-layer}"
     fi
-    BASE="$BASE_DIR/prefill-logit-${ARCH}-${MODEL_STEM}${fs_tag}${kv_tag}${xt_tag}${pin_tag}${dev_tag}${sm_tag}${UB:+-ub${UB}}.kld"
+    stem="prefill-logit-${ARCH}-${MODEL_STEM}${fs_tag}${kv_tag}${xt_tag}${pin_tag}${dev_tag}${sm_tag}${UB:+-ub${UB}}"
+    # The ROCm LINE is part of the POINT: the low bits of every prefill kernel move with the toolchain, so a
+    # cross-line compare is refused below.  The file NAME therefore carries the line (2026-11-22), which is what
+    # makes "record one base per ROCm line" possible at all: before this, `--record` on a second line silently
+    # overwrote the first line's reference, and a box with two ROCm installs could not hold both (a release's
+    # `fork-refresh.sh --gates` then failed with the delivery build on the line that was not recorded last).
+    # A base recorded before this change has no line in its name; it is still used when its `.meta` records THIS
+    # line, or when it predates the `rocm=` field entirely -- so existing references keep working unchanged.
+    line_tag="$(rocm_line)"
+    if [ -n "$line_tag" ]; then
+        BASE_LEGACY="$BASE_DIR/${stem}.kld"
+        BASE="$BASE_DIR/${stem}-${line_tag}.kld"
+        if [ ! -f "$BASE" ] && [ -f "$BASE_LEGACY" ]; then
+            legacy_line="$(sed -n 's/^rocm=//p' "$BASE_LEGACY.meta" 2>/dev/null | head -1)"
+            if [ -z "$legacy_line" ] || [ "$legacy_line" = "$line_tag" ]; then
+                BASE="$BASE_LEGACY"
+            fi
+        fi
+    else
+        BASE="$BASE_DIR/${stem}.kld"
+    fi
 fi
 META="$BASE.meta"
 CONTROL_BASE="${BASE%.kld}-control-ub${CONTROL_UB}.kld"
@@ -394,6 +425,9 @@ echo "    model=$MODEL"
 echo "    corpus=$CORPUS  (sha256=${CORPUS_SHA:0:16}...)"
 echo "    arch=$ARCH  device=$DEVICE  ctx=$CTX chunks=$CHUNKS fa=$FA kv=$KV ngl=$NGL threads=$THREADS${PPL_EXTRA:+  extra='$PPL_EXTRA'}${PINS:+  pin='$PINS'}"
 echo "    base=$BASE$( [ -f "$META" ] && { r="$(sed -n 's/^rocm=//p' "$META" | head -1)"; [ -n "$r" ] && printf '  (recorded with ROCm %s)' "$r"; } )"
+if [ -n "${line_tag:-}" ] && [ "${BASE##*/}" = "${BASE_LEGACY##*/}" ]; then
+    echo "    base name: legacy (no ROCm line in it); its metadata matches this build's line '$line_tag'"
+fi
 echo "    thresholds: mean KLD <= $MAX_KLD, same-top-p >= ${MIN_TOPP}%"
 [ "$FAMILY_SWITCH" -eq 1 ] && echo "    mode=family-switch (control ubatch=$CONTROL_UB, max point PPL=$FAMILY_MAX_PPL)"
 [ "$RECORD" -eq 1 ] && echo "    mode=record${RECORD_ENV:+ (base arm: $RECORD_ENV)}"
@@ -452,14 +486,6 @@ build_ref() {
 # 7.14.1 -- a different compiler moves the low bits of every prefill kernel, so a cross-line compare
 # reports a "divergence" that is the toolchain (TODO #126: the 35B base was an r125-era recording of
 # the pre-r126 FA prefill row, and it read as a gate failure for six releases).
-rocm_line() {
-    local p
-    p="$(ldd "$LLAMA_PPL" 2>/dev/null | sed -n 's#.*=> \(/opt/rocm[^/]*\)/.*#\1#p' | head -1)"
-    if [ -z "$p" ] && command -v readelf >/dev/null 2>&1; then
-        p="$(readelf -d "$LLAMA_PPL" 2>/dev/null | sed -n 's#.*\[\(/opt/rocm[^]:]*\)[:/].*#\1#p' | head -1)"
-    fi
-    printf '%s\n' "${p##*/}"
-}
 le() { awk -v a="$1" -v b="$2" 'BEGIN{ exit !(a+0 <= b+0) }'; }
 ge() { awk -v a="$1" -v b="$2" 'BEGIN{ exit !(a+0 >= b+0) }'; }
 

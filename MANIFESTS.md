@@ -182,7 +182,10 @@ in CI.  The model-level gates are manual:
    zero GTT census lines with the envs forced on).  Every arm freezes the heat-map prior
    (`MOE_EXPERT_HEATMAP=load`).  Pass `--kld` to run the KLD gate inside it.
 4. **Prefill logits** — `scripts/gate-prefill-logits.sh`: mean KLD <= 0.005 and same-top-p >= 98 % against
-   a recorded known-good base.  **Required for any change to a prefill kernel** (GDN/SSM chunked, FA,
+   a recorded known-good base.  **One base per ROCm line, and the base's file name carries the line**
+   (`...-rocm-10.2.0-gfx120X.kld`, 2026-11-22): a cross-line compare is refused, so the maintainer's 10.1 binary
+   and the delivery build (`~/bin/build-llama-rocm`, 10.2) each compare against their own reference and
+   `fork-refresh.sh --gates` resolves the delivery line's automatically.  **Required for any change to a prefill kernel** (GDN/SSM chunked, FA,
    MMQ/MMVF/MMB, MoE prefill) or to a default-on approximate path.  Protocol:
    [`benchmarks/prefill-logit-methodology.md`](benchmarks/prefill-logit-methodology.md).
    **An all-reduce arm is a prefill-numerics change too** (block 01): it is only reachable on >= 2 devices

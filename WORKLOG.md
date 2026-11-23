@@ -1,3 +1,29 @@
+## 261122.037 (no patch change; scripts only, no revision, no tag) -- the prefill-logit base is PER ROCm LINE now, so `fork-refresh.sh --gates` can pass on a box with two ROCm installs
+
+**No patch block changed, no revision, no tag** (`patches/`, `rdna-boosts-all.patch` and `release.json` are untouched:
+this is tooling).  Found while shipping r347: `scripts/fork-refresh.sh --gates` aborted on `gate-prefill-logits.sh`
+because the recorded canonical base carries `rocm=rocm-10.1.0-gfx120X` (recorded from the maintainer's `build-2ctx`)
+while `~/bin/build-llama-rocm`, the delivery build, links `rocm-10.2.0-gfx120X` -- and the gate refuses a
+cross-toolchain compare, correctly.
+
+**The root cause was the base FILE NAME, not the check.** The gate has always said "record one base per ROCm line",
+but the default path had no line component, so recording a base on a second line silently **overwrote** the first
+line's reference.  Fix (`scripts/gate-prefill-logits.sh`): the default base name now carries the line
+(`prefill-logit-<arch>-<model><point tags>-<rocm line>.kld`), with a **legacy fallback** that keeps using a
+line-less base when its `.meta` records the line in use (or predates the `rocm=` field) and says so on its `base=`
+line -- so no existing reference had to be re-recorded, and the two lines now coexist.  `rocm_line()` (an `ldd` /
+`readelf` read of the binary, never a model load) moved up so the name block can use it.  `scripts/fork-refresh.sh`
+says which line's base the `--gates` step resolves and that `BASE=<file>` still overrides.
+
+**Verified**: the 10.2 delivery build resolves `...-Qwen3.8-27B-Q8_0-rocm-10.2.0-gfx120X.kld` and reads
+**0.000000 / 100.000 %**; the 10.1 maintainer build falls back to the legacy line-less base (and the gate prints
+`base name: legacy ... its metadata matches this build's line`) and also reads **0.000000 / 100.000 %**; and
+`./scripts/fork-refresh.sh --gates` now runs the coherence gate and the prefill-logit gate to **PASS** with no
+`BASE=` override, on the delivery line, with the tree/tip checks still matching `release.json`.
+
+The 10.2 reference itself was recorded (from the released tree `8f88fc861`, not from the tree under test) while
+shipping r347; it is renamed to the new line-tagged name, and its `.meta` still records `build=8f88fc861`.
+
 ## 261122.036 (r347, BLOCK-17 AMENDMENT -- cut, validated, NOT yet committed or tagged) -- crash #373 (the P0), `#366` and `#365` ship INSIDE block 17, and the pair gets the gate arm it was owed
 
 **The delivery is re-cut at `v18-919794500-r347` in the working tree: `patches/`, `rdna-boosts-all.patch`,
