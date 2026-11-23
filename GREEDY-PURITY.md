@@ -3120,3 +3120,40 @@ claim needs the base build's own text **in that regime**.
 
 **Record.**  This entry; `archive/work/prefill-decode-arms/RESULTS-2026-11-22.md` passes 12/17;
 `patches/README.md` block 17; `MANIFESTS.md` block-17 row; `WORKLOG.md` 261122.027; §38, §63, §89.
+
+## 106 (r348, block 17) — an external draft head keeps its own cache and moves no token, and "the same model" is the wrong test for `ctx_other`
+
+**Claim.**  A speculative draft that is a **separate GGUF** (the shared-NextN MTP head) is its own `llama_model`
+object, and `ctx_other` is how it names its target.  Two things follow, and both are purity rules:
+
+1. it is **not** a memory co-owner.  `ctx_other_share_memory` needs a context of the SAME model; sharing a
+   different model's cells is silent garbage because a cell belongs to its own model's layer layout.  The
+   constructor therefore adopts a same-model `ctx_other`, **declines** a cross-model one (the draft keeps its own
+   cache, exactly as before block 17's generic arm existed) and refuses only the contradictory combination.
+2. it **moves no token**.  A drafter that changes the target's greedy text is a defect, not a speed: the
+   comparison `--spec-type none` vs `--spec-type draft-mtp` on the same seed must be byte-identical, and the
+   draft acceptance must be non-zero so the comparison is not two plain runs wearing different flags.
+
+**Rule.**  Any change to the context constructor's `ctx_other` adoption, or to `common/speculative.cpp`'s draft
+context, runs `scripts/gate-draft-ctx.sh`: the external head loads, `none == draft-mtp` byte for byte (repeated,
+pinned), the census shows the DECLINE line and a non-zero acceptance, and no same-model refusal.  **A gate that
+can take an external head but defaults to an embedded one does not cover this class** — that is exactly how
+r346 shipped a build where every separate-MTP-head server died at load while the ladder was green.
+
+**Numbers** (gfx1201, Flash-Next GSQ-RCO IQ3_S + the Unsloth shared Q8_0 MTP head, `-ncmoe 48`,
+`MOE_EXPERT_HEATMAP=load`, `ROCBLAS_USE_HIPBLASLT=0`, `--spec-draft-n-max 2`, `-n 128`, seed 42, temp 0):
+
+* 1 device `-sm layer`: `none` == `draft-mtp` == `552 chars e7aae6034b4f`, two repeats; acceptance **0.80-0.85**
+  (mean len 2.6-2.7); decode **34.0 -> 48.0 t/s**;
+* 3 devices `-sm tensor`: `none` == `draft-mtp` == `645 chars af9171d90336`, two repeats; acceptance **0.77**;
+  decode **40.0 -> 65.3 t/s**.  The two device counts read different texts, which is a tensor split's own
+  property, not a drafter's (a greedy text is a per-device-count reference, `AGENTS.md`);
+* the r347 build fails the gate at construction (`ctx_other must be a context of the same model`), 8 of 11 checks.
+
+**Also recorded here:** the **embedded** head is unaffected by the rule and still takes the generic same-model
+arm (`-lv 4`: `this context is the draft of the named context (generic)`), with Protocol A on both affected axes
+at `-n 3000` reading `none` == `draft-mtp` (`6468 chars 6ed44a2da7b3` prose, `13121 chars 166f7d8b97bc` code) and
+acceptance 0.824 / 0.876 — i.e. the amendment is bit-neutral for it.
+
+**Record.**  This entry; `scripts/gate-draft-ctx.sh` (its header carries the arms and the negative control);
+`INVARIANTS.md` r348; `WORKLOG.md` 261122.038; `patches/README.md` block 17; issue #351.

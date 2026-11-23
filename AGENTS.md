@@ -382,6 +382,7 @@ tier runs what); this table is the quick answer for a change in flight.
 | the server's context-checkpoint or speculative-checkpoint path | `scripts/gate-ckpt-reuse.sh` / `scripts/gate-spec-ckpt-device.sh` |
 | a state save/restore (`llama_io_*`, `state_stage`) | `scripts/gate-state-pipe.sh` |
 | the verify-batch alignment / a multi-slot draft width | `scripts/gate-spec-align.sh` / `scripts/gate-spec-width-band.sh` |
+| the context constructor's `ctx_other` adoption rule, or anything that gives a DRAFT context a `ctx_other` (an external shared-NextN MTP head is its own GGUF and its own model object) | `scripts/gate-draft-ctx.sh` (the head must load, keep its own cache, and not move the target's text; a same-model `ctx_other` keeps block 17's shared view) |
 | the chunked-GDN prefill threshold (`GDN_CHUNKED_MIN_TOKENS`), `n_rs_batch`'s use as a kernel input, or a speculator's draft width | `scripts/gate-spec-gdn-split.sh` |
 | the MTP target h-rows path (`LLAMA_MTP_DEV_ROWS`), the `h_nextn` device buffer, or `llama_set_ctx_state_src` | `scripts/gate-mtp-dev-rows.sh` |
 | a qwen4exp hyper-connection op, chain or matcher | `scripts/gate-hc-fusions.sh MODEL.gguf` |

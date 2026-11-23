@@ -6331,7 +6331,15 @@ operator who asked for it is never silently downgraded.
 * **The second context.**  `llama_context_params::ctx_other_share_memory`, the generic same-model `ctx_other`
   gate, and `llama_kv_cache::other_coowner`: a second context **OWNS** cells in the shared map.  A mirror
   (gemma4's assistant path) must keep touching nothing, because a mirror that exercised the mutable paths read
-  garbage.
+  garbage.  **The generic arm adopts a `ctx_other` of the SAME model only (r348, issue #351)**: a context of a
+  DIFFERENT model is a draft head — the external shared-NextN MTP GGUF is its own `llama_model`, and an
+  `-md`-style draft names its target while keeping its own cache — so the constructor declines it (INFO:
+  `is a context of ANOTHER model (a draft head): not adopted, this context keeps its own cache`) and refuses
+  only the contradictory combination (`ctx_other_share_memory` with a cross-model `ctx_other`, whose cells
+  belong to the other model's layer layout).  r346's version threw on the cross-model case instead, so every
+  server started with a separate MTP head died at load (`ctx_other must be a context of the same model`) even
+  with the two-arm mode off; `scripts/gate-draft-ctx.sh` is the arm, because no gate was driving an external
+  head (the gates that can take one default to an embedded one).
 * **A shared view of the KV for every memory module the pair can reach** — plain KV, plain hybrid, `hybrid_idx`
   (attention KV + recurrent state + lightning indexer KV, i.e. qwen4exp) and `iswa` (sliding-window, gemma4).
   A module that does not implement the view leaves the decode arm on an **empty** cache while the server prints
@@ -6475,8 +6483,9 @@ one's design, acceptance oracles and risks.
 
 ### Verification
 
-`MANIFESTS.md` — the block-17 row (both tiers), the **request-boundary** arm (`gate-arms-soak.sh boundary`,
-r347) and gates 28/34 for the paths it reuses.  Gate scripts:
+`MANIFESTS.md` — the block-17 row (both tiers and the r348 external-draft-head arm), the **request-boundary** arm
+(`gate-arms-soak.sh boundary`, r347) and gates 28/34 for the paths it reuses.  Gate scripts:
+`scripts/gate-draft-ctx.sh` (the `ctx_other` adoption rule, r348),
 `scripts/gate-spec-purity.sh`, `scripts/gate-park-idle-slots.sh`, `scripts/gate-ckpt-reuse.sh`,
 `scripts/gate-host-pool.sh`, `scripts/gate-moe-promise.sh`, `scripts/gate-state-pipe.sh`,
 `scripts/check-gen-docs.sh`, and for the feature itself

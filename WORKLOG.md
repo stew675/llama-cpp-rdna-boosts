@@ -1,3 +1,77 @@
+## 261122.038 (r348, BLOCK-17 AMENDMENT: cut, validated, NOT yet committed or tagged) -- issue #351: block 17's generic `ctx_other` arm threw on every SEPARATE MTP head, so `--spec-draft-model <mtp gguf>` never started
+
+**The delivery is re-cut at `v18-919794500-r348` in the working tree: `patches/`, `rdna-boosts-all.patch` and
+`release.json` are regenerated (the two OPTIONAL artifacts needed no re-cut: both still apply strictly and their
+recorded trees are refreshed); `validate-set.sh` is green (9 checks, 19/19 strict apply, applied tree `86658fa0`,
+file-set reconciliation 0 unexplained, system-header check 0 unguarded).  Nothing is committed, tagged, pushed
+or image-built** -- the findings go to the maintainer first (`AGENTS.md`, report before shipping), then the
+release commit, the tag, `scripts/fork-refresh.sh --build --gates --push` and the worker's images.
+
+Reported by **tazmaniax** (Chris Webb) on GitHub (issue #351, `regression`, Radeon 780M / gfx1103 / ROCm 10.1 /
+Docker in an LXC): Flash-Next GSQ-RCO IQ3_XXS worked on **r345** with the separate Unsloth shared Q8_0 MTP head
+(105/154 drafts accepted at depth 2, a tool-call round trip) and failed on **r346** with
+`llama_init_from_model: failed to initialize the context: ctx_other must be a context of the same model` ->
+`common_speculative_init_result: failed to create MTP context` -> the worker never reached readiness, **with
+`--prefill-decode-arms` at its default off**.  His own diagnosis was right: block 17's new check was catching the
+external-MTP case.
+
+### 1. Reproduced on this box with his shape, then fixed (block 17 amendment, no new block)
+
+`/llm/models/Qwen3.8/Flash-Next/GSQ-RCO-IQ3_S` (the IQ3_S sibling) + `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`,
+`--spec-type draft-mtp --spec-draft-n-max 2`, `-ncmoe 48`: the r347 build dies at **0.11 s** with the reporter's
+exact three lines.  The cause is a **cross-model `ctx_other`**, which is `common/speculative.cpp`'s own
+construction (`cparams.ctx_other = ctx_tgt` for every draft context): a separate draft GGUF is its own
+`llama_model`, so block 17's generic arm -- which exists so a second context of the SAME model can view the first
+one's memory -- threw on it.  The arch-gated arms above it (gemma4-assistant, eagle3, dflash, qwen4exp) are the
+drafts that deliberately ask for a cross-model `ctx_other`; a plain NextN MTP head is not one of them.
+
+Fix (`src/llama-context.cpp`, folded into block 17 as one amended commit `913c2857b`): the generic arm **adopts a
+same-model `ctx_other` only**; a cross-model one is **declined** with an INFO line (`is a context of ANOTHER model
+(a draft head): not adopted, this context keeps its own cache`), which is exactly the pre-r346 behaviour, and
+`ctx_other_share_memory` **with** a cross-model `ctx_other` is refused (another model's cells belong to its own
+layer layout).  `include/llama.h`'s `ctx_other_share_memory` comment states the rule.
+
+**Why not "adopt it anyway":** adopting a cross-model `ctx_other` would flip every `cparams.ctx_other != nullptr`
+site in the fork for this shape -- `sched_alt_for()`'s second scheduler, the slab's narrow-2 draft routing,
+`params_mem.kv_pool` -- on hardware this repo does not validate (a 780M), for a shape that has run without it
+since the block existed.  That is a measured change, not a regression fix.
+
+### 2. Verified: the drafter drafts, and it moves no token
+
+| arm (gfx1201, pins `MOE_EXPERT_HEATMAP=load` + `ROCBLAS_USE_HIPBLASLT=0`, seed 42, temp 0, `-n 128`) | `none` | `draft-mtp n2` | acceptance |
+|---|---|---|---|
+| 1 device `-sm layer` (`-c 8192 -ncmoe 48`) | `552 e7aae6034b4f` | `552 e7aae6034b4f` x2 | **0.80-0.85** (mean len 2.6-2.7) |
+| 3 devices `-sm tensor` | `645 af9171d90336` | `645 af9171d90336` x2 | **0.77** (mean len 2.5) |
+
+Decode **34.0 -> 48.0 t/s** (1 GPU) and **40.0 -> 65.3 t/s** (3 GPU `-sm tensor`); the r347 build fails the same
+arm at construction.  The `-lv 4` census shows the decline line, `create_memory: MTP context uses a hybrid-idx
+memory (sparse draft attention)` and the draft reserve line, i.e. the draft context is built normally with its
+**own** cache.
+
+Gates run on the amended tree (`~/llama.cpp`, tree `86658fa0`, `~/bin/build-llama-rocm` / ROCm 10.2):
+
+* **`scripts/gate-draft-ctx.sh` (NEW, gate 17 TIER A)** -- PASS 11/11 on 1 device and PASS 11/11 on 3 devices
+  `-sm tensor`; **negative control**: the r347 build fails 8/11 (exit 1);
+* **MTP Protocol A** (reduced: axes P and C, both arms, `-n 3000`, 27B Q8_0, 1 device): `none` == `draft-mtp`
+  byte-identical (`6468 6ed44a2da7b3` prose, `13121 166f7d8b97bc` code), MTP 19.9 -> 53.5 and 20.0 -> 56.7 t/s; the
+  census reads `this context is the draft of the named context (generic)` (the embedded head still takes the
+  same-model arm) with acceptance **0.82412 / 0.87616**;
+* **`gate-arms-soak.sh soak --quick`** PASS 11/11 (the pair still starts, `try_clear_idle_slots` guard, no leak,
+  cold text == single context) and **`boundary --quick`** PASS 9/9 (two prefills in flight + a decode on one pair,
+  `ce1bc88edc1b` == the single-context text) -- the sharing path my edit moved the refusal onto;
+* **`gate-prefill-logits.sh`** **0.000000 / 100.000 %** (27B Q8_0, ROCm 10.2 line's own base);
+* `validate-set.sh` GREEN (see above), `check-rung-file-sets` 21/21 blocks / 571 files / 174 defines / 587 envs /
+  17 options accounted for, `check-gpu-faults` clean over every run's window.
+
+### 3. The gate gap that let it ship, closed
+
+Every gate that CAN take an external draft head takes it from `DRAFT=` / `-md` and **defaults to an embedded
+one**, so r346's ladder was green while every separate-MTP-head server was dead at load.  `scripts/gate-draft-ctx.sh`
+is the missing arm (text purity + the constructor's decline line + a non-zero acceptance + a GPU-fault check);
+`MANIFESTS.md` gate 17 TIER A, `AGENTS.md`'s pick-the-gate table and `scripts/README.md` index it.
+`INVARIANTS.md` r348 and `GREEDY-PURITY.md` §106 carry the fact and the rule; `patches/README.md` block 17
+carries the amendment.
+
 ## 261122.037 (no patch change; scripts only, no revision, no tag) -- the prefill-logit base is PER ROCm LINE now, so `fork-refresh.sh --gates` can pass on a box with two ROCm installs
 
 **No patch block changed, no revision, no tag** (`patches/`, `rdna-boosts-all.patch` and `release.json` are untouched:

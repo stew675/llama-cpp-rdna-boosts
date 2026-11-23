@@ -2136,3 +2136,45 @@ The engineering facts, in the order they were learned:
 
 Record: `WORKLOG.md` 261122.036, `patches/README.md` block 17, `ENVIRONMENT.md` §23, `MANIFESTS.md` gates 17/17b,
 `wip/prefill-decode-arms-followups/` (§W2/§W9 + `repro-373/`).
+
+## r348 (2026-11-22, `WORKLOG.md` 261122.038) — a cross-model `ctx_other` is a DRAFT, never a memory co-owner: block 17's generic arm threw on every separate MTP head (block 17 amendment, issue #351)
+
+The block-17 amendment (same block, no new block, no renumbering).  GitHub issue #351, reproduced and fixed on
+this box with the reporter's own shape.
+
+1. **`ctx_other` has TWO meanings and only one of them needs the same model.**  Block 17's generic arm lifts the
+   gate so that a second context of the SAME model can view the first one's memory (that is the one place a decode
+   can be submitted from while `llama_process()` is open).  A context of a DIFFERENT model is the other meaning:
+   a DRAFT head.  The external shared-NextN MTP GGUF (`-md` / `--spec-draft-model`) loads as its **own
+   `llama_model`**, borrows the target's `token_embd` / `lm_head`, and `common_speculative_init_result` sets
+   `cparams.ctx_other = ctx_tgt` **unconditionally** (`common/speculative.cpp`) -- so the r346 same-model check in
+   `llama_context` threw at the draft context's construction:
+   `ctx_other must be a context of the same model`, then `failed to create MTP context`, and the server never
+   reached readiness (also with `--prefill-decode-arms` off, because the check is in the constructor, not the
+   pair's code).  The arch-gated arms above it (gemma4-assistant, eagle3, dflash, qwen4exp) are exactly the
+   drafts that ASK for a cross-model `ctx_other`; a plain NextN MTP head is not one of them, so it fell through
+   into the generic arm.  **The rule now: the generic arm adopts a same-model `ctx_other` only; a cross-model one
+   is declined (its own cache, which is what the pre-r346 tree did) and `ctx_other_share_memory` with a
+   cross-model `ctx_other` is refused, because another model's cells belong to ITS layer layout.**
+   Deliberately NOT "adopt it anyway": adopting it flips every `cparams.ctx_other != nullptr` site in the fork
+   (`sched_alt_for()`'s second scheduler, the slab's narrow-2 draft routing, `params_mem.kv_pool`) for a shape
+   that has run without it since the block existed, i.e. an unvalidated behaviour change on hardware this repo
+   does not validate (the reporter's 780M).  A future "an external head is a draft too" change is a measured
+   change, not a regression fix.
+2. **The draft really drafts, and it changes no token.**  Flash-Next GSQ-RCO IQ3_S + the Unsloth shared Q8_0 MTP
+   head, `--spec-type draft-mtp --spec-draft-n-max 2`, `-ncmoe 48`, pins `MOE_EXPERT_HEATMAP=load` +
+   `ROCBLAS_USE_HIPBLASLT=0`: `--spec-type none` and `draft-mtp` read the SAME greedy text, byte for byte, on
+   1 device (`552 chars e7aae6034b4f`) and on 3 devices `-sm tensor` (`645 chars af9171d90336` -- a
+   device-count-specific text, as any tensor split is), repeated; draft acceptance **0.77-0.85**, mean accepted
+   length 2.5-2.7, and decode **34.0 -> 48.0 t/s** (1 GPU) / **40.0 -> 65.3 t/s** (3 GPU tensor).  The external
+   head is inert to the target's text and worth +41..+63 % decode on this shape.
+3. **A gate that can take an external head and defaults to an embedded one cannot see this class.**  `DRAFT=` /
+   `-md` is optional in `gate-state-pipe.sh`, `gate-ckpt-reuse.sh`, `gate-park-idle-slots.sh` and
+   `gate-spec-ckpt-device.sh`, so the r346 gate ladder drove them all with an embedded head and stayed green
+   while every separate-MTP-head server was dead at load.  `scripts/gate-draft-ctx.sh` is the missing arm: the
+   external head must load, its text must equal `--spec-type none`, the `-lv 4` census must show the constructor's
+   DECLINE line and a non-zero acceptance, and no same-model refusal may appear.  Negative-tested on the r347
+   build: **8 of 11 checks fail** (exit 1).
+
+Record: `WORKLOG.md` 261122.038, `patches/README.md` block 17, `MANIFESTS.md` gates 17 (TIER A) / the block-17
+row, `scripts/gate-draft-ctx.sh`, `GREEDY-PURITY.md` §106.
