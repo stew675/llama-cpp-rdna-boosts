@@ -8,6 +8,31 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — STEP 6d-1: `slot_step()` extracted from `post_decode()` (`WORKLOG.md` 261123.014)
+
+1 file, +66/-42 (`tools/server/server-context.cpp`).  Inert by construction: the only caller is
+`post_decode()`, with the same arguments it used to compute inline.
+
+| arm | shape | result |
+|---|---|---|
+| pair OFF | 4B Q8_0, 2 slots `--kv-unified`, 2 concurrent | `7bd542418112` / `6ce1f88dd5f7`; startup shape **byte-identical** to the anchor |
+| pair ON | same | `7bd542418112` / `6ce1f88dd5f7` |
+| pair OFF | 27B Q8_0, 3 GPU `-sm tensor -mg 0`, 2 slots | `f2753e13e419` / `c5f2fdc43642` (unchanged from 6a/6c) |
+| `gate-park-idle-slots.sh` | Flash-Next host tier, 3 arms | **PASS** — 6 park + 2 unpark moves traced, journal clean |
+| GPU faults | since the landing start | clean |
+
+`slot_step(slot, ctx, tok_idx)` — `ctx` is the context that RAN the batch, which is what lets the decode arm
+reuse it unchanged.  The speculative verify path keeps its own inline emit loop (n_accepted tokens with
+per-position probs); STEP 10 owns that.
+
+**Next landing (6d-2/6e/6f, deliberately not split further):** `decode_arm_loop()` + `slot.arm` ownership +
+the handover in `post_decode()` + `arm_step_guard()`.  A loop with nothing routed to it has no oracle, and a
+handover without the loop leaves a slot that stops generating, so they land together with the oracle that can
+judge them: text identical to the single-context server, the cell census with `reserved == 0` at the request
+boundary, and the ITL through a 2-5 s prefill (`gate-arms-itl.sh`).
+
+---
+
 ## 2026-11-23 — STEP 6a/6c: the pairing predicate + the decode arm's context, INERT (`WORKLOG.md` 261123.013)
 
 4 files, +160 (`common/common.{h,cpp}`, `common/arg.cpp`, `tools/server/server-context.cpp`).

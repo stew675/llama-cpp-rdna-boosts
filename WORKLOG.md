@@ -1,3 +1,45 @@
+## 261123.014 (no release; `prefill-decode-arms` v2 STEP 6d-1) -- `slot_step()` is extracted out of `post_decode()`: ONE sample/emit/stop implementation, taking the context that RAN the batch, so the decode arm cannot drift from the prefill arm
+
+`PLAN.md` STEP 6d, first half.  Delivery untouched; the change is on `~/llama.cpp` branch `arms-v2`, stored as
+[`wip/prefill-decode-arms-v2/steps/STEP-6d-0007-slot-step-extraction.patch`](wip/prefill-decode-arms-v2/steps/STEP-6d-0007-slot-step-extraction.patch)
+(1 file, +66/−42).
+
+### 1. What and why
+
+The two-arm server needs "run a batch and step its slots" in **two** places: the prefill arm's `post_decode()`
+and the decode arm's loop.  A round implemented twice is a round that drifts, so the SAMPLING/EMIT/STOP block —
+sample the row the batch produced, accept it into the slot's sampler, time it, build the token, populate probs,
+`process_token()`, and on a stop `print_timings()` + `send_final_response()` + `release()` — is now
+`slot_step(server_slot &, llama_context * ctx, int32_t tok_idx)`.  It takes **the context that ran the batch**,
+so the same function serves `ctx_tgt` and `ctx_dec`; that parameter is the whole point of the signature.
+
+Three details worth their comment in the code:
+* the RESPONSE LIFECYCLE stays where the function is called from — with the pair OFF that is the main thread,
+  exactly as before; the pair's invariant 5 (DESIGN §8) keeps it there when the decode arm becomes a thread;
+* the speculative branch keeps its **own** inline emit loop on purpose (it emits `n_accepted` tokens with
+  per-position probabilities from the verify batch), and STEP 10 owns that path;
+* `slot_step` returns `true` (continue) / `false` (finished and released here), because the caller is an
+  `iterate()` lambda in one arm and a loop body in the other, and those two need different continuations.
+
+### 2. This landing is INERT, and the oracle says so
+
+| oracle | result |
+|---|---|
+| 2 slots `--kv-unified`, 2 concurrent greedy, pair **OFF** | `7bd542418112` / `6ce1f88dd5f7`; startup shape **byte-identical** to the anchor |
+| the same arm, pair **ON** | `7bd542418112` / `6ce1f88dd5f7` — identical |
+| 27B Q8_0, **3 GPU `-sm tensor -mg 0`**, 2 slots | `f2753e13e419` / `c5f2fdc43642` — unchanged from 6a/6c |
+| `gate-park-idle-slots.sh` (the server slot-lifecycle gate) | **PASS**, 6 park + 2 unpark moves traced, journal clean |
+| GPU faults | clean over the landing window |
+
+### 3. What is deliberately NOT in this landing
+
+`decode_arm_loop()`, the `slot.arm` ownership flag, the handover in `post_decode()` and `arm_step_guard()`.
+They are inseparable — a loop with no slot routed to it is dead code with no oracle, and the handover without
+the loop is a slot that stops generating.  They land together as the next landing, with the oracle that can
+actually judge them: text identical to the single-context server **plus** the ITL measurement through a long
+prefill (`gate-arms-itl.sh`, which is also the instrument that shows a merged-step regression as the
+300-880 ms stall), plus the cell census and `reserved == 0` at the request boundary.
+
 ## 261123.013 (no release; `prefill-decode-arms` v2 STEP 6a/6c) -- the pairing predicate, the options and the decode arm's context land INERT: one pure decision, one borrowed memory, and nothing routed to the second context yet
 
 `PLAN.md` STEP 6, sub-steps **6a** (predicate + options) and **6c** (create the decode arm), landed as one

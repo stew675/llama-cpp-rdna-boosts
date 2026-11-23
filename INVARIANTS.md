@@ -2609,3 +2609,24 @@ delivery revision that eventually carries the change, if it is promoted, is the 
 5. **`mmproj`, LoRA, backend sampling and `--sleep-idle` are per-context state machines, not shapes a second
    context can share.**  They belong on the pair's refusal list *by construction*, not because a test failed:
    each of them assumes it is the only user of its context's sampler, adapters or load/unload state.
+
+## r361-wip (2026-11-23, `WORKLOG.md` 261123.014) — a round implemented twice is a round that drifts; the shared step must take the CONTEXT that ran the batch (`prefill-decode-arms` v2 STEP 6d-1)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 6d-1, nothing in `patches/` changed.
+
+1. **The sampling/emit/stop block of a server round is the part two arms must share; the batch composition is
+   the part that may differ.**  `post_decode()`'s inline block became `slot_step(slot, ctx, tok_idx)`, and its
+   `ctx` parameter is the load-bearing one: it is the context that RAN the batch, so `common_sampler_sample()`
+   reads the right output buffer and `common_token_to_piece()` the right vocab without a branch.  A duplicated
+   emit block would drift on the first change to either arm.
+2. **A step that may finish a slot needs a return value the two callers can each act on.**  One caller is an
+   `iterate()` lambda (it must `return` from that slot), the other a loop body (it must stop stepping that
+   slot and take the next); `bool slot_step(...)` (false = finished and released here) is the smallest shape
+   that serves both without a callback.
+3. **A speculative verify round is NOT the same step and must not be folded in.**  It emits `n_accepted` tokens
+   with per-position probabilities taken from the verify batch's rows, so it keeps its own loop; sharing
+   `slot_step()` there would mean passing a row list and a per-row prob mode -- a second implementation wearing
+   the first one's name.
+4. **An extraction is only worth landing if it is provably inert.**  Same-slot text identity (2 slots, pair OFF
+   and ON), the same hashes on a second shape (27B, 3 GPU tensor), a byte-identical startup shape and the
+   delivery's slot-lifecycle gate (park) all had to hold *before* the routing could be written on top.
