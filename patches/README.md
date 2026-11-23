@@ -6338,6 +6338,14 @@ operator who asked for it is never silently downgraded.
   `KV shared` — silent garbage on a long prompt (the campaign's P0: an 82 615-token request that answered as if
   only its tail were present).  `create_memory()` now warns `implements no shared view` and that line is
   **load-bearing**; `INVARIANTS.md` r346.
+* **The cell map is mutated by ONE thread at a time** (r347, crash #373) — `llama_memory_i::apply_mutex()`, one
+  apply lock per memory **GROUP**, shared through `create_memory()`, taken at `init_batch`/`apply`/`clear`/
+  `state_*`/every `llama_memory_*` op/`seq_park`.  The pair runs two `llama_process()` calls on structures that
+  were never shared before: without it the two arms mutated one cell map from two threads, which was the
+  qwen4exp `qwen4exp.cpp:1138` abort (children ~1078 cells apart) **and** a libstdc++ red-black-tree SIGSEGV in
+  `llama_kv_cache::prepare()`'s rollback snapshot.  `llama_memory_alloc_sync()` and
+  `llama_memory_seq_state_take()` are deliberately not locked (the server calls them only inside the
+  request-boundary quiet window, and a take reads the PEER's map, so its lock would have to span two groups).
 * **One allocation owner for the co-owner pair** — `struct llama_kv_alloc`: per-ubatch
   reserve/publish/release plus `llama_memory_alloc_sync()` as the request-boundary handshake, called on both
   arms and asserted clean inside a quiet window.  `LLAMA_KV_ALLOC_SHARED=0` is the A/B control; the legacy path
@@ -6346,6 +6354,21 @@ operator who asked for it is never silently downgraded.
   copy of a sequence's recurrent rows and cell metadata (0.45-0.66 ms against 34.5-36.1 ms serialised for
   52.7 MiB), plus `llama_memory_seq_state_take()` at llama level, `seq_rm_recr()` and
   `LLAMA_STATE_SEQ_FLAGS_RECR_ONLY` for the serialised control.
+* **The Meta buffer's per-child `cpy_tensor_n`, so a `-sm tensor` handover is a DEVICE copy** (r347,
+  `TODO` #365) — the take's 2-D row views are built **out of graph**, so no `simple_tensor` container knows
+  them and the host paths cannot resolve them; with no copy hook on the Meta buffer,
+  `can_take_batched()` refused the batched take and every boundary on a `-sm tensor` hybrid was
+  `state_write()` → host → `state_read()`: **112.57 MiB, 72-77 ms, in TTFT**.  The hook is per **child**: the
+  split state of the view's ROOT (which IS registered) says which byte range of a row belongs to which child,
+  and a child's covered rows are one contiguous range on both sides even when the split state is segmented —
+  the state of Qwen3.8-Flash-Next is one segment repeated 3 or 5 times, i.e. interleaved inside the row,
+  identically on both sides.  Measured **1.4-1.9 ms** (3.0-3.3 ms with the verify capture; the first take in a
+  process ~5.5 ms) against 72-77 ms, `LLAMA_RS_VERIFY_TAKE=1` **0 of 118 039 420 bytes differ**, and the same
+  turn driven once per arm (`LLAMA_RS_FORCE_SERIALISED=1`) gives **byte-identical** per-take destination dumps
+  and identical greedy text.  A shape the planner cannot express is staged through the host via the root —
+  never partially copied.  `cpy_tensor` (the single-tensor hook) is deliberately left null: the take only uses
+  the batched one, and adding it would silently reroute the KV-park and state-staging copies that take the host
+  path today.
 * **The REVERSE handover** — at the return the decode arm frees nothing and the main thread takes the recurrent
   state **back** to the prefill arm and keeps the prompt, so a finished conversation stays resident and the next
   request on that slot reuses its prefix (measured 685 → 33 ms per appended chat turn, i.e. single-context
@@ -6354,13 +6377,21 @@ operator who asked for it is never silently downgraded.
   context, so a restore or a handover must stale it; otherwise a `cache_prompt` repeat cannot see the prefix it
   has just reused.
 * **The declared second-context graph reserve** — the decode context's reserve is declared **before** the arena
-  claims the space, exactly as an embedded MTP head's draft context is: a flat 3584 MiB
-  (`MOE_EXPERT_CACHE_AUX_RESERVE_MIB` overrides; a manual `GGML_CUDA_SLAB_RESERVE_MIB` still wins).  Without it a
-  host-expert tier refused the second context because the reserve arrived after the movable-boundary slab was
-  created; it is never charged when a speculator is configured (the pair refuses one, so it would be waste).
+  claims the space, exactly as an embedded MTP head's draft context is: `common_arms_dec_reserve()`, i.e. a flat
+  **3584 MiB floor plus a WIDTH-keyed tier** (`0` at `-ub <= 1024`, **1536 MiB** at `-ub >= 2048`, +256 MiB per
+  doubling) since r347 (`TODO` #366), because the pair creates a **second** late narrow view — the prefill arm's
+  post-prefill re-reserve — and the flat floor did not cover it (measured 3584 fails, 4096 fails, **5120
+  clean** on Flash-Next `-ncmoe 48 -c 131072`).  `MOE_EXPERT_CACHE_AUX_RESERVE_MIB` overrides; a manual
+  `GGML_CUDA_SLAB_RESERVE_MIB` still wins.  Without it a host-expert tier refused the second context because the
+  reserve arrived after the movable-boundary slab was created; it is never charged when a speculator is
+  configured (the pair refuses one, so it would be waste).
 * **The `-sm tensor` safety work the pair needs** — the take's null-buffer views (a keys-only cache's shared
-  layer has no `v`), a serialised state-move fallback for a buffer with no device copy, and a `thread_local`
-  4-slot meta view selector so the two arms cannot race one view container.
+  layer has no `v`), the Meta buffer's own per-child device copy (r347, above), a serialised state-move fallback
+  that stays as the A/B control **and** as the transport for a buffer that has no device copy, the Meta
+  split-state cache made per **view slot** (a co-owner pair resolved one `unordered_map` from two threads: the
+  released build's SIGSEGV in `ggml-backend-meta.cpp`), the view slot bound for **every** graph build/alloc
+  (`meta_bind_view_slot()`), and a `thread_local` 4-slot view selector so the two arms cannot race one view
+  container.
 * **The server cut** — `ctx_dec` beside `ctx_tgt`, a second `server_batch`, `slot.arm` plus the arm handshake,
   the handover posted to a decode thread, `post_decode`'s sample/stop/emit factored into
   `slot_step(ctx, batch, slot, row)` and shared by both arms, and `llama_memory_alloc_sync` at every request
@@ -6431,18 +6462,21 @@ oracle.
 one's design, acceptance oracles and risks.
 
 * **Speculative decoding with the arms** — refused, a follow-up campaign (`W1`).
-* **A meta-aware device copy** for the handover: a `-sm tensor` hybrid boundary takes the serialised state move
-  (~74.6 ms per boundary, 112.57 MiB).  Cost item, follow-up.
 * A **recurrent-only** memory (a pure Mamba-class model): `llama_memory_seq_state_take()` refuses anything that
   is not a hybrid, and no such model exists on this box.
 * `GLM5-Next`: the same memory module as qwen4exp, no checkpoint on this box.
-* The declared decode reserve is a **flat 3584 MiB**; deriving it from the decode width is `TODO` #366 (`W3`).
+* The `-sm tensor` handover is a device copy **on the split states the planner can express** (a contiguous
+  per-child row range: every state the delivery's hybrids use).  A *per-device* or *partial* split still stages
+  through the host and says so once; `GGML_META_DEBUG_CPY=1` names the shape.
+* The pair's `-sm tensor` state handover is **1.4-1.9 ms**, not free: it is 73 per-child copies per boundary
+  (one per layer-tensor per device), i.e. launch-bound rather than bandwidth-bound.
 * The **prefill/decode speed balance** is not tuned at all: `TODO` #371 (`W6`) evaluates a prefill-arm turn-skip
   policy as a Pareto curve, with a refutation an acceptable result.
 
 ### Verification
 
-`MANIFESTS.md` — the block-17 row (both tiers) and gates 28/34 for the paths it reuses.  Gate scripts:
+`MANIFESTS.md` — the block-17 row (both tiers), the **request-boundary** arm (`gate-arms-soak.sh boundary`,
+r347) and gates 28/34 for the paths it reuses.  Gate scripts:
 `scripts/gate-spec-purity.sh`, `scripts/gate-park-idle-slots.sh`, `scripts/gate-ckpt-reuse.sh`,
 `scripts/gate-host-pool.sh`, `scripts/gate-moe-promise.sh`, `scripts/gate-state-pipe.sh`,
 `scripts/check-gen-docs.sh`, and for the feature itself

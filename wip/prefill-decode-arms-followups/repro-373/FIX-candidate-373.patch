@@ -1,7 +1,7 @@
 From 00a568fba2e756f3d4a36e9f5598f90e4d168584 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 22 Nov 2026 16:04:47 -0600
-Subject: [PATCH 1/4] crash #373 fix (candidate): one apply lock per memory
+Subject: [PATCH 1/5] crash #373 fix (candidate): one apply lock per memory
  GROUP -- the pair's two arms mutate one KV cell map from two threads, which
  is the qwen4exp n_kv abort AND a std::set/tree corruption in
  llama_kv_cache::prepare()'s rollback snapshot; plus set the meta view slot on
@@ -204,7 +204,7 @@ index 7d1b577c2..fabf0a041 100644
 From 7ea83092273d0e738f544949e0dcb3ab0e832c04 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 22 Nov 2026 16:40:11 -0600
-Subject: [PATCH 2/4] crash #373 fix (candidate), part 2: the Meta split-state
+Subject: [PATCH 2/5] crash #373 fix (candidate), part 2: the Meta split-state
  cache is per VIEW SLOT (two co-owner contexts resolved the shared KV's views
  through one rotating unordered_map -- the released build's SIGSEGV in
  ggml-backend-meta.cpp), the view slot is bound for EVERY graph build/alloc
@@ -432,7 +432,7 @@ index 9ab266537..d96b8ec91 100644
 From eae8c79c09ad68aa3e27ab6ce0d8124ac1dc0aef Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 22 Nov 2026 17:07:27 -0600
-Subject: [PATCH 3/4] crash #373 fix (candidate), part 3: A -- the VMM pool's
+Subject: [PATCH 3/5] crash #373 fix (candidate), part 3: A -- the VMM pool's
  peer grant is BEST EFFORT, exactly as the slab's already is
 
 cuMemSetAccess over all peer descriptors in ONE call meant a single refused descriptor (the driver cannot build a
@@ -761,7 +761,7 @@ index ec5569136..6a45735ed 100644
 From 431365ec5574cde39da2e3b75aa36d9a001f1257 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 22 Nov 2026 17:36:43 -0600
-Subject: [PATCH 4/4] crash #373 fix (candidate), part 4 + TODO #366: the
+Subject: [PATCH 4/5] crash #373 fix (candidate), part 4 + TODO #366: the
  synchronous host paths stop using the cudaStreamPerThread sentinel, and the
  pair's slab reserve is derived from the ubatch width
 
@@ -1193,6 +1193,605 @@ index 6a45735ed..07239afc1 100644
  }
  
  static void ggml_backend_cuda_kv_region_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
+-- 
+2.56.1
+
+
+From fdc58fc7890fab1a05a64e4ac5eb30e091b33293 Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Sun, 22 Nov 2026 18:34:19 -0600
+Subject: [PATCH 5/5] TODO #365: the Meta buffer gets a per-child, split-aware
+ `cpy_tensor_n` -- a `-sm tensor` hybrid's state handover is a device copy
+ (1.4-3.3 ms) instead of a 112.57 MiB host round trip (72-77 ms)
+
+`llama_memory_recurrent::seq_state_take()` hands one sequence's recurrent rows between the two arms of the
+prefill/decode pair as ONE `ggml_backend_tensor_copy_n()` over 2-D row views it builds OUT OF GRAPH; those views are
+registered in no simple-tensor container, and the Meta buffer exposed neither `cpy_tensor` nor `cpy_tensor_n`, so
+`can_take_batched()` refused the batched take and every boundary on a `-sm tensor` hybrid took the serialised
+fallback (`state_write()` -> host -> `state_read()`): 112.57 MiB, 72-77 ms, in TTFT.
+
+The hook is per CHILD: the split state of the view's ROOT (the tensor the memory allocated, which IS registered) says
+which byte range of a row belongs to which child, and each child's own buffer takes a plain copy of its rows --
+both sides are children of the SAME layout, so a child's covered rows are one contiguous range even when the split
+state is segmented/repeated (Qwen3.8-Flash-Next's state is one segment repeated 3 or 5 times, i.e. the chunks are
+interleaved inside the row on both sides, identically).  A shape the planner cannot express that way is staged
+through the host via the root, never partially copied.  `cpy_tensor` (the single-tensor hook) stays null on purpose:
+`can_copy_tensor()` is satisfied by either hook, the take only uses the batched one, and the single-tensor hook would
+silently reroute the KV-park and state-staging copies that take the host path today.
+
+`LLAMA_RS_VERIFY_TAKE=1` now instruments WHICHEVER arm runs (it used to see only the serialised fallback), and
+`LLAMA_RS_VERIFY_TAKE_DUMP=<file>` appends each verified destination blob so two arms can be compared with cmp(1).
+
+Measured (Qwen3.8-Flash-Next IQ4_NL, 3 devices, `-sm tensor`, the maintainer's shape):
+  * take 1.4-1.9 ms interleaved (3.0-3.3 ms with the verify capture), first take in a process ~5.5 ms, against
+    72-77 ms serialised -- 40-50x, and it no longer lands in TTFT;
+  * VERIFY: 0 of 118 039 420 byte(s) differ (cell metadata included) -- FAITHFUL;
+  * the same turn driven SERIAL + ARM_TEMP=0 once per arm: the per-take destination dumps are BYTE-IDENTICAL
+    (708 236 592 B, 6 takes) and all three requests' generated text is byte-identical;
+  * `gate-ckpt-reuse.sh` PASS on 1 GPU `-sm layer` and on 3 GPUs `-sm tensor`, `gate-state-pipe.sh` PASS,
+    `gate-arms-soak.sh soak --quick` PASS 11/11 with the text oracle.
+---
+ ggml/src/ggml-backend-meta.cpp | 343 ++++++++++++++++++++++++++++++++-
+ src/llama-context.cpp          | 161 ++++++++++------
+ 2 files changed, 444 insertions(+), 60 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index fd41e635d..86d851a25 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -2972,6 +2972,347 @@ static void ggml_backend_meta_buffer_reset(ggml_backend_buffer_t buffer) {
+     }
+ }
+ 
++// TODO #365: the Meta buffer's per-child, split-aware device copy (`cpy_tensor_n`).
++//
++// The recurrent handover of the two-arm server (block 17) moves one sequence's state from one context's memory to
++// the other's with ONE `ggml_backend_tensor_copy_n()` over 2-D row views that `llama_memory_recurrent::
++// seq_state_take()` builds OUT OF GRAPH.  Those views carry `buffer`/`data` by hand and are registered in NO
++// simple-tensor container, so the host paths here (`set_tensor`/`get_tensor`) cannot resolve them at all -- and
++// because this buffer exposed no copy hook, `llama_memory_recurrent::can_take_batched()` refused the batched take
++// and every handover on a `-sm tensor` hybrid was a host round trip of the whole state (112.57 MiB, ~74 ms, in
++// TTFT; the fallback is still the A/B control `LLAMA_RS_FORCE_SERIALISED=1`).
++//
++// A Meta copy has to be per CHILD: the split state of the view's ROOT -- the tensor the memory allocated, which IS
++// registered -- says which byte range of a row belongs to which child, and each child's own buffer then takes a
++// plain copy of its rows.  (Both sides of a copy are children of the SAME layout, so a child's covered rows are one
++// contiguous range even when the split state is segmented/repeated: the interleaving is INSIDE that range,
++// identically on both sides.)  A shape the planner cannot express that way -- a per-device/partial split, a padded
++// child row, a non-contiguous view -- is staged through the host via the ROOT, i.e. what the serialised arm does for
++// those bytes.  It is NEVER partially copied: a half-moved recurrent state is fluent-but-wrong text, the worst
++// outcome this repo allows.
++//
++// `cpy_tensor` (the single-tensor hook) stays null deliberately.  `ggml_backend_buffer_can_copy_tensor()` is
++// satisfied by either hook and the take only ever uses the batched one; adding the single-tensor hook would
++// silently reroute the KV-park and state-staging copies that take the host path today (they have their own gates and
++// are not part of this change), so this buffer advertises exactly the capability it implements.
++static bool ggml_backend_meta_copy_root_range(const struct ggml_tensor * tensor,
++        struct ggml_tensor ** root, size_t * off, size_t * len) {
++    if (tensor == nullptr || tensor->data == nullptr) {
++        return false;
++    }
++    // the chain root: the take's views are `ggml_view_2d()` over the memory's own tensor, with `buffer`/`data`
++    // assigned by hand, so the root -- not the view -- is what every container knows about
++    struct ggml_tensor * r = const_cast<struct ggml_tensor *>(tensor);
++    for (int guard = 0; guard < 64 && r->view_src != nullptr; ++guard) {
++        r = r->view_src;
++    }
++    if (r->data == nullptr || r->buffer == nullptr) {
++        return false;
++    }
++    const size_t base = (size_t) r->data;
++    const size_t addr = (size_t) tensor->data;
++    if (addr < base) {
++        return false;
++    }
++    const size_t o = addr - base;
++    const size_t n = ggml_nbytes(tensor);
++    if (n > ggml_nbytes(r) || o > ggml_nbytes(r) - n) {
++        return false;
++    }
++    // the copied bytes have to be ONE range of the root: a view of packed whole rows is, a permuted view is not
++    if (n > 0 && !ggml_is_contiguous(tensor)) {
++        return false;
++    }
++    *root = r;
++    *off  = o;
++    *len  = n;
++    return true;
++}
++
++struct ggml_backend_meta_copy_chunk {
++    size_t child; // index of the child buffer the bytes live in
++    size_t off;   // byte offset inside that child's simple tensor
++    size_t len;   // contiguous bytes
++};
++
++struct ggml_backend_meta_copy_side {
++    struct ggml_tensor * root = nullptr; // the allocated tensor the copied range lives in (nullptr: unresolved)
++    size_t off = 0;                      // where the range starts inside `root`
++    size_t len = 0;
++    bool   device = false;               // `chunk` is usable: one contiguous range per child
++    // diagnostics only (GGML_META_DEBUG_CPY), so a staged copy says WHY it was not per child
++    int      axis = GGML_BACKEND_SPLIT_AXIS_NONE;
++    uint32_t n_segments = 0;
++    uint32_t nr0 = 0;
++    size_t   n_bufs = 0;
++    const char * why = "ok";
++    std::vector<ggml_backend_meta_copy_chunk> chunk;
++};
++
++// TODO #365: the per-child plan for ONE side of a copy.  `false` means the range is not resolvable at all (the
++// caller declines); `true` with `device == false` means "staged through the host", never "partly copied".
++static bool ggml_backend_meta_copy_plan(struct ggml_tensor * tensor, ggml_backend_meta_copy_side & side) {
++    side = ggml_backend_meta_copy_side();
++
++    struct ggml_tensor * root = nullptr;
++    if (!ggml_backend_meta_copy_root_range(tensor, &root, &side.off, &side.len)) {
++        return false;
++    }
++    side.root = root;
++
++    if (!ggml_backend_buffer_is_meta(root->buffer) || side.len == 0) {
++        side.why = "a host/other root, or nothing to copy";
++        return true;
++    }
++
++    // whole rows of a contiguous root only: the row is the smallest unit the split state describes
++    const size_t row_stride = root->nb[1];
++    if (!ggml_is_contiguous(root) || row_stride == 0 ||
++            tensor->ne[0] != root->ne[0] || tensor->nb[1] != row_stride ||
++            side.off % row_stride != 0 || side.len % row_stride != 0) {
++        side.why = "not whole packed rows of a contiguous root";
++        return true;
++    }
++    const size_t r0    = side.off / row_stride;
++    const size_t nrows = side.len / row_stride;
++
++    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(root->buffer);
++    const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(root, /*assume_sync =*/ false);
++    side.axis = (int) ss.axis;
++    side.n_segments = ss.n_segments;
++    side.nr0 = ss.nr[0];
++    side.n_bufs = n_bufs;
++
++    auto child = [&](size_t j) { return ggml_backend_meta_buffer_simple_tensor(root, j); };
++
++    if (ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
++        // every child holds the whole tensor: the same byte range in each
++        for (size_t j = 0; j < n_bufs; ++j) {
++            struct ggml_tensor * c = child(j);
++            if (c == nullptr || c->nb[1] != row_stride) {
++                side.why = "mirrored, but a child is missing or has a different row stride";
++                side.chunk.clear();
++                return true;
++            }
++            side.chunk.push_back({j, side.off, side.len});
++        }
++        side.device = true;
++        return true;
++    }
++
++    if (ss.axis != GGML_BACKEND_SPLIT_AXIS_0 && ss.axis != GGML_BACKEND_SPLIT_AXIS_1) {
++        // a per-device / partial / unknown split: stage it (the host paths serve a registered root)
++        side.why = "a per-device, partial or non-row split";
++        return true;
++    }
++
++    if (ss.axis == GGML_BACKEND_SPLIT_AXIS_0) {
++        // A row is dealt to the children in chunks -- for the recurrent state of a `-sm tensor` hybrid, one segment
++        // repeated `nr[0]` times (3 and 5 on Qwen3.8-Flash-Next) -- and each child PACKS its own chunks in its own
++        // row.  Both sides of this copy are children of the SAME layout, so a child's covered rows are ONE
++        // contiguous range on each side: the interleaving lives inside that range, identically on both, and does
++        // not have to be walked (walking it costs `nr[0]` copies per row per child, which is what made the first
++        // cut of this hook 3.5 ms instead of ~1 ms).  What must hold is that the children's rows tile the root's
++        // row exactly, and that no child row is padded.
++        size_t row_total = 0;
++        for (size_t j = 0; j < n_bufs; ++j) {
++            struct ggml_tensor * c = child(j);
++            if (c == nullptr || c->nb[1] != ggml_row_size(c->type, c->ne[0]) ||
++                    (int64_t) (r0 + nrows) > c->ne[1]) {
++                side.why = "axis 0, but a child row is padded or the row range leaves the child";
++                side.chunk.clear();
++                return true;
++            }
++            row_total += (size_t) c->nb[1];
++            side.chunk.push_back({j, r0*(size_t) c->nb[1], nrows*(size_t) c->nb[1]});
++        }
++        if (row_total != row_stride) {
++            side.why = "axis 0, but the children's rows do not tile the root's row";
++            side.chunk.clear();
++            return true;
++        }
++        side.device = true;
++        return true;
++    }
++
++    // axis 1: whole rows are dealt to the children in bands, so each child takes its overlap with the row range
++    if (ss.n_segments != 1 || ss.nr[0] != 1) {
++        side.why = "axis 1 with segments/repeats";
++        return true;
++    }
++    int64_t row_base = 0;
++    for (size_t j = 0; j < n_bufs; ++j) {
++        struct ggml_tensor * c = child(j);
++        if (c == nullptr || c->nb[1] != row_stride) {
++            side.why = "axis 1, but a child is missing or has a different row stride";
++            side.chunk.clear();
++            return true;
++        }
++        const int64_t rows_j = ss.ne[j];
++        const int64_t lo = std::max<int64_t>((int64_t) r0, row_base);
++        const int64_t hi = std::min<int64_t>((int64_t) (r0 + nrows), row_base + rows_j);
++        if (hi > lo) {
++            side.chunk.push_back({j, (size_t) (lo - row_base)*(size_t) c->nb[1], (size_t) (hi - lo)*(size_t) c->nb[1]});
++        }
++        row_base += rows_j;
++    }
++    if (row_base != root->ne[1]) {
++        side.why = "axis 1, but the child bands do not add up to the root";
++        side.chunk.clear();
++        return true;
++    }
++    side.device = true;
++    return true;
++}
++
++static const char * ggml_backend_meta_copy_debug(void) {
++    return getenv("GGML_META_DEBUG_CPY");
++}
++
++static bool ggml_backend_meta_buffer_cpy_tensor_n(ggml_backend_buffer_t buffer,
++        const struct ggml_tensor * const * srcs, struct ggml_tensor * const * dsts, size_t n_tensors) {
++    GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
++    if (n_tensors == 0) {
++        return true;
++    }
++
++    static const bool dbg = ggml_backend_meta_copy_debug() != nullptr;
++
++    std::vector<ggml_backend_meta_copy_side> sside(n_tensors);
++    std::vector<ggml_backend_meta_copy_side> dside(n_tensors);
++    std::vector<bool> per_child(n_tensors, false);
++
++    size_t n_device = 0, n_staged = 0, bytes_device = 0, bytes_staged = 0;
++
++    for (size_t i = 0; i < n_tensors; ++i) {
++        if (!ggml_backend_meta_copy_plan(const_cast<struct ggml_tensor *>(srcs[i]), sside[i]) ||
++            !ggml_backend_meta_copy_plan(dsts[i], dside[i])) {
++            // not resolvable: decline and let the caller's own fallback own this shape (nothing copied here)
++            if (dbg) {
++                GGML_LOG_INFO("%s: decline '%s' -> '%s' (no resolvable root range)\n", __func__,
++                        srcs[i] != nullptr ? srcs[i]->name : "null", dsts[i] != nullptr ? dsts[i]->name : "null");
++            }
++            return false;
++        }
++
++        // the two sides only pair up when they resolve to the SAME children with the same extents (one model, two
++        // contexts: they should, and a mismatch is staged rather than guessed)
++        bool device = sside[i].device && dside[i].device &&
++                      sside[i].len == dside[i].len &&
++                      sside[i].chunk.size() == dside[i].chunk.size();
++        for (size_t c = 0; device && c < sside[i].chunk.size(); ++c) {
++            device = sside[i].chunk[c].child == dside[i].chunk[c].child &&
++                     sside[i].chunk[c].len   == dside[i].chunk[c].len;
++        }
++        per_child[i] = device;
++
++        if (device) {
++            ++n_device;
++            bytes_device += sside[i].len;
++        } else {
++            ++n_staged;
++            bytes_staged += sside[i].len;
++        }
++        if (dbg) {
++            GGML_LOG_INFO("%s: %s '%s' -> '%s': %zu B, %zu child chunk(s); src axis %d/%u seg/%zu bufs (%s), "
++                    "dst axis %d/%u seg (%s); src nr0 %u\n", __func__,
++                    device ? "device" : "staged(host)", srcs[i]->name, dsts[i]->name, sside[i].len,
++                    device ? sside[i].chunk.size() : 0,
++                    sside[i].axis, sside[i].n_segments, sside[i].n_bufs, sside[i].why,
++                    dside[i].axis, dside[i].n_segments, dside[i].why, sside[i].nr0);
++        }
++    }
++
++    if (dbg || n_staged > 0) {
++        GGML_LOG_INFO("%s: %zu tensor(s) copied per child (%.2f MiB), %zu staged through the host (%.2f MiB)\n",
++                __func__, n_device, (double) bytes_device/1024.0/1024.0, n_staged,
++                (double) bytes_staged/1024.0/1024.0);
++    }
++
++    // the staged pairs first: a host round trip of the pair's whole range through the ROOT (the registered tensor)
++    if (n_staged > 0) {
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            GGML_LOG_WARN("%s: %zu tensor(s) (%.2f MiB) of this Meta copy have no contiguous per-child plan, so they are "
++                    "staged through the host (correct, but a round trip).  GGML_META_DEBUG_CPY=1 names the shapes\n",
++                    __func__, n_staged, (double) bytes_staged/1024.0/1024.0);
++        }
++        std::vector<uint8_t> blob;
++        for (size_t i = 0; i < n_tensors; ++i) {
++            if (per_child[i] || sside[i].len == 0) {
++                continue;
++            }
++            if (blob.size() < sside[i].len) {
++                blob.resize(sside[i].len);
++            }
++            ggml_backend_tensor_get(sside[i].root, blob.data(), sside[i].off, sside[i].len);
++            ggml_backend_tensor_set(dside[i].root, blob.data(), dside[i].off, dside[i].len);
++        }
++    }
++
++    if (n_device == 0) {
++        return true;
++    }
++
++    // the device pairs: ONE batched copy over per-child views, so the child backends group it per device and each
++    // device pays one synchronisation for all of its chunks
++    size_t n_chunks = 0;
++    for (size_t i = 0; i < n_tensors; ++i) {
++        if (per_child[i]) {
++            n_chunks += sside[i].chunk.size();
++        }
++    }
++
++    std::vector<const struct ggml_tensor *> csrc;
++    std::vector<struct ggml_tensor *>       cdst;
++    csrc.reserve(n_chunks);
++    cdst.reserve(n_chunks);
++
++    struct ggml_init_params vparams = {
++        /*.mem_size   =*/ 2*n_chunks*ggml_tensor_overhead() + ggml_tensor_overhead(),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++    struct ggml_context * vctx = ggml_init(vparams);
++    if (vctx == nullptr) {
++        return false;
++    }
++
++    // a child range as a 1-D view of the child's own simple tensor: `ggml_nbytes()` of the view is exactly the
++    // contiguous range the child backend copies, which is how the CUDA hook already serves the take's own views
++    auto child_view = [&](struct ggml_tensor * c, size_t off, size_t len) -> struct ggml_tensor * {
++        const size_t es   = ggml_type_size(c->type);
++        const size_t blck = ggml_blck_size(c->type);
++        GGML_ASSERT(len % es == 0);
++        const int64_t ne0 = (int64_t) (len/es*blck);
++        struct ggml_tensor * v = ggml_view_1d(vctx, c, ne0, off);
++        GGML_ASSERT(ggml_nbytes(v) == len);
++        return v;
++    };
++
++    for (size_t i = 0; i < n_tensors; ++i) {
++        if (!per_child[i]) {
++            continue;
++        }
++        for (size_t c = 0; c < sside[i].chunk.size(); ++c) {
++            const ggml_backend_meta_copy_chunk & sc = sside[i].chunk[c];
++            const ggml_backend_meta_copy_chunk & dc = dside[i].chunk[c];
++            struct ggml_tensor * src_child = ggml_backend_meta_buffer_simple_tensor(sside[i].root, sc.child);
++            struct ggml_tensor * dst_child = ggml_backend_meta_buffer_simple_tensor(dside[i].root, dc.child);
++            GGML_ASSERT(src_child != nullptr && dst_child != nullptr);
++            csrc.push_back(child_view(src_child, sc.off, sc.len));
++            cdst.push_back(child_view(dst_child, dc.off, dc.len));
++        }
++    }
++
++    ggml_backend_tensor_copy_n(csrc.data(), cdst.data(), csrc.size());
++
++    ggml_free(vctx);
++
++    return true;
++}
++
+ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
+     /* .free_buffer     = */ ggml_backend_meta_buffer_free_buffer,
+     /* .get_base        = */ ggml_backend_meta_buffer_get_base,
+@@ -2986,7 +3327,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
+     /* .reset           = */ ggml_backend_meta_buffer_reset,
+     /* .set_tensor_n    = */ NULL,
+     /* .get_tensor_n    = */ NULL,
+-    /* .cpy_tensor_n    = */ NULL,
++    /* .cpy_tensor_n    = */ ggml_backend_meta_buffer_cpy_tensor_n,
+ };
+ 
+ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 92ec39c84..9309da6fd 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -5551,8 +5551,10 @@ public:
+                 }
+             }
+             if (!llama_state_copy_staged(lctx, jobs)) {
+-                // upstream's batched copy is the fallback (a meta buffer has no cpy_tensor_n, so it lands on the
+-                // per-tensor path - which is why the staged band above exists)
++                // upstream's batched copy is the fallback.  The staged band above is what a meta buffer takes on
++                // purpose (one pageable allocation + a synchronise per piece is the cliff r157 removed); this call
++                // serves the pieces whose window did not fit, and since TODO #365 the meta buffer HAS a
++                // `cpy_tensor_n`, so those land on per-child device copies instead of per-tensor host copies
+                 std::vector<const ggml_tensor *> srcs(mbuf_cur.org.begin(), mbuf_cur.org.end());
+                 std::vector<ggml_tensor *> dsts(mbuf_cur.cpy.begin(), mbuf_cur.cpy.end());
+                 ggml_backend_tensor_copy_n(srcs.data(), dsts.data(), mbuf_cur.org.size());
+@@ -7188,6 +7190,96 @@ bool llama_memory_seq_state_take(
+         return e != nullptr && atoi(e) != 0;
+     }();
+ 
++    // wip/prefill-decode-arms (diagnostic, LLAMA_RS_VERIFY_TAKE=1): is the transfer FAITHFUL?  This runs for
++    // WHICHEVER arm performs the take -- the batched device copy or the serialised state move -- because it is the
++    // only instrument that can tell a correct handover from a fluent-but-wrong one (`GREEDY-PURITY.md` §89).  The
++    // source's state is captured BEFORE the take (the take releases the source's rows), the destination's is read
++    // back after it, and the two are diffed: a difference inside the cell metadata (the first 4 + 8*cell_count
++    // bytes) is placement, not state; a difference in the rows means the destination is not the source's state.
++    // `LLAMA_RS_VERIFY_TAKE_DUMP=<file>` additionally appends each verified destination blob (with its seq id and
++    // length), so the same turn driven once per arm can be compared BYTE FOR BYTE with cmp(1).
++    static const bool verify_take = [] {
++        const char * e = getenv("LLAMA_RS_VERIFY_TAKE");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    static const char * const verify_dump = getenv("LLAMA_RS_VERIFY_TAKE_DUMP");
++
++    auto state_blob = [seq_id](llama_memory_recurrent * recr) {
++        llama_io_write_dummy dummy(/* skip_tensors = */ false);
++        recr->state_write(dummy, seq_id, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
++        std::vector<uint8_t> blob(dummy.n_bytes());
++        if (!blob.empty()) {
++            llama_io_write_host wio(blob.data(), blob.size());
++            recr->state_write(wio, seq_id, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
++        }
++        return blob;
++    };
++
++    auto verify_move = [seq_id](llama_memory_recurrent * dst_recr, const std::vector<uint8_t> & blob) {
++        const size_t size = blob.size();
++        llama_io_write_dummy dummy2(/* skip_tensors = */ false);
++        dst_recr->state_write(dummy2, seq_id, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
++        const size_t size2 = dummy2.n_bytes();
++
++        std::vector<uint8_t> blob2(size2);
++        if (size2 != 0) {
++            llama_io_write_host wio2(blob2.data(), blob2.size());
++            dst_recr->state_write(wio2, seq_id, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
++        }
++
++        if (verify_dump != nullptr) {
++            if (FILE * f = fopen(verify_dump, "ab")) {
++                const uint32_t sid = (uint32_t) seq_id;
++                const uint64_t n   = (uint64_t) size2;
++                fwrite(&sid, sizeof(sid), 1, f);
++                fwrite(&n,   sizeof(n),   1, f);
++                if (size2 != 0) {
++                    fwrite(blob2.data(), 1, size2, f);
++                }
++                fclose(f);
++            }
++        }
++
++        // the metadata a RECR_ONLY write emits: u32 cell_count, then (i32 pos, u32 n_seq_id) per cell
++        uint32_t n_cells = 0;
++        if (size >= sizeof(n_cells)) {
++            memcpy(&n_cells, blob.data(), sizeof(n_cells));
++        }
++        const size_t meta_size = std::min(size, sizeof(uint32_t) + (size_t) n_cells * (sizeof(int32_t) + sizeof(uint32_t)));
++
++        size_t n_diff = 0, n_diff_meta = 0, first = (size_t) -1;
++        if (size2 != size) {
++            LLAMA_LOG_ERROR("%s: VERIFY size mismatch: source %zu, destination %zu\n", __func__, size, size2);
++        } else {
++            for (size_t i = 0; i < size; ++i) {
++                if (blob[i] != blob2[i]) {
++                    if (first == (size_t) -1) {
++                        first = i;
++                    }
++                    ++n_diff;
++                    if (i < meta_size) {
++                        ++n_diff_meta;
++                    }
++                }
++            }
++        }
++        LLAMA_LOG_INFO("%s: VERIFY seq %d: %zu of %zu byte(s) differ (%zu in the %zu-byte cell metadata), "
++                "first at %zd; the source rows are %s\n",
++                __func__, (int) seq_id, n_diff, size, n_diff_meta, meta_size, (ssize_t) first,
++                n_diff == 0 ? "FAITHFUL" : (n_diff == n_diff_meta ? "re-placed (metadata only)" : "NOT the source's state"));
++
++        if (n_diff > n_diff_meta) {
++            char lines[512];
++            size_t pos = 0;
++            int shown = 0;
++            for (size_t i = first; i < size && shown < 8; i += 4096) { // one sample per 4 KiB window
++                pos += snprintf(lines + pos, sizeof(lines) - pos, " %zu:%02x/%02x", i, blob[i], blob2[i]);
++                ++shown;
++            }
++            LLAMA_LOG_INFO("%s: VERIFY bytes (offset:src/dst):%s\n", __func__, lines);
++        }
++    };
++
+     // wip/prefill-decode-arms: a handover can move a sequence's CELLS (the reverse handover and a checkpoint
+     // restore the peer performed both re-place them), while qwen4exp's derived indexer pool is laid out FROM
+     // those cells (`kpool_by_order` pools consecutive cells).  The raw indexer keys are shared and authoritative,
+@@ -7201,9 +7293,15 @@ bool llama_memory_seq_state_take(
+     };
+ 
+     if (!force_serialised && dst_recr->can_take_batched(*src_recr)) {
++        // captured before the take: the take releases the source's rows
++        const std::vector<uint8_t> blob_src =
++            (verify_take || verify_dump != nullptr) ? state_blob(src_recr) : std::vector<uint8_t>();
+         if (!dst_recr->seq_state_take(*src_recr, seq_id)) {
+             return false;
+         }
++        if (verify_take || verify_dump != nullptr) {
++            verify_move(dst_recr, blob_src);
++        }
+         note_idx();
+         return true;
+     }
+@@ -7249,63 +7347,8 @@ bool llama_memory_seq_state_take(
+ 
+     src_recr->seq_rm(seq_id, -1, -1);
+ 
+-    // wip/prefill-decode-arms (diagnostic, LLAMA_RS_VERIFY_TAKE=1): is the transfer FAITHFUL?  Re-read the
+-    // destination's state into a second blob and diff it against the source's.  A difference inside the cell
+-    // metadata (the first 4 + 8*cell_count bytes) is placement, not state; a difference in the rows means the
+-    // destination is not the source's state and the decode arm is decoding from something else.
+-    static const bool verify_take = [] {
+-        const char * e = getenv("LLAMA_RS_VERIFY_TAKE");
+-        return e != nullptr && atoi(e) != 0;
+-    }();
+-    if (verify_take) {
+-        llama_io_write_dummy dummy2(/* skip_tensors = */ false);
+-        dst_recr->state_write(dummy2, seq_id, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
+-        const size_t size2 = dummy2.n_bytes();
+-
+-        std::vector<uint8_t> blob2(size2);
+-        {
+-            llama_io_write_host wio2(blob2.data(), blob2.size());
+-            dst_recr->state_write(wio2, seq_id, LLAMA_STATE_SEQ_FLAGS_RECR_ONLY);
+-        }
+-
+-        // the metadata a RECR_ONLY write emits: u32 cell_count, then (i32 pos, u32 n_seq_id) per cell
+-        uint32_t n_cells = 0;
+-        if (size >= sizeof(n_cells)) {
+-            memcpy(&n_cells, blob.data(), sizeof(n_cells));
+-        }
+-        const size_t meta_size = std::min(size, sizeof(uint32_t) + (size_t) n_cells * (sizeof(int32_t) + sizeof(uint32_t)));
+-
+-        size_t n_diff = 0, n_diff_meta = 0, first = (size_t) -1;
+-        if (size2 != size) {
+-            LLAMA_LOG_ERROR("%s: VERIFY size mismatch: source %zu, destination %zu\n", __func__, size, size2);
+-        } else {
+-            for (size_t i = 0; i < size; ++i) {
+-                if (blob[i] != blob2[i]) {
+-                    if (first == (size_t) -1) {
+-                        first = i;
+-                    }
+-                    ++n_diff;
+-                    if (i < meta_size) {
+-                        ++n_diff_meta;
+-                    }
+-                }
+-            }
+-        }
+-        LLAMA_LOG_INFO("%s: VERIFY seq %d: %zu of %zu byte(s) differ (%zu in the %zu-byte cell metadata), "
+-                "first at %zd; the source rows are %s\n",
+-                __func__, (int) seq_id, n_diff, size, n_diff_meta, meta_size, (ssize_t) first,
+-                n_diff == 0 ? "FAITHFUL" : (n_diff == n_diff_meta ? "re-placed (metadata only)" : "NOT the source's state"));
+-
+-        if (n_diff > n_diff_meta) {
+-            char lines[512];
+-            size_t pos = 0;
+-            int shown = 0;
+-            for (size_t i = first; i < size && shown < 8; i += 4096) { // one sample per 4 KiB window
+-                pos += snprintf(lines + pos, sizeof(lines) - pos, " %zu:%02x/%02x", i, blob[i], blob2[i]);
+-                ++shown;
+-            }
+-            LLAMA_LOG_INFO("%s: VERIFY bytes (offset:src/dst):%s\n", __func__, lines);
+-        }
++    if (verify_take || verify_dump != nullptr) {
++        verify_move(dst_recr, blob);
+     }
+ 
+     LLAMA_LOG_INFO("%s: took seq %d as a serialised state move (%.2f MiB: %.2f ms out, %.2f ms in, %.2f ms total)\n",
 -- 
 2.56.1
 

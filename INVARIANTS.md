@@ -2059,10 +2059,80 @@ Promoted the `prefill-decode-arms` campaign as official **block 17** (`--prefill
 6. **The pair's own contract, so it is not re-litigated:** the prefill/decode overlap costs **-21…-24 %**
    prefill (flat from `-ub 2048` up; `-ub 4096` is the sweet spot) to hold a decoder at 47-49 ms p50 / 64-78 ms
    p95 through a 2-5 s prefill where the single context stalls 300-880 ms; a `-sm tensor` hybrid state boundary
-   takes the **serialised** move (~74.6 ms, 112.57 MiB) because a meta-aware device copy is a follow-up; a
+   takes the **serialised** move (~74.6 ms, 112.57 MiB) because a meta-aware device copy is a follow-up
+   (**superseded by r347**: it is a 1.4-1.9 ms device copy); a
    co-batched two-slot pair is **stress only, never a text oracle** (§63); `-ib` and `LLAMA_SERVER_PREFILL_DUTY`
    are **deprecated and inert** on this path (both bound a stall inside a SHARED step); and the pair refuses
    `--spec-type`, so speculative decoding with the arms is a separate campaign.
 
 Record: `WORKLOG.md` 261122.027, `patches/README.md` block 17, `ENVIRONMENT.md` §23,
 `archive/work/prefill-decode-arms/` (`RESULTS-2026-11-22.md` passes 2-18), `MANIFESTS.md` block-17 row.
+
+## r347 (2026-11-22, `WORKLOG.md` 261122.036) — the two-arm server becomes SAFE to run: five structures it shares from two threads, a reserve it creates TWICE, and a state handover the Meta buffer can finally copy (block 17 amendment)
+
+The block-17 amendment (same block, no new block, no renumbering).  `TODO` #373, #365 and #366 all shipped with it.
+The engineering facts, in the order they were learned:
+
+1. **The pair runs two `llama_process()` calls on structures that were never shared before, and every one of them
+   had to be given a lock or an owner.**  Five, all reproduced before they were fixed
+   (`wip/prefill-decode-arms-followups/repro-373/`): the **KV cell map** (`apply()` and `init_batch()`'s rollback
+   snapshot — the qwen4exp `qwen4exp.cpp:1138` abort with the children ~1078 cells apart, and a libstdc++
+   red-black-tree SIGSEGV inside `llama_kv_cache::prepare()`); the **Meta split-state cache** (per *buffer*, hence
+   shared through the KV cache's buffer: the released build's SIGSEGV in `ggml-backend-meta.cpp`); the
+   **async-input ring** (`cudaDeviceSynchronize()` on its wrap path); the **VMM pool's peer grant** (all peer
+   descriptors in ONE `cuMemSetAccess` + `CU_CHECK`); and the **synchronous host paths** (`cudaStreamPerThread` is
+   HIP's sentinel for the legacy default stream, which a peer context's graph capture claims).  The fixes:
+   `llama_memory_i::apply_mutex()` (one lock per memory **GROUP**, shared through `create_memory()` — a take reads
+   the PEER's map, so a lock there would have to span two groups, which is why `seq_state_take()` and
+   `alloc_sync()` are deliberately unlocked and rely on the server's quiet window); the split-state cache per
+   **view slot** (`[4][8]`) with the slot bound for every graph build/alloc (`meta_bind_view_slot()`); the ring
+   waiting on each **origin's own** stream; the pool grant best effort with a per-pool mask and
+   `ggml_cuda_peer_copy_ok()` answering for pools as well as slabs; and `ggml_cuda_host_stream()`, one private
+   non-blocking stream per **(thread, device)**, for every synchronous host path.  **A lock per memory INSTANCE
+   would not have been enough**: the pair shares one map, so the lock has to live with the group.
+2. **A second context's graph reserve has to cover TWO late narrow views, because the pair creates the post-prefill
+   re-reserve as well as the decode context's first one.**  The flat 3584 MiB (`r346`) covered one.  Measured on
+   Flash-Next `-ncmoe 48 -c 131072`, arena 13.3 GiB, 3 slots, 71k + 23k + 800: **3584 fails, 4096 fails, 5120
+   clean**, both views 1430.2 / 1430.6 MiB — hence `common_arms_dec_reserve()` = flat floor + a **width-keyed
+   tier** (`0` at `-ub <= 1024`, 1536 MiB at `>= 2048`, +256 per doubling).  A *reserve* is capacity, not state:
+   too small and the arena refuses a graph (a hard failure), too large and VRAM is wasted, and the width is what
+   predicts it.
+3. **The Meta buffer had no copy hook, so a `-sm tensor` hybrid paid a full host round trip at EVERY request
+   boundary — and it is now a device copy.**  `seq_state_take()`'s 2-D row views are built **out of graph**, so no
+   `simple_tensor` container knows them and the host paths cannot resolve them; that is why `cpy_tensor`/
+   `cpy_tensor_n` were null and `can_take_batched()` refused.  The hook is per **child**: the split state of the
+   view's ROOT (which IS registered) says which byte range of a row belongs to which child.
+   **The non-obvious half: both sides of the copy are children of the SAME layout, so a child's covered rows are
+   ONE contiguous range even when the split state is segmented/repeated** — the state of Qwen3.8-Flash-Next is one
+   segment **repeated 3 or 5 times** (interleaved inside the row, identically on both sides), and walking that
+   interleaving costs `nr[0]` copies per row per child: a planner that walked it measured **3.5 ms**, and one that
+   copies the child's range measured **1.4-1.9 ms**.  Against **72-77 ms** serialised (112.57 MiB).
+   `LLAMA_RS_VERIFY_TAKE=1` on the batched arm: **0 of 118 039 420 bytes differ**, cell metadata included; and the
+   same turn driven once per arm, serially and greedily, gives **byte-identical** per-take destination dumps
+   (`LLAMA_RS_VERIFY_TAKE_DUMP=`) and identical text.  A shape the planner cannot express is staged through the
+   host via the root — **never partially copied**, because a half-moved recurrent state is fluent-but-wrong text
+   (§89).  `cpy_tensor` (singular) stays null on purpose: `can_copy_tensor()` is satisfied by either hook, and
+   adding it would silently reroute the KV-park and state-staging copies that take the host path today.
+4. **A sequential arms oracle cannot see a request-boundary defect; that is a gate gap, not an oracle choice.**
+   Every arms oracle the campaign had (the 16/16 coverage matrix, the soak, the reuse gate) drove requests **one at
+   a time**, so nothing ever ran two arms' prefills at once — the shape the reported P0 lived in.  The arm that
+   does is `scripts/gate-arms-soak.sh boundary` (gate 17b): two prefills in flight plus a decode, pad buckets
+   shrunk to 256, `BB_ROUNDS >= 3`, and a fourth **sequential fresh** request compared against a single-context
+   server.  **A text claim about the pair is only valid on a serial, greedy arm** (§63/§38): at the runme's
+   temp 0.7 two arms differ in sampled tokens from kernel-shape noise alone, and their per-take dumps differ
+   because the cell placement follows the interleaving.
+5. **A small model over a 3-way split is NOT a shape anyone runs, and it faults on the released build too** — a
+   4B on 3 devices `-sm tensor` with the pair dies in `llama_kv_cache::find_slot()` (a null deref at `+0x6a0`,
+   `segfault at 25 ip … libllama.so[3561d0]`) with or without the fix set.  So the boundary arm must **not**
+   default to the fast 1-GPU soak model; it defaults to the validated 35B-A3B hybrid split.  General form: a gate
+   arm's *shape* has to come from a validated configuration, and "it crashes" is not a finding until the shape is
+   one the repo supports.
+6. **`TEMP` in the environment breaks the ROCm 10.1 runtime at LOAD, inside its LLVM-based JIT.**  A harness
+   variable named `TEMP=0` (hipBLASLt's Tensile cache path) made every model load die with a stack-write fault in
+   `libLLVM.so` (`segfault at <addr> ip … libLLVM[…815cd9] error 6`, i.e. a write at `sp`), reproducibly, and a
+   64 MB stack made it *survive* — so it is a stack exhaustion in the JIT, not a bounds bug we can fix.  Recorded
+   because it reads as a defect in the change under test: the harness variable is `ARM_TEMP` (`WORKLOG.md`
+   261122.014 had the `hipStreamCreateWithFlags` face of the same landmine).
+
+Record: `WORKLOG.md` 261122.036, `patches/README.md` block 17, `ENVIRONMENT.md` §23, `MANIFESTS.md` gates 17/17b,
+`wip/prefill-decode-arms-followups/` (§W2/§W9 + `repro-373/`).

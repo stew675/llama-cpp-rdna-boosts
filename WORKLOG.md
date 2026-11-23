@@ -1,3 +1,93 @@
+## 261122.036 (r347, BLOCK-17 AMENDMENT -- cut, validated, NOT yet committed or tagged) -- crash #373 (the P0), `#366` and `#365` ship INSIDE block 17, and the pair gets the gate arm it was owed
+
+**The delivery is re-cut at `v18-919794500-r347` in the working tree: `patches/`, `rdna-boosts-all.patch`,
+`release.json` and the two OPTIONAL artifacts are regenerated; `validate-set.sh` is green.  Nothing is committed,
+tagged, pushed or image-built** -- the findings below go to the maintainer first (`AGENTS.md`, report before
+shipping), and the fork refresh is `scripts/fork-refresh.sh --build --gates --push` afterwards.
+
+### 1. What went into block 17 (a same-block amendment, the maintainer's decision)
+
+Five shared-state defects from the #373 class, `#366`'s derived reserve, and `#365`'s meta-aware device copy.  All of
+it is on the canonical chain as ONE amended block-17 commit (`e7de9421a`, tree `d4ab6461`), re-cut from
+`release.json.base` with `scripts/apply-all.sh` -- the amended chain's tree reproduces the validated scratch branch
+(`crash373-fix`) **exactly**, and the `0300` commit replays onto it cleanly.  `n_blocks`/`n_default` are unchanged
+(18 official + `0300`); `release.json`: base `919794500`, tip `851fcd680`, tree `d4ab646184dc…`, `optional_tree`
+`fb371b3dd1ac…`.
+
+**The two OPTIONAL artifacts had to be re-cut** (`0100` no longer applied: it renames `process_ubatch()` to
+`prepare_ubatch(..., lane)` in the very function the apply lock is in).  Resolved by keeping BOTH sides -- the lock and
+`n_ubatch_eff` and the `lane` argument -- and re-exported as single commits against the new default tree, so
+`validate-set.sh`'s strict-apply check and the cumulative-optional tree both pass.  `0101` applied cleanly.
+
+### 2. `TODO` #365: the Meta buffer's per-child `cpy_tensor_n` -- 72-77 ms becomes 1.4-1.9 ms
+
+`llama_memory_recurrent::seq_state_take()` builds its 2-D row views **out of graph**, so no `simple_tensor` container
+knows them and the host paths cannot resolve them; with no copy hook on the Meta buffer, `can_take_batched()` refused
+and every `-sm tensor` hybrid boundary was `state_write()` -> host -> `state_read()`: **112.57 MiB, 72-77 ms, in TTFT**
+(measured, unchanged from the handover's 74.6).
+
+The hook is per **child**: the split state of the view's ROOT (which IS registered) says which byte range of a row
+belongs to which child, and each child's own buffer takes a plain copy of its rows.  **The non-obvious half:** both
+sides of a copy are children of the SAME layout, so a child's covered rows are ONE contiguous range even when the
+split state is segmented/repeated -- and the state of Qwen3.8-Flash-Next is one segment **repeated 3 or 5 times**
+(interleaved inside the row, identically on both sides).  The first cut walked that interleaving (`nr[0]` copies per
+row per child: **3.5 ms**); copying the child's range gives **1.4-1.9 ms** (3.0-3.3 ms with the verify capture; the
+first take in a process ~5.5 ms).  `GGML_META_DEBUG_CPY=1` is the diagnostic that showed the real split state.
+A shape the planner cannot express is staged through the host via the root -- never partially copied.  `cpy_tensor`
+(the single-tensor hook) stays null on purpose (it would silently reroute the KV-park and state-staging copies).
+
+**Validation** (the maintainer's shape, 3 devices, `-sm tensor`): `LLAMA_RS_VERIFY_TAKE=1` on the batched arm reads
+**0 of 118 039 420 byte(s) differ**, cell metadata included (that instrument only saw the serialised arm before --
+it now instruments whichever arm runs, capturing the source before the take releases it).  `LLAMA_RS_VERIFY_TAKE_DUMP`
+was added so the two arms can be compared with `cmp(1)`: the same turn driven SERIAL + greedy once per arm gives
+**byte-identical** per-take destination dumps (708 236 592 B, 6 takes) and identical text.
+
+### 3. The owed gate arm: `gate-arms-soak.sh boundary` (gate 17b)
+
+Two prefills in flight and a decode on ONE pair, pad buckets shrunk (`LLAMA_KV_N_PAD_MIN=256`,
+`LLAMA_KV_N_PAD_PREFILL=0`), `BB_ROUNDS >= 3`, then a fourth **sequential fresh** request compared against a
+single-context server.  **The gap it closes is structural**: every arms oracle the campaign had (the 16/16 coverage
+matrix, the soak, the reuse gate) drove requests one at a time, so nothing ran two arms' prefills at once -- which is
+exactly the shape the reported P0 lived in.  PASS 9/9 on the delivery build (35B-A3B, 3 devices, `-sm tensor`, ~50 s).
+
+**It immediately caught a shape that must NOT be used**: a 4B on 3 devices `-sm tensor` with the pair dies in
+`llama_kv_cache::find_slot()` (null deref at `+0x6a0`, `segfault at 25`) -- **on the released build too**, with and
+without the fix set, and with default pads.  A small model over a 3-way split is not a shape anyone runs; the arm
+therefore defaults to the campaign's validated 35B-A3B hybrid split, and the header says so.
+
+### 4. Gates (delivery build, ROCm 10.2 unless stated)
+
+| gate | result |
+|---|---|
+| whole-set `all` build at the tip (`~/bin/build-llama-rocm`) | clean |
+| `gate-prefill-logits.sh` (canonical 27B Q8_0 point) | **0.000000 / 100.000 %** on **both** lines: 10.1 against the recorded base, and 10.2 against a base **recorded from the released tree** (`--base …-rocm102.kld`, so the comparison is a real cross-build one and the 10.1 base is not clobbered) |
+| `gate-arms-soak.sh soak` | **PASS 11/11** (30/30 requests, text oracle) |
+| `gate-arms-soak.sh boundary` | **PASS 9/9** |
+| `gate-ckpt-reuse.sh` | PASS (1 GPU `-sm layer`; also PASS earlier at 3 GPU `-sm tensor` on the 10.1 build) |
+| `gate-state-pipe.sh` | PASS (all four arms within the 3x bound; the Meta `cpy_tensor_n` fallback is on this path) |
+| `check-gpu-faults.sh` | clean over every run window (each gate runs it) |
+| `validate-set.sh` | **green**: strict apply of 19 patches from a fresh tarball, tree `d4ab6461…`, both optionals strict + their trees + the cumulative tree, Windows portability, and `check-rung-file-sets` **0 unexplained (0 loss, 0 gone, 0 shrunk; 2 new envs** = `GGML_META_DEBUG_CPY`, `LLAMA_RS_VERIFY_TAKE_DUMP`) |
+
+The #373 re-validation itself (resident 3 slots x 71k+23k+800 x 2 rounds, and the host tier `-ncmoe 48 -c 131072` with
+the derived `aux=5.00 GiB`) was re-run from scratch at the start of this session on the 10.1 build: both clean, 0
+`ROCm error`, 0 HipVMM, 0 asserts, and the pair-off control clean.
+
+### 5. Box landmines that cost time here (both already partly recorded)
+
+* **`TEMP` in the environment breaks the ROCm 10.1 runtime at LOAD** -- a stack-write fault inside its LLVM-based JIT
+  (`segfault at <addr> ip … libLLVM[…815cd9] error 6`), reproducibly, and a 64 MB stack makes it *survive*.  A harness
+  variable named `TEMP=0` did it (hipBLASLt's Tensile cache path); the harness variable is now `ARM_TEMP`.
+  `WORKLOG.md` 261122.014 had the `hipStreamCreateWithFlags` face of the same landmine.
+* **`kill -9` on a `timeout` wrapper leaves the server alive** and `rocm-smi` shows the VRAM free -- re-confirmed
+  (a 94 GB server survived an aborted wrapper and answered `/health`).  Kill the process GROUP.
+
+### 6. Owed (not done here, on purpose)
+
+The maintainer's go-ahead for the commit, the tag (`v18-919794500-r347`), the fork refresh
+(`scripts/fork-refresh.sh --build --gates --push`) and the worker's image push; `TODO` #374 (the vacuous `pool` arm)
+stays open by decision; `#366`'s ordering hazard (the slab's aux reserve is whatever the LAST preflight carried,
+`wip/slab-draft-aux-reserve/`) is unchanged and still wants fixing when the draft path is next touched.
+
 ## 261122.035 (no delivery change) -- `TODO` #366 DONE (the pair's slab reserve derived from the ubatch width), plus the capture class closed for every synchronous host path
 
 **No delivery patch changed, no tag.**  Continues `261122.034`; the fix is still on the scratch branch

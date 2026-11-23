@@ -1,5 +1,14 @@
 # HANDOVER — block 17: `TODO` #365 (the meta-aware device copy) and the delivery wrap-up
 
+> **CONSUMED 2026-11-22 (r347).**  Everything in §3, §4 and §5 is done: the fix set is re-validated in both
+> configurations, `TODO` #365 is implemented (the Meta buffer's per-child `cpy_tensor_n`: 1.4-1.9 ms against 72-77 ms,
+> byte-identical state and text), and the whole thing is folded into **block 17** on a canonical chain with the
+> patches, `release.json` and both optional artifacts regenerated and `validate-set.sh` green.  The owed gate arm is
+> `scripts/gate-arms-soak.sh boundary` (`MANIFESTS.md` gate 17b).  **Read `WORKLOG.md` 261122.036 instead of this
+> file** — it is the record, including the two shapes that must not be used (a 4B over 3 devices; `TEMP` in the
+> environment) and what is still owed (the maintainer's go-ahead, the tag, the fork refresh).  §6's landmines all
+> still stand, and §7's open questions were answered as recorded there.
+
 **Written 2026-11-22 (end of the session that fixed `#373`/`#366`). Read this top to bottom before touching anything: it
 exists so you do not have to re-derive the state from a long transcript.**
 

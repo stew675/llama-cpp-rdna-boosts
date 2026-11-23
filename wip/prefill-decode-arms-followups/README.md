@@ -34,18 +34,19 @@ documented "no"; it is also the one the maintainer asked for by name.**
 | id | item | class | `TODO` | size | depends on |
 |---|---|---|---|---|---|
 | **W1** | speculative decoding with the arms (**MTP first**) | capability | #364 | large | W2 helps, not blocks |
-| **W2** | a **meta-aware device copy** for the recurrent handover | cost | #365 | medium | none |
+| **W2** | a **meta-aware device copy** for the recurrent handover | cost | #365 | medium | **DONE 2026-11-22 (r347)**: the Meta buffer's per-child `cpy_tensor_n` — **1.4-1.9 ms** against 72-77 ms serialised, `LLAMA_RS_VERIFY_TAKE=1` 0 of 118 039 420 bytes differ, and the two arms' per-take dumps are byte-identical |
 | **W3** | derive the **decode context's reserve** from the decode width | cost | #366 | small | **DONE 2026-11-22**: floor 3584 + a width-keyed tier (0 / 1536 MiB), which prints 5120 on the host tier and needs no knob |
 | **W4** | **GLM5-Next** on the pair | validation | #367 | small (needs a checkpoint) | none |
 | **W5** | a **recurrent-only** memory handover | capability | #368 | medium | needs a Mamba-class model |
 | **W6** | the **prefill/decode speed balance**: the prefill arm SKIPS turns while a decoder is active | tuning | #371 | medium | none; measure first (§7.1) |
 | **W7** | the pair's **slot erase and cell accounting** | correctness (narrow) | #370 | small | none |
 | **W8** | **multi-slot prefill batching** ("layer-major" across active prefill slots) | tuning / architecture | #372 | medium | read the premise check first (§11.1) |
-| **W9** | **P0: the pair mutates THREE shared structures from TWO threads with no lock** -- the KV cell map (`init_batch`'s snapshot + `apply()`), the **Meta split-state cache** (per buffer, so shared through the KV cache's buffer: the released build's SIGSEGV), and the **async-input ring's** device-wide sync (illegal during a peer's graph capture).  **REPRODUCED 2026-11-22** in ~30 s (`repro-373/`); **all three FIXED and validated** on the scratch branch (3 rounds clean on the 71k/23k shape, soak gate 11/11) but NOT shipped | **correctness (P0)** | #373 | memory lock = small (done); Meta + ring = done; **host tier blocked** on a VMM peer-grant abort (needs a design decision) | **done**: `repro-373/` (3 slots, two prefills + a decode) |
+| **W9** | **P0: the pair mutates FIVE shared structures from TWO threads with no lock** -- the KV cell map (`init_batch`'s snapshot + `apply()`), the **Meta split-state cache** (per buffer, so shared through the KV cache's buffer: the released build's SIGSEGV), the **async-input ring's** device-wide sync (illegal during a peer's graph capture), the **VMM pool's peer grant**, and the **synchronous host paths'** default-stream coupling.  **REPRODUCED 2026-11-22** in ~30 s (`repro-373/`); **SHIPPED in the r347 block-17 amendment** (`WORKLOG.md` 261122.036) with the owed gate arm (`gate-arms-soak.sh boundary`) | **correctness (P0)** | closed | memory lock = small; Meta + ring + pool + host streams = done | **done**: `repro-373/` (3 slots, two prefills + a decode) |
 | **G1** | gate debt: three gates still anchored to the retired Flash-Next model | tooling | #369 | small | none |
 
-Ordering suggestion: **G1, W7, W3** (small, close out loose ends) → **W6** (the one the maintainer wants measured) →
-**W2** → **W1** (the big one) with **W4** whenever a checkpoint appears and **W5** parked until a model exists.
+Ordering suggestion (after r347 closed **W2**, **W3** and **W9**): **G1, W7** (small, close out loose ends) →
+**W6** (the one the maintainer wants measured) → **W1** (the big one) with **W4** whenever a checkpoint appears and
+**W5** parked until a model exists.
 
 ---
 
@@ -106,6 +107,17 @@ first cut to be text-unstable across warm reps and plan for the `TWO_SLOT`-style
 ---
 
 ## 3. W2 (TODO #365) — a meta-aware device copy for the handover
+
+**DONE 2026-11-22 (r347, `WORKLOG.md` 261122.036), shipped in the block-17 amendment.**  The Meta buffer exposes a
+per-child, split-aware **`cpy_tensor_n`**, so `llama_memory_recurrent::can_take_batched()` stops refusing and the
+take is a device copy: **1.4-1.9 ms** (3.0-3.3 ms with the verify capture; ~5.5 ms on the first take in a process)
+against **72-77 ms** serialised, `LLAMA_RS_VERIFY_TAKE=1` **0 of 118 039 420 bytes differ**, and the same turn
+driven once per arm (`LLAMA_RS_FORCE_SERIALISED=1`, serially, greedy) gives **byte-identical** per-take destination
+dumps and identical text.  What made it work: the state of Qwen3.8-Flash-Next is **one segment repeated 3 or 5
+times** (interleaved inside the row), and both sides of a copy are children of the SAME layout, so a child's covered
+rows are one contiguous range on each side — a planner that only knew the single-repeat layout left 72 of 73
+tensors on the host path (measured with `GGML_META_DEBUG_CPY=1`).  The design record, kept because the next copy
+hook will face the same choices:
 
 ### What exists
 
@@ -515,6 +527,27 @@ when the decode arm gains a sequence and starts applying, and 70K of cells is wh
 > **NEXT SESSION:** see [`HANDOVER-365-and-release.md`](HANDOVER-365-and-release.md) -- the self-contained plan for
 > `TODO` #365 (the meta-aware device copy) and the block-17 amendment + release wrap-up, with the current repo state,
 > the fix branch, the re-validation commands and the landmines.
+
+### UPDATE 2026-11-22 (final): SHIPPED in the r347 block-17 amendment, with the owed gate arm
+
+`WORKLOG.md` 261122.036.  The whole fix set is in **block 17** as a same-block amendment (the maintainer's decision;
+no new block, no renumbering), and it carries two things this campaign listed as owed:
+
+5. **The synchronous host paths stop using the `cudaStreamPerThread` sentinel** (the fifth defect, `#366`'s commit):
+   one private non-blocking stream per **(thread, device)** — `ggml_cuda_host_stream()` — for every synchronous
+   host↔device path (`set_tensor`, `get_tensor`, memset, the bounce and peer-staging copies, the KV-region row
+   moves), with the async ring's origin sharing it so the ordering the sentinel used to provide is preserved.  A
+   peer arm's graph capture claims the device's legacy default stream, so those copies were refused
+   (`operation not permitted when stream is capturing`) on the host tier.
+6. **`#366` closed**: the pair's declared reserve is `common_arms_dec_reserve()` — the flat 3584 MiB floor plus a
+   **width-keyed tier** (0 at `-ub <= 1024`, 1536 MiB at `>= 2048`), because the pair creates a SECOND late narrow
+   view (the prefill arm's post-prefill re-reserve).  Measured 3584 fails, 4096 fails, **5120 clean** — which is
+   what the derivation prints, so the host tier needs no knob.
+7. **The owed gate arm exists now**: `scripts/gate-arms-soak.sh boundary` — two prefills in flight plus a decode on
+   one pair, pad buckets shrunk to 256, `BB_ROUNDS >= 3`, and a fourth sequential fresh request compared against a
+   single-context server (`MANIFESTS.md` gate 17b).  It also found that a **small model over a 3-way split is not a
+   shape anyone runs** (a 4B on 3 devices faults in `llama_kv_cache::find_slot()` on the *released* build too), so
+   its default is the validated 35B-A3B hybrid split.
 
 ### UPDATE 2026-11-22 (late): BOTH configurations clean -- the fourth defect (the VMM pool's peer grant) fixed
 
