@@ -1,0 +1,119 @@
+From fdd91342e4e7838d479f6ee9510a7e32fc225121 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:23:18 +0800
+Subject: [PATCH] CUDA/HIP: the GDN output norm folds into the SILU gate too
+ (GGML_CUDA_FUSE_GDN_NORM_GATE_SILU, on unless 0)
+
+The gate -> Q8_1 kernel that computes the GDN output RMS_NORM x w itself (ggml_cuda_gdn_norm_gate_*,
+unary_gated_q8_1_norm_kernel) already takes op_silu, but the matcher accepted only a SIGMOID gate.  The qwen35 /
+qwen3next gate is SILU, so on those models the RMS_NORM + MUL ran as their own kernels on every decode step.
+
+- The matcher and the skip at the RMS_NORM accept SIGMOID or SILU; the kernel is the same, launched with op_silu.
+- GGML_CUDA_FUSE_GDN_NORM_GATE_SILU=0 restores SIGMOID only.
+- GGML_CUDA_FUSE_GDN_NORM_GATE_CENSUS=1 logs, when the context is freed, the gates fused per op and the SILU gates
+  the switch declined (counted where the host walks the graph, so the OFF arm is not vacuous).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh            |  4 ++++
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 26 +++++++++++++++++++-----
+ ggml/src/ggml-cuda/ggml-cuda.cu          |  9 ++++++++
+ 3 files changed, 34 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index c44fdc40f..5fa3d0c2d 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1944,6 +1944,10 @@ struct ggml_backend_cuda_context {
+     // GDN output norm (RMS_NORM + MUL) skipped at its node; the gate -> Q8_1 kernel computes it (ggml_cuda_gdn_norm_gate_*)
+     const ggml_tensor * gdn_norm_pending = nullptr;
+     int                 gdn_norm_gate_at = -1;   // the gate node that computes it
++    // census (GGML_CUDA_FUSE_GDN_NORM_GATE_CENSUS=1, logged when the context is freed): gates the gate -> Q8_1 kernel
++    // took with the norm, [0] SIGMOID, [1] SILU, and [2] SILU gates that matched but GGML_CUDA_FUSE_GDN_NORM_GATE_SILU=0
++    // declined.  Counted where the host walks the graph, so a replayed graph adds nothing.
++    uint64_t            gdn_norm_gate_census[3] = {};
+     const ggml_tensor * glu_q8_1_mm   = nullptr;
+     std::vector<q8_1_cache_entry> q8_1_cache;
+     size_t q8_1_arena_pos = 0;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index b36478105..726abbebd 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -1929,18 +1929,29 @@ static int ggml_cuda_cont_gate_q8_1_try_fuse(ggml_backend_cuda_context * cuda_ct
+     return cgraph->nodes[i + 3] == mm ? 2 : 3;
+ }
+ 
+-// GDN output: RMS_NORM(xn) -> MUL(w) at r, r+1, and later UNARY(sigmoid)(z) -> MUL(norm, .) -> decode matmul at s, s+1.
++// GDN output: RMS_NORM(xn) -> MUL(w) at r, r+1, and later UNARY(sigmoid or silu)(z) -> MUL(norm, .) -> decode matmul at s, s+1.
+ // Returns r when the gate -> Q8_1 kernel at s can compute the norm itself (same decision at both nodes), -1 otherwise.
+-static int ggml_cuda_gdn_norm_gate_match(const ggml_cgraph * cgraph, int s) {
++// The qwen35 / qwen3next gate is SILU: the same kernel with op_silu (GGML_CUDA_FUSE_GDN_NORM_GATE_SILU=0: SIGMOID only).
++static bool ggml_cuda_gdn_norm_gate_silu_on() {
++    static const bool on = [] { const char * e = getenv("GGML_CUDA_FUSE_GDN_NORM_GATE_SILU"); return e == nullptr || atoi(e) != 0; }();
++    return on;
++}
++
++static bool ggml_cuda_gdn_norm_gate_op(const ggml_tensor * un, bool silu) {
++    return un->op == GGML_OP_UNARY &&
++        (ggml_get_unary_op(un) == GGML_UNARY_OP_SIGMOID || (silu && ggml_get_unary_op(un) == GGML_UNARY_OP_SILU));
++}
++
++static int ggml_cuda_gdn_norm_gate_match(const ggml_cgraph * cgraph, int s, bool silu = ggml_cuda_gdn_norm_gate_silu_on()) {
+     static const bool fuse = [] { const char * e = getenv("GGML_CUDA_FUSE_GDN_NORM_GATE"); return e == nullptr || atoi(e) != 0; }();
+     if (!fuse || s < 2 || s + 1 >= cgraph->n_nodes) {
+         return -1;
+     }
+     const ggml_tensor * un  = cgraph->nodes[s];
+     const ggml_tensor * mul = cgraph->nodes[s + 1];
+-    if (un->op != GGML_OP_UNARY || ggml_get_unary_op(un) != GGML_UNARY_OP_SIGMOID || un->type != GGML_TYPE_F32 ||
++    if (!ggml_cuda_gdn_norm_gate_op(un, silu) || un->type != GGML_TYPE_F32 ||
+             mul->op != GGML_OP_MUL || (mul->src[0] != un && mul->src[1] != un) ||
+-            !ggml_cuda_can_fuse(cgraph, s, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID })) {
++            !ggml_cuda_can_fuse(cgraph, s, { GGML_OP_UNARY, GGML_OP_MUL }, { ggml_get_unary_op(un) })) {
+         return -1;
+     }
+     const ggml_tensor * nm = mul->src[0] == un ? mul->src[1] : mul->src[0];
+@@ -1991,7 +2002,11 @@ static int ggml_cuda_gdn_norm_gate_skip(ggml_backend_cuda_context * cuda_ctx, co
+     }
+     for (int s = i + 2; s < cgraph->n_nodes && s <= i + 32; ++s) {
+         const ggml_tensor * t = cgraph->nodes[s];
+-        if (t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID && ggml_cuda_gdn_norm_gate_match(cgraph, s) == i) {
++        if (!ggml_cuda_gdn_norm_gate_silu_on() && t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SILU &&
++                ggml_cuda_gdn_norm_gate_match(cgraph, s, true) == i) {
++            cuda_ctx->gdn_norm_gate_census[2]++;   // census only: the switch declines this SILU gate (the scan goes on as before)
++        }
++        if (ggml_cuda_gdn_norm_gate_op(t, ggml_cuda_gdn_norm_gate_silu_on()) && ggml_cuda_gdn_norm_gate_match(cgraph, s) == i) {
+             if (cuda_ctx->gdn_norm_pending != nullptr) {
+                 GGML_ABORT("GDN norm %s was skipped but never computed", cuda_ctx->gdn_norm_pending->name);
+             }
+@@ -2015,6 +2030,7 @@ static int ggml_cuda_gdn_norm_gate_try_fuse(ggml_backend_cuda_context * cuda_ctx
+     }
+     cuda_ctx->gdn_norm_pending = nullptr;
+     cuda_ctx->gdn_norm_gate_at = -1;
++    cuda_ctx->gdn_norm_gate_census[ggml_get_unary_op(un) == GGML_UNARY_OP_SILU ? 1 : 0]++;
+     ggml_tensor * mul = cgraph->nodes[s + 1];
+     const ggml_tensor * mm = ggml_cuda_find_mul_q8_1_matmul(cgraph, s + 1, mul);
+     ggml_cuda_op_unary_mul_q8_1(*cuda_ctx, cgraph->nodes[s], mul, mm, nullptr, cgraph->nodes[r]);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 965b43981..6bd492fe6 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1731,6 +1731,15 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+         CUDA_CHECK(cudaFree(moe_red_cnt));
+     }
+     ggml_cuda_fattn_kq_blocks_free(*this);   // the shared FA KV-group bitmap (GGML_CUDA_FA_KQ_BLOCKS_REUSE)
++    {
++        static const bool census = [] { const char * e = getenv("GGML_CUDA_FUSE_GDN_NORM_GATE_CENSUS"); return e != nullptr && atoi(e) != 0; }();
++        if (census) {
++            const char * e = getenv("GGML_CUDA_FUSE_GDN_NORM_GATE_SILU");
++            GGML_LOG_WARN("GDN_NORM_GATE_CENSUS dev=%d silu=%s fused sigmoid=%llu silu=%llu declined silu=%llu\n", device,
++                          e == nullptr || atoi(e) != 0 ? "on" : "off", (unsigned long long) gdn_norm_gate_census[0],
++                          (unsigned long long) gdn_norm_gate_census[1], (unsigned long long) gdn_norm_gate_census[2]);
++        }
++    }
+     h2d_stage_free();
+ 
+     for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
+-- 
+2.43.0
+
