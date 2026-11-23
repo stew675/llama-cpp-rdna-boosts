@@ -2660,3 +2660,30 @@ delivery revision that eventually carries the change, if it is promoted, is the 
    answer varies run to run — on the unmodified delivery too (the interleaving picks the batch composition,
    the composition picks the kernels, V8).  Byte claims at one request in flight; concurrency carries the
    non-text claims.
+
+## r363-wip (2026-11-23, `WORKLOG.md` 261123.016) -- the pair FAULTS a host-expert shape under load, a census in a destructor must go to stderr, and a refused pair must reserve NOTHING (`prefill-decode-arms` v2 STEP 6e)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 6e, nothing in `patches/` changed.
+
+1. **The two arms may NOT overlap when the prefill arm's step remaps process-wide device state.**  A 4-slot soak
+   of the pair on 35B-A3B Q8_0 `-ncmoe 40` (host expert tier) faulted the GPU
+   (`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` in `rms_norm_mul_rope_f32_qk_pair`) and aborted the server: the
+   prefill arm's step remaps the MoE expert tables while the decode arm reads them.  The barrier deliberately
+   does not serialise the two arms' `llama_process` calls (that overlap is the feature), so on a host-expert
+   shape the overlap is UNSAFE as built.  Until it is root-caused, a host-expert shape (`-ncmoe > 0`) is
+   REFUSED by `common_arms_pair_possible()`, and `gates/gate-arms-multislot.sh` reproduces the fault.
+2. **A census printed from a destructor must go to STDERR.**  `~llama_kv_cache`'s reservation census at INFO was
+   silently dropped at teardown (the log callback is already gone -- the delivery's own rule for destructor
+   diagnostics).  A gate that asserts a teardown census will read "absent" and cannot tell that from a real
+   failure.
+3. **Never SIGKILL a server whose teardown you are about to measure -- and never wrap it in an inner `timeout`.**
+   `timeout` forwards the signal it receives to its child, so a TERM to the process group reaches the server
+   TWICE and its "second interrupt" path exits immediately without running a single destructor.  One signal,
+   then wait for the process to exit; the outer `timeout` is the bound.
+4. **A reserve must be charged only when the thing it reserves for will exist.**  `COMMON_ARMS_RESERVE_MIB`
+   (256, measured 157-235 MiB/device) is charged only when the pair is possible: the np=1 arm prints "reserves
+   NOTHING".  V2's defect was exactly the opposite, and it is now unrepresentable.
+5. **A concurrent multi-request gate cannot carry a byte text claim, and its gate must say so.**  `gate-arms-
+   multislot.sh` asserts survival, completion, the ownership census and the widest batch; the byte claims live in
+   `gate-arms-n1-memory.sh` (one request in flight) and `gate-arms-itl.sh` (a fixed pair of requests).  A gate
+   that quietly compared hashes across a concurrent arm would fail for reasons unrelated to its subject.

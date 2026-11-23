@@ -1,3 +1,67 @@
+## 261123.016 (no release; `prefill-decode-arms` v2 STEP 6e) -- the decode arm's arena reserve is measured and charged, the reservation census moves to stderr, and **a host-expert shape is REFUSED: the 4-slot soak faulted the GPU**
+
+`PLAN.md` STEP 6's remaining items (R6's reserve, the reservation census) plus the first finding the new gates
+produced.  Delivery untouched; `~/llama.cpp` `arms-v2`, patch
+[`steps/STEP-6e-0009-reserve-and-census.patch`](wip/prefill-decode-arms-v2/steps/STEP-6e-0009-reserve-and-census.patch).
+
+### 1. The reserve (R6), measured and conditional
+
+`COMMON_ARMS_RESERVE_MIB = 256`, charged in the **same preflight** the draft reserve uses, and **only** when
+`common_arms_pair_possible()` says the pair will really be created — the defect V2 is exactly "a refused pair
+paid for an arena it never used", so both directions are verified:
+
+```
+np=2 (possible):  the two-arm server's decode arm reserves 256 MiB (measured 157-235 MiB per device ...)
+                  MoE arena reserve = 256 MiB in total (draft 0 + two-arm decode arm 256)
+np=1 (refused):   the two-arm server is requested but cannot be built (...), so it reserves NOTHING
+```
+
+**The measurement** (2026-11-23, gfx1201 3× R9700, 27B Q8_0, `-sm tensor -mg 0 -np 2 -c 4096`, one tiny
+request, VRAM before/after the decode arm's reserve): **+157 MiB** on devices 0 and 1, **+235 MiB** on device 2
+(the axis the extra layers land on) → the constant is that rounded up, because it is headroom for one narrow
+context regardless of width.
+
+### 2. The reservation census prints on **stderr**
+
+It runs from `~llama_kv_cache`, and a destructor at process teardown may already have lost the log callback
+(the delivery's own rule for destructor diagnostics, `ggml-cuda.cu`'s pool `free()`).  It is now
+`fprintf(stderr, ...)`, still only when the cache is shared — so the default path stays silent and the gate can
+read it after a clean shutdown.
+
+### 3. FINDING (open): the pair FAULTS a host-expert shape under 4-slot load
+
+`gates/gate-arms-multislot.sh` on 35B-A3B Q8_0 `-ncmoe 40`, 1 GPU, np 4, 20 rounds: **80 requests, then**
+
+```
+HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION: The agent attempted to access memory beyond the largest legal address
+  ... GPU index: 0, kernel: void rms_norm_mul_rope_f32_qk_pair<false, float, __half, 0, 0>(...)
+```
+
+and the server aborted after 398 s.  That is **DESIGN §8 invariant 3's own warning made concrete**: on a
+host-expert shape the prefill arm's step *remaps the MoE expert tables* (process-wide device pointers) while the
+decode arm is reading them.  The barrier deliberately does **not** serialise the two arms' `llama_process`
+calls — that overlap is the feature — so on this shape the overlap is unsafe as currently built.
+
+**Action taken (temporary, stated, not hidden):** `common_arms_pair_possible()` now refuses a host-expert shape
+(`-ncmoe > 0`) with that reason, so the pair cannot be started into the unsafe shape; the soak gate reproduces
+it for whoever root-causes it.  **This is a re-plan, not a fix**: either the decode-band rule needs a real
+mutual exclusion (which would make the feature inert exactly where it was measured), or the host-tier expert
+remap needs to be made context-safe.  Both are beyond a landing and need the maintainer's direction.
+
+### 4. The gate set, and its first results
+
+| gate | shape | result |
+|---|---|---|
+| `gates/gate-arms-n1-memory.sh` | 4B Q8_0, 2 slots `--kv-unified`, one request in flight | **PASS** — ONE memory; **byte-identical** text vs the pair-off arm; `31 step(s), 1 handover(s)`; reservation census `0 of 8192` (**HARD** here); journal clean |
+| `gates/gate-arms-itl.sh` | 4B, 5k-token prefill on slot B while slot A decodes 64 tokens, `-ub 2048` | **PASS** — same text both arms (`36216e77db27`); ITL *no worse* with the pair (1028 → 959 ms per 64 tokens this run; the 6d-2 record has 20.27 → 15.68 ms/token on a different run) |
+| `gates/gate-arms-multislot.sh` | 4B Q8_0, **4 slots, 20 rounds, 80 requests**, 2 prefills + 2 decodes per round | **PASS** — 0 errors, 0 aborts, the decode arm carried 4 handovers and reached **widest batch 4** (two decoders in ONE decode batch), journal clean.  No byte claim by design (a concurrent arm's composition picks the kernels) |
+| … the same gate on 35B-A3B `-ncmoe 40` | host tier | **FAILS** with the GPU fault above → the shape is now refused |
+
+The soak also exposed a real harness bug worth keeping: a server killed with `kill -KILL` never runs its
+destructors, so every *census* printed from one silently disappears.  `server-arm.sh` no longer wraps the server
+in an inner `timeout` (`timeout` forwards the TERM to its child, so a group TERM arrived twice → the server's
+"second interrupt, terminating immediately" path skipped teardown), and it waits for the process to exit.
+
 ## 261123.015 (no release; `prefill-decode-arms` v2 STEP 6d-2/6e/6f) -- the decode arm runs: slot ownership, the handover, the step barrier, and the first measured win (ITL 20.3 -> 15.7 ms/token through a 5k prefill)
 
 `PLAN.md` STEP 6d (second half) + 6e + 6f, landed together because a loop with nothing routed to it has no

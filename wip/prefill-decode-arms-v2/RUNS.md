@@ -8,6 +8,36 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — STEP 6e: reserve, census, and the three gates (`WORKLOG.md` 261123.016)
+
+2 files in the tree (+52/-3) plus three gate scripts.
+
+| gate / arm | shape | result |
+|---|---|---|
+| `gates/gate-arms-n1-memory.sh` | 4B Q8_0, 2 slots `--kv-unified`, 1 request in flight | **PASS**: ONE memory line; text byte-identical to pair-off; `31 step(s), 1 handover(s)`; reservation census **0 of 8192** (HARD); journal clean |
+| `gates/gate-arms-itl.sh` | 4B, 5246-token prefill on B while A decodes 64 tokens, `-ub 2048` | **PASS**: same text (`36216e77db27`); A 1028 -> 959 ms / 64 tokens with the pair on (the 6d-2 run: 20.27 -> 15.68 ms/token, -23 %) |
+| `gates/gate-arms-multislot.sh` | 4B Q8_0, 4 slots, **20 rounds, 80 requests** | **PASS**: 0 errors, 0 aborts, 4 handovers, **widest batch 4** (two decoders in one decode batch) |
+| … same gate, 35B-A3B Q8_0 `-ncmoe 40`, np 4 | host expert tier, 1 GPU | **GPU FAULT**: `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` in `rms_norm_mul_rope_f32_qk_pair`, server aborted after 398 s (80 requests had completed) |
+| reserve charge | 35B-A3B `-ncmoe 40` np=2 vs np=1 | `reserves 256 MiB` + `MoE arena reserve = 256 MiB in total (draft 0 + decode arm 256)` vs `reserves NOTHING` |
+| the reserve's measurement | 27B Q8_0 3 GPU tensor np=2, VRAM before/after one tiny request | **+157 MiB** devices 0/1, **+235 MiB** device 2 → constant 256 |
+
+### The finding (open)
+
+The pair must NOT overlap on a shape where the prefill arm's step remaps process-wide device state.  A 4-slot
+soak on the host-expert tier faults the GPU; `-ncmoe > 0` is now refused by `common_arms_pair_possible()` and
+the gate reproduces it.  Two ways out, both a maintainer decision: a real decode-band mutual exclusion (which
+makes the pair inert exactly on the shapes it was measured on), or making the host-tier expert remap
+context-safe.
+
+### Harness rule learned here (kept)
+
+A census printed from a destructor disappears if the server is SIGKILLed -- and `timeout` inside the harness made
+it worse (`timeout` forwards the TERM, so the server saw a "second interrupt" and skipped teardown entirely).
+`server-arm.sh` now starts the server without an inner `timeout`, sends ONE signal, and waits for the process to
+exit; the reservation census moved to `fprintf(stderr)`.
+
+---
+
 ## 2026-11-23 — STEP 6d-2/6e/6f: the decode arm runs (`WORKLOG.md` 261123.015)
 
 2 files, +331/-3 (`tools/server/server-context.cpp`, one refusal in `common/common.cpp`).

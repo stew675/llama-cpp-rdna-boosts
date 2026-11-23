@@ -1,0 +1,103 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index aabc6edf2..0dbbb5294 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1320,6 +1320,18 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
+ // `--fit` MEASURES the draft per device, but that measurement cannot work for an MTP draft (its context
+ // requires `ctx_other`, which does not exist while fitting), so it silently fell back to zero and fit sized
+ // the target as if the draft were free.  This value is what both `--fit` and the MoE preflight charge instead.
++// The two-arm server's decode arm is a SECOND llama_context of the same model: it brings its own batch, scheduler,
++// compute buffers and graph cache, and it arrives AFTER the MoE expert-cache arena / movable-boundary slab has
++// sized itself from the free VRAM -- exactly like a draft context does.  So the arena must leave room for it, and
++// the reserve is charged ONLY when the pair will really be created (one predicate, DESIGN V2: a refused pair that
++// was charged leaves the arena smaller for a context that never exists).
++//
++// MEASURED (2026-11-23, gfx1201 3x R9700, 27B Q8_0, `-sm tensor -mg 0 -np 2 -c 4096`, one tiny request, VRAM
++// before/after the decode arm's reserve): +157 MiB on devices 0 and 1 and +235 MiB on device 2 (the axis the
++// extra layers land on).  The constant is that measurement rounded up -- it is headroom for ONE narrow (n_parallel
++// row) context, not a width-dependent number, because the decode arm's n_batch is n_parallel x (n_spec_max+1).
++static const int COMMON_ARMS_RESERVE_MIB = 256;
++
+ static common_draft_reserve common_draft_reserve_derive(const common_params & params) {
+     common_draft_reserve draft_reserve;
+     if (!params.speculative.has_aux()) {
+@@ -1551,13 +1563,31 @@ common_init_result::common_init_result(common_params & params, bool model_only,
+         const bool has_host_experts = llama_model_moe_host_expert_dev_count(model) > 0;
+         const bool has_aux = has_host_experts &&
+                 (params.speculative.has_dft() || params.speculative.has_mtp());
++
++        // the two-arm server's decode arm, charged on the same preflight (see COMMON_ARMS_RESERVE_MIB)
++        size_t arms_bytes = 0;
++        if (has_host_experts && params.prefill_decode_arms_mode != COMMON_ARMS_OFF) {
++            const char * why = common_arms_pair_possible(params);
++            if (why == nullptr) {
++                arms_bytes = (size_t) COMMON_ARMS_RESERVE_MIB * 1024 * 1024;
++                LOG_WRN("%s: the two-arm server's decode arm reserves %d MiB (measured 157-235 MiB per device on "
++                        "27B/Q8_0/3-GPU tensor: one narrow context's compute buffers arrive after this arena)\n",
++                        __func__, COMMON_ARMS_RESERVE_MIB);
++            } else {
++                LOG_INF("%s: the two-arm server is requested but cannot be built (%s), so it reserves NOTHING\n",
++                        __func__, why);
++            }
++        }
++
+         const common_draft_reserve draft_reserve = common_draft_reserve_derive(params);
+         size_t aux_bytes = 0;
+-        if (has_aux) {
++        if (has_aux || arms_bytes > 0) {
+             // wip/slab-transient-absorption (step 1/2): the reserve derived above (the same value `--fit`
+             // uses as its fallback), or the flat default when it could not be derived.
+             const char * e = getenv("MOE_EXPERT_CACHE_AUX_RESERVE_MIB");
+-            if (draft_reserve.ok) {
++            if (!has_aux) {
++                aux_bytes = 0;
++            } else if (draft_reserve.ok) {
+                 // wip/slab-transient-absorption (step 4): the draft MODEL is now loaded BEFORE the target
+                 // context (below), so its weights are already resident when the slab is created and are
+                 // measured there from the free VRAM.  They must NOT be charged to the slab's reserve a
+@@ -1595,6 +1625,12 @@ common_init_result::common_init_result(common_params & params, bool model_only,
+                         draft_reserve.note.empty() ? "not derivable" : draft_reserve.note.c_str());
+             }
+         }
++        if (arms_bytes > 0) {
++            aux_bytes += arms_bytes;
++            LOG_INF("%s: MoE arena reserve = %.0f MiB in total (draft %.0f + two-arm decode arm %.0f)\n",
++                    __func__, (double) aux_bytes / 1048576.0, (double) (aux_bytes - arms_bytes) / 1048576.0,
++                    (double) arms_bytes / 1048576.0);
++        }
+         llama_model_moe_cache_preflight(model, aux_bytes);
+     }
+ 
+@@ -2252,6 +2288,17 @@ const char * common_arms_pair_possible(const common_params & params) {
+         return "--sleep-idle unloads the model, which would tear the pair's SHARED memory down under the "
+                "other arm";
+     }
++    if (params.n_cpu_moe > 0) {
++        // OPEN (2026-11-23): a 4-slot soak of the pair on the 35B-A3B host tier (-ncmoe 40, one GPU) faulted
++        // the GPU -- HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION in rms_norm_mul_rope_f32_qk_pair -- and the
++        // server aborted.  A host-expert shape REMAPS the MoE expert tables from the prefill arm's step while
++        // the decode arm is reading them, which is the "process-wide state" DESIGN 8 invariant 3 warns about;
++        // the pair is therefore REFUSED on that shape until the interaction is root-caused (TODO: the soak in
++        // wip/prefill-decode-arms-v2/gates/gate-arms-multislot.sh reproduces it).
++        return "a host-expert shape remaps the MoE expert tables from the prefill arm's step while the decode "
++               "arm reads them (a 4-slot soak faulted the GPU); run the pair on a GPU-resident shape until "
++               "that is root-caused";
++    }
+     if (params.ctx_shift) {
+         return "--context-shift mutates the shared KV of a slot the decode arm owns; run --no-context-shift "
+                "(the pair does not shift a generating slot from the other arm)";
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 4bc35f92c..0d5d19413 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2739,7 +2739,9 @@ llama_kv_cache::~llama_kv_cache() {
+                 n_reserved += v != 0 ? 1 : 0;
+             }
+         }
+-        LLAMA_LOG_INFO("%s: shared KV cache teardown: %zu of %u cell(s) still reserved (0 expected), "
++        // STDERR, not the log: this runs from a destructor at process teardown, where the log callback may
++        // already be gone (the delivery's own rule for destructor diagnostics -- see the pool's free()).
++        fprintf(stderr, "%s: shared KV cache teardown: %zu of %u cell(s) still reserved (0 expected), "
+                 "%d borrower(s)\n", __func__, n_reserved, get_size(), n_borrowed);
+     }
+ 

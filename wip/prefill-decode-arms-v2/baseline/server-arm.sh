@@ -82,7 +82,7 @@ die() { echo "FAIL($TAG): $*" >&2; [ -n "$SPID" ] && tail -25 "$LOG" >&2; exit 1
 cleanup() {
     # a CLEAN shutdown matters: the library's teardown censuses (the pair's decode-arm step/handover count, the
     # expert-cache lines) print from destroy(), so give the server time to run it before the KILL.
-    [ -n "$SPID" ] && { kill -TERM -"$SPID" 2>/dev/null; sleep 3; kill -KILL -"$SPID" 2>/dev/null; }
+    [ -n "$SPID" ] && { kill -TERM -"$SPID" 2>/dev/null; sleep 6; kill -KILL -"$SPID" 2>/dev/null; }
     rm -rf "$TMPD"
 }
 trap cleanup EXIT
@@ -90,8 +90,13 @@ trap cleanup EXIT
 cd "$HOME/llama.cpp" || exit 1
 
 # shellcheck disable=SC2086
+# NOTE: no inner `timeout` around the server.  `timeout` forwards the signal it receives to its child, so a TERM
+# to the process group reached the server TWICE ("Received second interrupt, terminating immediately") and the
+# server skipped its teardown -- which is exactly where the library prints its censuses (the reservation bitmap,
+# the decode-arm counters).  The arm is still bounded: the caller wraps this script in `timeout`, the readiness
+# and request waits are bounded here, and the cleanup below always kills the group.
 setsid env $EXTRA_ENV LLAMA_SERVER_PARK_IDLE_SLOTS=0 \
-    timeout "$STIMEOUT" "$BIN/llama-server" \
+    "$BIN/llama-server" \
     -m "$MODEL" --port "$PORT" --host 127.0.0.1 \
     -np "$NP" -c "$CTX" --kv-unified -ngl 99 -t 16 \
     --no-webui --no-warmup $EXTRA >"$LOG" 2>&1 &
