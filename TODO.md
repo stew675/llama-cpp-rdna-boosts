@@ -90,7 +90,6 @@ delivery's host-expert tier, so it stays.
 | **361** | the r334 RDNA2 items (PR #338) are validated on the contributor's V620, not on the released tree: blocks 05/08/10 now carry an RDNA2-only FA tile-cap removal, a one-warp narrow `RMS_NORM`, a `H * n_seqs` GDN chunked gate and a rows-abreast MoE K walk, and no RDNA2 device is in the maintainer's fleet | validation / external (delivery) | **WAITING on `@jstamagal`** -- re-run on the r334 tree: full `test-backend-ops` on `gfx1030` at default flags (**especially `FLASH_ATTN_EXT` with the caps gone: the failure mode is `GGML_ASSERT(max_blocks_per_sm > 0)` in `launch_fattn`, not a rate**), `MUL_MAT_ID` with `GGML_CUDA_MOE_ROWS_ABREAST` on and off, `RMS_NORM*` in the default/`NARROW=0`/`VEC=1` arms, a model-level decode+prefill (a GDN model for the chunked gate, a MoE for the K walk) and an MTP-acceptance run; **it should also confirm that PR #339's BF16 `RMS_NORM + MUL (+ ADD)` abort is gone there** (fixed at r328 by the re-base, `archive/work/can-fuse-bf16-rms-norm-r324/` -- `RMS_NORM_MUL_ADD` now includes `type=bf16,type_w=f32` and `type=bf16,type_w=f32,type_add=bf16` arms); §361 |
 | **363** | `-of`/`--optional-features` exists with ONE tag (`tp-ffn-even`); the delivery's other env-only opt-in features are still environment-only, so a user who reads `--help` still cannot find them | tooling / docs (delivery) | **OPEN** -- migrate them one at a time: add the row to `common_optional_features()` with its switch, confirm the tag produces exactly what the env var produces (the arm `gate-ffn-even-split.sh` C-section runs), and delete the row if the feature gets a first-class option; candidates are the opt-in switches `ENVIRONMENT.md` already marks as such (§4 `LLAMA_KV_N_PAD_MIN`, §7.6 `--wmma-verify`-adjacent switches are options already, §1.2's arena knobs, block 14's `LLAMA_KV_SPILL_RAM_PCT`); §363 |
 | **369** | three gates still name the RETIRED Flash-Next `GSQ-IQ3_XXS` tree (`gate-hc-base-copy`, `gate-hc-fusions`, `gate-host-expert-text`) and were deliberately NOT repointed at r346, because each carries recorded text/KLD anchors for that class | tooling (delivery) | **OPEN** -- repoint each AND re-record its anchors on the new class (the STEW675 IQ4_NL tree) in the same change, then run each once. §369 |
-| **375** | the host-expert tier's **cache-OFF page fault**: `-ncmoe 48` + `MOE_EXPERT_CACHE_MIB=0` + `-sm tensor` faulted the GPU in the first prefill at r350 (a device read of a HOST page), reproduced at r349 with the pair inactive, and is **CLEAN on all seven control arms at r352** | correctness (delivery: block 09/12/15 host tier) | **OPEN, NO REPRO** -- needs a failing run's log + `dmesg` window; the tier is pageable (`ROCm_HostMap`) behind a pinned pool/bounce, so a repro must bypass `expert_host_src()` or hit a pinned refusal a caller treats as success. Recorded control arms: `beta/prefill-decode-arms/README.md`; §375 |
 
 
 ## Handle numbering
@@ -268,36 +267,6 @@ The work is one change: repoint each to the STEW675 IQ4_NL tree, re-record its a
 `--kld`/record paths already exist), and correct the headers' numbers.  Until then those three refuse at the
 model check rather than run on a wrong anchor — which is the correct failure, not a defect.
 
-## 375. The host-expert tier's page fault with the expert cache DISABLED (r350, not reproducible at r352)
-
-**Record:** `WORKLOG.md` 261122.040 §3 (the finding), 261123.002 (the r352 re-test); the seven control arms and
-what a reproduction must supply are in `beta/prefill-decode-arms/README.md` ("The page-fault diagnosis") — that
-directory is **frozen** as a code reproduction, but its page-fault section is the record of these control arms and
-is not part of the two-arm design the v2 campaign replaces.
-
-**What was observed (r350).**  `-ncmoe 48` + `MOE_EXPERT_CACHE_MIB=0` + `-sm tensor`, 3 devices, q8_0 KV, on
-Flash-Next: a HIP memory-access fault in the first prefill, immediately after
-`sequence parallelism engaged: T = 2048`, on a **HOST** address (`dmesg`: `in page starting at address 0x… from
-client 10` and `[gfxhub] … GCVM_L2_PROTECTION_FAULT_STATUS`).  The server survives the fault and keeps its port;
-the CWD collects multi-GB `gpucore.*.gpu` files.  It fired with `--spec-type none` and no `--prefill-decode-arms`,
-and reproduced on the **r349** tree, so it is not block 17.  The same shape with the cache **enabled** is clean.
-
-**What was measured at r352 (all clean).**  35B-A3B 1 GPU `-sm layer` `-ncmoe 48`; Flash-Next 3 GPU `-sm layer`
-`-ncmoe 48`; Flash-Next 3 GPU `-sm tensor` `-ncmoe 8`; the same at `-ncmoe 48`; the recorded 3-slot server command
-on the r351 build **and** on the r352 (block-17-free) build (11.2-11.6 s per cold 5.2 k-token POST, ~469 t/s);
-and the server arm with the pinned tier forced off two ways (`MOE_HOST_POOL_PIN=0`,
-`MOE_HOST_POOL_PIN_FAULT=late`).  Every arm's log was checked with `scripts/check-gpu-faults.sh`.
-
-**Why that is not a refutation.**  A no-XNACK GPU can only read host memory the driver has made resident, and the
-default host-expert tier is AUTO/POOL: the master is the **pageable** model mapping and the only device-readable
-copies are the bounded pinned per-expert pool and the per-table pinned bounce ring.  `expert_host_src()` *declines*
-when both are gone, so a fault needs a path that bypasses it, or a pinned refusal some caller treats as success.
-Neither is identified, and forcing the two documented pinned failures does not reproduce it.
-
-**Done =** a reproduction (log + `dmesg` + the `host experts:` census + `free -g`/`ulimit -l`), then either a fix
-in the owning block (09/12/15: pin/stage the source, or refuse the in-place read at the scheduler) or a clean
-one-line start-up refusal naming the flag combination, **plus a gate that fails on the pre-fix tree** -- the
-negative control this handle does not have.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 
