@@ -32,8 +32,11 @@ done
 python3 - "$LOG" "$DROP" "$MASK_INTS" <<'PY'
 import re, sys
 log, drop, mask_ints = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
-# a log line: "<ts> <level> <component> <function>: <message>"
-pre = re.compile(r'^\d+\.\d+\.\d+\.\d+ ([IWE]) +(\S+) +(\S+): (.*)$')
+# "<ts> <level> <component> <function>: <msg>"  (server / common)
+pre  = re.compile(r'^\d+\.\d+\.\d+\.\d+ ([IWE]) +(\S+) +(\S+): (.*)$')
+# "<ts> <level> <tag>: <msg>"                   (the library's own lines: llama_context:, llama_kv_cache:,
+#                                                notify_borrowed:, resolve_fused_ops:, report_locked:, ...)
+pre1 = re.compile(r'^\d+\.\d+\.\d+\.\d+ ([IWE]) +(\S+): (.*)$')
 term = re.compile(r'Received (first|second) interrupt|terminating immediately|Exiting\.\.\.')
 out = []
 for raw in open(log, encoding="utf-8", errors="replace"):
@@ -41,18 +44,23 @@ for raw in open(log, encoding="utf-8", errors="replace"):
     m = pre.match(line)
     if m:
         lvl, comp, fn, msg = m.groups()
-    elif line.startswith(("ggml_", "llama_", "load_", "print_info", "srv  ", "slot ")):
-        lvl, comp, fn, msg = "?", "?", "?", line          # ggml/plain lines (no timestamp prefix)
     else:
-        continue
+        m1 = pre1.match(line)
+        if m1:
+            lvl, comp, msg = m1.groups()
+            fn  = "-"
+        elif line.startswith(("ggml_", "llama_", "load_", "print_info", "srv  ", "slot ")):
+            lvl, comp, fn, msg = "?", "?", "?", line          # plain lines (no timestamp prefix)
+        else:
+            continue
     if term.search(msg):
         break
     msg = re.sub(r'127\.0\.0\.1:\d+', '127.0.0.1:PORT', msg)
     msg = re.sub(r'://[^ ]*:\d+', '://HOST:PORT', msg)
+    msg = re.sub(r'0x[0-9a-f]+', 'PTR', msg)                 # addresses are per-run
     msg = re.sub(r'\b\d+\.\d+\b', 'N', msg)                # decimals (rates, ms, MiB)
     if mask_ints:
         msg = re.sub(r'\b\d+\b', 'N', msg)
-    msg = re.sub(r'\bN(\.N)+\b', 'N', msg)
     msg = re.sub(r'\s+', ' ', msg).strip()
     shape = "%s %s %s: %s" % (lvl, comp, fn, msg)
     if drop and re.search(drop, shape):

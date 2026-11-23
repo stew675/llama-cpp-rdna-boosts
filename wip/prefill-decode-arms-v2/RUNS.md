@@ -8,6 +8,40 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — STEP 6a/6c: the pairing predicate + the decode arm's context, INERT (`WORKLOG.md` 261123.013)
+
+4 files, +160 (`common/common.{h,cpp}`, `common/arg.cpp`, `tools/server/server-context.cpp`).
+Nothing is routed to `ctx_dec` in this landing, so the pair must change no token.
+
+| arm | shape | result |
+|---|---|---|
+| pair OFF | 4B Q8_0, 2 slots `--kv-unified`, 2 concurrent greedy | `7bd542418112` / `6ce1f88dd5f7`; startup shape **byte-identical** to the (widened) anchor |
+| pair ON | same | text **identical**; shape delta = **exactly** 2 `resolve_fused_ops` WARNs + the `two-arm server: ... ONE memory ...` INFO |
+| pair ON | 27B Q8_0, 3 GPU `-sm tensor -mg 0`, 2 slots | `f2753e13e419` / `c5f2fdc43642`, identical to the pair-off arm |
+| `on`, `-np 1` | — | refuses to start: "it needs at least 2 slots (--parallel >= 2)" |
+| `on`, `--spec-type draft-mtp` | 27B | refuses to start: the speculator rule (STEP 7/10) |
+| `auto`, `-np 1` | — | warns, continues single-context |
+| `--prefill-decode-arms-mode bogus` | — | throws at parse time with the three legal values |
+| GPU faults | journal since the landing start | clean |
+
+The pair line, verbatim:
+
+```
+two-arm server: prefill arm 0x…2280 with n_batch/n_ubatch 2048/512, decode arm 0x…3060 with 2/2;
+ONE memory 0x…4270 (the decode arm borrows it, nothing is copied)
+```
+
+**Instrument fix in the same landing:** `baseline/norm-log.sh` had been dropping the library's single-tag log
+lines (`llama_context:`, `llama_kv_cache:`, `resolve_fused_ops:`), so the startup-shape anchor could not see a
+cache-geometry or memory-identity change.  It keeps both forms now (addresses -> `PTR`) and is cut at
+`listening on`; the anchor was re-baselined from the pair-off arm of a build whose text and KLD still match
+STEP 0.
+
+**Not yet charged:** the arena reserve for the decode arm (R6).  It is unnecessary while nothing is routed to
+`ctx_dec`; it becomes necessary with the routing (6d/6e/6f), where the measured cost is recorded.
+
+---
+
 ## 2026-11-23 — tooling: the ROCm 10.1 shadow removed, the draft-ctx check fixed, containers on 10.2 (`WORKLOG.md` 261123.012)
 
 Not a campaign step: the delivery's *instrumentation*.  Triggered by STEP 3's finding that

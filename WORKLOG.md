@@ -1,3 +1,75 @@
+## 261123.013 (no release; `prefill-decode-arms` v2 STEP 6a/6c) -- the pairing predicate, the options and the decode arm's context land INERT: one pure decision, one borrowed memory, and nothing routed to the second context yet
+
+`PLAN.md` STEP 6, sub-steps **6a** (predicate + options) and **6c** (create the decode arm), landed as one
+reviewable landing **before** the routing (6d/6e/6f), so that "the pair changes nothing until it is used" is an
+oracle rather than a claim.  Delivery untouched; the change is on `~/llama.cpp` branch `arms-v2`, stored as
+[`wip/prefill-decode-arms-v2/steps/STEP-6a-0006-pair-predicate-and-context.patch`](wip/prefill-decode-arms-v2/steps/STEP-6a-0006-pair-predicate-and-context.patch)
+(4 files, +160).
+
+### 1. `common_arms_pair_possible()` -- one pure decision (V2)
+
+`common/common.cpp` gains a **pure** predicate returning `nullptr` or a one-line REASON, and both the server and
+the reserve derivation call it, so a charge and a creation cannot disagree (the previous attempt charged an
+arena reserve computed from `params` alone, then refused the pair, leaving the arena several GiB smaller for a
+context that was never created).  Its refusals, each with its own sentence:
+
+| refusal | why |
+|---|---|
+| `n_parallel < 2` | the feature is a reply that keeps generating while *another* slot's prompt is processed |
+| an mmproj | the multimodal encoder pipeline is bound to one context |
+| embeddings | an embedding/rerank/decision request produces no decoded tokens to hand over |
+| LoRA adapters | `common_set_adapter_lora` is per context; the arms would disagree on which are active |
+| backend sampling | the sampler chain lives inside one context |
+| `--sleep-idle` | unloading the model tears the pair's SHARED memory down under the other arm |
+| any auxiliary speculator | its draft/verify round is not admitted on the pair yet (STEP 7 refuses it, STEP 10 re-admits it); the layer-input families and a gemma4 assistant stay refused permanently -- they assume they are the only other user of their target context |
+
+**A bug the oracle caught:** the first version also refused on `params.mmproj_use_gpu`, which is a *policy* flag
+(default **on**) and says nothing about whether a projector is loaded -- so every shape was refused for
+"multimodal".  Only `mmproj.path` says that.
+
+Options (`common/arg.cpp`, server examples only): `--prefill-decode-arms` / `--no-prefill-decode-arms`,
+`--prefill-decode-arms-mode off|on|auto` (default **off**), env `LLAMA_ARG_PREFILL_DECODE_ARMS` /
+`LLAMA_ARG_PREFILL_DECODE_ARMS_MODE`.  `on` refuses to start, `auto` falls back with the same reason, an
+unknown mode throws at parse time.
+
+### 2. The decode arm's context is a BORROW (6c), and nothing uses it yet
+
+When the pair is possible the server creates `ctx_dec` from the same model with `ctx_memory = ctx_tgt` -- **no**
+`ctx_other` (I8) -- and `n_batch = n_ubatch = n_parallel x (n_spec_max + 1)` (2 rows today, since the speculator
+is refused), `n_outputs_max`/`_per_seq` raised to match, `embeddings = false`.  It then **asserts**
+`llama_get_memory(ctx_dec) == llama_get_memory(ctx_tgt)` (I1) and logs both arms' widths and the one memory:
+
+```
+two-arm server: prefill arm 0x…2280 with n_batch/n_ubatch 2048/512, decode arm 0x…3060 with 2/2;
+ONE memory 0x…4270 (the decode arm borrows it, nothing is copied)
+```
+
+Teardown frees `ctx_dec` **before** `llama_init` (I2: the owner frees the memory, the owner outlives the
+borrower).  **No slot is routed to it in this landing** -- that is 6d/6e/6f.
+
+### 3. Oracles
+
+| oracle | result |
+|---|---|
+| pair **off**, 2 slots `--kv-unified`, 2 concurrent | text `7bd542418112` / `6ce1f88dd5f7`; **startup shape byte-identical** to the anchor |
+| pair **on**, same arm | text **identical**; startup delta = **exactly** two `resolve_fused_ops` WARNs (the second context resolves fused ops itself) + the pair's INFO line |
+| pair **on**, 27B Q8_0 **3 GPU `-sm tensor -mg 0`** | text identical: `f2753e13e419` / `c5f2fdc43642` both arms |
+| `on` with `-np 1` | **refuses to start**, naming "at least 2 slots" |
+| `on` with `--spec-type draft-mtp` | **refuses to start**, naming the speculator rule (6g) |
+| `auto` with `-np 1` | **warns** and continues as the single-context server |
+| `--prefill-decode-arms-mode bogus` | throws at parse time with the three legal values |
+| GPU faults | journal clean over the whole landing |
+
+### 4. The anchor's own instrument was fixed on the way
+
+`baseline/norm-log.sh` kept only `<level> <component> <function>:` lines and **silently dropped the library's
+single-tag lines** (`llama_context:`, `llama_kv_cache:`, `resolve_fused_ops:`, `report_locked:`) -- so a changed
+cache geometry or a new library INFO line would not have shown in the startup-shape anchor at all.  It now keeps
+both forms (addresses masked as `PTR`) and the shape is cut at `listening on`.  The anchor was re-baselined
+**from the pair-off arm of a build whose text and KLD still match STEP 0** (`be904e86f248`, `10a82b5559a9`,
+`7bd542418112`+`6ce1f88dd5f7`, 0.000000 / 100.000 %), so nothing was waved through: the two lines the wider
+rule adds are `resolve_fused_ops` WARNs every earlier run had always printed.
+
 ## 261123.012 (no release; tooling + gates) -- the ROCm 10.1 default is gone from `scripts/`: `LD_LIBRARY_PATH` had been shadowing the build's own runtime, which is what made cross-process text comparisons a coin flip. Plus `gate-draft-ctx.sh`'s census arm re-stated against the current rule, and the container lines are 7.14.1 + 10.2.0
 
 The maintainer's instruction after the STEP 3 finding: drop 10.1 everywhere, and the release containers reference

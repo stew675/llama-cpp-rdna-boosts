@@ -2584,3 +2584,28 @@ delivery revision that eventually carries the change, if it is promoted, is the 
    decline line asserted nothing.  The faithful check is the positive fact and arch-agnostic: **>= 2 distinct
    KV-cache geometries at load** (`(N cells, L layers)`), since a draft that viewed or aliased the target's
    memory would print one.
+
+## r360-wip (2026-11-23, `WORKLOG.md` 261123.013) — a policy flag is not a state flag, one predicate must serve the reserve AND the creation, and a log normalizer that drops a line form hides exactly what it should catch (`prefill-decode-arms` v2 STEP 6a/6c)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 6a/6c, nothing in `patches/` changed.
+
+1. **`mmproj_use_gpu` is a POLICY flag (default ON) and says nothing about whether a projector is loaded.**  A
+   pair-refusal predicate that tested it refused **every** shape for "multimodal input".  Only
+   `params.mmproj.path` says a projector exists.  A predicate that gates a *capability* must test the state,
+   never the policy that would apply if the state were present.
+2. **The reserve derivation and the context creation must call ONE predicate.**  The previous attempt computed
+   an arena reserve from `params` alone and then consulted a separate refusal list when creating the second
+   context, so a refused pair still left the arena several GiB smaller (V2).  `common_arms_pair_possible()` is
+   pure and returns the REASON, so "why not" is loggable from either caller and the two cannot drift.
+3. **A landing that creates the second context but routes nothing to it is worth its own oracle.**  With the
+   decode arm created and idle, the pair's text is byte-identical to the single-context arm on 4B/1-GPU and on
+   27B/3-GPU `-sm tensor`, so the *routing* landing (6d/6e/6f) starts from a proven-inert base and any text
+   change it introduces is attributable to the routing.
+4. **A log normalizer that keeps only one line FORM silently drops the rest.**  `norm-log.sh` matched
+   `<level> <component> <function>:` and therefore dropped every single-tag library line (`llama_context:`,
+   `llama_kv_cache:`, `resolve_fused_ops:`) -- i.e. exactly the lines that carry a cache geometry, a memory
+   identity or a fusion decision.  An anchor built on such a filter cannot see the class of change it exists
+   for; keep every form and mask the volatile parts (addresses -> `PTR`, decimals -> `N`).
+5. **`mmproj`, LoRA, backend sampling and `--sleep-idle` are per-context state machines, not shapes a second
+   context can share.**  They belong on the pair's refusal list *by construction*, not because a test failed:
+   each of them assumes it is the only user of its context's sampler, adapters or load/unload state.

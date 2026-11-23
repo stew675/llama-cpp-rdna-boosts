@@ -129,9 +129,19 @@ I srv server_run_i: model loaded
 I srv server_on_li: listening on http://N:PORT
 ```
 
-**This 11-line shape is the STEP 2/3/5/6 inertness assertion** for the default path: each of those steps
-must print exactly these lines (a new INFO line about the arms/memory is expected only when the pair is
+**This 13-line startup shape is the STEP 2/3/5/6 inertness assertion** for the default path: each of those
+steps must print exactly these lines (a new INFO line about the arms/memory is expected only when the pair is
 ON; the borrow/allocator/recurrent/Meta steps are inert with it OFF).
+
+*Widened at STEP 6 (2026-11-23):* `norm-log.sh` used to keep only `<level> <component> <function>:` lines and
+silently DROPPED the library's own single-tag lines (`llama_context:`, `llama_kv_cache:`, `resolve_fused_ops:`,
+`report_locked:`) -- so a changed cache geometry would not have shown in this anchor at all.  It now keeps both
+forms (addresses masked to `PTR`), and the shape is cut at the `listening on` line (the teardown census lines
+are per-run).  The re-baseline was taken from the **pair-off** arm of a build whose text (`be904e86f248` /
+`10a82b5559a9` / `7bd542418112`+`6ce1f88dd5f7`) and KLD (0.000000 / 100.000 %) still match STEP 0, so nothing
+was waved through: the two new lines are `resolve_fused_ops` WARNs every run had always printed.
+With the pair ON, the delta is exactly: those two WARNs again (the second context resolves fused ops itself)
+plus the pair's own `two-arm server: ... ONE memory ...` INFO line.
 
 ## A7 — the delivery's cheap ladder arm
 
