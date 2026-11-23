@@ -2519,3 +2519,30 @@ delivery revision that eventually carries the change, if it is promoted, is the 
 6. **A per-context diagnostic line at INFO changes every single-context startup log.**  The view-slot base is
    logged at DEBUG, and the pair's census goes on the BORROW line (which exists only when it matters), so the
    default path's startup shape stays byte-identical -- which is what lets that shape be an anchor at all.
+
+## r358-wip (2026-11-23, `WORKLOG.md` 261123.011) -- a recurrent module's per-batch placement is MODULE state that a graph reads, and a getter that RESETS an index is a race with a second graph (`prefill-decode-arms` v2 STEP 5)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 5, nothing in `patches/` changed.
+
+1. **`llama_memory_recurrent` kept this batch's graph-visible state on the MODULE** (`head`, `n`, `rs_z`), so
+   two contexts building graphs read each other's placement.  It now returns a `placement` from
+   `find_slot()` and the CONTEXT stores it.  `head` deliberately stays on the module: it is also the SCAN HINT
+   (where the next search starts), it is genuinely module state, and keeping its **value** -- not just its
+   meaning -- is what makes the single-context path bit-identical (A5's acceptance counts moved by zero).
+2. **A graph-time getter that mutates is a race, not a style problem.**  `s_copy()` reset `rs_idx[seq]` as a
+   side effect, so the value depended on HOW MANY TIMES the input had been set for one apply.  The reset moved
+   to `apply()` (under the memory lock) and the per-cell rollback index is staged there; the getter only reads.
+   The intended semantics is the staged one (the index belongs to the cell; the reset exists so the *next*
+   apply starts fresh), and it is what a second live graph needs.
+3. **A recurrent cell holds a whole SEQUENCE's state, not a token.**  A 32-token batch for one sequence
+   occupies ONE cell (`n = 1`), and the 27B's recurrent store is `n_seq_max` cells wide (4).  Any oracle that
+   expects `n == n_tokens` on this module is wrong; the distinguishing quantity is **which cell**, and whose
+   sequence lives in it.
+4. **The non-vacuity instrument for a placement extraction is two LIVE contexts read at one instant** -- prepare
+   two batch contexts against the shared memory, apply both, keep both alive, read `(head, n, rs_z)` from each.
+   Extracted: two different placements.  Not extracted: both read the module's one value (measured: the STEP 4
+   build prints `head=1 n=1 rs_z=1` for BOTH).
+5. **The rollback plane is the sensitive instrument for a recurrent change, and its acceptance COUNTS are the
+   strictest form.**  The four-axis draft-acceptance counts (`#gen drafts`/`#acc drafts`/`#gen tokens`/
+   `#acc tokens`) reproduced bit for bit through this refactor; a byte-identical text with different counts
+   would have meant the rollback indices moved.

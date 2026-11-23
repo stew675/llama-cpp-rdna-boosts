@@ -8,6 +8,30 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — STEP 5: `llama_memory_recurrent` contextified (`WORKLOG.md` 261123.011)
+
+2 files, +119/-48 (`src/llama-memory-recurrent.{h,cpp}`).
+
+| arm | shape | result |
+|---|---|---|
+| `gates/probe-recurrent-shared.cpp` (new) §1 | 27B Q8_0 (GDN hybrid), 1 GPU; two batch contexts prepared against the ONE memory, both **kept alive** | **PASS**: `A: head=0 n=1 rs_z=0 | B: head=1 n=1 rs_z=1`; A's cell holds seq 0 only, B's seq 1 only |
+| … the STEP 4 build (control) | same | **FAIL at that line**: `A: head=1 n=1 rs_z=1 | B: head=1 n=1 rs_z=1` (one module value for both) |
+| `gates/probe-recurrent-shared.cpp` §2 | two threads, seq 0 prefill + seq 1 single-token steps on the borrower | `DIGEST arm_a=9eaff8b3b77dc104 arm_b=04c5d3a8e61c128e`, identical to `--solo` |
+| A1 / A2 / A3 | 4B 1 GPU / 27B 3 GPU tensor / 35B-A3B host tier | `be904e86f248` / `10a82b5559a9` / `e9db5cb8db0b` |
+| A4 | prefill-logit | 0.000000 / 100.000 % |
+| A5 four-axis | 27B (recurrent), 3 GPU tensor, `-n 3000`, f16 KV | hashes `f27add1937e2` / `a87c4318b649` / `c494eb660f49` / `5f6c662c4e0f`, `none`==adaptive 4/4, t/s 41.7/79.1, 41.9/151.7, 41.3/111.1, 41.6/128.5, **acceptance counts bit-identical** to STEP 0 (R 1140/826/3574/1858, K 74/73/435/423, P 462/423/2409/1610, C 539/505/3559/2460) |
+| `gate-spec-purity.sh` | 3 devices, q8_0 + bf16 | **PASS** (plain == draft-mtp both caches; width probe 0 maxdiff) |
+| `gate-spec-gdn-split.sh` | 27B, 3 devices `-ts 1,2,2`, ngen 600 | **PASS** (one GDN prefill tail 16 across `n_rs_batch` 0/5/16/65; text `0a2b2aff2576` everywhere) |
+| `gate-spec-ckpt-device.sh` | 27B host vs device checkpoints | **PASS** (identical text/drafts/accepted tokens; 18 created / 5 restored both arms) |
+| A6 + startup shape | 2 slots `--kv-unified` | `{142 ch 7bd542418112, 207 ch 6ce1f88dd5f7}`, shape `diff` empty |
+| GPU faults | journal + every log | clean |
+
+**A recurrent cell holds a sequence, not a token**: both batches occupy ONE cell (`n = 1`) even at 32 tokens,
+which is why the oracle compares WHICH cell and whose sequence — an `n == n_tokens` expectation is wrong for
+this module (`INVARIANTS.md` r358-wip item 3).
+
+---
+
 ## 2026-11-23 — STEP 4: the Meta view slot is a per-context identity (`WORKLOG.md` 261123.010)
 
 3 files, +74/-7 (`ggml/src/ggml-backend-meta.cpp`, `src/llama-context.{h,cpp}`).

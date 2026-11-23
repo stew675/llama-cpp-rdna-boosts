@@ -1,3 +1,59 @@
+## 261123.011 (no release; `prefill-decode-arms` v2 STEP 5) -- `llama_memory_recurrent` is contextified: the per-batch placement moves out of the module, a graph-time getter stops mutating, and two contexts on one recurrent memory now read their OWN placement
+
+`PLAN.md` STEP 5 -- **the step that makes the whole design possible** (the upstream `TODO: extract all the state
+like head and n here`).  **Delivery untouched**; the change is on `~/llama.cpp` branch `arms-v2` and stored as
+[`wip/prefill-decode-arms-v2/steps/STEP-5-0005-recurrent-placement.patch`](wip/prefill-decode-arms-v2/steps/STEP-5-0005-recurrent-placement.patch)
+(2 files, +119/-48).
+
+### 1. What moved, and what deliberately did not
+
+| | before | after |
+|---|---|---|
+| `head` | module member, **read by the graph** (`get_head`, `s_src`, `s_copy`) *and* the next search's hint | module member kept **only** as the SCAN HINT (`seq_rm`/`seq_keep` pull it back, `clear`/`state_read_meta` reset it, `find_slot` sets it to `min`) -- value-for-value what it was, which is what makes the single-context path bit-identical |
+| `n` | module member | `placement.n`, returned by `find_slot()` and stored in `llama_memory_recurrent_context::slot` |
+| `rs_z` | module member | `placement.rs_z` |
+| `rs_idx[seq]` **reset** | inside `s_copy()`, a graph-time GETTER | `stage_rs_idx()`, called from `apply()` -- under the memory lock |
+| the rollback index a cell uses | recomputed by the getter from live module state | staged per cell in the context by `apply()`, read (never mutated) by `s_copy()` |
+
+`prepare()` discards the returned placement (it is a feasibility probe: it rolls the whole cell state back
+below), and `state_read_meta()` uses the placement it gets instead of re-reading `head` from the module.
+`placement::ok()` is `n > 0`, so "no placement" cannot be confused with a valid one at cell 0.
+
+**Why `n`/`rs_z` had to go and `head` had to stay:** with two contexts building graphs, the first four are read
+while the other arm writes them -- and `head` doubles as the search hint, i.e. it is genuine *module* state.
+Keeping its exact value (not just its meaning) is what keeps `-0.000000` and the acceptance counts identical.
+
+### 2. The census (a new diagnostic, `LLAMA_RS_DEBUG_PLACEMENT=1`)
+
+One INFO line per `apply()`, per CONTEXT:
+`RS placement: ctx <p> slot@<p> head=N n=N rs_z=N (mem <p> head-hint=N)`.  A build that had not extracted the
+placement prints ONE value for every context; the pair prints two.  It is a **diagnostic** class variable
+(`ENVIRONMENT.md`'s row lands with the candidate patch at STEP 9/12, since the delivery's `patches/` does not
+carry this code yet).
+
+### 3. Oracles -- inertness first, then the point
+
+| oracle | result |
+|---|---|
+| `gates/probe-recurrent-shared.cpp` (new), 27B Q8_0 = a **GDN hybrid**, one GPU | **PASS 13/13**.  Section 1 (deterministic, no threads): two batch contexts prepared **and kept alive** against the one memory -> `A: head=0 n=1 rs_z=0 | B: head=1 n=1 rs_z=1`, A's cell holds seq 0 and not 1, B's holds seq 1 and not 0.  Section 2 (two threads): digests `arm_a=9eaff8b3b77dc104 arm_b=04c5d3a8e61c128e`, **identical to `--solo`** |
+| … the **STEP 4 build** (the control) | **FAIL at exactly that line**: `A: head=1 n=1 rs_z=1 | B: head=1 n=1 rs_z=1` -- both contexts read the module's single placement.  This is the defect, demonstrated |
+| A1 / A2 / A3 | `be904e86f248` / `10a82b5559a9` / `e9db5cb8db0b` -- unchanged |
+| A4 prefill-logit | **0.000000 / 100.000 %** |
+| A5 four-axis (27B, recurrent), f16 KV, `-n 3000` | **bit-identical to the STEP 0 baseline in every number**, hashes `f27add1937e2 / a87c4318b649 / c494eb660f49 / 5f6c662c4e0f`, `none` == adaptive on 4/4, and the **draft-acceptance counts are identical**: R 1140/826/3574/1858, K 74/73/435/423, P 462/423/2409/1610, C 539/505/3559/2460.  The acceptance counts ride the rollback plane, so this is the strongest inertness evidence in the step |
+| `gate-spec-purity.sh` (3 devices `-sm tensor`, q8_0 + bf16) | **PASS**: plain == draft-mtp on both caches, width probe 0 maxdiff at the flat and 256-cell-boundary points |
+| `gate-spec-gdn-split.sh` | **PASS**: one GDN prefill tail (16) for every speculator set with `n_rs_batch` = 0/5/16/65, every set reproduces the plain greedy text `0a2b2aff2576`, the default n-gram width still drafts deeper (53.33 vs 16.00) |
+| `gate-spec-ckpt-device.sh` | **PASS**: the device checkpoint restores the same bytes the host path does (identical text, drafts and accepted tokens), 18 created / 5 restored on both arms |
+| A6 + startup shape | `{142 ch 7bd542418112, 207 ch 6ce1f88dd5f7}`; shape `diff` empty |
+| GPU faults | kernel journal clean over the whole step window |
+
+### 4. One behaviour change, stated rather than hidden
+
+`s_copy()` used to return the rollback index on its **first** call for a cell and `0` on any later one (the
+getter reset the module's index).  Staged in `apply()`, it returns the same value every time -- which is the
+intended meaning (the rollback index belongs to the cell, and the reset exists so the *next* apply starts
+fresh).  The input is set once per apply in the delivery's graph path, so no measured number moved (the A5
+acceptance counts above are the evidence), and the new behaviour is the one a second live graph needs.
+
 ## 261123.010 (no release; `prefill-decode-arms` v2 STEP 4) -- the Meta view slot becomes a per-context IDENTITY: 8 slots, a pair per context, and a selector that is thread-local because it selects state inside a shared buffer
 
 `PLAN.md` STEP 4 (defect V3).  **Delivery untouched**; the change is on `~/llama.cpp` branch `arms-v2` and
