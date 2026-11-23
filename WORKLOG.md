@@ -1,3 +1,84 @@
+## 261123.007 (no release; `prefill-decode-arms` v2 STEP 1) -- three backend concurrency fixes land as one independent change: the synchronous host stream stops being the stream a graph capture owns, a refused peer descriptor stops aborting the pool, and `ggml_cuda_pool_peer_copy_ok` is defined in every configuration
+
+`PLAN.md` STEP 1 of [`wip/prefill-decode-arms-v2/`](wip/prefill-decode-arms-v2/README.md).  **Delivery
+untouched**: nothing in `patches/`, `release.json` unchanged; the change lives on `~/llama.cpp` branch
+`arms-v2` and is delivered as a patch when the campaign reaches STEP 12.  Three independent correctness
+fixes, each defensible with the two-arm server out of the picture — which is why they land first and alone.
+
+### 1. The synchronous host stream is no longer the stream a capture owns
+
+`ggml/src/ggml-cuda/ggml-cuda.cu` gains `ggml_cuda_host_stream()` — a private, non-blocking stream per
+(thread, device), cached, **never** `cudaStreamPerThread` — and every synchronous host↔device path issues
+on it: `set_tensor` / `get_tensor` (plain, `_2d`, `_n`, the pinned bounce and the 2-D staging), `memset`,
+`clear`, `cpy_tensor` / `cpy_tensor_n` and the peer-staging copies, the KV-region row moves, and the
+async-input ring.  `batch-copy.cu`'s multi-tensor paths (`ggml_cuda_set_tensor_n` /
+`ggml_cuda_get_tensor_n`) are the same class and are included — the r346-r351 artifact did not cover them.
+
+Why: HIP resolves `cudaStreamPerThread` to the **legacy default stream** (its value is `(hipStream_t) 2`,
+confirmed by the probe below), and a graph capture claims the default stream.  A host copy issued by a
+second context is then refused with `operation not permitted when stream is capturing`, and **every later
+launch on the device fails** with `operation failed due to a previous error during capture`.  One context
+never sees it: only the capturing context issues host copies, and the capture path does not upload.
+
+Two details that are not style: the helper resolves against the **current device**, exactly as the
+sentinel did (a caller that has not selected its device was already issuing the copy on the wrong device),
+and a failed `cudaStreamCreateWithFlags` returns `cudaStreamPerThread` **directly** and caches that
+decision — retrying it per copy would cost more than the stream, and recursing into the helper overflows
+the stack (issues #354).  The async-input ring's wrap also stops taking a **device-wide**
+`cudaDeviceSynchronize()` (illegal while another thread captures, and a barrier for work it does not
+depend on): it synchronises each **origin's own** stream, which is exactly the guarantee the wrap needs,
+and if even that is refused the copy is reported "not staged" so the caller uploads it synchronously — on
+the same stream, so the ordering still holds.
+
+### 2. A refused peer descriptor no longer aborts the VMM pool
+
+`ggml_cuda_pool_vmm` granted access to every descriptor in **one** `CU_CHECK`ed `cuMemSetAccess` call, so a
+single refused peer aborted the process — `HipVMM Failure: invalid argument` from a pool that grew at
+request time, i.e. only once a second context exists and only with the arena full.  It now follows the rule
+the movable-boundary slab already learned the hard way: grant the **owner** alone (located explicitly, since
+the descriptor list is in device order and the owner is not at the front for device 1 or 2), then **each
+peer on its own**, keep the mask of what was actually granted, warn once per `(device, peer)` pair, and let
+the copy path stage the pairs the driver refused.  A range registry lets `ggml_cuda_peer_copy_ok()`
+(`ggml-cuda-slab.cu`) answer for pool destinations exactly as it does for slabs; the pool registers what it
+granted and unregisters in its destructor.
+
+### 3. A shared library with an undefined symbol is a consumer-side link break
+
+`ggml_cuda_pool_peer_copy_ok()` is now **defined unconditionally** (the `#else` branch of
+`#if defined(GGML_USE_VMM)` answers `true`: without VMM there is no pool, so no pool range can hold a
+peer-copy destination — the same answer the slab gives for a destination outside every range).  Its caller
+(`ggml-cuda-slab.cu`) is compiled in **every** configuration, so a guarded definition leaves
+`libggml-hip.so` that still links (a `.so` is allowed undefined symbols) and breaks every executable that
+links it.  Which linker refuses differs — GNU ld.bfd checks a shared object's undefined symbols, lld does
+not — so a green build on this box is not evidence, and `scripts/check-shlib-symbols.sh` (`ldd -r`) is the
+instrument, run on **both** configurations.
+
+### 4. The oracles, and why a text-only oracle would have been vacuous
+
+| oracle | result |
+|---|---|
+| `scripts/check-shlib-symbols.sh`, default build (`GGML_HIP_NO_VMM=OFF`) | **OK**, 16/16 libraries resolve every symbol |
+| … on a `GGML_HIP_NO_VMM=ON` build (`build-rocm-novmm`) | **OK**, 16/16; the `#else` definition really was taken (the VMM branch's "peer access to a …" warning string is absent from that library, present in the other) |
+| A1 4B Q8_0 1 GPU, 2 runs per build, both builds | 251 chars **`be904e86f248`** — the anchor, on both, all four runs |
+| A2 27B Q8_0 3 GPU `-sm tensor -mg 0` | 399 chars **`10a82b5559a9`** — the anchor |
+| A2 again with `GGML_CUDA_P2P=1` (exercises the new split grant) | identical text, **no** peer-refusal warning, no fault |
+| A3 35B-A3B `-ncmoe 40` host tier | 262 chars `e9db5cb8db0b` — the anchor |
+| A4 prefill-logit KLD, **cross-build** (base recorded from the pre-change build into `gates-baseline/`, candidate the post-change build) | mean KLD **0.000000**, same-top-p **100.000 %** |
+| `check-gpu-faults.sh --since` over the 3-GPU and host-tier logs | clean |
+| `test-backend-ops -o CPY` (3 ROCm backends) / `test-backend-tensor` | 286/286 + 286/286 passed / all backends passed |
+
+`gates/probe-host-stream.cpp` is the **non-vacuity** check for fix 1: text identity is equally consistent
+with the helper having returned the sentinel, so the probe links the built library and asserts the returned
+handle is a real stream (`0x558a…`, not `hipStreamPerThread`'s `0x2`, not the default `0x0`), stable across
+calls, distinct per device and distinct per thread.  It reads **PASS** on all three devices.
+
+### 5. Coverage the box cannot reach (reported, not silently skipped)
+
+The pool's *refusal* branch needs a peer grant the driver refuses, which needs an arena that has taken the
+VRAM **and** a second context whose pool grows at request time.  This box cannot produce it without the
+pair, so the branch is **exercised but not fired**: STEP 6/8's pair gate on a full host-expert arena is the
+arm that would hit it, and it is recorded there rather than claimed here.
+
 ## 261123.006 (no release; `prefill-decode-arms` v2 STEP 0) -- the v2 campaign's baseline anchors are recorded on the r353 tree, and two harness defects that would have produced false results are fixed as mechanisms
 
 `PLAN.md` STEP 0 of [`wip/prefill-decode-arms-v2/`](wip/prefill-decode-arms-v2/README.md).  **No code

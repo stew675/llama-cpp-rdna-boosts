@@ -8,6 +8,46 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — STEP 1: the three backend prerequisites (`WORKLOG.md` 261123.007)
+
+**Tree:** same r353 tree, `~/llama.cpp` branch `arms-v2`.  Files: `ggml/src/ggml-cuda/ggml-cuda.cu`,
+`batch-copy.cu`, `common.cuh`, `ggml-cuda-slab.cu`, `ggml-cuda-vmm.h`.  No delivery file touched.
+
+| arm | command / shape | result |
+|---|---|---|
+| shlib symbols, default (`GGML_HIP_NO_VMM=OFF`) | `scripts/check-shlib-symbols.sh` | **OK**, 16/16 libraries resolve every symbol |
+| shlib symbols, `GGML_HIP_NO_VMM=ON` | `BUILD_DIR=build-rocm-novmm EXTRA_CMAKE_FLAGS="-DGGML_HIP_NO_VMM=ON" ~/bin/build-llama-rocm` then `check-shlib-symbols.sh ~/llama.cpp/build-rocm-novmm` | **OK**, 16/16.  The `#else` definition is the one compiled: `strings … \| grep -c "peer access to a"` is **1** in the VMM build and **0** in the NO_VMM build |
+| host-stream probe (non-vacuity for fix 1) | `gates/probe-host-stream.cpp` linked against `build-rocm/bin/libggml-hip.so` | **PASS**: devices 0/1/2 → `0x558a914d5c50` / `0x558a91dee140` / `0x558a91eb9c70`, repeat calls identical, `hipStreamPerThread` = `0x2`, legacy default = `(nil)`; a second **thread** gets `0x7f4b68000d90`, distinct |
+| A1 | 4B Q8_0, 1 GPU, prose, `-n 64`, 2 runs × 2 builds | `be904e86f248` ×4 (anchor) |
+| A2 | 27B Q8_0, 3 GPU `-sm tensor -mg 0`, `-n 96` | `10a82b5559a9` (anchor) |
+| A2 + `GGML_CUDA_P2P=1` | exercises the new split grant (P2P on ⇒ `use_peer_access`) | `10a82b5559a9`, **no** `peer access to a …` warning (all peers granted), kernel journal + log clean |
+| A3 | 35B-A3B Q8_0, `-ncmoe 40` host tier, `MOE_EXPERT_HEATMAP=load` | `e9db5cb8db0b` (anchor) |
+| A4 | prefill-logit, base recorded from the **pre-change** build (`gates-baseline/`), candidate = post-change build | mean KLD **0.000000**, same-top-p **100.000 %**; the two base files are **byte-identical** (`sha256 ce8bb26f…` both) |
+| GPU faults | `check-gpu-faults.sh --since` over the 3-GPU and host-tier logs | clean |
+| copy/tensor plumbing | `test-backend-ops -o CPY` on 3 ROCm backends; `test-backend-tensor` | 286/286 + 286/286 passed; all backends passed |
+
+### Non-vacuity of the pool fix, and its one uncovered branch
+
+`GGML_CUDA_P2P=1` takes the `use_peer_access` path, so the **split grant ran** (owner located, per-peer
+`cuMemSetAccess`, mask registered) and every peer was granted — the copy behaviour is therefore unchanged,
+which is what the identical text shows.  The **refusal** branch needs a peer grant the driver refuses, i.e. an
+arena that has taken the VRAM *and* a second context whose pool grows at request time.  This box cannot
+produce that without the pair: the branch stays *exercised but not fired* until STEP 6/8's pair gate on a full
+host-expert arena.  Recorded so it is not mistaken for a validated path.
+
+### Observation: the pre-change A4 base disappeared from `~/.cache/rdna-boosts/gates/`
+
+The STEP 0 base (5.1 GiB, `sha256 ce8bb26f…`) was gone when A4 was re-run after the STEP 1 build: the
+directory existed and was empty, and `~/.cache/rdna-boosts` + `gates/` both carry `ctime == mtime ==
+10:20:39`, while `arms-v2/` and `gpu.lock` in the same parent were untouched.  Nothing in the delivery writes
+that path (`grep -rn rdna-boosts` over `src/ ggml/src/ common/ tools/` finds no writer), no `tmpfiles.d` rule
+names it, and the system journal has no entries for the window.  Cause unknown; the consequence was ~2
+minutes of re-recording, and the workaround is the one used here: record the cross-build reference into a
+**separate** directory (`gates-baseline/`), which is also the right protocol for a change whose oracle is a
+KLD point.  A recurrence would be worth chasing; a one-off is not.
+
+---
+
 ## 2026-11-23 — STEP 0: workspace, branch, baseline anchors (r353 tree)
 
 **Tree:** delivery `v17-919794500-r353` (base `919794500`, tree `27db9bfd4`, tip `089f90067`, build

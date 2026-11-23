@@ -2374,3 +2374,51 @@ block 17.
    run-to-run spread (+0.1 % / +0.5 %, the 35B-A3B's first run after load being the low outlier), and
    `llama-batched-bench -npl 1,4,8` +1.1 / +0.1 / +0.05 % with pp512 flat.  The mechanism is two launches per GDN
    layer per step, so the win scales with a launch's cost, not with the model.
+
+## r354-wip (2026-11-23, `WORKLOG.md` 261123.007) — the synchronous host-copy stream is the stream a graph capture OWNS, a refused peer descriptor poisons an all-descriptors grant, and a `.so` links with a symbol nobody defines (`prefill-decode-arms` v2 STEP 1)
+
+*No delivery revision:* this is `wip/prefill-decode-arms-v2/` STEP 1 and nothing in `patches/` changed
+(`release.json` untouched).  `r354-wip` is the campaign's handle for the entry, not a revision number; the
+delivery revision that eventually carries the change, if it is promoted, is the maintainer's to number.
+
+1. **`cudaStreamPerThread` is the legacy DEFAULT stream on HIP, and a graph capture claims it.**  Its value
+   is `(hipStream_t) 2` — the sentinel, not an identity — and HIP resolves it to the current device's legacy
+   default stream at issue time.  Two contexts therefore cannot both use it: while one thread has a capture
+   in flight, the other's host copy is refused with `operation not permitted when stream is capturing`, and
+   the device is then poisoned for **every** later launch (`operation failed due to a previous error during
+   capture`).  Measured on the 3-device `-sm tensor` pair from `llm_graph_input_ple::set_input`.  One context
+   never reaches it, because only the capturing context issues host copies and the capture path does not
+   upload — which is why this can sit in the delivery for years and appear only when a second context
+   exists.  Every synchronous host↔device path must issue on a **private per-(thread, device)** stream
+   (`ggml_cuda_host_stream()`), and the class includes more than the obvious setters: the pinned bounce and
+   2-D staging paths, `cpy_tensor`/`cpy_tensor_n` and the peer-staged copies, the KV-region row moves, the
+   async-input ring **and** `batch-copy.cu`'s multi-tensor `set_tensor_n`/`get_tensor_n`.
+2. **A helper that replaces the sentinel must resolve the device the way the sentinel did, and must fail
+   without recursing.**  Resolve against the **current** device (a caller that has not selected its device
+   was already copying to the wrong one, so nothing regresses); on a failed `cudaStreamCreateWithFlags`,
+   return `cudaStreamPerThread` **directly**, cache it, and never call back into the helper — a recursive
+   "fallback" is a stack overflow, not a fallback (issues #354).  A host-side `cudaDeviceSynchronize()` is
+   the same defect class in the other direction: it is illegal while another thread captures, and it
+   barrier-waits work the caller does not depend on, so a wrap that only needs "every origin's copies have
+   landed" must synchronise each **origin's own** stream.
+3. **A refused peer descriptor poisons an all-descriptors `cuMemSetAccess` call.**  The movable-boundary slab
+   learned it for its own mappings (r92): grant the owner alone, then each peer **on its own**, keep the mask
+   of what was actually granted, and let the copy path stage the pairs the driver refused.  The VMM **pool**
+   is the second user of the same machinery and did none of that — it granted every descriptor in one
+   `CU_CHECK`ed call, so one refusal aborted the process (`HipVMM Failure: invalid argument`).  Unreachable
+   with one context (its pools are created and grown during load and the first reserve, before the arena
+   fills); reachable the moment a second context's pool grows at request time with the arena full.  The
+   owner's descriptor must be **located**, not assumed first: the list is in device order, so for device 1 or
+   2 the front is a peer — and granting "the front" with `CU_CHECK` is exactly the abort being removed.
+4. **A shared library is allowed to carry undefined symbols, so a guarded DEFINITION with an unguarded CALLER
+   breaks the consumer, not the build** (issue #353, `r351` records the delivery-side version of this).  The
+   caller here (`ggml-cuda-slab.cu`) is backend-shared, the definition was inside `#if defined(GGML_USE_VMM)`,
+   so `libggml-hip.so` linked and every executable that linked *it* failed.  Which linker refuses differs —
+   GNU ld.bfd checks a shared object's undefined symbols, lld does not — so `scripts/check-shlib-symbols.sh`
+   (`ldd -r`, linker-independent) on **both** configurations is the instrument, and it belongs in any change
+   that touches a conditional-compilation guard.
+5. **A text-only oracle is vacuous for this class.**  "The greedy text did not change" is equally consistent
+   with the helper having returned the sentinel it was meant to replace, because the sentinel *is* the old
+   behaviour.  The non-vacuity check is structural: link the built library and assert the returned handle is
+   a real stream (`0x558a…`), not `hipStreamPerThread` (`0x2`), not the default (`0x0`), stable across calls
+   and distinct per device and per thread — `wip/prefill-decode-arms-v2/gates/probe-host-stream.cpp`.
