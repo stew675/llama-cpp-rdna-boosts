@@ -1,3 +1,43 @@
+## 261123.003 (r352, release completed: pushed, fork refreshed, tag cut) -- the gate results the withdrawal actually earned, and the two gate gaps it did not close
+
+`v17-919794500-r352` is committed (`7567a48e`), tagged and pushed to
+`git@github.com:stew675/llama-cpp-rdna-boosts.git` (`main` + the tag).  The personal fork's `rdna-boosts`
+branch was re-cut and force-pushed by `scripts/fork-refresh.sh --build --gates --push --yes`:
+**`4872868ef...e695c46ce`**, applied tree `0d2f70e6c` == `release.json.tree`, `n_default` 18 commits.  The
+branch carries the **default set only** (block 17 is not on it).  `gh api
+repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` is the freshness read; the branch's newest
+commit stays dated 2026-10-25 (block 0300's author date) by design.
+
+### 1. Gates that ran on the final build (all green unless stated)
+
+| gate / arm | result |
+|---|---|
+| `~/bin/build-llama-rocm` on the r352 tree | clean build, `llama-cli --version` = commit `e695c46ce` |
+| shared-library symbol check (`fork-refresh --gates`) | PASS |
+| coherence gate (4B Q8_0, 3-device tensor, seed 42) | PASS |
+| **`gate-prefill-logits.sh`** (27B Q8_0, the per-ROCm-line 10.2 base recorded *before* the withdrawal) | **mean KLD 0.000000 / same-top-p 100.000 %** |
+| `gate-moe-host-offload.sh` (issue #323) | **PASS**, every arm's log and the kernel window clean |
+| `gate-seqpar.sh` (2 devices; `MODEL=` the IQ3_S tree) | arms 1/4/5/6 PASS (the executed-form census reads `reduce-scatter ... all_gather 5 by the comm backend`), **no GPU faults**; arms 2/3a/3b FAIL |
+| host-expert **text anchors** (Flash-Next GSQ-RCO-IQ3_S, `-ncmoe 48`, `-n 128`, seed 42, temp 0, `--spec-type none`) | 1 GPU `-sm layer` **`552 e7aae6034b4f`** and 3 GPU `-sm tensor` **`645 af9171d90336`** — both **identical to the r348/r349 records** |
+| `validate-set.sh` | GREEN (18/18 strict, tree, optionals alone + cumulative, both Windows lints, file-set reconciliation 0 unexplained) |
+| `check-gen-docs.sh` | green |
+| `check-gpu-faults.sh` over every log + the kernel window | clean; `journalctl -k` has no GPU fault after 2026-11-23 00:30 (the last are 2026-11-22 20:55-23:13, the r350 session) |
+
+### 2. The two gate gaps, stated rather than papered over
+
+* **`gate-seqpar.sh` arms 2, 3a and 3b fail on this box at every tree**, and they are not r352's doing: they
+  consume a prefill-logit base recorded for the **retired** Flash-Next `GSQ-IQ3_XXS` tree (the gate defaults
+  to it; the model is gone from `/llm/models`).  That is `TODO` #369 (three gates still name the retired
+  tree), unchanged by this release.  The arms that carry the mechanism (OFF text identity, the ON
+  executed-form census, inertness on a non-splittable layout, the floor guard) all pass.
+* **MTP Protocol A was not re-run.**  The release set contains no decode-kernel change; what left the tree
+  with block 17 is `-sm tensor`/server machinery plus the synchronous host-copy stream and the Meta view-slot
+  cache, and the decode-side evidence obtained instead is the two **cross-release greedy text anchors above**
+  (host-expert tier, 1 GPU layer and 3 GPU tensor, both equal to the r348/r349 records) plus the KLD point on
+  the dense 27B.  A release that touches a decode kernel still owes the four-axis protocol
+  (`benchmarks/mtp-adaptive-methodology.md`); this one does not, and the maintainer should say if they want
+  it run anyway.
+
 ## 261123.002 (r352, BLOCK 17 WITHDRAWN: cut, validated, to be committed and tagged) -- the two-arm server leaves the delivery for `beta/`, and the r350 cache-off page fault will not reproduce
 
 **`v17-919794500-r352`**: block 17 is **out of `patches/`** and lives in `beta/prefill-decode-arms/`.  The
