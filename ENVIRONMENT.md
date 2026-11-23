@@ -1742,7 +1742,7 @@ interactivity, so it is a trade an operator makes for the shape they have.
 
 | variable | default | class | notes |
 |---|---|---|---|
-| `--prefill-decode-arms` / `--no-prefill-decode-arms`<br/>(env `LLAMA_ARG_PREFILL_DECODE_ARMS`) | **off** | **opt-in** | Run the server with the two arms.  The explicit form: the server **refuses to start** if the pair cannot be honoured (a speculator, mtmd/TTS/realtime, embeddings/rerank/decision, LoRA, `--sleep-idle`, backend sampling, `-np 1`).  The last of `--prefill-decode-arms` / `--no-prefill-decode-arms` / `--prefill-decode-arms-mode` wins. |
+| `--prefill-decode-arms` / `--no-prefill-decode-arms`<br/>(env `LLAMA_ARG_PREFILL_DECODE_ARMS`) | **off** | **opt-in** | Run the server with the two arms.  The explicit form: the server **refuses to start** if the pair cannot be honoured (mtmd/TTS/realtime, embeddings/rerank/decision, LoRA, `--sleep-idle`, backend sampling, `-np 1`, and the two drafter families listed at the end of this section).  The last of `--prefill-decode-arms` / `--no-prefill-decode-arms` / `--prefill-decode-arms-mode` wins. |
 | `--prefill-decode-arms-mode`<br/>(env `LLAMA_ARG_PREFILL_DECODE_ARMS_MODE`) | **`off`** | **opt-in** | `off` \| `on` \| `auto`.  `on` = the explicit form (refuse rather than silently run one arm).  `auto` = enable the pair when the shape can carry it (at least 2 slots, nothing the pair refuses) and **fall back to the single-context server with a warning** when the decode context cannot be created.  `auto` is the promotion candidate for a later default flip, **not** this release's default. |
 | `LLAMA_KV_ALLOC_SHARED` | **`1` (on)** | **A/B kill switch** | The co-owner pair's ONE allocation owner (`struct llama_kv_alloc`: per-ubatch reserve/publish/release + `llama_memory_alloc_sync()` at a request boundary).  `0` restores the legacy path, where two allocating arms can be handed the same cells between `find_slot()` and `apply_ubatch()` and a sequence's cells scatter over a warm run.  A **correctness** fix, so it is on wherever a co-owner is attached; `0` is the control arm of `gate-kv-residency`-style A/Bs, never a supported configuration for the pair.  Inert with no co-owner (a plain single-context run takes the untouched path). |
 | `LLAMA_RS_FORCE_SERIALISED` | unset | **diagnostic / A/B** | Take the **serialised** recurrent-state move (`llama_memory_seq_state_take()` through the host) even where the batched device-to-device copy is available.  This is the control arm for the handover: `0.45-0.66 ms` device-to-device against `34.5-36.1 ms` serialised (52.7 MiB) on the 35B-A3B, and `1.4-3.3 ms` against `72-77 ms` per `-sm tensor` boundary on a hybrid model since the Meta buffer got its own `cpy_tensor_n` (r347, `TODO` #365 — before that the batched copy had no device hook there and `74.6 ms` was what ran).  Text is identical either way (it is a transport), so it measures cost, not correctness. |
@@ -1753,11 +1753,40 @@ interactivity, so it is a trade an operator makes for the shape they have.
 | `LLAMA_RS_DEBUG_CELLS` | unset | **diagnostic** | Compact census of a sequence's **recurrent** cell metadata (head / `rs_z` / `src0` rows) before and after a handover, one line per range. |
 | `LLAMA_KV_DEBUG_CELLS` | unset | **diagnostic** | Compact census of the cells an ubatch was given (per-ubatch, one line), for the co-owner pair's cursor: what each arm reserved, published and released. |
 | `GGML_META_DEBUG_SET` | unset | **diagnostic** | Name the tensor and the slot a meta-backend `set_tensor` reaches.  This is how the `-sm tensor` view-slot race was found (two arms sharing one meta view container): the block gives each thread its own 4-slot view selector, and the census shows which slot a set landed in. |
-| `MOE_EXPERT_CACHE_AUX_RESERVE_MIB` | **derived when the pair runs** (unset otherwise) | tuning (existing variable, **new use**) | The decode context's graph reserve, declared **before** the arena claims the space — the same declaration an embedded MTP draft context gets, with no KV term because the pair shares one cache.  This is what makes a host-expert tier (`-ncmoe`/`-cmoe` with an arena) work with the **default** arena and no operator knob: the reserve arrives after the slab is created, so an undeclared second context is refused by the arena instead of silently over-committing.  Sized **`common_arms_dec_reserve()`** since r347 (`TODO` #366): a flat **3584 MiB floor plus a width-keyed tier** — `0` at `-ub <= 1024`, **1536 MiB** at `-ub >= 2048`, +256 MiB per doubling above that — because the pair creates a **second** late narrow view, the prefill arm's post-prefill re-reserve (1430.6 MiB measured alongside the decode context's first 1430.2 MiB), which the flat floor did not cover.  Measured on Flash-Next `-ncmoe 48 -c 131072` (arena 13.3 GiB, 3 slots, 71k + 23k + 800): **3584 fails, 4096 fails, 5120 clean**, and 5120 is what the derivation prints.  This variable still wins outright.  A manually set `GGML_CUDA_SLAB_RESERVE_MIB` still **wins over both**, because it is the explicit operator request.  Never charged when a speculator is configured (the pair refuses a speculator, so the reservation would be pure waste — that bug would have cost an MTP run 3.5 GiB). |
+| `MOE_EXPERT_CACHE_AUX_RESERVE_MIB` | **derived when the pair runs** (unset otherwise) | tuning (existing variable, **new use**) | The decode context's graph reserve, declared **before** the arena claims the space — the same declaration an embedded MTP draft context gets, with no KV term because the pair shares one cache.  This is what makes a host-expert tier (`-ncmoe`/`-cmoe` with an arena) work with the **default** arena and no operator knob: the reserve arrives after the slab is created, so an undeclared second context is refused by the arena instead of silently over-committing.  Sized **`common_arms_dec_reserve()`** since r347 (`TODO` #366): a flat **3584 MiB floor plus a width-keyed tier** — `0` at `-ub <= 1024`, **1536 MiB** at `-ub >= 2048`, +256 MiB per doubling above that — because the pair creates a **second** late narrow view, the prefill arm's post-prefill re-reserve (1430.6 MiB measured alongside the decode context's first 1430.2 MiB), which the flat floor did not cover.  Measured on Flash-Next `-ncmoe 48 -c 131072` (arena 13.3 GiB, 3 slots, 71k + 23k + 800): **3584 fails, 4096 fails, 5120 clean**, and 5120 is what the derivation prints.  This variable still wins outright.  A manually set `GGML_CUDA_SLAB_RESERVE_MIB` still **wins over both**, because it is the explicit operator request.  Since r350 the pair accepts a speculator, so the derivation returns the **decode arm's reserve PLUS the draft context's** (two separate late contexts) — before that the two were disjoint and only the larger was charged.  A speculator on the pair therefore costs the arena ~3.5 GiB more than the same speculator alone; the derivation prints both terms. |
 | `-ib` / `--interactive-batch-size`<br/>(env `LLAMA_ARG_INTERACTIVE_BATCH_SIZE`) | unchanged | **reported DEPRECATED on this path** | `-ib` bounds a decoder's stall inside a **shared** step.  On the pair the decoder has its own context and thread, so the option is reported deprecated **and inert** (with a log line) whenever the pair is running.  `-ib` itself is unchanged for the single-context server (block 16). |
 | `LLAMA_SERVER_PREFILL_DUTY` | unchanged | **reported DEPRECATED on this path** | Same reason as `-ib`: the duty cycle is a property of a shared step.  Reported deprecated and inert when the pair runs; unchanged otherwise (block 16). |
 
-**What the pair refuses (by design, and it says so at start-up):** `--spec-type` (speculative decoding with the
-arms is a follow-up campaign — `auto` falls back to the single-context server and runs MTP, `on` refuses),
-mtmd/mmproj, TTS, realtime, embeddings/rerank/decision, LoRA adapters, `--sleep-idle`, backend sampling, and
-`-np 1` (which warns and stays single-context, there being nothing to overlap with one slot).
+**What the pair refuses (by design, and it says so at start-up):** mtmd/mmproj, TTS, realtime,
+embeddings/rerank/decision, LoRA adapters, `--sleep-idle`, backend sampling, `-np 1` (which warns and stays
+single-context, there being nothing to overlap with one slot), and two drafter families under `--spec-type`:
+the **layer-input** drafters (`draft-eagle3`, `draft-dflash`, `draft-dspark`, `draft-dflash2`,
+`draft-lilicorr`, which read the target's per-layer inputs through a buffer bound to ONE context) and a
+**gemma4 assistant** drafter (it shares the target's KV instead of keeping its own, and that cache already has
+two co-owners here).
+
+**`--spec-type` ON the pair (r350, `TODO` #364 — it used to be refused outright).**  `draft-mtp`,
+`draft-mtp-adaptive`, `draft-simple` and the n-gram family now run on the pair.  What changes, and what an
+operator should expect:
+
+* the decode arm drafts, verifies and accepts on **its own context**, exactly as the single-context server
+  does on `ctx_tgt`, and it is **sized for the verify width**: `ctx_dec`'s `-b`/`-ub` become
+  `n_parallel × (n_max + 1)` (3 slots at `--spec-draft-n-max 3` = a 12-row graph), which is what a 3-slot
+  verify step is.  Its output limits are raised to match (every verify row is an output);
+* a drafter that reads the TARGET's hidden rows reads them from the context that **ran the batch**
+  (`common_speculative_add_target_ctx()`), i.e. `ctx_dec` for every generated token and `ctx_tgt` for the
+  prompt rows.  The opt-in **device** h-row path (`LLAMA_MTP_DEV_ROWS`) is per-context and is turned off with
+  one WARN when a second target context is registered; the host readback is the default and is bit-identical
+  (`gate-mtp-dev-rows.sh`);
+* the speculative state machine is driven from **two threads** (the prefill arm ingests every prompt ubatch,
+  the decode arm runs the rounds) and is serialised by one mutex.  The draft context's own `llama_process()`
+  is a second **decode-band** context, so it is bracketed by the arms' handshake: while a prompt ubatch is
+  ingested the decoder enters no step.  That is once per prompt ubatch and it is the price of the block-17
+  rule "one decode-band context in flight at a time";
+* a slot crossing the request boundary carries **no** speculative state (its draft, its draft candidates and
+  its checkpoint belong to the other arm's context);
+* the reserve charged to the slab is the **SUM** of the decode arm's reserve and the draft context's reserve
+  (they are two separate late contexts; before r350 the pair refused a speculator, so the code kept the
+  larger of the two);
+* `-ib` and `LLAMA_SERVER_PREFILL_DUTY` stay DEPRECATED and inert on this path (they are work-arounds for a
+  shared step, and there is none) — a speculator does not change that.

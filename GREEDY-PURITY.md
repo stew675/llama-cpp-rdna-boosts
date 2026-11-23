@@ -3157,3 +3157,46 @@ acceptance 0.824 / 0.876 — i.e. the amendment is bit-neutral for it.
 
 **Record.**  This entry; `scripts/gate-draft-ctx.sh` (its header carries the arms and the negative control);
 `INVARIANTS.md` r348; `WORKLOG.md` 261122.038; `patches/README.md` block 17; issue #351.
+
+## 107 (r350, block 17) — a speculator on the two-arm server changes no token, and the pair-vs-single text oracle also needs the SAME idle-slot parking policy
+
+**Claim.**  A speculator on the pair (`--prefill-decode-arms --spec-type draft-mtp`, `TODO` #364) is a
+**three-way** text claim, and none of the three legs is free:
+
+1. `pair + draft-mtp` == `pair + none` — the speculator changes no token (the class every speculator gate covers);
+2. `pair + draft-mtp` == `single-context + draft-mtp` — the pair changes no token (§105's claim, extended to a
+   shape where the decode arm owns the generation);
+3. **both legs are only oracles if the two server processes PLACE the sequences the same way.**  The single
+   server parks an idle slot's cells (`LLAMA_SERVER_PARK_IDLE_SLOTS`, block 16: on) and then places the next
+   sequence at cell 0; the **co-owner guard declines parking on the pair** (block 17), so it appends.  Two
+   placements, two texts on any near-tie — §38's placement artifact, reached through the parking guard rather
+   than through admission timing.
+
+**Rule.**  A pair-vs-single text comparison sets `LLAMA_SERVER_PARK_IDLE_SLOTS=0` for every arm (or compares
+first-request-per-process only, which is the cold oracle).  Any change to the decode arm's batch composition,
+`common_speculative_add_target_ctx()`, the draft ingest's `arms_quiet` bracket, or `spec_slot_reset()` runs
+`scripts/gate-arms-spec.sh`, whose `purity` arm is the three-way comparison at 3 devices f16 / q8_0 and 2 devices
+f16, plus `draft-mtp-adaptive`, plus the MTP protocol's four axes and a concurrency arm (stress only: a
+**co-batched** verify batch is not a text oracle, §63 — and a 3-slot speculative step is exactly that).
+
+**Numbers** (gfx1201, 27B Q8_0, 3 devices `-sm tensor`, `-np 3 --kv-unified -c 32768`, `--spec-draft-n-max 3`,
+`-n 256`, seed 42, temp 0, one cold prefill per request, three prompts):
+
+* **three-way, byte-identical** on all three shapes: 3 devices f16 (`73bad5e2634a / c3bf1df7aa1d / f978d4f9353d`
+  for prose / code / recall), 3 devices q8_0 (same three), 2 devices f16 (`cbb…`) — and
+  `single-context + none` equals them too (a fourth arm, run on the 3-device f16 shape);
+* **the speculator is not vacuous**: 199 accepted rounds of 215 drafted, mean accepted length **3.56** at
+  `n_max 3`, and generation **~99-107 t/s against ~41 t/s** for the same pair without it (27B Q8_0, 3 devices,
+  `-n 64`, same seed — the drafter is the model's own embedded MTP head);
+* **`draft-mtp-adaptive`** reads the same three hashes (the controller moves the per-round depth, never the
+  arithmetic);
+* the MTP protocol's four axes on the pair (R with reasoning on, P/C/K off, `-n 512`): `none` == `draft-mtp` on
+  every axis, acceptance not collapsed;
+* **the placement finding, measured**: with parking at its default the single context read `c3bf1df7aa1d` where
+  the pair read `38169dcc3325` on the second request (q8_0 KV), and the SAME single context with
+  `LLAMA_SERVER_PARK_IDLE_SLOTS=0` read `38169dcc3325`.  `LLAMA_KV_DEBUG_CELLS=1` names the cause:
+  `seq=1 ... runs=0-528` (parked) against `runs=5309-5837` (appended).
+
+**Record.**  This entry; `scripts/gate-arms-spec.sh` (header carries the arms and the negative reasoning);
+`INVARIANTS.md` r350; `WORKLOG.md` 261122.040; `patches/README.md` block 17; `ENVIRONMENT.md` §23; `TODO` #364
+(retired).

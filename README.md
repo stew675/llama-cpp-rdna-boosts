@@ -191,8 +191,10 @@ llama-server -m ... --parallel 2 --prefill-decode-arms            # explicit: re
 llama-server -m ... --parallel 2 --prefill-decode-arms-mode auto  # enable when it fits, else stay single-context
 ```
 
-It needs **at least 2 slots** (`-np 1` warns and stays single-context), and it **refuses** a speculator
-(`--spec-type`), mmproj/mtmd, TTS, realtime, embeddings/rerank/decision, LoRA and `--sleep-idle`.  On the pair,
+It needs **at least 2 slots** (`-np 1` warns and stays single-context), and it **refuses** mmproj/mtmd, TTS,
+realtime, embeddings/rerank/decision, LoRA, `--sleep-idle` and two drafter families (**r350**: `--spec-type`
+itself is supported -- `draft-mtp`, `draft-mtp-adaptive`, `draft-simple` and the n-gram family -- but the
+layer-input drafters `eagle3`/`dflash`/`dspark`/`dflash2`/`lilicorr` are refused, as is a gemma4 assistant).  On the pair,
 `-ib` and `LLAMA_SERVER_PREFILL_DUTY` are **reported deprecated and inert** — both exist to bound a decoder's
 stall inside a *shared* step, which this mode removes.  `-ub`/`-b` **4096** is the measured sweet spot.  A hybrid
 model on `-sm tensor` pays a serialised recurrent-state move per request boundary (~75 ms, lands in TTFT).  Knobs
@@ -201,7 +203,12 @@ and every refusal: `ENVIRONMENT.md` §23; the detail and the gate ladder: `patch
 for every memory module** (a module that lacks it leaves the decode arm blind *silently* — that was the campaign's
 one P0), **one allocation owner** for the pair, the **recurrent-state handover** (and the reverse one, so a
 finished conversation stays resident and its prefix is reused at single-context parity), and the **declared
-second-context graph reserve** that makes a host-expert tier work with no operator knob.
+second-context graph reserve** that makes a host-expert tier work with no operator knob.  **r350 adds a speculator
+ON the pair**: the decode arm drafts, verifies and accepts on its own context (sized for the verify width,
+`n_parallel x (n_max + 1)` rows), the drafter reads the target's hidden rows from the context that ran the batch,
+and the pair's text stays byte-identical to the single-context server's -- measured generation **41.5 -> 98.4 t/s**
+on a 27B at 3 devices, for **-5.7 %** prefill, and `scripts/gate-arms-spec.sh` is the gate (the whole ladder is
+`MANIFESTS.md` gate 39).
 
 **r263 adds block 15 — the UMA GTT expert store.**  On an **integrated GPU** (an APU: `gfx1151`, and any newer
 Ryzen AI part) there is no host-expert tier — "VRAM" and RAM are one pool, so `-ncmoe`/`--host-experts` are refused

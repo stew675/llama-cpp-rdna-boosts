@@ -2033,10 +2033,10 @@ Promoted the `prefill-decode-arms` campaign as official **block 17** (`--prefill
    after it.  On a host-expert tier that made the arena refuse the second context (`the decode arm's step
    failed`, `SLAB_INIT ... aux=0`).  The reserve is now declared up front the same way an embedded MTP head's
    draft context declares its own, with **no KV term** (the pair shares one cache): a flat **3584 MiB** via
-   `MOE_EXPERT_CACHE_AUX_RESERVE_MIB`, and a manually set `GGML_CUDA_SLAB_RESERVE_MIB` still wins.  It is
-   **never charged when a speculator is configured** — the pair refuses a speculator, so the reservation would
-   be pure waste (that bug would have cost an MTP run 3.5 GiB).  Measured need for the *derived* form (a
-   follow-up, `TODO` #366): 1792 MiB Flash-Next, 9.52 MiB on the 4B.
+   `MOE_EXPERT_CACHE_AUX_RESERVE_MIB`, and a manually set `GGML_CUDA_SLAB_RESERVE_MIB` still wins.  Measured
+   need for the *derived* form (a follow-up, `TODO` #366): 1792 MiB Flash-Next, 9.52 MiB on the 4B.
+   *(Superseded in part by r350: the pair accepts a speculator now, so the derivation charges the decode arm's
+   reserve PLUS the draft context's — two separate late contexts — instead of keeping the larger of the two.)*
 3. **A BUDGETED arena puts both arms in one RESIDENCY CLASS; an `auto` arena does not.**  A text reference is
    per device count, per split **and per residency class** (§89): with `MOE_EXPERT_CACHE_MIB=13653` (40 GiB
    total) the expert cache's hit rate is **identical between arms** (`h` 0.9352 / 0.9352) and the pair's text
@@ -2203,3 +2203,49 @@ row, `scripts/gate-draft-ctx.sh`, `GREEDY-PURITY.md` §106.
 
 Record: `WORKLOG.md` 261122.039, `scripts/check-windows-portability.sh`, `scripts/README.md`, `MANIFESTS.md`
 (the portability-gate row), `AGENTS.md` scripts row, `patches/README.md` block 17.
+
+## r350 (2026-11-22, `WORKLOG.md` 261122.040) — a speculator ON the two-arm server: the drafter reads the hidden rows of the context that RAN the batch, a verify batch is a co-batched shape, and the pair's text oracle also needs the SAME idle-slot parking policy (block 17, `TODO` #364)
+
+1. **A drafter's target side is per-CONTEXT, not per-model.**  Block 17 refused `--spec-type` because the pair
+   evaluates generation on `ctx_dec` while every drafter read `params.ctx_tgt` (the context the speculator was
+   constructed with).  The rows a drafter consumes (`llama_get_embeddings_nextn`, `..._ith`, `..._rows`, the
+   eagle3/dflash layer inputs) exist only in the context that just ran the batch, so `common_batch` now carries
+   its `ctx` and `common_speculative_process()` reads the rows from it; a second target context is registered with
+   `common_speculative_add_target_ctx()`, which is also what enables the nextn output there.  A batch from an
+   unregistered context is REFUSED with a warning (drafting degrades, the text cannot) rather than read stale.
+   The rule: **a hidden-row read is only valid on the context that produced the last batch** — a second target
+   context is not an optimisation, it is what makes the read well defined.
+2. **The verify width is a DECODE-ARM property, and it must be declared twice.**  `ctx_dec` was sized
+   `n_batch = n_ubatch = n_parallel` (a 1-row-per-slot decode).  A speculative step is a verify batch of
+   `n_parallel × (n_draft + 1)` rows (3 slots at `n_max 3` = 12 rows), so the context is now sized for that and
+   its output limits are raised to the whole width (every verify row is an output).  The slab reserve must follow
+   in the SAME change: `common_arms_dec_reserve()` is the decode arm's own graph reserve, so a speculator on the
+   pair is charged the **sum** of that and the draft context's reserve — before r350 the two were disjoint and
+   the code deliberately kept the larger, which under-charges by a whole draft context now that both exist.
+3. **The draft context's own `llama_process()` is a second DECODE-band context.**  Block 17's rule ("never two
+   decode-band contexts: the per-table `GGML_MOE_DEVREMAP` map is process-wide") was written for two arms; on the
+   pair with a drafter there are three contexts, and the prefill arm's prompt-ingest runs the draft's heads on the
+   main thread *while the decode arm steps*.  That is now bracketed by the same `arms_quiet` handshake a request
+   boundary uses (the decode arm enters no step until the ingest ends).  Measured cost: once per prompt ubatch,
+   bounded by one draft ingest.
+4. **A speculative slot's state does not cross the request boundary.**  The draft, the draft candidates, the
+   target checkpoint and `spec_is_replay` all describe the batch the OTHER arm ran, so the forward handover and
+   the reverse take both clear them (`spec_slot_reset()`), and the prefill arm's `post_decode()` accept loop skips
+   any slot the decode arm owns (it would otherwise read a `spec_i_batch` that thread is writing).
+5. **The pair-vs-single text claim is only an oracle under the SAME placement policy.**  Measured 2026-11-22
+   (27B Q8_0, `-ctk q8_0 -ctv q8_0`, 3 devices `-sm tensor`, `-np 3 --kv-unified`, three cold requests in one
+   process): the pair read `38169dcc3325` on the second request and the single-context server `c3bf1df7aa1d`.
+   The mechanism was **not** the pair and not the speculator: `LLAMA_SERVER_PARK_IDLE_SLOTS` is ON in the single
+   server, so it parked the finished slot's cells and placed the next sequence at cell 0, while the **co-owner
+   guard declines parking on the pair** (`idle slot parking: not supported by this KV cache`) and the sequence
+   was appended at cell 5309.  The `LLAMA_KV_DEBUG_CELLS` census names it exactly (`seq=1 ... runs=0-528` against
+   `runs=5309-5837`), and the SAME single context with `LLAMA_SERVER_PARK_IDLE_SLOTS=0` reads `38169dcc3325`.
+   The rule: **a pair-vs-single text pair must pin the parking policy** (or compare first-request-per-process
+   only) — `GREEDY-PURITY.md` §38's placement artifact, reached through block 16/17's parking guard.
+6. **What the pair still refuses, and why (each is a per-context binding, not a missing feature).**  The
+   layer-input drafters (eagle3/dflash/dspark/dflash2/lilicorr) read the target's per-layer inputs through a
+   device buffer bound to ONE context and to a warm-up decode; a gemma4 assistant shares the target's KV instead
+   of keeping its own, and that cache already has two co-owners.  Both are refused at start-up with a message.
+
+Record: `WORKLOG.md` 261122.040, `scripts/gate-arms-spec.sh`, `MANIFESTS.md` gate 39, `patches/README.md`
+block 17, `ENVIRONMENT.md` §23, `GREEDY-PURITY.md` §107.

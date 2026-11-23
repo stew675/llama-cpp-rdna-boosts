@@ -1,4 +1,118 @@
-## 261122.039 (r349, BLOCK-17 AMENDMENT 2: cut, validated, NOT yet committed or tagged) -- r348 did not compile on Windows (`ssize_t` in block 17's state-move VERIFY), so it ships 20 minutes later as r349 with the lint that would have caught it
+## 261122.040 (r350, BLOCK-17 AMENDMENT 3: cut, validated, committed and tagged) -- `TODO` #364: a SPECULATOR on the two-arm server, three-way text-pure, and the placement trap the first gate version fell into
+
+**`#364` is retired.**  Block 17 refused `--spec-type` (`auto` fell back to the single-context server and ran MTP,
+`on` refused to start) because the decode arm owns its slots' KV and the recurrent state moves at a request
+boundary, while a speculator needs a verify batch on the target plus a draft context whose KV is its own.  Nothing
+about the two features was ever known to be incompatible; what was missing was (a) the verify batch on the decode
+arm, (b) the drafter's target side on a second context, and (c) an oracle.  All three are now in block 17, and
+`draft-mtp`, `draft-mtp-adaptive`, `draft-simple` and the n-gram family run on the pair.
+
+### 1. What the implementation is (4 places, each a per-context binding)
+
+* **`common_batch` carries its `ctx`.**  A drafter that reads the target's hidden rows (`llama_get_embeddings_nextn*`,
+  the eagle3/dflash layer inputs) can only read them from the context that RAN the batch, so
+  `common_speculative_process()` takes the rows from `batch_in.ctx`, and
+  `common_speculative_add_target_ctx(spec, ctx_dec)` is what enables the nextn output on the second target context.
+  A batch from an unregistered context is refused with a warning (drafting degrades, the text cannot).  With one
+  target context this is bit-for-bit the old path (the batch's ctx IS `params.ctx_tgt`).
+* **The decode arm is sized for the VERIFY WIDTH**: `n_batch = n_ubatch = n_parallel x (n_max + 1)` (3 slots at
+  `--spec-draft-n-max 3` = a 12-row graph, `decode ctx n_batch = 12` in the log), and its output limits are raised
+  to the whole width because every verify row is an output.  `n_spec_max` also clamps a round's draft so a batch
+  can never overrun the width it was sized for.
+* **`accept_draft_round()`** is the single-context `post_decode()` acceptance block moved into ONE function with two
+  callers (the prefill arm for the row that ends a prompt, the decode arm for every later step) and an explicit
+  verdict (`OK` / `REPLAY` / `STOP`), because only the main thread may touch the response lifecycle.  The rollback's
+  `seq_rm` goes through the context the batch ran on (`common_memory::seq_rm_on`) and its sequence-removal class is
+  the decode arm's (`ctx_dec_seq_rm_type`, taken from the prefill arm's -- probing it would clear the shared cache).
+* **Cross-thread ownership**: `spec` is serialised by one mutex (`m_spec`); a slot carries no speculative state
+  across a boundary (`spec_slot_reset()` on the forward handover, the reverse take and a decode-arm failure); the
+  prefill arm's accept loop skips slots the decode arm owns; and the draft context's own `llama_process()` is
+  bracketed by the arms handshake (`arms_quiet`), because it is a second DECODE-band context and block 17's rule is
+  one in flight at a time.
+* **The slab reserve is the SUM** of the decode arm's and the draft context's (`common_draft_reserve_derive`), and
+  the FLAT fallback path adds the decode arm too -- that fallback is not hypothetical: the STEW675 2-part
+  Flash-Next tree has an empty `params.model.path`, so every such run takes it (measured: `aux=3.50 GiB` before,
+  `aux=8.50 GiB` after, the 35B-A3B and Flash-Next host tiers both still clean).  Refused with a message: the
+  **layer-input** drafters (eagle3/dflash/dspark/dflash2/lilicorr) and a **gemma4 assistant** (which shares the
+  target's KV instead of owning one).
+
+### 2. The gates, and the one that was wrong first
+
+`scripts/gate-arms-spec.sh` (new, `MANIFESTS.md` gate 39): a **three-way cold** text claim --
+`pair+draft-mtp` == `pair+none` == `single-context+draft-mtp`, one fresh process per arm and one cold prefill per
+request -- plus non-vacuity (`decode ctx n_batch = NP*(n_max+1)`, `decode arm: thread up`, `#acc drafts > 0`, mean
+accepted length > 1.2), the adaptive controller, the MTP four-axis protocol on the pair, and a concurrency arm
+(stress only: a co-batched verify batch is not a text oracle, §63).  **32/32 PASS** on 27B Q8_0, `-np 3
+--kv-unified -c 32768 --spec-draft-n-max 3 -n 256`, seed 42:
+
+| shape | prose | code | recall |
+|---|---|---|---|
+| 3 devices f16 | `73bad5e2634a` | `c3bf1df7aa1d` | `f978d4f9353d` |
+| 3 devices q8_0 | `73bad5e2634a` | `38169dcc3325` | `f978d4f9353d` |
+| 2 devices f16 | `73bad5e2634a` | `38169dcc3325` | `f978d4f9353d` |
+
+and all four arms (`pair_mtp`, `pair_none`, `single_mtp`, `single_none`) identical on the 3-device f16 shape;
+`draft-mtp-adaptive` reads the same three hashes; the four axes read one text each (`aa27fc3c9e0f` / `a5760f1a2e33`
+/ `13ba0b84bcf2` / `dbc684490b41`); 199 accepted rounds of 215 drafted, mean accepted length **3.56**; generation
+**98.39 t/s against 41.51 t/s** for the same pair without it (single-context `draft-mtp` 99.23 t/s, so the pair's
+speculator costs ~0.8 %); prefill 5246 tokens **2081 -> 1963 t/s** (-5.7 %, and the single context with MTP reads
+1953 -- the ingest is MTP's own cost, not the pair's).
+
+**The first version of that gate failed, and it was the GATE.**  Without a parking pin the q8_0 arm read
+`38169dcc3325` on the pair and `c3bf1df7aa1d` on the single context.  `LLAMA_KV_DEBUG_CELLS=1` named the cause in
+one line: `seq=1 ... runs=0-528` (parked, single context) against `runs=5309-5837` (appended, pair), because
+`LLAMA_SERVER_PARK_IDLE_SLOTS` is ON in the single server and the **co-owner guard declines parking on the pair**
+(`idle slot parking: not supported by this KV cache`).  Same single context with parking off read the pair's hash.
+So every arm now pins `LLAMA_SERVER_PARK_IDLE_SLOTS=0` (`GREEDY-PURITY.md` §107, `INVARIANTS.md` r350 item 5) --
+§38's placement artifact, reached through block 16/17's parking guard, and a reminder that the pair-vs-single text
+claim needs the placement policy spelled out, not just the residency class (§105).
+
+**Host tiers.**  A speculator changes the slab reserve and the expert-access pattern, so `none` vs `draft-mtp` on a
+host tier is only an oracle were both arms are in ONE residency class.  Measured:
+* **35B-A3B Q4_K_M, 1 GPU, `-sm layer`, `-ncmoe 48`, `-np 3`** (`MOE_EXPERT_HEATMAP=load`,
+  `ROCBLAS_USE_HIPBLASLT=0`): arena **100 % resident** in every arm -- `pair+mtp` == `pair+none` == `single+mtp` ==
+  `ccc55a0ee4a7 / 75a11da44c80 / d1666a3dbe00`, acceptance 3.35 mean, and the derived reserve reads
+  `aux=8.50 GiB` (the flat 3584 + the decode arm's 5120) after the fallback fix.  **PASS**;
+* **Flash-Next STEW675 IQ4_NL + its external shared MTP head, 3 devices `-sm tensor`, q8_0 KV, `-ncmoe 48`,
+  `-c 32768`**: the pair runs the speculator (mean accepted length 3.28, no failure, no abort) but the text is NOT
+  comparable -- `pair+none` lands at 100 % residency (arena 62400 MiB) and `pair+draft-mtp` at 79.5 % (49603 MiB),
+  and the same holds for the single context (100 % vs 94.5 % at a pinned `MOE_EXPERT_CACHE_MIB=16384`).  That is
+  §105/§89 and not a speculator defect: the draft context's own reserve comes out of the same arena.  **No text
+  claim for a partly resident host tier**; the arm to use there is a fully resident one.
+
+### 3. Found and NOT fixed: a pre-existing GPU page fault on the cache-DISABLED host tier
+
+`-ncmoe 48` + `MOE_EXPERT_CACHE_MIB=0` (the expert-cache kill switch) + `-sm tensor`, 3 devices, q8_0 KV, on
+Flash-Next faults the GPU in the first prefill (`Memory access fault by GPU node-2 ... Page not present`, a HOST
+address from `client 10`), and the server does not exit after it.  **It is not this change**: it fires with
+`--spec-type none` and no arms, and it reproduces on the **r349** tree (stash + rebuild, same command).  It is not
+the load mode (`dio` and `mlock` both fault).  With the cache ENABLED the same shape is clean, which is why the
+whole release ladder never saw it.  Recorded here as an open finding for the maintainer; nothing in this release
+depends on the cache-disabled host tier.
+
+### 4. Re-cut and gates (r350)
+
+`release.json`: base `919794500`, `n_blocks` 18 / `n_temporary` 1 / `n_default` 19, tip `73d34857c` / tree
+`83bdb702510693916340031ba2cb9e42eb5dfd04` from the deterministic re-cut (`fork-refresh.sh --build`), the two
+optional artifacts re-cut mechanically (0100 -> tree `b8305aee5`, 0101 -> `df1287b64`, cumulative `8dff92e00`).
+Gates on that build:
+
+| gate | result |
+|---|---|
+| `gate-arms-spec.sh all` (new, gate 39) | **32/32 PASS** |
+| `gate-arms-soak.sh soak --quick` | 11/11, exit 0 |
+| `gate-arms-soak.sh boundary --quick` | 9/9, exit 0 |
+| `gate-prefill-logits.sh` | mean KLD **0.000000** -> PASS |
+| `gate-spec-purity.sh` | PASS on both caches at 3-device tensor (axes `2fbc183348a8` / `4d87b7b221f7` / `eb89102cb7d8` / `a87c4318b649`; width probe flat + boundary PASS) |
+| `gate-draft-ctx.sh` | **11/11** (external head, acceptance 0.81429) |
+| `validate-set.sh` | GREEN: strict 19/19, tree matches, both optional artifacts strict + cumulative, portability clean, file-set reconciliation **0 unexplained** (21 blocks / 571 files / 174 defines / 587 envs / 17 options, all carried) |
+| `check-gen-docs.sh`, `check-windows-paths.sh` | green (no option added) |
+| `check-gpu-faults.sh` | clean over every gate's window |
+
+Host tiers re-checked by hand (not part of the automated ladder, the model classes above): the 35B-A3B
+`-ncmoe 48` three-way pass and the Flash-Next run above.
+
+## 261122.039 (r349, BLOCK-17 AMENDMENT 2: cut, validated, committed and tagged) -- r348 did not compile on Windows (`ssize_t` in block 17's state-move VERIFY), so it ships 20 minutes later as r349 with the lint that would have caught it
 
 **r348 is tagged and released, and this supersedes it the same evening.**  Its patch set does not build with the
 Windows HIP toolchain: block 17's serialised state-move VERIFY logs `first at %zd` through an `(ssize_t)` cast of a
@@ -39,7 +153,7 @@ soak --quick` **11/11**, `boundary --quick` **9/9** (with `LLAMA_RS_VERIFY_TAKE=
 the change is a `printf` format and a cast inside a diagnostic that only `LLAMA_RS_VERIFY_TAKE=1` reaches, and
 the r348 run of it (axes P and C, `none` == `draft-mtp`) stands -- the two trees differ by that one log line.
 
-## 261122.038 (r348, BLOCK-17 AMENDMENT: cut, validated, NOT yet committed or tagged) -- issue #351: block 17's generic `ctx_other` arm threw on every SEPARATE MTP head, so `--spec-draft-model <mtp gguf>` never started
+## 261122.038 (r348, BLOCK-17 AMENDMENT: cut, validated, committed and tagged) -- issue #351: block 17's generic `ctx_other` arm threw on every SEPARATE MTP head, so `--spec-draft-model <mtp gguf>` never started
 
 **The delivery is re-cut at `v18-919794500-r348` in the working tree: `patches/`, `rdna-boosts-all.patch` and
 `release.json` are regenerated (the two OPTIONAL artifacts needed no re-cut: both still apply strictly and their
@@ -139,7 +253,7 @@ says which line's base the `--gates` step resolves and that `BASE=<file>` still 
 The 10.2 reference itself was recorded (from the released tree `8f88fc861`, not from the tree under test) while
 shipping r347; it is renamed to the new line-tagged name, and its `.meta` still records `build=8f88fc861`.
 
-## 261122.036 (r347, BLOCK-17 AMENDMENT -- cut, validated, NOT yet committed or tagged) -- crash #373 (the P0), `#366` and `#365` ship INSIDE block 17, and the pair gets the gate arm it was owed
+## 261122.036 (r347, BLOCK-17 AMENDMENT -- cut, validated, committed and tagged) -- crash #373 (the P0), `#366` and `#365` ship INSIDE block 17, and the pair gets the gate arm it was owed
 
 **The delivery is re-cut at `v18-919794500-r347` in the working tree: `patches/`, `rdna-boosts-all.patch`,
 `release.json` and the two OPTIONAL artifacts are regenerated; `validate-set.sh` is green.  Nothing is committed,

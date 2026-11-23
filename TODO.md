@@ -26,7 +26,7 @@ still means the same subject after that item is closed and removed from this fil
 **Current state:** the **19-patch default set** (18 official blocks `0000`-`0017` + the temporary `0300`)
 at fork point **`919794500`**; read `.release` in `release.json` for the release id -- it is the source of
 truth, not this line.  **Block 17 is the two-arm server** (a prefill arm and a decode arm co-owning one KV,
-`--prefill-decode-arms`, **opt-in, default OFF**, r346), and its follow-ups are the `#364`-`#371` rows below,
+`--prefill-decode-arms`, **opt-in, default OFF**, r346), and its follow-ups are the `#365`-`#372` rows below,
 written up in `wip/prefill-decode-arms-followups/`.  Block 14 is the **streamed KV** (the resident window, the
 attendance pool and the MTP draft window -- all three opt-in, default off); block 15 is the UMA GTT expert
 store.  The **mixed K/V cache types** are **optional block `0101`** since the r288 block-number re-org (they
@@ -68,6 +68,18 @@ server, `v18-919794500-r346`): `#364` (speculative decoding with the arms), `#36
 defaults still anchored to the retired Flash-Next model), `#370` (the pair's slot erase and cell accounting) and
 `#371` (the prefill/decode speed balance, the maintainer's turn-skip idea).
 
+**`r350` housekeeping (2026-11-22):** `#364` closed and left the list -- **implemented, not deferred**: a
+speculator now runs ON the two-arm server (`draft-mtp`, `draft-mtp-adaptive`, `draft-simple` and the n-gram
+family; the layer-input drafters and a gemma4 assistant are still refused, each because its target side is bound
+to one context), the drafter reads the target's hidden rows from the context that ran the batch, the decode arm is
+sized for the verify width, and the slab reserve is the sum of the decode arm's and the draft context's.  The
+oracle is `scripts/gate-arms-spec.sh` (MANIFESTS gate 39): a **three-way cold** text claim
+(`pair+draft-mtp` == `pair+none` == `single+draft-mtp`) at 3 devices f16 / 3 devices q8_0 / 2 devices f16, plus
+the adaptive controller, the four-axis protocol on the pair and a concurrency arm -- **32/32**, and every arm pins
+`LLAMA_SERVER_PARK_IDLE_SLOTS=0` because the co-owner guard declines parking on the pair while the single context
+parks by default (`GREEDY-PURITY.md` §107).  `WORKLOG.md` 261122.040; campaign `wip/prefill-decode-arms-followups/`
+§W1 is now DONE.
+
 **`r347` housekeeping (2026-11-22):** `#365` and `#366` are **closed** (both shipped in the block-17 amendment:
 the Meta buffer's per-child `cpy_tensor_n` and the width-keyed decode reserve — `WORKLOG.md` 261122.036), and the
 crash row filed as `#373` is **closed** too (the five shared-state defects shipped with the same amendment; the
@@ -82,7 +94,6 @@ are open work) and they are written up in one campaign, `wip/prefill-decode-arms
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **361** | the r334 RDNA2 items (PR #338) are validated on the contributor's V620, not on the released tree: blocks 05/08/10 now carry an RDNA2-only FA tile-cap removal, a one-warp narrow `RMS_NORM`, a `H * n_seqs` GDN chunked gate and a rows-abreast MoE K walk, and no RDNA2 device is in the maintainer's fleet | validation / external (delivery) | **WAITING on `@jstamagal`** -- re-run on the r334 tree: full `test-backend-ops` on `gfx1030` at default flags (**especially `FLASH_ATTN_EXT` with the caps gone: the failure mode is `GGML_ASSERT(max_blocks_per_sm > 0)` in `launch_fattn`, not a rate**), `MUL_MAT_ID` with `GGML_CUDA_MOE_ROWS_ABREAST` on and off, `RMS_NORM*` in the default/`NARROW=0`/`VEC=1` arms, a model-level decode+prefill (a GDN model for the chunked gate, a MoE for the K walk) and an MTP-acceptance run; **it should also confirm that PR #339's BF16 `RMS_NORM + MUL (+ ADD)` abort is gone there** (fixed at r328 by the re-base, `archive/work/can-fuse-bf16-rms-norm-r324/` -- `RMS_NORM_MUL_ADD` now includes `type=bf16,type_w=f32` and `type=bf16,type_w=f32,type_add=bf16` arms); §361 |
 | **363** | `-of`/`--optional-features` exists with ONE tag (`tp-ffn-even`); the delivery's other env-only opt-in features are still environment-only, so a user who reads `--help` still cannot find them | tooling / docs (delivery) | **OPEN** -- migrate them one at a time: add the row to `common_optional_features()` with its switch, confirm the tag produces exactly what the env var produces (the arm `gate-ffn-even-split.sh` C-section runs), and delete the row if the feature gets a first-class option; candidates are the opt-in switches `ENVIRONMENT.md` already marks as such (§4 `LLAMA_KV_N_PAD_MIN`, §7.6 `--wmma-verify`-adjacent switches are options already, §1.2's arena knobs, block 14's `LLAMA_KV_SPILL_RAM_PCT`); §363 |
-| **364** | speculative decoding with the two arms: the pair **refuses** `--spec-type` today (auto falls back and runs MTP, `on` refuses to start), so the verify batch on the decode arm, the draft context on a shared KV and the block-14 draft ring are all undone | capability (delivery, block 17) | **OPEN** -- campaign `wip/prefill-decode-arms-followups/` §W1 has the design, the acceptance oracles (spec-purity on the pair, the four-axis protocol on the pair) and the risk (a verify batch makes the pair a co-batched shape, so the sequential `TWO_SLOT`-style oracle is the only valid text oracle) |
 | **367** | `GLM5-Next` is unvalidated on the pair: it uses the same `llama_memory_hybrid_idx` as Qwen3.8-Flash-Next (the module whose missing shared view was block 17's P0), but no checkpoint exists on this box | validation / external (delivery, block 17) | **OPEN (waiting on a model)** -- one coverage-matrix row: both arms, layer and tensor, 2 and 3 GPU, identical text, and no `implements no shared view` warning. Campaign §W4 |
 | **368** | a **recurrent-only** memory (Mamba class, no attention KV at all) gets **no state** on the second arm: `llama_memory_seq_state_take()` refuses anything that is not a hybrid | capability (delivery, block 17) | **PARKED (no model on this box)** -- the same take with the recurrent half as the whole state; implementing it without a model would be a claim with no oracle. Campaign §W5 |
 | **369** | three gates still name the RETIRED Flash-Next `GSQ-IQ3_XXS` tree (`gate-hc-base-copy`, `gate-hc-fusions`, `gate-host-expert-text`) and were deliberately NOT repointed at r346, because each carries recorded text/KLD anchors for that class | tooling (delivery) | **OPEN** -- repoint each AND re-record its anchors on the new class (the STEW675 IQ4_NL tree) in the same change, then run each once. Campaign §G1 |
@@ -248,20 +259,6 @@ Candidates (all already documented as opt-in in `ENVIRONMENT.md`): `LLAMA_KV_N_P
 spill/window budgets (`LLAMA_KV_SPILL_RAM_PCT`, §1.2's `MOE_EXPERT_CACHE_MIB`-adjacent knobs are tuning, not
 opt-in -- check the row's class before migrating), and the `GGML_CUDA_*` opt-ins §7 lists as "opt-in, default
 OFF".  A tag is only for a feature that is **off by default**; a kill-switch is not a tag.
-
-## 364. Speculative decoding WITH the two arms (block 17)
-
-**Campaign:** `wip/prefill-decode-arms-followups/` §W1 (the full design, the acceptance oracles and the risks). — refused today, and that is the follow-up campaign
-
-Block 17's pair **refuses** `--spec-type`: `--prefill-decode-arms-mode auto` falls back to the single-context
-server and runs MTP, `on` refuses to start.  The refusal is deliberate and measured (`pass 18`), not an oversight:
-the decode arm owns its slots' KV and the recurrent state moves at a request boundary, while a speculator needs a
-**verify batch** (a multi-row decode) on the target plus a draft context whose KV is its own.  Nothing about the
-two features is known to be incompatible; what is missing is (a) the verify batch composition on the decode arm,
-(b) the draft ring's interaction with the shared cursor (`--spec-draft-kv-window`, block 14) and (c) an oracle: the
-pair's purity claims are text comparisons, and a speculator's greedy text must equal `none`'s on the same shape
-(`GREEDY-PURITY.md` §63/§96 for the rules that a co-batched verify must obey).  Until then the refusal message
-names the reason, and the single-context server keeps MTP.
 
 ## 367. `GLM5-Next` on the two-arm server (block 17)
 

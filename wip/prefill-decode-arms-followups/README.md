@@ -33,7 +33,7 @@ documented "no"; it is also the one the maintainer asked for by name.**
 
 | id | item | class | `TODO` | size | depends on |
 |---|---|---|---|---|---|
-| **W1** | speculative decoding with the arms (**MTP first**) | capability | #364 | large | W2 helps, not blocks |
+| **W1** | speculative decoding with the arms (**MTP first**) | capability | #364 | large | **DONE r350** (`WORKLOG.md` 261122.040): `draft-mtp`/`-adaptive`/`draft-simple`/n-gram run on the pair, three-way text-pure, `scripts/gate-arms-spec.sh` 32/32 |
 | **W2** | a **meta-aware device copy** for the recurrent handover | cost | #365 | medium | **DONE 2026-11-22 (r347)**: the Meta buffer's per-child `cpy_tensor_n` — **1.4-1.9 ms** against 72-77 ms serialised, `LLAMA_RS_VERIFY_TAKE=1` 0 of 118 039 420 bytes differ, and the two arms' per-take dumps are byte-identical |
 | **W3** | derive the **decode context's reserve** from the decode width | cost | #366 | small | **DONE 2026-11-22**: floor 3584 + a width-keyed tier (0 / 1536 MiB), which prints 5120 on the host tier and needs no knob |
 | **W4** | **GLM5-Next** on the pair | validation | #367 | small (needs a checkpoint) | none |
@@ -50,9 +50,28 @@ Ordering suggestion (after r347 closed **W2**, **W3** and **W9**): **G1, W7** (s
 
 ---
 
-## 2. W1 (TODO #364) — speculative decoding with the arms, MTP first
+## 2. W1 (TODO #364) — speculative decoding with the arms, MTP first — **DONE r350**
 
-### What exists
+> **SHIPPED at r350 (`WORKLOG.md` 261122.040, `INVARIANTS.md` r350, `GREEDY-PURITY.md` §107).**  The design below
+> is what was built, with two additions the build needed and one correction the first gate version needed:
+> (a) `common_batch` carries its `ctx` and `common_speculative_add_target_ctx()` registers the decode arm, so a
+> drafter reads the target's hidden rows from the context that RAN the batch; (b) the draft context's own
+> `llama_process()` is a second DECODE-band context, so the prefill arm's prompt-ingest runs under the arms
+> handshake (`arms_quiet`); (c) **the pair-vs-single text claim also needs the same idle-slot parking policy**
+> (`LLAMA_SERVER_PARK_IDLE_SLOTS=0` for every arm) or the two arms place the next sequence at different cells and a
+> near-tie flips — the first version of `gate-arms-spec.sh` failed exactly there and the cause was the gate, not the
+> feature.  The draft's own KV is its own (the "simpler first cut" below), and the block-14 draft ring needed no
+> work: it is per sequence in the draft's cache, which the pair never shares.  Still refused, with a message: the
+> layer-input drafters (eagle3/dflash/dspark/dflash2/lilicorr) and a gemma4 assistant.
+>
+> Measured oracle: `pair+draft-mtp` == `pair+none` == `single-context+draft-mtp` byte for byte on 3 devices f16,
+> 3 devices q8_0 and 2 devices f16 (three distinct prompts, one cold prefill per request), `draft-mtp-adaptive` on
+> the same hashes, the four-axis protocol on the pair, 199 accepted rounds of 215 with a 3.56 mean accepted length,
+> and generation 98.39 t/s against 41.51 t/s for the same pair without it.  Host tiers: the 35B-A3B
+> (`-ncmoe 48`, 100 % residency) passes three-way; a PARTLY resident host tier is not a text oracle (§105/§89) —
+> the draft's reserve changes the arena.
+
+### What exists (as it was before r350)
 
 The pair **refuses** a speculator.  That is deliberate and measured, not an oversight: with
 `--prefill-decode-arms-mode auto` the server falls back to the single-context server *and runs your speculator*, and

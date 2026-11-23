@@ -6343,7 +6343,11 @@ operator who asked for it is never silently downgraded.
   state-move VERIFY line: it logged its differing-byte offset as `%zd` through an `(ssize_t)` cast, a POSIX type
   the MSVC/UCRT headers never declare, so the r348 tree did not compile on Windows (PR #352); it is `%lld`
   through `(long long)` now, and `scripts/check-windows-portability.sh` gained the POSIX-type-name rule that
-  would have caught it.
+  would have caught it.  **r350** lifts the block's `--spec-type` refusal (`TODO` #364): the decode arm drafts,
+  verifies and accepts on its own context (sized for the verify width), the drafter reads the target's hidden rows
+  from the context that ran the batch (`common_batch::ctx` + `common_speculative_add_target_ctx()`), the draft
+  ingest is bracketed by the arms handshake because it is a second DECODE-band context, and the slab reserve is
+  the SUM of the decode arm's and the draft context's.  See *Speculative decoding on the pair* below.
 * **A shared view of the KV for every memory module the pair can reach** — plain KV, plain hybrid, `hybrid_idx`
   (attention KV + recurrent state + lightning indexer KV, i.e. qwen4exp) and `iswa` (sliding-window, gemma4).
   A module that does not implement the view leaves the decode arm on an **empty** cache while the server prints
@@ -6468,12 +6472,56 @@ gather census; the 3-GPU capped-arena arm **3/3** with the cache hit rate **iden
 `CONCURRENT=1` is **stress only, never a text claim** (`GREEDY-PURITY.md` §63): a co-batched pair is not a text
 oracle.
 
+### Speculative decoding on the pair (r350, `TODO` #364 — it used to be REFUSED)
+
+`--prefill-decode-arms --spec-type draft-mtp` (also `draft-mtp-adaptive`, `draft-simple` and the n-gram family)
+now runs.  What the change is, in the order a reader needs it:
+
+* **the decode arm drafts, verifies and accepts on `ctx_dec`**, the same round the single-context server runs on
+  `ctx_tgt` (`accept_draft_round()` is ONE implementation with two callers, because the round must not be
+  duplicated: the response lifecycle stays with the main thread, which is why the round returns a verdict);
+* **a drafter reads the target's hidden rows from the context that RAN the batch.**  `common_batch` carries its
+  `ctx`; the MTP drafter reads `llama_get_embeddings_nextn*` from it, and
+  `common_speculative_add_target_ctx(spec, ctx_dec)` is what enables the nextn output on the second target
+  context.  A batch from an unregistered context is refused with a warning — drafting degrades, the text cannot;
+* **the decode arm is sized for the verify width**: `n_batch = n_ubatch = n_parallel × (n_max + 1)` (3 slots at
+  `--spec-draft-n-max 3` = 12 rows), and its output limits are raised to the whole width because every verify row
+  is an output;
+* **the draft ingest is bracketed by the arms handshake.**  The draft context's own `llama_process()` is a second
+  DECODE-band context, and block 17's rule is one in flight at a time, so the prefill arm's prompt-ingest runs
+  under `arms_quiet` (the decoder enters no step for its duration — once per prompt ubatch);
+* **the slab reserve is the SUM** of the decode arm's reserve and the draft context's
+  (`common_draft_reserve_derive`): they are two separate late contexts, and before r350 the pair refused a
+  speculator so the code kept the larger of the two.  A speculator on the pair therefore costs the arena about
+  one draft context more than the same speculator alone (the derivation prints both terms);
+* **a slot carries no speculative state across the boundary** (`spec_slot_reset()` on the forward handover, the
+  reverse take and a decode-arm failure): the draft, its candidates, the target checkpoint and `spec_is_replay`
+  describe the batch the *other* arm ran.  The prefill arm's accept loop also skips any slot the decode arm owns;
+* **the opt-in device h-row path (`LLAMA_MTP_DEV_ROWS`) is turned off** when a second target context is
+  registered (it binds ONE context into the draft); the host readback is the default and is bit-identical
+  (`gate-mtp-dev-rows.sh`).
+
+**Refused, with the reason at start-up:** the **layer-input** drafters (`draft-eagle3`, `draft-dflash`,
+`draft-dspark`, `draft-dflash2`, `draft-lilicorr` — they read the target's per-layer inputs through a device
+buffer bound to ONE context plus a warm-up decode) and a **gemma4 assistant** drafter (it *shares* the target's
+KV instead of keeping its own, and that cache already has two co-owners here).
+
+**The text claim, and the trap it hides.**  Three-way and cold: `pair+draft-mtp` == `pair+none` ==
+`single+draft-mtp`, one fresh process per arm, one cold prefill per request.  Measured (27B Q8_0, 3 devices
+`-sm tensor`, `-np 3 --kv-unified -c 32768`, `--spec-draft-n-max 3`, `-n 256`): identical on 3 devices f16, 3
+devices q8_0 and 2 devices f16, 199 accepted rounds of 215, mean accepted length **3.56**, generation **~99-107
+t/s against ~41 t/s** for the same pair without it.  **`LLAMA_SERVER_PARK_IDLE_SLOTS=0` is part of the oracle**:
+the co-owner guard declines idle-slot parking on the pair while the single-context server parks by default, so
+the two place the second sequence at different cells (0.. vs appended) and read different texts on a near-tie
+(measured `c3bf1df7aa1d` against `38169dcc3325`, and the same single context with parking off reads the pair's
+hash).  That is `GREEDY-PURITY.md` §38's placement artifact, reached through the parking guard — not a speculator
+effect and not a pair arithmetic difference (`LLAMA_KV_DEBUG_CELLS=1` names the placement).
+
 ### What it does NOT cover (state it, do not imply it)
 
-**All of the items below are work items in `wip/prefill-decode-arms-followups/`** (`TODO` #364-#371), which carries each
+**All of the items below are work items in `wip/prefill-decode-arms-followups/`** (`TODO` #365-#372), which carries each
 one's design, acceptance oracles and risks.
 
-* **Speculative decoding with the arms** — refused, a follow-up campaign (`W1`).
 * A **recurrent-only** memory (a pure Mamba-class model): `llama_memory_seq_state_take()` refuses anything that
   is not a hybrid, and no such model exists on this box.
 * `GLM5-Next`: the same memory module as qwen4exp, no checkpoint on this box.
@@ -6488,7 +6536,9 @@ one's design, acceptance oracles and risks.
 ### Verification
 
 `MANIFESTS.md` — the block-17 row (both tiers and the r348 external-draft-head arm), the **request-boundary** arm
-(`gate-arms-soak.sh boundary`, r347) and gates 28/34 for the paths it reuses.  Gate scripts:
+(`gate-arms-soak.sh boundary`, r347), **gate 39** (a speculator on the pair, r350) and gates 28/34 for the paths it
+reuses.  Gate scripts:
+`scripts/gate-arms-spec.sh` (spec-on-pair purity, r350),
 `scripts/gate-draft-ctx.sh` (the `ctx_other` adoption rule, r348),
 `scripts/gate-spec-purity.sh`, `scripts/gate-park-idle-slots.sh`, `scripts/gate-ckpt-reuse.sh`,
 `scripts/gate-host-pool.sh`, `scripts/gate-moe-promise.sh`, `scripts/gate-state-pipe.sh`,
