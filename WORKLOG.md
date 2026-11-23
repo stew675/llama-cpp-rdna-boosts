@@ -63,6 +63,21 @@ fold is the matcher's own `m+1..s` byte-range test, which the change does not mo
   `790e050d1`; both re-verified strictly by `validate-set.sh` check 8.  `beta/prefill-decode-arms/` also still
   applies strictly (`27db9bfd4` + beta -> `4105968be`) and its README records that.
 
+### 4. Release completed
+
+`v17-919794500-r353` is committed (`894b3f50`), pushed to
+`git@github.com:stew675/llama-cpp-rdna-boosts.git` (`main` + the annotated tag), and the personal fork's
+`rdna-boosts` branch was re-cut and force-pushed by `scripts/fork-refresh.sh --build --gates --push --yes`:
+**`e695c46ce...089f90067`**, applied tree `27db9bfd4` == `release.json.tree`, 18 default commits.
+`gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` reads
+`089f90067833934f0d7e6c6515b3e759af17c7a5` (the freshness read; the branch's newest commit stays dated
+2026-10-25 by design -- the committer date is stamped from the author date).
+
+`fork-refresh --gates` re-ran the shared-library check (16/16), the coherence arm (Qwen3.5-4B Q8_0, 3-GPU
+`-sm tensor`, `111 7e6229b260f6` -- identical on the r352 binary) and the canonical prefill-logit point
+(0.000000 / 100.000 % against the recorded 10.2 base).  The release container images are the off-host worker's
+job (`scripts/container-watch.sh` on `radiance`, `--rocm "7.14.1 10.1" --push --prune`); nothing was built here.
+
 ## 261123.003 (r352, release completed: pushed, fork refreshed, tag cut) -- the gate results the withdrawal actually earned, and the two gate gaps it did not close
 
 `v17-919794500-r352` is committed (`7567a48e`), tagged and pushed to
