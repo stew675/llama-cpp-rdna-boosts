@@ -2630,3 +2630,33 @@ delivery revision that eventually carries the change, if it is promoted, is the 
 4. **An extraction is only worth landing if it is provably inert.**  Same-slot text identity (2 slots, pair OFF
    and ON), the same hashes on a second shape (27B, 3 GPU tensor), a byte-identical startup shape and the
    delivery's slot-lifecycle gate (park) all had to hold *before* the routing could be written on top.
+
+## r362-wip (2026-11-23, `WORKLOG.md` 261123.015) — a handover with no arm to receive it spins the server at 94 % CPU, `i_batch` belongs to the arm that batched the slot, and the pair's win is a LATENCY win (`prefill-decode-arms` v2 STEP 6d-2/6e/6f)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 6d-2/6e/6f, nothing in `patches/` changed.
+
+1. **A handover that runs when the receiving arm does not exist takes the slot out of the only batch that
+   would run it.**  `post_decode` handed every freshly generating slot to `ctx_dec` even when the pair was OFF
+   (`ctx_dec == nullptr`), so the slot left the prefill arm's batch, nothing decoded it, and the main loop spun
+   at **94 % CPU** with no output — a hang, not a crash, and invisible to any text oracle.  Every "move a slot
+   between owners" call must be gated on the owner existing, and the pair-OFF path must be byte-for-byte the
+   old one.
+2. **`server_slot::i_batch` belongs to the arm that BATCHED the slot, so the other arm must not read it.**  It
+   is a row index into *that arm's* batch; read from the other arm it samples the wrong row of that context, or
+   a row with no logits (`GGML_ASSERT(logits != nullptr)` in `common/sampler`).  The ownership flag is therefore
+   not bookkeeping, it is a memory-safety property of the batching code: every iterate that touches a slot
+   checks the arm first.
+3. **Diagnosing a server hang: bisect the campaign commits, then `gdb` the live process.**  The repro (a
+   5-token prompt on `-np 2 -c 8192 --kv-unified`) failed on the working tree and passed on every committed
+   landings back to the base, which localised the change in minutes; `thread 1 bt` then named `pre_decode`'s
+   lambda and 94 % CPU distinguished a spin from a deadlock.
+4. **The pair's win is LATENCY, and it needs the wide chunk it exists for.**  On 4B/1 GPU with a 5246-token
+   prefill: `-ub 2048` → the decoder's ITL **20.27 → 15.68 ms/token (−23 %)** and the prefill itself **+25 %**
+   (4935 → 6147 t/s, the prefill no longer pays for the decoder's rows), with byte-identical output; at the
+   delivery's default `-ub 512` the same measurement is **flat** (13.25 vs 13.16) because on this model the
+   decoder never waits for a whole chunk.  A gate must report the ubatch with the number.
+5. **A concurrent multi-slot arm cannot carry a byte text claim.**  On the 27B 3-GPU tensor shape the pair
+   matches the single-context server **exactly** at one request in flight, and with two in flight one slot's
+   answer varies run to run — on the unmodified delivery too (the interleaving picks the batch composition,
+   the composition picks the kernels, V8).  Byte claims at one request in flight; concurrency carries the
+   non-text claims.

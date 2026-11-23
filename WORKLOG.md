@@ -1,3 +1,64 @@
+## 261123.015 (no release; `prefill-decode-arms` v2 STEP 6d-2/6e/6f) -- the decode arm runs: slot ownership, the handover, the step barrier, and the first measured win (ITL 20.3 -> 15.7 ms/token through a 5k prefill)
+
+`PLAN.md` STEP 6d (second half) + 6e + 6f, landed together because a loop with nothing routed to it has no
+oracle and a handover without the loop leaves a slot that stops generating.  Delivery untouched; the change is
+on `~/llama.cpp` branch `arms-v2`, stored as
+[`wip/prefill-decode-arms-v2/steps/STEP-6d2-0008-decode-arm-routing.patch`](wip/prefill-decode-arms-v2/steps/STEP-6d2-0008-decode-arm-routing.patch)
+(2 files, +331/−3: `tools/server/server-context.cpp`, one refusal in `common/common.cpp`).
+
+### 1. What the two arms now do
+
+```
+request arrives -> prefill arm: prompt ubatches on ctx_tgt (its own batch, sampler, scheduler)
+      last prompt row sampled ON ctx_tgt -> hand the slot over (flag + notify; NO state movement)
+   -> decode arm: one batch, one row per owned slot, llama_process(ctx_dec, ...), llama_synchronize,
+      then one slot_step() per slot (the 6d-1 extraction, can_finish = false)
+   -> a stop is REPORTED (finish_pending) -> the main thread closes the response
+```
+
+**Ownership** is `server_slot::arm` (+ `finish_pending`) and it is the ONLY cross-thread slot state, written
+only under `arms_mtx` (invariant 1).  The five invariants of DESIGN §8 are written in the block header, each
+next to the code that enforces it, with the deadlock argument for the barrier: every wait is on the same mutex
+and takes one direction (a boundary op waits for both in-step counters to reach 0; an arm waits for
+`!arms_boundary`), and neither holds the mutex while waiting on anything the other holds.
+
+**The barrier** (`arm_step_guard`) marks the window in which an arm drives a context — the decode arm's
+`llama_process(ctx_dec)` and the prefill arm's `llama_process(ctx_tgt)`.  An arm does NOT wait for the other
+arm: that overlap is the feature (invariant 3).  A request-boundary memory operation (`arms_boundary_guard`,
+built here, used by STEP 10's checkpoint/speculator work) waits for both to leave their windows.
+
+### 2. Two bugs the oracle caught (both mine, both now impossible)
+
+1. **The handover ran with `ctx_dec == nullptr`.**  `post_decode` handed every freshly generating slot to a
+   decode arm that did not exist, so the slot left the prefill arm's batch with nobody to run it and the main
+   loop spun at **94 % CPU** with no output.  Found by bisecting the campaign commits (base, STEP 1-5, 6a, 6d-1
+   all pass the repro; the working tree failed), then a `gdb` backtrace, then reverting hunks.  The handover
+   is now gated on `ctx_dec != nullptr` and the pair-OFF path is byte-for-byte the old one.
+2. **`post_decode` read a handed-over slot's `i_batch`.**  `i_batch` is written by whichever arm batched the
+   slot, so reading it from the other arm samples the *wrong row* of `ctx_tgt` — or a row with no logits, which
+   is a `GGML_ASSERT(logits != nullptr)` abort in `common/sampler`.  Both post_decode iterates (plain and
+   speculative) now skip a slot this arm does not own, which is invariant 2 as code.
+
+### 3. Oracles — and the first measured win
+
+| arm | shape | result |
+|---|---|---|
+| text identity | 4B Q8_0, 1 GPU, 2 slots `--kv-unified`, 2 concurrent, pair **OFF vs ON** | **byte-identical** `7bd542418112` / `6ce1f88dd5f7` |
+| the mechanism (census) | same arm, pair ON | `the decode arm is generating: 47 step(s), 2 handover(s), widest batch 2 slot(s)` — both slots decoded together on the decode arm |
+| text identity, tensor split | 27B Q8_0, 3 GPU `-sm tensor -mg 0`, **one request in flight** | **byte-identical** `f2753e13e419` / `c5f2fdc43642` |
+| concurrency on that shape | same, 2 requests at once | slot 0 identical, slot 1 differed once (`f783d2941fbe`, 178 ch vs 150).  **Not the pair**: the same slot varies run-to-run on the unmodified delivery under two concurrent requests (measured on Flash-Next earlier: `b2e646545bd9` once, `c60b5a919c9b` twice) — the interleaving picks the batch composition and the composition picks the kernels (DESIGN V8).  A **byte** text claim therefore belongs at one request in flight |
+| **ITL through a prefill** (`baseline/itl-arm.sh`, 4B, 5246-token prompt on slot B, 64 tokens on slot A, `-ub 2048`) | pair OFF | A **20.27 ms/token**; B 4935 t/s |
+| | pair ON | A **15.68 ms/token (−23 %)**; B **6147 t/s (+25 %)** — and the text is **identical** on both arms (`36216e77db27`), so the pair changed the *latency*, not the answer |
+| (`-ub 512` the same measurement is flat: 13.25 vs 13.16 ms/token — at the delivery's default ubatch the decoder never waits for a whole chunk on this small model, so the win needs the wide chunk the feature exists for.  Recorded rather than hidden) |
+| `gate-park-idle-slots.sh` (server slot lifecycle) | pair OFF | **PASS** (6 park + 2 unpark moves traced) |
+| A1 | 4B 1 GPU, `-n 64` | `be904e86f248` — unchanged |
+| GPU faults | journal over the whole landing | clean |
+
+### 4. Refusals added
+
+`--context-shift` joins the pair's refusal list: a shift mutates the shared KV of a slot the decode arm owns,
+and the pair does not shift a generating slot from the other arm.  `--no-context-shift` is the answer.
+
 ## 261123.014 (no release; `prefill-decode-arms` v2 STEP 6d-1) -- `slot_step()` is extracted out of `post_decode()`: ONE sample/emit/stop implementation, taking the context that RAN the batch, so the decode arm cannot drift from the prefill arm
 
 `PLAN.md` STEP 6d, first half.  Delivery untouched; the change is on `~/llama.cpp` branch `arms-v2`, stored as

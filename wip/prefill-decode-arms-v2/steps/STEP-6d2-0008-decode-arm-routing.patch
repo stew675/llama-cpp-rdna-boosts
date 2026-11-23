@@ -1,0 +1,459 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index 21222ed53..aabc6edf2 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2252,6 +2252,10 @@ const char * common_arms_pair_possible(const common_params & params) {
+         return "--sleep-idle unloads the model, which would tear the pair's SHARED memory down under the "
+                "other arm";
+     }
++    if (params.ctx_shift) {
++        return "--context-shift mutates the shared KV of a slot the decode arm owns; run --no-context-shift "
++               "(the pair does not shift a generating slot from the other arm)";
++    }
+     // the speculator: STEP 7 refuses it on the pair until the decode arm's draft/verify round is admitted
+     // (STEP 10).  A drafter whose TARGET side is bound to one context -- the layer-input families and a
+     // gemma4 assistant that shares the target's KV -- stays refused even then.
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 03714ca44..ea7ee3f8a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -270,6 +270,16 @@ struct server_slot {
+     llama_context * ctx_tgt = nullptr;
+     llama_context * ctx_dft = nullptr;
+ 
++    // ---- the two-arm server (--prefill-decode-arms) --------------------------------------------------
++    // Which ARM owns this slot right now: 0 = the prefill arm (the main loop), 1 = the decode arm (its own
++    // thread).  Written ONLY under server_context_impl::arms_mtx, and it is the only cross-thread slot state
++    // (invariant 1 of DESIGN §8): a slot is in exactly one arm's batch at a time.
++    int  arm             = 0;
++    // Set by the decode arm when a stop condition ended generation.  The MAIN thread then finishes the
++    // response (print_timings / send_final_response / release): the response lifecycle never runs on the decode
++    // arm (invariant 5).
++    bool finish_pending  = false;
++
+     common_memory mem;
+ 
+     // multimodal
+@@ -1141,6 +1151,42 @@ private:
+     // borrower must not outlive the owner (I1/I2).
+     llama_context * ctx_dec = nullptr;
+ 
++    // ---- the two-arm server: the ownership flag, the step barrier and the decode thread ------------------
++    //
++    // INVARIANTS (DESIGN §8; each is enforced by the code named next to it):
++    //  1. a slot is in exactly ONE arm's batch at a time; `server_slot::arm` is the only cross-thread slot
++    //     state and it is written only under `arms_mtx`                        -> arms_hand_over()/arms_finish()
++    //  2. the prefill arm never batches a slot it does not own, and the decode arm never touches a slot it does
++    //     not own                                                             -> pre_decode()'s `slot.arm != 0` guards
++    //  3. only ONE context may be inside llama_process() in the DECODE BAND at a time (the MoE device remap
++    //     table is process-wide); the prefill arm's wide pass MAY overlap a decode step -- that overlap is the
++    //     feature.  The draft context is decode-band, so drafting serialises with the decode step (STEP 10).
++    //                                                                          -> arm_step_guard + the spec mutex
++    //  4. a request-boundary memory operation that is not init_batch/apply (a prompt-cache/checkpoint restore)
++    //     runs only when NEITHER arm is inside a step                             -> arms_boundary_enter()
++    //  5. the response lifecycle (print_timings, send_final_response, release, the prompt cache) is MAIN THREAD
++    //     ONLY; the decode arm may process_token()/stream, nothing else              -> slot_step(can_finish=false)
++    //
++    // Deadlock argument: every wait below is on `arms_mtx` and takes one direction -- a boundary op waits for
++    // both in-step counters to reach 0, an arm waits for `!arms_boundary` -- and neither holds the mutex while
++    // waiting on anything the other holds (the memory's own lock is taken per bookkeeping call, never across a
++    // wait).  The counters are incremented with the mutex held, so no arm can slip in between the check and the
++    // increment.
++    enum { ARM_PREFILL = 0, ARM_DECODE = 1 };
++
++    std::mutex              arms_mtx;
++    std::condition_variable arms_cv;        // "a slot changed hands / finished"
++    std::condition_variable arms_step_cv;   // the step barrier and the boundary
++    std::thread             arms_thread;
++    bool                    arms_stop     = false;
++    int                     arms_in_step[2] = {0, 0};
++    bool                    arms_boundary   = false;
++    server_batch            batch_dec;      // the decode arm's OWN batch (one row per owned slot)
++    int64_t                 arms_n_steps     = 0;   // census: decode-arm llama_process() calls
++    int64_t                 arms_n_handovers = 0;   // census: slots handed to the decode arm
++    int64_t                 arms_n_max_slots = 0;   // census: the widest decode-arm batch
++    bool                    arms_reported   = false; // the one-shot "the arm is generating" line
++
+     server_batch batch;
+ 
+     llama_model   * model_dft = nullptr;
+@@ -1434,7 +1480,206 @@ private:
+ 
+     int64_t t_last_load_progress_ms = 0;
+ 
++    // ---- the two-arm server: the step barrier, the ownership handover and the decode thread -----------------
++
++    // Marks a window in which one arm drives a context (and therefore mutates the shared memory through
++    // init_batch/apply).  A request-boundary operation waits for both arms to leave their windows; the arms
++    // never wait for each other, which is what lets a wide prefill and a one-row decode overlap.
++    struct arm_step_guard {
++        server_context_impl & s;
++        const int arm;
++        arm_step_guard(server_context_impl & s_, int arm_) : s(s_), arm(arm_) {
++            std::unique_lock<std::mutex> lk(s.arms_mtx);
++            s.arms_step_cv.wait(lk, [&] { return !s.arms_boundary; });
++            s.arms_in_step[arm]++;
++        }
++        ~arm_step_guard() {
++            std::lock_guard<std::mutex> lk(s.arms_mtx);
++            s.arms_in_step[arm]--;
++            s.arms_step_cv.notify_all();
++        }
++        arm_step_guard(const arm_step_guard &) = delete;
++        arm_step_guard & operator=(const arm_step_guard &) = delete;
++    };
++
++    // A request-boundary memory operation (a prompt-cache / checkpoint restore): the shared memory is mutated
++    // outside init_batch/apply, so neither arm may be inside a step.
++    struct arms_boundary_guard {
++        server_context_impl & s;
++        explicit arms_boundary_guard(server_context_impl & s_) : s(s_) {
++            std::unique_lock<std::mutex> lk(s.arms_mtx);
++            s.arms_step_cv.wait(lk, [&] { return s.arms_in_step[0] == 0 && s.arms_in_step[1] == 0; });
++            s.arms_boundary = true;
++        }
++        ~arms_boundary_guard() {
++            std::lock_guard<std::mutex> lk(s.arms_mtx);
++            s.arms_boundary = false;
++            s.arms_step_cv.notify_all();
++        }
++        arms_boundary_guard(const arms_boundary_guard &) = delete;
++        arms_boundary_guard & operator=(const arms_boundary_guard &) = delete;
++    };
++
++    // NO state movement and NO memory operation: the slot's sequence stays exactly where it is, which is what
++    // makes the next request's prefix reusable for free.
++    void arms_hand_over(server_slot & slot) {
++        std::lock_guard<std::mutex> lk(arms_mtx);
++        if (slot.arm == ARM_DECODE || !slot.is_processing()) {
++            return;
++        }
++        slot.arm = ARM_DECODE;
++        slot.finish_pending = false;
++        arms_n_handovers++;
++        arms_cv.notify_all();
++    }
++
++    // The reverse direction: the main thread takes the slot back to finish the response (invariant 5).
++    void arms_take_back(server_slot & slot) {
++        std::lock_guard<std::mutex> lk(arms_mtx);
++        slot.arm = ARM_PREFILL;
++        slot.finish_pending = false;
++        arms_cv.notify_all();
++    }
++
++    // the main thread's half of a stop that happened on the decode arm
++    void arms_finish_pending_slots() {
++        std::vector<server_slot *> done;
++        {
++            std::lock_guard<std::mutex> lk(arms_mtx);
++            for (auto & slot : slots) {
++                if (slot.finish_pending) {
++                    slot.finish_pending = false;
++                    slot.arm            = ARM_PREFILL;
++                    done.push_back(&slot);
++                }
++            }
++        }
++        if (!done.empty() && arms_n_steps > 0 && !arms_reported) {
++            // the first generation the decode arm finished: one line, so a gate (or a log) can prove the arm
++            // really ran without depending on a clean shutdown
++            arms_reported = true;
++            SRV_INF("%s: the decode arm is generating: %" PRId64 " step(s), %" PRId64 " handover(s), widest "
++                    "batch %" PRId64 " slot(s)\n", __func__, arms_n_steps, arms_n_handovers, arms_n_max_slots);
++        }
++        for (auto * slot : done) {
++            // the lifecycle, on the thread that owns it (invariant 5)
++            slot->print_timings();
++            send_final_response(*slot);
++            slot->release();
++        }
++    }
++
++    void arms_start() {
++        if (ctx_dec == nullptr || arms_thread.joinable()) {
++            return;
++        }
++        arms_stop = false;
++        arms_thread = std::thread([this]() { arms_decode_loop(); });
++        SRV_INF("%s: decode arm started (own batch of %d rows)\n", __func__, llama_n_batch(ctx_dec));
++    }
++
++    void arms_stop_and_join() {
++        if (!arms_thread.joinable()) {
++            return;
++        }
++        {
++            std::lock_guard<std::mutex> lk(arms_mtx);
++            arms_stop = true;
++            arms_cv.notify_all();
++        }
++        arms_thread.join();
++        // the census: a gate needs to know the decode arm really ran, and with how many slots
++        SRV_INF("%s: decode arm stopped: %" PRId64 " step(s), %" PRId64 " handover(s), widest batch %" PRId64
++                " slot(s)\n", __func__, arms_n_steps, arms_n_handovers, arms_n_max_slots);
++    }
++
++    // The DECODE ARM.  One batch per round: one row per owned slot, one llama_process() on ctx_dec, then one
++    // slot_step() per slot -- the SAME sampling/emit/stop code the prefill arm uses (see slot_step()).
++    void arms_decode_loop() {
++        std::vector<server_slot *> owned;
++
++        while (true) {
++            owned.clear();
++            {
++                std::unique_lock<std::mutex> lk(arms_mtx);
++                arms_cv.wait_for(lk, std::chrono::milliseconds(20), [&] {
++                    if (arms_stop) {
++                        return true;
++                    }
++                    for (const auto & slot : slots) {
++                        if (slot.arm == ARM_DECODE && slot.state == SLOT_STATE_GENERATING && slot.has_next_token) {
++                            return true;
++                        }
++                    }
++                    return false;
++                });
++                if (arms_stop) {
++                    return;
++                }
++                // collect under the mutex: the ownership flag is the only cross-thread slot state
++                for (auto & slot : slots) {
++                    if (slot.arm == ARM_DECODE && slot.state == SLOT_STATE_GENERATING && slot.has_next_token) {
++                        owned.push_back(&slot);
++                    }
++                }
++            }
++            if (owned.empty()) {
++                continue;
++            }
++            if ((int64_t) owned.size() > llama_n_batch(ctx_dec)) {
++                // never assert at run time: a slot that does not fit waits for the next round
++                owned.resize((size_t) llama_n_batch(ctx_dec));
++            }
++
++            // one row per owned slot (handle_last_sampled_token() sets slot.i_batch = the row index)
++            batch_dec.clear();
++            for (auto * slot : owned) {
++                slot->handle_last_sampled_token(batch_dec);
++            }
++            batch_dec.render(0, batch_dec.size());
++
++            int ret = 0;
++            {
++                // invariant 3: the decode band is serialised; the prefill arm's wide pass may overlap it
++                arm_step_guard guard(*this, ARM_DECODE);
++                ret = llama_process(ctx_dec, LLAMA_PROCESS_TYPE_DECODE, batch_dec.view.get());
++                if (ret == 0) {
++                    llama_synchronize(ctx_dec);
++                }
++            }
++            arms_n_steps++;
++            arms_n_max_slots = std::max<int64_t>(arms_n_max_slots, (int64_t) owned.size());
++
++            if (ret != 0) {
++                SRV_ERR("%s: the decode arm's batch failed: ret = %d\n", __func__, ret);
++                // finish the affected slots on the main thread with an explicit error rather than leaving them
++                // spinning: the lifecycle is not ours (invariant 5)
++                for (auto * slot : owned) {
++                    send_error(*slot, "decode arm failed");
++                    std::lock_guard<std::mutex> lk(arms_mtx);
++                    slot->finish_pending = true;
++                }
++                arms_cv.notify_all();
++                continue;
++            }
++
++            for (auto * slot : owned) {
++                // can_finish = false: on a stop the slot is handed back and the MAIN thread finishes it
++                if (!slot_step(*slot, ctx_dec, slot->i_batch, /*can_finish =*/ false)) {
++                    std::lock_guard<std::mutex> lk(arms_mtx);
++                    slot->finish_pending = true;
++                }
++            }
++            // the main loop is woken by arms_cv (it waits there when this arm owns every live slot); a slot
++            // that stopped has finish_pending set, and the lifecycle closes it there (invariant 5)
++        }
++    }
++
+     void destroy() {
++        // the decode arm drives ctx_dec, which BORROWS ctx_tgt's memory: stop it (and wait for it) before
++        // anything is freed (I2), and let it drain its in-step window first
++        arms_stop_and_join();
++
+         spec.reset();
+         spec_init.reset();
+ 
+@@ -1984,6 +2229,12 @@ private:
+             const int32_t n_batch = llama_n_batch(ctx_tgt);
+             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
+             batch.init(ctx_tgt, std::max(n_batch, params_base.n_parallel), n_embd);
++            if (ctx_dec != nullptr) {
++                // the decode arm's own batch: one row per slot it owns (plus the verify rows once a speculator is
++                // admitted, STEP 10), sized by ITS n_batch
++                batch_dec.init(ctx_dec, llama_n_batch(ctx_dec), n_embd);
++                arms_start();
++            }
+         }
+ 
+         // decision requests rarely repeat a state, the prompt cache is opt-in for decision models
+@@ -2491,6 +2742,13 @@ private:
+     }
+ 
+     bool launch_slot_with_task(server_slot & slot, server_task && task) {
++        {
++            // a (re)used slot is the prefill arm's: clear any handover state from its previous generation
++            std::lock_guard<std::mutex> lk(arms_mtx);
++            slot.arm            = ARM_PREFILL;
++            slot.finish_pending = false;
++        }
++
+         auto task_loras = get_task_lora(task);
+ 
+         // the state can come from the prompt cache, so it is compared with its own lora config, not with the one of the last task
+@@ -4145,6 +4403,11 @@ private:
+         }
+ #endif
+ 
++        // the decode arm REPORTS a stop; the response is closed here, on the thread that owns the lifecycle
++        if (ctx_dec != nullptr) {
++            arms_finish_pending_slots();
++        }
++
+         // check if all slots are idle
+         // a realtime slot waiting for audio has no work, the next audio control task wakes the loop
+         {
+@@ -4200,6 +4463,28 @@ private:
+             abort_all_slots("process_realtime_slots() failed: " + std::string(e.what()));
+         }
+ 
++        if (batch.size() == 0 && ctx_dec != nullptr) {
++            // Every live slot is the decode arm's this round: it has its own batch and its own step, so there is
++            // nothing to decode here -- and that is NOT an error (decode() would count an empty step and abort
++            // after three).  Wait for the arm to hand something back rather than spinning: the arm notifies
++            // arms_cv when it stops a slot, and the wait is bounded so a handover can never be missed.
++            {
++                std::unique_lock<std::mutex> lk(arms_mtx);
++                arms_cv.wait_for(lk, std::chrono::milliseconds(20), [&] {
++                    if (arms_stop) {
++                        return true;
++                    }
++                    for (const auto & slot : slots) {
++                        if (slot.finish_pending) {
++                            return true;
++                        }
++                    }
++                    return false;
++                });
++            }
++            return;
++        }
++
+         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
+ 
+         if (batch.slot_batched) {
+@@ -4360,6 +4645,12 @@ private:
+                 // TTS and realtime conversation slots drive their own decode loop, never enter the shared batch
+                 return;
+             }
++            if (slot.arm != ARM_PREFILL) {
++                // a slot the decode arm owns: its context shift would mutate the shared memory under that arm.
++                // The pair REFUSES --context-shift (see common_arms_pair_possible), so this is unreachable today
++                // and stays as the guard that keeps it so.
++                return;
++            }
+             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+                 if (!params_base.ctx_shift) {
+                     // this check is redundant (for good)
+@@ -4435,6 +4726,12 @@ private:
+             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
+                 return;
+             }
++            if (slot.arm != ARM_PREFILL) {
++                // invariant 2: the prefill arm never batches a slot it does not own (the decode arm is running
++                // it).  Correct by construction -- a slot leaves this arm the moment its prompt row is sampled --
++                // and this guard is what keeps that true if a future path re-enters.
++                return;
++            }
+ 
+             if (slot.audio_stream && !slot_audio_step(slot)) {
+                 return; // waiting for audio, or the stream ended
+@@ -4630,7 +4927,7 @@ private:
+         // safe direction -- a wide step handed to a waiting decoder is exactly the stall this bounds.
+         bool decode_active = false;
+         for (const auto & slot : slots) {
+-            if (slot.state == SLOT_STATE_GENERATING) {
++            if (slot.state == SLOT_STATE_GENERATING && slot.arm == ARM_PREFILL) {
+                 decode_active = true;
+                 break;
+             }
+@@ -5402,6 +5699,8 @@ private:
+         // note: the sync is done here too, so that the wait is also covered by the yield
+         int ret = 0;
+         queue_tasks.yield_to_queue([&]() {
++            // an in-step window: a request-boundary memory operation must wait for it (invariant 4)
++            arm_step_guard guard(*this, ARM_PREFILL);
+             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+             if (ret == 0 && has_output) {
+                 llama_synchronize(ctx_tgt);
+@@ -5518,7 +5817,7 @@ private:
+     // The RESPONSE LIFECYCLE stays wherever this is called from: with the pair OFF that is the main thread, as
+     // before; the pair's invariant 5 (DESIGN §8) keeps it there when the decode arm is a second thread.
+     // Returns false when the slot was finished here (stop condition), true when generation continues.
+-    bool slot_step(server_slot & slot, llama_context * ctx, int32_t tok_idx) {
++    bool slot_step(server_slot & slot, llama_context * ctx, int32_t tok_idx, bool can_finish = true) {
+         const auto accept_special_token = [&](llama_token token) {
+             return params_base.special ||
+                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
+@@ -5557,6 +5856,11 @@ private:
+         }
+ 
+         if (!process_token(result, slot)) {
++            if (!can_finish) {
++                // the decode arm: a stop is REPORTED, not finished -- the response lifecycle (print_timings /
++                // send_final_response / release) is main-thread only (invariant 5)
++                return false;
++            }
+             // release slot because of stop condition
+             slot.print_timings();
+             send_final_response(slot);
+@@ -5592,6 +5896,13 @@ private:
+         };
+ 
+         iterate(slots, [&](server_slot & slot) {
++            // Invariant 2: the prefill arm never touches a slot the decode arm owns.  This is not a formality --
++            // `slot.i_batch` is written by whichever arm batched the slot, so reading it here for a handed-over
++            // slot samples the WRONG row of ctx_tgt (or a row with no logits at all: an abort).
++            if (slot.arm != ARM_PREFILL) {
++                return;
++            }
++
+             // optionally send prompt processing progress
+             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
+                 if (slot.task->params.stream && slot.task->params.return_progress) {
+@@ -5647,11 +5958,24 @@ private:
+             const int tok_idx = slot.i_batch - off;
+ 
+             // ONE implementation of sample/emit/stop (see slot_step()), shared with the decode arm
+-            slot_step(slot, slot.ctx_tgt, tok_idx);
++            const bool cont = slot_step(slot, slot.ctx_tgt, tok_idx);
++
++            // The slot's prompt row was just sampled, so the NEXT token belongs to the decode arm: hand it over
++            // now, with NO state movement (the sequence stays exactly where it is).  A slot that stopped here is
++            // released and never handed over; a speculative slot keeps its verify round on this arm (STEP 10).
++            // ... and ONLY when there IS a decode arm: handing a slot over with `ctx_dec == nullptr` would take
++            // it out of the prefill arm's batch with nobody to run it (the slot would stop generating and the
++            // main loop would spin on an empty batch).  The pair OFF path must be byte-for-byte the old one.
++            if (ctx_dec != nullptr && cont && slot.state == SLOT_STATE_GENERATING && !slot.can_speculate()) {
++                arms_hand_over(slot);
++            }
+         });
+ 
+         // speculative decoding - main model sample and accept
+         iterate(slots, [&](server_slot & slot) {
++            if (slot.arm != ARM_PREFILL) {
++                return;
++            }
+             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
+                     slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
+                 return;

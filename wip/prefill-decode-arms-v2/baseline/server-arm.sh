@@ -80,7 +80,9 @@ SPID=""
 die() { echo "FAIL($TAG): $*" >&2; [ -n "$SPID" ] && tail -25 "$LOG" >&2; exit 1; }
 
 cleanup() {
-    [ -n "$SPID" ] && { kill -TERM -"$SPID" 2>/dev/null; sleep 1; kill -KILL -"$SPID" 2>/dev/null; }
+    # a CLEAN shutdown matters: the library's teardown censuses (the pair's decode-arm step/handover count, the
+    # expert-cache lines) print from destroy(), so give the server time to run it before the KILL.
+    [ -n "$SPID" ] && { kill -TERM -"$SPID" 2>/dev/null; sleep 3; kill -KILL -"$SPID" 2>/dev/null; }
     rm -rf "$TMPD"
 }
 trap cleanup EXIT

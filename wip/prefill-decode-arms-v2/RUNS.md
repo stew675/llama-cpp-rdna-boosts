@@ -8,6 +8,38 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — STEP 6d-2/6e/6f: the decode arm runs (`WORKLOG.md` 261123.015)
+
+2 files, +331/-3 (`tools/server/server-context.cpp`, one refusal in `common/common.cpp`).
+
+| arm | shape | result |
+|---|---|---|
+| text identity | 4B Q8_0 1 GPU, 2 slots `--kv-unified`, 2 concurrent, pair OFF vs ON | **identical** `7bd542418112` / `6ce1f88dd5f7` |
+| census (mechanism) | same, pair ON | `the decode arm is generating: 47 step(s), 2 handover(s), widest batch 2 slot(s)` |
+| text identity, tensor split | 27B Q8_0 3 GPU `-sm tensor -mg 0`, **1 request in flight** | **identical** `f2753e13e419` / `c5f2fdc43642` |
+| concurrency on that shape | same, 2 at once | slot 0 identical; slot 1 differed once (`f783d2941fbe`, 178 ch vs 150).  Not the pair: the same slot varies run-to-run on the unmodified delivery under two concurrent requests (Flash-Next: `b2e646545bd9` once, `c60b5a919c9b` twice) — composition picks the kernels (V8) |
+| **ITL through a prefill** (`baseline/itl-arm.sh`; A = 5-token prompt, 64 tokens; B = 5246-token prompt; `-ub 2048`) | pair OFF | A **20.27 ms/token**; B **4935 t/s** |
+| | pair ON | A **15.68 ms/token (−23 %)**; B **6147 t/s (+25 %)**; text **identical** (`36216e77db27` / `e8279ccca426`) |
+| same at `-ub 512` | OFF vs ON | 13.25 vs 13.16 ms/token — flat; the decoder never waits for a whole chunk at that width on this model.  A gate must report the ubatch |
+| `gate-park-idle-slots.sh` | pair OFF | **PASS** (6 park + 2 unpark traced) |
+| A1 | 4B 1 GPU | `be904e86f248` |
+| GPU faults | whole window | clean |
+
+### Two bugs the oracle caught
+
+1. **The handover ran with `ctx_dec == nullptr`** → every generating slot left the prefill arm's batch with no
+   arm to run it → the server spun at **94 % CPU** with no output.  Localised by bisecting the campaign commits
+   (base + STEP 1-5 + 6a + 6d-1 all pass the repro; the working tree failed), then `gdb` on the live process.
+2. **`post_decode` read a handed-over slot's `i_batch`** → samples the wrong row, or one with no logits
+   (`GGML_ASSERT(logits != nullptr)`).  Both post_decode iterates now check the arm first.
+
+### Still owed for STEP 6
+
+The arena reserve for the decode arm (R6) measured and charged, the 4-slot × 20-round soak, and `gate-arms-itl.sh`
+as a scripted gate (the numbers above are from `baseline/itl-arm.sh`, one arm at a time).
+
+---
+
 ## 2026-11-23 — STEP 6d-1: `slot_step()` extracted from `post_decode()` (`WORKLOG.md` 261123.014)
 
 1 file, +66/-42 (`tools/server/server-context.cpp`).  Inert by construction: the only caller is
