@@ -65,10 +65,10 @@ operator the exact value for next time.
 
 | arm | result |
 |---|---|
-| 35B-A3B `-ncmoe 40` np 4 soak, pair ON | **PASS 5/5**, 0 `arena alloc failed` (7a: 1), region from the spare every run |
+| 35B-A3B `-ncmoe 40` np 4 soak, pair ON | **PASS 7/7** (5 runs on the retake, 2 after the `mapped_arena` fix), 0 `arena alloc failed` (7a: 1), region from the spare every run |
 | Gemma4 26B-A4B `-ncmoe 20` + `-md` MTP head, reserve 2560 | both regions from the spare, 0 eviction, `none` == `draft-mtp` == `a195d3d6953c` |
 | 4B soak (pair, no slab) | **PASS**, widest batch 4 |
-| `gate-arms-n1-memory.sh` / `gate-arms-itl.sh` | **PASS**; text identical; 16.32 -> 15.08 ms/token (pair ON) |
+| `gate-arms-n1-memory.sh` / `gate-arms-itl.sh` | **PASS**; text identical; **16.33 -> 15.09 ms/token** on the pair arm (1044.8 -> 965.5 ms / 64 tokens), prefill 5191 -> 6165 t/s |
 | A1 / A3 | `be904e86f248` / `e9db5cb8db0b` unchanged (the pair's charge is inert with the pair off) |
 
 ---
