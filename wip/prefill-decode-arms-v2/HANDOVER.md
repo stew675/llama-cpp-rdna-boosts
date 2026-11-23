@@ -7,11 +7,11 @@ on this box; nothing here is a plan that has not been run unless it says so.
 | | |
 |---|---|
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`prefill-decode-arms-v2`** (pushed; `main` untouched at `91a81505`) |
-| work tree | `~/llama.cpp`, branch **`arms-v2`** (local only, **never pushed**), tip `5e668c768` |
+| work tree | `~/llama.cpp`, branch **`arms-v2`** (local only, **never pushed**), tip `e460f0dea` (STEP 7a; the previous landing was `5e668c768`) |
 | build | `~/bin/build-llama-rocm` → `build-rocm` (ROCm **10.2.0**); fast loop `cmake --build build-rocm --target llama-cli llama-server -j 16` |
-| last landing | `604e21a8` (delivery) / `5e668c768` (`~/llama.cpp`) — STEP 6e |
-| the one open defect | **the pair FAULTS a host-expert (`-ncmoe`) shape under load** — `-ncmoe > 0` is therefore *refused* by the predicate; making it safe is TASK 1 below |
-| next action | TASK 1 §2.3, experiment 1 (`GGML_CUDA_QK_PAIR_FWHT=0`) |
+| last landing | STEP 7a: `steps/STEP-7a-0010-aux-narrow-regions.patch` — code tip `e460f0dea` (`WORKLOG.md` 261123.017, `RUNS.md` top) |
+| the defect it closes | the host-expert (`-ncmoe`) FAULT — **root-caused as a slab work-base ALIAS** (two contexts' compute buffers were the same memory), fixed with one pinned aux region per extra context + thread-local routing; the `-ncmoe` refusal is gone (§2) |
+| next action | **STEP 8** — the two missing gates (`gate-arms-default-inert.sh`, `gate-arms-recurrent-shared.sh`), each with its non-vacuity line (§3) |
 
 ---
 
@@ -56,6 +56,7 @@ nothing is copied between them.**  `llama_context_params::ctx_memory` is the onl
 | STEP 6d-1 | `STEP-6d-0007-slot-step-extraction.patch` | `slot_step()` extracted from `post_decode()` — ONE sample/emit/stop implementation for both arms |
 | STEP 6d-2/6e/6f | `STEP-6d2-0008-decode-arm-routing.patch` | the decode thread, `slot.arm` ownership, the handover, the step barrier, the five invariants |
 | STEP 6e | `STEP-6e-0009-reserve-and-census.patch` | the decode arm's arena reserve (256 MiB, measured), the reservation census on stderr, the `-ncmoe` refusal (TASK 1's subject) |
+| STEP 7a (= TASK 1) | `STEP-7a-0010-aux-narrow-regions.patch` | the **aux narrow region stack**: one pinned slab work region per extra context (draft = slot 0, a context that borrows another's memory = slot 1), a thread-local routing slot from the allocating context's identity, the iface rename, and the `-ncmoe` refusal **removed** |
 
 ### 1.3 Green, with the number that proves it
 
@@ -68,122 +69,114 @@ nothing is copied between them.**  `llama_context_params::ctx_memory` is the onl
 | STEP 3's I4 bitmap | `gates/probe-kv-reservation.cpp`: borrowed A `[0..511]`, B `[512..1023]`, C `[1024..1535]`; the STEP-2 control build gives `[0..511]` twice |
 | STEP 5's extraction | `gates/probe-recurrent-shared.cpp`: two **live** contexts `A head=0 n=1` vs `B head=1 n=1`; the STEP-4 control gives `head=1 n=1` for both |
 | the gates | `gates/gate-arms-n1-memory.sh` **PASS**, `gates/gate-arms-itl.sh` **PASS**, `gates/gate-arms-multislot.sh` **PASS on a GPU-resident shape** (4B, 4 slots × 20 rounds, 80 requests, 0 errors) |
+| **the host-expert shape** (STEP 7a) | `gates/gate-arms-multislot.sh` on 35B-A3B Q8_0 `-ncmoe 40`, np 4, 20 rounds: **PASS**, 0 errors, 15 steps / 3 handovers / widest batch 3, `aux narrow-3 (borrowing-context compute) pinned at [26.31, 27.56] GiB`, journal clean, wall 28 s; the pair-OFF **control** on the same shape PASS (no aux region pinned) |
 
 ### 1.4 Open (this is what you are here for)
 
-* **TASK 1 (blocking further validation): the pair faults a host-expert shape.** §2.
-* Not yet done from STEP 6: nothing — but the host-expert half of the shape matrix is blocked by TASK 1.
-* STEP 7 (speculator refused on the pair) is **already in place** inside `common_arms_pair_possible()`
-  (`params.speculative.has_aux()` → refuse), so STEP 7 is done and its re-admission is STEP 10.
-* STEP 8's gate set: three of five exist (§5).  Missing: `gate-arms-default-inert.sh` and
-  `gate-arms-recurrent-shared.sh` (the latter's oracle exists as `gates/probe-recurrent-shared.cpp`).
-* STEPs 9-12: see §3.
+* **STEP 8 — the gate set.**  Three exist (`gates/gate-arms-{n1-memory,itl,multislot}.sh`; the multislot one
+  now also takes `ARMS=` for the pair-OFF control and FAILS if a slab-armed shape did not give the decode arm
+  its own pinned region).  Still owed: `gate-arms-default-inert.sh` and `gate-arms-recurrent-shared.sh` (§3).
+* **STEP 9 — the shape/latency matrix** (the host-expert row is now unblocked) and the records
+  (`ENVIRONMENT.md` rows; see the two doc gaps in §7).
+* STEP 7 (speculator refused on the pair) is **in place** inside `common_arms_pair_possible()`
+  (`params.speculative.has_aux()` → refuse); its re-admission is STEP 10.
+* STEPs 10-12: see §3.
+* **One verification gap this landing did not close:** the **draft** slot (0) was not exercised on a
+  *slab-armed* shape (§2.6).  Slot 0's code path is identical to slot 1's and it ran, but its *routing*
+  (`ctx_other` → slot 1) has no arm here.
 
 ---
 
-## 2. TASK 1 — make the host-tier expert remap context-safe
+## 2. TASK 1 — CLOSED: the host-tier fault was a SLAB WORK-BASE ALIAS, not the MoE remap
 
-### 2.1 The evidence (do not re-derive it; re-run it if you doubt it)
+**Status: fixed in STEP 7a, `-ncmoe > 0` is supported again.**  Read this section before touching the slab, the
+pair, or any third context; the root cause generalises to every future extra context.
 
-`gates/gate-arms-multislot.sh` with the host-tier defaults, **np 4, 20 rounds, 80 requests, all of which
-completed**, then:
+### 2.1 What was observed (and what it was blamed on)
+
+`gates/gate-arms-multislot.sh` with the host-tier defaults (35B-A3B Q8_0 `-ncmoe 40`, np 4, 20 rounds):
 
 ```
 HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION: The agent attempted to access memory beyond the largest legal address
-  ... code: 0x29 [host: soar, GPU index: 0,
-  kernel: void rms_norm_mul_rope_f32_qk_pair<false, float, __half, 0, 0>(rmr_args<float>, rmr_args<__half>)]
+  ... kernel: void rms_norm_mul_rope_f32_qk_pair<false, float, __half, 0, 0>(rmr_args<float>, rmr_args<__half>)
 ```
 
-and the server aborted ~398 s in.  The same gate on the **4B, GPU-resident** shape passes (80 requests, 0
-errors, widest decode batch 4), and the same 35B-A3B host-tier shape passes the whole delivery ladder with the
-pair **OFF** (`gate-park-idle-slots.sh`, `gate-spec-*`, the four-axis protocol).  So the fault is
-**pair × host-tier**.
+and the server aborted.  The previous session's hypothesis was "the prefill arm remaps the MoE expert tables
+from the decode arm's step" (the arena evictions in the log looked like the trigger).  **That was wrong.**
 
-Current mitigation (temporary, in `common/common.cpp`): `-ncmoe > 0` is refused with that reason, so nothing
-regresses while you work.
+### 2.2 The root cause (`GGML_CUDA_WORK_ALLOC_DEBUG=1`)
 
-### 2.2 Repro (exact)
-
-```bash
-cd ~/llama-cpp-rdna-boosts
-# the fault needs the load, not a specific prompt: 4 slots, 20 rounds, 2 prefills + 2 decodes per round
-HIP_VISIBLE_DEVICES=0 ROCBLAS_USE_HIPBLASLT=0 timeout 2400 \
-  wip/prefill-decode-arms-v2/gates/gate-arms-multislot.sh --keep        # host-tier defaults: 35B-A3B -ncmoe 40, np 4
-# gates/gate-arms-multislot.sh currently REFUSES to start because of the predicate -- to reproduce, either
-# remove the refusal for the experiment or run the server by hand with the same args:
-HIP_VISIBLE_DEVICES=0 setsid ~/llama.cpp/build-rocm/bin/llama-server \
-  -m /llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf \
-  -np 4 -c 16384 --kv-unified -ngl 99 -t 16 --no-webui -lv 4 -ncmoe 40 --prefill-decode-arms
+```
+0.07.583 W WORK_ALLOC dev=0 need=1280.0 MiB narrow=1 ret_off=0.0 MiB   <- the PREFILL arm's compute view
+0.07.586 W WORK_RELEASE dev=0 off=0.0 MiB need=910.8 MiB               <- its old (smaller) view, dropped
+0.07.589 W WORK_ALLOC dev=0 need=1280.0 MiB narrow=1 ret_off=0.0 MiB   <- the DECODE arm's view: SAME base 0
+0.08.683 W WORK_ALLOC dev=0 need=1280.0 MiB narrow=1 ret_off=0.0 MiB   <- the prefill arm re-takes base 0
+0.08.686 GPU FAULT (the K rope's SET_ROWS kernel)
 ```
 
-Then check with **`scripts/check-gpu-faults.sh --since "<before the run>" --log <log>`** — never grep for
-`page fault` by hand.  Remove any `gpucore.*.gpu` (32 GB each) before moving on.
+`ggml_cuda_slab_work_alloc()` has ONE "narrow" (decode/verify) base at offset 0 and assumed **one live narrow
+view per device**.  Each `llama_context` keeps its own persistent compute buffer, so the pair's decode arm was
+handed the prefill arm's memory: one arm's prefill wrote the other's activations, and the K rope then wrote KV
+rows at the index tensor it found there.  The delivery fixed exactly this class once already — the MTP draft
+context aliased at base 0 and got the `narrow2` region ("without this they both aliased at base 0").  The pair
+is the **third** context; the region count was still one.
 
-### 2.3 The experiment ladder (cheapest discriminator first — do them in this order)
+A second, independent defect: the routing flag was **process-wide** (`static bool g_slab_compute_narrow2`), so
+the prefill arm's reserve inherited the decode arm's flag, was routed into the aux region, found a live view,
+fell back to `cudaMalloc` and failed the graph reserve (1280 MiB OOM) 1.3 s into the soak.
 
-Each rung is one soak run with an env var; stop at the first rung that stops the fault, because that names the
-mechanism.
+### 2.3 The ladder that got there (each rung is one soak; keep it for the next defect)
 
-1. **`GGML_CUDA_QK_PAIR_FWHT=0`** — the faulting kernel is reached only through the **deferred Q/K "pair"
-   fusion**.  That fusion is the one place in block 08 where state is carried **across graph nodes**
-   (`cuda_ctx->qk_pend_graph` / `qk_pend_j`, `ggml-cuda-try-fuse.cu` ~3290-3400, `ggml-cuda-qk-pair` /
-   `ggml_cuda_qk_pair_k_at`): the Q half is *deferred* to node `j` and both halves run in ONE launch.  With two
-   contexts dispatching two graphs at the same time this deferral is the first thing to suspect, and the switch
-   turns it off.  **If this rung is clean, the defect is the deferral, not the expert remap** — read
-   `ggml_cuda_should_fuse_rms_norm_mul_rope_fwht()` and decide what makes a deferred fusion safe under two
-   contexts (the honest answers: bind the pending state to the *graph object* AND assert it cannot outlive the
-   dispatch, or refuse the deferral when a second context is live).
-2. **`GGML_CUDA_MOE_HOST_OFFLOAD=0`** (and/or `MOE_EXPERT_CACHE_MIB=0`) — is the fault the host tier at all, or
-   any MoE on the pair?  If `MOE_EXPERT_CACHE_MIB=0` is clean, the arena/remap path is implicated and the kernel
-   name is a red herring.
-3. **np=2 instead of 4, 1 round** — does it need two decoders, or one decoder plus a prefill?
-4. **The same shape with the pair OFF but `-ncmoe 40` and np 4** — the control (expected clean; the park gate
-   already covers a 3-slot host-tier shape).
-5. **`LLAMA_KV_DEBUG_CELLS=1`** on a near-faulting arm — the cell census.  A fault with an identical cell map
-   says "not placement"; a different cell map says the two arms disagreed about cells (I4/I5 territory).
+| rung | env | result |
+|---|---|---|
+| 0 repro | — | FAULT at ~9 s, `rms_norm_mul_rope_f32_qk_pair<false,float,__half,0,0>` |
+| 1 Q/K deferral off | `GGML_CUDA_ROPE_QK_PAIR=0 GGML_CUDA_QK_PAIR_FWHT=0` | **still faults**, in the *unfused* `rms_norm_mul_rope_f32<...>` — the deferral is not the mechanism.  **Note:** `GGML_CUDA_QK_PAIR_FWHT=0` alone could never have disabled the faulting instantiation (`fwht_n=0` = the plain pair, switch `GGML_CUDA_ROPE_QK_PAIR`) |
+| 2 aux routing with a process-wide flag | temp `is_draft \| memory_borrowed` | server aborted at load (the flag leaked across threads) — a real finding, see §2.2 |
+| 3 the fix | — | **PASS** |
 
-### 2.4 The code map (where to look, in the order the evidence points)
+Use `GGML_CUDA_WORK_ALLOC_DEBUG=1` early on any "two contexts, wrong numbers / GPU fault" report: it prints
+every compute-buffer alloc/release with its base offset, which is what named this in one run.
 
-| what | where |
-|---|---|
-| the faulting kernel + its arg struct | `ggml/src/ggml-cuda/rope.cu`: `struct rmr_args` (~1097), `rms_norm_mul_rope_f32_qk_pair` (~1113) |
-| the **deferred** Q/K pair fusion (per-context state across nodes) | `ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu`: `ggml_cuda_qk_pair_k_at` (~1109), the two `qk_pend_graph` arm/match sites (~3290, ~3367, ~3397); `cuda_ctx->qk_pend_graph/j` live in `ggml_backend_cuda_context` |
-| the host-expert cache: tables, residency, the **slot remap** | `ggml/src/ggml-cuda/moe-expert-cache.cu`: `g_mutex` (~323), `table_t::remap_dev` (~218), `moe_cache_remap_dev`, `moe_cache_get_table`, `moe_cache_in_place`, the takeover promise (`taken_cpy`) |
-| the remap's host decision + the fused-launch placement | `ggml/src/ggml-cuda/ggml-cuda.cu` ~7788-7830 (`ggml_cuda_mul_mat_id`'s redirect), `ggml-cuda-moe-cache-hooks.cu`:293 (`ggml_backend_cuda_moe_cache_remap`), `ggml-cuda-try-fuse.cu`:2883 (`fuse_serve_routed`) |
-| the KV cache the kernel writes (shared by BOTH arms) | `src/llama-kv-cache.cpp`: `grow_regions` (VA mapping — a no-op unless `LLAMA_KV_REGION`/a pool is on), `apply_ubatch`, `seq_park`/`park_move` |
-| the pair's own concurrency contract | `tools/server/server-context.cpp`: the block header above `enum { ARM_PREFILL … }` — five invariants, the barrier, `arm_step_guard`, `arms_decode_loop` |
+### 2.4 The fix (`DESIGN.md` I9)
 
-**The rule that decides the fix** (DESIGN §8 invariant 3): only one context may be inside `llama_process()` in
-the **decode band** at a time, because the MoE remap is process-wide; the prefill arm's wide pass *may* overlap a
-decode step — that overlap is the feature.  If the experiment ladder shows the overlap is simply unsound for a
-host-expert shape, the two honest exits are:
+* the `narrow2` region becomes a **stack of N=2 pinned auxiliary regions** at the top of the reserved VA
+  (slot 0 = an MTP draft context, slot 1 = a context that **borrows** another context's memory: the decode
+  arm); the arena ceiling is the **lowest** pinned offset; the commit takes the pinned offset as an argument
+  (the pin releases the lock to evict, so another context can pin in that window — the window is validated);
+* the routing is a **`thread_local` slot derived from the allocating context's own identity**
+  (`llama_context::slab_aux_slot()`: `cparams.ctx_other` → 1, `memory_borrowed` → 2).  Same pattern as STEP 4's
+  Meta view slot, and it removes the process-wide flag from the MTP path too;
+* `GGML_CUDA_SLAB_NARROW2=0` still bypasses the slab for such a context (the A/B arm);
+* the `-ncmoe > 0` refusal is **removed** from `common_arms_pair_possible()`.
 
-1. **serialise the two arms' `llama_process` calls on such shapes** — correct, and it makes the pair inert on
-   exactly the shapes it was measured on (do this only with the maintainer's agreement, and make it a *refusal*
-   rather than a silent slowdown); or
-2. **make the remap context-safe**: the decode arm must not read a table the prefill arm can remap under it —
-   e.g. pin the tables a decode-band batch will read for the duration of the step (`moe_cache_promise`-style), or
-   keep the decode arm on a private table set, or defer the remap out of the step.  This is the maintainer's
-   chosen direction (2026-11-23).
+### 2.5 Definition of done — all met (numbers in `RUNS.md`, top section)
 
-### 2.5 Definition of done for TASK 1
+* host-tier soak **PASS** (0 errors, 15/3/3 census, aux region pinned, journal clean, wall 28 s vs 371-382 s
+  for the faulting runs), plus the **pair-OFF control** on the same shape;
+* the refusal removed; the 4B soak **PASS** (widest batch 4), `gate-arms-n1-memory.sh` and `gate-arms-itl.sh`
+  **PASS** (-26 % ITL through a 5246-token prefill, +25 % prefill, text identical);
+* A1/A2/A3 unchanged, **A4 KLD 0.000000 / 100.000 %**, A5 K axis `a87c4318b649`, A6 startup shape 13 lines
+  identical, `check-shlib-symbols.sh` OK.
 
-* `gates/gate-arms-multislot.sh` **with the host-tier defaults** (35B-A3B Q8_0 `-ncmoe 40`, np 4, 20 rounds)
-  **PASS**, with `check-gpu-faults.sh` clean and no `gpucore.*`;
-* the `-ncmoe` refusal **removed** from `common_arms_pair_possible()`, and the predicate's comment updated;
-* the 4B GPU-resident soak still PASS, `gates/gate-arms-n1-memory.sh` and `gates/gate-arms-itl.sh` still PASS,
-  and A1-A4, A6 unchanged (the default path is not allowed to move);
-* one `WORKLOG.md` entry + `INVARIANTS.md` facts + a `RUNS.md` section, and a patch in `steps/`;
-* **report the finding and the fix to the maintainer before committing** (see §6).
+### 2.6 Not covered by an arm here (say so, do not wave it through)
+
+The **draft** slot (0) never pinned on a slab-armed shape in this session: an embedded-MTP arm
+(`--spec-type draft-mtp-adaptive`) allocates no second compute buffer at all, and a `--spec-type draft-dflash2`
+arm on the 35B-A3B host tier is **not text-stable** run to run (two builds × two arms gave four different
+hashes at two fixed lengths — the host tier's expert residency picks the kernel set, `GREEDY-PURITY.md` §89).
+Slot 0's code path is identical to slot 1's and slot 1 ran every arm; its *routing* (`ctx_other` → slot 1) is
+what a future arm must confirm.  The natural arm is an external-head / gemma4-assistant drafter **with
+`-ncmoe`**, which the delivery's `gate-draft-ctx.sh` / `gate-mtp-dev-rows.sh` shapes do not currently do.
 
 ---
 
-## 3. The rest of the campaign, after TASK 1
+## 3. The rest of the campaign (TASK 1 is done)
 
 Read `PLAN.md` for each step's own detail; this is the order and what is left.
 
 * **STEP 7 — done.**  `--spec-type` is refused on the pair inside `common_arms_pair_possible()`; its re-admission
   is STEP 10.  Nothing to do unless you want the message wording reviewed.
+* **STEP 7a — done** (= the old TASK 1): the host-tier fault, §2.
 * **STEP 8 — the gate set.**  Three exist (`gates/gate-arms-{n1-memory,itl,multislot}.sh`).  Still owed:
   * `gate-arms-default-inert.sh` — the pair OFF must print a **byte-identical startup shape** to
     `baseline/A6-startup-shape.txt` **and** read A1/A2/A3 identical, on 4 shapes.  (The shape anchor already
@@ -194,8 +187,8 @@ Read `PLAN.md` for each step's own detail; this is the order and what is left.
   * every gate must print its **non-vacuity** line; a gate that could pass on the single-context server is
     defective.
 * **STEP 9 — the shape/latency matrix + the records.**  4B (1 GPU), phi-4 IQ4_XS (1 GPU, dense), 27B Q8_0
-  (3 GPU `-sm tensor`), 35B-A3B Q8_0 (`-ncmoe 40`, host tier — **needs TASK 1**), Flash-Next IQ4_NL (3 GPU
-  tensor, 3 slots `--kv-unified`), Gemma4 (iswa).  **Byte text claims at ONE request in flight only** — a
+  (3 GPU `-sm tensor`), 35B-A3B Q8_0 (`-ncmoe 40`, host tier — **unblocked by STEP 7a**), Flash-Next IQ4_NL
+  (3 GPU tensor, 3 slots `--kv-unified`), Gemma4 (iswa).  **Byte text claims at ONE request in flight only** — a
   concurrent arm's composition picks the kernels and even the unmodified server varies run to run
   (`INVARIANTS.md` r362-wip item 5).  Then `ENVIRONMENT.md` rows for `--prefill-decode-arms`,
   `--prefill-decode-arms-mode`, `LLAMA_ARG_PREFILL_DECODE_ARMS[_MODE]` and `LLAMA_RS_DEBUG_PLACEMENT`; the
@@ -287,11 +280,16 @@ Every number of record is in `RUNS.md` (newest first) with its command and shape
 
 ## 7. Open questions for the maintainer (ask before deciding alone)
 
-1. **TASK 1's exit:** if the experiment ladder shows the overlap is unsound for a host-expert shape and the
-   remap cannot be made context-safe cheaply, is a *refusal* (the pair on GPU-resident shapes only) acceptable
-   as the shipped state, with the host-tier case documented as a follow-up?
-2. **The decode arm's arena reserve** is a 256 MiB constant measured on the 27B/3-GPU shape.  If TASK 1 changes
-   the placement of the expert tables, re-measure it rather than keeping the constant.
+1. **`GGML_CUDA_SLAB_NARROW2` is not in `ENVIRONMENT.md`** — it is a delivery kill switch (default on) that
+   predates this campaign, and STEP 7a now applies it to a borrowing context as well as a draft.  Add the row,
+   or is the catalogue deliberately scoped to variables the delivery's own gates exercise?
+2. **The two pinned aux regions cost real VRAM** (1.25 GiB on the 35B-A3B shape, taken from the arena).  With
+   the pair and a drafter both live that is 2 × 1.25 GiB, and the delivery's `COMMON_ARMS_RESERVE_MIB` (256)
+   accounts for only the measured *arena shrink* of one narrow context.  Should the pair's reserve grow to the
+   measured pinned size at STEP 10, or is the eviction path (which handled it here) the accepted answer?
 3. **The Step-9 byte-claim rule** ("one request in flight") is this campaign's reading of DESIGN V8.  If the
    maintainer wants a byte claim *under* concurrency, the batch composition has to be pinned first — that is a
    separate instrument, not a gate tweak.
+4. **Where should the slab change live?**  STEP 7a touches a *delivery* file (`ggml-cuda-slab.cu`, blocks
+   12/15's slab) from inside a wip campaign.  It is inert for the default path (A1-A6 unchanged, one region),
+   but if the campaign is promoted it lands in whichever block owns the slab — that is a block decision.

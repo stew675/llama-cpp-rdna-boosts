@@ -14,6 +14,7 @@ step**, and so that each step is independently reviewable.
 | 5 | **`llama_memory_recurrent` contextified** | `mem->n`, `mem->rs_z` as graph-visible state; the `s_copy()` getter mutation | per-batch `placement` in the context | inert single-context (text + MTP four-axis); then `gate-arms-recurrent-shared.sh` |
 | 6 | the server's two arms | the whole handover state machine | `ctx_dec` (borrow), the decode thread, slot ownership, the pairing predicate | `gate-arms-n1-memory.sh`, `gate-arms-multislot.sh` |
 | 7 | `--spec-type` refused/off on the pair | — | one guard | the guard fires; the pair runs without a drafter |
+| 7a | **the host-expert fault** (found by STEP 6's soak) | one narrow slab work base for every context; a process-wide routing flag | one pinned AUX region per extra context + a `thread_local` routing slot (`DESIGN.md` I9) | the host-tier soak PASSes (it faulted), the 4B soak/n1-memory/itl still PASS, A1-A6 unchanged |
 | 8 | the gate set + the census | — | 4 gates under `gates/`, `--json` where useful | each gate green **and** non-vacuous |
 | 9 | the shape/latency matrix + records | — | `WORKLOG.md`, `ENVIRONMENT.md`, `INVARIANTS.md` rows | the matrix reproduces text on every shape |
 | 10 | re-admit the speculator on the pair | the STEP 7 guard | the draft/verify/accept on the decode arm | 3-way cold text + the four axes |

@@ -103,6 +103,16 @@ provably inert (same-seed text + KLD 0.000000).
 **I8 — `ctx_other` keeps exactly its three existing meanings.**  MTP/draft target, gemma4 assistant view, eagle3
 token_embd donor.  The pair uses a **new** field and must not be visible to those code paths.
 
+**I9 — two live compute buffers never share a slab work base, and "which context is allocating" is never a
+process-wide flag.**  Everything *above* the memory is per context, and one of those things is the scheduler's
+COMPUTE buffer — the slab's work region is process-wide, so it must hand each live view its own region.  It had
+exactly one "narrow" (decode/verify) base for the target plus one pinned `narrow2` region for the MTP draft, so a
+**third** context (the pair's decode arm) aliased the prefill arm's 1280 MiB view at offset 0 and the GPU faulted
+in the K rope's `SET_ROWS` (`HANDOVER.md` §2, `INVARIANTS.md` r364-wip).  Each extra context now gets its own
+pinned region, selected by its **own identity** (`ctx_other` → the draft slot, `memory_borrowed` → the borrowing
+slot) through a `thread_local`, because two arms reserve on two threads and a process-wide flag leaks.  This is
+the same rule as I3/I5 one level up: no shared bookkeeping, no role-derived selection, one owner per resource.
+
 ---
 
 ## 5. Defect register V1-V11
@@ -312,6 +322,10 @@ request arrives ──► prefill arm: prompt ubatches on ctx_tgt (its own batch
 3. Only **one** context may be inside `llama_process()` in the *decode band* at a time (the MoE device remap
    table is process-wide).  The prefill arm's wide pass may overlap a decode step, which is the point of the
    feature; the **speculator's draft context is decode-band**, so drafting is serialised with the decode step.
+   *Corrected 2026-11-23 (`HANDOVER.md` §2):* the pair's host-expert GPU fault was **not** this invariant being
+   violated — it was two contexts' COMPUTE buffers sharing one slab work base (I9).  The remap rule above still
+   stands on its own (it is why a decode step and a prefill pass may overlap but two decode-band contexts may
+   not), but a fault on a host-expert shape is not evidence of it; check `GGML_CUDA_WORK_ALLOC_DEBUG=1` first.
 4. Any request-boundary memory operation that is not `init_batch`/`apply` (an allocation assert, a checkpoint
    restore) runs only when neither arm is inside `llama_process()`.
 5. The response lifecycle (`print_timings`, `send_final_response`, `release`, the prompt cache) is **main-thread
@@ -353,5 +367,6 @@ lifecycle.
 | R3 | the reservation bitmap leaks a mark (a batch context destroyed in an unexpected order) | an assert at every request boundary (`reserved == 0`), and the counts are in the census |
 | R4 | the recurrent extraction changes single-context numerics subtly | text + KLD oracles in the same step, before the pair uses it (STEP 5) |
 | R5 | the decode arm's narrow graph picks different kernels than the single context's decode row (V8) | the shape matrix in the text oracle; a divergence is investigated as a kernel/shape question with the cell census |
-| R6 | the arena reserve for the second context is still a hand-tuned constant | keep the constant small and *derived from a measurement*, I3-style: print the measured reserve at load, and fail loudly rather than silently shrinking the expert arena |
+| R6 | the arena reserve for the second context is still a hand-tuned constant | keep the constant small and *derived from a measurement*, I3-style: print the measured reserve at load, and fail loudly rather than silently shrinking the expert arena.  **Re-measure at STEP 10:** on a slab-armed shape the decode arm's *compute* buffer is 1280 MiB, pinned out of the arena (1.25 GiB rounded to a chunk), not the 157-235 MiB the 27B/3-GPU tensor arm measured — the constant covers the arena shrink of one narrow context and a drafter would make it two (`HANDOVER.md` §7 item 2) |
+| R8 | a third (or later) context aliases an extra context's slab region | I9: every extra context has its own pinned region, chosen by its own identity; `gates/gate-arms-multislot.sh` FAILS if the slab is armed and the decode arm got no region of its own |
 | R7 | a "helpful" refactor re-merges the arms to save the prefill cost | `DESIGN.md` §1/§8 and the gate that measures ITL through a prefill: a merged step shows the 300-880 ms stall and fails |

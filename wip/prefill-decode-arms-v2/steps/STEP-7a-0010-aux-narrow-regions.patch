@@ -1,0 +1,891 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index 0dbbb5294..aa0bd8d02 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2288,17 +2288,6 @@ const char * common_arms_pair_possible(const common_params & params) {
+         return "--sleep-idle unloads the model, which would tear the pair's SHARED memory down under the "
+                "other arm";
+     }
+-    if (params.n_cpu_moe > 0) {
+-        // OPEN (2026-11-23): a 4-slot soak of the pair on the 35B-A3B host tier (-ncmoe 40, one GPU) faulted
+-        // the GPU -- HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION in rms_norm_mul_rope_f32_qk_pair -- and the
+-        // server aborted.  A host-expert shape REMAPS the MoE expert tables from the prefill arm's step while
+-        // the decode arm is reading them, which is the "process-wide state" DESIGN 8 invariant 3 warns about;
+-        // the pair is therefore REFUSED on that shape until the interaction is root-caused (TODO: the soak in
+-        // wip/prefill-decode-arms-v2/gates/gate-arms-multislot.sh reproduces it).
+-        return "a host-expert shape remaps the MoE expert tables from the prefill arm's step while the decode "
+-               "arm reads them (a 4-slot soak faulted the GPU); run the pair on a GPU-resident shape until "
+-               "that is root-caused";
+-    }
+     if (params.ctx_shift) {
+         return "--context-shift mutates the shared KV of a slot the decode arm owns; run --no-context-shift "
+                "(the pair does not shift a generating slot from the other arm)";
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index b031d1b77..29f725e01 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -143,12 +143,12 @@ extern "C" {
+     // wip/moe-verify-fusions (narrow-2): pin the MTP draft's COMPUTE region at the top of the slab's
+     // reserved VA, so it cannot alias the target's narrow verify buffer at slab base 0.  Idempotent;
+     // no-op for a backend without a slab.
+-    GGML_API void                  ggml_backend_dev_slab_narrow2_floor(ggml_backend_dev_t dev, size_t bytes);
++    GGML_API void                  ggml_backend_dev_slab_aux_floor(ggml_backend_dev_t dev, int slot, size_t bytes);
+ 
+     // wip/moe-verify-fusions (narrow-2): mark this context's COMPUTE allocations as the MTP draft's, so
+     // they route to the pinned narrow-2 region (or, with GGML_CUDA_SLAB_NARROW2=0, bypass the slab).
+     // No-op for a backend without a slab.
+-    GGML_API void                  ggml_backend_dev_slab_compute_narrow2(ggml_backend_dev_t dev, bool enable);
++    GGML_API void                  ggml_backend_dev_slab_compute_aux(ggml_backend_dev_t dev, int slot);
+ 
+     // allocate this context's COMPUTE buffers outside the slab and without the chunk quantization (a buffer the
+     // slab never serves, e.g. the MTP draft's second scheduler).  No-op for a backend without a slab.
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index d0bf5b3f2..0ea9b2a64 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -505,11 +505,11 @@ extern "C" {
+         // (optional) wip/moe-verify-fusions (narrow-2): pin the MTP draft's COMPUTE region at the top of
+         // the slab's reserved VA (idempotent), so it cannot alias the target's narrow verify buffer at
+         // base 0.  Appended like the fields above, so backends that do not set it are zero-initialized.
+-        void (*slab_narrow2_floor)(ggml_backend_dev_t dev, size_t bytes);
++        void (*slab_aux_floor)(ggml_backend_dev_t dev, int slot, size_t bytes);
+ 
+         // (optional) wip/moe-verify-fusions (narrow-2): route this context's COMPUTE allocations to the
+         // pinned narrow-2 region (the MTP draft).  Appended like the fields above.
+-        void (*slab_compute_narrow2)(ggml_backend_dev_t dev, bool enable);
++        void (*slab_compute_aux)(ggml_backend_dev_t dev, int slot);
+ 
+         // (optional) wip/host-expert-dio-cache: enable the bounded pinned host pool and register the
+         // on-disk source of a host-resident expert tensor.  Routed through the device API so libllama
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 1ab2c1bba..3db613815 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -284,19 +284,19 @@ static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_
+     return true;
+ }
+ 
+-static void ggml_backend_meta_device_slab_narrow2_floor(ggml_backend_dev_t dev, size_t bytes) {
++static void ggml_backend_meta_device_slab_aux_floor(ggml_backend_dev_t dev, int slot, size_t bytes) {
+     // forward to the simple devices: the meta device owns no slab of its own
+     ggml_backend_meta_device_context * ctx = (ggml_backend_meta_device_context *) dev->context;
+     for (ggml_backend_dev_t d : ctx->simple_devs) {
+-        ggml_backend_dev_slab_narrow2_floor(d, bytes);
++        ggml_backend_dev_slab_aux_floor(d, slot, bytes);
+     }
+ }
+ 
+-static void ggml_backend_meta_device_slab_compute_narrow2(ggml_backend_dev_t dev, bool enable) {
++static void ggml_backend_meta_device_slab_compute_aux(ggml_backend_dev_t dev, int slot) {
+     // forward to the simple devices: the meta device owns no slab of its own
+     ggml_backend_meta_device_context * ctx = (ggml_backend_meta_device_context *) dev->context;
+     for (ggml_backend_dev_t d : ctx->simple_devs) {
+-        ggml_backend_dev_slab_compute_narrow2(d, enable);
++        ggml_backend_dev_slab_compute_aux(d, slot);
+     }
+ }
+ 
+@@ -333,8 +333,8 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+     /* .slab_ring_set        = */ nullptr,
+     /* .slab_narrow_floor    = */ nullptr,
+     /* .slab_reserve_wide    = */ nullptr,
+-    /* .slab_narrow2_floor   = */ ggml_backend_meta_device_slab_narrow2_floor,
+-    /* .slab_compute_narrow2 = */ ggml_backend_meta_device_slab_compute_narrow2,
++    /* .slab_aux_floor       = */ ggml_backend_meta_device_slab_aux_floor,
++    /* .slab_compute_aux     = */ ggml_backend_meta_device_slab_compute_aux,
+     /* .moe_cache_set_host_pool   = */ nullptr,
+     /* .moe_cache_set_host_source = */ nullptr,
+     /* .slab_compute_plain   = */ ggml_backend_meta_device_slab_compute_plain,
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 9fef9f14a..f548ad025 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -505,22 +505,22 @@ void ggml_backend_dev_slab_reserve_wide(ggml_backend_dev_t dev, size_t bytes) {
+     dev->iface.slab_reserve_wide(dev, bytes);
+ }
+ 
+-void ggml_backend_dev_slab_narrow2_floor(ggml_backend_dev_t dev, size_t bytes) {
++void ggml_backend_dev_slab_aux_floor(ggml_backend_dev_t dev, int slot, size_t bytes) {
+     // wip/moe-verify-fusions (narrow-2): pin the MTP draft's COMPUTE region.  Optional hook; a backend
+     // without a slab (or that never set it) is a no-op.
+-    if (dev == nullptr || dev->iface.slab_narrow2_floor == nullptr) {
++    if (dev == nullptr || dev->iface.slab_aux_floor == nullptr) {
+         return;
+     }
+-    dev->iface.slab_narrow2_floor(dev, bytes);
++    dev->iface.slab_aux_floor(dev, slot, bytes);
+ }
+ 
+-void ggml_backend_dev_slab_compute_narrow2(ggml_backend_dev_t dev, bool enable) {
++void ggml_backend_dev_slab_compute_aux(ggml_backend_dev_t dev, int slot) {
+     // wip/moe-verify-fusions (narrow-2): route this context's COMPUTE allocations to the pinned narrow-2
+     // region.  Optional hook; a backend without a slab (or that never set it) is a no-op.
+-    if (dev == nullptr || dev->iface.slab_compute_narrow2 == nullptr) {
++    if (dev == nullptr || dev->iface.slab_compute_aux == nullptr) {
+         return;
+     }
+-    dev->iface.slab_compute_narrow2(dev, enable);
++    dev->iface.slab_compute_aux(dev, slot);
+ }
+ 
+ void ggml_backend_dev_slab_compute_plain(ggml_backend_dev_t dev, bool enable) {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index af0dfefa2..953d847ee 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -720,8 +720,8 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
+     /* .slab_ring_set        = */ nullptr,
+     /* .slab_narrow_floor    = */ nullptr,
+     /* .slab_reserve_wide    = */ nullptr,
+-    /* .slab_narrow2_floor   = */ nullptr,
+-    /* .slab_compute_narrow2 = */ nullptr,
++    /* .slab_aux_floor       = */ nullptr,
++    /* .slab_compute_aux     = */ nullptr,
+     /* .moe_cache_set_host_pool   = */ nullptr,
+     /* .moe_cache_set_host_source = */ nullptr,
+     /* .slab_compute_plain   = */ nullptr,
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index f2ec2d8e6..d76b3a5fa 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -154,15 +154,27 @@ struct ggml_cuda_slab {
+     // -- the band a wide prefill immediately reclaims -- so nothing is pre-seeded only to be evicted; the
+     // hole fills lazily during decode.  See `ggml_cuda_slab_seed_floor`.
+     size_t                   wide_reserve_bytes = 0;
+-    // wip/moe-verify-fusions (narrow-2): a SECOND static narrow view -- the MTP draft context's compute
+-    // buffer -- is pinned at the TOP of the reserved VA: `[narrow2_off, size)`.  With MTP there are TWO
+-    // live compute buffers (the target's verify view and the draft context's), so without this they both
+-    // aliased at base 0 (measured: plain != MTP, near-tie flip at decode token 69).  Pinning narrow-2 at
+-    // the top of `size` (NOT `mapped`) lets `slab_extend` grow the arena only up to `narrow2_off`: nothing
+-    // moves and no arena table is evicted to make room.  It is never part of the work pool or the arena.
+-    size_t                   narrow2_floor = 0; // the pinned narrow-2 size (0 = not established)
+-    size_t                   narrow2_off   = 0; // = size - narrow2_floor, fixed once established
+-    int                      narrow2_live  = 0; // live narrow-2 views (diagnostic/guard)
++    // prefill-decode-arms v2 (the narrow-2 region, generalized): ONE pinned region per extra context that
++    // keeps a static narrow (decode/verify) COMPUTE view of its own, stacked downward from the top of the
++    // reserved VA:
++    //   slot 0 = the MTP draft context, slot 1 = a context that BORROWS another context's memory
++    //   (the two-arm server's decode arm) -- see `ggml_cuda_slab_set_compute_aux`.
++    //   [size - floor(0), size), [size - floor(0) - floor(1), size - floor(0)), ...
++    // Without a region of its own each extra context's compute buffer ALIASED the target's narrow view at
++    // base 0.  Measured for MTP: `plain != MTP`, a near-tie flip at decode token 69.  Measured for the
++    // pair: two live 1280 MiB views at offset 0 and, 3 ms later, an
++    // HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION in the K rope's SET_ROWS (block 08, 35B-A3B Q8_0
++    // `-ncmoe 40`, 4 slots; `GGML_CUDA_WORK_ALLOC_DEBUG=1` prints both views and their offsets).
++    // Pinning at the top of `size` (NOT `mapped`) lets `slab_extend` grow the arena only up to the LOWEST
++    // pinned region, so nothing moves and no arena table has to be evicted to make room in the ordinary
++    // case.  These regions are never part of the work pool or of the arena.
++    struct aux_region {
++        size_t floor = 0;   // the pinned size (0 = not established)
++        size_t off   = 0;   // the base offset = (the region above it, or `size`) - `floor`
++        int    live  = 0;   // live views (a graph-allocator re-reserve overlaps its own replacement)
++    };
++    static constexpr int     N_AUX = 2;
++    aux_region               narrow2[N_AUX];
+     size_t                   ring_region  = 0;  // ring bytes above the narrow floor (0 = no ring)
+     bool                     ring_armed   = false; // the wide view (hence the ring region) is reserved
+     // wip/slab-transient-absorption: the WIDE-PHASE auxiliary region (the FA prefill staging arena), bump
+@@ -250,14 +262,19 @@ static ggml_cuda_slab g_slabs[GGML_CUDA_MAX_DEVICES];
+ static bool g_slab_armed = false;
+ 
+ // wip/moe-verify-fusions: when false, COMPUTE buffers bypass the slab (raw cudaMalloc from the slab
+-// reserve).  The A/B arm (`GGML_CUDA_SLAB_NARROW2=0`) sets it for the MTP draft context so its compute
+-// buffer cannot alias the target's narrow verify buffer at slab base 0 (the session's "quick fix").
+-static bool g_slab_compute_enabled = true;
+-
+-// wip/moe-verify-fusions (narrow-2): when true, the COMPUTE buffer being allocated belongs to the MTP
+-// draft context and is routed to the slab's second pinned narrow region (the top of the reserved VA).
+-// Set/cleared around the draft's reserve and alloc_graph calls by `llama_context`.
+-static bool g_slab_compute_narrow2 = false;
++// reserve).  The A/B arm (`GGML_CUDA_SLAB_NARROW2=0`) sets it for an AUXILIARY context (the MTP draft's, or
++// the two-arm server's decode arm) so its compute buffer cannot alias the target's narrow verify buffer at
++// slab base 0.  thread_local for the same reason as `g_slab_compute_aux`: two arms allocate on two threads.
++static thread_local bool g_slab_compute_enabled = true;
++
++// wip/moe-verify-fusions (narrow-2), generalized: which pinned AUX narrow region the COMPUTE buffer being
++// allocated belongs to -- 0 = none (the target's own views), 1 = the MTP draft context, 2 = a context that
++// BORROWS another context's memory (the two-arm server's decode arm).
++// THREAD-LOCAL, and set by `llama_context` from the allocating context's OWN identity: a process-wide flag
++// is wrong the moment two arms reserve on two threads.  Measured with a process-wide flag: the PREFILL
++// arm's reserve inherited the decode arm's flag, was routed into the aux region, found a live view there,
++// fell back to cudaMalloc and failed the graph reserve (1280 MiB "out of memory") 1.3 s into the soak.
++static thread_local int g_slab_compute_aux = 0;
+ 
+ // when true, the COMPUTE buffer being allocated is one the slab never serves (the MTP draft's second scheduler):
+ // it bypasses the slab and the chunk quantization.  Set/cleared around that allocation by `llama_context`.
+@@ -590,14 +607,21 @@ static size_t ggml_cuda_slab_up(size_t x, size_t a) {
+     return a * ((x + a - 1) / a);
+ }
+ 
+-// wip/moe-verify-fusions: the arena's VA ceiling and usable top when a narrow-2 region is pinned at the
+-// top of the reserved VA.  Before narrow-2 exists the ceiling is the whole reserved VA (`size`); after, it
+-// stops at `narrow2_off` so neither `slab_extend` nor `arena_alloc` can touch the pinned region.  The
+-// usable top is the mapped extent, clamped to the ceiling -- and the clamp is LOAD-BEARING, not defensive:
+-// a narrow-2 region wider than the unmapped spare straddles `mapped` (`narrow2_off < mapped`) and its
+-// commit then maps the VA above `mapped` as well, so `mapped` ends up ABOVE `narrow2_off` (TODO #143).
++// wip/moe-verify-fusions / prefill-decode-arms v2: the arena's VA ceiling and usable top when AUX narrow
++// regions are pinned at the top of the reserved VA.  Before any exists the ceiling is the whole reserved VA
++// (`size`); after, it stops at the LOWEST pinned region's offset so neither `slab_extend` nor
++// `arena_alloc` can touch a pinned region.  The usable top is the mapped extent, clamped to the ceiling --
++// and the clamp is LOAD-BEARING, not defensive: a region wider than the unmapped spare straddles `mapped`
++// and its commit then maps the VA above `mapped` as well, so `mapped` ends up ABOVE that region's offset
++// (TODO #143).
+ static size_t ggml_cuda_slab_arena_limit(const ggml_cuda_slab & s) {
+-    return s.narrow2_floor > 0 ? s.narrow2_off : s.size;
++    size_t lim = s.size;
++    for (const auto & r : s.narrow2) {
++        if (r.floor > 0 && r.off < lim) {
++            lim = r.off;   // the LOWEST pinned region is the ceiling (they stack downward)
++        }
++    }
++    return lim;
+ }
+ static size_t ggml_cuda_slab_arena_top(const ggml_cuda_slab & s) {
+     const size_t lim = ggml_cuda_slab_arena_limit(s);
+@@ -959,9 +983,9 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+     }
+     s.boundary     = w;
+     s.narrow_floor = 0;   // established on the first narrow reserve or by `ggml_cuda_slab_set_narrow_floor`
+-    s.narrow2_floor = 0;  // established lazily on the draft context's first narrow compute allocation
+-    s.narrow2_off   = 0;
+-    s.narrow2_live  = 0;
++    for (auto & r : s.narrow2) {   // each established lazily, on that context's first narrow compute allocation
++        r = ggml_cuda_slab::aux_region();
++    }
+     s.ring_region  = 0;
+     s.ring_armed   = false;
+     s.ring_used    = 0;
+@@ -993,87 +1017,75 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+     return true;
+ }
+ 
+-// A work-region view was dropped (`reported` = the size the buffer reported, i.e. the boundary at its
+-// alloc).  Removing it lowers the floor the boundary may shrink to; the actual shrink happens on the next
+-// `work_alloc`, which knows the new need.
+-//
+-// This is a MULTISET, not a flag: more than one compute buffer is live at a time (the main context and the
+-// MTP draft context each own one), so a release must not make the slab believe the work region is idle.
+-// Tracking each view's REPORTED size is also required, not its request: a narrow view allocated while the
+-// boundary was wide was handed the wide range, so the graph allocator may have laid its tensors out
+-// anywhere in it.
+-// A work-region view was dropped (`need` = the size it requested).  Removing it lowers the floor the
+-// boundary may shrink to; the actual shrink happens on the next `work_alloc`, which knows the new need.
+-//
+-// wip/moe-verify-fusions (narrow-2): establish the MTP draft's pinned compute region at the top of the
+-// reserved VA and map its physical.  Idempotent: the draft reserves at construction, DROPS those buffers
+-// (`llama_context_drop_compute_buffers`, before the target's first prefill) and lazily re-reserves on its
+-// first real (n_max+1-token) graph, so this is called repeatedly.  Returns the region's base offset, or 0
+-// when it cannot be established (no room for the work region + a usable arena above `boundary`, the top
+-// overlaps already-mapped physical, or `ggml_cuda_vmm_map_phys` failed); the caller then falls back to
+-// the plain cudaMalloc path for that buffer.
+-//
+-// The size is FIXED at the first establishment: narrow-2 is anchored at the top (`off = size - floor`), so
+-// a later, larger request would move a live view's base.  In practice the first request is the draft's
+-// `sched_reserve` pp layout, which is its widest graph, so the region never needs to grow.
+-// Decide where the narrow-2 (draft compute) region goes.  Returns `off` (0 = nowhere) and reports whether
+-// the arena already holds mapped physical in [off, mapped) that has to be evicted first: the region is
+-// pinned at the TOP of the reserved VA, so anything the arena mapped above `off` is in the way.
++// Decide where an AUX narrow region goes.  Returns `off` (0 = nowhere) and reports whether the arena
++// already holds mapped physical in [off, mapped) that has to be evicted first: the regions are stacked
++// DOWNWARD from the TOP of the reserved VA, so anything the arena mapped above `off` is in the way.
+ //
+ // Two placements, in order of preference:
+ //   * ABOVE `mapped`: the VA the creation reservation left unmapped (`reserve - headroom`, i.e. the
+ //     draft-context estimate).  Nothing has to be moved and no arena byte is spent -- the MTP-draft case.
+-//   * STRADDLING `mapped` (`off < mapped < off + nf2`): the shortfall case -- the draft's compute region
+-//     is bigger than the unmapped spare the creation reservation left.  The arena yields [off, mapped)
+-//     (evicted, `ggml_cuda_slab_arena_limit`) AND the VA above `mapped` is mapped here, because the
+-//     region the buffer occupies is [off, off + nf2) whatever the split: mapping only the part the arena
+-//     happened to have mapped leaves the top of the region with no physical behind it, and a device
+-//     access there is a hard GPU page fault on a no-XNACK part (TODO #143: `HSA_STATUS_ERROR_MEMORY_FAULT`
+-//     in `rms_norm_f32` on the MTP's `mtp_h_state`, 1.31-1.37 GiB of the draft's compute region
+-//     unmapped, 2 devices at `-c 204800`; `-c 131072` and one device fit the spare and never hit it).
+-//     NEEDED because a TENSOR-SPLIT drafter's per-device compute buffer is much larger than an MTP
+-//     draft's: measured 1280 MiB for a DFlash2 drafter under `-sm tensor` against the estimator's 512 MiB
+-//     tier, i.e. bigger than the whole unmapped spare, which used to leave the draft on the cudaMalloc
+-//     path with the slab holding the VRAM (`graph_reserve: failed to allocate compute buffers`).
+-static size_t ggml_cuda_slab_narrow2_pin_locked(int device, ggml_cuda_slab & s, size_t bytes, bool * evict) {
++//   * STRADDLING `mapped` (`off < mapped < off + nf2`): the shortfall case -- the region is bigger than
++//     the unmapped spare the creation reservation left.  The arena yields [off, mapped) (evicted,
++//     `ggml_cuda_slab_arena_limit`) AND the VA above `mapped` is mapped here, because the region the buffer
++//     occupies is [off, off + nf2) whatever the split: mapping only the part the arena happened to have
++//     mapped leaves the top of the region with no physical behind it, and a device access there is a hard
++//     GPU page fault on a no-XNACK part (TODO #143: `HSA_STATUS_ERROR_MEMORY_FAULT` in `rms_norm_f32` on
++//     the MTP's `mtp_h_state`, 1.31-1.37 GiB of the draft's compute region unmapped, 2 devices at
++//     `-c 204800`; `-c 131072` and one device fit the spare and never hit it).  NEEDED because a
++//     TENSOR-SPLIT drafter's per-device compute buffer is much larger than an MTP draft's: measured
++//     1280 MiB for a DFlash2 drafter under `-sm tensor` against the estimator's 512 MiB tier, i.e. bigger
++//     than the whole unmapped spare, which used to leave the draft on the cudaMalloc path with the slab
++//     holding the VRAM (`graph_reserve: failed to allocate compute buffers`).
++//
++// The size is FIXED at the first establishment: the region is anchored against the slab's ceiling, so a
++// later, larger request would move a live view's base -- it is refused instead (and the caller falls back
++// to the plain cudaMalloc path for that buffer).  In practice the first request is that context's widest
++// `sched_reserve` layout, so the region never needs to grow.
++static size_t ggml_cuda_slab_aux_pin_locked(int device, ggml_cuda_slab & s, int slot, size_t bytes, bool * evict) {
+     *evict = false;
+-    if (!s.inited || bytes == 0) {
++    if (!s.inited || bytes == 0 || slot < 0 || slot >= ggml_cuda_slab::N_AUX) {
+         return 0;
+     }
++    ggml_cuda_slab::aux_region & r = s.narrow2[slot];
+     const size_t nf2 = ggml_cuda_slab_up(bytes, s.chunk);
+-    if (s.narrow2_floor == 0) {
+-        if (nf2 == 0 || nf2 >= s.size) {
+-            return 0;
+-        }
+-        const size_t off = s.size - nf2;
+-        const size_t min_arena = ggml_cuda_slab_min_arena_bytes();
+-        // The work region (`boundary`, which includes the wide prefill view and the ring) and a usable
+-        // arena must both fit below narrow-2, and enough VA must be left for the mapping.
+-        if (off < s.boundary + min_arena + s.chunk) {
+-            GGML_LOG_WARN("%s: device %d: no room for a %.2f GiB narrow-2 region above the work region "
+-                          "(%.2f GiB) and a %.2f GiB arena floor in a %.2f GiB slab (mapped %.2f GiB); "
+-                          "the draft compute buffer stays on the cudaMalloc path\n",
+-                          __func__, device, (double) nf2 / (1ull << 30), (double) s.boundary / (1ull << 30),
+-                          (double) min_arena / (1ull << 30), (double) s.size / (1ull << 30),
+-                          (double) s.mapped / (1ull << 30));
++    if (nf2 == 0 || nf2 >= s.size) {
++        return 0;
++    }
++    if (r.floor != 0) {
++        if (nf2 > r.floor) {
++            GGML_LOG_WARN("%s: device %d: aux narrow-%d request %.2f GiB exceeds the pinned %.2f GiB and the "
++                          "region cannot grow without moving a live view; falling back\n",
++                          __func__, device, slot + 2, (double) nf2 / (1ull << 30), (double) r.floor / (1ull << 30));
+             return 0;
+         }
+-        // mapped physical above `off` is in the way: it has to be evicted before the pin (the eviction
+-        // re-enters the slab through `arena_free`, so it cannot run under this lock).
+-        *evict = off < s.mapped;
+-        return off;
+-    }
+-    if (nf2 > s.narrow2_floor) {
+-        GGML_LOG_WARN("%s: device %d: narrow-2 request %.2f GiB exceeds the pinned %.2f GiB and the region "
+-                      "cannot grow without moving a live view; falling back\n",
+-                      __func__, device, (double) nf2 / (1ull << 30), (double) s.narrow2_floor / (1ull << 30));
++        return r.off;
++    }
++    const size_t top = ggml_cuda_slab_arena_limit(s);   // the lowest pinned region, or the whole reserved VA
++    if (top < nf2) {
++        return 0;
++    }
++    const size_t off = top - nf2;
++    const size_t min_arena = ggml_cuda_slab_min_arena_bytes();
++    // The work region (`boundary`, which includes the wide prefill view and the ring) and a usable arena
++    // must both fit below the aux region, and enough VA must be left for the mapping.
++    if (off < s.boundary + min_arena + s.chunk) {
++        GGML_LOG_WARN("%s: device %d: no room for a %.2f GiB aux narrow-%d region above the work region "
++                      "(%.2f GiB) and a %.2f GiB arena floor in a %.2f GiB slab (mapped %.2f GiB); the "
++                      "auxiliary compute buffer stays on the cudaMalloc path\n",
++                      __func__, device, (double) nf2 / (1ull << 30), slot + 2, (double) s.boundary / (1ull << 30),
++                      (double) min_arena / (1ull << 30), (double) s.size / (1ull << 30),
++                      (double) s.mapped / (1ull << 30));
+         return 0;
+     }
+-    return s.narrow2_off;
++    // mapped physical above `off` is in the way: it has to be evicted before the pin (the eviction
++    // re-enters the slab through `arena_free`, so it cannot run under this lock).
++    *evict = off < s.mapped;
++    return off;
+ }
+ 
+-// Commit a pin decided above: map whatever part of [off, off + nf2) has no physical behind it, and cap
+-// the arena at `off`.
++// Commit a pin decided above: map whatever part of [off, off + nf2) has no physical behind it, and cap the
++// arena at `off`.  `off` is PASSED IN, not recomputed: the pin released the lock to evict arena tables, and
++// another context may have pinned a region in that window (the window is validated below).
+ //
+ // TWO ranges can need a mapping, and only the first used to be handled:
+ //   * the whole region lying above `mapped` (the ordinary short-nothing case), and
+@@ -1081,20 +1093,33 @@ static size_t ggml_cuda_slab_narrow2_pin_locked(int device, ggml_cuda_slab & s,
+ //     wider than the spare.  The pre-fix code took the "arena gave it up" branch for a straddle and
+ //     mapped nothing at all, so the top of the draft's compute buffer was reserved-but-absent VA and the
+ //     first device access past `mapped` was an unrecoverable page fault (TODO #143).
+-static void ggml_cuda_slab_narrow2_commit_locked(int device, ggml_cuda_slab & s, size_t bytes) {
+-    if (!s.inited || s.narrow2_floor != 0 || bytes == 0) {
++static void ggml_cuda_slab_aux_commit_locked(int device, ggml_cuda_slab & s, int slot, size_t off, size_t bytes) {
++    if (!s.inited || bytes == 0 || slot < 0 || slot >= ggml_cuda_slab::N_AUX) {
++        return;
++    }
++    ggml_cuda_slab::aux_region & r = s.narrow2[slot];
++    if (r.floor != 0) {
+         return;
+     }
+     const size_t nf2 = ggml_cuda_slab_up(bytes, s.chunk);
+-    if (nf2 == 0 || nf2 >= s.size) {
++    if (nf2 == 0 || off < s.boundary || off + nf2 > s.size) {
+         return;
+     }
+-    const size_t off  = s.size - nf2;
+-    const size_t want = off + nf2;              // == s.size; the top of the region, always
++    for (int j = 0; j < ggml_cuda_slab::N_AUX; ++j) {
++        const ggml_cuda_slab::aux_region & o = s.narrow2[j];
++        if (j != slot && o.floor > 0 && off < o.off + o.floor && o.off < off + nf2) {
++            GGML_LOG_WARN("%s: device %d: the aux narrow-%d window [%.2f, %.2f] GiB was taken by slot %d while "
++                          "the arena was evicted; the auxiliary compute buffer stays on the cudaMalloc path\n",
++                          __func__, device, slot + 2, (double) off / (1ull << 30), (double) (off + nf2) / (1ull << 30),
++                          j);
++            return;
++        }
++    }
++    const size_t want = off + nf2;
+     const size_t mapped_before = s.mapped;
+     if (off < mapped_before) {
+-        // The arena gave the range up: drop every free run at or above the new top, so a later
+-        // `arena_alloc` cannot hand out memory that now belongs to the draft's compute view.
++        // The arena gave the range up: drop every free run at or above the new ceiling, so a later
++        // `arena_alloc` cannot hand out memory that now belongs to the auxiliary compute view.
+         for (auto it = s.arena_free.begin(); it != s.arena_free.end(); ) {
+             const size_t lo = it->first;
+             const size_t hi = lo + it->second;
+@@ -1110,28 +1135,28 @@ static void ggml_cuda_slab_narrow2_commit_locked(int device, ggml_cuda_slab & s,
+     }
+     if (mapped_before < want) {
+         // [mapped_before, want) is reserved VA with no physical behind it -- either the whole region (the
+-        // arena never mapped up there) or its tail above the arena's mapped extent.  Map it, so the VA
+-        // the draft's compute buffer occupies is ACTUALLY PRESENT for the whole region.
++        // arena never mapped up there) or its tail above the arena's mapped extent.  Map it, so the VA the
++        // auxiliary compute buffer occupies is ACTUALLY PRESENT for the whole region.
+         const size_t map_off = mapped_before > off ? mapped_before : off;
+         const size_t map_len = want - map_off;
+         ggml_cuda_set_device(device);
+         uint32_t granted = 0;
+         if (!ggml_cuda_vmm_map_phys(device, (CUdeviceptr) ((uintptr_t) s.base + map_off), map_len, &granted)) {
+-            GGML_LOG_WARN("%s: device %d: could not map the %.2f GiB of the %.2f GiB narrow-2 region at "
+-                          "[%.2f, %.2f) GiB; the draft compute buffer stays on the cudaMalloc path\n",
+-                          __func__, device, (double) map_len / (1ull << 30), (double) nf2 / (1ull << 30),
++            GGML_LOG_WARN("%s: device %d: could not map the %.2f GiB of the %.2f GiB aux narrow-%d region at "
++                          "[%.2f, %.2f) GiB; the auxiliary compute buffer stays on the cudaMalloc path\n",
++                          __func__, device, (double) map_len / (1ull << 30), (double) nf2 / (1ull << 30), slot + 2,
+                           (double) map_off / (1ull << 30), (double) want / (1ull << 30));
+             return;
+         }
+         s.peer_mask &= granted;
+         s.mapped     = want;
+     }
+-    s.narrow2_floor = nf2;
+-    s.narrow2_off   = off;
+-    GGML_LOG_WARN("%s: device %d: narrow-2 (draft compute) pinned at [%.2f, %.2f] GiB "
++    r.floor = nf2;
++    r.off   = off;
++    GGML_LOG_WARN("%s: device %d: aux narrow-%d (%s compute) pinned at [%.2f, %.2f] GiB "
+                   "(%.2f GiB, %s); the arena now tops out at %.2f GiB\n",
+-                  __func__, device, (double) off / (1ull << 30), (double) s.size / (1ull << 30),
+-                  (double) nf2 / (1ull << 30),
++                  __func__, device, slot + 2, slot == 0 ? "draft" : "borrowing-context",
++                  (double) off / (1ull << 30), (double) s.size / (1ull << 30), (double) nf2 / (1ull << 30),
+                   off >= mapped_before ? "unmapped VA spare"
+                                        : off + nf2 <= mapped_before ? "taken from the arena (tables evicted)"
+                                                                    : "taken from the arena (tables evicted) "
+@@ -1139,9 +1164,9 @@ static void ggml_cuda_slab_narrow2_commit_locked(int device, ggml_cuda_slab & s,
+                   (double) (ggml_cuda_slab_arena_top(s) - s.boundary) / (1ull << 30));
+ }
+ 
+-// The draft context's narrow-2 compute allocation.  Runs OUTSIDE `g_slab_mutex` because pinning may have to
++// An aux context's narrow compute allocation.  Runs OUTSIDE `g_slab_mutex` because pinning may have to
+ // evict arena tables first (that callback re-enters the slab).
+-static void * ggml_cuda_slab_narrow2_alloc(int device, size_t need) {
++static void * ggml_cuda_slab_aux_alloc(int device, int slot, size_t need) {
+     size_t off = 0;
+     bool   evict = false;
+     {
+@@ -1155,17 +1180,7 @@ static void * ggml_cuda_slab_narrow2_alloc(int device, size_t need) {
+                 return nullptr;
+             }
+         }
+-        // narrow-2 is ONE region: two simultaneous draft views would alias each other exactly as the
+-        // pre-fix defect did at base 0.  The MTP draft's buffers are sequential (the construction
+-        // reserve is released before the live verify buffer), but fall back to cudaMalloc rather than
+-        // alias if that ever changes.
+-        if (s.narrow2_live > 0) {
+-            GGML_LOG_WARN("%s: device %d: a narrow-2 view is already live (need %.2f MiB); falling back "
+-                          "to cudaMalloc to avoid an alias\n",
+-                          __func__, device, (double) need / (1ull << 20));
+-            return nullptr;
+-        }
+-        off = ggml_cuda_slab_narrow2_pin_locked(device, s, need, &evict);
++        off = ggml_cuda_slab_aux_pin_locked(device, s, slot, need, &evict);
+     }
+     if (off == 0) {
+         return nullptr;
+@@ -1176,7 +1191,7 @@ static void * ggml_cuda_slab_narrow2_alloc(int device, size_t need) {
+             std::lock_guard<std::mutex> lock(g_slab_mutex);
+             ggml_cuda_slab & s = g_slabs[device];
+             base = (size_t) s.base;
+-            top  = s.mapped;
++            top  = (size_t) s.mapped;
+         }
+         moe_cache_evict_slab_range(device, (void *) (uintptr_t) (base + off),
+                                           (void *) (uintptr_t) (base + top));
+@@ -1185,24 +1200,29 @@ static void * ggml_cuda_slab_narrow2_alloc(int device, size_t need) {
+     {
+         std::lock_guard<std::mutex> lock(g_slab_mutex);
+         ggml_cuda_slab & s = g_slabs[device];
+-        ggml_cuda_slab_narrow2_commit_locked(device, s, need);
+-        if (s.narrow2_floor != 0 && ggml_cuda_slab_up(need, s.chunk) <= s.narrow2_floor) {
+-            s.narrow2_live++;
+-            ret = (void *) (uintptr_t) ((char *) s.base + s.narrow2_off);
++        ggml_cuda_slab_aux_commit_locked(device, s, slot, off, need);
++        ggml_cuda_slab::aux_region & r = s.narrow2[slot];
++        // A live view at this slot is the graph allocator's REPLACEMENT pattern (it allocates the new
++        // buffer before freeing the one it replaces -- the same overlap base 0 has always allowed), so the
++        // count is a multiset, not a claim of mutual exclusion: a DIFFERENT context cannot reach this slot
++        // (the slot is chosen from the allocating context's own identity, never from "the next free one").
++        if (r.floor != 0 && ggml_cuda_slab_up(need, s.chunk) <= r.floor) {
++            r.live++;
++            ret = (void *) (uintptr_t) ((char *) s.base + r.off);
+             if (ggml_cuda_work_alloc_debug()) {
+-                GGML_LOG_WARN("NARROW2_ALLOC dev=%d need=%.1f MiB off=%.1f MiB live=%d\n",
+-                    device, (double) need/1048576.0, (double) s.narrow2_off/1048576.0, s.narrow2_live);
++                GGML_LOG_WARN("AUX_ALLOC dev=%d slot=%d need=%.1f MiB off=%.1f MiB live=%d\n",
++                    device, slot, (double) need/1048576.0, (double) r.off/1048576.0, r.live);
+             }
+         }
+     }
+     return ret;
+ }
+ 
+-// Public form: pin narrow-2 from a known (worst-case) narrow size.  Called by the draft context after its
++// Public form: pin an aux region from a known (worst-case) narrow size.  Called by the context after its
+ // reserve so the region covers the widest layout the scheduler reserved, not just the first graph.
+-void ggml_cuda_slab_narrow2_floor(int device, size_t bytes) {
+-    // Same placement decision as the allocation path, but never grows/evicts for a live view: if the
+-    // region is not pinned yet this pins it from the measured size.
++void ggml_cuda_slab_aux_floor(int device, int slot, size_t bytes) {
++    // Same placement decision as the allocation path, but never grows for a live view: if the region is
++    // not pinned yet this pins it from the measured size.
+     size_t off = 0;
+     bool   evict = false;
+     {
+@@ -1211,7 +1231,7 @@ void ggml_cuda_slab_narrow2_floor(int device, size_t bytes) {
+         if (!s.inited) {
+             return;
+         }
+-        off = ggml_cuda_slab_narrow2_pin_locked(device, s, bytes, &evict);
++        off = ggml_cuda_slab_aux_pin_locked(device, s, slot, bytes, &evict);
+     }
+     if (off == 0) {
+         return;
+@@ -1222,13 +1242,13 @@ void ggml_cuda_slab_narrow2_floor(int device, size_t bytes) {
+             std::lock_guard<std::mutex> lock(g_slab_mutex);
+             ggml_cuda_slab & s = g_slabs[device];
+             base = (size_t) s.base;
+-            top  = s.mapped;
++            top  = (size_t) s.mapped;
+         }
+         moe_cache_evict_slab_range(device, (void *) (uintptr_t) (base + off),
+                                           (void *) (uintptr_t) (base + top));
+     }
+     std::lock_guard<std::mutex> lock(g_slab_mutex);
+-    ggml_cuda_slab_narrow2_commit_locked(device, g_slabs[device], bytes);
++    ggml_cuda_slab_aux_commit_locked(device, g_slabs[device], slot, off, bytes);
+ }
+ 
+ // This is a MULTISET, not a flag: more than one compute buffer is live at a time (the main context and the
+@@ -1241,17 +1261,19 @@ void ggml_cuda_slab_work_release(int device, size_t off, size_t need) {
+     if (!s.inited) {
+         return;
+     }
+-    // wip/moe-verify-fusions: a narrow-2 view owns no boundary/arena contribution -- the region is pinned
+-    // at the top of the reserved VA and never enters `work_needs`.
+-    if (s.narrow2_floor > 0 && off == s.narrow2_off) {
+-        if (s.narrow2_live > 0) {
+-            s.narrow2_live--;
+-        }
+-        if (ggml_cuda_work_alloc_debug()) {
+-            GGML_LOG_WARN("NARROW2_RELEASE dev=%d need=%.1f MiB off=%.1f MiB live=%d\n",
+-                device, (double) need/1048576.0, (double) off/1048576.0, s.narrow2_live);
++    // wip/moe-verify-fusions / prefill-decode-arms v2: an AUX narrow view owns no boundary/arena
++    // contribution -- its region is pinned above the arena ceiling and never enters `work_needs`.
++    for (auto & r : s.narrow2) {
++        if (r.floor > 0 && off == r.off) {
++            if (r.live > 0) {
++                r.live--;
++            }
++            if (ggml_cuda_work_alloc_debug()) {
++                GGML_LOG_WARN("AUX_RELEASE dev=%d need=%.1f MiB off=%.1f MiB live=%d\n",
++                    device, (double) need/1048576.0, (double) off/1048576.0, r.live);
++            }
++            return;
+         }
+-        return;
+     }
+     // Remove this view's boundary contribution (`off + up(need)`), the same value `work_alloc` inserted.
+     const size_t contrib = off + ggml_cuda_slab_up(need, s.chunk);
+@@ -1277,10 +1299,11 @@ void ggml_cuda_slab_work_release(int device, size_t off, size_t need) {
+ // when the wide view is dropped.  The ring is never part of the arena, so arming it is an ordinary
+ // boundary move (evicting the COLDEST tables), not an independent arena eviction.
+ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+-    if (g_slab_compute_narrow2) {
+-        // the draft context's compute buffers: a pinned region of their own (may evict arena tables, so it
+-        // runs outside the lock below)
+-        return ggml_cuda_slab_narrow2_alloc(device, need);
++    if (g_slab_compute_aux != 0) {
++        // an AUX context's compute buffers (the MTP draft's, or a context that BORROWS another context's
++        // memory: the two-arm server's decode arm) get a pinned region of their own, so they cannot alias
++        // the target's narrow view at base 0 (may evict arena tables, so it runs outside the lock below)
++        return ggml_cuda_slab_aux_alloc(device, g_slab_compute_aux - 1, need);
+     }
+     size_t lo = 0, hi = 0;
+     bool   move = false;
+@@ -1401,13 +1424,13 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+             s.wide_aux_gen++;
+         }
+         base    = s.base;
+-        // wip/moe-verify-fusions: never grow the work pool into a pinned narrow-2 region (the draft's
++        // wip/moe-verify-fusions: never grow the work pool into a pinned AUX region (an extra context's
+         // compute VA).  A request that does not fit falls back to cudaMalloc rather than corrupt it.
+         if (target > ggml_cuda_slab_arena_limit(s)) {
+             GGML_LOG_WARN("%s: device %d: work request %.2f MiB (target %.2f GiB) does not fit below the "
+-                          "pinned narrow-2 region at %.2f GiB; falling back to cudaMalloc\n",
++                          "pinned auxiliary narrow region at %.2f GiB; falling back to cudaMalloc\n",
+                           __func__, device, (double) need / (1ull << 20), (double) target / (1ull << 30),
+-                          (double) s.narrow2_off / (1ull << 30));
++                          (double) ggml_cuda_slab_arena_limit(s) / (1ull << 30));
+             return nullptr;
+         }
+         if (target <= s.boundary) {
+@@ -1612,7 +1635,10 @@ static void ggml_cuda_slab_log_stats_locked(int device, const char * tag) {
+     const size_t arena        = s.mapped > s.boundary ? s.mapped - s.boundary : 0;
+     const size_t narrow_floor = s.narrow_floor;
+     const size_t ring         = s.ring_region;
+-    const size_t narrow2      = s.narrow2_floor;
++    size_t narrow2 = 0;
++    for (const auto & r : s.narrow2) {
++        narrow2 += r.floor;
++    }
+     const size_t aux          = s.wide_aux_size;
+     const bool   inited       = s.inited;
+     size_t free_b = 0, total_b = 0;
+@@ -1956,7 +1982,7 @@ void ggml_cuda_slab_ring_set(int device, bool arm) {
+ }
+ 
+ // --- Phase-2 (item 6b): state accessors for the device wrappers kept in ggml-cuda.cu ---
+-// `g_slab_armed` / `g_slab_compute_enabled` / `g_slab_compute_narrow2` are module-local to the slab.
++// `g_slab_armed` / `g_slab_compute_enabled` / `g_slab_compute_aux` are module-local to the slab.
+ void ggml_cuda_slab_arm() {
+     g_slab_armed = true;
+     // r165: this model offloads experts to host memory, so the large all-reduce arm is RCCL's ring
+@@ -1996,15 +2022,16 @@ bool ggml_cuda_slab_compute_plain() {
+     return g_slab_compute_plain;
+ }
+ 
+-void ggml_cuda_slab_set_compute_narrow2(bool enable) {
+-    if (enable && !ggml_cuda_slab_narrow2_enabled()) {
++void ggml_cuda_slab_set_compute_aux(int slot) {
++    if (slot < 0 || slot > ggml_cuda_slab::N_AUX) {
++        slot = 0;
++    }
++    if (slot != 0 && !ggml_cuda_slab_narrow2_enabled()) {
++        // the A/B arm (GGML_CUDA_SLAB_NARROW2=0): an aux context's compute buffers bypass the slab
+         g_slab_compute_enabled = false;
+-        g_slab_compute_narrow2 = false;
+-    } else if (enable) {
+-        g_slab_compute_enabled = true;
+-        g_slab_compute_narrow2 = true;
++        g_slab_compute_aux     = 0;
+     } else {
+         g_slab_compute_enabled = true;
+-        g_slab_compute_narrow2 = false;
++        g_slab_compute_aux     = slot;
+     }
+ }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm.h b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+index d66ddd3ac..4095cac16 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm.h
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+@@ -79,9 +79,10 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need);
+ // A work-region view was dropped; the next, smaller work need may shrink the boundary and hand the slack
+ // back to the arena.
+ void   ggml_cuda_slab_work_release(int device, size_t off, size_t need);
+-// wip/moe-verify-fusions (narrow-2): pin (idempotently) the MTP draft's COMPUTE region at the top of the
+-// slab's reserved VA from a known narrow size.  No-op when the slab is not live.
+-void   ggml_cuda_slab_narrow2_floor(int device, size_t bytes);
++// wip/moe-verify-fusions (narrow-2) / prefill-decode-arms v2: pin (idempotently) the auxiliary COMPUTE
++// region of `slot` at the top of the slab's reserved VA from a known narrow size (slot 1 = a draft context,
++// slot 2 = a context that borrows another context's memory).  No-op when the slab is not live.
++void   ggml_cuda_slab_aux_floor(int device, int slot, size_t bytes);
+ // Chunk-aligned arena allocation from `[boundary, size)`; nullptr when the arena region is full.
+ void * ggml_cuda_slab_arena_alloc(int device, size_t size);
+ // Serve a large TRANSIENT from the slab's reserved, NON-EVICTABLE ring hole (a fixed region at the top of
+@@ -146,7 +147,7 @@ void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
+ void   ggml_cuda_slab_arm();
+ void   ggml_cuda_slab_disarm();
+ bool   ggml_cuda_slab_compute_enabled();
+-void   ggml_cuda_slab_set_compute_narrow2(bool enable);
++void   ggml_cuda_slab_set_compute_aux(int slot);
+ void   ggml_cuda_slab_set_compute_plain(bool enable);
+ bool   ggml_cuda_slab_compute_plain();
+ size_t ggml_cuda_slab_headroom_bytes();
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 65c35a084..e4fbe2dac 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -12359,19 +12359,21 @@ static void ggml_backend_cuda_device_slab_reserve_wide(ggml_backend_dev_t dev, s
+     ggml_cuda_slab_reserve_wide(ctx->device, bytes);
+ }
+ 
+-static void ggml_backend_cuda_device_slab_narrow2_floor(ggml_backend_dev_t dev, size_t bytes) {
+-    // wip/moe-verify-fusions (narrow-2): pin (idempotently) the MTP draft's compute region from its
+-    // measured narrow size.  No-op when the slab is not live on this device.
++static void ggml_backend_cuda_device_slab_aux_floor(ggml_backend_dev_t dev, int slot, size_t bytes) {
++    // wip/moe-verify-fusions (narrow-2) / prefill-decode-arms v2: pin (idempotently) an auxiliary
++    // context's compute region from its measured narrow size.  No-op when the slab is not live.
+     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+-    ggml_cuda_slab_narrow2_floor(ctx->device, bytes);
++    ggml_cuda_slab_aux_floor(ctx->device, slot, bytes);
+ }
+ 
+-static void ggml_backend_cuda_device_slab_compute_narrow2(ggml_backend_dev_t dev, bool enable) {
+-    // wip/moe-verify-fusions (narrow-2): `enable` marks the MTP draft context's COMPUTE allocations.
+-    // Default: route them to the slab's pinned second narrow region.  `GGML_CUDA_SLAB_NARROW2=0` is the
+-    // A/B arm -- the draft bypasses the slab entirely (raw cudaMalloc), the session's quick fix.
++static void ggml_backend_cuda_device_slab_compute_aux(ggml_backend_dev_t dev, int slot) {
++    // wip/moe-verify-fusions (narrow-2) / prefill-decode-arms v2: `slot` marks the COMPUTE allocations of
++    // an auxiliary context (1 = the MTP draft, 2 = a context that borrows another context's memory: the
++    // two-arm server's decode arm) so they land in their OWN pinned narrow region.  `slot` is written to
++    // a thread-local, not a process-wide flag: the arms reserve on two threads.  `GGML_CUDA_SLAB_NARROW2=0`
++    // is the A/B arm -- such a context bypasses the slab entirely (raw cudaMalloc).
+     GGML_UNUSED(dev);
+-    ggml_cuda_slab_set_compute_narrow2(enable);
++    ggml_cuda_slab_set_compute_aux(slot);
+ }
+ 
+ static void ggml_backend_cuda_device_slab_compute_plain(ggml_backend_dev_t dev, bool enable) {
+@@ -12404,8 +12406,8 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+     /* .slab_ring_set           = */ ggml_backend_cuda_device_slab_ring_set,
+     /* .slab_narrow_floor       = */ ggml_backend_cuda_device_slab_narrow_floor,
+     /* .slab_reserve_wide       = */ ggml_backend_cuda_device_slab_reserve_wide,
+-    /* .slab_narrow2_floor      = */ ggml_backend_cuda_device_slab_narrow2_floor,
+-    /* .slab_compute_narrow2    = */ ggml_backend_cuda_device_slab_compute_narrow2,
++    /* .slab_aux_floor          = */ ggml_backend_cuda_device_slab_aux_floor,
++    /* .slab_compute_aux        = */ ggml_backend_cuda_device_slab_compute_aux,
+     /* .moe_cache_set_host_pool   = */ ggml_backend_cuda_device_moe_cache_set_host_pool,
+     /* .moe_cache_set_host_source = */ ggml_backend_cuda_device_moe_cache_set_host_source,
+     /* .slab_compute_plain        = */ ggml_backend_cuda_device_slab_compute_plain,
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 13c3ed786..938939d3b 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -3201,8 +3201,8 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
+     /* .slab_ring_set        = */ nullptr,
+     /* .slab_narrow_floor    = */ nullptr,
+     /* .slab_reserve_wide    = */ nullptr,
+-    /* .slab_narrow2_floor   = */ nullptr,
+-    /* .slab_compute_narrow2 = */ nullptr,
++    /* .slab_aux_floor       = */ nullptr,
++    /* .slab_compute_aux     = */ nullptr,
+     /* .moe_cache_set_host_pool   = */ nullptr,
+     /* .moe_cache_set_host_source = */ nullptr,
+     /* .slab_compute_plain   = */ nullptr,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 519436f18..a9eb27816 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1923,7 +1923,8 @@ void llama_context::sched_reserve() {
+     // from its measured compute size.  The region is established lazily on the draft's first allocation
+     // (its widest reserve); this keeps the pin at least as large as that layout.  A no-op for the target
+     // and when the slab is not live on a device.
+-    if (cparams.ctx_other != nullptr && !model.no_alloc()) {
++    const int slab_aux = slab_aux_slot();
++    if (slab_aux != 0 && !model.no_alloc()) {
+         size_t narrow2_bytes = 0;
+         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+             if (backend_buf_exp_size[i] > narrow2_bytes) {
+@@ -1932,7 +1933,7 @@ void llama_context::sched_reserve() {
+         }
+         if (narrow2_bytes > 0) {
+             for (const auto & d : model.devices) {
+-                ggml_backend_dev_slab_narrow2_floor(d.dev, narrow2_bytes);
++                ggml_backend_dev_slab_aux_floor(d.dev, slab_aux, narrow2_bytes);
+             }
+         }
+     }
+@@ -3234,17 +3235,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         // slab's pinned narrow-2 region (the reserve-time toggle in `graph_reserve` does not cover the
+         // first `alloc_graph`).
+         const bool is_draft = cparams.ctx_other != nullptr;
+-        if (is_draft) {
++        const int  slab_aux = slab_aux_slot();
++        if (slab_aux != 0) {
+             for (const auto & d : model.devices) {
+-                ggml_backend_dev_slab_compute_narrow2(d.dev, true);
+-                // the second scheduler's small buffer is never served by the slab (narrow-2 holds one view)
+-                ggml_backend_dev_slab_compute_plain(d.dev, sched_alt_in_use);
++                ggml_backend_dev_slab_compute_aux(d.dev, slab_aux);
++                // the second scheduler's small buffer is never served by the slab (an aux region holds one view)
++                ggml_backend_dev_slab_compute_plain(d.dev, is_draft && sched_alt_in_use);
+             }
+         }
+         const bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
+-        if (is_draft) {
++        if (slab_aux != 0) {
+             for (const auto & d : model.devices) {
+-                ggml_backend_dev_slab_compute_narrow2(d.dev, false);
++                ggml_backend_dev_slab_compute_aux(d.dev, 0);
+                 ggml_backend_dev_slab_compute_plain(d.dev, false);
+             }
+         }
+@@ -4663,26 +4665,29 @@ ggml_cgraph * llama_context::graph_reserve(
+             ggml_backend_sched_split_graph(sched.get(), gf);
+         }
+     } else {
+-        // wip/moe-verify-fusions (narrow-2): the MTP draft context (identified by `ctx_other`, set for
+-        // every speculative draft context) routes its COMPUTE buffer to the slab's pinned narrow-2 region
+-        // at the top of the reserved VA.  The slab used to hand a single narrow base to every narrow view,
+-        // so the draft's buffer aliased the target's narrow verify buffer at base 0 (the MTP-vs-plain
+-        // near-tie drift).  `GGML_CUDA_SLAB_NARROW2=0` is the A/B arm (the draft bypasses the slab).
++        // wip/moe-verify-fusions (narrow-2) / prefill-decode-arms v2: an AUXILIARY context -- an MTP draft
++        // (`ctx_other`) or a context that BORROWS another context's memory (`ctx_memory`: the two-arm
++        // server's decode arm) -- routes its COMPUTE buffer to a pinned region of its own at the top of the
++        // reserved VA.  The slab used to hand a single narrow base to every narrow view, so each extra
++        // context's buffer aliased the target's narrow verify buffer at base 0 (the MTP-vs-plain near-tie
++        // drift; and, for the pair on a host-expert shape, an HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION).
++        // `GGML_CUDA_SLAB_NARROW2=0` is the A/B arm (such a context bypasses the slab).
+         const bool is_draft = cparams.ctx_other != nullptr;
++        const int  slab_aux = slab_aux_slot();
+         // read once: this runs on every reserve; getenv() is expensive on Windows
+         static const bool work_alloc_debug = getenv("GGML_CUDA_WORK_ALLOC_DEBUG") != nullptr;
+         if (work_alloc_debug) {
+             LLAMA_LOG_WARN("GRAPH_RESERVE ctx=%p is_draft=%d n_tokens=%u\n", (void *) this, (int) is_draft, n_tokens);
+         }
+-        if (is_draft) {
++        if (slab_aux != 0) {
+             for (const auto & d : model.devices) {
+-                ggml_backend_dev_slab_compute_narrow2(d.dev, true);
++                ggml_backend_dev_slab_compute_aux(d.dev, slab_aux);
+             }
+         }
+         const bool reserved = ggml_backend_sched_reserve(sched.get(), gf);
+-        if (is_draft) {
++        if (slab_aux != 0) {
+             for (const auto & d : model.devices) {
+-                ggml_backend_dev_slab_compute_narrow2(d.dev, false);
++                ggml_backend_dev_slab_compute_aux(d.dev, 0);
+             }
+         }
+         if (!reserved) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 3d72332e2..0d0cff184 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -425,6 +425,18 @@ private:
+     llama_memory_ptr memory_own;
+     llama_memory_t   memory = nullptr;
+     bool             memory_borrowed = false;
++
++    // wip/moe-verify-fusions (narrow-2) / prefill-decode-arms v2: which pinned AUXILIARY narrow compute
++    // region THIS context's COMPUTE buffers belong to -- 0 = none (the target's own views), 1 = an MTP
++    // draft context, 2 = a context that BORROWS another context's memory (the two-arm server's decode arm,
++    // `llama_context_params::ctx_memory`).  Derived from this context's own identity and handed to the slab
++    // as a THREAD-LOCAL: an extra context must never share the target's narrow work view at base 0, and a
++    // process-wide flag is wrong as soon as two arms reserve on two threads.
++    int slab_aux_slot() const {
++        if (cparams.ctx_other != nullptr) { return 1; }
++        if (memory_borrowed)              { return 2; }
++        return 0;
++    }
+     llama_moe_cache_ptr moe_cache;
+ 
+     // decode output (2-dimensional array: [n_outputs][n_vocab])

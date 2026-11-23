@@ -8,6 +8,88 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — STEP 7a (= TASK 1): the host-tier fault is the SLAB WORK ALIAS, and each extra context gets its own pinned region (`WORKLOG.md` 261123.017)
+
+12 files (+263/-227): `ggml-cuda-slab.cu` (the aux-region stack), the three iface/API renames, `llama-context.{h,cpp}`
+(the per-context slot), and the `-ncmoe` refusal removed from `common/common.cpp`.
+
+### The defect (root-caused, not the MoE remap)
+
+`GGML_CUDA_WORK_ALLOC_DEBUG=1` on the faulting shape shows **two live compute buffers at the same slab work
+base**:
+
+```
+0.07.583 W WORK_ALLOC dev=0 need=1280.0 MiB narrow=1 ret_off=0.0 MiB ...            <- the PREFILL arm's view
+0.07.586 W WORK_RELEASE dev=0 off=0.0 MiB need=910.8 MiB                            <- its old (smaller) view
+0.07.589 W WORK_ALLOC dev=0 need=1280.0 MiB narrow=1 ret_off=0.0 MiB ...            <- the DECODE arm's view, SAME base
+0.08.683 W WORK_ALLOC dev=0 need=1280.0 MiB narrow=1 ret_off=0.0 MiB ...            <- the prefill arm re-takes base 0
+0.08.686 HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION in rms_norm_mul_rope_f32_qk_pair / _f32 (the K rope's
+         SET_ROWS: its I64 row-index tensor is one of the aliased activations)
+```
+
+Two contexts whose compute buffers are the SAME memory: one arm's prefill writes the other arm's
+activations, and the K rope then writes KV rows at a garbage index.  The slab's work allocator has exactly one
+"narrow" base (offset 0) and assumed a single live narrow view per device; the MTP draft had the same defect
+and got the `narrow2` region for it (its own comment: "without this they both aliased at base 0"), so this is
+that defect returning for a *third* context.  **The MoE expert remap is NOT involved** -- the arena evictions in
+the log are the boundary moves of a second view, not the cause.
+
+### The rungs that refuted the old hypothesis (cheap to re-run)
+
+| rung | env | result |
+|---|---|---|
+| 0 repro | — | FAULT at ~9 s: `rms_norm_mul_rope_f32_qk_pair<false,float,__half,0,0>` (the **plain** pair) |
+| 1 Q/K deferral off | `GGML_CUDA_ROPE_QK_PAIR=0 GGML_CUDA_QK_PAIR_FWHT=0` | **still FAULTS**, now in the *unfused* `rms_norm_mul_rope_f32<256,false,__half,0,0,...>` — the deferral is not the mechanism (and `GGML_CUDA_QK_PAIR_FWHT` alone would not have disabled this instantiation: `fwht_n=0`) |
+| 2 aux routing, process-wide flag | temp `is_draft \| memory_borrowed` | server aborted at load: the **prefill** arm inherited the decode arm's flag, was routed into the aux region, found it live, fell back to `cudaMalloc` (1280 MiB OOM).  A second, real defect: the routing flag was process-wide while the arms reserve on two threads |
+| 3 the fix | — | **PASS** (below) |
+
+### The fix
+
+* the `narrow2` region becomes a **stack of N=2 pinned aux regions** at the top of the reserved VA
+  (slot 0 = a draft context, slot 1 = a context that BORROWS another context's memory), the arena ceiling is
+  the lowest pinned offset, and the commit takes the pinned offset as an argument (it must not be recomputed:
+  the pin releases the lock to evict, so another context may pin in that window);
+* the routing is a **thread_local slot derived from the allocating context's own identity**
+  (`slab_aux_slot()`: `ctx_other` -> 1, `memory_borrowed` -> 2), not a process-wide flag — the same pattern as
+  STEP 4's Meta view slot;
+* `GGML_CUDA_SLAB_NARROW2=0` still bypasses the slab for such a context (unchanged A/B arm).
+
+### Green, with the number
+
+| arm | shape | result |
+|---|---|---|
+| host-tier soak, pair ON | 35B-A3B Q8_0 `-ncmoe 40`, 1 GPU, np 4, 20 rounds, 80 requests | **PASS**: 0 errors, 15 steps / 3 handovers / widest batch 3, `aux narrow-3 (borrowing-context compute) pinned at [26.31, 27.56] GiB`, journal clean, **wall 28 s** (the faulting runs took 371-382 s) |
+| the same, pair OFF (the control) | same shape | **PASS**, 80 requests, 0 errors, no aux region pinned (inert) |
+| the same, pair OFF, `-ncmoe` REMOVED from the refusal | — | the refusal is gone; the predicate no longer names the shape |
+| 4B soak, pair ON | 4B Q8_0, 4 slots, 20 rounds | **PASS**: 15 steps / 4 handovers / widest batch **4** (the slab is not armed here, so the aux path is a no-op) |
+| `gate-arms-n1-memory.sh` | 4B, 2 slots, 1 request in flight | **PASS**: ONE memory, text byte-identical (`01c9cbe2e895` / `5e69982c7d94` both arms), 31 steps, 0 of 8192 cells reserved |
+| `gate-arms-itl.sh` | 4B, 5246-token prefill beside 64 decoded tokens, `-ub 2048` | **PASS**: same text `36216e77db27`; **20.37 -> 15.04 ms/token (-26 %)**, prefill **4908 -> 6141 t/s (+25 %)** |
+| A1 / A2 / A3 (inertness) | 4B / 27B-3GPU-tensor / 35B-A3B host | **unchanged**: `be904e86f248`, `10a82b5559a9`, `e9db5cb8db0b` |
+| A4 prefill-logit | 27B Q8_0, default point | **KLD 0.000000 / same-top-p 100.000 %**, clean |
+| A5, K axis, `--spec adaptive` | 27B-3GPU-tensor | **anchor reproduced**: `a87c4318b649`, 151.4 t/s, acc 0.98649/0.97241, pos-1 0.986 |
+| A6 startup shape | 4B, 2 slots `--kv-unified` | **13 lines byte-identical** to `baseline/A6-startup-shape.txt`; responses `{7bd542418112, 6ce1f88dd5f7}` |
+| `scripts/check-shlib-symbols.sh` | the `all` build | **OK** (16 libs, all symbols resolved) — the iface rename is consistent across cuda/cpu/rpc/meta |
+
+### Two harness notes
+
+* the multislot gate now takes `ARMS=` (default `--prefill-decode-arms`) so the **pair-OFF control** runs the
+  same soak on the same shape, and it FAILS if the slab is armed and the decode arm did **not** get a pinned
+  region (the non-vacuity check for this fix);
+* "empty completion" in that gate counts `content` only: a reasoning model that emits 16 thinking tokens
+  returns `reasoning_content` and an empty `content` (measured: pair ON 13-16 empty, pair OFF 20 empty, same
+  shape, all on slot 0 = `reasoning.txt`).  Not a pair property, and not a failure.
+
+### Not covered here (recorded as a gap)
+
+The **draft** slot (0) was not exercised on a slab-armed shape: an embedded-MTP arm (`--spec-type
+draft-mtp-adaptive`) allocates no second compute buffer, and a `--spec-type draft-dflash2` arm on the 35B-A3B
+host tier ran (`none` == `draft-dflash2` at 1961/1839 chars, but the *text* is not run-stable there: two
+builds x two arms gave two different hashes per arm at identical lengths — the host tier's expert residency
+picks the kernel set, `GREEDY-PURITY.md` §89).  Slot 0's code path is identical to slot 1's (it ran), but its
+*routing* (`ctx_other` -> slot 1) needs an external-head/assistant arm with `-ncmoe` to be called green.
+
+---
+
 ## 2026-11-23 — STEP 6e: reserve, census, and the three gates (`WORKLOG.md` 261123.016)
 
 2 files in the tree (+52/-3) plus three gate scripts.

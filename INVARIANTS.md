@@ -2665,7 +2665,9 @@ delivery revision that eventually carries the change, if it is promoted, is the 
 
 *No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 6e, nothing in `patches/` changed.
 
-1. **The two arms may NOT overlap when the prefill arm's step remaps process-wide device state.**  A 4-slot soak
+1. **(CORRECTED at r364-wip: the mechanism is a slab work-base alias, not the remap -- see r364-wip item 1 and
+   `WORKLOG.md` 261123.017.  The refusal this item introduced has been removed.)**  **The two arms may NOT
+   overlap when the prefill arm's step remaps process-wide device state.**  A 4-slot soak
    of the pair on 35B-A3B Q8_0 `-ncmoe 40` (host expert tier) faulted the GPU
    (`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` in `rms_norm_mul_rope_f32_qk_pair`) and aborted the server: the
    prefill arm's step remaps the MoE expert tables while the decode arm reads them.  The barrier deliberately
@@ -2687,3 +2689,39 @@ delivery revision that eventually carries the change, if it is promoted, is the 
    multislot.sh` asserts survival, completion, the ownership census and the widest batch; the byte claims live in
    `gate-arms-n1-memory.sh` (one request in flight) and `gate-arms-itl.sh` (a fixed pair of requests).  A gate
    that quietly compared hashes across a concurrent arm would fail for reasons unrelated to its subject.
+
+## r364-wip (2026-11-23, `WORKLOG.md` 261123.017) -- two live compute buffers must never share a slab work base, and a per-context routing flag must be per-thread (`prefill-decode-arms` v2 STEP 7a)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 7a; nothing in `patches/` changed.  This corrects
+r363-wip item 1, whose diagnosis was wrong.
+
+1. **Two contexts' COMPUTE buffers must never be given the same slab work base.**  `ggml_cuda_slab_work_alloc()`
+   has one "narrow" (decode/verify) base at offset 0 and assumed ONE live narrow view per device.  A second
+   `llama_context` keeps its own persistent compute buffer, so the pair's decode arm landed on the prefill arm's
+   1280 MiB view; one arm's prefill overwrote the other's activations and the K rope wrote KV rows at a garbage
+   index.  Measured (35B-A3B Q8_0 `-ncmoe 40`, np 4, `GGML_CUDA_WORK_ALLOC_DEBUG=1`): `WORK_ALLOC ... narrow=1
+   ret_off=0.0 MiB` twice, 3 ms before `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` in
+   `rms_norm_mul_rope_f32_qk_pair`.  The delivery already fixed this class once for the MTP draft (the
+   `narrow2` top region; its comment: "without this they both aliased at base 0"); the rule is now:
+   **one pinned auxiliary region per extra context, stacked downward from the top of the VA, with the arena
+   ceiling at the lowest pinned offset** (`DESIGN.md` I9).
+2. **A "which context is allocating" flag must be per-thread, not process-wide.**  `g_slab_compute_narrow2`
+   was a global set around a reserve; with two arms reserving on two threads the prefill arm inherited the
+   decode arm's flag, was routed into the aux region, found a live view, fell back to `cudaMalloc` and failed
+   the graph reserve (1280 MiB OOM) 1.3 s into the soak.  It is now a `thread_local` slot derived from the
+   allocating context's own identity (`ctx_other` -> draft, `memory_borrowed` -> borrowing context).  Same
+   pattern as r355-wip's per-context Meta view slot, and it removes the same hazard from the MTP path.
+3. **An aux region's pinned offset must be passed to its commit, not recomputed.**  The pin releases
+   `g_slab_mutex` to evict arena tables (the eviction re-enters the slab); recomputing the offset after
+   re-taking the lock can land on a different ceiling if another context pinned in that window, so the commit
+   validates the passed window against the other slots and declines instead of overlapping.
+4. **The fault was NOT the MoE expert remap.**  Rung 1 of the ladder (both Q/K deferral fusions off,
+   `GGML_CUDA_ROPE_QK_PAIR=0 GGML_CUDA_QK_PAIR_FWHT=0`) still faulted -- in the *unfused*
+   `rms_norm_mul_rope_f32<256,false,__half,0,0,false>` -- and the arena-eviction lines that suggested the remap
+   are the boundary moves of the second view.  Note also that `GGML_CUDA_QK_PAIR_FWHT=0` alone cannot disable
+   the `rms_norm_mul_rope_f32_qk_pair<...,0,0>` instantiation: `fwht_n=0` is the PLAIN pair, whose switch is
+   `GGML_CUDA_ROPE_QK_PAIR`.
+5. **A "grew past the reserve expectation" WARN at teardown is not a new finding.**  `~llama_context` prints
+   `compute buffer size ... does not match expectation` on the 4B `--concurrent` shape; it is present on the
+   pre-change build too (verified by stashing the change and re-running the A6 arm), so it must not be read as
+   a regression of this step.

@@ -20,6 +20,12 @@
 # flight) and gate-arms-itl.sh (a fixed pair of requests).
 #
 # USAGE: gate-arms-multislot.sh [--model FILE] [--rounds N] [--np N] [--extra "ARGS"] [--keep]
+#
+# ARMS selects the arm under test (default `--prefill-decode-arms`).  `ARMS="--prefill-decode-arms-mode off"`
+# runs the SAME soak as the pair-OFF control: the delivery's single-context server on the same shape, where
+# the two decode-arm census checks are SKIPped (there is no decode arm to carry a slot) and every other
+# check still applies.  A soak that only ever runs one arm cannot tell "the pair broke it" from "the shape
+# does that".
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 V2="$(cd "$HERE/.." && pwd)"
@@ -31,6 +37,7 @@ NP="${NP:-4}"
 CTX="${CTX:-16384}"
 NPRED="${NPRED:-16}"
 PORT="${PORT:-19700}"
+ARMS="${ARMS:---prefill-decode-arms}"
 OUT="${OUT:-$HOME/.cache/rdna-boosts/gates/arms-multislot}"
 BIN="${LLAMA_BIN:-$HOME/llama.cpp/build-rocm/bin}"
 mkdir -p "$OUT"
@@ -45,7 +52,7 @@ vram() { rocm-smi --showmeminfo vram 2>/dev/null | sed -n "s/.*GPU\\[0\\].*Used 
 
 # shellcheck disable=SC2086
 setsid "$BIN/llama-server" -m "$MODEL" --port "$PORT" --host 127.0.0.1 -np "$NP" -c "$CTX" \
-    --kv-unified -ngl 99 -t 16 --no-webui -lv 4 $EXTRA --prefill-decode-arms > "$LOG" 2>&1 &
+    --kv-unified -ngl 99 -t 16 --no-webui -lv 4 $EXTRA $ARMS > "$LOG" 2>&1 &
 SPID=$!
 # Resolve the SERVER pid itself (not just the job pid) and give it a real chance to run its teardown: the
 # reservation census and the decode-arm counters print from DESTRUCTORS, so a SIGKILL loses them.
@@ -68,7 +75,7 @@ for _ in $(seq 1 240); do
 done
 curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null || { echo "FAIL  never healthy"; tail -5 "$LOG"; exit 1; }
 [ -n "$SRV" ] || SRV="$(pgrep -n -f "llama-server.*--port $PORT" 2>/dev/null)"
-echo "==> multislot soak: $(basename "$MODEL") np=$NP ctx=$CTX rounds=$ROUNDS '${EXTRA}'"
+echo "==> multislot soak: $(basename "$MODEL") np=$NP ctx=$CTX rounds=$ROUNDS '${EXTRA}' arm='${ARMS}'"
 echo "    vram before $(vram) | rss before $(rss "$SPID") KiB"
 
 t0=$(date +%s)
@@ -118,14 +125,33 @@ echo "      census: ${census:-<absent>}"
 steps="$(sed -n 's/.*generating: \([0-9]*\) step.*/\1/p' <<<"$census")"
 hand="$(sed -n 's/.*, \([0-9]*\) handover.*/\1/p' <<<"$census")"
 wide="$(sed -n 's/.*widest batch \([0-9]*\).*/\1/p' <<<"$census")"
-hard "$([ -n "${steps:-}" ] && [ "${steps:-0}" -gt 0 ] && [ "${hand:-0}" -gt 0 ] && echo 1 || echo 0)" \
-    "the decode arm carried slots (steps=$steps handovers=$hand)"
-hard "$([ -n "${wide:-}" ] && [ "${wide:-0}" -ge 2 ] && echo 1 || echo 0)" \
-    "two decoders shared ONE decode batch at least once (widest batch=$wide)"
+# the pair-OFF control arm has no decode arm: the two census checks do not apply to it (SKIP, not PASS)
+PAIR=0
+case " $ARMS " in *" --prefill-decode-arms "*) PAIR=1 ;; esac
+if [ "$PAIR" = 1 ]; then
+    hard "$([ -n "${steps:-}" ] && [ "${steps:-0}" -gt 0 ] && [ "${hand:-0}" -gt 0 ] && echo 1 || echo 0)" \
+        "the decode arm carried slots (steps=$steps handovers=$hand)"
+    hard "$([ -n "${wide:-}" ] && [ "${wide:-0}" -ge 2 ] && echo 1 || echo 0)" \
+        "two decoders shared ONE decode batch at least once (widest batch=$wide)"
+else
+    echo "SKIP  decode-arm census: this is the pair-OFF control (arm='${ARMS}')"
+fi
 # The reservation census is printed from the CACHE DESTRUCTOR, so a soak whose server is killed before its
 # teardown finishes the cache would read "absent" and say nothing about the bitmap.  It is a HARD check where the
 # teardown is deterministic (gate-arms-n1-memory.sh, one short arm); here it is asserted whenever the destructor
 # ran and reported otherwise, so a leaked reservation is still caught on the arm where it can be.
+# NON-VACUITY for the slab-armed (host-expert) shapes: when the slab is live, the pair's decode arm must have
+# been given a pinned AUXILIARY narrow compute region of its own.  Without one its compute buffer aliased the
+# prefill arm's at base 0, which is the defect this gate caught on 2026-11-23 (two live 1280 MiB views at
+# offset 0 -> HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION in the K rope's SET_ROWS).  A GPU-resident shape
+# never arms the slab, so the check does not apply there.
+if [ "$PAIR" = 1 ] && grep -qaE 'ggml_cuda_slab_init_locked: device [0-9]+: slab ' "$LOG"; then
+    aux="$(grep -oE 'aux narrow-[0-9]+ \(borrowing-context compute\) pinned at' "$LOG" | tail -1)"
+    hard "$([ -n "$aux" ] && echo 1 || echo 0)" \
+        "the slab is armed and the decode arm's compute buffer got its OWN pinned region (${aux:-<absent>})"
+else
+    echo "SKIP  aux-region pin: the slab is not armed on this shape (or this is the pair-OFF control)"
+fi
 resv="$(grep -oE 'shared KV cache teardown: [0-9]+ of [0-9]+ cell\(s\) still reserved' "$LOG" | tail -1)"
 leaked="$(sed -n 's/.*teardown: \([0-9]*\) of .*/\1/p' <<<"$resv")"
 if [ -n "$resv" ]; then

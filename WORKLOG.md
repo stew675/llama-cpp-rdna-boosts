@@ -1,3 +1,73 @@
+## 261123.017 (no release; `prefill-decode-arms` v2 STEP 7a = TASK 1) -- **the host-expert fault is a SLAB WORK ALIAS, not the MoE remap**: two contexts' compute buffers were the same memory, and each extra context now gets its own pinned region
+
+The previous landing (261123.016) recorded a GPU fault (`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`) for the
+paired server on a host-expert shape and refused `-ncmoe > 0` as a stop-gap, with the suspected mechanism "the
+prefill arm remaps the MoE expert tables under the decode arm".  **That diagnosis was wrong.**  The campaign's
+experiment ladder (HANDOVER §2.3) came back on rung 1 already -- turning the deferred Q/K pair fusion off
+(`GGML_CUDA_ROPE_QK_PAIR=0 GGML_CUDA_QK_PAIR_FWHT=0`) still faulted, in the *unfused* kernel -- so the fault was
+never about the fusion or the remap.  `GGML_CUDA_WORK_ALLOC_DEBUG=1` on the same shape then printed the actual
+mechanism.
+
+### 1. The defect: one slab work base, two live compute buffers
+
+```
+0.07.583 W WORK_ALLOC dev=0 need=1280.0 MiB narrow=1 ret_off=0.0 MiB   <- the PREFILL arm's compute view
+0.07.586 W WORK_RELEASE dev=0 off=0.0 MiB need=910.8 MiB               <- its old (smaller) view, dropped
+0.07.589 W WORK_ALLOC dev=0 need=1280.0 MiB narrow=1 ret_off=0.0 MiB   <- the DECODE arm's view: SAME base 0
+0.08.683 W WORK_ALLOC dev=0 need=1280.0 MiB narrow=1 ret_off=0.0 MiB   <- the prefill arm re-takes base 0
+0.08.686 GPU FAULT in rms_norm_mul_rope_f32_qk_pair / rms_norm_mul_rope_f32 (the K rope's SET_ROWS)
+```
+
+`ggml_cuda_slab_work_alloc()` has ONE "narrow" (decode/verify) base at offset 0 and assumed **one** live narrow
+view per device; a second `llama_context` keeps its own persistent compute buffer, so it landed on the same
+memory.  One arm's prefill wrote the other arm's activations, and the K rope then wrote KV cache rows at the
+index tensor it found there.  The delivery already knows this class: the MTP draft context hit it and got the
+`narrow2` region for it -- its own comment says "without this they both aliased at base 0".  The pair is simply
+the **third** context, and the region count was one.
+
+A second, independent defect surfaced inside the same experiment: the routing flag (`g_slab_compute_narrow2`)
+was **process-wide**, so the prefill arm's reserve inherited the decode arm's flag, was routed into the aux
+region, found a live view there, fell back to `cudaMalloc` and failed the graph reserve (1280 MiB out of
+memory) 1.3 s in.  Two arms reserve on two threads; the flag had to be per-thread.
+
+### 2. The fix (`steps/STEP-7a-0010-aux-narrow-regions.patch`, 12 files, +263/-227)
+
+* the `narrow2` region becomes a **stack of N=2 pinned auxiliary regions** at the top of the reserved VA
+  (slot 0 = an MTP draft context, slot 1 = a context that **borrows** another context's memory, i.e. the
+  pair's decode arm); the arena ceiling is the **lowest** pinned offset; the commit takes the pinned offset as
+  an **argument** rather than recomputing it (the pin releases the lock to evict arena tables, so another
+  context can pin in that window -- the window is validated before it is committed);
+* the routing is a **`thread_local` slot derived from the allocating context's own identity**
+  (`llama_context::slab_aux_slot()`: `cparams.ctx_other` -> 1, `memory_borrowed` -> 2), set by the context
+  around its own reserve/alloc_graph -- the same pattern as STEP 4's Meta view slot, and it removes the
+  process-wide flag from the MTP path as well;
+* `GGML_CUDA_SLAB_NARROW2=0` keeps working as the A/B arm (such a context bypasses the slab entirely);
+* the `-ncmoe > 0` refusal leaves `common_arms_pair_possible()`: the shape is supported.
+
+### 3. Green (details and commands in `wip/prefill-decode-arms-v2/RUNS.md`)
+
+| arm | result |
+|---|---|
+| host-tier soak, pair ON, 35B-A3B `-ncmoe 40`, np 4, 20 rounds, 80 requests | **PASS**, 0 errors, 15 steps / 3 handovers / widest batch 3, `aux narrow-3 (borrowing-context compute) pinned at [26.31, 27.56] GiB`, journal clean, wall **28 s** (the faulting run took 371-382 s) |
+| the same shape, pair OFF (control) | **PASS**, 80 requests, 0 errors, no aux region pinned |
+| 4B soak (4 slots x 20 rounds), pair ON | **PASS**, widest decode batch **4** |
+| `gate-arms-n1-memory.sh` / `gate-arms-itl.sh` | **PASS**; text identical, **20.37 -> 15.04 ms/token (-26 %)**, prefill **4908 -> 6141 t/s (+25 %)** |
+| A1 / A2 / A3 / A4 / A5(K axis) / A6 | unchanged: `be904e86f248`, `10a82b5559a9`, `e9db5cb8db0b`; KLD **0.000000 / 100.000 %**; MTP-K `a87c4318b649`; startup shape **13 lines identical** |
+| `scripts/check-shlib-symbols.sh` (the iface rename) | **OK**, 16 libs |
+
+### 4. What this changes for the campaign
+
+TASK 1 is closed and the host-expert half of the shape matrix (STEP 9) is unblocked.  The lesson for `DESIGN.md`
+is recorded as invariant **I9**: *two live compute buffers never share a slab work base -- an extra context
+gets its own pinned region and its own thread-local routing slot.*  A `draft` slot (0) arm on a slab-armed
+shape is still owed (an embedded-MTP arm allocates no second compute buffer, and a DFlash2 arm on the host tier
+is text-unstable run to run because expert residency picks the kernel set); the gap is named in `RUNS.md` and
+`HANDOVER.md` §7 rather than waved through.  Two small gaps are also noted there: `GGML_CUDA_SLAB_NARROW2` is
+still uncatalogued in `ENVIRONMENT.md` (the delivery's own gap, older than this change), and the multislot gate
+counts only `content`, so a reasoning model's `reasoning_content` reads as an "empty" completion.
+
+Delivery untouched: nothing in `patches/`, no release, `~/llama.cpp` stays on the local `arms-v2` branch.
+
 ## 261123.016 (no release; `prefill-decode-arms` v2 STEP 6e) -- the decode arm's arena reserve is measured and charged, the reservation census moves to stderr, and **a host-expert shape is REFUSED: the 4-slot soak faulted the GPU**
 
 `PLAN.md` STEP 6's remaining items (R6's reserve, the reservation census) plus the first finding the new gates
