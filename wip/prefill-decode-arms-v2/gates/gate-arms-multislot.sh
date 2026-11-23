@@ -38,6 +38,12 @@ CTX="${CTX:-16384}"
 NPRED="${NPRED:-16}"
 PORT="${PORT:-19700}"
 ARMS="${ARMS:---prefill-decode-arms}"
+# PIN THE RESIDENCY PRIOR (AGENTS.md rule 5, GREEDY-PURITY.md §89): on a host-expert shape the expert-cache
+# RESIDENCY picks the MoE kernel set, and `MOE_EXPERT_HEATMAP` DEFAULT WRITES the persisted map, so two soaks
+# in a row start from different priors -- which flipped this gate's outcome (measured 2026-11-23: the same
+# binary passed 3/3, then failed 3/3 once the map had been rewritten by its own runs).  `load` = load+seed,
+# never write.
+export MOE_EXPERT_HEATMAP="${MOE_EXPERT_HEATMAP:-load}"
 OUT="${OUT:-$HOME/.cache/rdna-boosts/gates/arms-multislot}"
 BIN="${LLAMA_BIN:-$HOME/llama.cpp/build-rocm/bin}"
 mkdir -p "$OUT"

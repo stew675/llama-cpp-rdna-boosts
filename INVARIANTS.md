@@ -2747,3 +2747,27 @@ r363-wip item 1, whose diagnosis was wrong.
    taken it yet only if the slab is also smaller), i.e. the same budget as item 1.  The only variant that keeps
    the arena intact is a bigger *reservation* (`GGML_CUDA_SLAB_RESERVE_MIB`), which shrinks the slab at creation --
    the same arena loss.
+
+## r366-wip (2026-11-23, `WORKLOG.md` 261123.019) -- the prefill -> decode compute-buffer drop is a process-wide mutation and races a second context's graph capture; a host-tier soak must pin the expert-residency prior (`prefill-decode-arms` v2 STEP 7d)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 7d.
+
+1. **A compute-buffer drop must not run while another context is inside `llama_process()`.**  The drop releases
+   the wide-prefill layout: it moves the movable-boundary slab's work boundary and re-arms stood-down MoE arena
+   tables.  With a second context capturing its graph on another thread, the capture fails:
+   `ROCm error: operation failed due to a previous error during capture` at the next kernel launch (and then
+   `operation would make the legacy stream depend on a capturing blocking stream` in the async-input ring, which
+   is a consequence, not the cause).  It is INTERMITTENT: measured on the two-arm server, 35B-A3B Q8_0
+   `-ncmoe 40` np 4 -- PASS 3/3, then FAIL 3/3, then FAIL 1/PASS 1, and **PASS 3/3 with
+   `LLAMA_DROP_COMPUTE_BUFFERS=0`**.  A text/hash oracle cannot see it: the run either aborts or is correct.
+   Exposure removed for the pair by `llama_context_disable_compute_buffer_drop()` (both arms); the measured cost
+   is nil (arena 25537 MiB and expert hit-rate 1.0 identical to the drop-on arm).  The proper answer for any
+   future second-context design is a barrier around the drop, not a permanent disable.
+2. **`MOE_EXPERT_HEATMAP` DEFAULTS TO WRITING the persisted map**, so two host-expert runs in a row start from
+   different residency priors -- and residency selects the MoE kernel set (r89).  That flipped a gate's outcome
+   between two sessions of the SAME binary (the map was rewritten at 17:06:20 by the session's own soaks).  A
+   host-expert gate must pin `MOE_EXPERT_HEATMAP=load`.
+3. **A "PASS 3/3" is not a stable-rate claim when the arm is intermittent.**  Re-measuring the same binary after
+   the environment drifted (item 2) reversed the verdict; a soak gate's record should state the repeats and the
+   prior it pinned, or the green line is a lottery ticket.
+

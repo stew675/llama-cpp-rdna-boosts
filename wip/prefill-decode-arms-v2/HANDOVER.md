@@ -9,8 +9,8 @@ on this box; nothing here is a plan that has not been run unless it says so.
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`prefill-decode-arms-v2`** (pushed; `main` untouched at `91a81505`) |
 | work tree | `~/llama.cpp`, branch **`arms-v2`** (local only, **never pushed**), tip `e460f0dea` (STEP 7a; the previous landing was `5e668c768`) |
 | build | `~/bin/build-llama-rocm` → `build-rocm` (ROCm **10.2.0**); fast loop `cmake --build build-rocm --target llama-cli llama-server -j 16` |
-| last landing | STEP 7a: `steps/STEP-7a-0010-aux-narrow-regions.patch` — code tip `e460f0dea` (`WORKLOG.md` 261123.017, `RUNS.md` top) |
-| the defect it closes | the host-expert (`-ncmoe`) FAULT — **root-caused as a slab work-base ALIAS** (two contexts' compute buffers were the same memory), fixed with one pinned aux region per extra context + thread-local routing; the `-ncmoe` refusal is gone (§2) |
+| last landing | **STEP 7d**: `steps/STEP-7d-0011-pair-drop-disable.patch` (`WORKLOG.md` 261123.019, `RUNS.md` top) + STEP 7a `steps/STEP-7a-0010-aux-narrow-regions.patch` (code tip `e460f0dea`, `WORKLOG.md` 261123.017) |
+| the defects it closes | (7a) the host-expert (`-ncmoe`) FAULT: **a slab work-base ALIAS** — two contexts' compute buffers were the same memory — fixed with one pinned aux region per extra context + thread-local routing; the `-ncmoe` refusal is gone.  (7d) the same soak's **INTERMITTENCY**: the prefill -> decode drop races the decode arm's graph capture; the pair now keeps both layouts reserved (§2.7) |
 | next action | **STEP 8** — the two missing gates (`gate-arms-default-inert.sh`, `gate-arms-recurrent-shared.sh`), each with its non-vacuity line (§3) |
 
 ---
@@ -83,6 +83,8 @@ nothing is copied between them.**  `llama_context_params::ctx_memory` is the onl
 * STEPs 10-12: see §3.
 * **Both aux slots are covered** (draft slot 0 *and* borrowing slot 1), see §2.6 — the arm is an external MTP
   head on a MoE target with `-ncmoe`.
+* **The host-tier soak is stable now** (5/5 with the pair's drop disabled, §2.7) — before 7d it failed about half
+  the time, and 7a's three PASSes were luck (§2.5).
 
 ---
 
@@ -156,6 +158,38 @@ every compute-buffer alloc/release with its base offset, which is what named thi
   **PASS** (-26 % ITL through a 5246-token prefill, +25 % prefill, text identical);
 * A1/A2/A3 unchanged, **A4 KLD 0.000000 / 100.000 %**, A5 K axis `a87c4318b649`, A6 startup shape 13 lines
   identical, `check-shlib-symbols.sh` OK.
+
+### 2.5a The DoD status, honestly (read this before quoting §2.5)
+
+STEP 7a's DoD table in `RUNS.md` was measured at a moment when the persisted expert heat map made the soak pass;
+**the same binary fails about half the time** once the prior drifts (`RUNS.md` STEP 7d).  So:
+
+* 7a's **alias** fix stands (deterministic fault: 2/2 repro before, clean after) and is what keeps the host-tier
+  shape from faulting;
+* the soak's **green** line is only true with **STEP 7d** applied (pair keeps both compute layouts reserved:
+  **5/5 PASS**, 0 capture errors);
+* a host-expert gate must pin `MOE_EXPERT_HEATMAP=load` (the default writes the map; the gate now does).
+
+### 2.7 The intermittency (STEP 7d) — the drop races the other arm's capture
+
+The prefill -> decode **compute-buffer drop** is a process-wide mutation: it moves the movable-boundary slab's
+work boundary and re-arms stood-down MoE arena tables.  Run from the prefill arm while the decode arm is inside
+`llama_process()` capturing its graph, that fails the capture:
+
+```
+0.19.024 I compute buffer 1280.00 MiB from the slab work region (boundary 1536.00 MiB)
+0.19.026 W moe_cache_rearm: re-armed 15 stood-down expert-cache tables after a compute-buffer drop
+0.19.026 E ROCm error: operation failed due to a previous error during capture
+0.19.058 E operation would make the legacy stream depend on a capturing blocking stream   <- consequence
+```
+
+`LLAMA_DROP_COMPUTE_BUFFERS=0` with the pair on: **3/3 clean**, which is the proof.  The fix is
+`llama_context_disable_compute_buffer_drop()` called for **both** arms when the pair is created; the measured cost
+is nil (arena 25537 MiB and hit-rate 1.0, identical to the drop-on arm, because the slab reclaims the wide view on
+the next wide pass).  **This is exposure removal, not the general answer**: the general answer is a barrier that
+keeps the other arm out of `llama_process()` around a drop, which would let the drop come back (DESIGN §8
+invariants 3-4, `INVARIANTS.md` r366-wip).  Unmeasured for STEP 10: whether two more compute layouts (a drafter's)
+make the always-reserved layout cost arena.
 
 ### 2.6 Both slots, and the arm that covers them
 

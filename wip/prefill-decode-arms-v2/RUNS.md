@@ -8,6 +8,67 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — STEP 7d: **the host-tier soak was INTERMITTENT, not green** — the prefill arm's compute-buffer drop races the decode arm's graph capture (`WORKLOG.md` 261123.019)
+
+**A correction first.**  STEP 7a's host-tier PASSes were *lucky runs*.  The same 7a binary (`e460f0dea`, tree
+clean) re-measured later gives:
+
+| when | prior | result |
+|---|---|---|
+| 16:33-16:45 (STEP 7a session) | whatever the persisted heat map held | **PASS 3/3** |
+| 17:0x, same binary | the map rewritten by those runs (default = load+**save**) | **FAIL 3/3** |
+| 17:1x, same binary | `MOE_EXPERT_HEATMAP=load` (pinned) | **FAIL 1, PASS 1** |
+
+So the host-tier shape fails ~half the time in the current state, and STEP 7a's aliasing fix is orthogonal to it
+(that was deterministic: 2/2 repro before, clean after).
+
+### The defect: the drop + arena re-arm vs the other arm's capture
+
+The abort is always the same shape, and the line immediately before it is the re-arm:
+
+```
+0.19.024 I compute buffer 1280.00 MiB from the slab work region (boundary 1536.00 MiB)   <- prefill->decode drop
+0.19.026 W moe_cache_rearm: re-armed 15 stood-down expert-cache tables after a compute-buffer drop (...)
+0.19.026 E ROCm error: operation failed due to a previous error during capture
+            in ggml_cuda_kernel_launch
+0.19.058 E ROCm error: operation would make the legacy stream depend on a capturing blocking stream
+            in ggml_cuda_async_input_batch_locked          <- consequence
+```
+
+`LLAMA_DROP_COMPUTE_BUFFERS=0` (pair ON, prior pinned) → **3/3 PASS, 0 capture errors**.  The drop is a
+**process-wide memory mutation** (it moves the slab's work boundary and re-arms MoE arena tables) issued from the
+prefill arm while the decode arm is inside `llama_process()` capturing its graph -- DESIGN §8 invariant 4's
+subject, and invisible to a text/hash oracle.
+
+### The fix (STEP 7d): the pair keeps both layouts reserved
+
+`llama_context_disable_compute_buffer_drop()` (new, 32 lines over 4 files) + the server calls it for **both** arms
+when the pair is created.  Neutral: only the pair calls it; every other run keeps the drop.
+
+| arm | result |
+|---|---|
+| host-tier soak, pair ON, prior pinned | **PASS 5/5**, 0 capture errors, decode arm active (8 steps / 3 handovers / widest 3-4) |
+| the same, cost of not dropping | arena **25537 MiB** and expert hit-rate **1.0** -- **identical** to the drop-on arm (the slab reclaims the wide view on the next wide pass) |
+| A1 / A3 (neutrality) | `be904e86f248` / `e9db5cb8db0b` -- unchanged |
+| 4B soak, pair ON | **PASS**, widest batch 4 |
+| `gate-arms-n1-memory.sh` | **PASS**, text byte-identical, 0 of 8192 cells reserved |
+| `gate-arms-itl.sh` | **PASS**, same text, **1311.4 -> 960.4 ms / 64 tokens (-27 %)** |
+
+### Harness change this forced
+
+`gates/gate-arms-multislot.sh` now pins `MOE_EXPERT_HEATMAP=load`.  The default **writes** the persisted map, so
+two soaks in a row start from different residency priors -- which is what flipped this gate's own outcome between
+the 7a session and this one (`GREEDY-PURITY.md` §89, `AGENTS.md` rule 5).
+
+### Still owed after 7d
+
+The *proper* fix for the underlying hazard is not "never drop": it is a barrier so a drop/re-arm can run while the
+other arm is **not** inside `llama_process()` (DESIGN §8 invariants 3-4).  7d removes the exposure on the pair;
+any future second-context design that wants the drop back needs that barrier.  Also unmeasured: whether the
+drop's absence costs arena at STEP 10 (a drafter holds two more compute layouts).
+
+---
+
 ## 2026-11-23 — STEP 7b: the aux compute buffer allocated **outside** the slab was measured and REJECTED (`WORKLOG.md` 261123.018)
 
 The maintainer's question — "wouldn't it be better to allocate these out of anonymous memory *before* the slab

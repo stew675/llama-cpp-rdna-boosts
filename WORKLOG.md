@@ -1,3 +1,54 @@
+## 261123.019 (no release; `prefill-decode-arms` v2 STEP 7d) -- **the host-tier soak was intermittent, not green**: the prefill arm's compute-buffer drop races the decode arm's graph capture
+
+A correction and a fix.  **STEP 7a's host-tier PASSes (261123.017) were lucky runs.**  The same binary, re-run
+later, passes or fails about half the time (PASS 3/3 at the time; FAIL 3/3 and then FAIL 1/PASS 1 afterwards with
+the residency prior pinned).  Two things came out of that.
+
+### 1. A harness confound, now closed
+
+`MOE_EXPERT_HEATMAP` defaults to load+**save**, so each soak rewrites the persisted heat map and the next soak
+starts from a different residency prior -- and on a host-expert shape residency picks the MoE kernel set
+(`GREEDY-PURITY.md` §89).  The map file's mtime (17:06:20) is the session's own runs.  `gate-arms-multislot.sh`
+now pins `MOE_EXPERT_HEATMAP=load`; the campaign's other arms already did.
+
+### 2. The real defect: the drop + arena re-arm races the other arm's capture
+
+```
+0.19.024 I compute buffer 1280.00 MiB from the slab work region (boundary 1536.00 MiB)   <- prefill -> decode drop
+0.19.026 W moe_cache_rearm: re-armed 15 stood-down expert-cache tables after a compute-buffer drop
+0.19.026 E ROCm error: operation failed due to a previous error during capture  (ggml_cuda_kernel_launch)
+0.19.058 E ROCm error: operation would make the legacy stream depend on a capturing blocking stream
+            (ggml_cuda_async_input_batch_locked)                                        <- consequence
+```
+
+The prefill -> decode compute-buffer drop is a **process-wide memory mutation** (it moves the movable-boundary
+slab's work boundary and re-arms MoE arena tables).  Issued from the prefill arm while the decode arm is inside
+`llama_process()` capturing its graph, it fails that capture -- DESIGN §8 invariant 4's subject, and invisible to
+a text/hash oracle (which is why the earlier runs "passed").
+
+**Mechanism proven**: `LLAMA_DROP_COMPUTE_BUFFERS=0` with the pair on -> **3/3 PASS, 0 capture errors**; drop on
+-> intermittent.
+
+### 3. The fix (STEP 7d, `steps/STEP-7d-0011-pair-drop-disable.patch`, 4 files, +32/-1)
+
+`llama_context_disable_compute_buffer_drop()` (new API), and the server calls it for **both** arms when the pair
+is created: the pair keeps both compute layouts reserved.  Neutral by construction -- only the pair calls it, so
+every other run keeps the drop.
+
+| arm | result |
+|---|---|
+| host-tier soak, pair ON, prior pinned | **PASS 5/5**, 0 capture errors, decode arm active (8 steps / 3 handovers / widest 3-4) |
+| cost of not dropping, measured | arena **25537 MiB**, expert hit-rate **1.0** -- identical to the drop-on arm (the slab reclaims the wide view on the next wide pass) |
+| A1 / A3 | `be904e86f248` / `e9db5cb8db0b` unchanged |
+| 4B soak / `gate-arms-n1-memory.sh` / `gate-arms-itl.sh` | PASS; text identical; **1311.4 -> 960.4 ms/64 tokens (-27 %)** |
+
+### 4. Status of the campaign record
+
+`HANDOVER.md` §2 and `RUNS.md` now say what was measured: 7a fixed the deterministic **alias** fault (that fix
+stands), and 7d removes the **intermittency**.  The *proper* long-term answer to the drop/re-arm hazard is a
+barrier that excludes the other arm from `llama_process()` around a drop, so the drop can come back; 7d is the
+pair-scoped exposure removal.  Nothing in `patches/` changed; `~/llama.cpp` stays local.
+
 ## 261123.018 (no release; `prefill-decode-arms` v2 STEP 7b) -- **the VRAM outside the slab is its growth fuel, not spare capacity**: allocating an auxiliary compute buffer there aborts a host-tier run, so the arena route (7a) stands
 
 Asked whether the two auxiliary compute buffers should instead be allocated from **anonymous memory before the
