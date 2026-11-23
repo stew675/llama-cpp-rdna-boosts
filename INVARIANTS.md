@@ -2452,3 +2452,44 @@ delivery revision that eventually carries the change, if it is promoted, is the 
    pointers, a **negative control** (two unborrowed contexts must hold *different* memories, or "the pointers
    are equal" proves nothing about the borrow), and a decode whose rows are written by one context and read
    by the other (`gates/probe-ctx-memory.cpp`).
+
+## r356-wip (2026-11-23, `WORKLOG.md` 261123.009) — a prepared batch's cells look EMPTY in the cell map, a shared library's undefined symbol is a link break, and a `const` searcher that allocates (`prefill-decode-arms` v2 STEP 3)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 3, nothing in `patches/` changed.
+
+1. **`prepare()` ROLLS THE CELL MAP BACK, so "the cell map says free" does not mean free.**  Between a
+   `prepare()` and the decode that commits it (`apply_ubatch(..., trial)` places each ubatch, then `v_cells`
+   and `v_heads` are restored), the cells a batch will write are **empty** to every other search.  In a
+   single-context run that is invisible: the caller applies before it prepares again.  With two contexts it is
+   the whole defect -- both searches are handed the same cells and both batches write them, which is fluent
+   wrong output under load, not a crash and not a text change.  **The only mechanism that closes it is a
+   reservation bitmap that outlives the rollback** (one per stream/cell, enabled only when the cache is
+   shared), with three release paths: a real `apply_ubatch`, `prepare()`'s failure path, and the batch
+   context's DESTRUCTOR (a cancel/abort gets no cooperation, so the destructor is the only place that cannot
+   be forgotten).  A handed-out cell that is already reserved must be an `GGML_ASSERT` -- a log line would let
+   silent corruption through.
+2. **The reservation is invisible to every text oracle, and a two-thread soak does not exercise it either.**
+   Two arms on one memory read the *same* text with and without the bitmap (measured: identical digests on
+   both builds), because the collision needs two batches that are **prepared and not yet applied**, a state
+   the public API does not expose.  The decisive instrument is a deterministic set-algebra probe on the cache
+   itself: `prepare(A)` then `prepare(B)` must be **disjoint** -- and on the build without the bitmap it is
+   `[0..511]` twice, exactly.  Prefer that shape over timing/luck.
+3. **`llama_memory_i`'s lock must be a MEMBER of the object, not a `shared_ptr` handed around.**  One object
+   has one lock; an `apply_mutex()` accessor means no caller can forget to share it and no per-context shadow
+   can exist.  The discipline is part of the invariant: bookkeeping only (µs at a ubatch boundary), released
+   before the graph build and the compute -- a measurable hold means the lock is in the wrong place
+   (the previous attempt measured a 2.85 s starvation that way).
+4. **A composite memory must FORWARD `notify_borrowed()` to every module it holds** (hybrid attn+recurrent,
+   the indexer, iSWA base+swa, dsa/dsv4/msa).  A module that never hears it keeps `n_borrowed == 0` and
+   silently stops reserving -- the same "shares the KV" trap in a new place, caught only by the N:1 gate.
+   `llama_memory_hybrid_idx` must call its PARENT's forwarder, not `llama_memory_i::notify_borrowed()`, or the
+   base's two caches are skipped.
+5. **`gate-park-idle-slots.sh` needs `ROCBLAS_USE_HIPBLASLT=0` on its own shape, and the delivery's lottery
+   check does not cover that shape.**  Unpinned the gate fails `park != lazyoff` on 3 of 4 requests, with the
+   random-divergence signature (`park == parkoff` on some requests, not others); the pin makes it pass twice on
+   the same build, `MOE_EXPERT_HEATMAP=load` does not.  `scripts/check-hipblaslt-lottery.sh` reads
+   `NO-CHOICE` because it measures the 27B Q8_0 *default* call sites, while the gate drives the Flash-Next
+   host-tier IQ4_NL shape -- §44's "stability is config-dependent", made concrete.  Reported (the fix is a
+   delivery-tooling change), and a fresh-process comparison on that shape needs **one request in flight**:
+   even pinned, two concurrent 2-slot arms differed across runs (147 vs 188 chars) because the interleaving
+   picks the batch composition and the batch composition picks the kernels.

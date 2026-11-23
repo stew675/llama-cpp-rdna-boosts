@@ -1,3 +1,80 @@
+## 261123.009 (no release; `prefill-decode-arms` v2 STEP 3) -- one allocator and one lock: a prepared batch's cells are RESERVED (so a second context cannot take them) and every bookkeeping call takes the memory's own mutex
+
+`PLAN.md` STEP 3.  **Delivery untouched**; the change is on `~/llama.cpp` branch `arms-v2` and stored as
+[`wip/prefill-decode-arms-v2/steps/STEP-3-0003-one-allocator-one-lock.patch`](wip/prefill-decode-arms-v2/steps/STEP-3-0003-one-allocator-one-lock.patch)
+(13 files, +314/-19).
+
+### 1. I4 -- the reservation, and why it is the only mechanism that works
+
+`prepare()` places a batch's ubatches and then **rolls the cell map back** (`v_cells` and `v_heads`), so
+between a `prepare()` and the decode that commits it the cells look **EMPTY**.  A second context's search --
+or the same context's next batch -- is therefore handed the same cells, and both batches write them.  That is
+not a crash and not a text change: it is fluent wrong output under load.
+
+`llama_kv_cache` now keeps a per-stream, per-cell `reserved` bitmap, enabled the moment the cache is
+**shared** (`llama_memory_i::n_borrowed > 0`, set by the borrowing context through `notify_borrowed()`, which
+each composite memory forwards to the modules it holds -- attn/recurrent/indexer/iSWA/base+swa), and:
+
+* `find_slot()` skips a reserved cell and marks what it hands out (it is no longer `const`, which is the
+  honest signature: it allocates);
+* `apply_ubatch(..., trial)` clears the marks -- except for `prepare()`'s trial apply, whose placement is
+  rolled back and whose reservation must survive;
+* `prepare()`'s failure path releases the ubatches it had placed; `llama_kv_cache_context`'s destructor
+  releases everything it never applied (a cancel/abort path, so it needs no cooperation); `clear()` resets;
+* a handed-out cell that is already reserved is a **`GGML_ASSERT`** (always compiled in), not a log line --
+  two batches in one cell is silent corruption.
+
+`reserve()` returns immediately when `n_borrowed == 0`, so the single-context path pays nothing, and the bitmap
+is only sized when a borrower appears.
+
+### 2. I3 -- one lock, a plain member of the object
+
+`llama_memory_i` gains `std::mutex mtx_memory` and `apply_mutex()`.  It is a member of the object, not a
+`shared_ptr` handed around at construction and not something a caller must remember to share: **one object,
+one lock, nothing per context**.  Every bookkeeping call takes it in `llama-context.cpp` -- `init_batch`,
+the committing `apply()`, `memory_update`'s `init_update`+apply block, the error-path `seq_rm`, the public
+`llama_memory_*` ops (`clear`, `seq_rm/cp/keep/add/div`, `seq_pos_min/max`), the `state_*` paths
+(`state_write`/`state_read` and the per-sequence forms), `opt_epoch_iter`'s clear/init/apply, and
+`llama_memory_seq_park` -- and it is **released before** the graph build and the compute.  The discipline is
+stated where the lock is declared: bookkeeping only (microseconds), never a compute, a reserve or a
+synchronisation; a measurable hold means the lock is in the wrong place.
+
+### 3. The oracles, and the control that makes the reservation non-vacuous
+
+| oracle | result |
+|---|---|
+| `gates/probe-kv-reservation.cpp` (new; deterministic, one thread) | **PASS** on this build: unborrowed `prepare` A/B both `[0..511]` (bitmap off, single-context path untouched); **borrowed** A `[0..511]`, B `[512..1023]`, C `[1024..1535]` -- disjoint; a batch context dropped without applying gives its cells back (a later prepare starts at 0); teardown census `0 of 8192` |
+| the same probe on the **STEP 2 build** (the control) | **FAIL at exactly the I4 claim**: `prepare A: [0..511]`, `prepare B: [0..511]` -- the same cells.  Everything else passes there, so the probe isolates the mechanism |
+| `gates/probe-n1-threads.cpp` (new; two contexts on **two threads**, 1900-token prefill rounds on seq 0 while seq 1 decodes 32 steps on the borrower) | `PASS`, **digests identical to the solo arm**: `prefill=64a94dac… decode=897f0e38…` in both; no deadlock (982 ms); teardown census `0 of 2048 reserved`.  Declared honestly: this is the **I3/no-corruption** oracle, not the I4 one -- the same digests are read by the pre-STEP-3 build, because the collision needs two *prepared* batches, which the public API does not expose |
+| A1 / A2 / A3 | `be904e86f248` / `10a82b5559a9` / `e9db5cb8db0b` -- unchanged |
+| A6 (2 slots, 2 concurrent) and its **startup shape** | `{142 ch 7bd542418112, 207 ch 6ce1f88dd5f7}`; `diff` empty against the STEP 0 shape |
+| A4 prefill-logit KLD | **0.000000 / 100.000 %** |
+| `gate-state-pipe.sh` | **PASS** (all arms; pipe 0.45x the synchronous arm) |
+| `gate-park-idle-slots.sh` | **PASS with `ROCBLAS_USE_HIPBLASLT=0`**, twice; **FAILS without it**, twice (see the finding) |
+
+### 4. Finding: `gate-park-idle-slots.sh` is hipBLASLt-lottery sensitive on its own default shape
+
+Unpinned, the gate failed `park != lazyoff` on 3 of 4 requests (A passed, B/C/D differed), and the
+`park`/`parkoff` hashes were equal on A and D but not B and C -- the signature of *random* divergence, not of
+a broken park (a broken park would make `park == parkoff` everywhere).  Attribution, on this build:
+
+| pins | result |
+|---|---|
+| none | **FAIL** (2 runs) |
+| `MOE_EXPERT_HEATMAP=load` only | **FAIL** (B/C/D) |
+| `ROCBLAS_USE_HIPBLASLT=0` | **PASS** (2 runs) |
+
+So the pin the delivery's own rule asks for (`AGENTS.md` verify rule 5, `GREEDY-PURITY.md` §44) is **missing
+from this gate**, and its shape is the one that needs it: the gate drives the Flash-Next **host-tier IQ4_NL**
+model (`-ncmoe 48`), while `scripts/check-hipblaslt-lottery.sh` measures the 27B Q8_0 **default** call sites
+and reads `NO-CHOICE` -- §44 says stability is config-dependent, and this is that gap.  **Reported, not
+patched**: `scripts/` is delivery tooling and the fix is the maintainer's (add the pin, or widen the lottery
+check to this shape).  A second observation from the same probe, for STEP 9: even *pinned*, a 2-slot
+concurrent server arm on this shape was not reproducible across fresh processes (one run's slot-0 answer was
+147 chars where two others were 188) -- the interleaving picks the batch composition, and the batch
+composition picks the kernels (DESIGN V8).  A cross-arm text comparison on that shape needs one request in
+flight at a time.
+
 ## 261123.008 (no release; `prefill-decode-arms` v2 STEP 2) -- `llama_context_params::ctx_memory`: a context that *borrows* another context's `llama_memory`, so "shares the KV" is true by construction for every module, including ones that do not exist yet
 
 `PLAN.md` STEP 2.  **Delivery untouched** (nothing in `patches/`, `release.json` unchanged); the change is
