@@ -85,7 +85,7 @@
 #   --build-dir NAME BUILD_DIR   build directory, relative to REPO (default
 #                                build-per-block)
 #   --jobs N         JOBS        build parallelism (default 16)
-#   --rocm DIR       ROCM_DIR    ROCm install (default /opt/rocm-10.1.0-gfx120X;
+#   --rocm DIR       ROCM_DIR    ROCm install (default: resolved from the build, scripts/rocmlib.sh;
 #                                ROCM_714 is still honoured as an env alias)
 #   --gpu-target T   GPU_TARGETS (default gfx1201)
 #   --keep-going                 continue past the first failure (default: stop)
@@ -138,12 +138,13 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 MANIFEST="$REPO_DIR/release.json"
 
 REPO="${LLAMA_REPO:-$HOME/llama.cpp}"
 BUILD_DIR="build-per-block"
 JOBS="${JOBS:-16}"
-ROCM_DIR="${ROCM_DIR:-${ROCM_714:-/opt/rocm-10.1.0-gfx120X}}"
+ROCM_DIR="${ROCM_DIR:-${ROCM_714:-$(rocm_dir)}}"
 GPU_TARGETS="${GPU_TARGETS:-gfx1201}"
 KEEP_GOING=0
 LIST_ONLY=0

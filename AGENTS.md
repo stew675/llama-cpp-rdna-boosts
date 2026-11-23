@@ -148,7 +148,7 @@ still open, stop before the release cut, the commit and the tag.
   whose tip is `.tip` is the whole contract.
 - **Every release MUST also publish the ROCm container images.**  They are built and pushed
   **off-host** by the worker watcher (`scripts/container-watch.sh` on `radiance`), which polls for the
-  new release tag and runs `scripts/build-containers.sh --rocm "7.14.1 10.1" --push --prune`; see
+  new release tag and runs `scripts/build-containers.sh --rocm "7.14.1 10.2" --push --prune`; see
   `CONTAINERS.md` → "Offload the image build to a worker".  **Do not run the full container image build
   (all targets, both ROCm lines) on the primary box during a release**: it pins all cores for tens of
   minutes and contaminates any benchmark running beside it.  Nothing here changes the normal local
@@ -443,9 +443,12 @@ scoped to the transition it was decided in.
 ### Build the fork
 
 ```bash
-cd ~/llama.cpp && ~/bin/build-llama-rocm          # default BUILD_DIR=build-rocm, ROCm 10.1.0
+cd ~/llama.cpp && ~/bin/build-llama-rocm          # default BUILD_DIR=build-rocm, ROCm 10.2.0
 # fast loop: cmake --build build-rocm --target llama-cli llama-bench -j 16
-# runtime libs: LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib
+# runtime libs: the build's RUNPATH names them (/opt/rocm-10.2.0-gfx120X/lib).  Do NOT put another
+# ROCm install in LD_LIBRARY_PATH: it is searched before RUNPATH, so a 10.2 build then loads 10.1's
+# libraries (hipBLASLt 1.4 = the per-start solution container) and every fresh-process comparison becomes
+# a coin flip -- INVARIANTS.md r359-wip.  scripts/rocmlib.sh resolves the right dir from the build.
 ```
 
 `~/bin/build-llama-rocm` is the canonical tree (`build-rocm`); `~/bin/build-llama-rocm-714` is the older
@@ -477,11 +480,11 @@ not by any build.  `INVARIANTS.md` r332/r341, `WORKLOG.md` 261121.011/261121.022
 ### Build the release container images (worker by default)
 
 **The ROCm images are built and pushed off-host** by the worker watcher (`scripts/container-watch.sh` on
-`radiance`), which polls for the new release tag and runs `scripts/build-containers.sh --rocm "7.14.1 10.1"
+`radiance`), which polls for the new release tag and runs `scripts/build-containers.sh --rocm "7.14.1 10.2"
 --push --prune` there. So **after pushing a tag nothing else is needed** (the worker picks it up within ~10
 minutes), and **do not run the full two-line image build on the primary box during a release** — it pins
 every core for tens of minutes. This is the *image* build only; the normal source build and the release
-gates stay on the primary box. A fast smoke: `scripts/build-containers.sh --rocm 10.1 --arch gfx1201
+gates stay on the primary box. A fast smoke: `scripts/build-containers.sh --rocm 10.2 --arch gfx1201
 --targets server` (no `--push`). Worker one-time setup, the build args, `--prepare-only`, the prune rules
 (prune only what was just built, never the base images or the ccache) and the GHCR retention
 (`scripts/cleanup-ghcr.py`, 7-day window, current tags always kept) are in [`CONTAINERS.md`](CONTAINERS.md).

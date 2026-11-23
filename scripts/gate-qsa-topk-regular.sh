@@ -61,6 +61,7 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 LLAMA_CLI="${LLAMA_CLI:-$HOME/llama.cpp/build-rocm/bin/llama-cli}"
 OP_TEST="${OP_TEST:-$(dirname "$LLAMA_CLI")/test-backend-ops}"
 QSA_MODEL="${QSA_MODEL:-}"
@@ -72,7 +73,7 @@ CTX="${CTX:-131072}"
 REPS="${REPS:-2}"
 MIN_GAIN_PCT="${MIN_GAIN_PCT:-1.0}"
 NCMOE="${NCMOE:-48}"
-ROCM_LIB="${ROCM_LIB:-/opt/rocm-10.1.0-gfx120X/lib}"
+ROCM_LIB="${ROCM_LIB:-$(rocm_libdir)}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 mkdir -p "$KEEPOUT"
 

@@ -53,7 +53,7 @@
 #      LLAMA_REPO (long-lived checkout)  default $HOME/llama-ci   <- keep ONE path (ccache keys on it)
 #      STATE_DIR                         default $HOME/.cache/rdna-validate
 #      JOBS                              default nproc
-#      ROCM_DIR / GPU_TARGETS            auto-detected from /opt/rocm-10.1.0-gfxNNNN
+#      ROCM_DIR / GPU_TARGETS            auto-detected from the build's ROCm (scripts/rocmlib.sh)
 #      KLD_MODEL, KLD_CTX (512), KLD_CHUNKS (40), KLD_BASE_DIR
 #      HC_MODELS                     space-separated qwen4exp GGUFs for the fusion gate (both
 #                                    hc-down classes); HC_ALWAYS=1 forces it
@@ -80,6 +80,9 @@
 #
 # Exit: 0 = validated (or nothing to do / already given up on this rev); 1 = a step failed.
 set -uo pipefail
+
+# the ROCm tree the BUILD links (never a hardcoded install): see scripts/rocmlib.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rocmlib.sh"
 
 export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -165,10 +168,11 @@ done
 for t in git jq rsync; do command -v "$t" >/dev/null || die "$t is required"; done
 command -v ccache >/dev/null && : || log "WARN: ccache not found -- the whole-set build will be slow and cold"
 
-# ROCm: pick the installed 10.1 tree and its target, so this works on any gfx box.
+# ROCm: pick the tree the BUILD links (never a hardcoded install -- a second install's runtime would shadow
+# the build's own via LD_LIBRARY_PATH; see scripts/rocmlib.sh), and its gfx target.
 if [ -z "${ROCM_DIR:-}" ]; then
-    ROCM_DIR="$(ls -d /opt/rocm-10.1.0-gfx* 2>/dev/null | head -1)"
-    [ -n "$ROCM_DIR" ] || die "no /opt/rocm-10.1.0-gfx* install found (set ROCM_DIR)"
+    ROCM_DIR="$(rocm_dir)"
+    [ -n "$ROCM_DIR" ] || die "no ROCm install could be resolved (set ROCM_DIR)"
 fi
 [ -n "${GPU_TARGETS:-}" ] || GPU_TARGETS="$(basename "$ROCM_DIR" | sed 's/^.*-//')"
 

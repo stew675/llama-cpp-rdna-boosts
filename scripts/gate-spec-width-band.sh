@@ -61,6 +61,7 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 LLAMA_SERVER="${LLAMA_SERVER:-$HOME/llama.cpp/build-rocm/bin/llama-server}"
 MODEL="${MODEL:-/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
 GPUS="${GPUS:-0,1,2}"
@@ -121,7 +122,7 @@ run_arm() {
     local envs=()
     [ -n "$band" ] && envs=(LLAMA_SPEC_ALIGN_WIDTH_BAND="$band")
 
-    env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}" \
+    env LD_LIBRARY_PATH="$(rocm_ld_library_path)" \
         HIP_VISIBLE_DEVICES="$GPUS" ROCBLAS_USE_HIPBLASLT=0 \
         "${envs[@]}" \
         "$LLAMA_SERVER" -m "$MODEL" --spec-type "$SPEC" --spec-draft-n-max "$NMAX" \

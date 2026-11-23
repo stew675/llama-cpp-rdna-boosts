@@ -51,6 +51,7 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 BUILD_DIR="${BUILD_DIR:-$HOME/llama.cpp/build-rocm}"
 LLAMA_CLI="${LLAMA_CLI:-$BUILD_DIR/bin/llama-cli}"
 MODEL="${MODEL:-/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
@@ -85,7 +86,7 @@ mkdir -p "$KEEPOUT"
 [ -x "$LLAMA_CLI" ] || { echo "no llama-cli at $LLAMA_CLI" >&2; exit 2; }
 [ -f "$MODEL" ]     || { echo "no model at $MODEL" >&2; exit 2; }
 
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}"
+export LD_LIBRARY_PATH="$(rocm_ld_library_path)"
 
 # The 17..31-token window.  19 is the reporter's shape; `p19` is exactly that many tokens on the
 # Qwen-family tokenizer this gate's default model uses (verified against llama-tokenize when written).

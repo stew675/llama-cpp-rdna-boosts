@@ -52,6 +52,7 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 BUILD_DIR="${BUILD_DIR:-$HOME/llama.cpp/build-rocm}"
 LLAMA_CLI="${LLAMA_CLI:-$BUILD_DIR/bin/llama-cli}"
 LLAMA_SERVER="${LLAMA_SERVER:-$BUILD_DIR/bin/llama-server}"
@@ -135,7 +136,7 @@ run_server_arm() { # <tag> <max_tokens: "" = default>
     echo "--> $tag (4 slots, draft-mtp n3, GGML_CUDA_GRAPH_MAX_TOKENS=${band:-default})"
     local envs=()
     [ -n "$band" ] && envs=(GGML_CUDA_GRAPH_MAX_TOKENS="$band")
-    LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}" \
+    LD_LIBRARY_PATH="$(rocm_ld_library_path)" \
         env HIP_VISIBLE_DEVICES="$GPU" ROCBLAS_USE_HIPBLASLT=0 GGML_CUDA_GRAPH_TRACE=1 "${envs[@]}" \
         "$LLAMA_SERVER" -m "$MODEL" -sm layer -ngl 99 -t 8 -c "$CTX" --parallel 4 --kv-unified \
         --cache-ram 0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0 \
@@ -249,7 +250,7 @@ cli_arm() { # <tag> <max_tokens: "" = default> <extra args...>
     local envs=()
     [ -n "$band" ] && envs=(GGML_CUDA_GRAPH_MAX_TOKENS="$band")
     echo "--> $tag (GGML_CUDA_GRAPH_MAX_TOKENS=${band:-default})"
-    HIP_VISIBLE_DEVICES="$GPU" LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}" \
+    HIP_VISIBLE_DEVICES="$GPU" LD_LIBRARY_PATH="$(rocm_ld_library_path)" \
         env GGML_CUDA_GRAPH_TRACE=1 "${envs[@]}" timeout "$TIME_LIMIT" \
         "$LLAMA_CLI" -m "$MODEL" -ngl 99 -fa on --fit off -t 8 -p "The capital of France is" \
         -n 64 --seed 42 --temp 0 --no-display-prompt --single-turn "$@" > "$KEEPOUT/$tag.log" 2>&1

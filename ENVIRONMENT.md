@@ -1239,7 +1239,7 @@ These are not llama.cpp variables but they control how the delivery runs.
 | variable | notes |
 |---|---|
 | `HIP_VISIBLE_DEVICES` | which GPUs are visible, in order. Part of every validated command (`0,1` or `0,1,2`). |
-| `LD_LIBRARY_PATH` | must include the matching ROCm runtime libs, e.g. `/opt/rocm-10.1.0-gfx120X/lib` (the canonical build tree), or the build will not start. |
+| `LD_LIBRARY_PATH` | the ROCm runtime libs **of the line the build links**, e.g. `/opt/rocm-10.2.0-gfx120X/lib`; the build's own `RUNPATH` already names it, so it normally needs no setting.  **Never point it at another ROCm install**: it is searched before `RUNPATH`, so a 10.2 build then loads 10.1's hip/rocBLAS/hipBLASLt (hipBLASLt 1.4 = the per-start solution container, `GREEDY-PURITY.md` §44) and every fresh-process comparison becomes a coin flip (`INVARIANTS.md` r359-wip).  `scripts/rocmlib.sh` resolves it from the build. |
 | `ROCR_VISIBLE_DEVICES` | lower-level alternative to `HIP_VISIBLE_DEVICES`; prefer `HIP_VISIBLE_DEVICES`. |
 | `GGML_CUDA_ENABLE_UNIFIED_MEMORY` | forces managed allocations; not used in this repo's validated configurations. |
 

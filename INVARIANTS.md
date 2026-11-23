@@ -2546,3 +2546,41 @@ delivery revision that eventually carries the change, if it is promoted, is the 
    strictest form.**  The four-axis draft-acceptance counts (`#gen drafts`/`#acc drafts`/`#gen tokens`/
    `#acc tokens`) reproduced bit for bit through this refactor; a byte-identical text with different counts
    would have meant the rollback indices moved.
+
+## r359-wip (2026-11-23, `WORKLOG.md` 261123.012) -- `LD_LIBRARY_PATH` beat the build's `RUNPATH`, so a 10.2 build ran on 10.1's hipBLASLt and every cross-process text comparison became a coin flip (tooling)
+
+*No delivery revision:* `scripts/` + the workflows; nothing in `patches/` changed.
+
+1. **`LD_LIBRARY_PATH` is searched BEFORE a binary's `DT_RUNPATH`.**  A gate that defaulted it to another ROCm
+   install therefore ran the build against that install's runtime, silently -- every soname matches.  Measured
+   2026-11-23: the delivery's gates defaulted to the retired `/opt/rocm-10.1.0-gfx120X/lib` while
+   `~/bin/build-llama-rocm` links **10.2.0**, so `libamdhip64`/`librocblas`/`libhipblaslt` all came from 10.1.
+   The rule is now a helper, `scripts/rocmlib.sh`: resolve the lib dir from the **build's own RUNPATH** (with
+   `$ROCM_LIB` as the explicit override), never from a hardcoded tree.
+2. **The symptom was per-PROCESS text non-reproducibility, and it looked exactly like a placement bug.**  With
+   the 10.1 runtime the same gate arm (`park`, identical args) read three different texts across four fresh
+   runs, so a gate that compares three arms across three processes failed whenever two of them drew different
+   classes -- 1-2 failures in every 2-4 runs, with the pattern moving.  The tell is that the **same arm**
+   disagreed with itself: a placement defect would make `park == parkoff` everywhere, consistently.
+3. **That is the §44 mechanism, and it is a property of the LIBRARY, not of the pin.**  10.1.0 ships hipBLASLt
+   **1.4** (`libhipblaslt.so.1.4`, 9.2 MB, the pre-`c50ea60130f` per-shape candidate container); 10.2.0 ships
+   **1.5** (3.4 MB).  Under 1.4 each fresh process picks its own solution; `ROCBLAS_USE_HIPBLASLT=0` hid it by
+   bypassing the library, and pointing `LD_LIBRARY_PATH` at the build's own tree removes it **with hipBLASLt
+   enabled** (2 runs x 3 arms byte-identical, 3 runs pinned done previously).  A delivery gate must therefore
+   never pin the library as a *substitute* for pinning the environment.
+4. **A gate that compares text must state WHICH per-process variables are pinned.**  Two are documented and both
+   matter on a host-tier MoE shape: the hipBLASLt runtime (§44) and the expert-cache residency prior
+   (`MOE_EXPERT_HEATMAP=load`, §89 -- residency selects the MoE kernel set).  `gate-park-idle-slots.sh` now
+   derives its library path from the build and needs **no** `ROCBLAS` pin; the resid­ency prior remains the
+   caller's job where a gate's model has a writable `.moe-heatmap` sidecar.
+5. **A residual, real concurrency effect survives the toolchain fix.**  On the Flash-Next host-tier shape with
+   **two requests in flight**, one slot's greedy answer varied across three fresh 10.2 runs (`b2e646545bd9` once,
+   `c60b5a919c9b` twice) while the other was stable throughout -- the interleaving picks the batch composition
+   and the composition picks the kernels (DESIGN V8).  A **byte** text claim on such a shape belongs at one
+   request in flight; concurrent arms carry the non-text claims.
+6. **A gate's mechanism check must assert the CURRENT rule.**  `gate-draft-ctx.sh` grepped for block 17's
+   `is a context of ANOTHER model (a draft head)` decline message, deleted at the r352 withdrawal -- and the
+   delivery's rule for a cross-model head is adopt-as-a-draft with its **own** cache, so the absence of a
+   decline line asserted nothing.  The faithful check is the positive fact and arch-agnostic: **>= 2 distinct
+   KV-cache geometries at load** (`(N cells, L layers)`), since a draft that viewed or aliased the target's
+   memory would print one.

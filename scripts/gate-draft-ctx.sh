@@ -27,10 +27,16 @@
 #                 HARD  `draft-mtp` text == plain text, byte for byte, and identical across repeats
 #                       (GREEDY-PURITY: a drafter that changes the target's text is a defect, not a speed)
 #   arm `census`  one `-lv 4` `draft-mtp` run
-#                 HARD  the constructor's decline line is present: `is a context of ANOTHER model (a draft
-#                       head)`.  This is the MECHANISM check -- it proves the arm reached the cross-model
-#                       branch and that the delivery's rule was NOT "adopt it".  A change that adopts a
-#                       cross-model ctx_other must update this gate with the classification it intends.
+#                 HARD  the draft context built ITS OWN memory module: at least two DISTINCT KV-cache
+#                       geometries appear at load (`llama_kv_cache: size = ... (N cells, L layers, ...)`),
+#                       because a draft that viewed/aliased the target's cache would print ONE.  This is the
+#                       MECHANISM check, and it is what replaced the block-17 message `is a context of
+#                       ANOTHER model (a draft head)` after r352 withdrew the generic `ctx_other` arm: the
+#                       delivery's rule for a cross-model head is ADOPT-as-a-draft (qwen4exp/eagle3/dflash
+#                       need the target's `token_embd`/`output`) with its OWN cache, so the decline line no
+#                       longer exists and its absence meant nothing (2026-11-23, WORKLOG 261123.012).
+#                 INFO  the memory kind the arch names for the draft (`create_memory: MTP context uses ...`),
+#                       when it logs one -- a second, arch-specific confirmation of the same fact
 #                 HARD  a `draft acceptance` line with a rate > 0: the drafter really drafted, so the
 #                       comparison above is not two plain runs wearing different flags
 #                 HARD  no `ctx_other must be a context of the same model` (the failure this gate exists for)
@@ -158,7 +164,7 @@ hard "$([ "$uniq_mtp" = 1 ] && [ -n "${mtp_hashes[0]}" ] && echo 1 || echo 0)" \
     "the $RUNS draft-mtp runs read ONE text ($uniq_mtp distinct, ${mtp_hashes[0]:-<none>})"
 
 echo
-echo "--> arm census: the constructor's rule was reached and DECLINED the cross-model ctx_other"
+echo "--> arm census: the DRAFT built its own memory module (it does not view the target's cache)"
 census="$LOGDIR/census.log"
 timeout "$TIMEOUT" env HIP_VISIBLE_DEVICES="$DEV" $PIN \
         "$LLAMA_CLI" -m "$MODEL" -md "$DRAFT" -ngl 999 --fit off \
@@ -168,8 +174,15 @@ timeout "$TIMEOUT" env HIP_VISIBLE_DEVICES="$DEV" $PIN \
         -p "$PROMPT" --seed 42 --temp 0 --no-display-prompt --single-turn >"$census" 2>&1
 hard "$([ $? -eq 0 ] && echo 1 || echo 0)" "the census run completed"
 
-hard "$(grep -q "is a context of ANOTHER model (a draft head)" "$census" && echo 1 || echo 0)" \
-    "the cross-model ctx_other was DECLINED (constructor census line present)"
+# The draft's own cache: at least two DISTINCT (cells, layers) geometries at load.  A draft that shared the
+# target's memory would print one, which is exactly the defect this arm exists to catch.  (`-md`'s head is a
+# separate model with its own layer count on this family: 12 target layers vs 1 draft layer.)
+geoms="$(grep -o "size = .*( *[0-9]* cells, *[0-9]* layers" "$census" | sed 's/.*( *\([0-9]*\) cells, *\([0-9]*\) layers/\1 cells \2 layers/' | sort -u)"
+n_geoms="$(printf '%s\n' "$geoms" | grep -c . )"
+hard "$([ "${n_geoms:-0}" -ge 2 ] && echo 1 || echo 0)" \
+    "the draft has its OWN KV cache (${n_geoms:-0} distinct cache geometries at load)"
+printf '%s\n' "$geoms" | sed 's/^/        cache geometry: /' | head -6
+grep -o "create_memory: MTP context uses .*" "$census" | tail -1 | sed 's/^/        /' || true
 hard "$(! grep -q "ctx_other must be a context of the same model" "$census" && echo 1 || echo 0)" \
     "no same-model refusal (the r346/r347 failure this gate exists for)"
 

@@ -205,11 +205,13 @@ in CI.  The model-level gates are manual:
    arm is the previous arm via `--ab "GGML_CUDA_ALLREDUCE=hybrid"`.
    **The base is PER TOOLCHAIN, and the build the gate runs must link the line it was recorded on** (r339): the
    base meta records `rocm=`, and the gate refuses a cross-line compare because the low bits of every prefill
-   kernel move between ROCm lines.  On this box the recorded base is the **10.1** line while the canonical
-   `~/bin/build-llama-rocm` now targets **10.2**, so a release runs the gate from a 10.1 build of the same tree --
-   `BUILD_DIR=build-rocm-101 ~/bin/build-llama-rocm-101` (ccache-warm, ~1 min) -- and passes
-   `--ppl ~/llama.cpp/build-rocm-101/bin/llama-perplexity`.  Re-recording a 10.2 base (`--record` from the
-   previous release's build) is the other legal answer, but it moves the reference and must be recorded as such.
+   kernel move between ROCm lines.  **The canonical line is 10.2.0** (the one `~/bin/build-llama-rocm` links and
+   the one `release.json`'s arms are measured on), and the recorded base carries it in its FILE name
+   (`…-rocm-10.2.0-gfx120X.kld`), so a 10.1 build is no longer part of the reference: **10.1 was retired
+   2026-11-23** (`INVARIANTS.md` r359-wip: 10.1's hipBLASLt 1.4 is the pre-`c50ea60130f` library, and forcing its
+   lib dir into `LD_LIBRARY_PATH` under a 10.2 build made cross-process text comparisons a coin flip).  A base
+   recorded on another line is refused by the gate; re-record with `--record` from the previous release's build
+   on 10.2 when the reference must move.
    The default arm is an **f16 KV cache**, which skips the quantized-cache prefill paths (the F16 FA staging
    arena, `GGML_CUDA_FA_KV_NATIVE`'s tile read); a change to those also needs `--kv q8_0` (its own base file,
    r156).

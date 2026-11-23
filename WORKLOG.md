@@ -1,3 +1,94 @@
+## 261123.012 (no release; tooling + gates) -- the ROCm 10.1 default is gone from `scripts/`: `LD_LIBRARY_PATH` had been shadowing the build's own runtime, which is what made cross-process text comparisons a coin flip. Plus `gate-draft-ctx.sh`'s census arm re-stated against the current rule, and the container lines are 7.14.1 + 10.2.0
+
+The maintainer's instruction after the STEP 3 finding: drop 10.1 everywhere, and the release containers reference
+only **7.14.1** and **10.2.0**.  **No delivery patch changed**; the delivery's *instrumentation* did.
+
+### 1. The finding, precisely (it was not "a missing pin")
+
+A gate that compares generated text between **fresh processes** had been doing it under **two toolchains**:
+
+```
+scripts/<gate>: LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}"
+```
+
+`LD_LIBRARY_PATH` is searched **before** a binary's `DT_RUNPATH`, so a build linked against ROCm **10.2.0** ran
+against **10.1.0's** runtime -- silently, because every soname matches:
+
+```
+with that default : libamdhip64.so.7, librocblas.so.5, libhipblaslt.so.1 => /opt/rocm-10.1.0-gfx120X/lib
+without it        : the same three                                     => /opt/rocm-10.2.0-gfx120X/lib
+```
+
+10.1.0 ships `libhipblaslt.so.1.4` (9.2 MB), 10.2.0 ships `.1.5` (3.4 MB) -- 1.4 is the pre-`c50ea60130f`
+library whose per-shape candidate **container** lets each fresh process pick its own solution
+(`GREEDY-PURITY.md` §44).  Measured on `gate-park-idle-slots.sh`, whose three arms are each a fresh server:
+
+| `LD_LIBRARY_PATH` | pin | the SAME arm (`park`, identical args) across fresh runs | gate |
+|---|---|---|---|
+| 10.1.0 (the old default) | none | `6a6e67…` · `6a6e67…` · `6a6e67/229547/2b4487/824b24` · `4f468c…` | **FAIL** whenever two arms drew different classes |
+| 10.1.0 | `ROCBLAS_USE_HIPBLASLT=0` | 3 runs × 3 arms, all identical | pass (the workaround) |
+| **10.2.0 (the build's)** | **none** | 2 runs × 3 arms, all identical, `parkoff` stably different | **pass, hipBLASLt enabled** |
+
+So the failure condition is a **byte text comparison across fresh processes**, and the variable was the
+**process's library set**, not the parking policy (the same arm disagreed with itself across runs).  It also
+explains why `check-hipblaslt-lottery.sh` reads `NO-CHOICE`: that script does not force the 10.1 path, so it
+loads 1.5 -- the delivery's instrument and its gates had been measuring different libraries.
+
+### 2. What changed (21 files, all instrumentation)
+
+* **`scripts/rocmlib.sh` (new, sourced)**: `rocm_libdir` / `rocm_ld_library_path` / `rocm_dir` resolve the ROCm
+  the BUILD links -- `$ROCM_LIB`, then the first `/opt/rocm*/lib` entry of the binary's `RUNPATH`, then the
+  newest `/opt/rocm-<v>-gfx*/lib`.  `rocm_ld_library_path` keeps the old `${LD_LIBRARY_PATH:-<default>}`
+  semantics exactly: a caller's value wins; only the *default* is now derived rather than hardcoded.
+* **19 gate/tool scripts** source it and no longer name an install: the 11 `-gfx120X` `LD_LIBRARY_PATH` gates
+  (`gate-park-idle-slots`, `gate-state-pipe`, `gate-spec-ckpt-device`, `gate-spec-align`, `gate-spec-width-band`,
+  `gate-spec-draft-window`, `gate-spec-reuse-window`, `gate-moe-promise`, `gate-graph-replay-width`,
+  `gate-ckpt-reuse`, `gate-seqpar`, `gate-server-arms`, `gate-qsa-topk-regular`, `gate-host-read-transport`,
+  `gate-moe-host-offload`), the two APU gates that prepended `-gfx1151`
+  (`gate-uma-experts`, `gate-prefill-server-slots`), the two BUILD-side tools (`gate-per-block-build`,
+  `scratch-tree`) and `validate-gpu.sh`'s auto-detect.
+* **containers**: `scripts/build-containers.sh` and `scripts/container-watch.sh` default to
+  **`7.14.1 10.2`**; `10.2)` maps to `10.2.0-full` and owns the `latest` tag; a `10.1` request is **refused**
+  with the reason in the message (it was `10.1) … 10.1.0` before).  `.github/workflows/docker-ghcr.yml` (both
+  its default input and its matrix case arms) and `release.yml`'s release-note text follow.  Verified on the
+  worker: `rocm/dev-ubuntu-24.04:10.2.0-full` and `:7.14.1-full` are both pullable from `radiance`, which has
+  `/opt/rocm-10.2.0-gfx1151` installed.
+* **docs, current-state lines only**: `AGENTS.md` (the build block and the container commands),
+  `CONTAINERS.md` (the line table, the tags, and a retirement note), `BASELINE.md` (the 10.1 row is now
+  RETIRED), `MANIFESTS.md` (the prefill-logit base paragraph: the canonical line is 10.2 and a 10.1 build is no
+  longer part of the reference), `ENVIRONMENT.md` (`LD_LIBRARY_PATH`'s row says which line, and why never
+  another), `scripts/README.md` (the new helper, and `validate-gpu`'s auto-detect).  Dated records
+  (`WORKLOG.md`, `INVARIANTS.md`, `GREEDY-PURITY.md`, `benchmarks/`, `wiki/`, `patches/README.md`) keep 10.1
+  where it is a measurement or a dated decision -- those are history, not defaults.
+
+### 3. `gate-draft-ctx.sh`: the census arm re-stated (11/11)
+
+Its census check grepped for block 17's `is a context of ANOTHER model (a draft head)` message, which the r352
+withdrawal deleted -- and the delivery's rule for a cross-model head is **adopt-as-a-draft with its OWN
+cache** (qwen4exp/eagle3/dflash need the target's `token_embd`/`output`), so "no decline line" meant nothing.
+The check is now the positive fact, arch-agnostic: **at least two DISTINCT KV-cache geometries at load**
+(`llama_kv_cache: size = … (N cells, L layers, …)`), because a draft that viewed or aliased the target's memory
+would print one.  On the default shape it reads three (`8192 cells 12 layers` target, `8192 cells 1 layers`
+draft, `1 cells 48 layers` indexer), plus the arch's own note
+(`create_memory: MTP context uses a hybrid-idx memory (sparse draft attention)`) as INFO.  The gate now passes
+**11/11** (`e7aae6034b4f`, acceptance 0.81429).
+
+### 4. Re-measured after the fix
+
+| arm | before (10.1 shadowing) | after (10.2) |
+|---|---|---|
+| `gate-park-idle-slots.sh`, no pins | FAIL 1-2 of every 2-4 runs | **PASS**, and `parkoff` stably differs (the #210 dependence is reproducible) |
+| `gate-state-pipe.sh`, no pin | passed (ran under 10.1) | **PASS**, pipe 19.8 ms vs sync 41.4 ms (0.48×) |
+| `gate-spec-ckpt-device.sh`, no pin | passed (ran under 10.1) | **PASS**, text/drafts/accepted identical, −148 MiB resident |
+| `gate-draft-ctx.sh` | 10/11 (census unreachable) | **11/11** |
+| Flash-Next host-tier, **2 concurrent slots**, 3 fresh runs, 10.2 + hipBLASLt on | — | slot 0 **stable** (`3ec8e6750cd6` ×3); slot 1 **two classes** (`b2e646545bd9` once, `c60b5a919c9b` twice) |
+
+The last row is the answer to "re-assess whether this is still an issue": **the toolchain was one cause and it is
+gone**, and a *residual, real* effect remains -- with two requests in flight the interleaving picks the batch
+composition, and the composition picks the kernels (DESIGN V8), so **one slot's answer can vary run to run on
+that shape even on 10.2**.  Slot 0 was stable throughout.  So a byte text claim on this shape belongs at one
+request in flight; the concurrent arms carry the non-text claims.
+
 ## 261123.011 (no release; `prefill-decode-arms` v2 STEP 5) -- `llama_memory_recurrent` is contextified: the per-batch placement moves out of the module, a graph-time getter stops mutating, and two contexts on one recurrent memory now read their OWN placement
 
 `PLAN.md` STEP 5 -- **the step that makes the whole design possible** (the upstream `TODO: extract all the state

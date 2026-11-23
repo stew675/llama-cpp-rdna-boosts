@@ -8,6 +8,57 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — tooling: the ROCm 10.1 shadow removed, the draft-ctx check fixed, containers on 10.2 (`WORKLOG.md` 261123.012)
+
+Not a campaign step: the delivery's *instrumentation*.  Triggered by STEP 3's finding that
+`gate-park-idle-slots.sh` failed without a `ROCBLAS_USE_HIPBLASLT=0` pin.
+
+### The failure condition, measured (it was the toolchain, not the pin)
+
+`LD_LIBRARY_PATH` is searched **before** `DT_RUNPATH`; 19 scripts defaulted it to the retired
+`/opt/rocm-10.1.0-gfx120X/lib` while the build links 10.2.0:
+
+```
+with the old default : libamdhip64.so.7, librocblas.so.5, libhipblaslt.so.1 => /opt/rocm-10.1.0-.../lib
+with the build's     : the same three                                      => /opt/rocm-10.2.0-.../lib
+libhipblaslt: 10.1.0 -> .so.1.4 (9.2 MB)   |   10.2.0 -> .so.1.5 (3.4 MB)   # 1.4 = the pre-c50ea60130f container
+```
+
+The `park` arm (identical args, fresh process each run):
+
+| library set | pin | same arm across runs | gate |
+|---|---|---|---|
+| 10.1.0 | none | `6a6e67…` · `6a6e67…` · `6a6e67/229547/2b4487/824b24` · `4f468c…` | FAIL 1-2 of every 2-4 runs |
+| 10.1.0 | `ROCBLAS_USE_HIPBLASLT=0` | 3 runs x 3 arms identical | pass |
+| 10.2.0 | none | 2 runs x 3 arms identical, `parkoff` stably different | **PASS** |
+
+### After the fix (all re-run on the build's own 10.2 runtime, no pins)
+
+| gate | result |
+|---|---|
+| `gate-park-idle-slots.sh` | **PASS**, no env pins at all; `parkoff` stably differs (the #210 dependence is reproducible) |
+| `gate-state-pipe.sh` | **PASS** (pipe 19.8 ms vs sync 41.4 ms, 0.48x) |
+| `gate-spec-ckpt-device.sh` | **PASS** (identical text/drafts/accepted; -148 MiB resident) |
+| `gate-draft-ctx.sh` | **PASS 11/11** with the re-stated census arm (`e7aae6034b4f`, acceptance 0.81429) |
+
+### Re-assessment of the Flash-Next concurrency question (STEP 9 input)
+
+Flash-Next host-tier IQ4_NL, **2 concurrent slots**, 3 fresh processes, 10.2 + hipBLASLt **on**:
+
+| run | slot 0 (reasoning) | slot 1 (recall) |
+|---|---|---|
+| 1 | `3ec8e6750cd6` (188 ch) | `b2e646545bd9` (251 ch) |
+| 2 | `3ec8e6750cd6` | `c60b5a919c9b` (248 ch) |
+| 3 | `3ec8e6750cd6` | `c60b5a919c9b` |
+
+The toolchain cause is gone (slot 0 is stable, and the earlier 147-vs-188 observation was 10.1-era noise); a
+**residual** effect is real: with two requests in flight the interleaving picks the batch composition and the
+composition picks the kernels, so one slot's answer can vary run to run.  Conclusion for STEP 9: anchor the
+**byte** claim at one request in flight; the concurrent arms carry the non-text claims (no fault/OOM, per-slot
+== that slot solo with the others resident, cell census).
+
+---
+
 ## 2026-11-23 — STEP 5: `llama_memory_recurrent` contextified (`WORKLOG.md` 261123.011)
 
 2 files, +119/-48 (`src/llama-memory-recurrent.{h,cpp}`).

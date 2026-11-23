@@ -50,6 +50,7 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 LLAMA_BUILD="${LLAMA_BUILD:-$HOME/llama.cpp/build-rocm}"
 LLAMA_SERVER="${LLAMA_SERVER:-$LLAMA_BUILD/bin/llama-server}"
 PROMPT="${PROMPT:-$REPO_DIR/prompts/prose-rdna-boosts.txt}"
@@ -60,7 +61,7 @@ ACC_TOL="${ACC_TOL:-0.10}"
 PORT="${PORT:-18360}"
 TIME_LIMIT="${TIME_LIMIT:-2400}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
-DEFAULT_LD_LIBRARY_PATH=/opt/rocm-10.1.0-gfx120X/lib
+DEFAULT_LD_LIBRARY_PATH="$(rocm_ld_library_path "$LLAMA_SERVER")"
 
 FN=/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
 FN_D=/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-DFlash2-Q8_0.gguf

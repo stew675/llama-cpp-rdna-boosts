@@ -53,6 +53,7 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 LLAMA_SERVER="${LLAMA_SERVER:-$HOME/llama.cpp/build-rocm/bin/llama-server}"
 MODEL="${MODEL:-/llm/models/Qwen3.5/122B-A10B/Q8_0/Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf}"
 LME="${LME:-90}"
@@ -80,7 +81,7 @@ done
 [ -x "$LLAMA_SERVER" ] || { echo "ERROR: no llama-server at $LLAMA_SERVER" >&2; exit 2; }
 [ -f "$MODEL" ]        || { echo "ERROR: no model at $MODEL" >&2; exit 2; }
 
-export LD_LIBRARY_PATH="/opt/rocm-10.1.0-gfx1151/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$(rocm_ld_library_path)"
 export HIP_VISIBLE_DEVICES="$GPU"
 export MOE_EXPERT_HEATMAP=load        # the frozen prior: every arm starts from the same arena
 

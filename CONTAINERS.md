@@ -40,7 +40,15 @@ Registry path: `ghcr.io/<owner>/<repo>` (here
 |------|-----------|------|
 | 7.2  | `rocm/dev-ubuntu-24.04:7.2.4-complete`  | `rocm-7.2`, `server-rocm-7.2`, `light-rocm-7.2`, `full-rocm-7.2` *(manual dispatch only)* |
 | 7.14.1 | `rocm/dev-ubuntu-24.04:7.14.1-full`   | `rocm-7.14.1`, `server-rocm-7.14.1`, `light-rocm-7.14.1`, `full-rocm-7.14.1` |
-| 10.1   | `rocm/dev-ubuntu-24.04:10.1.0-full`   | `rocm-10.1`, `server-rocm-10.1`, `light-rocm-10.1`, `full-rocm-10.1`, `latest` |
+| 10.2   | `rocm/dev-ubuntu-24.04:10.2.0-full`   | `rocm-10.2`, `server-rocm-10.2`, `light-rocm-10.2`, `full-rocm-10.2`, `latest` |
+
+> **ROCm 10.1 is RETIRED (2026-11-23).**  The two published lines are **7.14.1** and **10.2.0**.  10.1's
+> hipBLASLt is **1.4**, the pre-`c50ea60130f` library whose per-shape candidate container makes hipBLASLt pick a
+> different solution per process -- the mechanism behind `GREEDY-PURITY.md` §44.  It also broke every gate that
+> forced `/opt/rocm-10.1.0-gfx120X/lib` into `LD_LIBRARY_PATH` while the build linked 10.2: a cross-process text
+> comparison then became a coin flip (`INVARIANTS.md` r359-wip).  `scripts/build-containers.sh` refuses the line
+> rather than building it.  An existing `rocm-10.1*` tag is left in the registry until `cleanup-ghcr.py`'s window
+> passes; do not pull it for a result you intend to quote.
 
 **ROCm 7.2 is not built by default.**  Its `-complete` base image compiles several times more slowly
 than the `-full` lines, and from release r10 onward its full image no longer fitted the 6 h build
@@ -53,20 +61,20 @@ Each tag also has an immutable `<tag>-<fork-point>` variant pinned to the fork
 point (currently `<tag>-6050b467c`; earlier releases used `<tag>-a55e952b8`,
 `<tag>-84e76d8a2`, `<tag>-ebbb18522`, `<tag>-d1d3c3396` and `<tag>-790cf51aa`)
 and a `<tag>-<release>` variant pinned to the RELEASE (e.g.
-`ghcr.io/stew675/llama-cpp-rdna-boosts:server-rocm-10.1-v16-6050b467c-r222`).
+`ghcr.io/stew675/llama-cpp-rdna-boosts:server-rocm-10.2-v17-919794500-r353`).
 `rocm-<version>` is an alias of `server-rocm-<version>` (the serving image, with
-its own `-<release>` variant); `latest` points at the newest ROCm (10.1) server
+its own `-<release>` variant); `latest` points at the newest ROCm (10.2) server
 image.
 
 **Provenance: pin the release, and read the labels (r222, issue #272 follow-up).**
 The fork-point variants cannot say *which release* an image carries, because one
-fork point serves many releases, and the moving tags (`rocm-10.1`, `latest`) are
+fork point serves many releases, and the moving tags (`rocm-10.2`, `latest`) are
 overwritten every release.  A reporter on issue #272 could not tell whether the
 "newer fork image" he had tested was r218 or r219.  So every image also carries
 `-<release>` tags, and its labels name the release instead of only the fork point:
 
 ```
-$ podman inspect --format '{{json .Labels}}' ghcr.io/stew675/llama-cpp-rdna-boosts:rocm-10.1 | python3 -m json.tool
+$ podman inspect --format '{{json .Labels}}' ghcr.io/stew675/llama-cpp-rdna-boosts:rocm-10.2 | python3 -m json.tool
 {
   "org.opencontainers.image.version": "v16-6050b467c-r222",     # the release (release.json .release)
   "org.opencontainers.image.revision": "80bfb80be...",          # its canonical tip (.tip)
@@ -133,7 +141,7 @@ target.  On the validation host `llama-bench` (9B Q8_0) measured 577.27 vs
 > reproduced here) to break greedy purity where 7.14 is clean, see the "Separate,
 > untriaged" note in `TODO.md` item 22; it was also dropped from the automatic release
 > matrix because its image build outgrew the runner timeout (see the note above).
-> Prefer `rocm-7.14.1` (or `rocm-10.1`) for speculative decoding and for anything
+> Prefer `rocm-7.14.1` (or `rocm-10.2`) for speculative decoding and for anything
 > compared against the recorded hashes; if a 7.2 run disagrees with a 7.14 run,
 > suspect the toolchain before the delivery.
 
@@ -178,7 +186,7 @@ What applies / what does not:
   build at all (`mmb.cu`, `fattn-qsa3.cu`).  They are now `#if defined(RDNA4)
   ... #elif defined(RDNA3) ... #else <no-op> #endif`, so RDNA2 compiles a dead
   arm that is never launched; RDNA3/RDNA4 codegen is byte-identical.
-* **BLAS routing is covered.**  rocBLAS in the `7.14.1-full` and `10.1.0-full`
+* **BLAS routing is covered.**  rocBLAS in the `7.14.1-full` and `10.2.0-full`
   base images carries `gfx1030` Tensile kernels (verified), so the `cublas`
   fallback works.  hipBLASLt does **not** ship `gfx1030`, but llama.cpp uses
   rocBLAS unless `ROCBLAS_USE_HIPBLASLT` is set — which this delivery does not
@@ -228,7 +236,7 @@ packaging stays in CI:
   to the GitHub Release (about a minute; no compiler, no Docker).  The tag is
   checked against `release.json.release` and the `v<blocks>-<base>-r<N>` shape.
 - **off-host image build** → the `radiance` watcher (`scripts/container-watch.sh`)
-  sees the new tag and runs `scripts/build-containers.sh --rocm "7.14.1 10.1"
+  sees the new tag and runs `scripts/build-containers.sh --rocm "7.14.1 10.2"
   --push --prune` there.  For a manual build, run the same script on whichever box
   you prefer; either way it reads the tree from `release.json`, not from the tag.
   **The watcher runs the script as it exists in the TAG it is building**, so a
@@ -277,7 +285,7 @@ To cut a release after a re-base or a block amendment:
 # (see "Offload the image build to a worker").  To smoke-test or to build on this
 # box instead, run the script manually (do the full build on the worker during a
 # release so it does not tie up the primary box):
-./scripts/build-containers.sh --rocm "7.14.1 10.1" --push --prune
+./scripts/build-containers.sh --rocm "7.14.1 10.2" --push --prune
 
 # freeze it: annotated tag on the commit that carries this release.json
 git tag -a v<blocks>-<base-sha>-r<N> -m "rdna-boosts v<blocks>-<base-sha>-r<N>"
@@ -326,10 +334,10 @@ gh auth refresh -h github.com -s write:packages            # once; podman needs 
 gh auth token | podman login ghcr.io -u stew675 --password-stdin
 
 ./scripts/build-containers.sh --prepare-only               # reconstruct + verify the release tree
-./scripts/build-containers.sh --rocm "7.14.1 10.1" --push # build + push the release images
+./scripts/build-containers.sh --rocm "7.14.1 10.2" --push # build + push the release images
 
 # fast smoke: one ROCm line, one GPU arch, one target, no push
-./scripts/build-containers.sh --rocm 10.1 --arch gfx1201 --targets server
+./scripts/build-containers.sh --rocm 10.2 --arch gfx1201 --targets server
 ```
 
 `--src DIR` overrides the build-context tree (default `$HOME/llama-src`);
@@ -359,7 +367,7 @@ images and the ccache store** — re-pulling the ~20 GB base images on every
 release is the waste a bare `podman system prune -a` causes:
 
 ```bash
-./scripts/build-containers.sh --rocm "7.14.1 10.1" --push --prune
+./scripts/build-containers.sh --rocm "7.14.1 10.2" --push --prune
 ```
 
 ### Registry cleanup (GHCR)
@@ -383,11 +391,11 @@ prunes them with [`scripts/cleanup-ghcr.py`](scripts/cleanup-ghcr.py):
 
 ```bash
 # normal release: cleanup is on with --push
-./scripts/build-containers.sh --rocm "7.14.1 10.1" --push --prune
+./scripts/build-containers.sh --rocm "7.14.1 10.2" --push --prune
 
 # opt out, or widen/narrow the window
-./scripts/build-containers.sh --rocm "7.14.1 10.1" --push --prune --no-cleanup
-./scripts/build-containers.sh --rocm "7.14.1 10.1" --push --prune --keep-days 14
+./scripts/build-containers.sh --rocm "7.14.1 10.2" --push --prune --no-cleanup
+./scripts/build-containers.sh --rocm "7.14.1 10.2" --push --prune --keep-days 14
 ```
 
 The prune needs a token with the **`delete:packages`** scope (once):
@@ -454,7 +462,7 @@ pin the block count, so a `v12-*` -> `v13-*` rename cannot make it go quiet (it 
 (not a version sort: the base SHA is in the tag name, so a re-base to a lower-sorting
 base would otherwise be missed), and if it differs from
 `~/.cache/rdna-containers/last-built`, checks it out and runs that tag's
-`scripts/build-containers.sh --rocm "7.14.1 10.1" --push --prune`.  `--prune`
+`scripts/build-containers.sh --rocm "7.14.1 10.2" --push --prune`.  `--prune`
 removes the images just built plus dangling layers after a successful push, so the
 worker's disk stays bounded; the ROCm base images (~20 GB each) and the ccache
 store (bounded at `CCACHE_MAXSIZE=20G`) are deliberately kept.  A `flock` serialises
