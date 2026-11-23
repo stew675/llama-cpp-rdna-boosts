@@ -32,6 +32,12 @@ the purity rulebook.
   THESE blocks; the prefix is derived by `scripts/make-release.sh`, never hand-written.
 * `0300`-`0399` — **temporary** blocks.  They ARE in the default apply (after every `00xx`), and they are
   **not** counted in `v<N>`.  Currently `0300` (`-sm relaxed-tensor`, `TODO` #104).
+* **Block 17 (the two-arm server) is WITHDRAWN from the delivery as of r352.**  It was an official block from
+  r346 to r351 and now lives in `beta/prefill-decode-arms/` (apply with `apply-all.sh --include-beta`, never by
+  default): it is not in `patches/`, not counted in `v<N>`, and its gates (`gate-arms-spec.sh`,
+  `gate-draft-ctx.sh`, `gate-arms-soak.sh`, `MANIFESTS.md` gate 17/39) are beta-only, not release gates.  The
+  `v<N>` prefix is `v17-` because the official set is `0000`-`0016`.  Re-admitting it is the maintainer's
+  decision (the usual "ALWAYS ask before creating a block" rule) and it needs a validated window first.
 * `0100`-`0199` — **optional** blocks under `optional/<name>/<NNNN>-<name>.patch`.  They are never in the
   default apply, the default tree, `rdna-boosts-all.patch`, the fork branch or the default release gates;
   `scripts/apply-all.sh --include-optional[-all]` applies them on the verified default tree in **numeric**
@@ -382,7 +388,7 @@ tier runs what); this table is the quick answer for a change in flight.
 | the server's context-checkpoint or speculative-checkpoint path | `scripts/gate-ckpt-reuse.sh` / `scripts/gate-spec-ckpt-device.sh` |
 | a state save/restore (`llama_io_*`, `state_stage`) | `scripts/gate-state-pipe.sh` |
 | the verify-batch alignment / a multi-slot draft width | `scripts/gate-spec-align.sh` / `scripts/gate-spec-width-band.sh` |
-| the context constructor's `ctx_other` adoption rule, or anything that gives a DRAFT context a `ctx_other` (an external shared-NextN MTP head is its own GGUF and its own model object) | `scripts/gate-draft-ctx.sh` (the head must load, keep its own cache, and not move the target's text; a same-model `ctx_other` keeps block 17's shared view) |
+| the context constructor's `ctx_other` adoption rule, or anything that gives a DRAFT context a `ctx_other` (an external shared-NextN MTP head is its own GGUF and its own model object) | `scripts/gate-draft-ctx.sh` (the head must load, keep its own cache, and not move the target's text; a same-model `ctx_other` keeps block 17's shared view) | **[BETA ONLY since r352 — block 17 is withdrawn to `beta/prefill-decode-arms/`]**
 | the chunked-GDN prefill threshold (`GDN_CHUNKED_MIN_TOKENS`), `n_rs_batch`'s use as a kernel input, or a speculator's draft width | `scripts/gate-spec-gdn-split.sh` |
 | the MTP target h-rows path (`LLAMA_MTP_DEV_ROWS`), the `h_nextn` device buffer, or `llama_set_ctx_state_src` | `scripts/gate-mtp-dev-rows.sh` |
 | a qwen4exp hyper-connection op, chain or matcher | `scripts/gate-hc-fusions.sh MODEL.gguf` |
@@ -397,7 +403,7 @@ tier runs what); this table is the quick answer for a change in flight.
 | the MTP draft KV window (block 14 Goal C) | `scripts/gate-spec-draft-window.sh` |
 | a drafter's own KV cache: the DFlash/MTP prompt-ingest tail, a restored draft checkpoint, or anything that decides which rows a draft ingests | `scripts/gate-spec-reuse-window.sh` |
 | the KV window/region provider, the attendance pool, `is_streaming()` or the sparse decode arm (block 14) | `scripts/gate-kv-residency.sh` |
-| a speculator ON the two-arm server: the decode arm's batch composition or width, `common_speculative_add_target_ctx()`, the MTP per-batch target-context read, the draft ingest's `arms_quiet` bracket, `spec_slot_reset()`, `accept_draft_round()`, or the arms+draft reserve sum (block 17) | `scripts/gate-arms-spec.sh` (a **three-way cold** text claim -- `pair+draft-mtp` == `pair+none` == `single+draft-mtp` -- plus non-vacuity, the adaptive controller, the MTP four axes on the pair and a concurrency arm; every arm pins `LLAMA_SERVER_PARK_IDLE_SLOTS=0` or the two servers place the next sequence at different cells and a near-tie flips, `GREEDY-PURITY.md` §107) |
+| a speculator ON the two-arm server: the decode arm's batch composition or width, `common_speculative_add_target_ctx()`, the MTP per-batch target-context read, the draft ingest's `arms_quiet` bracket, `spec_slot_reset()`, `accept_draft_round()`, or the arms+draft reserve sum (block 17) | `scripts/gate-arms-spec.sh` (a **three-way cold** text claim -- `pair+draft-mtp` == `pair+none` == `single+draft-mtp` -- plus non-vacuity, the adaptive controller, the MTP four axes on the pair and a concurrency arm; every arm pins `LLAMA_SERVER_PARK_IDLE_SLOTS=0` or the two servers place the next sequence at different cells and a near-tie flips, `GREEDY-PURITY.md` §107) | **[BETA ONLY since r352 — block 17 is withdrawn to `beta/prefill-decode-arms/`]**
 | the tile FA launcher's decode/verify KV split (`parallel_blocks`), the band's own fixup period `P` (`ggml_cuda_fattn_band_wmma_split`), the band predicates, the KV extent/padding (`get_n_kv`, `LLAMA_KV_N_PAD_*`) or a speculator's verify-batch composition | `scripts/gate-spec-purity.sh` (plain == draft-mtp on q8_0 and bf16 at 3-device `-sm tensor`, plus the width probe's 256-cell-boundary arm; `--control` proves the pre-fix split diverges) |
 | a GDN fold's own matcher (`gdn_conv_norm_match`, which layouts a fold accepts) or the conv-state gather deferral (`gdn_deferred_gathers`, `ggml_cuda_gdn_conv_gather_deferrable`) | `test-logits-width-probe` with `KV=q8_0` at `P=3584` and `P>=4096` on a dense and a MoE GDN model, plus a matcher **census**: a decision change moves no hash, so the arm is vacuous unless it shows the refusal (`deferred=1 base=overlap_state`) before and the fold after |
 | the Meta split-state cache: the warm walk, a cache version, the resolve step or `calculate_split_state` (block 09) | `scripts/gate-seqpar.sh` plus the `-sm tensor` arms of `scripts/gate-host-pool.sh` and `scripts/gate-prefill-logits.sh`, and identical `-sm tensor` text against the previous build |

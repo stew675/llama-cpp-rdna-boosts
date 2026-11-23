@@ -1,7 +1,7 @@
-From a8e13cdc9c4ba00ae682b17f1cf7cbd54c9fe2fd Mon Sep 17 00:00:00 2001
+From fba0f505b24a07a894162780c82cb8bf569103bf Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 22 Nov 2026 11:59:13 -0600
-Subject: [PATCH 17/18] rdna-boosts: block 17: the two-arm server -- an opt-in
+Subject: [PATCH] rdna-boosts: block 17: the two-arm server -- an opt-in
  prefill arm and a decode arm co-owning one KV
 
 An opt-in llama-server mode with TWO llama_contexts on one model: a
@@ -149,7 +149,7 @@ included) beside the normal `GGML_HIP_NO_VMM=OFF` one.
  30 files changed, 3683 insertions(+), 367 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index ee0bbac3e..ea5ba7aea 100644
+index dedf56bf4..3e068dcef 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2678,6 +2678,48 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -689,7 +689,7 @@ index 14d30193f..7cccd08f6 100644
  // prompt ingestion (LLAMA_MTP_INGEST_TAIL)
  void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos n_prompt);
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index d0fecde6c..27038c7be 100644
+index b031d1b77..91cf39982 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
 @@ -202,6 +202,11 @@ extern "C" {
@@ -705,10 +705,10 @@ index d0fecde6c..27038c7be 100644
      GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
  
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 0affce9df..1cc468d10 100644
+index b71bc089e..86d851a25 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -803,12 +803,21 @@ struct ggml_backend_meta_simple_tensor_container {
+@@ -805,12 +805,21 @@ struct ggml_backend_meta_simple_tensor_container {
  };
  
  // The external views of a buffer live in a rotating pair of containers that assumes ONE live graph: a rebuild
@@ -734,7 +734,7 @@ index 0affce9df..1cc468d10 100644
      g_meta_view_slot = slot;
  }
  
-@@ -831,8 +840,9 @@ struct ggml_backend_meta_buffer_context {
+@@ -833,8 +842,9 @@ struct ggml_backend_meta_buffer_context {
      // Current solution: rotating set of 2 "compute" containers to hold external views, works correctly for llama.cpp.
      // Long-term: tie the lifetime of external views to the meta backend executing the graph instead,
      //     currently not possible due to graph-external operations in the backend scheduler.
@@ -746,7 +746,7 @@ index 0affce9df..1cc468d10 100644
      ggml_backend_meta_simple_tensor_container stc_static;
      ggml_backend_meta_simple_tensor_container stc_compute[n_view_slots][2];
      // views created between graph evals, reset by their creator once the copies that read them are done
-@@ -878,10 +888,21 @@ struct ggml_backend_meta_buffer_context {
+@@ -880,10 +890,21 @@ struct ggml_backend_meta_buffer_context {
              return std::hash<const void *>()(k.first) ^ (size_t) k.second;
          }
      };
@@ -772,7 +772,7 @@ index 0affce9df..1cc468d10 100644
  
      ggml_backend_meta_buffer_context(
              ggml_backend_meta_simple_tensor_container & stc_static,
-@@ -2017,9 +2038,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -2073,9 +2094,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
  
      // Current-version cache test, used only to prune the walk (a false negative just visits a node that
      // the nested lookup then resolves from another version, so pruning is always safe).
@@ -787,7 +787,7 @@ index 0affce9df..1cc468d10 100644
          const auto itc = c.find(k);
          return itc != c.end() && memcmp(itc->second.bytes, (const char *) t, sizeof(itc->second.bytes)) == 0;
      };
-@@ -2028,10 +2053,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -2084,10 +2109,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
      // other versions for an entry byte-identical to the tensor, else a recycle of the least recently used
      // one; under the pin a nested lookup only invalidates its own stale entry instead.
      const std::pair key = std::make_pair(tensor, assume_sync);
@@ -800,7 +800,7 @@ index 0affce9df..1cc468d10 100644
          it = cache->find(key);
          if (it == cache->end() || memcmp(it->second.bytes, (const char *) tensor, sizeof(it->second.bytes)) == 0) {
              return;
-@@ -2045,27 +2070,27 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -2101,27 +2126,27 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
          }
          // the tensor changed: switch to the cache version in which it is unchanged, else recycle the least recently used one
          int k_new = -1;
@@ -839,7 +839,7 @@ index 0affce9df..1cc468d10 100644
          it = cache->find(key);
      };
      ss_resolve();
-@@ -2134,7 +2159,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -2190,7 +2215,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              ss_verify_active = false;
          }
          // the calculation recurses into the sources and may have switched the current version
@@ -848,7 +848,7 @@ index 0affce9df..1cc468d10 100644
          auto & entry = (*cache)[key];
          entry.set(ss, n_bufs);
          memcpy(entry.bytes, tensor, sizeof(entry.bytes));
-@@ -2379,6 +2404,12 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+@@ -2435,6 +2460,12 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
  
  static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
      GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
@@ -861,7 +861,7 @@ index 0affce9df..1cc468d10 100644
      ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
      buf_ctx->stc_compute_index[g_meta_view_slot] = buf_ctx->stc_compute_index_next[g_meta_view_slot];
      return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
-@@ -2488,6 +2519,25 @@ static void ggml_backend_meta_buffer_memset_tensor(
+@@ -2547,6 +2578,25 @@ static void ggml_backend_meta_buffer_memset_tensor(
  
  static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
@@ -887,7 +887,7 @@ index 0affce9df..1cc468d10 100644
      const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
      GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
  
-@@ -2856,6 +2906,347 @@ static void ggml_backend_meta_buffer_reset(ggml_backend_buffer_t buffer) {
+@@ -2922,6 +2972,347 @@ static void ggml_backend_meta_buffer_reset(ggml_backend_buffer_t buffer) {
      }
  }
  
@@ -1235,7 +1235,7 @@ index 0affce9df..1cc468d10 100644
  static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
      /* .free_buffer     = */ ggml_backend_meta_buffer_free_buffer,
      /* .get_base        = */ ggml_backend_meta_buffer_get_base,
-@@ -2870,7 +3261,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
+@@ -2936,7 +3327,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
      /* .reset           = */ ggml_backend_meta_buffer_reset,
      /* .set_tensor_n    = */ NULL,
      /* .get_tensor_n    = */ NULL,
@@ -1904,10 +1904,10 @@ index 965b43981..a08dfdc09 100644
                                             cuda_ctx_dst->device, cuda_ctx_dst->stream(),
                                             dst->data, src->data, ggml_nbytes(dst));
 diff --git a/include/llama.h b/include/llama.h
-index 7be0a9c87..3353c6078 100644
+index eec23b49d..7a552b8f5 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -493,6 +493,18 @@ extern "C" {
+@@ -502,6 +502,18 @@ extern "C" {
                            // derived mask serves every batch.  A 2-D batch that arrives anyway forces one
                            // mid-run re-reserve instead (see llama_context::decode).
  
@@ -1926,7 +1926,7 @@ index 7be0a9c87..3353c6078 100644
          // [EXPERIMENTAL]
          // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
          // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
-@@ -920,6 +932,40 @@ extern "C" {
+@@ -929,6 +941,40 @@ extern "C" {
                   llama_pos p0,
                   llama_pos p1);
  
@@ -1967,7 +1967,7 @@ index 7be0a9c87..3353c6078 100644
      // Copy all tokens that belong to the specified sequence to another sequence
      // p0 < 0 : [0,  p1]
      // p1 < 0 : [p0, inf)
-@@ -1061,6 +1107,12 @@ extern "C" {
+@@ -1070,6 +1116,12 @@ extern "C" {
  // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
  #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
  
@@ -1981,7 +1981,7 @@ index 7be0a9c87..3353c6078 100644
  
      LLAMA_API size_t llama_state_seq_get_size_ext(
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 70fa60eec..60fde3d89 100644
+index 8518e09fe..d317267b7 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,5 +1,6 @@
@@ -4125,10 +4125,10 @@ index 395c0a5c2..441fc76fe 100644
  
  using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 030e43796..1103ce0e0 100644
+index d6cd012f4..659b813ee 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -3485,6 +3485,15 @@ uint32_t llama_spec_draft_kv_cells(uint32_t n_ctx_seq, uint32_t n_ubatch, uint32
+@@ -3491,6 +3491,15 @@ uint32_t llama_spec_draft_kv_cells(uint32_t n_ctx_seq, uint32_t n_ubatch, uint32
  llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
      llama_memory_i * res;
  
@@ -4144,7 +4144,7 @@ index 030e43796..1103ce0e0 100644
      // the non-causal LFM2 and LFM3 decision graphs read the whole prompt in one batch, nothing is kept
      if (arch == LLM_ARCH_LFM2 && !hparams.causal_attn && hparams.n_layer_decision > 0) {
          return nullptr;
-@@ -3642,6 +3651,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3648,6 +3657,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                      filter_recr = [&](uint32_t)    { return false; };
                  }
  
@@ -4152,7 +4152,7 @@ index 030e43796..1103ce0e0 100644
                  res = new llama_memory_hybrid_idx(
                      /* model             */ *this,
                      /* no_alloc          */ params.no_alloc,
-@@ -3661,7 +3671,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3667,7 +3677,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                      /* unified           */ cparams.kv_unified,
                      /* filter_attn       */ std::move(filter_attn),
                      /* filter_recr       */ std::move(filter_recr),
@@ -4164,7 +4164,7 @@ index 030e43796..1103ce0e0 100644
              } break;
          case LLM_ARCH_HY_V4:
              {
-@@ -3972,6 +3985,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3978,6 +3991,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* filter_recr       */ std::move(filter_recr));
                      } else if (needs_mem_idx) {
                          // sparse attention over a per-token indexer cache, in its own memory type
@@ -4172,7 +4172,7 @@ index 030e43796..1103ce0e0 100644
                          res = new llama_memory_hybrid_idx(
                              /* model             */ *this,
                              /* no_alloc          */ params.no_alloc,
-@@ -3993,8 +4007,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3999,8 +4013,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* filter_recr       */ std::move(filter_recr),
                              /* filter_idx        */ std::move(filter_idx),
                              /* kv_pool           */ params.kv_pool,
@@ -4185,7 +4185,7 @@ index 030e43796..1103ce0e0 100644
                          res = new llama_memory_hybrid(
                              /* model             */ *this,
                              /* no_alloc          */ params.no_alloc,
-@@ -4015,7 +4032,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -4021,7 +4038,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* filter_attn       */ std::move(filter_attn),
                              /* filter_recr       */ std::move(filter_recr),
                              /* kv_pool           */ params.kv_pool,
@@ -4195,7 +4195,7 @@ index 030e43796..1103ce0e0 100644
                      }
                  } else {
                      llama_kv_cache::layer_filter_cb filter = nullptr;
-@@ -4075,6 +4093,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -4081,6 +4099,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                                      reuse,
                                      share);
                          } else {
@@ -4214,7 +4214,7 @@ index 030e43796..1103ce0e0 100644
                              res = new llama_kv_cache_iswa(
                                      *this,
                                      params.no_alloc,
-@@ -4087,10 +4117,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -4093,10 +4123,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                                      cparams.n_ctx_seq,
                                      cparams.n_seq_max,
                                      cparams.n_ubatch,
@@ -4228,7 +4228,7 @@ index 030e43796..1103ce0e0 100644
                          }
                      } else {
                          GGML_ASSERT(!hparams.is_swa_any());
-@@ -4158,6 +4189,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -4164,6 +4195,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              }
                          }
  
@@ -4240,7 +4240,7 @@ index 030e43796..1103ce0e0 100644
                          res = new llama_kv_cache(
                                  *this,
                                  params.no_alloc,
-@@ -4171,21 +4207,35 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -4177,21 +4213,35 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                                  cparams.n_seq_max,
                                  mtp_n_swa,
                                  mtp_swa_type,

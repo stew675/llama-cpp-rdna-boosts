@@ -1,3 +1,90 @@
+## 261123.002 (r352, BLOCK 17 WITHDRAWN: cut, validated, to be committed and tagged) -- the two-arm server leaves the delivery for `beta/`, and the r350 cache-off page fault will not reproduce
+
+**`v17-919794500-r352`**: block 17 is **out of `patches/`** and lives in `beta/prefill-decode-arms/`.  The
+official set is `0000`-`0016` (17 blocks) + the temporary `0300` = **18 default patches**; the release prefix is
+derived from that count, so it moves `v18-` -> `v17-` on its own.  The maintainer's decision (2026-11-23): the
+two-arm server is not release-ready, and its open issues are also being seen on shapes that do not use the pair.
+
+### 1. The withdrawal is content-preserving, and that is checkable
+
+`release.json`: base `919794500`, **tip `e695c46ce` / tree `0d2f70e6c`**, `n_blocks` 17 / `n_temporary` 1 /
+`n_default` 18.  The beta artifact is cut against that tree and, applied alone, produces
+**`8851b0d02` — r351's release tree, byte for byte** (`git am` strict, no 3-way).  So a default checkout is the
+r351 tree minus block 17 and nothing else; the block's content is preserved, not re-written.  The block-17 →
+`0300` order changed (`0300` now sits directly on block 16) and both orders give the same tree, i.e. the two
+patches are textually disjoint.
+
+The two **optional** artifacts were rebased onto the new default tree mechanically:
+
+* `0100` (two-lane prefill) conflicts in `src/llama-context.cpp` where block 17's crash-#373 bookkeeping sat
+  (`memory->apply_mutex()`, `meta_bind_view_slot()`); the conflict is *context*, so the resolution keeps 0100's
+  own change and drops the block-17 lines.  Verified by tree relation: new 0100 tree `d794be3e7` vs the old
+  `7934579876e` differs by exactly block 17 (3682/367/30 — one line less than block 17's own 3683, an unresolved
+  blank line inside a hunk);
+* `0101` (mixed K/V) re-applied with `git am -3` and no conflict, tree `13611034a`, and reconciles to block 17
+  exactly (3683/367/30).  Cumulative optional tree `3cf56a5af`.
+
+### 2. The page fault recorded at r350 does NOT reproduce (and no fix is claimed)
+
+The r350 finding (261122.040 §3) was re-tested at r352, **seven arms, all clean** (logs checked with
+`check-gpu-faults.sh`, one GPU job at a time, `setsid` + `timeout`, coredumps off):
+
+| # | arm | result |
+|---|---|---|
+| 1 | 35B-A3B Q4_K_M, 1 GPU, `-sm layer`, `-ncmoe 48`, cache off, 5256-token prompt | CLEAN, 2212 t/s (host tier 19 177 MiB) |
+| 2 | Flash-Next IQ4_NL, 3 GPU, `-sm layer`, `-ncmoe 48`, cache off, 5298 tokens | CLEAN, 271 t/s (host tier 90 206 MiB) |
+| 3 | Flash-Next, 3 GPU `-sm tensor`, `-ncmoe 8`, cache off | CLEAN, 1240 t/s |
+| 4 | Flash-Next, 3 GPU `-sm tensor`, `-ncmoe 48`, cache off (`llama-cli`) | CLEAN, 407 t/s |
+| 5 | the **recorded server command** (3 slots, `--kv-unified`, `-c 32768`, 2048/2048, q8_0 KV, `--load-mode dio`, cold 5246-token POST) | CLEAN on **r351** (11.6 s) and CLEAN on **r352** (11.2 s, 469 t/s) |
+| 6 | arm 5 + `MOE_HOST_POOL_PIN_FAULT=late` (pinned tier latched off mid-run) | CLEAN, 11.6 s |
+| 7 | arm 4 + `MOE_HOST_POOL_PIN=0` (pinned tier closed at init) | CLEAN, 415 t/s |
+
+**What the failing state must be, and why that is not a refutation.**  The default host-expert tier is
+AUTO/POOL, so the expert master is the **pageable** read-only model mapping (`ROCm_HostMap`; the load census
+reads `pinned 0.0 MiB … pageable 62 400.0 MiB, 144/144 pool sources registered`, with a 62 256 MiB pinned
+per-expert pool) and the only device-readable copies are that pool and the per-table pinned bounce ring.  A
+no-XNACK GPU faulting on a host page therefore means a reader got neither — and `expert_host_src()` *declines*
+(returns false) rather than handing out a pageable pointer when both are unavailable.  Forcing the two
+documented pinned-tier failures (arms 6/7) does not reproduce it, so a repro needs a path that bypasses
+`expert_host_src()` or a mid-run pinned refusal some caller treats as success.  Neither was identified.
+
+**The kernel journal agrees.**  `journalctl -k` has **no** GPU-fault line after `2026-11-23 00:30` (the
+session's `t0`), i.e. every arm above is clean in the authoritative source and not only in its own log; the
+last fault entries on this box are **2026-11-22 20:55 - 23:13**, the r350 session that recorded the finding
+(6 events, 8 journal lines each, all on `0000:06:00.0`).  Note for anyone re-running `check-gpu-faults.sh`:
+`--log` *without* `--since` scans the WHOLE journal, so it will replay those historical r350 faults for every
+log file; the window is what makes the answer about today's run.
+
+**No code change and no gate.**  A gate anchored on a fault that does not fire is vacuous
+(`MANIFESTS.md` requires non-vacuity), and a speculative change in a correctness path is worse than an open
+finding.  The finding is now `TODO` #375, with the control set and what a reproduction must supply (log +
+`dmesg` + the `host experts:` census + `free -g`/`ulimit -l`) in
+`beta/prefill-decode-arms/README.md`; `INVARIANTS.md` r352 item 4 carries the engineering fact.
+
+### 3. Set checks
+
+* `validate-set.sh` **GREEN**: 18 default patches (17 official + 1 temporary) + 2 optional, checksums, strict
+  **18/18** apply on a fresh tarball, tree `0d2f70e6c` matched, every block tree scanned for conflict markers,
+  both optional artifacts strict + tree-checked + the cumulative order, the Windows portability lint (515 files,
+  no unguarded POSIX call/type/macro) — and the file-set reconciliation, which needed **one** decision row:
+  `v18-919794500-r350	0017	block	0017` in `patches/FILE-SET-RETIREMENTS.tsv` (the block is `GONE` by
+  decision; the files it carried are not individually lost because... they are reported as lower totals, not
+  `LOSS` rows).
+* `check-gen-docs.sh` green (no option added/removed on the delivery tree — block 17's options left with it).
+* The default tree builds (`~/bin/build-llama-rocm`, block-17-free tree).
+* The withdrawal's own arm: the beta artifact applies strictly on the r352 tree and gives `8851b0d02`; the
+  optional artifacts apply strictly alone and cumulatively.
+
+### 4. What moved, and where the record is
+
+`patches/README.md` (block index row + the block-17 section) now points at `beta/prefill-decode-arms/`, which
+**carries the block's full reference verbatim** plus the withdrawal's reason, the diagnosis above and
+`BETA-TESTING.md` (apply/build/smoke ladder).  `MANIFESTS.md` (header counts, apply-order row, and gates 17/39
+marked **BETA-ONLY**), `ENVIRONMENT.md` §23 (same marker), `README.md` (the r346 narrative replaced by the
+withdrawal note), `TODO.md` (`#375`; every `block 17` row marked beta work) and `INVARIANTS.md` r352.
+`fork-refresh.sh` re-cuts the fork branch from the new set, so the `rdna-boosts` branch no longer carries block
+17 either.
+
 ## 261123.001 (r351, BLOCK-17 AMENDMENT 4: cut, validated, committed and tagged) -- two user reports on block 17's plumbing: a `.so` that links with a symbol nobody defines (#353) and two fallbacks that call themselves (#354), plus the symbol check the first one earned
 
 Two reports against block 17's crash-#373 work (#373, r347).  Neither is reachable in a configuration this repo

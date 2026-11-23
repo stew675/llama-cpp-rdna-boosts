@@ -2293,3 +2293,48 @@ block 17, `ENVIRONMENT.md` §23, `GREEDY-PURITY.md` §107.
 
 Record: `WORKLOG.md` 261123.001, `scripts/check-shlib-symbols.sh`, `MANIFESTS.md` gate 40, `patches/README.md`
 block 17.
+
+## r352 (2026-11-23, `WORKLOG.md` 261123.002) — a BLOCK can be withdrawn without moving a byte, and a page fault that will not reproduce is a report, not a fix
+
+1. **A withdrawal is verifiable when the artifact reproduces the old tree exactly.**  Block 17 left
+   `patches/` at r352.  The check is not "the block still builds somewhere": it is that applying the beta
+   artifact to the new default tree produces the **previous release tree byte for byte** (measured:
+   default tip `e695c46ce` / tree `0d2f70e6c`; `beta/prefill-decode-arms/prefill-decode-arms.patch`
+   applied alone → tree `8851b0d02`, i.e. r351's `.tree`).  That proves the withdrawal removed exactly the
+   block and nothing else, so a default checkout is the r351 tree minus block 17 and no other r may have
+   to be re-verified for behaviour.  The block 17 → 0300 **order** changed (0300 used to sit on top of
+   block 17 and now sits directly on block 16); both orders give the same tree, so the two patches are
+   textually disjoint, which is what makes the re-cut a `git am` and not a port.
+2. **The optional artifacts had to be rebased, and one was not a clean apply.**  `0100` (two-lane
+   prefill) conflicts in `src/llama-context.cpp` wherever block 17's crash-#373 bookkeeping sat
+   (`memory->apply_mutex()`, `meta_bind_view_slot()`): the conflict is *context*, not content, so the
+   resolution is to keep 0100's own change and **drop the block-17 lines** — the resolution is verified by
+   the same tree relation (old `0100` tree vs new = exactly block 17's 3682/367/30, one line less than
+   block 17's own 3683 because an unresolved block-17 blank line sat inside a hunk).  `0101` re-applied
+   with `git am -3` and no conflict and reconciles exactly (3683/367/30).  An optional artifact is cut
+   against the current default tree, so this rebasing is part of every release, not an exception.
+3. **A withdrawn block is a `GONE` finding, and one decision row closes it.**  `check-rung-file-sets.py`
+   reports the block as `GONE` (30 files) and nothing else: the files, defines, env vars and options it
+   carried read as *lower totals* without individual `LOSS` rows, because a row is only emitted for an
+   item that no block of the new set carries.  The row is
+   `v18-919794500-r350	0017	block	0017	<reason>` in `patches/FILE-SET-RETIREMENTS.tsv` — scoped to the
+   transition it was decided in, per the file's contract.
+4. **A page fault that will not reproduce does not get a speculative fix.**  The r350 cache-off host-tier
+   fault (`WORKLOG.md` 261122.040 §3) was re-tested at r352 on seven arms — `-sm layer` at 1 GPU and 3
+   GPUs, `-sm tensor` with `-ncmoe 8` and `48`, the recorded 3-slot server command on **both** the r351
+   build and the block-17-free build, and the same shape with the pinned tier forced off two ways
+   (`MOE_HOST_POOL_PIN=0`, `MOE_HOST_POOL_PIN_FAULT=late`) — and every one is **clean** (467-469 t/s
+   prefill on the server arm, 11.2-11.6 s per cold 5.2k-token POST).  What the failing state must be is
+   narrow: the default host-expert tier is AUTO/POOL, so the expert master is the **pageable** read-only
+   model mapping (`ROCm_HostMap`, 62 400 MiB here) and the only device-readable copies of it are the
+   bounded **pinned per-expert pool** (62 256 MiB, 144/144 sources registered) and the per-table pinned
+   bounce ring; `expert_host_src()` *declines* (returns false) rather than handing out a pageable pointer
+   when both are unavailable, and forcing the pinned tier off does not fault.  So a reproduction needs a
+   path that bypasses `expert_host_src()` or a mid-run pinned refusal that some caller does not treat as a
+   decline — neither is identified, and no gate was added: a gate anchored on a fault that does not fire
+   is vacuous (`MANIFESTS.md` requires non-vacuity).  The finding stays open with its control arms
+   recorded (`TODO` #374), and the arms are re-runnable from its own entry.
+5. **The withdrawal does not change the tag arithmetic.**  `n_blocks` is the official count and the
+   `v<N>` prefix is derived from it (`scripts/make-release.sh`), so removing the 18th official block moves
+   the release from `v18-` to `v17-` on its own; `n_default` follows (`18`), and `validate-set.sh` /
+   CI read the counts from `release.json` rather than carrying them.

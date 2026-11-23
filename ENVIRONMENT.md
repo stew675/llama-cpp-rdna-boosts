@@ -1726,13 +1726,19 @@ that is genuinely new should follow the repo's conventions: default-on if it hel
 a *kill-switch* that restores the old behaviour), default-off only for a known-risky correctness
 workaround, and a first line in the relevant block's `patches/README.md` note.
 
-## 23. The two-arm server (block 17) — a prefill arm and a decode arm co-owning one KV — **opt-in, default OFF**
+## 23. The two-arm server (block 17) — a prefill arm and a decode arm co-owning one KV — **opt-in, default OFF; BETA ONLY since r352**
+
+> **BETA ONLY since r352.**  Block 17 was **withdrawn from the delivery** at r352 (the two-arm server is not
+> release-ready).  Every variable in this section belongs to the candidate in
+> [`beta/prefill-decode-arms/`](beta/prefill-decode-arms/README.md) and is **absent from a default
+> `apply-all.sh` build** — it only exists in a checkout applied with `--include-beta`.  Nothing here is a
+> delivery default or a delivery knob.
 
 An opt-in `llama-server` mode with two `llama_context`s on one model: a **prefill arm** (the main loop,
 `ctx_tgt`) and a **decode arm** (`ctx_dec`, its own thread) that co-own the prefill arm's KV, so a reply
 generating while another slot's prompt is prefilled does not wait for the prefill's steps.  A slot crosses
-between the arms only at a request boundary.  The record: `patches/README.md` → block 17,
-`INVARIANTS.md` r346, `WORKLOG.md` 261122.027.
+between the arms only at a request boundary.  The record: `beta/prefill-decode-arms/README.md` (the block's
+reference, moved there at r352), `INVARIANTS.md` r346/r352, `WORKLOG.md` 261122.027.
 
 **The delivery default is OFF, and that is a decision, not an unfinished default.**  A run that does not ask
 for the pair allocates, reserves and logs exactly what the single-context server does (prefill-logit KLD

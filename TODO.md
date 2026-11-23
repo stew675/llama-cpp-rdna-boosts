@@ -23,11 +23,12 @@ records it points at (`WORKLOG.md`, the campaign, the `benchmarks/` or `archive/
 **Numbers are never reused.**  `#NN` is a permanent handle: an old `WORKLOG.md` entry that cites `TODO #74`
 still means the same subject after that item is closed and removed from this file.  New items append.
 
-**Current state:** the **19-patch default set** (18 official blocks `0000`-`0017` + the temporary `0300`)
+**Current state:** the **18-patch default set** (17 official blocks `0000`-`0016` + the temporary `0300`)
 at fork point **`919794500`**; read `.release` in `release.json` for the release id -- it is the source of
-truth, not this line.  **Block 17 is the two-arm server** (a prefill arm and a decode arm co-owning one KV,
-`--prefill-decode-arms`, **opt-in, default OFF**, r346), and its follow-ups are the `#365`-`#372` rows below,
-written up in `wip/prefill-decode-arms-followups/`.  Block 14 is the **streamed KV** (the resident window, the
+truth, not this line.  **Block 17 (the two-arm server) was WITHDRAWN from the delivery at r352** and lives in
+`beta/prefill-decode-arms/` (apply with `--include-beta`); its follow-ups are the `#367`-`#374` rows below, and
+they are **beta work**, not delivery work -- the campaign `wip/prefill-decode-arms-followups/` is where they are
+written up.  `#375` is the cache-off host-tier GPU page fault (open, **not reproducible at r352**).  Block 14 is the **streamed KV** (the resident window, the
 attendance pool and the MTP draft window -- all three opt-in, default off); block 15 is the UMA GTT expert
 store.  The **mixed K/V cache types** are **optional block `0101`** since the r288 block-number re-org (they
 were numbered block 17 in r287, PR #312 -- a different block from today's `0017`; the one native pair, head 256
@@ -88,6 +89,14 @@ the accepted limitations (they were briefly appended after it, which read as if 
 are open work) and they are written up in one campaign, `wip/prefill-decode-arms-followups/`, as `W1`-`W7` plus
 `G1`.  `#363` was in the same wrong place and moved up with them.
 
+**`r352` housekeeping (2026-11-23):** **block 17 (the two-arm server) was WITHDRAWN from the delivery** and moved
+to `beta/prefill-decode-arms/` -- every row below whose kind says `block 17` is now **beta work**: parked with the
+artifact, not release work, and re-admission is the maintainer's decision (the artifact reproduces the r351 tree
+exactly, so the code is preserved).  One new row: **`#375`**, the cache-disabled host-tier **GPU page fault**
+recorded at r350 (`WORKLOG.md` 261122.040 §3) -- it reproduced at r349 with the pair inactive and did **not**
+reproduce on any of the seven arms re-run at r352 (both builds), so it is open with a recorded control set and
+**no fix**: a gate on a fault that does not fire would be vacuous.
+
 | # | subject | kind | status |
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
@@ -101,11 +110,12 @@ are open work) and they are written up in one campaign, `wip/prefill-decode-arms
 | **374** | the gate's **`pool` arm is VACUOUS**: `gate-arms-soak.sh pool` fails its own non-vacuity check (*no expert-access/teardown census*) with the 4B model on a 1-GPU host tier, both with the derived pair reserve and with `MOE_EXPERT_CACHE_AUX_RESERVE_MIB=3584` forced | **gate debt (block 17)** | **OPEN (found 2026-11-22)** -- the other six checks pass (`decline_all=0`, `broken=0 repaired=0`, text equals the single context's, no GPU faults), so the arm currently proves nothing about the pair's host-expert path.  Repair the census (or the arm's config, e.g. a `-ncmoe` value that really routes through the cache at this model size) before relying on it.  `WORKLOG.md` 261122.035 |
 | **371** | the prefill/decode **speed balance** is untuned: the pair trades -21..-24 % prefill for a decoder that keeps moving, and the worst in-window gap is 95.5 / 86.5 / 60.5 / 32.8 ms on the recorded shapes; the idea is for the prefill arm to **skip one or more submission opportunities** while a decoder is active, so decode runs a burst of uninterrupted steps | tuning (delivery, block 17) | **OPEN** -- a measurement campaign, not a patch: the gap is four to twenty times SMALLER than the prefill arm's own step, so the mechanism must be identified first, and the deliverable is a Pareto curve for K in {0,1,2,4,8} with a **refutation acceptable** (bound stated up front: >= 50 % fewer worst-gap ms for <= 3 pp prefill). Campaign §W6 |
 | **372** | multi-slot prefill batching: with several slots prefilling, does each slot really re-scan the full weight set per chunk, and can a "layer-major" schedule across slots batch them for better prefill throughput? | tuning / architecture (delivery, block 17) | **OPEN** -- the premise needs checking first: `share_prompt_budget()` already puts **every** active prompt into one step and one ubatch is one graph, so co-batchable slots already share the weight pass and the real cost is the **ubatch SPLIT** (which `-ub` moves: 1440 -> 3041 -> 3884 t/s at 512/2048/4096).  First task is a composition census (`LLAMA_KV_DEBUG_CELLS`), then a two-slot aggregate-scaling table.  **Do NOT merge the two arms' layer passes**: that is the shared step the feature exists to remove.  Campaign §W8 |
+| **375** | the host-expert tier's **cache-OFF page fault**: `-ncmoe 48` + `MOE_EXPERT_CACHE_MIB=0` + `-sm tensor` faulted the GPU in the first prefill at r350 (a device read of a HOST page), reproduced at r349 with the pair inactive, and is **CLEAN on all seven control arms at r352** | correctness (delivery: block 09/12/15 host tier) | **OPEN, NO REPRO** -- needs a failing run's log + `dmesg` window; the tier is pageable (`ROCm_HostMap`) behind a pinned pool/bounce, so a repro must bypass `expert_host_src()` or hit a pinned refusal a caller treats as success. Recorded control arms: `beta/prefill-decode-arms/README.md`; §375 |
 
 
 ## Handle numbering
 
-**New handles append after the highest issued so far, so the next free handle is `#374` (`#364`-`#372` were issued
+**New handles append after the highest issued so far, so the next free handle is `#376` (`#375` was issued at r352 for the cache-off page fault; `#364`-`#372` were issued
 for the block-17 follow-ups at r346); a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
 subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
 
@@ -376,6 +386,35 @@ work, which is exactly the 300-880 ms stall block 17 was built to delete.
 **Done =** a composition census, an aggregate-scaling table for a two-slot prefill at four ubatches on a dense and a
 host-expert MoE, and either a scheduler change that keeps more slots in the same ubatch (purity green) or a recorded
 conclusion that the `-ub` knob already captures the available gain.  A refutation is a legitimate result.
+
+## 375. The host-expert tier's page fault with the expert cache DISABLED (r350, not reproducible at r352)
+
+**Record:** `WORKLOG.md` 261122.040 §3 (the finding), 261123.002 (the r352 re-test); the seven control arms and
+what a reproduction must supply are in `beta/prefill-decode-arms/README.md` ("The page-fault diagnosis").
+
+**What was observed (r350).**  `-ncmoe 48` + `MOE_EXPERT_CACHE_MIB=0` + `-sm tensor`, 3 devices, q8_0 KV, on
+Flash-Next: a HIP memory-access fault in the first prefill, immediately after
+`sequence parallelism engaged: T = 2048`, on a **HOST** address (`dmesg`: `in page starting at address 0x… from
+client 10` and `[gfxhub] … GCVM_L2_PROTECTION_FAULT_STATUS`).  The server survives the fault and keeps its port;
+the CWD collects multi-GB `gpucore.*.gpu` files.  It fired with `--spec-type none` and no `--prefill-decode-arms`,
+and reproduced on the **r349** tree, so it is not block 17.  The same shape with the cache **enabled** is clean.
+
+**What was measured at r352 (all clean).**  35B-A3B 1 GPU `-sm layer` `-ncmoe 48`; Flash-Next 3 GPU `-sm layer`
+`-ncmoe 48`; Flash-Next 3 GPU `-sm tensor` `-ncmoe 8`; the same at `-ncmoe 48`; the recorded 3-slot server command
+on the r351 build **and** on the r352 (block-17-free) build (11.2-11.6 s per cold 5.2 k-token POST, ~469 t/s);
+and the server arm with the pinned tier forced off two ways (`MOE_HOST_POOL_PIN=0`,
+`MOE_HOST_POOL_PIN_FAULT=late`).  Every arm's log was checked with `scripts/check-gpu-faults.sh`.
+
+**Why that is not a refutation.**  A no-XNACK GPU can only read host memory the driver has made resident, and the
+default host-expert tier is AUTO/POOL: the master is the **pageable** model mapping and the only device-readable
+copies are the bounded pinned per-expert pool and the per-table pinned bounce ring.  `expert_host_src()` *declines*
+when both are gone, so a fault needs a path that bypasses it, or a pinned refusal some caller treats as success.
+Neither is identified, and forcing the two documented pinned failures does not reproduce it.
+
+**Done =** a reproduction (log + `dmesg` + the `host experts:` census + `free -g`/`ulimit -l`), then either a fix
+in the owning block (09/12/15: pin/stage the source, or refuse the in-place read at the scheduler) or a clean
+one-line start-up refusal naming the flag combination, **plus a gate that fails on the pre-fix tree** -- the
+negative control this handle does not have.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

@@ -20,7 +20,7 @@ and treat it as a stop-gap, not a feature.  Two further blocks are **optional** 
 default set: `0100` (two-lane prefill) and `0101` (mixed K/V cache types), applied only with
 `--include-optional` (see [`optional/README.md`](optional/README.md)).  The release `v<N>-...` prefix is
 the **official** block count (`N` = 17); `0300` and the optional blocks are not counted.  The current
-release is **`v17-919794500-r336`** (read `.release` in `release.json` -- it is the source of truth, not this
+release is **`v17-919794500-r352`** (read `.release` in `release.json` -- it is the source of truth, not this
 line): the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
@@ -159,7 +159,8 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── wiki/                  # source for the GitHub wiki (Home, MTP & Adaptive MTP, Quick Reference); see wiki/README.md
 ├── wip/                   # ACTIVE exploration only, never applied; index: wip/CAMPAIGNS.md
 ├── beta/                  # promotion-candidate patches pending a beta test (NOT part of the delivery;
-│                          #   apply with `apply-all.sh --include-beta`; currently empty, see beta/README.md)
+│                          #   apply with `apply-all.sh --include-beta`; currently: the withdrawn two-arm
+│                          #   server (block 17), see beta/README.md
 ├── optional/              # opt-in blocks 0100/0101 (NOT part of the default delivery; apply with
 │                          #   `apply-all.sh --include-optional` and a [y/N] per artifact, numeric order)
 ├── upstream/              # upstream-PR candidates: one sub-directory each (README.md + patch) + index
@@ -171,44 +172,21 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 > in `archive/docs/` (see also `archive/work/` for the closed experiments).
 > Do not mix them with the current `patches/` files.
 
-## The blocks: official `0000`-`0017` + temporary `0300` + optional `0100`/`0101`
+## The blocks: official `0000`-`0016` + temporary `0300` + optional `0100`/`0101`
 
 `release.json` (the current release).  Each row is one `git am` commit, applied in filename order:
-`0000`-`0017` then `0300`.  The optional `0100`/`0101` are **not** in this table and never in the default
+`0000`-`0016` then `0300`.  The optional `0100`/`0101` are **not** in this table and never in the default
 apply -- see [`optional/README.md`](optional/README.md).
 
-**r346 adds block 17 — the two-arm server, and it is OPT-IN.**  `llama-server --prefill-decode-arms` runs **two
-contexts on one model**: a *prefill arm* (the main loop) and a *decode arm* (its own thread) that co-own the same
-KV, so a reply generating while another slot's prompt is prefilled does not wait for the prefill's steps.  Measured
-on one R9700: the decoder keeps getting tokens every **47-49 ms** (p95 64-78 ms) through a 2-5 s prefill, where
-the single-context server stalls **300-880 ms** — for **-21…-24 %** of prefill.  That trade is why it is **off by
-default**: a run that does not ask for the pair allocates, reserves and logs exactly what the single-context
-server does (prefill-logit KLD **0.000000 / 100 %** against r345, and identical greedy text), and turning it on is
-a decision about *your* shape.
-
-```
-llama-server -m ... --parallel 2 --prefill-decode-arms            # explicit: refuse rather than degrade
-llama-server -m ... --parallel 2 --prefill-decode-arms-mode auto  # enable when it fits, else stay single-context
-```
-
-It needs **at least 2 slots** (`-np 1` warns and stays single-context), and it **refuses** mmproj/mtmd, TTS,
-realtime, embeddings/rerank/decision, LoRA, `--sleep-idle` and two drafter families (**r350**: `--spec-type`
-itself is supported -- `draft-mtp`, `draft-mtp-adaptive`, `draft-simple` and the n-gram family -- but the
-layer-input drafters `eagle3`/`dflash`/`dspark`/`dflash2`/`lilicorr` are refused, as is a gemma4 assistant).  On the pair,
-`-ib` and `LLAMA_SERVER_PREFILL_DUTY` are **reported deprecated and inert** — both exist to bound a decoder's
-stall inside a *shared* step, which this mode removes.  `-ub`/`-b` **4096** is the measured sweet spot.  A hybrid
-model on `-sm tensor` pays a serialised recurrent-state move per request boundary (~75 ms, lands in TTFT).  Knobs
-and every refusal: `ENVIRONMENT.md` §23; the detail and the gate ladder: `patches/README.md` → Block 17
-(`archive/work/prefill-decode-arms/` is the campaign record).  Built out of the block: a **shared view of the KV
-for every memory module** (a module that lacks it leaves the decode arm blind *silently* — that was the campaign's
-one P0), **one allocation owner** for the pair, the **recurrent-state handover** (and the reverse one, so a
-finished conversation stays resident and its prefix is reused at single-context parity), and the **declared
-second-context graph reserve** that makes a host-expert tier work with no operator knob.  **r350 adds a speculator
-ON the pair**: the decode arm drafts, verifies and accepts on its own context (sized for the verify width,
-`n_parallel x (n_max + 1)` rows), the drafter reads the target's hidden rows from the context that ran the batch,
-and the pair's text stays byte-identical to the single-context server's -- measured generation **41.5 -> 98.4 t/s**
-on a 27B at 3 devices, for **-5.7 %** prefill, and `scripts/gate-arms-spec.sh` is the gate (the whole ladder is
-`MANIFESTS.md` gate 39).
+**r352 WITHDREW block 17 — the two-arm server — and it is no longer in the delivery.**  It shipped from r346
+to r351 as an opt-in `llama-server --prefill-decode-arms` mode (two contexts on one model: a prefill arm and a
+decode arm co-owning the same KV, so a reply keeps generating while another slot's prompt is prefilled; measured
+at -21…-24 % prefill for a decoder cadence of 47-49 ms where the single-context server stalls 300-880 ms).  It
+is **not release-ready**: a GPU page fault on the cache-disabled host tier reproduced with the pair *inactive*
+(and could not be reproduced at r352 — the diagnosis, the seven control arms and what a repro needs are in its
+`README.md`), a qwen4exp abort at a request boundary, and its own open work queue.  The artifact now lives in
+[`beta/prefill-decode-arms/`](beta/prefill-decode-arms/README.md) (apply with `--include-beta`), it is not
+counted in `v<N>`, and its gates are beta-only.  A default checkout is the r351 tree minus that block.
 
 **r263 adds block 15 — the UMA GTT expert store.**  On an **integrated GPU** (an APU: `gfx1151`, and any newer
 Ryzen AI part) there is no host-expert tier — "VRAM" and RAM are one pool, so `-ncmoe`/`--host-experts` are refused

@@ -35,7 +35,18 @@ move happens with a "refuted" status.  A finished candidate leaves `beta/`; no s
 
 ## Current candidates
 
-**None.**  The `arena-steady-sizing` v2 candidate was **promoted into block 09 at r292** (2026-11-15);
+* **`prefill-decode-arms`** — **the two-arm server (the withdrawn delivery block 17)**, withdrawn at **r352**
+  (2026-11-23) because it is not release-ready: a GPU page fault on the cache-disabled host tier that
+  reproduced with the pair *inactive* (and could not be reproduced at r352 — the diagnosis is in its
+  `README.md`), a qwen4exp abort at a request boundary, and the feature's own open work queue.  Applied on
+  the r352 default tree it reproduces the **r351 release tree** (`8851b0d02`) exactly.  Files:
+  [`prefill-decode-arms/README.md`](prefill-decode-arms/README.md) (what it is, the moved block reference,
+  the diagnosis), [`prefill-decode-arms/BETA-TESTING.md`](prefill-decode-arms/BETA-TESTING.md) (the apply,
+  build and smoke ladder) and [`prefill-decode-arms/prefill-decode-arms.patch`](prefill-decode-arms/prefill-decode-arms.patch)
+  (sha256 `91ed9920…2d558d`).  Its gates (`gate-arms-spec.sh`, `gate-draft-ctx.sh`, `gate-arms-soak.sh`) are
+  beta-only from r352.
+
+The `arena-steady-sizing` v2 candidate was **promoted into block 09 at r292** (2026-11-15);
 see *Recently promoted* below and `archive/work/arena-steady-sizing/`.
 `0016-host-experts-window` was **withdrawn 2026-11-02**: the mode is unimplementable on a
 no-XNACK GPU (a kernel read of a reclaimable registered page is a fatal fault, and holding it is pinning —
