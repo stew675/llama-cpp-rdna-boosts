@@ -1,3 +1,65 @@
+## 261123.020 (no release; `prefill-decode-arms` v2 STEP 7c, retaken) -- the auxiliary compute region is charged to the slab reserve up front, the slab logs the calibrated value for the next run, and a residual accounting defect (`mapped` vs the arena's extent) is fixed
+
+7c was implemented and rejected earlier today (261123.018 was 7b; the 7c attempt is in the 7d entry's history)
+because raising the reserve changed which arena tables were resident, which in turn decided how often the
+drop/capture race fired -- so the change could not be judged.  With **7d** removing the race, it was retaken and
+it does what it was meant to.
+
+### 1. The reserve (the maintainer's plan)
+
+`COMMON_ARMS_RESERVE_MIB` 256 -> **1280**, the measured size class of the decode arm's compute buffer (1280 MiB
+on 35B-A3B `-ncmoe 40` np 4; 512 MiB per aux context on Gemma4 26B-A4B + an MTP head).  The slab's reserve is
+`headroom + aux`, so the aux region is then mapped from the **unmapped VA spare** instead of evicting arena
+tables at load:
+
+```
+before:  aux narrow-3 pinned at [26.31, 27.56] GiB (1.25 GiB, taken from the arena (tables evicted)); 1 arena alloc failed
+after:   aux narrow-3 pinned at [26.31, 27.56] GiB (1.25 GiB, unmapped VA spare);                0 arena alloc failed
+```
+
+### 2. The calibration log ("set this on the next run")
+
+Once per aux slot, when the region is pinned, the slab now prints the measured size and the reserve that would
+host it:
+
+```
+the aux narrow-3 region (1280 MiB) came from the unmapped VA spare -- no arena table was evicted.
+The reserve in force is 2816 MiB; 2816 MiB would host every auxiliary region (headroom 1536 + aux 1280)
+```
+
+and when it did NOT fit:
+
+```
+... had to TAKE arena tables (1024 MiB evicted) because the reserve in force (2496 MiB) left only 960 MiB of
+unmapped VA spare.  Set GGML_CUDA_SLAB_RESERVE_MIB=2560 for a run that maps it from the spare instead
+(headroom 1536 + aux 1024)
+```
+
+Verified end to end on the Gemma4 shape: default reserve 2496 -> one eviction + the recommendation; setting
+**2560** -> both regions from the spare, zero eviction, same text (`a195d3d6953c`).
+
+### 3. A defect 7c exposed in 7a's own accounting
+
+`ggml_cuda_slab::mapped` is the slab's **VMM** extent, and pinning region 0 *above* the arena grows it.  The
+second pin's "is the arena mapped over my window?" test therefore read the slab instead of the arena and evicted a
+GiB of tables that were not there (Gemma4, both regions 512 MiB: slot 1 claimed `1024 MiB evicted` while the
+arena's mapped top was exactly slot 1's base).  Fixed by tracking **`mapped_arena`** separately: seeded at init,
+grown by `slab_extend`, never moved by an aux pin; `arena_top()` and the pin's eviction test read it.  After the
+fix both Gemma4 regions come from the spare, zero eviction.
+
+### 4. Green (the final tree)
+
+| arm | result |
+|---|---|
+| 35B-A3B `-ncmoe 40` np 4 soak, pair ON | **PASS 5/5**, 0 `arena alloc failed` (7a: 1), region from the spare every run |
+| Gemma4 26B-A4B `-ncmoe 20` + MTP head, reserve 2560 | both regions from the spare, 0 eviction, `none` == `draft-mtp` == `a195d3d6953c` |
+| 4B soak / n1-memory / itl | PASS; text identical; 16.32 -> 15.08 ms/token through a 5246-token prefill |
+| A1 / A3 | `be904e86f248` / `e9db5cb8db0b` unchanged |
+
+Code: `steps/STEP-7c-0012-aux-reserve-calibration.patch` (2 files, +83/-20), and the campaign's gates now pin
+`MOE_EXPERT_HEATMAP=load` so a soak's verdict is not a residency lottery.  Nothing in `patches/`; `~/llama.cpp`
+stays local.
+
 ## 261123.019 (no release; `prefill-decode-arms` v2 STEP 7d) -- **the host-tier soak was intermittent, not green**: the prefill arm's compute-buffer drop races the decode arm's graph capture
 
 A correction and a fix.  **STEP 7a's host-tier PASSes (261123.017) were lucky runs.**  The same binary, re-run

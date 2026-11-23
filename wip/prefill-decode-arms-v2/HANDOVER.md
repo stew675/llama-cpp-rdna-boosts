@@ -9,8 +9,9 @@ on this box; nothing here is a plan that has not been run unless it says so.
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`prefill-decode-arms-v2`** (pushed; `main` untouched at `91a81505`) |
 | work tree | `~/llama.cpp`, branch **`arms-v2`** (local only, **never pushed**), tip `e460f0dea` (STEP 7a; the previous landing was `5e668c768`) |
 | build | `~/bin/build-llama-rocm` → `build-rocm` (ROCm **10.2.0**); fast loop `cmake --build build-rocm --target llama-cli llama-server -j 16` |
-| last landing | **STEP 7d**: `steps/STEP-7d-0011-pair-drop-disable.patch` (`WORKLOG.md` 261123.019, `RUNS.md` top) + STEP 7a `steps/STEP-7a-0010-aux-narrow-regions.patch` (code tip `e460f0dea`, `WORKLOG.md` 261123.017) |
+| last landing | **STEP 7c** (retaken): `steps/STEP-7c-0012-aux-reserve-calibration.patch` (`WORKLOG.md` 261123.020) on top of **7d** `steps/STEP-7d-0011-pair-drop-disable.patch` (261123.019) and **7a** `steps/STEP-7a-0010-aux-narrow-regions.patch` (261123.017) |
 | the defects it closes | (7a) the host-expert (`-ncmoe`) FAULT: **a slab work-base ALIAS** — two contexts' compute buffers were the same memory — fixed with one pinned aux region per extra context + thread-local routing; the `-ncmoe` refusal is gone.  (7d) the same soak's **INTERMITTENCY**: the prefill -> decode drop races the decode arm's graph capture; the pair now keeps both layouts reserved (§2.7) |
+| the reserve loop | the aux compute region is charged to the slab RESERVE (an approximation, 1280 MiB), the slab logs the measured size + the reserve to set **once per slot**, and setting that value makes the region map from the unmapped VA spare with zero eviction (§2.8) |
 | next action | **STEP 8** — the two missing gates (`gate-arms-default-inert.sh`, `gate-arms-recurrent-shared.sh`), each with its non-vacuity line (§3) |
 
 ---
@@ -190,6 +191,19 @@ the next wide pass).  **This is exposure removal, not the general answer**: the 
 keeps the other arm out of `llama_process()` around a drop, which would let the drop come back (DESIGN §8
 invariants 3-4, `INVARIANTS.md` r366-wip).  Unmeasured for STEP 10: whether two more compute layouts (a drafter's)
 make the always-reserved layout cost arena.
+
+### 2.8 The reserve loop (STEP 7c) — approximation now, measured number for the next run
+
+* the decode arm's compute region is charged to the **slab reserve** (not to the arena's headroom, which is
+  `slab_extend`'s growth fuel — that variant aborts, `INVARIANTS.md` r365-wip);
+* the figure is an **approximation** (`COMMON_ARMS_RESERVE_MIB = 1280`; measured 1280 MiB on 35B-A3B
+  `-ncmoe 40` np 4, 512 MiB per aux context on Gemma4 26B-A4B + MTP);
+* at the pin the slab logs, **once per slot**, the region's measured size and the reserve that would host every
+  aux region (`headroom + sum(floors)`), and says whether this run had to evict arena tables;
+* verified end to end: Gemma4 default 2496 MiB -> one eviction + "set 2560"; at 2560 -> both regions from the
+  spare, zero eviction, same text;
+* a defect this exposed in 7a's accounting is fixed with it (`mapped_arena`: the arena's mapped extent is not
+  the slab's).
 
 ### 2.6 Both slots, and the arm that covers them
 

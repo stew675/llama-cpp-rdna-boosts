@@ -8,6 +8,71 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — STEP 7c (retaken on top of 7d): the aux reserve is an approximation, and the slab now **tells the operator the number to set** (`WORKLOG.md` 261123.020)
+
+7c was rejected before 7d because it changed table placement and thereby exposed the drop/capture race; with the
+race gone it does what it was meant to, plus it exposed a residual defect in **7a's own** accounting.
+
+### Part 1 — the reserve is charged up front (approximation), and calibrated by a one-time log
+
+`COMMON_ARMS_RESERVE_MIB` 256 -> **1280** (measured: 1280 MiB on 35B-A3B `-ncmoe 40` np 4; 512 MiB per aux
+context on Gemma4 26B-A4B + MTP).  The slab then maps the aux region from the **unmapped VA spare** instead of
+evicting arena tables:
+
+```
+35B-A3B Q8_0 -ncmoe 40, np 4, before:  aux narrow-3 pinned at [26.31, 27.56] GiB (1.25 GiB, taken from the arena)
+                                       1 x "arena alloc failed"
+                              after:   SLAB_INIT ... reserve=2.75 GiB ... va_spare=1.25 GiB
+                                       aux narrow-3 pinned at [26.31, 27.56] GiB (1.25 GiB, unmapped VA spare)
+                                       0 x "arena alloc failed"
+```
+
+and the slab logs the calibration **once per slot**, with the exact numbers:
+
+```
+the aux narrow-3 region (1280 MiB) came from the unmapped VA spare -- no arena table was evicted.
+The reserve in force is 2816 MiB; 2816 MiB would host every auxiliary region (headroom 1536 + aux 1280)
+```
+
+### Part 2 — the residual 7a defect this exposed: `mapped` conflated the arena with a sibling region
+
+The Gemma4 arm (two aux contexts, 512 MiB each) still evicted on the second one and claimed **1024 MiB** with
+`arena_before` == its own base.  Cause: `s.mapped` is the slab's VMM extent, and pinning region 0 ABOVE the arena
+grows it -- so the second pin's "is the arena mapped over my window?" test read the *slab*, not the arena.  Fixed
+with `s.mapped_arena` (the arena's own mapped extent: set at init, grown by `slab_extend`, never moved by an aux
+pin); `ggml_cuda_slab_arena_top()` and the pin's eviction test now read it.
+
+| arm | before the `mapped_arena` fix | after |
+|---|---|---|
+| Gemma4 26B-A4B + MTP, `GGML_CUDA_SLAB_RESERVE_MIB=2560` | slot 0 from spare, slot 1 "taken from the arena (1024 MiB evicted)" | **both from the unmapped VA spare**, zero eviction |
+
+### Part 3 — the calibration loop, end to end (the point of the whole exercise)
+
+On the Gemma4 shape the *default* reserve is the draft's own derived 2496 MiB, which does not cover both aux
+contexts, so the run logs:
+
+```
+the aux narrow-3 region (512 MiB) had to TAKE arena tables (1024 MiB evicted) because the reserve in force
+(2496 MiB) left only 960 MiB of unmapped VA spare.  Set GGML_CUDA_SLAB_RESERVE_MIB=2560 for a run that maps it
+from the spare instead (headroom 1536 + aux 1024)
+```
+
+Setting **2560** on the next run gives both regions from the spare, zero eviction, and the same text
+(`a195d3d6953c`).  That is the loop the maintainer asked for: approximate now, measure at startup, tell the
+operator the exact value for next time.
+
+### Verification (all on the final tree)
+
+| arm | result |
+|---|---|
+| 35B-A3B `-ncmoe 40` np 4 soak, pair ON | **PASS 5/5**, 0 `arena alloc failed` (7a: 1), region from the spare every run |
+| Gemma4 26B-A4B `-ncmoe 20` + `-md` MTP head, reserve 2560 | both regions from the spare, 0 eviction, `none` == `draft-mtp` == `a195d3d6953c` |
+| 4B soak (pair, no slab) | **PASS**, widest batch 4 |
+| `gate-arms-n1-memory.sh` / `gate-arms-itl.sh` | **PASS**; text identical; 16.32 -> 15.08 ms/token (pair ON) |
+| A1 / A3 | `be904e86f248` / `e9db5cb8db0b` unchanged (the pair's charge is inert with the pair off) |
+
+---
+
 ## 2026-11-23 — STEP 7d: **the host-tier soak was INTERMITTENT, not green** — the prefill arm's compute-buffer drop races the decode arm's graph capture (`WORKLOG.md` 261123.019)
 
 **A correction first.**  STEP 7a's host-tier PASSes were *lucky runs*.  The same 7a binary (`e460f0dea`, tree

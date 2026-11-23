@@ -1,0 +1,186 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index aa0bd8d02..b2ba890f4 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1326,11 +1326,20 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
+ // the reserve is charged ONLY when the pair will really be created (one predicate, DESIGN V2: a refused pair that
+ // was charged leaves the arena smaller for a context that never exists).
+ //
+-// MEASURED (2026-11-23, gfx1201 3x R9700, 27B Q8_0, `-sm tensor -mg 0 -np 2 -c 4096`, one tiny request, VRAM
+-// before/after the decode arm's reserve): +157 MiB on devices 0 and 1 and +235 MiB on device 2 (the axis the
+-// extra layers land on).  The constant is that measurement rounded up -- it is headroom for ONE narrow (n_parallel
+-// row) context, not a width-dependent number, because the decode arm's n_batch is n_parallel x (n_spec_max+1).
+-static const int COMMON_ARMS_RESERVE_MIB = 256;
++// MEASURED (2026-11-23): the decode arm's COMPUTE buffer is one narrow (n_parallel-row) layout, and it is what
++// this reserve has to cover -- the slab maps it from the VA it leaves unmapped, so no arena table has to be
++// evicted at load to make room:
++//   * 35B-A3B Q8_0 `-ncmoe 40`, np 4 (host expert tier, slab armed): 1280 MiB (the same size class as the
++//     prefill arm's narrow layout -- the 35B-A3B compute layout is size-independent);
++//   * Gemma4 26B-A4B Q8_0 `-ncmoe 20` + an external MTP head: 512 MiB per auxiliary context.
++// The earlier "+157/+235 MiB per device" figure (27B/Q8_0/3-GPU tensor) measured the *arena shrink after the
++// slab had already absorbed the buffer*, i.e. a different quantity -- a dense model arms no slab at all, so
++// that arm could not see the real number.  THIS IS AN APPROXIMATION: the exact per-device figure is known only
++// once the decode arm's own `sched_reserve` has run, and the slab logs a one-time recommendation for the next
++// run at that point (`ggml_cuda_slab_aux_commit_locked`).  Withholding the widest measured value means the pin
++// never has to evict on any validated shape; an over-estimate only costs arena on a shape whose aux layout is
++// narrower, which the logged recommendation then fixes.
++static const int COMMON_ARMS_RESERVE_MIB = 1280;
+ 
+ static common_draft_reserve common_draft_reserve_derive(const common_params & params) {
+     common_draft_reserve draft_reserve;
+@@ -1570,8 +1579,11 @@ common_init_result::common_init_result(common_params & params, bool model_only,
+             const char * why = common_arms_pair_possible(params);
+             if (why == nullptr) {
+                 arms_bytes = (size_t) COMMON_ARMS_RESERVE_MIB * 1024 * 1024;
+-                LOG_WRN("%s: the two-arm server's decode arm reserves %d MiB (measured 157-235 MiB per device on "
+-                        "27B/Q8_0/3-GPU tensor: one narrow context's compute buffers arrive after this arena)\n",
++                LOG_WRN("%s: the two-arm server's decode arm reserves %d MiB (measured 1280 MiB on 35B-A3B "
++                        "Q8_0 `-ncmoe 40` np 4 and 512 MiB on Gemma4 26B-A4B + MTP: one narrow context's "
++                        "compute buffer arrives after this arena, and the slab maps it from the VA it leaves "
++                        "unmapped so no arena table is evicted at load; the exact figure and the reserve to "
++                        "set are logged once when the buffer is allocated)\n",
+                         __func__, COMMON_ARMS_RESERVE_MIB);
+             } else {
+                 LOG_INF("%s: the two-arm server is requested but cannot be built (%s), so it reserves NOTHING\n",
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index d76b3a5fa..587429edd 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -175,6 +175,13 @@ struct ggml_cuda_slab {
+     };
+     static constexpr int     N_AUX = 2;
+     aux_region               narrow2[N_AUX];
++    // The ARENA's mapped extent, tracked separately from `mapped` (the slab's VMM mapping).  An aux region
++    // pinned ABOVE the arena maps VA of its own, so `mapped` then overstates what the arena holds -- and the
++    // pin's eviction test (`is the arena mapped over my window?`) and `arena_top` must read the arena's extent,
++    // not the slab's.  Conflating them made the SECOND aux region evict a GiB of tables that were not there
++    // (measured: Gemma4 26B-A4B + MTP, both regions 512 MiB, slot 1 "evicted 1024 MiB" while the arena's
++    // mapped top was exactly slot 1's base).
++    size_t                   mapped_arena = 0;
+     size_t                   ring_region  = 0;  // ring bytes above the narrow floor (0 = no ring)
+     bool                     ring_armed   = false; // the wide view (hence the ring region) is reserved
+     // wip/slab-transient-absorption: the WIDE-PHASE auxiliary region (the FA prefill staging arena), bump
+@@ -427,6 +434,9 @@ void ggml_cuda_slab_set_aux_reserve(size_t bytes) {
+ // Forward declaration: the reserve policy reads the (single-sourced) headroom.
+ size_t ggml_cuda_slab_headroom_bytes();
+ 
++static size_t ggml_cuda_slab_reserve_bytes(size_t total_b);
++static size_t ggml_cuda_slab_reserve_mib(size_t total_b);
++
+ static size_t ggml_cuda_slab_reserve_bytes(size_t total_b) {
+     static size_t reserve_mib = SIZE_MAX;
+     if (reserve_mib == SIZE_MAX) {
+@@ -625,7 +635,7 @@ static size_t ggml_cuda_slab_arena_limit(const ggml_cuda_slab & s) {
+ }
+ static size_t ggml_cuda_slab_arena_top(const ggml_cuda_slab & s) {
+     const size_t lim = ggml_cuda_slab_arena_limit(s);
+-    return s.mapped < lim ? s.mapped : lim;
++    return s.mapped_arena < lim ? s.mapped_arena : lim;
+ }
+ 
+ // The arena's allocation unit: fine (the VMM granularity).  The slab is ONE mapping, so this is pure
+@@ -850,9 +860,10 @@ bool ggml_cuda_slab_extend(int device) {
+     s.peer_mask &= granted;
+     // Hand the new range to the arena (coalescing with the run below it if there is one; the arena fills
+     // top-down, so normally the top of the region IS the free run).
+-    const size_t lo = s.mapped;
+-    const size_t hi = s.mapped + add;
+-    s.mapped = hi;
++    const size_t lo = s.mapped_arena;
++    const size_t hi = s.mapped_arena + add;
++    s.mapped_arena = hi;
++    s.mapped       = std::max(s.mapped, hi);
+     auto next = s.arena_free.lower_bound(lo);
+     size_t new_lo = lo, new_hi = hi;
+     if (next != s.arena_free.end() && next->first == new_hi) {
+@@ -996,6 +1007,7 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+     s.wide_aux_denied_n    = 0;
+     s.wide_aux_race_n      = 0;
+     s.ring_slots   = ggml_backend_cuda_context::h2d_stage_slots();
++    s.mapped_arena = s.mapped;
+     s.arena_free.clear();
+     s.arena_free[w] = s.mapped - w;
+     s.inited = true;
+@@ -1077,9 +1089,10 @@ static size_t ggml_cuda_slab_aux_pin_locked(int device, ggml_cuda_slab & s, int
+                       (double) s.mapped / (1ull << 30));
+         return 0;
+     }
+-    // mapped physical above `off` is in the way: it has to be evicted before the pin (the eviction
+-    // re-enters the slab through `arena_free`, so it cannot run under this lock).
+-    *evict = off < s.mapped;
++    // ARENA-mapped physical above `off` is in the way: it has to be evicted before the pin (the eviction
++    // re-enters the slab through `arena_free`, so it cannot run under this lock).  `mapped_arena`, not
++    // `mapped`: VA that a SIBLING aux region already mapped is not in the way.
++    *evict = off < s.mapped_arena;
+     return off;
+ }
+ 
+@@ -1116,8 +1129,9 @@ static void ggml_cuda_slab_aux_commit_locked(int device, ggml_cuda_slab & s, int
+         }
+     }
+     const size_t want = off + nf2;
+-    const size_t mapped_before = s.mapped;
+-    if (off < mapped_before) {
++    const size_t mapped_before = s.mapped;           // the slab's VMM extent (what has to be mapped)
++    const size_t arena_before  = s.mapped_arena;     // what the ARENA holds, and what can be in the way
++    if (off < arena_before) {
+         // The arena gave the range up: drop every free run at or above the new ceiling, so a later
+         // `arena_alloc` cannot hand out memory that now belongs to the auxiliary compute view.
+         for (auto it = s.arena_free.begin(); it != s.arena_free.end(); ) {
+@@ -1153,15 +1167,52 @@ static void ggml_cuda_slab_aux_commit_locked(int device, ggml_cuda_slab & s, int
+     }
+     r.floor = nf2;
+     r.off   = off;
++    const bool from_spare = off >= arena_before;
+     GGML_LOG_WARN("%s: device %d: aux narrow-%d (%s compute) pinned at [%.2f, %.2f] GiB "
+                   "(%.2f GiB, %s); the arena now tops out at %.2f GiB\n",
+                   __func__, device, slot + 2, slot == 0 ? "draft" : "borrowing-context",
+                   (double) off / (1ull << 30), (double) s.size / (1ull << 30), (double) nf2 / (1ull << 30),
+-                  off >= mapped_before ? "unmapped VA spare"
+-                                       : off + nf2 <= mapped_before ? "taken from the arena (tables evicted)"
+-                                                                   : "taken from the arena (tables evicted) "
+-                                                                     "plus the VA above the mapped extent mapped",
++                  from_spare ? "unmapped VA spare"
++                             : off + nf2 <= arena_before ? "taken from the arena (tables evicted)"
++                                                          : "taken from the arena (tables evicted) "
++                                                            "plus the VA above the mapped extent mapped",
+                   (double) (ggml_cuda_slab_arena_top(s) - s.boundary) / (1ull << 30));
++    // ONE-TIME calibration message, once per slot per process: the region's size is only known now (it is the
++    // aux context's own `sched_reserve` layout), and the slab's reserve was an APPROXIMATION chosen before the
++    // slab existed.  Tell the operator the number to set, so the next run maps the region from the unmapped
++    // spare instead of evicting arena tables.  `GGML_CUDA_SLAB_RESERVE_MIB` leaves `reserve - headroom` as that
++    // spare (see `ggml_cuda_slab_reserve_bytes`), so the value that hosts every aux region is
++    // `headroom + sum(floors)`.
++    static bool calib_done[ggml_cuda_slab::N_AUX] = {};
++    if (!calib_done[slot]) {
++        calib_done[slot] = true;
++        size_t aux_total = 0;
++        for (const auto & a : s.narrow2) {
++            aux_total += a.floor;
++        }
++        const size_t recommended_mib = (ggml_cuda_slab_headroom_bytes() + aux_total + (1024 * 1024 - 1)) / (1024 * 1024);
++        const size_t current_mib     = ggml_cuda_slab_reserve_mib(0);
++        if (from_spare) {
++            GGML_LOG_INFO("%s: device %d: the aux narrow-%d region (%.0f MiB) came from the unmapped VA spare "
++                          "-- no arena table was evicted.  The reserve in force is %zu MiB; %zu MiB would host "
++                          "every auxiliary region (headroom %zu + aux %zu) if this shape ever needs more than "
++                          "one.\n", __func__, device, slot + 2, (double) nf2 / 1048576.0, current_mib,
++                          recommended_mib, ggml_cuda_slab_headroom_bytes() / 1048576,
++                          aux_total / 1048576);
++        } else {
++            GGML_LOG_WARN("%s: device %d: the aux narrow-%d region (%.0f MiB) had to TAKE arena tables "
++                          "(%.0f MiB evicted) because the reserve in force (%zu MiB) left only %zu MiB of "
++                          "unmapped VA spare.  Set GGML_CUDA_SLAB_RESERVE_MIB=%zu for a run that maps it from "
++                          "the spare instead (headroom %zu + aux %zu); the arena ends up the same size either "
++                          "way, this only removes the load-time eviction.\n",
++                          __func__, device, slot + 2, (double) nf2 / 1048576.0,
++                          (double) (arena_before > off ? arena_before - off : 0) / 1048576.0, current_mib,
++                          current_mib > ggml_cuda_slab_headroom_bytes() / 1048576
++                              ? current_mib - ggml_cuda_slab_headroom_bytes() / 1048576 : 0,
++                          recommended_mib, ggml_cuda_slab_headroom_bytes() / 1048576,
++                          aux_total / 1048576);
++        }
++    }
+ }
+ 
+ // An aux context's narrow compute allocation.  Runs OUTSIDE `g_slab_mutex` because pinning may have to

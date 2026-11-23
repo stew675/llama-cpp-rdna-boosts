@@ -2771,3 +2771,20 @@ r363-wip item 1, whose diagnosis was wrong.
    the environment drifted (item 2) reversed the verdict; a soak gate's record should state the repeats and the
    prior it pinned, or the green line is a lottery ticket.
 
+## r367-wip (2026-11-23, `WORKLOG.md` 261123.020) -- an auxiliary compute region must be charged to the slab RESERVE up front, and the slab's `mapped` is not the arena's extent (`prefill-decode-arms` v2 STEP 7c)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 7c.
+
+1. **Charge an auxiliary context's compute region to the slab reserve, not to the arena's headroom.**  With
+   `reserve = headroom + aux` the region is mapped from the **unmapped VA spare** and no arena table is evicted
+   at load (measured: 1 -> 0 `arena alloc failed` lines on 35B-A3B `-ncmoe 40` np 4, the region at
+   `[26.31, 27.56] GiB` labelled `unmapped VA spare`).  Taking it from the headroom instead (STEP 7b) starves
+   `slab_extend` and aborts (r365-wip); taking it from the arena (unreserved, STEP 7a) costs one eviction pass.
+   The figure is shape-dependent (1280 MiB on that shape, 512 MiB per auxiliary context on Gemma4 26B-A4B + MTP),
+   so the slab logs it once per slot with the reserve that would host it -- the operator sets that on the next run.
+2. **`ggml_cuda_slab::mapped` is the slab's VMM extent, not the arena's.**  An aux region pinned ABOVE the arena
+   grows `mapped`, so a second pin's eviction test ("is the arena mapped over my window?") reads the slab and
+   evicts tables that are not there (measured: Gemma4, both regions 512 MiB, slot 1 reported `1024 MiB evicted`
+   with the arena's mapped top exactly at slot 1's base).  Track the arena's extent separately (`mapped_arena`:
+   seeded at init, grown by `slab_extend`, never moved by a pin) and read it in `arena_top()` and in the pin.
+
