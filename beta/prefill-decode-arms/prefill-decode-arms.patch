@@ -1,6 +1,6 @@
-From 26a26fc2fec4554d0b88a14e3b4388c5b6a48a48 Mon Sep 17 00:00:00 2001
+From 78c3d3028ae081ed1c5dbda2dacaabdcecc7ecf0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
-Date: Tue, 24 Nov 2026 11:10:01 -0600
+Date: Tue, 24 Nov 2026 11:58:11 -0600
 Subject: [PATCH] rdna-boosts: block 17: the two-arm server -- ONE
  llama_memory, TWO llama_contexts
 
@@ -18,16 +18,17 @@ Options (both default OFF; -mode auto falls back with a warning):
   --prefill-decode-arms, --no-prefill-decode-arms
   --prefill-decode-arms-mode off|on|auto
 
-Covers the work needed to make two live contexts correct and safe on this
-backend: a per-(thread,device) host stream with the async-input ring and the
-best-effort VMM pool peer grants, the one-allocator/one-lock memory with its
-reservation bitmap, a per-context Meta view slot and split-state cache, the
-contextified recurrent placement, one pinned slab work region per extra context
-routed by the allocating context's identity, the pair's compute-buffer drop
-disabled, a capture/library-GEMM barrier (graph capture exclusive, library
-GEMMs shared, handle creation exclusive), and release_slot() -- the main-thread
-teardown that quiesces the decode arm before releasing a slot it may be
-stepping (the CANCEL path, found by a beta tester).
+Covers the work two live contexts need on this backend: a per-(thread,device)
+host stream with the async-input ring and the best-effort VMM pool peer grants,
+the one-allocator/one-lock memory with its reservation bitmap, a per-context
+Meta view slot and split-state cache, the contextified recurrent placement, one
+pinned slab work region per extra context routed by the allocating context's
+identity, the pair's compute-buffer drop disabled, a capture/library-GEMM
+barrier, and -- from the beta testing of this candidate -- release_slot() (a
+main-thread teardown must quiesce the arm that may be mid-round on the slot,
+the CANCEL/abort path) and ONE RCCL comm layer per process (an auxiliary
+context asks for the copy-engine chain: a second RCCL comm layer costs ~646
+descriptors on a 3-device split, which crosses FD_SETSIZE and aborts).
 
 Nothing here is covered by the delivery's release gates; this is a beta
 candidate, NOT part of patches/, release.json or rdna-boosts-all.patch.
@@ -49,13 +50,13 @@ candidate, NOT part of patches/, release.json or rdna-boosts-all.patch.
  ggml/src/ggml-cuda/fp8.cu            |    1 +
  ggml/src/ggml-cuda/ggml-cuda-slab.cu |  504 ++++++----
  ggml/src/ggml-cuda/ggml-cuda-vmm.h   |   29 +-
- ggml/src/ggml-cuda/ggml-cuda.cu      |  418 ++++++--
+ ggml/src/ggml-cuda/ggml-cuda.cu      |  516 ++++++++--
  ggml/src/ggml-cuda/out-prod.cu       |    3 +
  ggml/src/ggml-cuda/solve_tri.cu      |    1 +
  ggml/src/ggml-cuda/ssm-scan.cu       |    5 +
  ggml/src/ggml-rpc/ggml-rpc.cpp       |    4 +-
  include/llama.h                      |   34 +
- src/llama-context.cpp                |  257 ++++-
+ src/llama-context.cpp                |  290 +++++-
  src/llama-context.h                  |   47 +-
  src/llama-cparams.h                  |    4 +
  src/llama-kv-cache-dsa-iswa.h        |   11 +
@@ -74,7 +75,7 @@ candidate, NOT part of patches/, release.json or rdna-boosts-all.patch.
  src/llama-memory.h                   |   31 +
  tools/server/README.md               |    2 +
  tools/server/server-context.cpp      | 1382 ++++++++++++++++++++------
- 42 files changed, 2942 insertions(+), 741 deletions(-)
+ 42 files changed, 3073 insertions(+), 741 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index dedf56bf4..a6afcfb89 100644
@@ -1856,7 +1857,7 @@ index 7570a3b06..4095cac16 100644
  bool   ggml_cuda_slab_compute_plain();
  size_t ggml_cuda_slab_headroom_bytes();
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a8241b6c9..517c6fd2d 100644
+index a8241b6c9..74ce56816 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -181,6 +181,40 @@ int ggml_cuda_get_device() {
@@ -2402,7 +2403,137 @@ index a8241b6c9..517c6fd2d 100644
  }
  
  static void ggml_backend_cuda_kv_region_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
-@@ -7018,6 +7216,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -4066,6 +4264,9 @@ ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buffer_type(int device) {
+     return ggml_backend_cuda_kv_region_buffer_type_split(device, 0);
+ }
+ 
++// how many RCCL comm layers this process has already created (see the backstop in comm_init_nccl)
++static std::atomic<int> g_comm_rccl_layers{0};
++
+ // Communication context for multi-GPU AllReduce during tensor parallelism.
+ //
+ // Created once per meta backend instance.  Resources for the selected mode
+@@ -4448,6 +4649,33 @@ static bool ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context
+ 
+ // Try to bring up the NCCL/RCCL comms.  Returns true on success.
+ static bool ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
++    // ONLY ONE RCCL COMM LAYER PER PROCESS.  Each `ncclCommInitAll` creates one `/dev/shm/nccl-*` IPC
++    // segment per peer per channel -- measured 646 open descriptors per layer on a 3-device `-sm tensor`
++    // split -- and `FD_SETSIZE` (1024) is compile-time in the PREBUILT library whose `select()` trips on
++    // them, so a second layer is not a tuning decision, it is an abort:
++    //   `*** bit out of range 0 - FD_SETSIZE on fd_set ***` (measured: the target context + an MTP draft
++    //   head + the two-arm server's decode arm = 2026 descriptors, TWO LIMITS' worth, before a request).
++    //
++    // The first layer keeps RCCL -- that is what a host-expert PRE-FILL wants (pp2048 809 vs 604 t/s on
++    // the copy-engine arm).  Every later layer stands down to the copy-engine chain, which for an
++    // auxiliary (decode-band) context is free: it only ever reduces decode-sized tensors, and every chain
++    // already routes those to the internal pipeline.  `llama_context` additionally ASKS for this per
++    // context (`ggml_backend_comm_set_chain_next`), so a shape whose auxiliary context comes up first
++    // does not depend on this backstop; an explicit `GGML_CUDA_ALLREDUCE` does not override it, because
++    // the alternative to standing down is a hard abort and the warning names both.
++    if (g_comm_rccl_layers.load() > 0) {
++        const char * pinned = getenv("GGML_CUDA_ALLREDUCE");
++        GGML_LOG_WARN("all-reduce: NOT bringing up a second RCCL comm layer%s%s -- each one costs ~646 open "
++                      "descriptors on a 3-device split and two of them cross FD_SETSIZE (1024), which aborts the "
++                      "process in a library's select(); this context uses the copy-engine chain instead, and its "
++                      "tensors are decode-sized (the internal pipeline serves them either way)\n",
++                      pinned ? " (GGML_CUDA_ALLREDUCE=" : "", pinned ? pinned : "");
++        if (pinned) {
++            GGML_LOG_WARN("all-reduce: `%s` is pinned but cannot be honoured for a second comm layer -- see above\n",
++                          pinned);
++        }
++        return false;
++    }
+ #ifdef GGML_USE_NCCL
+     // Disabling NCCL path when CUDA virtual devices are in use since NCCL requires one distinct physical GPU per rank.
+     const ggml_cuda_device_info & info = ggml_cuda_info();
+@@ -4459,6 +4687,9 @@ static bool ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
+     const size_t n = ret->dev_ids.size();
+     ret->comms.resize(n);
+     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
++    if (rc == ncclSuccess) {
++        g_comm_rccl_layers.fetch_add(1);
++    }
+     if (rc == ncclSuccess) {
+         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+         return true;
+@@ -5542,6 +5773,42 @@ static bool ggml_backend_cuda_comm_init_ce_chain(ggml_backend_cuda_comm_context
+ // large arm is RCCL's ring, which is what a PCIe-saturated host-expert prefill wants.
+ bool g_comm_host_experts = false;
+ 
++// A CONSUME-ONCE override for the NEXT comm layer created in this process: 0 = none, 1 = the copy-engine
++// chain (the internal pipeline for the latency-bound smalls + CE for the large ones, RCCL never brought
++// up).  Set by `llama_context::sched_new()` for a context that BORROWS another context's memory (the
++// two-arm server's decode arm), because that is the one case where a second comm layer must not be a
++// second RCCL:
++//
++//   * each `ncclCommInitAll` creates one `/dev/shm/nccl-*` IPC segment per peer per channel -- measured
++//     646 open descriptors per comm layer on a 3-device `-sm tensor` split, and the delivery alone
++//     already sits at 63 % of `FD_SETSIZE` (1024) there;
++//   * two of them (1356 descriptors measured) cross `FD_SETSIZE`, and the next `select()` in a PREBUILT
++//     library aborts the process: `*** bit out of range 0 - FD_SETSIZE on fd_set ***`.  `FD_SETSIZE` is
++//     compile-time in the caller's TU, so it cannot be raised for RCCL from here;
++//   * a borrowing context only ever reduces DECODE-sized tensors, and every chain already routes those
++//     to the internal pipeline, so the copy-engine chain costs it nothing measurable -- while the
++//     PREFILL context keeps the RCCL ring, which is what a host-expert prefill wants (see
++//     `ggml_backend_cuda_comm_init_auto` for the measurements).
++//
++// Consume-once (not a modal flag) so that nothing but the comm layer created immediately after it can
++// inherit it.  An explicit `GGML_CUDA_ALLREDUCE` still wins -- see the hook in
++// `ggml_backend_cuda_comm_init()` -- because an operator who pinned a chain meant it, and the warning
++// then names the descriptor ceiling instead of silently overriding.
++static std::mutex g_comm_chain_next_mtx;
++static int        g_comm_chain_next = 0;   // 0 = none, 1 = copy-engine chain
++
++static void ggml_backend_cuda_comm_set_chain_next(int chain) {
++    std::lock_guard<std::mutex> lk(g_comm_chain_next_mtx);
++    g_comm_chain_next = chain;
++}
++
++static int ggml_backend_cuda_comm_take_chain_next() {
++    std::lock_guard<std::mutex> lk(g_comm_chain_next_mtx);
++    const int chain = g_comm_chain_next;
++    g_comm_chain_next = 0;
++    return chain;
++}
++
+ // The Linux/HIP default chain (r165).  Both large-tensor arms are brought up eagerly and the arm is
+ // chosen once, at the FIRST large all-reduce, from the only signal that separates the two regimes:
+ // whether the model offloads experts to host memory (g_comm_host_experts, set by the slab block).
+@@ -5677,6 +5944,32 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
+         ret->dev_ids.push_back(static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device);
+     }
+ 
++    // A context that BORROWS another's memory asks for the copy-engine chain (see the flag above): its
++    // tensors are decode-sized, so the large-tensor arm is never reached, and a second RCCL comm layer
++    // would push the process over `FD_SETSIZE` on a 3+-device tensor split.
++    if (ggml_backend_cuda_comm_take_chain_next() == 1) {
++        const char * pinned = getenv("GGML_CUDA_ALLREDUCE");
++        if (pinned != nullptr && strcmp(pinned, "auto") != 0 && strcmp(pinned, "ce") != 0) {
++            GGML_LOG_WARN("all-reduce: GGML_CUDA_ALLREDUCE=%s is pinned, so it is used for this "
++                          "context too -- but this context BORROWS another's memory, and a SECOND RCCL "
++                          "comm layer costs ~646 open descriptors on a 3-device split, which crosses "
++                          "FD_SETSIZE (1024) and aborts the process in a library's select(); `ce` is the "
++                          "value that avoids it\n", pinned);
++        } else {
++            GGML_LOG_INFO("all-reduce: this context BORROWS another context's memory (a two-arm server "
++                          "arm) -- the copy-engine chain, and RCCL is NOT brought up a second time (a "
++                          "second RCCL comm layer crosses FD_SETSIZE on a 3-device split; its tensors are "
++                          "decode-sized anyway)\n");
++            const bool ce_ok = ggml_backend_cuda_comm_init_ce_chain(ret, false);
++            if (!ce_ok) {
++                GGML_LOG_WARN("all-reduce: the copy-engine chain did not come up for this context; it "
++                              "keeps the internal pipeline (or the meta backend's butterfly) and RCCL is "
++                              "still not initialised\n");
++            }
++            return ret;
++        }
++    }
++
+     const char * env = getenv("GGML_CUDA_ALLREDUCE");
+     bool ok = false;
+     if (!env || strcmp(env, "auto") == 0) {
+@@ -7018,6 +7311,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                                           (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr);
          } else
  #endif
@@ -2410,7 +2541,7 @@ index a8241b6c9..517c6fd2d 100644
          CUBLAS_CHECK(
              cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                      ne01, ne11, ne10,
-@@ -7025,6 +7224,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -7025,6 +7319,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                                             (const float *) src1_ptr, s11,
                      (const float *) beta,  (float       *)  dst_ptr, ldc));
      } else if (ne12 == 1 && ne13 == 1) {
@@ -2418,7 +2549,7 @@ index a8241b6c9..517c6fd2d 100644
          CUBLAS_CHECK(
              cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                      ne01, ne11, ne10,
-@@ -7040,6 +7240,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -7040,6 +7335,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
  
          // there is no broadcast and src0, src1 are contiguous across dims 2, 3
          // use cublasGemmStridedBatchedEx
@@ -2426,7 +2557,7 @@ index a8241b6c9..517c6fd2d 100644
          CUBLAS_CHECK(
          cublasGemmStridedBatchedEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                  ne01, ne11, ne10,
-@@ -7078,6 +7279,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -7078,6 +7374,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
  
          CUDA_CHECK(cudaGetLastError());
  
@@ -2434,7 +2565,7 @@ index a8241b6c9..517c6fd2d 100644
          CUBLAS_CHECK(
          cublasGemmBatchedEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                  ne01, ne11, ne10,
-@@ -8540,7 +8742,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+@@ -8540,7 +8837,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
  // peer mapping, and `cuMemSetAccess` returns `invalid argument`).  The failure is not catchable: without
  // peer access enabled HIP returns an error host-side, and with `GGML_CUDA_P2P=1` the copy is issued and the
  // GPU FAULTS (`HSA_STATUS_ERROR_MEMORY_FAULT` in `__amd_rocclr_copyBuffer`, "Page not present"), which
@@ -2443,7 +2574,7 @@ index a8241b6c9..517c6fd2d 100644
  // pinned host memory for the pairs the driver refused.
  //
  // One grow-only buffer and one done-event per (src, dst) pair.  The D2H runs on the source stream and the
-@@ -8595,6 +8797,9 @@ static void ggml_cuda_peer_copy_staged(
+@@ -8595,6 +8892,9 @@ static void ggml_cuda_peer_copy_staged(
      }
  
      ggml_cuda_set_device(src_device);
@@ -2453,7 +2584,7 @@ index a8241b6c9..517c6fd2d 100644
      if (st.have_done) {
          CUDA_CHECK(cudaStreamWaitEvent(src_stream, st.done, 0));
      }
-@@ -8655,7 +8860,7 @@ static bool ggml_backend_cuda_cpy_tensor_async_impl(ggml_backend_t backend_src,
+@@ -8655,7 +8955,7 @@ static bool ggml_backend_cuda_cpy_tensor_async_impl(ggml_backend_t backend_src,
              return false;
  #else
              // a peer copy the driver's grants do not cover faults the GPU, so ask first
@@ -2462,7 +2593,7 @@ index a8241b6c9..517c6fd2d 100644
                  ggml_cuda_peer_copy_staged(cuda_ctx_src->device, cuda_ctx_src->stream(),
                                             cuda_ctx_dst->device, cuda_ctx_dst->stream(),
                                             dst->data, src->data, ggml_nbytes(dst));
-@@ -9785,6 +9990,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -9785,6 +10085,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
          g_gc_n_replay++;
      }
  
@@ -2479,7 +2610,7 @@ index a8241b6c9..517c6fd2d 100644
      if (use_cuda_graph && cuda_graph_update_required) {
          // Start CUDA graph capture
          if (ggml_cuda_graph_trace()) {
-@@ -9805,12 +10020,75 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -9805,12 +10115,75 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required,
                                          use_cuda_graph ? graph : nullptr);
      cuda_ctx->capturing = false;
@@ -2555,7 +2686,7 @@ index a8241b6c9..517c6fd2d 100644
  static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
  
-@@ -9821,6 +10099,10 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+@@ -9821,6 +10194,10 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
  
      if (ggml_backend_is_cuda(backend)) {
@@ -2566,7 +2697,7 @@ index a8241b6c9..517c6fd2d 100644
          CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
      } else {
  #if 0
-@@ -12165,19 +12447,21 @@ static void ggml_backend_cuda_device_slab_reserve_wide(ggml_backend_dev_t dev, s
+@@ -12165,19 +12542,21 @@ static void ggml_backend_cuda_device_slab_reserve_wide(ggml_backend_dev_t dev, s
      ggml_cuda_slab_reserve_wide(ctx->device, bytes);
  }
  
@@ -2597,7 +2728,7 @@ index a8241b6c9..517c6fd2d 100644
  }
  
  static void ggml_backend_cuda_device_slab_compute_plain(ggml_backend_dev_t dev, bool enable) {
-@@ -12210,8 +12494,8 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+@@ -12210,8 +12589,8 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
      /* .slab_ring_set           = */ ggml_backend_cuda_device_slab_ring_set,
      /* .slab_narrow_floor       = */ ggml_backend_cuda_device_slab_narrow_floor,
      /* .slab_reserve_wide       = */ ggml_backend_cuda_device_slab_reserve_wide,
@@ -2608,6 +2739,16 @@ index a8241b6c9..517c6fd2d 100644
      /* .moe_cache_set_host_pool   = */ ggml_backend_cuda_device_moe_cache_set_host_pool,
      /* .moe_cache_set_host_source = */ ggml_backend_cuda_device_moe_cache_set_host_source,
      /* .slab_compute_plain        = */ ggml_backend_cuda_device_slab_compute_plain,
+@@ -12410,6 +12789,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+         return (void *)ggml_backend_cuda_comm_all_gather_tensor;
+     }
+ #ifdef GGML_USE_NCCL
++    if (strcmp(name, "ggml_backend_comm_set_chain_next") == 0) {
++        return (void *) ggml_backend_cuda_comm_set_chain_next;
++    }
+     if (strcmp(name, "ggml_backend_comm_init_rank") == 0) {
+         return (void *)ggml_backend_cuda_comm_init_rank;
+     }
 diff --git a/ggml/src/ggml-cuda/out-prod.cu b/ggml/src/ggml-cuda/out-prod.cu
 index c46e0455d..3ec8c09d0 100644
 --- a/ggml/src/ggml-cuda/out-prod.cu
@@ -2759,7 +2900,7 @@ index eec23b49d..d542596e9 100644
      LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
      LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 8518e09fe..0e962de24 100644
+index 8518e09fe..dfb8584b7 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,5 +1,6 @@
@@ -2805,7 +2946,47 @@ index 8518e09fe..0e962de24 100644
  
      // TODO: more generic
      if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
-@@ -996,6 +1019,63 @@ llama_context::llama_context(
+@@ -924,6 +947,39 @@ llama_context::llama_context(
+     }
+ 
+     if (!hparams.vocab_only) {
++        // A context that BORROWS another context's memory (the two-arm server's decode arm) must not bring a
++        // SECOND RCCL comm layer up.  Each `ncclCommInitAll` costs ~646 open descriptors on a 3-device
++        // `-sm tensor` split (one `/dev/shm/nccl-*` IPC segment per peer per channel), the delivery alone
++        // already sits at 63 % of `FD_SETSIZE` (1024) there, and two of them cross it -- the next `select()`
++        // in a PREBUILT library then aborts the process (`*** bit out of range 0 - FD_SETSIZE on fd_set ***`),
++        // and `FD_SETSIZE` is compile-time in that library's TU, so it cannot be raised from here.
++        //
++        // Ask for the copy-engine chain for the comm layer the instantiation below is about to create: a
++        // borrowing context only ever reduces DECODE-sized tensors, which every chain already routes to the
++        // internal pipeline, so the large-tensor arm is never reached -- while the PREFILL context keeps RCCL's
++        // ring, which is what a host-expert prefill wants (measured 809 vs 604 t/s CE).  The backend consumes
++        // the request once, so only the comm layer created here can inherit it, and a backend without the hook
++        // (CPU, RPC, no Meta device) simply does not get it.
++        //
++        // The test is "is this an AUXILIARY context", which is the same identity `slab_aux_slot()` uses: a
++        // context that views its target (`ctx_other`: an MTP draft head), an auxiliary decoder-band context
++        // (`ctx_aux`) or a BORROWER (`ctx_memory`: the two-arm server's decode arm).  All of them are
++        // decode-band, so none of them needs RCCL's ring, and each one that brought up its own would add ~646
++        // descriptors: measured 2026 open fds with target + MTP draft + decode arm on a 3-device split, i.e.
++        // TWO LIMITS' worth before a request.  The REQUEST fields are used (not `memory_borrowed`), because the
++        // Meta backend -- and therefore the comm layer -- is instantiated HERE.
++        const bool aux_comm = params.ctx_memory != nullptr || params.ctx_other != nullptr || params.ctx_aux;
++        if (aux_comm) {
++            ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++            ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
++            auto set_chain_next = reg != nullptr
++                ? (void (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_set_chain_next")
++                : nullptr;
++            if (set_chain_next != nullptr) {
++                set_chain_next(1); // 1 = the copy-engine chain (RCCL is not brought up for this context)
++            }
++        }
++
+         // GPU backends
+         for (const auto & dev : model.devices) {
+             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+@@ -996,6 +1052,63 @@ llama_context::llama_context(
  
      // init the memory module
      if (!hparams.vocab_only) {
@@ -2869,7 +3050,7 @@ index 8518e09fe..0e962de24 100644
          llama_memory_params params_mem = {
              /*.type_k    =*/ params.type_k,
              /*.type_v    =*/ params.type_v,
-@@ -1011,7 +1091,9 @@ llama_context::llama_context(
+@@ -1011,7 +1124,9 @@ llama_context::llama_context(
          cparams.type_k = params_mem.type_k;
          cparams.type_v = params_mem.type_v;
  
@@ -2880,7 +3061,7 @@ index 8518e09fe..0e962de24 100644
      }
  
      // init backends
-@@ -1219,6 +1301,15 @@ llama_context::llama_context(
+@@ -1219,6 +1334,15 @@ llama_context::llama_context(
  }
  
  llama_context::~llama_context() {
@@ -2896,7 +3077,7 @@ index 8518e09fe..0e962de24 100644
      for (auto & be : state_pipe_evs) {
          for (ggml_backend_event_t ev : be.second) {
              if (ev != nullptr) {
-@@ -1534,6 +1625,15 @@ void llama_context::sched_new(const sched_params & params) {
+@@ -1534,6 +1658,15 @@ void llama_context::sched_new(const sched_params & params) {
  }
  
  void llama_context::sched_alt_select(bool alt) {
@@ -2912,7 +3093,7 @@ index 8518e09fe..0e962de24 100644
      if (alt == sched_alt_in_use) {
          return;
      }
-@@ -1550,7 +1650,6 @@ void llama_context::sched_alt_select(bool alt) {
+@@ -1550,7 +1683,6 @@ void llama_context::sched_alt_select(bool alt) {
      std::swap(sched, sched_alt);
      std::swap(gf_res_prev_active, gf_res_prev_active_alt);
      sched_alt_in_use = alt;
@@ -2920,7 +3101,7 @@ index 8518e09fe..0e962de24 100644
  }
  
  bool llama_context::sched_alt_for(const llama_ubatch & ubatch) const {
-@@ -1589,11 +1688,11 @@ const std::vector<llama_kv_cache *> & llama_context::kq_mask_kvs() const {
+@@ -1589,11 +1721,11 @@ const std::vector<llama_kv_cache *> & llama_context::kq_mask_kvs() const {
      if (memory && !kq_mask_kvs_done) {
          kq_mask_kvs_store.clear();
  
@@ -2935,7 +3116,7 @@ index 8518e09fe..0e962de24 100644
              kq_mask_kvs_store = { iswa->get_base(), iswa->get_swa() };
          }
  
-@@ -1653,6 +1752,10 @@ void llama_context::sched_reserve() {
+@@ -1653,6 +1785,10 @@ void llama_context::sched_reserve() {
          return;
      }
  
@@ -2946,7 +3127,7 @@ index 8518e09fe..0e962de24 100644
      sched_need_reserve = false;
  
      LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
-@@ -1838,11 +1941,20 @@ void llama_context::sched_reserve() {
+@@ -1838,11 +1974,20 @@ void llama_context::sched_reserve() {
          }
      }
  
@@ -2972,7 +3153,7 @@ index 8518e09fe..0e962de24 100644
          size_t narrow2_bytes = 0;
          for (size_t i = 0; i < backend_ptrs.size(); ++i) {
              if (backend_buf_exp_size[i] > narrow2_bytes) {
-@@ -1851,7 +1963,7 @@ void llama_context::sched_reserve() {
+@@ -1851,7 +1996,7 @@ void llama_context::sched_reserve() {
          }
          if (narrow2_bytes > 0) {
              for (const auto & d : model.devices) {
@@ -2981,7 +3162,7 @@ index 8518e09fe..0e962de24 100644
              }
          }
      }
-@@ -1879,6 +1991,10 @@ void llama_context::sched_reserve() {
+@@ -1879,6 +2024,10 @@ void llama_context::sched_reserve() {
              __func__, (t_end_us - t_start_us_l)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
  }
  
@@ -2992,7 +3173,7 @@ index 8518e09fe..0e962de24 100644
  void llama_context::drop_compute_buffers() {
      // WIP r42 (TODO #42): release the grow-only compute buffers so the next alloc_graph re-reserves them
      // from the graph at hand.  See ggml_backend_sched_drop_buffers().
-@@ -1888,6 +2004,10 @@ void llama_context::drop_compute_buffers() {
+@@ -1888,6 +2037,10 @@ void llama_context::drop_compute_buffers() {
      ggml_backend_sched_drop_buffers(sched.get());
  }
  
@@ -3003,7 +3184,7 @@ index 8518e09fe..0e962de24 100644
  void llama_context_drop_compute_buffers(struct llama_context * ctx) {
      if (ctx == nullptr) {
          return;
-@@ -1970,7 +2090,11 @@ uint32_t llama_context::n_threads_batch() const {
+@@ -1970,7 +2123,11 @@ uint32_t llama_context::n_threads_batch() const {
  }
  
  llama_memory_t llama_context::get_memory() const {
@@ -3016,7 +3197,7 @@ index 8518e09fe..0e962de24 100644
  }
  
  bool llama_context::memory_update(bool optimize) {
-@@ -1979,6 +2103,7 @@ bool llama_context::memory_update(bool optimize) {
+@@ -1979,6 +2136,7 @@ bool llama_context::memory_update(bool optimize) {
      }
  
      {
@@ -3024,7 +3205,7 @@ index 8518e09fe..0e962de24 100644
          const auto mctx = memory->init_update(this, optimize);
          switch (mctx->get_status()) {
              case LLAMA_MEMORY_STATUS_SUCCESS:
-@@ -2816,10 +2941,15 @@ bool llama_context::set_adapter_cvec(
+@@ -2816,10 +2974,15 @@ bool llama_context::set_adapter_cvec(
      static const size_t GGML_DROP_RESERVE_SLACK_BYTES = (size_t) 512 << 20;
  
  llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -3044,7 +3225,7 @@ index 8518e09fe..0e962de24 100644
      }
  
      // TODO #42 (OPEN 1): release the wide-prefill compute layout at the prefill -> decode transition so
-@@ -2832,7 +2962,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2832,7 +2995,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          const char * e = getenv("LLAMA_DROP_COMPUTE_BUFFERS");
          return e != nullptr ? atoi(e) : -1;
      }();
@@ -3054,7 +3235,7 @@ index 8518e09fe..0e962de24 100644
      // OPEN 2: WHEN to drop.  The compute reserve is created for the WIDEST graph the parameters allow, and
      // the work region holds it until a drop releases it.  The classic condition below only drops after a
      // WIDE pass (`n_tokens_prev > 8`), so a workload that never prefills -- a chat of short prompts -- keeps
-@@ -3141,19 +3272,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -3141,19 +3305,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
  
          // wip/moe-verify-fusions (narrow-2): route the MTP draft context's compute allocation to the
          // slab's pinned narrow-2 region (the reserve-time toggle in `graph_reserve` does not cover the
@@ -3085,7 +3266,7 @@ index 8518e09fe..0e962de24 100644
                  ggml_backend_dev_slab_compute_plain(d.dev, false);
              }
          }
-@@ -3589,7 +3723,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -3589,7 +3756,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
      llama_memory_context_ptr mctx;
  
      while (true) {
@@ -3098,7 +3279,7 @@ index 8518e09fe..0e962de24 100644
          if (!mctx) {
              return -2;
          }
-@@ -3742,7 +3881,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -3742,7 +3914,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
  
                  LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
  
@@ -3110,7 +3291,7 @@ index 8518e09fe..0e962de24 100644
              }
  
              switch (status) {
-@@ -4564,26 +4706,29 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -4564,26 +4739,29 @@ ggml_cgraph * llama_context::graph_reserve(
              ggml_backend_sched_split_graph(sched.get(), gf);
          }
      } else {
@@ -3150,7 +3331,7 @@ index 8518e09fe..0e962de24 100644
              }
          }
          if (!reserved) {
-@@ -4647,6 +4792,11 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph
+@@ -4647,6 +4825,11 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph
  ggml_status llama_context::graph_compute(
              ggml_cgraph * gf,
                     bool   batched) {
@@ -3162,7 +3343,7 @@ index 8518e09fe..0e962de24 100644
      int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
      ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
  
-@@ -6083,6 +6233,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
+@@ -6083,6 +6266,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
      if (memory) {
          LLAMA_LOG_DEBUG("%s: - reading memory module\n", __func__);
  
@@ -3170,7 +3351,7 @@ index 8518e09fe..0e962de24 100644
          memory->state_read(io);
      }
  
-@@ -6091,6 +6242,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
+@@ -6091,6 +6275,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
  
  size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
      if (memory) {
@@ -3178,7 +3359,7 @@ index 8518e09fe..0e962de24 100644
          memory->state_write(io, seq_id, flags);
      }
  
-@@ -6099,6 +6251,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
+@@ -6099,6 +6284,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
  
  size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
      if (memory) {
@@ -3186,7 +3367,7 @@ index 8518e09fe..0e962de24 100644
          memory->state_read(io, seq_id, flags);
      }
  
-@@ -6321,7 +6474,10 @@ void llama_context::opt_epoch_iter(
+@@ -6321,7 +6507,10 @@ void llama_context::opt_epoch_iter(
      const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
      const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
  
@@ -3198,7 +3379,7 @@ index 8518e09fe..0e962de24 100644
  
      for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
          batch.clear();
-@@ -6349,7 +6505,11 @@ void llama_context::opt_epoch_iter(
+@@ -6349,7 +6538,11 @@ void llama_context::opt_epoch_iter(
  
          uint32_t n_outputs_all = n_tokens_all;
  
@@ -3211,7 +3392,7 @@ index 8518e09fe..0e962de24 100644
          if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
              LLAMA_LOG_ERROR("%s: could not initialize batch\n", __func__);
              break;
-@@ -6367,9 +6527,12 @@ void llama_context::opt_epoch_iter(
+@@ -6367,9 +6560,12 @@ void llama_context::opt_epoch_iter(
  
              n_outputs = ubatch.n_tokens;
  
@@ -3227,7 +3408,7 @@ index 8518e09fe..0e962de24 100644
              }
  
              // the trainer has no draft context and therefore no second scheduler: keep the slot the
-@@ -6516,6 +6679,8 @@ llama_context_params llama_context_default_params() {
+@@ -6516,6 +6712,8 @@ llama_context_params llama_context_default_params() {
          /*.sampler                     =*/ nullptr,
          /*.n_sampler                   =*/ 0,
          /*.ctx_other                   =*/ nullptr,
@@ -3236,7 +3417,7 @@ index 8518e09fe..0e962de24 100644
          /*.spec_draft_kv_window        =*/ 0,
          /*.kv_region_pool              =*/ 0,
          /*.kv_resident_cells           =*/ 0,
-@@ -7017,6 +7182,9 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
+@@ -7017,6 +7215,9 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
          return;
      }
  
@@ -3246,7 +3427,7 @@ index 8518e09fe..0e962de24 100644
      mem->clear(data);
  }
  
-@@ -7029,6 +7197,7 @@ bool llama_memory_seq_rm(
+@@ -7029,6 +7230,7 @@ bool llama_memory_seq_rm(
          return true;
      }
  
@@ -3254,7 +3435,7 @@ index 8518e09fe..0e962de24 100644
      return mem->seq_rm(seq_id, p0, p1);
  }
  
-@@ -7042,6 +7211,7 @@ void llama_memory_seq_cp(
+@@ -7042,6 +7244,7 @@ void llama_memory_seq_cp(
          return;
      }
  
@@ -3262,7 +3443,7 @@ index 8518e09fe..0e962de24 100644
      mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
  }
  
-@@ -7052,6 +7222,7 @@ void llama_memory_seq_keep(
+@@ -7052,6 +7255,7 @@ void llama_memory_seq_keep(
          return;
      }
  
@@ -3270,7 +3451,7 @@ index 8518e09fe..0e962de24 100644
      mem->seq_keep(seq_id);
  }
  
-@@ -7065,6 +7236,7 @@ void llama_memory_seq_add(
+@@ -7065,6 +7269,7 @@ void llama_memory_seq_add(
          return;
      }
  
@@ -3278,7 +3459,7 @@ index 8518e09fe..0e962de24 100644
      mem->seq_add(seq_id, p0, p1, delta);
  }
  
-@@ -7078,6 +7250,7 @@ void llama_memory_seq_div(
+@@ -7078,6 +7283,7 @@ void llama_memory_seq_div(
          return;
      }
  
@@ -3286,7 +3467,7 @@ index 8518e09fe..0e962de24 100644
      mem->seq_div(seq_id, p0, p1, d);
  }
  
-@@ -7088,6 +7261,7 @@ llama_pos llama_memory_seq_pos_min(
+@@ -7088,6 +7294,7 @@ llama_pos llama_memory_seq_pos_min(
          return -1;
      }
  
@@ -3294,7 +3475,7 @@ index 8518e09fe..0e962de24 100644
      return mem->seq_pos_min(seq_id);
  }
  
-@@ -7098,6 +7272,7 @@ llama_pos llama_memory_seq_pos_max(
+@@ -7098,6 +7305,7 @@ llama_pos llama_memory_seq_pos_max(
          return -1;
      }
  

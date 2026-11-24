@@ -3127,3 +3127,29 @@ it removed an abort (r374-wip) -- so the per-shape rule above stands, now on the
    guarantee that, and any local lock orders them differently per rank.  The sound directions are a per-context
    all-reduce chain for the decode context (it only ever reduces decode-sized tensors) or a smaller RCCL
    descriptor footprint.
+
+## r383-wip (2026-11-24, `WORKLOG.md` 261124.005) — ONE RCCL comm layer per process: an auxiliary context must never add another (`prefill-decode-arms` v2 STEP 14, from a beta tester)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/`, `beta/prefill-decode-arms/`.
+
+1. **A second `llama_context` on a `-sm tensor` split aborted the process with
+   `*** bit out of range 0 - FD_SETSIZE on fd_set ***`, and it was the FD COUNT, not memory.**  RCCL's IPC rings cost
+   one `/dev/shm/nccl-*` descriptor per peer per channel = **646 open fds per comm layer** on 3 devices; the delivery
+   alone is at 63 % of `FD_SETSIZE` (1024) there.  Measured: 686 fds (pair off), 1356 (pair on), **2026** (target +
+   MTP draft + decode arm), 568 (2 devices), 10 (1 GPU).
+2. **`FD_SETSIZE` is not raisable for the offender.**  The range check is glibc's inline `__FD_SET`, expanded in the
+   CALLER's TU, and the `select()` that trips is inside a PREBUILT library (RCCL/ROCr) -- there is no `select()` in
+   this tree and the vendored httplib is thread-per-connection.  `ulimit -n` is unrelated (524288 here).
+3. **The rule: an AUXILIARY context uses the copy-engine chain; exactly one RCCL comm layer exists per process.**
+   "Auxiliary" is the identity `slab_aux_slot()` already defines (`ctx_memory` borrower, `ctx_other` draft view,
+   `ctx_aux`); `llama_context` asks for CE for it (a capability-probed, consume-once backend proc) AND ggml-cuda
+   refuses a second `ncclCommInitAll` outright, so the invariant does not depend on the request arriving.  Free
+   where it applies: an auxiliary context only reduces decode-sized tensors, which every chain routes to the
+   internal pipeline; the PREFILL context keeps the ring (pp2048 809 vs 604 t/s on CE, `ggml-cuda.cu`).  Measured
+   after: 686 / 686 / 686 (base / pair+drafter / pair+drafter) = **0 extra fds**, text unchanged.
+4. **Behind it (OPEN, recorded in the artifact):** the state/checkpoint save batches pieces into one
+   `ggml_backend_tensor_get_n`, which collapses N single-row reads into ONE 2-D read with `n_copies = N`; on a
+   ROW-SPLIT (vocab-split) 2-D tensor the Meta backend's chunked path ("simple tensors as chunks",
+   `ggml-backend-meta.cpp`) hands a per-device read a range past that device's slice -> `invalid argument` ->
+   `GGML_ABORT` (`331092 bytes x 5 copies, tensor pitch 331092, host pitch 993280`).  Pair-off does not reach it,
+   and it is independent of the all-reduce chain (`ce` reproduces it).

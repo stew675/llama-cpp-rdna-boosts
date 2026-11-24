@@ -15,10 +15,10 @@ and **nothing is copied between them**.
 | | |
 |---|---|
 | patch | `prefill-decode-arms.patch` — **one** commit, cut against the current `release.json` tree |
-| sha256 | `77bd3a72f2bf3a45f7fe9c7ae278d09eca23b1ca0d51d32f1135de97b0d2a03f` |
-| size | 42 files, **+2942 / −741** (329 429 bytes) |
+| sha256 | `8f3a8d10935a0e3766e685813e382ee154e4d17700becbb59d3f957b643e0258` |
+| size | 42 files, **+3073 / −741** |
 | cut against | `release.json` base `919794500`, tree **`27db9bfd4ef7f41c7df60f704410de28863beac3`** |
-| **applied tree** | **`fdcd86d81c1251339a4214a5eb90cff254491270`** (release tree + this patch; verified twice, below) |
+| **applied tree** | **`2c63a657e1d4977f8b1dd6578acd60eecfcfefef`** (release tree + this patch; verified twice, below) |
 | options | `--prefill-decode-arms` / `--no-prefill-decode-arms` (`LLAMA_ARG_PREFILL_DECODE_ARMS`), `--prefill-decode-arms-mode off\|on\|auto` (`LLAMA_ARG_PREFILL_DECODE_ARMS_MODE`) — **both default OFF** |
 | campaign record | `wip/prefill-decode-arms-v2/` (`DESIGN.md`, `RUNS.md`, `HANDOVER.md`, `gates/`, `baseline/`) |
 
@@ -29,15 +29,15 @@ git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 919794500
 bash <delivery>/scripts/apply-all.sh --include-beta .
 #   18 delivery blocks (tip 089f90067, tree 27db9bfd4...), then this patch
-#   applied tree: fdcd86d81c1251339a4214a5eb90cff254491270
+#   applied tree: 2c63a657e1d4977f8b1dd6578acd60eecfcfefef
 ```
 
 **The round-trip was verified on this box:** a fresh clone at the release tree (`089f90067`, tree `27db9bfd4…`)
-`git am`s this patch strictly and reads tree **`fdcd86d81c…`**; and the full tester path
+`git am`s this patch strictly and reads tree **`2c63a657e1…`**; and the full tester path
 (`apply-all.sh --include-beta .`) from `919794500` reports the same applied tree.  The patch was cut from a
-canonical chain — `apply-all.sh` on a clean checkout at `919794500`, then the campaign's 20 `steps/` replayed in
+canonical chain — `apply-all.sh` on a clean checkout at `919794500`, then the campaign's 21 `steps/` replayed in
 order, then the generated docs regenerated — and the replayed tree equals the campaign's own tree
-(`f191c7bf1…` before the doc regeneration) **exactly**.
+(`ae5530a1a…` before the doc regeneration) **exactly**.
 
 ## What it does
 
@@ -60,9 +60,7 @@ before releasing a slot it may be mid-round on (the CANCEL/abort path — a test
 
 ## Shapes it reaches
 
-A server shape is admitted when `common_arms_pair_possible()` returns no reason.  **A `-sm tensor` split on 3 or
-more devices with `GGML_CUDA_ALLREDUCE=auto` does NOT work yet** (see *Known issue* below) — 1-2 devices are fine.
-It was measured on: 4B Q8_0
+A server shape is admitted when `common_arms_pair_possible()` returns no reason.  It was measured on: 4B Q8_0
 (1 GPU), phi-4 IQ4_XS (1 GPU dense), 27B Q8_0 (3 GPU `-sm tensor`), 35B-A3B Q8_0 (1 GPU, `-ncmoe 40`, host-expert
 tier), Flash-Next GSQ IQ3_S (3 GPU `-sm tensor`, qwen4exp), Gemma4 26B-A4B (iswa), and **Gemma4 26B-A4B + its
 external MTP head** (`-ncmoe 20`, both aux regions pinned).
@@ -156,42 +154,49 @@ Once per slot the slab logs the region's measured size and the reserve that woul
    the unmodified server varies run to run), so a *byte* claim under concurrency is a lottery; the concurrency arms
    assert the census, the ITL bound and a clean fault scan instead.
 
-## Known issue — `-sm tensor` on 3+ devices exhausts `FD_SETSIZE` (open; a true fix is agreed, not in this patch)
+## Fixed here: the `-sm tensor` 3+ device `FD_SETSIZE` abort (`gate-arms-fd-budget.sh`)
 
-Found by the same beta tester, 2026-11-24.  A long generation plus a ~77K-token prefill on the other slot aborts
-the server with
+A beta tester's second crash, 2026-11-24: a long generation plus a ~77K-token prefill on the other slot aborted
+with `*** bit out of range 0 - FD_SETSIZE on fd_set ***`.  **It was the file-descriptor count, not memory.**  Each
+`ncclCommInitAll` creates one `/dev/shm/nccl-*` IPC segment per peer per channel — **646 open descriptors per comm
+layer** on a 3-device split — and the delivery alone already sits at 63 % of `FD_SETSIZE` (1024) there, so the
+pair's decode arm and/or an MTP draft head pushed it over (measured **2026 fds** with target + draft + decode arm,
+i.e. two limits' worth, before a single request).  `FD_SETSIZE` is compile-time in the *prebuilt* library whose
+`select()` trips on it, so it cannot be raised from here, and `ulimit -n` is irrelevant.
+
+**Fixed in two places, measured to cost nothing:** an auxiliary context (a borrower, a draft view, or an
+auxiliary decoder-band context — the same identity `slab_aux_slot()` uses) asks the backend for the **copy-engine
+chain**, and the CUDA backend additionally enforces **one RCCL comm layer per process** where RCCL is actually
+initialised.  The prefill context keeps the RCCL ring, which a host-expert prefill wants (pp2048 809 vs 604 t/s on
+the copy-engine arm); an auxiliary context only ever reduces decode-sized tensors, which every chain already routes
+to the internal pipeline.
+
+| arm (3-device `-sm tensor`, Flash-Next `-ncmoe 48`, `draft-mtp-adaptive`) | fds |
+|---|---|
+| pair OFF, no drafter (the delivery's single-context cost) | 686 |
+| pair OFF + drafter | 686 |
+| **pair ON + drafter** | **686** |
+
+An auxiliary context costs **zero** extra descriptors, and the refusal is logged.  Text is unchanged:
+`gate-arms-spec` 36/36, `gate-spec-purity` PASS with the same hashes, `gate-prefill-logits` KLD 0.000000.
+
+## Open: a 2-D state-save read of a row-split `result_output` fails on a 3-device split
+
+**With the fd abort gone, the tester's recipe reaches a SECOND, independent defect** (~6 s into the big prefill,
+pair ON + MTP, 3 devices; pair OFF survives the identical recipe, and it reproduces with `GGML_CUDA_ALLREDUCE=ce`
+so it is not the all-reduce chain):
 
 ```
-*** bit out of range 0 - FD_SETSIZE on fd_set ***: terminated        (then: Aborted)
+E ggml_backend_cuda_get_tensor_2d_async: device 1: 2-D read of 'result_output' failed (invalid argument):
+  331092 bytes x 5 copies, tensor pitch 331092, host pitch 993280, offset 0 (ROCm1 buffer)
 ```
 
-**It is NOT a memory bug — it is the file-descriptor count.**  Each `llama_context` brings up its own RCCL comm
-layer under `GGML_CUDA_ALLREDUCE=auto`, and RCCL's IPC rings cost one `/dev/shm/nccl-*` descriptor per peer per
-channel.  Measured here on the Flash-Next `-ncmoe 48` / attendance-pool shape:
-
-| shape | open fds | of which `/dev/shm/nccl-*` | verdict |
-|---|---|---|---|
-| 1 GPU, pair ON | 10 | — | fine |
-| 3 dev `-sm tensor`, pair OFF | 686 | 646 | fine (the delivery alone sits at 63 % of the ceiling) |
-| 2 dev `-sm tensor`, pair ON | 568 | ~548 | fine |
-| **3 dev `-sm tensor`, pair ON** | **1356** | **1292** | **abort** — the second context's comm layer doubles the 646 |
-
-`FD_SETSIZE` is 1024 and **compile-time**: the check is glibc's inline `__FD_SET`, expanded in the *caller's*
-translation unit, and the `select()` that trips it is inside a **prebuilt** library (RCCL/ROCr — there is no
-`select()` anywhere in this tree; the vendored httplib is thread-per-connection).  `ulimit -n` is irrelevant
-(524288 here).
-
-**Workaround, measured:** `GGML_CUDA_ALLREDUCE=ce` never brings RCCL up (the copy-engine chain needs no
-descriptors), and the count becomes **11 for both pair-OFF and pair-ON** on the same 3-device split.  It is a
-supported value of the delivery's all-reduce selector, and the CE large-tensor arm measures *faster* than RCCL's
-on a 3-device config (`ggml-cuda.cu`: pp2048 2227 vs 2187 t/s) — but the delivery prefers the RCCL ring for
-host-expert shapes, so this is a trade, not a free substitution.
-
-**The fix is NOT in this patch.**  Note that simply *sharing* one communicator between the two contexts is not
-sound: the two arms compute concurrently, and a collective's order must match on every rank, which two
-unsynchronised arms cannot guarantee.  The sound candidates are (a) a per-context all-reduce chain for the decode
-context (CE — its tensors are decode-sized anyway) or (b) reducing RCCL's descriptor footprint.  Until then, add
-`GGML_CUDA_ALLREDUCE=ce` to a 3+-device `-sm tensor` run.
+`host pitch = 3 x tensor pitch` — a **vocabulary/row-split** 2-D tensor, whose per-device slice is a third of the
+meta row.  The caller is the state/checkpoint save (`llama_io_write_host` batches its pieces into one
+`ggml_backend_tensor_get_n`, which collapses 5 single-row reads into one 2-D read with `n_copies=5`), and the Meta
+backend's chunked 2-D path (`ggml-backend-meta.cpp`, the `AXIS_0/1/2` "simple tensors as chunks" branch) hands the
+per-device read a range that runs past that device's slice.  Not fixed yet; it is a **delivery**-level path
+(`ggml-backend-meta.cpp`) that the pair's per-round draft checkpoint reaches, and it needs its own landing.
 
 ## Not covered by the delivery's release gates
 

@@ -1,3 +1,43 @@
+## 2026-11-24 — STEP 14: `-sm tensor` on 3 devices was FD exhaustion, not memory — FIXED (`WORKLOG.md` 261124.005)
+
+### The numbers (Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, pool, `-sm tensor -mg 0`, `-np 2`)
+
+| arm | open fds | `/dev/shm/nccl-*` |
+|---|---|---|
+| 1 GPU, pair ON | 10 | — |
+| 2 dev, pair ON | 568 | ~548 |
+| 3 dev, pair OFF | 686 | 646 |
+| 3 dev, pair ON (no drafter) | 1356 | 1292 |
+| 3 dev, pair ON + MTP draft | **2026** | ~1938 |
+| **3 dev, after the fix: base / pair+drafter / pair+drafter** | **686 / 686 / 686** | 646 |
+
+One `ncclCommInitAll` = one `/dev/shm/nccl-*` segment per peer per channel = 646 fds on 3 devices.  The aborting
+`select()` is in a prebuilt library, so `FD_SETSIZE` cannot be raised here; `ulimit -n` = 524288 is irrelevant.
+
+### The fix and its verification
+
+`llama_context` asks for the copy-engine chain for an AUXILIARY context (`ctx_memory` / `ctx_other` / `ctx_aux` —
+the `slab_aux_slot()` identity) through a consume-once backend proc; ggml-cuda additionally refuses a second
+`ncclCommInitAll` (`g_comm_rccl_layers`), so the invariant holds even if the request is not made.
+
+| check | result |
+|---|---|
+| `gates/gate-arms-fd-budget.sh` (new) | **PASS** — base 686, pair off+drafter 686, pair on+drafter 686; a second RCCL actually refused (non-vacuity); below `FD_SETSIZE` |
+| `gates/gate-arms-spec.sh` | **PASS 36/36** (pair on/off x spec on 3-dev f16 and q8_0: one text) |
+| `scripts/gate-spec-purity.sh` (delivery) | **PASS** — same hashes as before (`4d87b7b221f7`, `eb89102cb7d8`, `a87c4318b649`), width probe maxdiff 0 |
+| `scripts/gate-prefill-logits.sh` | **PASS** — KLD 0.000000, same-top-p 100.000 % |
+| `gates/gate-arms-cancel.sh` | **PASS** |
+| whole-set `all` build | clean |
+
+### Still open (behind it)
+
+The tester's recipe now reaches a 2-D state-save read failure on the same shape:
+`2-D read of 'result_output' failed (invalid argument): 331092 bytes x 5 copies, tensor pitch 331092, host pitch
+993280 (ROCm1 buffer)` — a row/vocab-split 2-D tensor, `host pitch = 3 x tensor pitch`, from
+`llama_io_write_host` -> `ggml_backend_tensor_get_n` (N single-row reads collapsed into one `n_copies=N` 2-D read)
+into the Meta backend's chunked path.  Pair OFF survives the same recipe and `GGML_CUDA_ALLREDUCE=ce` reproduces
+it, so it is independent of the all-reduce chain and is a delivery-level path the pair's draft checkpoint reaches.
+
 ## 2026-11-24 — STEP 13: a beta tester's abort crash (FIXED) and the `-sm tensor` FD ceiling (diagnosed) — `WORKLOG.md` 261124.004
 
 ### 1. Crash: aborting one of two concurrent generations

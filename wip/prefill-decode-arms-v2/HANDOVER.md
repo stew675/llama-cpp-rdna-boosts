@@ -33,9 +33,10 @@ candidate patch + the ask (STEP 12).**  Read `§0.0 START HERE` first; it is the
   **missing from the box**, not stale gate debt: the gate PASSed on `GSQ-RCO-IQ3_S` and then on its own defaults once
   the model tree was restored, and `TODO` #369 stays at three gates.  `INVARIANTS.md` r380-wip.
 * **STEP 12 — the candidate**: `beta/prefill-decode-arms/` replaced whole (three files), ONE `format-patch` commit,
-  sha256 `a4e207c9…c4687585e`, 42 files, +2854/−715, cut against the **release tree** `27db9bfd4` and applying to tree
-  **`84ffb1ef1c`** — verified by a fresh clone + strict `git am` and by `apply-all.sh --include-beta`.  The 19 `steps/`
-  replay reproduces the campaign tree `14dfb1f64` **exactly**.
+  sha256 `8f3a8d10…b643e0258`, 42 files, +3073/−741, cut against the **release tree** `27db9bfd4` and applying to
+  tree **`2c63a657e1`** — re-cut twice since (STEP 13's cancel fix, STEP 14's one-RCCL-per-process fix), each verified
+  by a fresh clone + strict `git am` and by `apply-all.sh --include-beta`.  The 21 `steps/` replay reproduces the
+  campaign tree `ae5530a1a` **exactly**.
 * **Correction recorded:** §12.1's `git diff 919794500` is wrong — a `beta/` candidate is applied AFTER the blocks and
   must be release-tree-relative `format-patch` output.
 * **STEP 13 (added 2026-11-24, from the maintainer's beta testing) — a crash the STEP 11 sweep could not see:**
@@ -45,6 +46,16 @@ candidate patch + the ask (STEP 12).**  Read `§0.0 START HERE` first; it is the
   (`-sm tensor` on 3 devices: `FD_SETSIZE` exhausted by RCCL's IPC rings, doubled by the second context) is
   **diagnosed and recorded as a Known issue in the beta artifact, not yet fixed** — `GGML_CUDA_ALLREDUCE=ce` is
   the measured workaround (11 fds), and the maintainer's decision is a true fix.  `INVARIANTS.md` r381/r382-wip.
+* **STEP 14 (added 2026-11-24, same beta testing)** — a `-sm tensor` split on 3 devices aborted with
+  `*** bit out of range 0 - FD_SETSIZE on fd_set ***`: **not memory, descriptors**.  RCCL's IPC rings cost 646
+  fds per comm layer, the delivery alone is at 63 % of the ceiling, and the pair's decode arm and/or an MTP draft
+  head crossed it (2026 fds measured with both).  Fixed: an auxiliary context asks for the copy-engine chain and
+  the backend enforces ONE RCCL comm layer per process — measured 686 fds for base / pair+drafter / pair+drafter,
+  i.e. **0 extra**, text unchanged (`gate-arms-spec` 36/36, `gate-spec-purity` same hashes).  Gate:
+  `gates/gate-arms-fd-budget.sh`.  **`GGML_CUDA_ALLREDUCE=ce` is no longer needed** as a workaround.
+  **Behind it: an OPEN, independent defect** — the state/checkpoint save's 2-D read of a row-split `result_output`
+  fails with a pitch of 1/3 the host pitch on a 3-device split (the Meta backend's chunked 2-D path); recorded in
+  the beta artifact's README, not fixed.
 * **NOT taken:** promotion into `patches/` as block 17.  That is the maintainer's decision, and a validated window
   comes first.
 
@@ -666,6 +677,11 @@ gates/     gate-arms-default-inert.sh  pair OFF on 4 shapes: cli text + startup 
                                      the four-axis protocol ON the pair, and the non-vacuity lines (the
                                      decode-arm census, drafts AND accepted drafts).  `--nreq 1` on the
                                      axis arms, `-lv 4` for the statistics (the text comes over HTTP)
+           gate-arms-fd-budget.sh    STEP 14's gate (a beta tester's crash): a 3-device `-sm tensor` split must
+                                     cost the SAME descriptors with and without the pair and with and without a
+                                     drafter (an auxiliary context may add NO comm layer), the count must sit
+                                     below FD_SETSIZE, and the backend must really have refused a second RCCL
+                                     (`NOT bringing up a second RCCL comm layer`)
            gate-arms-cancel.sh       STEP 13's gate (a beta tester's crash): two concurrent generations, ABORT
                                      one (a client disconnect -> a CANCEL), N rounds per arm; the server must
                                      survive, the decode arm must provably have run (`finish_pending` is what

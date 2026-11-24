@@ -42,11 +42,11 @@ move happens with a "refuted" status.  A finished candidate leaves `beta/`; no s
   *viewed* and *co-owned* the first's memory, and the recurrent state copied between two modules, are gone at
   the root); on promotion it is **delivery block 17 as ONE self-contained patch**, a modification to the
   lower-numbered blocks.  Applied on the r353 default tree (`27db9bfd4`) it produces tree
-  **`fdcd86d81c`**.  Files: [`prefill-decode-arms/README.md`](prefill-decode-arms/README.md) (what it is, the
+  **`2c63a657e1`**.  Files: [`prefill-decode-arms/README.md`](prefill-decode-arms/README.md) (what it is, the
   measured numbers, the residuals, the shapes it refuses),
   [`prefill-decode-arms/BETA-TESTING.md`](prefill-decode-arms/BETA-TESTING.md) (the apply, build and arm ladder)
   and [`prefill-decode-arms/prefill-decode-arms.patch`](prefill-decode-arms/prefill-decode-arms.patch)
-  (sha256 `77bd3a72…b0d2a03f`, 42 files, +2942/−741).  Campaign record:
+  (sha256 `8f3a8d10…b643e0258`, 42 files, +3073/−741).  Campaign record:
   [`../wip/prefill-decode-arms-v2/`](../wip/prefill-decode-arms-v2/README.md); its own gate set is
   `wip/prefill-decode-arms-v2/gates/gate-arms-*.sh` (beta-only, never delivery gates).
 

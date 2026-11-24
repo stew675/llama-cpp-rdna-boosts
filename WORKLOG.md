@@ -1,3 +1,43 @@
+## 261124.005 (no release; `prefill-decode-arms` v2 STEP 14, from the same beta testing) -- the `-sm tensor` abort is FD exhaustion, and it is FIXED: an auxiliary context may add NO RCCL comm layer
+
+Follows 261124.004 (the cancel crash).  Same tester, same shape (Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, the attendance
+pool, `-sm tensor` on 3 devices, `-np 2`, `draft-mtp-adaptive` with the external `-Q8_0` head).
+
+1. **The crash:** a long generation plus a ~77K-token prefill on the other slot aborted with
+   `*** bit out of range 0 - FD_SETSIZE on fd_set ***: terminated`, ~6 s into the prefill.  **Not memory --
+   descriptors.**  Each `ncclCommInitAll` creates one `/dev/shm/nccl-*` IPC segment per peer per channel:
+   **646 open fds per comm layer** on a 3-device split, and the delivery ALONE already sits at 63 % of `FD_SETSIZE`
+   (1024) there.  Measured: pair OFF 686 fds, pair ON (no drafter) 1356, **target + MTP draft + decode arm 2026** --
+   two limits' worth before a single request -- and 2 devices 568 (fine), 1 GPU 10.  The aborting `select()` is
+   inside a PREBUILT library (there is no `select()` in this tree; the vendored httplib is thread-per-connection), so
+   **`FD_SETSIZE` cannot be raised from here** and `ulimit -n` (524288) is irrelevant.
+2. **The fix (STEP-14-0021).**  Two mechanisms: `llama_context` ASKS for the copy-engine chain when it is an
+   **auxiliary** context (the same identity `slab_aux_slot()` uses -- a borrower `ctx_memory`, a draft view
+   `ctx_other`, or `ctx_aux`), through a capability-probed, consume-once backend proc; and ggml-cuda ENFORCES **one
+   RCCL comm layer per process** where RCCL is actually initialised, so a shape whose auxiliary context comes up
+   first cannot depend on the request.  The prefill context keeps the RCCL ring -- which a host-expert prefill wants
+   (pp2048 809 vs 604 t/s on the CE arm) -- and an auxiliary context only ever reduces DECODE-sized tensors, which
+   every chain already routes to the internal pipeline, so the change is free there.  **Measured: base 686,
+   pair OFF + drafter 686, pair ON + drafter 686 -- an auxiliary context costs ZERO fds.**  Text unchanged:
+   `gates/gate-arms-spec.sh` 36/36 (pair on/off x spec, 3-dev f16 and q8_0), `scripts/gate-spec-purity.sh` PASS with
+   the same hashes (`a87c4318b649` ...), `scripts/gate-prefill-logits.sh` **KLD 0.000000**, `gate-arms-cancel.sh`
+   PASS, whole-set build clean.  **New gate `gates/gate-arms-fd-budget.sh`** (three arms + the non-vacuity that a
+   second RCCL was actually refused).  The `GGML_CUDA_ALLREDUCE=ce` workaround recorded in 261124.004 is **no longer
+   needed**.
+3. **Behind it, a SECOND and still OPEN defect.**  With the fd abort gone the recipe reaches a 2-D read failure
+   ~6 s into the same prefill: `2-D read of 'result_output' failed (invalid argument): 331092 bytes x 5 copies,
+   tensor pitch 331092, host pitch 993280 (ROCm1 buffer)`.  `host pitch = 3 x tensor pitch` = a row/vocab-SPLIT
+   2-D tensor; the caller is the state/checkpoint save (`llama_io_write_host` -> `ggml_backend_tensor_get_n`,
+   which collapses 5 single-row reads into one `n_copies=5` 2-D read) and the Meta backend's chunked 2-D path
+   (`ggml-backend-meta.cpp`, the "simple tensors as chunks" branch) hands the per-device read a range past that
+   device's slice.  **Pair OFF survives the identical recipe, and it reproduces with `GGML_CUDA_ALLREDUCE=ce`**, so
+   it is independent of the all-reduce chain; it is a DELIVERY-level path that the pair's per-round draft
+   checkpoint reaches.  Recorded in `beta/prefill-decode-arms/README.md` as the open item; needs its own landing.
+4. **Candidate re-cut** with both fixes: sha256
+   `8f3a8d10935a0e3766e685813e382ee154e4d17700becbb59d3f957b643e0258`, 42 files, **+3073/-741**, applied tree
+   **`2c63a657e1`**; the canonical replay (21 `steps/`) reproduces the campaign tree `ae5530a1a` exactly, and a fresh
+   clone at the release tree `git am`s it back to `2c63a657e1`.
+
 ## 261124.004 (no release; `prefill-decode-arms` v2 STEP 13, from BETA TESTER reports) -- aborting one of two generations killed the server (FIXED, gated), and "-sm tensor on 3 devices" dies of FD exhaustion, not memory (diagnosed, fix agreed)
 
 Both found by the maintainer beta-testing the candidate on `Qwen3.8-Flash-Next/GSQ-IQ3_XXS` (his `runme`, which is
