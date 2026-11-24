@@ -1,18 +1,67 @@
-# HANDOVER — `prefill-decode-arms` v2, campaign state + the next task (STEP 10)
+# HANDOVER — `prefill-decode-arms` v2, campaign state + the next tasks (STEP 11, then STEP 12)
 
 **Read this file first, then work top to bottom.**  Written for a session with *no* memory of the campaign: what
-exists, what is green, what is open, what to do first.  Everything below was measured on this box; a plan that has
-not been run says so.
+exists, what is green, what is open, and the exact ladder to run.  Everything below was measured on this box; a
+plan that has not been run says so.  **STEPs 0-10 are DONE — your work is §3: the delivery sweep (STEP 11) and the
+candidate patch + the ask (STEP 12).**  Read `§0.0 START HERE` first; it is the short version of §3.
 
 | | |
 |---|---|
-| delivery repo | `~/llama-cpp-rdna-boosts`, branch **`prefill-decode-arms-v2`**, HEAD = the **STEP 7e/8 landing** (the commit that carries this file; **`main` untouched** at `91a81505`) |
+| delivery repo | `~/llama-cpp-rdna-boosts`, branch **`prefill-decode-arms-v2`** (**pushed to origin**), HEAD = the commit that carries this file; **`main` untouched** at `91a81505` |
+| release the candidate is cut against | `release.json`: base `919794500`, tip `089f90067`, tree `27db9bfd4ef7f41c7df60f704410de28863beac3`, `n_blocks` 17 + 1 temporary (`0300`) = `n_default` 18, `n_optional` 2 |
 | work tree | `~/llama.cpp`, branch **`arms-v2`** (**local only, never pushed**), tip **`ffaee2c52`** (STEP 10b), tree clean |
 | build | `~/bin/build-llama-rocm` → `build-rocm` (ROCm **10.2.0**); fast loop `cmake --build build-rocm --target llama-cli llama-server -j 16` |
 | extra build dirs | **`build-ref`** = a build of the delivery tip `089f90067` (the "pre-change build": the reference for a regression question), **`build-bisect`** = the last bisect rung's build.  Both at the same source path, so ccache stays warm |
-| landings | STEP 0-6e, **7a**, **7d**, **7c**, **7e** (STEP 4 broke the external draft head on a tensor split), **8** (the gate set), **7f** (a borrowing context carried an uninitialized `cparams.type_k`), **9** (the shape/latency/memory matrix), **10a/10** (the speculator on the pair + six memory defects) — §1.2 |
-| **next action** | **STEP 11 — the delivery regression sweep** (§3).  STEP 10 (the speculator on the pair) is CLOSED: the decode arm drives the draft/verify/accept round, the three-way oracle is green on 3 shapes and the four axes on the pair, and the six memory defects re-admitting it exposed are recorded in `RUNS.md` |
-| after that | STEP 12 candidate patch + the promotion ask |
+| landings | STEP 0-6e, **7a**, **7d**, **7c**, **7e** (STEP 4 broke the external draft head on a tensor split), **8** (the gate set), **7f** (a borrowing context carried an uninitialized `cparams.type_k`), **9** (the shape/latency/memory matrix), **10a/10/10b** (the speculator on the pair, six memory defects, the per-aux-context reserve) — §1.2 |
+| **next action** | **STEP 11 — the delivery regression sweep** (§3): 16 delivery gates + one whole-set build, on the CURRENT tip.  Then **STEP 12** (§3): one self-contained patch, cut from a canonical chain, that REPLACES `beta/prefill-decode-arms/` |
+| what is NOT done | nothing in `patches/` changes; no `beta/` artifact exists for this design yet; the campaign's own gates are green but are NOT delivery gates |
+
+---
+
+## 0.0 START HERE — the STEP 11/12 session, in order
+
+**You have two jobs and they are ordered: prove the delivery did not move (STEP 11), then package the work as one
+candidate patch and ASK (STEP 12).**  Nothing here needs a design decision; if you find yourself redesigning, you
+are off the plan.  The full detail is in §3 — this is the checklist.
+
+**Before anything: the state you must verify** (2 minutes)
+
+```bash
+cd ~/llama.cpp && git rev-parse --abbrev-ref HEAD && git rev-parse --short HEAD   # arms-v2 ffaee2c52, tree clean
+cd ~/llama-cpp-rdna-boosts && git rev-parse --abbrev-ref HEAD && git log --oneline -1  # prefill-decode-arms-v2
+tail -5 WORKLOG.md | head -3            # 261124.002 = the newest entry
+cmake --build ~/llama.cpp/build-rocm --target llama-server llama-cli -j 16   # must be a no-op
+```
+If `~/llama.cpp` is not at `ffaee2c52` with a clean tree, STOP and read §1-§3 before touching it — the whole
+campaign's evidence is tied to that tree and its `build-rocm` (ROCm 10.2.0).
+
+**STEP 11 — the sweep (commands: §3 STEP 11, 11.2; the touched-file map is 11.1)**
+
+1. `scripts/validate-set.sh` — the DELIVERY set is unchanged, so this must be green as it was at r353.
+2. The 16 delivery gates the touched files owe — 11.1 maps every touched file to the gates that can see it, and
+   11.2 is the run order.  Run them **one GPU job at a time** (the campaign's harnesses take a flock; the
+   delivery's gates mostly do not) and **record each verdict**, because a green campaign gate does not imply a
+   green delivery gate.
+3. `scripts/check-gen-docs.sh`, `check-windows-portability.sh`, `check-windows-paths.sh`,
+   `scripts/check-shlib-symbols.sh`, one whole-set `all` build, `scripts/check-gpu-faults.sh` over the logs.
+4. **A failure is a finding, not a work item you invent.**  Diff it against the delivery tip build
+   (`build-ref`, built from `089f90067` at the same source path) with the same command **before** you change
+   anything: if `build-ref` fails the same way, it is not this campaign's defect (record it, report it).  If it
+   passes there and fails here, it IS this campaign's — fix it, re-run the gate, and add a `WORKLOG.md` entry.
+5. **Report the sweep's result to the maintainer BEFORE STEP 12's commit** (§6, the reporting rule).
+
+**STEP 12 — the candidate (commands: §3 STEP 12, 12.1; the directory contract is 12.2)**
+
+6. Cut the patch from a **canonical** chain: `scripts/apply-all.sh` on a clean `~/llama.cpp` at `release.json.base`
+   → apply the campaign's own steps → `git diff <base> > beta/prefill-decode-arms/prefill-decode-arms.patch`.
+7. **Replace `beta/prefill-decode-arms/` entirely** (`README.md`, `BETA-TESTING.md`, the one `.patch`; delete the
+   old design text — the maintainer's decision 2026-11-24).  It is ONE self-contained patch: on promotion it is
+   **delivery block 17**, a modification to the lower-numbered blocks.
+8. Report: the measured trade/memory/shapes, what is validated and what is not, the residuals (§7), and
+   **ASK about promotion**.  A green ladder is not permission; the block is the maintainer's (§6).
+
+**Do not:** push `~/llama.cpp` anywhere; touch `patches/`, `MANIFESTS.md` gates or `release.json`; renumber or
+create a block; "fix" a delivery gate by changing the gate; or read the archived beta design (§0).
 
 ---
 
@@ -73,13 +122,13 @@ nothing is copied between them.**  `llama_context_params::ctx_memory` is the onl
 Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077`, 7e `3013e880a`, 7f `f61fcb03f`, 7g `ffbde9a41`,
 7h `f4540afd0`, 10a `e7ae0b470`, 10 `f3e34859d`, 10b `ffaee2c52` (branch `arms-v2`, local only).
 
-### 1.3 Green, with the number that proves it (all re-measured after 7c)
+### 1.3 Green, with the number that proves it (re-measured across STEPs 7c-10b; see the tip per row)
 
 | claim | evidence |
 |---|---|
 | **the speculator ON the pair (STEP 10)** | `gates/gate-arms-spec.sh` **30/30 PASS**: `pair+draft == pair+none == single+draft == single+none` on 3 dev f16 (`f2753e13e419`), 3 dev q8_0 (`f2753e13e419`), 2 dev f16 (`0f06ed90e017`), drafts accepted on the decode arm (34/25, 32/26, 32/26); the four axes on the pair R `3a41e71cfaab` / K `8fe00a125d38` / P `fb4519c618ef` / C `4d46d5ab509d` with 74-181 drafts accepted; the pair-off drafter path unchanged (`a87c4318b649`, 74/73/435/423) |
 | **concurrency with a drafter** | `gate-arms-multislot.sh` + `--spec-type draft-mtp-adaptive` on the 35B-A3B host tier (np 4, 3 devices): PASS at `ROUNDS=20` 2/2 (`6 step(s), 2 handovers, widest batch 2`); `baseline/itl-arm.sh` pair+drafter **5/5 clean, ITL 1.26-1.28 ms/token** through a 5246-token prefill (70 ms/token solo) |
-| default path inert (pair OFF) | A1 4B `be904e86f248`, A2 27B-3GPU-tensor `10a82b5559a9`, A3 35B-A3B-host `e9db5cb8db0b`, A4 prefill-logit **KLD 0.000000 / same-top-p 100.000 %**, A5 K axis `a87c4318b649` (151.4 t/s, acc 0.98649/0.97241, pos-1 0.986), A6 server `{7bd542418112, 6ce1f88dd5f7}` + the **13-line startup shape byte-identical** to `baseline/A6-startup-shape.txt` |
+| default path inert (pair OFF) — re-verified on the final tip | A1 4B `be904e86f248`, A2 27B-3GPU-tensor `10a82b5559a9`, A3 35B-A3B-host `e9db5cb8db0b`, A4 prefill-logit **KLD 0.000000 / same-top-p 100.000 %**, A5 K axis `a87c4318b649` (151.4 t/s, acc 0.98649/0.97241, pos-1 0.986), A6 server `{7bd542418112, 6ce1f88dd5f7}` + the **13-line startup shape byte-identical** to `baseline/A6-startup-shape.txt` |
 | the pair reads the single-context text | 4B `7bd542418112`/`6ce1f88dd5f7`; `gate-arms-n1-memory.sh` PASS (`01c9cbe2e895`/`5e69982c7d94` both arms, 0 of 8192 cells reserved); 27B-3GPU-tensor `f2753e13e419`/`c5f2fdc43642` |
 | the decode arm really runs | census `the decode arm is generating: N step(s), M handover(s), widest batch W slot(s)` — e.g. 8/3/3 and 15/3/**4** in the soaks |
 | the pair's win (latency) | `gate-arms-itl.sh`, 4B, 5246-token prefill on B while A decodes 64 tokens, `-ub 2048`: **16.33 → 15.09 ms/token** (1044.8 → 965.5 ms / 64 tokens), prefill **5191 → 6165 t/s**, text identical (`36216e77db27`).  **Flat at `-ub 512`** — the win needs the wide chunk |
@@ -97,16 +146,21 @@ Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077`, 7e `3013e880a`, 7f `f
 
 ### 1.4 Open
 
-* **STEP 11 (next):** the delivery regression sweep (§3) — `scripts/validate-set.sh` plus the delivery gates the
-  touched files owe.  Note that STEP 10 landed changes in files the DELIVERY owns even with the pair off:
-  `include/llama.h`/`llama-cparams.h`/`llama-context.{h,cpp}` (`ctx_aux`, the aux pin fixes, the capture guards)
-  and `ggml-cuda-slab.cu` — every one of them inert for a single context, but the sweep is what proves it.
+* **STEP 11 (next):** the delivery regression sweep — §0.0 steps 1-5, §3 STEP 11 (11.1 the touched-file map,
+  11.2 the ladder, 11.3 a failure).  Always: the campaign landed changes in files the DELIVERY owns even with the
+  pair off (`include/llama.h`/`llama-cparams.h`/`llama-context.{h,cpp}`, `ggml-cuda-slab.cu`, `ggml-cuda.cu`,
+  `common/`), every one inert for a single context — the sweep is what proves it, and the three gates that
+  actually cover those edits are `gate-draft-ctx.sh`, `gate-mtp-dev-rows.sh`, `gate-spec-purity.sh`.
+* **Residuals a tester must be told about** (all in §7): `LLAMA_MTP_DEV_ROWS` inert on the pair; the aux pin grows
+  only while nothing is live at its slot; the reserve count is one constant per context, re-measure if the verify
+  batch is much wider than `4 x (7+1)` rows; the slab reserve to set comes from the calibration line.
 * **Closed at STEP 10:** the speculator on the pair (§1.3 row 1, `RUNS.md` 2026-11-24).  Six memory defects came
   out of it, four fixed here and two recorded as follow-ups (§7.2/§7.8).
 * **Closed at STEP 8:** the five-gate set (`gate-arms-{default-inert,n1-memory,itl,multislot,recurrent-shared}.sh`)
   plus STEP 10's `gate-arms-spec.sh`, each printing its own non-vacuity line.  `RUNS.md` has the numbers;
   `INVARIANTS.md` r368/r369-wip and r375..r378-wip the facts.
-* **STEP 12:** the candidate patch + the promotion ask (§3).
+* **STEP 12:** the candidate patch + the promotion ask — §0.0 steps 6-8, §3 STEP 12.  The artifact REPLACES
+  `beta/prefill-decode-arms/` whole and is ONE patch; promotion is block 17 and the maintainer's decision.
 
 ---
 
@@ -231,7 +285,10 @@ The reserve in force is 2816 MiB; 2816 MiB would host every auxiliary region (he
 
 ## 3. The rest of the campaign
 
-`PLAN.md` has each step's own detail.  Order and what is left:
+**If you are the STEP 11/12 session: skip to `### STEP 11` and `### STEP 12` at the END of this section.**  The
+blocks before them are the CLOSED steps, kept because they carry the reasoning, the traps and the anchors a
+regression question will send you back to (STEP 8 the gate set, STEP 9 the shape/latency matrix, STEP 10 the
+speculator).  `PLAN.md` has each step's own detail; `RUNS.md` the numbers.
 
 ### STEP 8 — the gate set (CLOSED 2026-11-23)
 
@@ -340,32 +397,183 @@ region landing in the hole the first one's pin left mapped-but-absent.
   fix here was re-run at least twice (and the soak's overlap check needs `ROUNDS=20` with a drafter, because a
   verify step emits up to 8 tokens and two decoders rarely share a 16-token batch).
 
-### STEP 11 — the delivery regression sweep
+### STEP 11 — the delivery regression sweep  (11.1 what was touched, 11.2 the ladder, 11.3 a failure)
 
-**Two additional items STEP 10 created:**
-* STEP 10 landed changes in files the DELIVERY owns even with the pair off: `include/llama.h` +
-  `src/llama-cparams.h` + `src/llama-context.{h,cpp}` (`ctx_aux`, the aux floor slot, the aux pin growth, the
-  capture guards) and `ggml/src/ggml-cuda/{ggml-cuda.cu,common.cuh,ggml-cuda-slab.cu}`.  Every one is inert for a
-  single context (A1-A6 and `gate-arms-default-inert` re-verified after them), but the delivery gates listed below
-  are what proves it on the delivery's own configurations -- and `ggml-cuda-slab.cu` is the file blocks 12/15 own.
-* README's definition of done wants the **shape matrix with a speculator ON and OFF**.  Runner with a drafter on
-  the pair is `gates/gate-arms-spec.sh` (3 shapes, 4 arms + the four axes); `baseline/shape-matrix.sh` itself has
-  no drafter arm yet -- adding one for the MTP-capable shapes (27B, 35B-A3B, Gemma4+its head) is owed here.
+**Goal:** prove that everything this campaign landed is either INERT for the delivery's default path or covered by a
+delivery gate, and that the delivery's own set still validates.  It is a *verification* step: the expected outcome
+is "all green, nothing to change", and a change here is a finding to report first (§6).
 
-`scripts/validate-set.sh`, plus `gate-prefill-logits.sh`, `gate-state-pipe.sh`, `gate-park-idle-slots.sh`,
-`gate-kv-residency.sh`, `gate-host-pool.sh`, `gate-spec-purity.sh`, `gate-mtp-dev-rows.sh`,
-`gate-moe-promise.sh`, `gate-node-budget.sh`, `gate-graph-replay-width.sh`, `scripts/check-gen-docs.sh` (the pair
-adds options → the three generated docs must be regenerated), `check-windows-portability.sh`,
-`check-windows-paths.sh`, one whole-set `all` build, and `check-shlib-symbols.sh` (the iface rename landed).
+#### 11.1 What this campaign changed in files the DELIVERY owns
 
-### STEP 12 — the candidate patch + the ask
+Every one of these is inert with one context — but "inert by argument" is not the standard, a gate is:
 
-Regenerate from a **canonical** chain (`scripts/apply-all.sh` at `release.json.base`), and put it in
-**`beta/prefill-decode-arms/`, replacing that artifact in its entirety** — the maintainer's decision of 2026-11-24
-(the old directory's design/README/patch are deleted, not kept beside it; the reading rules in `README.md` §0 still
-forbid reading them).  It stays **ONE self-contained patch**: on promotion it is **delivery block 17**, a
-modification to the lower-numbered blocks.  Report the measured trade/memory/shapes to the maintainer.
-**Promotion into `patches/` is a block decision and is the maintainer's** (§6).
+| delivery-owned file | what landed | inert because | the gates that can see it |
+|---|---|---|---|
+| `include/llama.h`, `src/llama-cparams.h`, `src/llama-context.{h,cpp}` | `ctx_memory` (the borrow, STEP 2), `cparams.type_k/v` for a borrower (7f), `ctx_aux` + `is_draft` (10), the aux floor slot / pin growth / region mapping (10), `slab_aux_slot()` | every field defaults to the old behaviour: `ctx_memory = null`, `ctx_aux = false`, and `slab_aux_slot()` returns 0 for a normal context | `gate-state-pipe.sh`, `gate-park-idle-slots.sh`, `gate-kv-residency.sh`, `gate-mtp-dev-rows.sh`, `gate-draft-ctx.sh`, `gate-spec-purity.sh` |
+| `ggml/src/ggml-cuda/ggml-cuda.cu`, `common.cuh` | the capture barrier's two new users (an allocation EXCLUSIVE, a cross-stream event wait / peer copy SHARED) | a single context never has an allocation or an event wait beside a capture | `gate-graph-replay-width.sh`, `gate-kv-residency.sh`, `gate-host-pool.sh` |
+| `ggml/src/ggml-cuda/ggml-cuda-slab.cu` | the aux pin's slot off-by-one, growth-when-idle, the region-below-the-extent mapping (10) | no aux context, so no region, so no pin path | `gate-host-pool.sh`, `gate-kv-residency.sh`, `gate-graph-replay-width.sh` |
+| `common/common.cpp`, `common/speculative.{h,cpp}`, `common/arg.cpp` | `common_arms_pair_possible()`, the per-aux-context reserve, `ctx_tgt_alt`, the per-round target context, `common_speculative_path_shares_target_kv()`, the `--prefill-decode-arms*` options | the pair is OFF by default, so `common_arms_reserve_derive()` returns not-charged and the drafter keeps `ctx_tgt` (it must read the same rows) | `gate-mtp-dev-rows.sh`, `gate-spec-purity.sh`, `gate-draft-ctx.sh`, `check-gen-docs.sh` |
+| `tools/server/server-context.cpp` | the two arms, the slot ownership flag, `slot_step`/`slot_draft_setup`/`slot_draft_ckpt`/`slot_accept_draft_round`, the handover resets | the prefill arm is the old code path when `ctx_dec == nullptr`, and the extracted helpers are the SAME code | `gate-park-idle-slots.sh`, `gate-spec-purity.sh`, `gate-ckpt-reuse.sh`, `gate-spec-ckpt-device.sh`, `gate-draft-ctx.sh` |
+| `src/llama-kv-cache.*`, `src/llama-memory.{h,cpp}`, `src/llama-memory-recurrent.*`, `ggml/src/ggml-backend-meta.cpp` | one lock + the reservation bitmap (STEP 3), the contextified recurrent placement (5), the Meta view slot (4/7e/7g) | unchanged for one context: one owner, no reservation, one slot | `gate-kv-residency.sh`, `gate-state-pipe.sh`, `gate-seqpar.sh` (`-sm tensor` arms), `gate-meta-seg-drain.sh` |
+
+#### 11.2 The ladder (run in this order; ONE GPU JOB AT A TIME)
+
+```bash
+cd ~/llama-cpp-rdna-boosts
+./scripts/validate-set.sh                    # 1. the delivery set: checksums, fresh-tarball strict apply, file sets
+                                             #    EXPECTED: green.  It cannot see the campaign (nothing in patches/), so
+                                             #    a failure here means the tree or release.json moved -- stop and report.
+./scripts/check-shlib-symbols.sh             # 2. every shipped .so resolves (already OK at 16 libs on this tip)
+./scripts/check-gen-docs.sh                  # 3. the three generated docs (the pair ADDS options -> they must be
+                                             #    regenerated IN THE CANDIDATE; see 12.2)
+./scripts/check-windows-portability.sh        # 4. POSIX-only calls/types in inserted lines (the campaign inserts
+./scripts/check-windows-paths.sh              #    server + llama-context code, so both are in scope)
+./scripts/gate-prefill-logits.sh              # 5. the prefill-logit KLD: mean KLD <= 0.005, same-top-p >= 98 %
+                                             #    (needs a base recorded on THIS ROCm line: --record from build-ref)
+./scripts/gate-state-pipe.sh                 # 6. state save/restore: every arm restores byte-identical text
+./scripts/gate-park-idle-slots.sh             # 7. idle-slot parking: park == lazy-off text + the indexer cache
+./scripts/gate-kv-residency.sh                # 8. block 15's window + attendance pool, incl. the slab aux path
+./scripts/gate-host-pool.sh                   # 9. the host-expert pool: 13 arms, byte-identical text
+./scripts/gate-mtp-dev-rows.sh                # 10. the MTP h-rows gate: DEFAULT = host readback, no h_nextn device
+                                             #     buffer; both arms the same text + acceptance (the drafter path)
+./scripts/gate-spec-purity.sh                 # 11. plain == draft-mtp on q8_0 and bf16 at 3-device -sm tensor
+./scripts/gate-draft-ctx.sh                   # 12. the context constructor's ctx_other adoption rule (this campaign
+                                             #     edited exactly that layer: ctx_aux / is_draft)
+./scripts/gate-moe-promise.sh                 # 13. the take-over promise's lifetime (the slab/MoE layer)
+./scripts/gate-node-budget.sh                 # 14. graph_max_nodes / scheduler sizing
+./scripts/gate-graph-replay-width.sh          # 15. the capture decision + the capture-time FA staging rule (the two
+                                             #     new barrier users landed next to it)
+./scripts/gate-ckpt-reuse.sh                  # 16. the context-checkpoint reuse path (server-context.cpp)
+# then, and only then, the whole-set build + the fault scan:
+~/bin/build-llama-rocm                       # the `all` profile at the tip (6-10 min cold, ~10 s warm)
+for f in <the logs the gates wrote>; do ./scripts/check-gpu-faults.sh --since "<start>" --log "$f"; done
+```
+
+Notes that cost this campaign time:
+* **`gate-prefill-logits.sh` needs a base recorded on THIS ROCm line** — and one IS on this box:
+  `~/.cache/rdna-boosts/gates/prefill-logit-gfx1201-Qwen3.8-27B-Q8_0-rocm-10.2.0-gfx120X.kld` (5.1 GiB, recorded
+  2026-11-23, base PPL 5.9325).  If it is missing, record it from `build-ref` with `--record` first; a base recorded
+  on another line is refused, not silently compared.  Never point a base at `/tmp` (tmpfs here).
+* **`scripts/gate-draft-ctx.sh`, `gate-mtp-dev-rows.sh` and `gate-spec-purity.sh` are the three that actually cover
+  this campaign's edits** (the draft-context layer, the drafter's row path, and the verify/accept plane).  If you
+  have time for only three, those are the three.
+* **What is actually green, and on which tip** (this matters: do not read "the campaign is green" as "every gate
+  passed on the last binary"):
+  * on the FINAL tip `ffaee2c52`: `gates/gate-arms-spec.sh` 30/30 (3 shapes x 4 arms + 4 axes) and 19/19 on the
+    post-10b re-run, `gates/gate-arms-default-inert.sh` PASS (4 shapes, then `--no-cli` after 10b),
+    `gates/gate-arms-multislot.sh` PASS with the drafter at 20 rounds, `baseline/mtp-axis.sh` K axis
+    `a87c4318b649` 74/73/435/423, `scripts/check-shlib-symbols.sh` OK (16 libs);
+  * on a slightly EARLIER campaign tip: `gates/gate-arms-n1-memory.sh` PASS, the pair-only
+    `gates/gate-arms-multislot.sh` (no drafter, `widest batch 3`), and 5 clean runs of `baseline/itl-arm.sh` with
+    the drafter (ITL 1.26-1.28 ms/token).  Two later changes (the `is_draft`/`ctx_aux` test and the 10b reserve
+    count) touch none of their code paths, so they stand;
+  * **NOT run at all**: `gates/gate-arms-itl.sh` and `gates/gate-arms-recurrent-shared.sh` on the final tip, and
+    **none of the 16 delivery gates** — that is STEP 11's job, and it is the reason STEP 11 exists.  If you change
+    code during STEP 11, re-run the campaign gate that covers it.
+* Anything you run at a host-expert shape: `MOE_EXPERT_HEATMAP=load`; anything fresh-process text:
+  `ROCBLAS_USE_HIPBLASLT=0`; every arm: `HIP_VISIBLE_DEVICES` pinned.
+
+#### 11.3 When a delivery gate FAILS
+
+1. **Reproduce it on `build-ref` first.**  It EXISTS on this box: `~/llama.cpp/build-ref/bin/llama-server` reports
+   `commit 089f90067` (the delivery tip), built at the same source path so ccache stays warm.  Use `LLAMA_BIN=` /
+   `LLAMA_CLI=` (most campaign harnesses honour them) or the absolute path.  A scratch worktree also exists at
+   `~/llama-scratch` (checked out at `089f90067`) if you need a clean delivery tree to build from.
+2. `build-ref` fails too → **not this campaign's defect**.  Record it (a `RUNS.md` note + the `TODO.md`/issue it
+   belongs to), report it, and move on.  Do NOT fix it inside STEP 11.
+3. `build-ref` passes and the tip fails → **this campaign's defect**.  Localise before fixing:
+   `scripts/gate-per-block-build.sh` exists for a *build* breakage, and `git bisect` over the campaign's `steps/`
+   commits (each is one landing) for a behaviour breakage.  Then fix, re-run THAT gate plus
+   `gate-arms-default-inert.sh`, and add a `WORKLOG.md` entry (`YYMMDD.VVV`, newest first) + an `INVARIANTS.md`
+   entry if the lesson is general.
+4. **Never** weaken a gate, skip an arm, or re-record an anchor to make a red gate green.  A gate that another
+   change makes vacuous is documented in `MANIFESTS.md`; "simplify to the arm that passes" is the exact defect the
+   gate exists to catch.
+
+### STEP 12 — the candidate patch and the ask  (12.1 the cut, 12.2 the beta contract, 12.3 the report)
+
+**The maintainer's decision (2026-11-24): this work COMPLETELY REPLACES `beta/prefill-decode-arms/`** — the old
+directory's design text, README and patch are deleted, not kept beside it — **and on promotion it is delivery block
+17 as ONE self-contained patch**, a modification to the lower-numbered blocks.  Promotion is still asked (§6).
+
+#### 12.1 Cut it from a CANONICAL chain — never from the working branch
+
+`~/llama.cpp` on `arms-v2` carries the campaign's own history on top of the delivery tree; a raw
+`git diff <base>` there can export upstream commits or miss a landing.  The chain must be re-derived:
+
+```bash
+cd ~/llama.cpp
+git checkout -q --detach 919794500            # release.json.base -- NEVER the tip of master
+bash ~/llama-cpp-rdna-boosts/scripts/apply-all.sh .
+#    -> prints "Applied tip: <sha>" and the applied TREE, and verifies it equals release.json.tree
+git checkout -q rdna-boosts                   # the branch apply-all.sh created
+```
+(`--include-beta` is the TESTER's path — it applies whatever `beta/*/*.patch` holds, which at this point is the OLD
+artifact.  Never use it to build the candidate; the candidate is cut from the campaign's `steps/` on a clean
+delivery set.)
+The canonical set has to be the delivery ALONE first (18 patches, tree = `release.json.tree`).  Then apply the
+campaign's steps **in order**, each as its own `git am`, so the candidate is their union and you can still bisect:
+
+```bash
+for p in ~/llama-cpp-rdna-boosts/wip/prefill-decode-arms-v2/steps/STEP-*.patch; do
+    git am -3 "$p" || { echo "FAILED on $p -- do not continue"; break; }
+done
+git status --short          # must be empty
+```
+The `steps/` files are `git diff` output (not `format-patch`), so apply them with `git apply --index` + one commit
+if `git am` refuses them -- **do not** concatenate them into one file and `git apply` (the delivery's own rule:
+that silently drops hunks).
+
+Then, and this is the deliverable:
+
+```bash
+git diff 919794500 > ~/llama-cpp-rdna-boosts/beta/prefill-decode-arms/prefill-decode-arms.patch
+git diff --stat 919794500 | tail -3        # record the size in the README
+```
+
+**Verify the patch round-trips before you write a word of documentation** (this is the contract a tester relies on):
+
+```bash
+cd /tmp && rm -rf cand && git clone -q ~/llama.cpp cand && cd cand
+git checkout -q 919794500
+git am  <beta>/prefill-decode-arms.patch
+git rev-parse HEAD^{tree}        # must equal the tree you cut it from (`git rev-parse <campaign-tip>^{tree}`)
+```
+
+#### 12.2 The beta directory contract
+
+`beta/prefill-decode-arms/` must contain **exactly three files** (the shape `scripts/apply-all.sh --include-beta`
+expects, and the shape the delivery's `beta/` policy describes):
+
+| file | what it must say |
+|---|---|
+| `prefill-decode-arms.patch` | the ONE patch above, cut against `919794500`, applying strictly with `git am` |
+| `README.md` | what it is (one sentence: one `llama_memory_i`, two `llama_context`s — the prefill arm owns the memory, the decode arm borrows it, nothing is copied); the applied TREE; the shapes it reaches and the ones it refuses; **the measured numbers** from `RUNS.md` (`2026-11-24` — the four-arm text claim, the four axes, ITL, the cost); the options it adds (`--prefill-decode-arms`, `--prefill-decode-arms-mode`) and the fact that they DEFAULT OFF; what it does NOT cover (`LLAMA_MTP_DEV_ROWS` inert, the aux-pin growth path, the reserve count's wider-verify caveat); and that nothing here is covered by the delivery's release gates |
+| `BETA-TESTING.md` | the ladder a tester runs, in order: apply → build → the 4-5 arms with the exact commands → what to report (their ROCm line, GPU model, build clean, the text hash per arm, the acceptance counts, the ITL pair) → the hygiene rules (`HIP_VISIBLE_DEVICES`, `setsid`+`timeout`+kill the process group, `rm -f gpucore.*.gpu` after a fault, `check-gpu-faults.sh`, `MOE_EXPERT_HEATMAP=load`, `ROCBLAS_USE_HIPBLASLT=0`, no two GPU jobs) |
+
+**Delete** the old artifact's three files and its design text.  The campaign's `README.md` §0 reading ban STAYS in
+force for you (do not read the deleted material — it is in git history if a maintainer asks).  **Regenerate the three
+generated docs** (`tools/cli/README.md`, `tools/completion/README.md`, `tools/server/README.md`) *inside the
+candidate patch*, because the pair adds options: run `scripts/check-gen-docs.sh` on the candidate tree and fold the
+regeneration into the patch (the delivery's rule: one regeneration, in the last block that touches `common/arg.cpp`
+— here the candidate IS that block).
+
+#### 12.3 The report, and the ask
+
+Report to the maintainer in the session's final message (and as a `WORKLOG.md` entry, newest first) — with:
+
+* the STEP 11 verdict per gate (and any finding, with the `build-ref` comparison that classified it);
+* the candidate's applied TREE + the patch's sha256, the file count, and the round-trip proof;
+* the measured trade: ITL, prefill, the memory/arena cost, and the shapes validated (and NOT validated);
+* the residuals that a tester or a future block must know (§7 — `LLAMA_MTP_DEV_ROWS` inert on the pair, the aux
+  pin's growth-only-when-idle, the reserve count's wider-verify caveat, the slab reservoir value to set);
+* **the ask**: promotion into `patches/` as **block 17**, which is a maintainer decision and a block-structure
+  decision — a green ladder is not permission (§6), and `AGENTS.md`'s "ALWAYS ask before creating a block" is the
+  rule that applies.
+
+Do **not**: touch `patches/`, `release.json`, `MANIFESTS.md`, `BASELINE.md` or any release gate; create or renumber
+a block; push `~/llama.cpp` anywhere (a bare `push` there targets upstream `ggml-org/llama.cpp` and can get the
+account banned); or push the delivery branch's candidate before the sweep is reported.
 
 ---
 
@@ -433,18 +641,28 @@ gates/     gate-arms-default-inert.sh  pair OFF on 4 shapes: cli text + startup 
 
 Every number of record is in `RUNS.md` (newest first) with its command and shape; the anchors are in
 `baseline/r353-anchors.md` (+ `inert-anchors.tsv` for the default-inert rows).  The campaign's facts are in
-`INVARIANTS.md` under `r353-wip` … `r369-wip`.
+`INVARIANTS.md` under `r353-wip` … `r379-wip` (r375-r379 are STEP 10's: the draft context that keeps no
+`ctx_other`, the two capture-barrier users, the slab's aux regions, what a drafter-on-the-pair text oracle must
+assert, and the reserve count).
+
+The review machinery a cold STEP 11/12 session needs is in the DELIVERY repo, not here: `scripts/validate-set.sh`,
+the `scripts/gate-*.sh` list in §3 STEP 11's ladder, `scripts/check-{gen-docs,shlib-symbols,windows-*}.sh`, and
+`AGENTS.md` (policy: what a block is, the reporting rule, the push targets).  `MANIFESTS.md` is the delivery's
+gate contract — read the entries for the gates you run, not just the gate's own `--help`.
 
 ---
 
 ## 6. Git, records and the reporting rule
 
 * **Delivery repo** (`~/llama-cpp-rdna-boosts`), branch `prefill-decode-arms-v2`: docs, gates, harnesses, patches.
-  `git push -u origin prefill-decode-arms-v2` after each landing.  **`main` stays untouched.**
+  `git push -u origin prefill-decode-arms-v2` after each landing (it is PUSHED as of this file: STEPs 0-10 +
+  the review decisions).  **`main` stays untouched.**
+* **Current tips:** `~/llama.cpp` `arms-v2` = **`ffaee2c52`** (STEP 10b), local only; the delivery branch's HEAD is
+  the commit that carries this file.  A landing is one commit in EACH repo + a patch in `steps/`
+  (`git diff > steps/STEP-<n>-<name>.patch` from `~/llama.cpp`), and the delivery commit carries the records.  STEP
+  10's own landings are `e7ae0b470` (10a), `f3e34859d` (10) and `ffaee2c52` (10b); the `steps/` files are 0017-0019.
 * **`~/llama.cpp`**, branch `arms-v2`: the code.  **Never push it** (a bare `push` there targets upstream
   `ggml-org/llama.cpp` and can get the account banned).
-* One landing = one commit in each repo + a patch in `steps/` (`git diff > steps/STEP-<n>-<name>.patch` from
-  `~/llama.cpp`).
 * **Records in the same landing:** a dated `WORKLOG.md` entry at the **top** (`YYMMDD.VVV`, today's real date +
   the next free number), an appended `INVARIANTS.md` entry tagged with the landing's `rNNN-wip`, and a `RUNS.md`
   section with the command, the shape and the number.
