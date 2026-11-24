@@ -38,8 +38,9 @@
 # not take it.
 set -uo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 BIN=${BIN:-$HOME/llama.cpp/build-rocm/bin/llama-cli}
-export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}
+export LD_LIBRARY_PATH="$(rocm_ld_library_path)"
 export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}
 # A host-expert config is required (the transport only exists for host-resident expert weights); the field
 # model is the one the campaign measured.

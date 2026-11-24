@@ -35,16 +35,24 @@ move happens with a "refuted" status.  A finished candidate leaves `beta/`; no s
 
 ## Current candidates
 
-* **`prefill-decode-arms`** — **the two-arm server (the withdrawn delivery block 17)**, withdrawn at **r352**
-  (2026-11-23) because it is not release-ready: a GPU page fault on the cache-disabled host tier that
-  reproduced with the pair *inactive* (and could not be reproduced at r352 — the diagnosis is in its
-  `README.md`), a qwen4exp abort at a request boundary, and the feature's own open work queue.  Applied on
-  the r352 default tree it reproduces the **r351 release tree** (`8851b0d02`) exactly.  Files:
-  [`prefill-decode-arms/README.md`](prefill-decode-arms/README.md) (what it is, the moved block reference,
-  the diagnosis), [`prefill-decode-arms/BETA-TESTING.md`](prefill-decode-arms/BETA-TESTING.md) (the apply,
-  build and smoke ladder) and [`prefill-decode-arms/prefill-decode-arms.patch`](prefill-decode-arms/prefill-decode-arms.patch)
-  (sha256 `91ed9920…2d558d`).  Its gates (`gate-arms-spec.sh`, `gate-draft-ctx.sh`, `gate-arms-soak.sh`) are
-  beta-only from r352.
+* **`prefill-decode-arms`** — **the two-arm server (the withdrawn delivery block 17), REBUILT as v2** (2026-11-24).
+  **ONE `llama_memory_i`, TWO `llama_context`s**: the prefill arm owns the memory and the decode arm borrows it
+  through `llama_context_params::ctx_memory`; nothing is copied between them.  This **replaces the earlier
+  artifact in its entirety** (the maintainer's decision of 2026-11-24 — the old design's second context that
+  *viewed* and *co-owned* the first's memory, and the recurrent state copied between two modules, are gone at
+  the root); on promotion it is **delivery block 17 as ONE self-contained patch**, a modification to the
+  lower-numbered blocks.  Applied on the r353 default tree (`27db9bfd4`) it produces tree
+  **`29c9644350`**.  Files: [`prefill-decode-arms/README.md`](prefill-decode-arms/README.md) (what it is, the
+  measured numbers, the residuals, the shapes it refuses),
+  [`prefill-decode-arms/BETA-TESTING.md`](prefill-decode-arms/BETA-TESTING.md) (the apply, build and arm ladder)
+  and [`prefill-decode-arms/prefill-decode-arms.patch`](prefill-decode-arms/prefill-decode-arms.patch)
+  (**THREE** patch files, applied in filename order, one commit each: `prefill-decode-arms.patch` — block 17,
+  sha256 `a2badad1…e366fe3c`, 42 files, +3073/−741 — then two delivery-level fixes the candidate carries for
+  now, `state-split-2d-read.patch` (STEP 15, sha256 `b3f0645a…c2a7336b`, 1 file, +85/−46) and
+  `two-arm-drop-boundary.patch` (STEP 16, sha256 `fd50d736…d31030963`, 4 files, +97/−4)).
+  Campaign record:
+  [`../wip/prefill-decode-arms-v2/`](../wip/prefill-decode-arms-v2/README.md); its own gate set is
+  `wip/prefill-decode-arms-v2/gates/gate-arms-*.sh` (beta-only, never delivery gates).
 
 The `arena-steady-sizing` v2 candidate was **promoted into block 09 at r292** (2026-11-15);
 see *Recently promoted* below and `archive/work/arena-steady-sizing/`.

@@ -1,0 +1,314 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 49d113e9e..0d57b646c 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -26,6 +26,8 @@
+ #include <cfloat>
+ #include <cstdio>
+ #include <string>
++#include <mutex>
++#include <shared_mutex>
+ #include <unordered_map>
+ #include <utility>
+ #include <vector>
+@@ -40,6 +42,34 @@
+ 
+ #include "ggml-common.h"
+ 
++// ---------------------------------------------------------------------------------------------
++// CAPTURE-vs-BLAS exclusion (the "capture barrier").  See the definition in ggml-cuda.cu for why.
++// A graph CAPTURE holds this exclusively; every library GEMM (hipBLAS/rocBLAS/hipBLASLt) takes it shared.
++// `g_ggml_cuda_capture_depth` is > 0 on the thread that is recording, whose own GEMM calls are being
++// CAPTURED rather than executed and must therefore not take the shared side (it would deadlock on the
++// exclusive side the same thread holds).
++// `GGML_CUDA_CAPTURE_BLAS_BARRIER=0` disables the whole mechanism (A/B and bisect; the pair then needs one of
++// `GGML_CUDA_GRAPH_MAX_TOKENS=0` / `ROCBLAS_USE_HIPBLASLT=0` on a tensor split).
++// ---------------------------------------------------------------------------------------------
++std::shared_mutex & ggml_cuda_capture_barrier();
++extern thread_local int g_ggml_cuda_capture_depth;
++bool ggml_cuda_capture_barrier_enabled();
++
++struct ggml_cuda_blas_guard {
++    // SHARED, and measured to be sufficient: two arms' GEMMs may overlap (they do, on every concurrent pair arm,
++    // and the arm reads the same text), while a graph CAPTURE takes the same mutex exclusively.  The hazard that
++    // needed removing was not the GEMM dispatch but the library's lazy HANDLE CREATION -- see `cublas_handle()`
++    // and the definition in ggml-cuda.cu.
++    std::shared_lock<std::shared_mutex> lk;
++    ggml_cuda_blas_guard();
++    ~ggml_cuda_blas_guard() = default;
++};
++
++#define GGML_CUDA_CONCAT_(a, b) a##b
++#define GGML_CUDA_CONCAT(a, b) GGML_CUDA_CONCAT_(a, b)
++// one line before a library GEMM: it may not be in flight while another thread records a graph
++#define GGML_CUDA_BLAS_GUARD() ggml_cuda_blas_guard GGML_CUDA_CONCAT(ggml_cuda_blas_guard_, __LINE__)
++
+ // Read-once diagnostic flags.  These are queried on per-allocation / per-table paths and getenv() is
+ // expensive on Windows; a function-local static caches the answer for the process.
+ static inline bool ggml_cuda_work_alloc_debug() {
+@@ -2692,6 +2722,15 @@ struct ggml_backend_cuda_context {
+ 
+     cublasHandle_t cublas_handle() {
+         if (cublas_handles[device][curr_stream_no] == nullptr) {
++            // CREATION is a library call too, and it is the one that is easy to miss: `hipblasCreate`
++            // initialises hipBLASLt, which synchronises the LEGACY stream -- illegal while another thread is
++            // capturing a graph (`operation would make the legacy stream depend on a capturing blocking
++            // stream`).  Guarded here as well as around the GEMMs, because creation happens on the first GEMM
++            // of every (context, stream, device) and that first GEMM is exactly what a fresh arm issues.
++            std::unique_lock<std::shared_mutex> blas_create_lock(ggml_cuda_capture_barrier(), std::defer_lock);
++            if (g_ggml_cuda_capture_depth == 0 && ggml_cuda_capture_barrier_enabled()) {
++                blas_create_lock.lock();
++            }
+             ggml_cuda_set_device(device);
+             CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
+             CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
+@@ -2715,6 +2754,10 @@ struct ggml_backend_cuda_context {
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
+     cublasLtHandle_t cublaslt_handle() {
+         if (cublaslt_handles[device] == nullptr) {
++            std::unique_lock<std::shared_mutex> blas_create_lock(ggml_cuda_capture_barrier(), std::defer_lock);
++            if (g_ggml_cuda_capture_depth == 0 && ggml_cuda_capture_barrier_enabled()) {
++                blas_create_lock.lock();
++            }
+             ggml_cuda_set_device(device);
+             CUBLAS_CHECK(cublasLtCreate(&cublaslt_handles[device]));
+         }
+diff --git a/ggml/src/ggml-cuda/conv2d.cu b/ggml/src/ggml-cuda/conv2d.cu
+index ea586eb75..326bdd64c 100644
+--- a/ggml/src/ggml-cuda/conv2d.cu
++++ b/ggml/src/ggml-cuda/conv2d.cu
+@@ -426,6 +426,7 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+             const int      positions = int(OW * OH);
+             cublasHandle_t cublas_h  = ctx.cublas_handle();
+             for (int n = 0; n < B; ++n) {
++                GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+                 CUBLAS_CHECK(cublasGemmEx(cublas_h, CUBLAS_OP_N, CUBLAS_OP_N, positions, int(OC), int(IC), &alpha,
+                                           x_half.get() + int64_t(n) * IC * positions, CUDA_R_16F, positions, K_H,
+                                           CUDA_R_16F, int(IC), &beta, Y_D + int64_t(n) * OC * positions, CUDA_R_32F,
+diff --git a/ggml/src/ggml-cuda/conv3d.cu b/ggml/src/ggml-cuda/conv3d.cu
+index 7e4bd57ac..b6db64888 100644
+--- a/ggml/src/ggml-cuda/conv3d.cu
++++ b/ggml/src/ggml-cuda/conv3d.cu
+@@ -327,6 +327,7 @@ void ggml_cuda_op_conv3d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+             const float    alpha = 1.0f, beta = 0.0f;
+             cublasHandle_t cublas_h = ctx.cublas_handle();
+             for (int n = 0; n < B; ++n) {
++                GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+                 CUBLAS_CHECK(cublasGemmEx(cublas_h, CUBLAS_OP_N, CUBLAS_OP_N, positions, int(OC), int(IC), &alpha,
+                                           x_half.get() + int64_t(n) * IC * positions, CUDA_R_16F, positions, w,
+                                           CUDA_R_16F, int(IC), &beta, y + int64_t(n) * OC * positions, CUDA_R_32F,
+diff --git a/ggml/src/ggml-cuda/fp8.cu b/ggml/src/ggml-cuda/fp8.cu
+index 5fdec4220..2e8acb7cb 100644
+--- a/ggml/src/ggml-cuda/fp8.cu
++++ b/ggml/src/ggml-cuda/fp8.cu
+@@ -186,6 +186,7 @@ bool ggml_cuda_mul_mat_fp8(
+         const char * a = (const char *) src0->data + (i3/r3)*nb03;
+         const uint8_t * b = src1_fp8.ptr + i3*ne12*ne11*ne10;
+         float * d = (float *) ((char *) dst->data + i3*dst->nb[3]);
++        GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+         CUBLAS_CHECK(cublasLtMatmul(ctx.cublaslt_handle(), op_desc, &alpha, a, a_desc, b, b_desc,
+             &beta, d, d_desc, d, d_desc, &heuristic.algo, nullptr, 0, stream));
+     }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index e4fbe2dac..6244476bf 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7212,6 +7212,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+                                          (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr);
+         } else
+ #endif
++        GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+         CUBLAS_CHECK(
+             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                     ne01, ne11, ne10,
+@@ -7219,6 +7220,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+                                            (const float *) src1_ptr, s11,
+                     (const float *) beta,  (float       *)  dst_ptr, ldc));
+     } else if (ne12 == 1 && ne13 == 1) {
++        GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+         CUBLAS_CHECK(
+             cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                     ne01, ne11, ne10,
+@@ -7234,6 +7236,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+ 
+         // there is no broadcast and src0, src1 are contiguous across dims 2, 3
+         // use cublasGemmStridedBatchedEx
++        GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+         CUBLAS_CHECK(
+         cublasGemmStridedBatchedEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                 ne01, ne11, ne10,
+@@ -7272,6 +7275,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+ 
+         CUDA_CHECK(cudaGetLastError());
+ 
++        GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+         CUBLAS_CHECK(
+         cublasGemmBatchedEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                 ne01, ne11, ne10,
+@@ -9979,6 +9983,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+         g_gc_n_replay++;
+     }
+ 
++    // The capture barrier: exclusive for a capture (see ggml_cuda_capture_barrier), and this thread's own GEMM
++    // calls are recorded rather than executed.
++    std::unique_lock<std::shared_mutex> capture_barrier(ggml_cuda_capture_barrier(), std::defer_lock);
++    const bool capturing_here = use_cuda_graph && cuda_graph_update_required &&
++                                ggml_cuda_capture_barrier_enabled();
++    if (capturing_here) {
++        capture_barrier.lock();
++        g_ggml_cuda_capture_depth++;
++    }
++
+     if (use_cuda_graph && cuda_graph_update_required) {
+         // Start CUDA graph capture
+         if (ggml_cuda_graph_trace()) {
+@@ -9999,12 +10013,67 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required,
+                                         use_cuda_graph ? graph : nullptr);
+     cuda_ctx->capturing = false;
++    if (capturing_here) {
++        g_ggml_cuda_capture_depth--;
++        capture_barrier.unlock();
++    }
+     if (t_gc) { g_ev_rest_us += ggml_time_us() - g_loop_start; }
+ 
+     ggml_cuda_mmb_compute_done();
+     return GGML_STATUS_SUCCESS;
+ }
+ 
++// The CAPTURE BARRIER (see the declaration in common.cuh).
++//
++// A HIP library call that touches the LEGACY (blocking) stream cannot run while another thread records a graph.
++// On this ROCm line the offender is hipBLASLt -- reached through rocBLAS -- and the call that actually trips it
++// is the library's LAZY HANDLE CREATION (`hipblasCreate` initialises hipBLASLt, which synchronises the legacy
++// stream), not the GEMM dispatch: guarding the GEMMs alone left the abort at 2 of 3 runs, guarding creation
++// removed it (7 of 7 clean), and no GEMM is ever recorded INTO a capture on this shape (an instrumented run
++// logged zero).  The failure looked like:
++//
++//   Hip error: 'operation would make the legacy stream depend on a capturing blocking stream' (906)
++//       at .../hipblaslt.cpp:415
++//   E ROCm error: operation failed due to a previous error during capture
++//
++// and the sticky error then kills the CAPTURING thread on its next launch -- so the thread that aborts is not
++// the thread that failed, which is what made this expensive to localise.  Measured 2026-11-23 on the two-arm
++// server (Flash-Next GSQ-RCO IQ3_S, 3 devices `-sm tensor -mg 0`, np 2, one slot decoding while another
++// prefills): 2 of 3 runs aborted, and no gate could see it, because with ONE request in flight the two arms
++// never compute at the same time.  This is STEP 7d's family -- a process-wide/library hazard against a second
++// arm's capture -- so it gets the same kind of answer: a barrier, not a disabled feature.
++//
++// A CAPTURE takes the barrier exclusively; every library GEMM takes it shared.  The steady state is both
++// arms holding it SHARED (the whole point of the feature: two contexts computing at once); a capture is a
++// one-time-per-graph event, and the other arm waits at its next GEMM for it.  Neither the capture nor
++// hipBLASLt is disabled, so the pair keeps its graph replay AND its BLAS kernels.
++//
++// `g_ggml_cuda_capture_depth` marks the RECORDING thread: its own GEMM calls are being captured, not
++// executed, so they skip the shared side (taking it would deadlock on the exclusive side it already holds).
++// GGML_CUDA_CAPTURE_BLAS_BARRIER=0 restores the pre-barrier behaviour (A/B and bisect).
++thread_local int g_ggml_cuda_capture_depth = 0;
++
++std::shared_mutex & ggml_cuda_capture_barrier() {
++    static std::shared_mutex barrier;
++    return barrier;
++}
++
++bool ggml_cuda_capture_barrier_enabled() {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_CUDA_CAPTURE_BLAS_BARRIER");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return enabled;
++}
++
++ggml_cuda_blas_guard::ggml_cuda_blas_guard() : lk(ggml_cuda_capture_barrier(), std::defer_lock) {
++    // a GEMM issued by the RECORDING thread is being captured, not executed: the capture already owns the
++    // barrier exclusively, so taking it again here would deadlock on this thread.
++    if (g_ggml_cuda_capture_depth == 0 && ggml_cuda_capture_barrier_enabled()) {
++        lk.lock();
++    }
++}
++
+ static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+ 
+diff --git a/ggml/src/ggml-cuda/out-prod.cu b/ggml/src/ggml-cuda/out-prod.cu
+index c46e0455d..3ec8c09d0 100644
+--- a/ggml/src/ggml-cuda/out-prod.cu
++++ b/ggml/src/ggml-cuda/out-prod.cu
+@@ -79,6 +79,7 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+         GGML_ASSERT(ne2 <= std::numeric_limits<int>::max());
+         const int batch_count = (int) ne2;
+         for (int64_t i3 = 0; i3 < ne3; ++i3) {
++            GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+             CUBLAS_CHECK(
+                 cublasSgemmStridedBatched(handle, CUBLAS_OP_N, src1_cublas_op,
+                         ne0, ne1, ne01,
+@@ -106,6 +107,7 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+             ne2, ne3, dps2, dps3, s02, s03, s12, s13, s2, s3);
+         CUDA_CHECK(cudaGetLastError());
+ 
++        GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+         CUBLAS_CHECK(
+             cublasSgemmBatched(handle, CUBLAS_OP_N, src1_cublas_op,
+                     ne0, ne1, ne01,
+@@ -115,6 +117,7 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+                     batch_count));
+     } else {
+         // ne2 == 1 && ne3 == 1: single GEMM
++        GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+         CUBLAS_CHECK(
+             cublasSgemm(handle, CUBLAS_OP_N, src1_cublas_op,
+                     ne0, ne1, ne01,
+diff --git a/ggml/src/ggml-cuda/solve_tri.cu b/ggml/src/ggml-cuda/solve_tri.cu
+index d96783420..273ba38e8 100644
+--- a/ggml/src/ggml-cuda/solve_tri.cu
++++ b/ggml/src/ggml-cuda/solve_tri.cu
+@@ -67,6 +67,7 @@ static void solve_tri_f32_cublas(ggml_backend_cuda_context & ctx,
+ 
+     // Yes, this is necessary, without this we get RMSE errors
+     CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_DEFAULT_MATH));
++    GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+     CUBLAS_CHECK(cublasStrsmBatched(ctx.cublas_handle(), CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
+                                     CUBLAS_DIAG_NON_UNIT, k, n, &alpha, A_ptrs_dev, n, X_ptrs_dev, k, total_batches));
+ 
+diff --git a/ggml/src/ggml-cuda/ssm-scan.cu b/ggml/src/ggml-cuda/ssm-scan.cu
+index 7568bc1d0..1b36e2c77 100644
+--- a/ggml/src/ggml-cuda/ssm-scan.cu
++++ b/ggml/src/ggml-cuda/ssm-scan.cu
+@@ -685,11 +685,13 @@ static void ssm_scan_ssd_f32_cuda(
+             float *      CB_s = CB + s * chunk_len * chunk_len * n_group;
+ 
+             if (n_group == 1) {
++                GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+                 CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                     chunk_len, chunk_len, d_state,
+                     &alpha_one, C_s, lda_C_src, B_s, ldb_B_src,
+                     &beta_zero, CB_s, (int)chunk_len));
+             } else {
++                GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+                 CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                     chunk_len, chunk_len, d_state,
+                     &alpha_one,
+@@ -730,6 +732,7 @@ static void ssm_scan_ssd_f32_cuda(
+             for (int64_t s = 0; s < n_seq; s++) {
+                 float * dst_chunk = dst_d + s * d_inner * n_tok + chunk_offset * d_inner;
+ 
++                GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+                 CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                     head_dim, chunk_len, d_state,
+                     &alpha_one,
+@@ -750,6 +753,7 @@ static void ssm_scan_ssd_f32_cuda(
+ 
+             for (int64_t s = 0; s < n_seq; s++) {
+                 float * dst_chunk = dst_d + s * d_inner * n_tok + chunk_offset * d_inner;
++                GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+                 CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                     head_dim, chunk_len, chunk_len,
+                     &alpha_one,
+@@ -780,6 +784,7 @@ static void ssm_scan_ssd_f32_cuda(
+ 
+             for (int64_t s = 0; s < n_seq; s++) {
+                 // X_dt is d-fastest {hd, C}, read as OP_T to get {C, hd}
++                GGML_CUDA_BLAS_GUARD();   // no library GEMM while another thread records a graph
+                 CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                     d_state, head_dim, chunk_len,
+                     &alpha_one,

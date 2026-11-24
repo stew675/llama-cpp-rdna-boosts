@@ -23,7 +23,7 @@
 #   RDNA_REPO     delivery repo checkout      (default $HOME/llama-cpp-rdna-boosts)
 #   LLAMA_DIR     llama.cpp checkout          (default $HOME/llama.cpp; passed as LLAMA_CPP_DIR)
 #   STATE_DIR     state + logs                (default $HOME/.cache/rdna-containers)
-#   ROCM_LINES    ROCm release lines          (default "7.14.1 10.1")
+#   ROCM_LINES    ROCm release lines          (default "7.14.1 10.2")
 #   BUILD_EXTRA   extra args for build-containers.sh (e.g. "--no-cleanup")
 #   FORCE_TAG     build this tag even if it equals the last-built marker
 #   MAX_ATTEMPTS  failed attempts before this tag stops being retried automatically
@@ -54,7 +54,7 @@ fi
 RDNA_REPO="${RDNA_REPO:-$HOME/llama-cpp-rdna-boosts}"
 LLAMA_DIR="${LLAMA_DIR:-$HOME/llama.cpp}"
 STATE_DIR="${STATE_DIR:-$HOME/.cache/rdna-containers}"
-ROCM_LINES="${ROCM_LINES:-7.14.1 10.1}"
+ROCM_LINES="${ROCM_LINES:-7.14.1 10.2}"
 BUILD_EXTRA="${BUILD_EXTRA:-}"
 FORCE_TAG="${FORCE_TAG:-}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"

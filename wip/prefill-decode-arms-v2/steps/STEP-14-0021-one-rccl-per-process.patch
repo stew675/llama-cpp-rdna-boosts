@@ -1,0 +1,188 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 517c6fd2d..11f5a2180 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4264,6 +4264,9 @@ ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buffer_type(int device) {
+     return ggml_backend_cuda_kv_region_buffer_type_split(device, 0);
+ }
+ 
++// how many RCCL comm layers this process has already created (see the backstop in comm_init_nccl)
++static std::atomic<int> g_comm_rccl_layers{0};
++
+ // Communication context for multi-GPU AllReduce during tensor parallelism.
+ //
+ // Created once per meta backend instance.  Resources for the selected mode
+@@ -4646,6 +4649,33 @@ static bool ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context
+ 
+ // Try to bring up the NCCL/RCCL comms.  Returns true on success.
+ static bool ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
++    // ONLY ONE RCCL COMM LAYER PER PROCESS.  Each `ncclCommInitAll` creates one `/dev/shm/nccl-*` IPC
++    // segment per peer per channel -- measured 646 open descriptors per layer on a 3-device `-sm tensor`
++    // split -- and `FD_SETSIZE` (1024) is compile-time in the PREBUILT library whose `select()` trips on
++    // them, so a second layer is not a tuning decision, it is an abort:
++    //   `*** bit out of range 0 - FD_SETSIZE on fd_set ***` (measured: the target context + an MTP draft
++    //   head + the two-arm server's decode arm = 2026 descriptors, TWO LIMITS' worth, before a request).
++    //
++    // The first layer keeps RCCL -- that is what a host-expert PRE-FILL wants (pp2048 809 vs 604 t/s on
++    // the copy-engine arm).  Every later layer stands down to the copy-engine chain, which for an
++    // auxiliary (decode-band) context is free: it only ever reduces decode-sized tensors, and every chain
++    // already routes those to the internal pipeline.  `llama_context` additionally ASKS for this per
++    // context (`ggml_backend_comm_set_chain_next`), so a shape whose auxiliary context comes up first
++    // does not depend on this backstop; an explicit `GGML_CUDA_ALLREDUCE` does not override it, because
++    // the alternative to standing down is a hard abort and the warning names both.
++    if (g_comm_rccl_layers.load() > 0) {
++        const char * pinned = getenv("GGML_CUDA_ALLREDUCE");
++        GGML_LOG_WARN("all-reduce: NOT bringing up a second RCCL comm layer%s%s -- each one costs ~646 open "
++                      "descriptors on a 3-device split and two of them cross FD_SETSIZE (1024), which aborts the "
++                      "process in a library's select(); this context uses the copy-engine chain instead, and its "
++                      "tensors are decode-sized (the internal pipeline serves them either way)\n",
++                      pinned ? " (GGML_CUDA_ALLREDUCE=" : "", pinned ? pinned : "");
++        if (pinned) {
++            GGML_LOG_WARN("all-reduce: `%s` is pinned but cannot be honoured for a second comm layer -- see above\n",
++                          pinned);
++        }
++        return false;
++    }
+ #ifdef GGML_USE_NCCL
+     // Disabling NCCL path when CUDA virtual devices are in use since NCCL requires one distinct physical GPU per rank.
+     const ggml_cuda_device_info & info = ggml_cuda_info();
+@@ -4657,6 +4687,9 @@ static bool ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
+     const size_t n = ret->dev_ids.size();
+     ret->comms.resize(n);
+     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
++    if (rc == ncclSuccess) {
++        g_comm_rccl_layers.fetch_add(1);
++    }
+     if (rc == ncclSuccess) {
+         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+         return true;
+@@ -5740,6 +5773,42 @@ static bool ggml_backend_cuda_comm_init_ce_chain(ggml_backend_cuda_comm_context
+ // large arm is RCCL's ring, which is what a PCIe-saturated host-expert prefill wants.
+ bool g_comm_host_experts = false;
+ 
++// A CONSUME-ONCE override for the NEXT comm layer created in this process: 0 = none, 1 = the copy-engine
++// chain (the internal pipeline for the latency-bound smalls + CE for the large ones, RCCL never brought
++// up).  Set by `llama_context::sched_new()` for a context that BORROWS another context's memory (the
++// two-arm server's decode arm), because that is the one case where a second comm layer must not be a
++// second RCCL:
++//
++//   * each `ncclCommInitAll` creates one `/dev/shm/nccl-*` IPC segment per peer per channel -- measured
++//     646 open descriptors per comm layer on a 3-device `-sm tensor` split, and the delivery alone
++//     already sits at 63 % of `FD_SETSIZE` (1024) there;
++//   * two of them (1356 descriptors measured) cross `FD_SETSIZE`, and the next `select()` in a PREBUILT
++//     library aborts the process: `*** bit out of range 0 - FD_SETSIZE on fd_set ***`.  `FD_SETSIZE` is
++//     compile-time in the caller's TU, so it cannot be raised for RCCL from here;
++//   * a borrowing context only ever reduces DECODE-sized tensors, and every chain already routes those
++//     to the internal pipeline, so the copy-engine chain costs it nothing measurable -- while the
++//     PREFILL context keeps the RCCL ring, which is what a host-expert prefill wants (see
++//     `ggml_backend_cuda_comm_init_auto` for the measurements).
++//
++// Consume-once (not a modal flag) so that nothing but the comm layer created immediately after it can
++// inherit it.  An explicit `GGML_CUDA_ALLREDUCE` still wins -- see the hook in
++// `ggml_backend_cuda_comm_init()` -- because an operator who pinned a chain meant it, and the warning
++// then names the descriptor ceiling instead of silently overriding.
++static std::mutex g_comm_chain_next_mtx;
++static int        g_comm_chain_next = 0;   // 0 = none, 1 = copy-engine chain
++
++static void ggml_backend_cuda_comm_set_chain_next(int chain) {
++    std::lock_guard<std::mutex> lk(g_comm_chain_next_mtx);
++    g_comm_chain_next = chain;
++}
++
++static int ggml_backend_cuda_comm_take_chain_next() {
++    std::lock_guard<std::mutex> lk(g_comm_chain_next_mtx);
++    const int chain = g_comm_chain_next;
++    g_comm_chain_next = 0;
++    return chain;
++}
++
+ // The Linux/HIP default chain (r165).  Both large-tensor arms are brought up eagerly and the arm is
+ // chosen once, at the FIRST large all-reduce, from the only signal that separates the two regimes:
+ // whether the model offloads experts to host memory (g_comm_host_experts, set by the slab block).
+@@ -5875,6 +5944,32 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
+         ret->dev_ids.push_back(static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device);
+     }
+ 
++    // A context that BORROWS another's memory asks for the copy-engine chain (see the flag above): its
++    // tensors are decode-sized, so the large-tensor arm is never reached, and a second RCCL comm layer
++    // would push the process over `FD_SETSIZE` on a 3+-device tensor split.
++    if (ggml_backend_cuda_comm_take_chain_next() == 1) {
++        const char * pinned = getenv("GGML_CUDA_ALLREDUCE");
++        if (pinned != nullptr && strcmp(pinned, "auto") != 0 && strcmp(pinned, "ce") != 0) {
++            GGML_LOG_WARN("all-reduce: GGML_CUDA_ALLREDUCE=%s is pinned, so it is used for this "
++                          "context too -- but this context BORROWS another's memory, and a SECOND RCCL "
++                          "comm layer costs ~646 open descriptors on a 3-device split, which crosses "
++                          "FD_SETSIZE (1024) and aborts the process in a library's select(); `ce` is the "
++                          "value that avoids it\n", pinned);
++        } else {
++            GGML_LOG_INFO("all-reduce: this is an AUXILIARY context (a borrower, a draft view or an "
++                          "auxiliary decoder-band context) -- the copy-engine chain, and RCCL is NOT brought "
++                          "up for it (a second RCCL comm layer crosses FD_SETSIZE on a 3-device split; an "
++                          "auxiliary context's tensors are decode-sized, which the internal pipeline serves)\n");
++            const bool ce_ok = ggml_backend_cuda_comm_init_ce_chain(ret, false);
++            if (!ce_ok) {
++                GGML_LOG_WARN("all-reduce: the copy-engine chain did not come up for this context; it "
++                              "keeps the internal pipeline (or the meta backend's butterfly) and RCCL is "
++                              "still not initialised\n");
++            }
++            return ret;
++        }
++    }
++
+     const char * env = getenv("GGML_CUDA_ALLREDUCE");
+     bool ok = false;
+     if (!env || strcmp(env, "auto") == 0) {
+@@ -12694,6 +12789,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+         return (void *)ggml_backend_cuda_comm_all_gather_tensor;
+     }
+ #ifdef GGML_USE_NCCL
++    if (strcmp(name, "ggml_backend_comm_set_chain_next") == 0) {
++        return (void *) ggml_backend_cuda_comm_set_chain_next;
++    }
+     if (strcmp(name, "ggml_backend_comm_init_rank") == 0) {
+         return (void *)ggml_backend_cuda_comm_init_rank;
+     }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0e962de24..dfb8584b7 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -947,6 +947,39 @@ llama_context::llama_context(
+     }
+ 
+     if (!hparams.vocab_only) {
++        // A context that BORROWS another context's memory (the two-arm server's decode arm) must not bring a
++        // SECOND RCCL comm layer up.  Each `ncclCommInitAll` costs ~646 open descriptors on a 3-device
++        // `-sm tensor` split (one `/dev/shm/nccl-*` IPC segment per peer per channel), the delivery alone
++        // already sits at 63 % of `FD_SETSIZE` (1024) there, and two of them cross it -- the next `select()`
++        // in a PREBUILT library then aborts the process (`*** bit out of range 0 - FD_SETSIZE on fd_set ***`),
++        // and `FD_SETSIZE` is compile-time in that library's TU, so it cannot be raised from here.
++        //
++        // Ask for the copy-engine chain for the comm layer the instantiation below is about to create: a
++        // borrowing context only ever reduces DECODE-sized tensors, which every chain already routes to the
++        // internal pipeline, so the large-tensor arm is never reached -- while the PREFILL context keeps RCCL's
++        // ring, which is what a host-expert prefill wants (measured 809 vs 604 t/s CE).  The backend consumes
++        // the request once, so only the comm layer created here can inherit it, and a backend without the hook
++        // (CPU, RPC, no Meta device) simply does not get it.
++        //
++        // The test is "is this an AUXILIARY context", which is the same identity `slab_aux_slot()` uses: a
++        // context that views its target (`ctx_other`: an MTP draft head), an auxiliary decoder-band context
++        // (`ctx_aux`) or a BORROWER (`ctx_memory`: the two-arm server's decode arm).  All of them are
++        // decode-band, so none of them needs RCCL's ring, and each one that brought up its own would add ~646
++        // descriptors: measured 2026 open fds with target + MTP draft + decode arm on a 3-device split, i.e.
++        // TWO LIMITS' worth before a request.  The REQUEST fields are used (not `memory_borrowed`), because the
++        // Meta backend -- and therefore the comm layer -- is instantiated HERE.
++        const bool aux_comm = params.ctx_memory != nullptr || params.ctx_other != nullptr || params.ctx_aux;
++        if (aux_comm) {
++            ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++            ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
++            auto set_chain_next = reg != nullptr
++                ? (void (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_set_chain_next")
++                : nullptr;
++            if (set_chain_next != nullptr) {
++                set_chain_next(1); // 1 = the copy-engine chain (RCCL is not brought up for this context)
++            }
++        }
++
+         // GPU backends
+         for (const auto & dev : model.devices) {
+             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);

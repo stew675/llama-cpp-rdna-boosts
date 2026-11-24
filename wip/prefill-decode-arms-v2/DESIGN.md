@@ -103,6 +103,16 @@ provably inert (same-seed text + KLD 0.000000).
 **I8 — `ctx_other` keeps exactly its three existing meanings.**  MTP/draft target, gemma4 assistant view, eagle3
 token_embd donor.  The pair uses a **new** field and must not be visible to those code paths.
 
+**I9 — two live compute buffers never share a slab work base, and "which context is allocating" is never a
+process-wide flag.**  Everything *above* the memory is per context, and one of those things is the scheduler's
+COMPUTE buffer — the slab's work region is process-wide, so it must hand each live view its own region.  It had
+exactly one "narrow" (decode/verify) base for the target plus one pinned `narrow2` region for the MTP draft, so a
+**third** context (the pair's decode arm) aliased the prefill arm's 1280 MiB view at offset 0 and the GPU faulted
+in the K rope's `SET_ROWS` (`HANDOVER-2026-11-24-campaign.md` §2, `INVARIANTS.md` r364-wip).  Each extra context now gets its own
+pinned region, selected by its **own identity** (`ctx_other` → the draft slot, `memory_borrowed` → the borrowing
+slot) through a `thread_local`, because two arms reserve on two threads and a process-wide flag leaks.  This is
+the same rule as I3/I5 one level up: no shared bookkeeping, no role-derived selection, one owner per resource.
+
 ---
 
 ## 5. Defect register V1-V11
@@ -311,18 +321,39 @@ request arrives ──► prefill arm: prompt ubatches on ctx_tgt (its own batch
 2. The prefill arm never batches a slot it does not own, and the decode arm never touches a slot it does not own.
 3. Only **one** context may be inside `llama_process()` in the *decode band* at a time (the MoE device remap
    table is process-wide).  The prefill arm's wide pass may overlap a decode step, which is the point of the
-   feature; the **speculator's draft context is decode-band**, so drafting is serialised with the decode step.
+   feature; the **speculator's draft context is decode-band**, so drafting is serialised with the decode step --
+   enforced by `arms_spec_mtx`, which the decode arm holds across its own `llama_process(ctx_dec)` as well.
+   *Corrected 2026-11-23 (`HANDOVER-2026-11-24-campaign.md` §2):* the pair's host-expert GPU fault was **not** this invariant being
+   violated — it was two contexts' COMPUTE buffers sharing one slab work base (I9).  The remap rule above still
+   stands on its own (it is why a decode step and a prefill pass may overlap but two decode-band contexts may
+   not), but a fault on a host-expert shape is not evidence of it; check `GGML_CUDA_WORK_ALLOC_DEBUG=1` first.
 4. Any request-boundary memory operation that is not `init_batch`/`apply` (an allocation assert, a checkpoint
    restore) runs only when neither arm is inside `llama_process()`.
 5. The response lifecycle (`print_timings`, `send_final_response`, `release`, the prompt cache) is **main-thread
    only**.  The decode arm may `process_token()`/stream (it must, for latency), and nothing else.
 
-**The speculator.**  v2 keeps the pair's ability to run a drafter, but only under rule 3: the decode arm drives
-draft/verify/accept for its slots, the prefill arm's ingest is bracketed by the same barrier, and **both** arms'
-speculator entry points take the one speculator mutex (V4).  A drafter whose target side is bound to one context
-(the layer-input families: eagle3/dflash/dspark/dflash2/lilicorr) or that shares the target's KV (a gemma4
-assistant) stays **refused** with a message: with one shared memory their assumption ("I am the only other user")
-is not just wrong, it is unreachable.  `--spec-type` on the pair is **off by default and guarded separately**
+**The speculator** (STEP 10, landed 2026-11-24).  The decode arm drives draft/verify/accept for the slots it owns,
+the prefill arm's ingest is bracketed by the same lock, and **both** arms' speculator entry points take the one
+speculator mutex (V4).  Three facts the implementation settled, each measured:
+
+* **the drafter's target-side reads follow the arm that RAN the batch** (`common_batch::ctx`): `ctx_dec` on the
+  decode arm, `ctx_tgt` on the prefill arm, with the h_nextn extraction enabled on both.  Reading `ctx_tgt` from
+  the decode arm would verify against the prefill arm's last pass -- garbage drafts, every one rejected, and the
+  TEXT unchanged (which is why the gate asserts drafts were ACCEPTED, not just produced);
+* the speculator lock is also the DECODE-BAND lock: the decode arm holds it across its own `llama_process(ctx_dec)`,
+  so the draft context (decode-band, rule 3) can never run beside a decode step.  It is recursive because a round
+  can end by printing the statistics line through `print_timings()`.  The prefill arm's WIDE pass does not take it;
+* a slot's speculative state (`spec_draft`/`spec_i_batch`/`spec_ckpt`/`spec_is_replay`) names a batch the OTHER arm
+  could not restore, so it is reset at every handover, with an assert that nothing is pending.  A speculating slot
+  is handed over only after its accept round RESOLVED -- a replay round (a context that cannot roll back in place)
+  keeps its draft and must stay where its checkpoint came from.
+
+A drafter whose target side is bound to one context (the layer-input families: eagle3/dflash/dspark/dflash2/
+lilicorr) or that shares the target's KV (a gemma4 assistant) stays **refused** with a message: with one shared
+memory their assumption ("I am the only other user") is not just wrong, it is unreachable.  The family refusal is
+a property of `common_params`; the gemma4 one needs the draft GGUF's `general.architecture`, which the predicate
+reads (one metadata key) so that the arena reserve and the pair decision still cannot disagree (V2).  The
+admitted set is `draft-simple`, `draft-mtp`, `draft-mtp-adaptive` and the model-free n-gram family.  `--spec-type` on the pair is **off by default and guarded separately**
 (STEP 7) until the shared-memory ladder is green; that ordering is deliberate — the speculator is what made the
 old design's concurrency unexplainable, and it must be re-admitted onto a foundation that is already sound.
 
@@ -353,5 +384,6 @@ lifecycle.
 | R3 | the reservation bitmap leaks a mark (a batch context destroyed in an unexpected order) | an assert at every request boundary (`reserved == 0`), and the counts are in the census |
 | R4 | the recurrent extraction changes single-context numerics subtly | text + KLD oracles in the same step, before the pair uses it (STEP 5) |
 | R5 | the decode arm's narrow graph picks different kernels than the single context's decode row (V8) | the shape matrix in the text oracle; a divergence is investigated as a kernel/shape question with the cell census |
-| R6 | the arena reserve for the second context is still a hand-tuned constant | keep the constant small and *derived from a measurement*, I3-style: print the measured reserve at load, and fail loudly rather than silently shrinking the expert arena |
+| R6 | the arena reserve for the second context is still a hand-tuned constant | keep the constant small and *derived from a measurement*, I3-style: print the measured reserve at load, and fail loudly rather than silently shrinking the expert arena.  **Re-measure at STEP 10:** on a slab-armed shape the decode arm's *compute* buffer is 1280 MiB, pinned out of the arena (1.25 GiB rounded to a chunk), not the 157-235 MiB the 27B/3-GPU tensor arm measured — the constant covers the arena shrink of one narrow context and a drafter would make it two (`HANDOVER-2026-11-24-campaign.md` §7 item 2) |
+| R8 | a third (or later) context aliases an extra context's slab region | I9: every extra context has its own pinned region, chosen by its own identity; `gates/gate-arms-multislot.sh` FAILS if the slab is armed and the decode arm got no region of its own |
 | R7 | a "helpful" refactor re-merges the arms to save the prefill cost | `DESIGN.md` §1/§8 and the gate that measures ITL through a prefill: a merged step shows the 300-880 ms stall and fails |

@@ -1,0 +1,232 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index dedf56bf4..a6afcfb89 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4166,6 +4166,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.sleep_idle_seconds = value;
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--prefill-decode-arms"},
++        {"--no-prefill-decode-arms"},
++        string_format("the TWO-ARM server: a decode arm (its own llama_context) BORROWS the prefill arm's "
++                      "llama_memory, so a reply keeps generating while another slot's prompt is processed.  "
++                      "One memory object, two contexts; nothing is copied between them (default: %s)",
++                      params.prefill_decode_arms_mode != COMMON_ARMS_OFF ? "enabled" : "disabled"),
++        [](common_params & params, bool value) {
++            params.prefill_decode_arms_mode = value ? COMMON_ARMS_ON : COMMON_ARMS_OFF;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_DECODE_ARMS"));
++    add_opt(common_arg(
++        {"--prefill-decode-arms-mode"}, "MODE",
++        string_format("off | on | auto (default: %s).  on: refuse to start when the shape cannot carry a pair "
++                      "(`common_arms_pair_possible()` names the reason); auto: fall back to the single-context "
++                      "server with that warning; off: never create the second context",
++                      params.prefill_decode_arms_mode == COMMON_ARMS_ON    ? "on"   :
++                      params.prefill_decode_arms_mode == COMMON_ARMS_AUTO  ? "auto" : "off"),
++        [](common_params & params, const std::string & value) {
++            if (value == "off") {
++                params.prefill_decode_arms_mode = COMMON_ARMS_OFF;
++            } else if (value == "on") {
++                params.prefill_decode_arms_mode = COMMON_ARMS_ON;
++            } else if (value == "auto") {
++                params.prefill_decode_arms_mode = COMMON_ARMS_AUTO;
++            } else {
++                throw std::invalid_argument("invalid value for --prefill-decode-arms-mode: '" + value +
++                        "' (off | on | auto)");
++            }
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_DECODE_ARMS_MODE"));
+     add_opt(common_arg(
+         {"--simple-io"},
+         "use basic IO for better compatibility in subprocesses and limited consoles",
+diff --git a/common/common.cpp b/common/common.cpp
+index 3a08ee05c..21222ed53 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2226,6 +2226,43 @@ struct llama_model * common_model_load(const std::vector<std::string> & paths, c
+     return llama_model_load_from_splits(c_paths.data(), c_paths.size(), mparams);
+ }
+ 
++// Is the TWO-ARM pair possible for this configuration?  ONE function, called by the reserve derivation and by
++// the server, so a charge and a creation cannot disagree (DESIGN.md V2).  Pure: no I/O, no allocation.
++const char * common_arms_pair_possible(const common_params & params) {
++    if (params.n_parallel < 2) {
++        return "it needs at least 2 slots (--parallel >= 2): the feature is a reply that keeps generating "
++               "while ANOTHER slot's prompt is processed";
++    }
++    // note: `mmproj_use_gpu` is a POLICY flag (default on) and says nothing about whether a projector
++    // is loaded -- only the path does
++    if (!params.mmproj.path.empty()) {
++        return "multimodal input (an mmproj) drives its own encoder pipeline, which is bound to one context";
++    }
++    if (params.embedding) {
++        return "embeddings/rerank/decision requests produce no decoded tokens to hand to a second arm";
++    }
++    if (!params.lora_adapters.empty()) {
++        return "LoRA adapters are applied per context (common_set_adapter_lora), and the two arms would "
++               "never agree on which are active";
++    }
++    if (params.sampling.backend_sampling) {
++        return "backend sampling keeps its sampler chain inside one context";
++    }
++    if (params.sleep_idle_seconds > 0) {
++        return "--sleep-idle unloads the model, which would tear the pair's SHARED memory down under the "
++               "other arm";
++    }
++    // the speculator: STEP 7 refuses it on the pair until the decode arm's draft/verify round is admitted
++    // (STEP 10).  A drafter whose TARGET side is bound to one context -- the layer-input families and a
++    // gemma4 assistant that shares the target's KV -- stays refused even then.
++    if (params.speculative.has_aux()) {
++        return "a speculator's draft/verify round is not admitted on the pair yet (--spec-type none); the "
++               "layer-input families and a gemma4 assistant are refused permanently because they assume "
++               "they are the only other user of their target context";
++    }
++    return nullptr;
++}
++
+ struct llama_context_params common_context_params_to_llama(const common_params & params) {
+     auto cparams = llama_context_default_params();
+ 
+diff --git a/common/common.h b/common/common.h
+index 727840f63..4492fa67b 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -523,6 +523,13 @@ struct lr_opt {
+ 
+ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
+ 
++// how the two-arm server was asked for (`--prefill-decode-arms-mode`; `--prefill-decode-arms` is `on`)
++enum common_arms_mode {
++    COMMON_ARMS_OFF = 0,  // the single-context server, exactly as before
++    COMMON_ARMS_ON,       // refuse to start when the pair cannot be built
++    COMMON_ARMS_AUTO,     // fall back to single-context with a warning
++};
++
+ struct common_params {
+     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
+     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
+@@ -796,6 +803,13 @@ struct common_params {
+     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
+     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
+ 
++    // --prefill-decode-arms / --prefill-decode-arms-mode: the TWO-ARM server.  A second llama_context (the
++    // decode arm) BORROWS the first one's llama_memory (`llama_context_params::ctx_memory`), so a reply keeps
++    // generating while another slot's prompt is being processed.  One memory object, two contexts; nothing is
++    // copied between them.  DEFAULT OFF: the single-context server is unchanged, and `auto` falls back with a
++    // warning when the shape cannot carry a pair (`common_arms_pair_possible()`).
++    common_arms_mode prefill_decode_arms_mode = COMMON_ARMS_OFF;
++
+     std::vector<std::string> api_keys;
+ 
+     std::string ssl_file_key  = "";                                                                         // NOLINT
+@@ -1186,6 +1200,20 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
+ struct llama_model_params   common_model_params_to_llama  (      common_params & params);
+ struct llama_context_params common_context_params_to_llama(const common_params & params);
+ 
++// May this configuration carry the TWO-ARM pair (a prefill arm and a decode arm on ONE llama_memory)?
++//
++// PURE: no I/O, no state change, no allocation, so the reservation derivation and the server call the SAME
++// function and cannot disagree -- a pair that is refused after the reserve was charged leaves the MoE arena
++// several GiB smaller for a context that is never created (defect V2 of DESIGN.md).
++//
++// Returns nullptr when the pair is possible, else a one-line REASON suitable for the log.  The refusals are
++// properties of the SHAPE (they do not depend on the request): a second context with its own batch, ubatch,
++// scheduler and compute buffers cannot serve a multimodal input pipeline, a TTS/realtime loop, an
++// embedding/rerank/decision request, a LoRA stack, the idle-sleep state machine or a backend sampler, and a
++// drafter whose TARGET side is bound to one context (the layer-input families, and a gemma4 assistant that
++// shares the target's KV) assumes it is the only other user of that context.
++const char * common_arms_pair_possible(const common_params & params);
++
+ // apply --fit to mparams and cparams, no-op if params.fit_params is false
+ void common_fit_apply(common_params & params, struct llama_model_params & mparams, struct llama_context_params & cparams);
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 60d3feec3..1afffb178 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1133,6 +1133,14 @@ private:
+ 
+     llama_context * ctx_tgt = nullptr;
+ 
++    // The DECODE arm (--prefill-decode-arms): a second context of the SAME model that BORROWS ctx_tgt's
++    // llama_memory (`llama_context_params::ctx_memory`).  One memory object, two contexts: the KV, the
++    // recurrent state and the indexer cache are literally the same objects, so nothing is copied between the
++    // arms at any request boundary.  Everything above the memory is per context (batch, ubatch, scheduler,
++    // compute buffers, logits, sampler).  Owned here and freed BEFORE `llama_init` (which owns ctx_tgt): the
++    // borrower must not outlive the owner (I1/I2).
++    llama_context * ctx_dec = nullptr;
++
+     server_batch batch;
+ 
+     llama_model   * model_dft = nullptr;
+@@ -1433,6 +1441,13 @@ private:
+         ctx_dft   = nullptr;
+         model_dft = nullptr;
+ 
++        // the decode arm BORROWS ctx_tgt's memory, so it must go first (I2: the owner frees the memory, and
++        // the owner's context must outlive the borrower's)
++        if (ctx_dec != nullptr) {
++            llama_free(ctx_dec);
++            ctx_dec = nullptr;
++        }
++
+         llama_init.reset();
+ 
+         ctx_tgt = nullptr;
+@@ -1639,6 +1654,55 @@ private:
+ 
+         vocab = llama_model_get_vocab(model_tgt);
+ 
++        // ---- the two-arm server (--prefill-decode-arms) ------------------------------------------------
++        // ONE predicate decides, and the reserve derivation calls the same one (common_arms_pair_possible()):
++        // a pair that is refused AFTER the arena was charged leaves it several GiB smaller for a context that
++        // is never created (DESIGN.md V2).  `on` refuses to start; `auto` falls back with the same reason.
++        if (params_base.prefill_decode_arms_mode != COMMON_ARMS_OFF) {
++            const char * why = common_arms_pair_possible(params_base);
++            if (why != nullptr) {
++                if (params_base.prefill_decode_arms_mode == COMMON_ARMS_ON) {
++                    SRV_ERR("%s: cannot run the two-arm server: %s\n", __func__, why);
++                    return false;
++                }
++                SRV_WRN("%s: the two-arm server falls back to the single-context server: %s\n", __func__, why);
++            } else {
++                auto cparams_dec = common_context_params_to_llama(params_base);
++
++                // the decode arm is ROW-count optimised, not width optimised: one row per slot it owns, and
++                // (with a speculator admitted, STEP 10) n_max + 1 rows per slot for its verify batch.  A
++                // speculator is REFUSED on the pair until then, so n_spec_max is 0 today.
++                const int32_t n_spec_max = common_speculative_n_max(&params_base.speculative);
++                cparams_dec.n_batch  = params_base.n_parallel * std::max(1, n_spec_max + 1);
++                cparams_dec.n_ubatch = cparams_dec.n_batch;
++                cparams_dec.n_outputs_max         = std::max(cparams_dec.n_outputs_max, (uint32_t) cparams_dec.n_batch);
++                cparams_dec.n_outputs_max_per_seq = std::max(cparams_dec.n_outputs_max_per_seq,
++                                                              (uint32_t) std::max(1, n_spec_max + 1));
++                cparams_dec.embeddings = false;
++                // THE BORROW: the only relationship the pair needs.  No ctx_other (I8): that field already
++                // means MTP draft target / assistant view / token_embd donor, each of which keeps its OWN
++                // memory.  This context gets no memory of its own and never frees the borrowed one.
++                cparams_dec.ctx_memory = ctx_tgt;
++
++                ctx_dec = llama_init_from_model(model_tgt, cparams_dec);
++                if (ctx_dec == nullptr) {
++                    SRV_ERR("%s: failed to create the decode arm's context\n", __func__);
++                    return false;
++                }
++                if (llama_get_memory(ctx_dec) != llama_get_memory(ctx_tgt)) {
++                    // I1: the borrower must hold the OWNER'S memory object, not a copy or a view
++                    SRV_ERR("%s: the decode arm did not get the prefill arm's memory (%p != %p)\n", __func__,
++                            (void *) llama_get_memory(ctx_dec), (void *) llama_get_memory(ctx_tgt));
++                    return false;
++                }
++                SRV_INF("%s: two-arm server: prefill arm %p with n_batch/n_ubatch %d/%d, decode arm %p with "
++                        "%d/%d; ONE memory %p (the decode arm borrows it, nothing is copied)\n",
++                        __func__, (void *) ctx_tgt, llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt),
++                        (void *) ctx_dec, llama_n_batch(ctx_dec), llama_n_ubatch(ctx_dec),
++                        (void *) llama_get_memory(ctx_tgt));
++            }
++        }
++
+         try {
+             decision.init(model_tgt);
+         } catch (const std::exception & e) {

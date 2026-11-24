@@ -108,6 +108,7 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 LLAMA_CLI="${LLAMA_CLI:-$HOME/llama.cpp/build-rocm/bin/llama-cli}"
 MODEL="${MODEL:-/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf}"
 MODEL_RAM="${MODEL_RAM:-/llm/models/Qwen3.5/122B-A10B/Q8_0/Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf}"
@@ -142,7 +143,7 @@ done
 case "$AS_KB" in ''|*[!0-9]*) echo "ERROR: AS_KB must be '0' or a number of KiB" >&2; exit 2 ;; esac
 
 GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
-export LD_LIBRARY_PATH="/opt/rocm-10.1.0-gfx1151/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$(rocm_ld_library_path)"
 
 # The ANCHOR: which binary this run certifies.  A census assertion cannot fail on a stale build -- it reads a
 # run that predates the print it asserts and reports it as a mechanism defect -- so the binary names itself.

@@ -1,0 +1,679 @@
+diff --git a/ggml/src/ggml-cuda/batch-copy.cu b/ggml/src/ggml-cuda/batch-copy.cu
+index 920b2b15d..6c1ad25e5 100644
+--- a/ggml/src/ggml-cuda/batch-copy.cu
++++ b/ggml/src/ggml-cuda/batch-copy.cu
+@@ -183,12 +183,12 @@ static bool ggml_cuda_copy_tensor_n(int device, cudaMemcpyKind direction,
+             const size_t blocks_per_copy = std::min<size_t>(UINT16_MAX, std::max<size_t>(1, (nsm + n_batch - 1) / n_batch));
+             const dim3 blocks((unsigned int) n_batch, (unsigned int) blocks_per_copy);
+             // Stream ordering keeps each kernel ahead of the next descriptor overwrite.
+-            CUDA_CHECK(cudaMemcpyAsync(device_copies, copies, n_batch * sizeof(copies[0]), cudaMemcpyHostToDevice, cudaStreamPerThread));
+-            ggml_cuda_batch_copy_kernel<<<blocks, threads, 0, cudaStreamPerThread>>>(device_copies, n_batch);
++            CUDA_CHECK(cudaMemcpyAsync(device_copies, copies, n_batch * sizeof(copies[0]), cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
++            ggml_cuda_batch_copy_kernel<<<blocks, threads, 0, ggml_cuda_host_stream()>>>(device_copies, n_batch);
+             CUDA_CHECK(cudaGetLastError());
+             if (first + n_batch < n_reads_kernel) {
+                 // Wait before refilling the pinned host descriptor buffer.
+-                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++                CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+             }
+         }
+     }
+@@ -197,11 +197,11 @@ static bool ggml_cuda_copy_tensor_n(int device, cudaMemcpyKind direction,
+         if (sizes[i] && (!n_reads_kernel || sizes[i] > max_kernel_read_bytes)) {
+             void * host = const_cast<void *>(data[i]);
+             void * tensor = (char *) tensors[i]->data + offsets[i];
+-            CUDA_CHECK(cudaMemcpyAsync(to_host ? host : tensor, to_host ? tensor : host, sizes[i], direction, cudaStreamPerThread));
++            CUDA_CHECK(cudaMemcpyAsync(to_host ? host : tensor, to_host ? tensor : host, sizes[i], direction, ggml_cuda_host_stream()));
+         }
+     }
+     // Wait for transfers before releasing the CPU mapping and descriptor buffers.
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+     return true;
+ #endif
+ }
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index f7d49b8dc..49d113e9e 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1515,6 +1515,14 @@ const ggml_cuda_device_info & ggml_cuda_info();
+ void ggml_cuda_set_device(int device);
+ int ggml_cuda_get_device();
+ 
++// The stream every SYNCHRONOUS host <-> device path in this backend issues on: a private non-blocking stream per
++// (thread, device), NOT `cudaStreamPerThread` (HIP maps that sentinel onto the legacy default stream, which a
++// graph capture claims, so a second context's host copy is refused and the device is then poisoned -- see the
++// definition in ggml-cuda.cu).  Resolves against the CURRENT device, like the sentinel it replaces, and every
++// caller synchronises, so the choice carries no ordering.  Also used by batch-copy.cu's multi-tensor host paths,
++// which the same callers reach.
++cudaStream_t ggml_cuda_host_stream();
++
+ bool ggml_cuda_pool_debug_enabled();
+ 
+ // Incremented whenever memory that captured graphs may reference is returned to the driver: the pools'
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index 01087b511..f2ec2d8e6 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -84,7 +84,7 @@ static bool ggml_cuda_vmm_map_phys(int device, CUdeviceptr addr, size_t aligned,
+     // second and third ~29 GiB slab (no free VRAM left in the peers for the driver to build a 29 GiB peer
+     // mapping), the owner-only retry papered over it, and every peer copy into those slabs then either
+     // returned `invalid argument` or faulted the GPU.  A refused peer keeps owner access only, and copies
+-    // between those devices stage through host memory (see `ggml_cuda_slab_peer_copy_ok`).
++    // between those devices stage through host memory (see `ggml_cuda_peer_copy_ok`).
+     if (cuMemSetAccess(addr, aligned, &access.front(), 1) != cudaSuccess) {
+         (void) cudaGetLastError();
+         (void) cuMemUnmap(addr, aligned);
+@@ -232,7 +232,7 @@ struct ggml_cuda_slab {
+     // grant is best effort: with three ~29 GiB slabs there is no free VRAM left in the peers for the driver
+     // to grant a range that large, and `cuMemSetAccess` refuses it.  A peer copy into a range that was NOT
+     // granted FAULTS the GPU (`HSA_STATUS_ERROR_MEMORY_FAULT`, `__amd_rocclr_copyBuffer`, "Page not
+-    // present"), it does not return an error, so every cross-device copy asks `ggml_cuda_slab_peer_copy_ok`
++    // present"), it does not return an error, so every cross-device copy asks `ggml_cuda_peer_copy_ok`
+     // first and stages through pinned host memory when the grants are incomplete.
+     uint32_t                 peer_mask     = 0;
+     std::map<size_t, size_t> arena_free;        // arena free runs: offset -> size (chunk-aligned)
+@@ -669,10 +669,16 @@ bool ggml_cuda_slab_active(int device) {
+ // a copy fails while ANY live slab's grants are incomplete -- even between two fully granted devices.  A
+ // destination outside every slab is always fine (plain memory peer copies stage inside the driver).
+ // false => stage the copy through pinned host memory.
+-bool ggml_cuda_slab_peer_copy_ok(const void * dst, size_t nbytes) {
++bool ggml_cuda_peer_copy_ok(const void * dst, size_t nbytes) {
+     if (dst == nullptr || nbytes == 0) {
+         return true;
+     }
++    // The VMM POOL is the second user of the same grant machinery (a per-context allocation pool is not part of a
++    // slab), so its ranges answer too and both answers are required: a pool destination that the pool half refuses
++    // must stage, even though no slab contains it.
++    if (!ggml_cuda_pool_peer_copy_ok(dst, nbytes)) {
++        return false;
++    }
+     std::lock_guard<std::mutex> lock(g_slab_mutex);
+     int      n_live  = 0;
+     uint32_t pending = 0;                         // device ids that have a live slab
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm.h b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+index 7570a3b06..d66ddd3ac 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm.h
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+@@ -26,13 +26,21 @@ bool   ggml_cuda_slab_configured();
+ // Is the slab live on THIS device?  (The gate can be on while a device failed to create one.)  Used to
+ // keep the generic OOM path from churning the arena, which cannot help under the slab.
+ bool   ggml_cuda_slab_active    (int device);
+-// May `[dst, dst+nbytes)` be the destination of a raw cross-device peer copy?  A peer copy into a slab range
+-// the driver's grants do not cover FAULTS the GPU instead of returning an error (the grant is best effort:
+-// three ~29 GiB slabs leave the peers no free VRAM to build it), and the slab check is process-wide because
+-// a copy fails while ANY live slab's grants are incomplete -- even between two fully granted devices.  A
+-// destination outside every slab is always fine (plain memory peer copies stage inside the driver).
++// May `[dst, dst+nbytes)` be the destination of a raw cross-device peer copy?  A peer copy into a SLAB or POOL
++// range the driver's grants do not cover FAULTS the GPU instead of returning an error (the grant is best effort:
++// three ~29 GiB slabs leave the peers no free VRAM to build it), and the check is process-wide because a copy
++// fails while ANY live range's grants are incomplete -- even between two fully granted devices.  A destination
++// outside every slab and every pool is always fine (plain memory peer copies stage inside the driver).
++// Covers BOTH VMM users: the movable-boundary slab (ggml-cuda-slab.cu) and the per-context allocation pool
++// (ggml-cuda.cu -- a second context owns a pool of its own and grants peers best effort, exactly like the slab).
+ // false => stage the copy through pinned host memory.
+-bool   ggml_cuda_slab_peer_copy_ok(const void * dst, size_t nbytes);
++bool   ggml_cuda_peer_copy_ok(const void * dst, size_t nbytes);
++// The pool half of `ggml_cuda_peer_copy_ok`, implemented in ggml-cuda.cu where the pool lives.  Defined
++// UNCONDITIONALLY: a `GGML_HIP_NO_VMM=ON` / `GGML_CUDA_NO_VMM=ON` build has no pool, so no pool range can hold a
++// peer-copy destination and the answer is `true` -- and the caller (ggml-cuda-slab.cu) is compiled in that build,
++// so a definition behind `#if defined(GGML_USE_VMM)` leaves a shared library that links (a `.so` may carry
++// undefined symbols) and breaks every executable that links it (issue #353).
++bool   ggml_cuda_pool_peer_copy_ok(const void * dst, size_t nbytes);
+ // The slab declined because `work estimate + cache floor` does not fit.  The expert cache must then stream
+ // the experts from the host instead of building an arena a wide prefill would have to evict wholesale.
+ bool   ggml_cuda_slab_cache_unusable(int device);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a8241b6c9..65c35a084 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -181,6 +181,40 @@ int ggml_cuda_get_device() {
+     return id;
+ }
+ 
++// The stream the SYNCHRONOUS host <-> device paths issue on (set_tensor/get_tensor in all their forms, memset,
++// clear, the bounce and peer-staging copies, the KV-region row moves, the async-input ring).
++//
++// WHY IT IS NOT `cudaStreamPerThread`: HIP resolves that sentinel to the LEGACY DEFAULT stream of the current
++// device, and a graph capture claims the default stream.  A host copy issued by a thread other than the one
++// capturing -- i.e. by a second context -- is then refused with `operation not permitted when stream is
++// capturing`, and every later launch on the device fails with `operation failed due to a previous error during
++// capture`.  One context alone never hits it: only the context that is capturing issues host copies, and the
++// capture path does not upload.  A private non-blocking stream per (thread, device) is invisible to another
++// thread's capture, and it also stops two contexts serialising each other's uploads.
++//
++// SEMANTICS: identical to the sentinel in the one respect that matters -- it resolves against the CURRENT device,
++// exactly as `cudaStreamPerThread` did, so a caller that has not selected its device was already issuing the copy
++// on the wrong device.  Every caller below SYNCHRONISES before returning, so the stream choice carries no
++// ordering of its own; it only decides WHO is allowed to issue the copy.
++//
++// A failure to create the stream returns `cudaStreamPerThread` DIRECTLY and caches that decision: it is not a
++// transient error, retrying it on every host copy would cost more than the stream it replaces, and recursing
++// back into this function would overflow the stack.
++cudaStream_t ggml_cuda_host_stream() {
++    static thread_local cudaStream_t streams[GGML_CUDA_MAX_DEVICES] = {};
++    const int device = ggml_cuda_get_device();
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return cudaStreamPerThread;
++    }
++    if (streams[device] == nullptr) {
++        if (cudaStreamCreateWithFlags(&streams[device], cudaStreamNonBlocking) != cudaSuccess) {
++            (void) cudaGetLastError();
++            streams[device] = cudaStreamPerThread;
++        }
++    }
++    return streams[device];
++}
++
+ static bool ggml_cuda_env_flag(const char * name) {
+     const char * env = getenv(name);
+     return env != nullptr && std::atoi(env) != 0;
+@@ -1318,6 +1352,86 @@ static ggml_cuda_pool_trace_map & ggml_cuda_pool_trace() {
+     return t;
+ }
+ 
++//
++// The VMM POOL's peer-access grants, and the query the cross-device copy paths use.
++//
++// A pool mapping is granted READWRITE to its own device and, BEST EFFORT, to every peer -- the same rule the
++// movable-boundary slab already follows (`ggml_cuda_vmm_map_phys` in ggml-cuda-slab.cu), for the same measured
++// reason: when the MoE arena has taken nearly all of the VRAM the driver can refuse to build a peer mapping and
++// `cuMemSetAccess` returns `invalid argument`.  The slab learned this the hard way -- granting every descriptor in
++// ONE call means a single refused peer poisons the whole grant -- so the rule there is: grant the owner alone, then
++// each peer on its own, keep the mask of what was actually granted, and let the copy path STAGE the pairs the
++// driver refused.  The pool did none of that: it granted all descriptors in one `CU_CHECK`ed call, so a refused
++// grant ABORTED the process.  That is unreachable with one context (a context's pools are created and grown during
++// load and the first reserve, before the arena fills) and reachable as soon as a SECOND context exists: its pools
++// grow at request time, when the arena is full -- measured as `HipVMM Failure: invalid argument` in `alloc()`
++// called from a matmul kernel, ~2 s into the first request, only with the arena on and only with two contexts.
++//
++// The registry below lets `ggml_cuda_peer_copy_ok()` answer for pool destinations exactly as it does for slabs.
++struct ggml_cuda_pool_peer_range {
++    const void * pool;
++    uintptr_t    base;
++    size_t       size;
++    uint32_t     mask;   // physical devices that hold READWRITE on this range
++};
++
++static std::mutex                             g_pool_peer_mutex;
++static std::vector<ggml_cuda_pool_peer_range> g_pool_peer_ranges;
++
++// Register (or update) one pool's range and grant mask.
++static void ggml_cuda_pool_peer_register(const void * pool, uintptr_t base, size_t size, uint32_t mask) {
++    std::lock_guard<std::mutex> lock(g_pool_peer_mutex);
++    for (auto & r : g_pool_peer_ranges) {
++        if (r.pool == pool) {
++            r.base = base;
++            r.size = size;
++            r.mask = mask;
++            return;
++        }
++    }
++    g_pool_peer_ranges.push_back({ pool, base, size, mask });
++}
++
++static void ggml_cuda_pool_peer_unregister(const void * pool) {
++    std::lock_guard<std::mutex> lock(g_pool_peer_mutex);
++    for (size_t i = 0; i < g_pool_peer_ranges.size(); i++) {
++        if (g_pool_peer_ranges[i].pool == pool) {
++            g_pool_peer_ranges.erase(g_pool_peer_ranges.begin() + (ptrdiff_t) i);
++            return;
++        }
++    }
++}
++
++// Pool destinations: process-wide and pessimistic, like the slab's answer -- a peer copy fails while ANY live
++// range's grants are incomplete, so every live pool's mask is intersected.  A wrong "yes" faults the GPU and
++// nothing can catch that.
++bool ggml_cuda_pool_peer_copy_ok(const void * dst, size_t nbytes) {
++    if (dst == nullptr || nbytes == 0) {
++        return true;
++    }
++    std::lock_guard<std::mutex> lock(g_pool_peer_mutex);
++    uint32_t pending = 0;
++    uint32_t common  = ~0u;
++    bool     in_pool = false;
++    const uintptr_t lo = (uintptr_t) dst;
++    const uintptr_t hi = lo + nbytes - 1;
++    for (const auto & r : g_pool_peer_ranges) {
++        if (r.base == 0 || r.size == 0) {
++            continue;
++        }
++        pending |= r.mask;
++        common  &= r.mask;
++        if (hi >= r.base && lo <= r.base + r.size - 1) {
++            in_pool = true;
++        }
++    }
++    if (!in_pool) {
++        // outside every pool: nothing here can fault, the slab (or the driver) decides
++        return true;
++    }
++    return (common & pending) == pending;
++}
++
+ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+     static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
+ 
+@@ -1330,6 +1444,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+ #if defined(GGML_USE_HIP)
+     std::vector<std::pair<CUdeviceptr, size_t>> mappings;
+ #endif
++    // Intersection of every peer grant this pool has made (one bit per PHYSICAL device).  A refused peer keeps
++    // owner access only, and the mask drops that device, so the copy path stages the copies that pair cannot make
++    // (see the registry above).
++    uint32_t peer_mask = ~0u;
+ 
+     explicit ggml_cuda_pool_vmm(int device) :
+         device(device),
+@@ -1338,6 +1456,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+     }
+ 
+     ~ggml_cuda_pool_vmm() {
++        ggml_cuda_pool_peer_unregister(this);
+         if (pool_addr != 0) {
+             if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
+                 g_pool_mapped[device].fetch_sub(pool_size, std::memory_order_relaxed);
+@@ -1426,16 +1545,60 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+                     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                     access_descs.push_back(access);
+                 }
+-                CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, access_descs.data(), access_descs.size()));
++                // Grant the OWNER first, then each peer ON ITS OWN -- the slab's rule, for the reason the slab
++                // records: one refused peer descriptor poisons a single all-descriptors call, which used to read as
++                // "the pool is broken" (a process abort) and now reads as "stage the copies between these two
++                // devices".  A refused peer keeps owner access only and the mask drops that device.
++                {
++                    GGML_ASSERT(!access_descs.empty());
++                    // The OWNER's descriptor is located explicitly: the list is in device order, so for device 1 or 2
++                    // the owner is NOT at the front (a peer is), and granting "the front" would grant -- and
++                    // CU_CHECK -- a peer, which is the very abort this replaces.
++                    size_t i_own = access_descs.size();
++                    for (size_t i = 0; i < access_descs.size(); i++) {
++                        if ((int) access_descs[i].location.id == physical_device) {
++                            i_own = i;
++                            break;
++                        }
++                    }
++                    GGML_ASSERT(i_own < access_descs.size());   // the owner is always in its own list
++                    // owner access is not optional: a range nobody may write is not a range we can serve
++                    CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, &access_descs[i_own], 1));
++                    uint32_t granted = 1u << (uint32_t) physical_device;
++                    for (size_t i = 0; i < access_descs.size(); i++) {
++                        if (i == i_own) {
++                            continue;
++                        }
++                        if (cuMemSetAccess(start_ptr, reserve_size, &access_descs[i], 1) != cudaSuccess) {
++                            (void) cudaGetLastError();
++                            static std::set<std::pair<int, int>> warned;
++                            const int peer_phys = (int) access_descs[i].location.id;
++                            if (warned.insert({ device, peer_phys }).second) {
++                                GGML_LOG_WARN("%s: device %d: peer access to a %.1f MiB pool mapping on physical "
++                                        "device %d was refused (the arena has taken the VRAM), so copies between that "
++                                        "pair stage through host memory; the grant stays best effort, exactly as for "
++                                        "the slab\n",
++                                        __func__, device, (double) reserve_size / 1048576.0, peer_phys);
++                            }
++                            continue;
++                        }
++                        granted |= 1u << (uint32_t) access_descs[i].location.id;
++                    }
++                    peer_mask &= granted;
++                }
+             } else {
+-                // set access for non P2P
++                // set access for non P2P: owner only, so no peer may target this range (see the registry above)
+                 CUmemAccessDesc access = {};
+                 access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                 access.location.id = physical_device;
+                 access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                 CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, &access, 1));
++                peer_mask &= 1u << (uint32_t) physical_device;
+             }
+ 
++            // register what was actually granted, before the range becomes allocatable
++            ggml_cuda_pool_peer_register(this, (uintptr_t) pool_addr, pool_size + reserve_size, peer_mask);
++
+             // add to the pool
+             pool_size += reserve_size;
+             if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
+@@ -1521,6 +1684,20 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+     }
+ };
++#else
++// Without VMM there is no VMM pool, so no pool range can hold a peer-copy destination and the pool half of
++// ggml_cuda_peer_copy_ok() (ggml-cuda-slab.cu, compiled on EVERY backend) always answers "fine" -- the same
++// answer the slab gives for a destination outside every range.  The definition must exist UNCONDITIONALLY,
++// because its caller is compiled in this configuration too: with it inside `#if defined(GGML_USE_VMM)`,
++// `libggml-hip.so` still links (an undefined symbol is allowed in a shared object) and every executable that
++// links it fails with `undefined reference to ggml_cuda_pool_peer_copy_ok`.  Which linker refuses differs --
++// GNU ld.bfd checks a shared object's undefined symbols, lld does not -- so a green build on one box is not
++// evidence (issue #353).
++bool ggml_cuda_pool_peer_copy_ok(const void * dst, size_t nbytes) {
++    GGML_UNUSED(dst);
++    GGML_UNUSED(nbytes);
++    return true;
++}
+ #endif // defined(GGML_USE_VMM)
+ 
+ // Debug pool for NVIDIA compute-sanitizer, e.g.
+@@ -1885,8 +2062,8 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
+ 
+         if (padded_size > original_size) {
+             ggml_cuda_set_device(ctx->device);
+-            CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + original_size, 0, padded_size - original_size, cudaStreamPerThread));
+-            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++            CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + original_size, 0, padded_size - original_size, ggml_cuda_host_stream()));
++            CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+         }
+     }
+     return GGML_STATUS_SUCCESS;
+@@ -1897,8 +2074,8 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+ 
+     ggml_cuda_set_device(ctx->device);
+     ggml_cuda_async_input_drain(ctx->device);
+-    CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, ggml_cuda_host_stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ // GGML_CUDA_ASYNC_INPUT=1: graph inputs (small host -> device writes into a compute buffer) are staged through a
+@@ -2039,7 +2216,7 @@ static ggml_cuda_async_input_origin & ggml_cuda_async_input_origin_locked(ggml_c
+     auto it = d.origins.find(key);
+     if (it == d.origins.end()) {
+         it = d.origins.emplace(key, ggml_cuda_async_input_origin()).first;
+-        it->second.stream = cudaStreamPerThread;
++        it->second.stream = ggml_cuda_host_stream();
+         if (g_async_input_dbg) {
+             fprintf(stderr, "AIN origin: dev=%d key=%llx thread=%llx origins=%zu\n", device,
+                     ggml_cuda_ain_tid(key), ggml_cuda_ain_tid(std::this_thread::get_id()), d.origins.size());
+@@ -2198,7 +2375,24 @@ static bool ggml_cuda_async_input_set(int device, void * dst, const void * src,
+                 ggml_cuda_async_input_drain_locked(d, e);
+             }
+         }
+-        CUDA_CHECK(cudaDeviceSynchronize());
++        // Wait on the ORIGINS' own streams, never the whole device.  The ring bytes can only be read by an
++        // origin's own uploads -- its `ev`/`flush_ev` are recorded on its stream -- so synchronising each
++        // origin's stream is exactly the guarantee the wrap needs, and unlike `cudaDeviceSynchronize()` it is not
++        // a device-wide barrier: it does not also wait for this or another context's graph compute, and it is not
++        // ILLEGAL while another thread has a capture in flight (which a host-side device sync is).  If even the
++        // per-origin wait is refused, clear the error and report "not staged": the caller then uploads this copy
++        // synchronously (on the same stream, so the ordering still holds), and a later wrap, after the capture
++        // ends, resets the ring.
++        for (auto & kv : d.origins) {
++            ggml_cuda_async_input_origin & e = kv.second;
++            if (e.stream == nullptr) {
++                continue;
++            }
++            if (cudaStreamSynchronize(e.stream) != cudaSuccess) {
++                (void) cudaGetLastError();
++                return false;
++            }
++        }
+         for (auto & kv : d.origins) {
+             kv.second.pending   = false;
+             kv.second.has_flush = false;
+@@ -2416,13 +2610,13 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
+         for (size_t done = 0; done < size; done += ggml_cuda_pin_chunk_bytes) {
+             const size_t n = std::min(ggml_cuda_pin_chunk_bytes, size - done);
+             memcpy(pin, (const char *) data + done, n);
+-            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset + done, pin, n, cudaMemcpyHostToDevice, cudaStreamPerThread));
+-            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset + done, pin, n, cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
++            CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+         }
+         return;
+     }
+-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+@@ -2437,14 +2631,14 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
+         (pin = ggml_cuda_pin_chunk(ctx->device, lock)) != nullptr) {
+         for (size_t done = 0; done < size; done += ggml_cuda_pin_chunk_bytes) {
+             const size_t n = std::min(ggml_cuda_pin_chunk_bytes, size - done);
+-            CUDA_CHECK(cudaMemcpyAsync(pin, (const char *) tensor->data + offset + done, n, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++            CUDA_CHECK(cudaMemcpyAsync(pin, (const char *) tensor->data + offset + done, n, cudaMemcpyDeviceToHost, ggml_cuda_host_stream()));
++            CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+             memcpy((char *) data + done, pin, n);
+         }
+         return;
+     }
+-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, ggml_cuda_host_stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ // Load-path 2-D staging: a grow-only pinned buffer per device, reused across the tensors of a model
+@@ -2514,20 +2708,20 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
+             for (size_t e = 0; e < n_copies; ++e) {
+                 memcpy((char *) pin + e * size, (const char *) data + e * stride_data, size);
+             }
+-            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, pin, compact, cudaMemcpyHostToDevice, cudaStreamPerThread));
++            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, pin, compact, cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
+         } else {
+             memcpy(pin, data, full);
+             CUDA_CHECK(cudaMemcpy2DAsync((char *) tensor->data + offset, stride_tensor, pin, stride_data, size, n_copies,
+-                    cudaMemcpyHostToDevice, cudaStreamPerThread));
++                    cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
+         }
+-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++        CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+         if (one_shot) {
+             CUDA_CHECK(cudaFreeHost(pin));   // a cached staging buffer is kept for the next tensor
+         }
+         return;
+     }
+-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
+@@ -2547,8 +2741,8 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
+         for (size_t e0 = 0; e0 < n_copies; e0 += rows) {
+             const size_t n = std::min(rows, n_copies - e0);
+             CUDA_CHECK(cudaMemcpy2DAsync(pin, size, (const char *) tensor->data + offset + e0 * stride_tensor, stride_tensor,
+-                    size, n, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++                    size, n, cudaMemcpyDeviceToHost, ggml_cuda_host_stream()));
++            CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+             for (size_t e = 0; e < n; ++e) {
+                 memcpy((char *) data + (e0 + e) * stride_data, pin + e * size, size);
+             }
+@@ -2556,8 +2750,8 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
+         return;
+     }
+     CUDA_CHECK(cudaMemcpy2DAsync(
+-        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, ggml_cuda_host_stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer, struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+@@ -2579,10 +2773,10 @@ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer,
+             data[i],
+             sizes[i],
+             cudaMemcpyHostToDevice,
+-            cudaStreamPerThread));
++            ggml_cuda_host_stream()));
+     }
+ 
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ static void ggml_backend_cuda_buffer_get_tensor_n(ggml_backend_buffer_t buffer, const struct ggml_tensor * const * tensors, void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+@@ -2604,10 +2798,10 @@ static void ggml_backend_cuda_buffer_get_tensor_n(ggml_backend_buffer_t buffer,
+             (const char *) tensors[i]->data + offsets[i],
+             sizes[i],
+             cudaMemcpyDeviceToHost,
+-            cudaStreamPerThread));
++            ggml_cuda_host_stream()));
+     }
+ 
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ // defined further down: the staged (pinned host bounce) cross-device copy, used for the slab peer pairs the
+@@ -2628,21 +2822,21 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
+         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
+         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
+         if (src_physical == dst_physical) {
+-            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
++            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, ggml_cuda_host_stream()));
+         } else {
+ #ifdef GGML_CUDA_NO_PEER_COPY
+             return false;
+ #else
+-            if (!ggml_cuda_slab_peer_copy_ok(dst->data, ggml_nbytes(src))) {
+-                ggml_cuda_peer_copy_staged(src_ctx->device, cudaStreamPerThread,
+-                                           dst_ctx->device, cudaStreamPerThread,
++            if (!ggml_cuda_peer_copy_ok(dst->data, ggml_nbytes(src))) {
++                ggml_cuda_peer_copy_staged(src_ctx->device, ggml_cuda_host_stream(),
++                                           dst_ctx->device, ggml_cuda_host_stream(),
+                                            dst->data, src->data, ggml_nbytes(src));
+             } else {
+-                CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
++                CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), ggml_cuda_host_stream()));
+             }
+ #endif
+         }
+-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++        CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+         return true;
+     }
+     return false;
+@@ -2684,17 +2878,17 @@ static bool ggml_backend_cuda_buffer_cpy_tensor_n(ggml_backend_buffer_t buffer,
+         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
+         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx_i->device);
+         if (src_physical == dst_physical) {
+-            CUDA_CHECK(cudaMemcpyAsync(dsts[i]->data, srcs[i]->data, ggml_nbytes(srcs[i]), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
++            CUDA_CHECK(cudaMemcpyAsync(dsts[i]->data, srcs[i]->data, ggml_nbytes(srcs[i]), cudaMemcpyDeviceToDevice, ggml_cuda_host_stream()));
+         } else {
+ #ifdef GGML_CUDA_NO_PEER_COPY
+             GGML_ABORT("peer copy not supported");
+ #else
+-            CUDA_CHECK(cudaMemcpyPeerAsync(dsts[i]->data, dst_physical, srcs[i]->data, src_physical, ggml_nbytes(srcs[i]), cudaStreamPerThread));
++            CUDA_CHECK(cudaMemcpyPeerAsync(dsts[i]->data, dst_physical, srcs[i]->data, src_physical, ggml_nbytes(srcs[i]), ggml_cuda_host_stream()));
+ #endif
+         }
+     }
+ 
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+     return true;
+ }
+ 
+@@ -2703,8 +2897,8 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
+ 
+     ggml_cuda_set_device(ctx->device);
+     ggml_cuda_async_input_drain(ctx->device);
+-    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, ggml_cuda_host_stream()));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
+@@ -3748,8 +3942,8 @@ static char * ggml_cuda_kv_region_dev_stage(int device, size_t need, std::unique
+ static void ggml_backend_cuda_kv_region_rows_to_host(ggml_backend_cuda_buffer_context * ctx, const char * src, void * data,
+         size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+     if (stride_tensor == size && stride_data == size) {
+-        CUDA_CHECK(cudaMemcpyAsync(data, src, (n_copies - 1) * stride_tensor + size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++        CUDA_CHECK(cudaMemcpyAsync(data, src, (n_copies - 1) * stride_tensor + size, cudaMemcpyDeviceToHost, ggml_cuda_host_stream()));
++        CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+         return;
+     }
+     if (size * n_copies >= ggml_cuda_bounce_min()) {   // GGML_CUDA_BOUNCE_MIN=0 keeps the per-row arm selectable
+@@ -3763,9 +3957,9 @@ static void ggml_backend_cuda_kv_region_rows_to_host(ggml_backend_cuda_buffer_co
+                     ggml_cuda_kv_region_stage_max) / size);
+             for (size_t e0 = 0; e0 < n_copies; e0 += rows) {
+                 const size_t n = std::min(rows, n_copies - e0);
+-                ggml_cuda_cpy_2d_rows(stage, src + e0 * stride_tensor, size, n, stride_tensor, size, cudaStreamPerThread);
+-                CUDA_CHECK(cudaMemcpyAsync(pin, stage, n * size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++                ggml_cuda_cpy_2d_rows(stage, src + e0 * stride_tensor, size, n, stride_tensor, size, ggml_cuda_host_stream());
++                CUDA_CHECK(cudaMemcpyAsync(pin, stage, n * size, cudaMemcpyDeviceToHost, ggml_cuda_host_stream()));
++                CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+                 for (size_t e = 0; e < n; ++e) {
+                     memcpy((char *) data + (e0 + e) * stride_data, pin + e * size, size);
+                 }
+@@ -3775,9 +3969,9 @@ static void ggml_backend_cuda_kv_region_rows_to_host(ggml_backend_cuda_buffer_co
+     }
+     for (size_t e = 0; e < n_copies; ++e) {
+         CUDA_CHECK(cudaMemcpyAsync((char *) data + e * stride_data, src + e * stride_tensor, size, cudaMemcpyDeviceToHost,
+-                cudaStreamPerThread));
++                ggml_cuda_host_stream()));
+     }
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ // the write direction is the mirror image: pack the host rows into the pinned chunk, one 1-D H2D per chunk, then
+@@ -3789,8 +3983,8 @@ static void ggml_backend_cuda_kv_region_rows_from_host(ggml_backend_cuda_buffer_
+         size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data, size_t offset) {
+     if (stride_tensor == size && stride_data == size) {
+         CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, (n_copies - 1) * stride_data + size,
+-                cudaMemcpyHostToDevice, cudaStreamPerThread));
+-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++                cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
++        CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+         return;
+     }
+     if (size * n_copies >= ggml_cuda_bounce_min() && ggml_cuda_stage_pin_on) {
+@@ -3807,10 +4001,10 @@ static void ggml_backend_cuda_kv_region_rows_from_host(ggml_backend_cuda_buffer_
+                 for (size_t e = 0; e < n; ++e) {
+                     memcpy(pin + e * size, (const char *) data + (e0 + e) * stride_data, size);
+                 }
+-                CUDA_CHECK(cudaMemcpyAsync(stage, pin, n * size, cudaMemcpyHostToDevice, cudaStreamPerThread));
++                CUDA_CHECK(cudaMemcpyAsync(stage, pin, n * size, cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
+                 ggml_cuda_cpy_2d_rows((char *) tensor->data + offset + e0 * stride_tensor, stage, size, n, size,
+-                        stride_tensor, cudaStreamPerThread);
+-                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++                        stride_tensor, ggml_cuda_host_stream());
++                CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+             }
+             return;
+         }
+@@ -3824,9 +4018,9 @@ static void ggml_backend_cuda_kv_region_rows_from_host(ggml_backend_cuda_buffer_
+     }
+     for (size_t e = 0; e < n_copies; ++e) {
+         CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset + e * stride_tensor, (const char *) data + e * stride_data,
+-                size, cudaMemcpyHostToDevice, cudaStreamPerThread));
++                size, cudaMemcpyHostToDevice, ggml_cuda_host_stream()));
+     }
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_host_stream()));
+ }
+ 
+ static void ggml_backend_cuda_kv_region_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
+@@ -8540,7 +8734,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+ // peer mapping, and `cuMemSetAccess` returns `invalid argument`).  The failure is not catchable: without
+ // peer access enabled HIP returns an error host-side, and with `GGML_CUDA_P2P=1` the copy is issued and the
+ // GPU FAULTS (`HSA_STATUS_ERROR_MEMORY_FAULT` in `__amd_rocclr_copyBuffer`, "Page not present"), which
+-// kills the process.  So the copy path asks `ggml_cuda_slab_peer_copy_ok` first and stages the copy through
++// kills the process.  So the copy path asks `ggml_cuda_peer_copy_ok` first and stages the copy through
+ // pinned host memory for the pairs the driver refused.
+ //
+ // One grow-only buffer and one done-event per (src, dst) pair.  The D2H runs on the source stream and the
+@@ -8655,7 +8849,7 @@ static bool ggml_backend_cuda_cpy_tensor_async_impl(ggml_backend_t backend_src,
+             return false;
+ #else
+             // a peer copy the driver's grants do not cover faults the GPU, so ask first
+-            if (!ggml_cuda_slab_peer_copy_ok(dst->data, ggml_nbytes(dst))) {
++            if (!ggml_cuda_peer_copy_ok(dst->data, ggml_nbytes(dst))) {
+                 ggml_cuda_peer_copy_staged(cuda_ctx_src->device, cuda_ctx_src->stream(),
+                                            cuda_ctx_dst->device, cuda_ctx_dst->stream(),
+                                            dst->data, src->data, ggml_nbytes(dst));

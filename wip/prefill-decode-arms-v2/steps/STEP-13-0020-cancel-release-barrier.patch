@@ -1,0 +1,380 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 6bb986359..e13e18999 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -280,6 +280,15 @@ struct server_slot {
+     // response (print_timings / send_final_response / release): the response lifecycle never runs on the decode
+     // arm (invariant 5).
+     bool finish_pending  = false;
++    // "the decode arm is INSIDE this slot right now": claimed under arms_mtx for the slots of one decode round
++    // (draft setup -> batch build -> llama_process -> the accept round/step) and cleared when that round ends.
++    // A main-thread teardown (`release_slot()`) of a DECODE-owned slot clears `arm` and then WAITS for this to
++    // clear, so a release can never land between the decode arm's batch and its per-slot step.  Without it the
++    // CANCEL path released a slot the arm was mid-round on, `reset()` zeroed `stats`, and the arm's next
++    // `slot_step()` read `n_gen == 0` -> `update_prompt_last()` -> `GGML_ASSERT(t_start > 0)` (abort; reproduced
++    // 2 of 2 attempts at pair ON, 0 of 25 at pair OFF, `wip/prefill-decode-arms-v2/`, 2026-11-24).
++    // Written ONLY under server_context_impl::arms_mtx.
++    bool arm_busy        = false;
+ 
+     common_memory mem;
+ 
+@@ -1613,6 +1622,30 @@ private:
+         arms_cv.notify_all();
+     }
+ 
++    // THE main-thread teardown of a slot, and the only release path that is safe for a DECODE-owned slot.
++    //
++    // `server_slot::release()` mutates the slot (state -> IDLE, `reset()`: `stats = {}`, `task.reset()`), so it
++    // may not run while the decode arm is inside that slot: the arm collected its round's slots earlier and uses
++    // them OUTSIDE the mutex (draft setup, the batch build, and the per-slot step/accept round after
++    // `llama_process()`), and a release landing in between makes the arm step a slot it no longer has -- the
++    // concrete signature is `slot_step()` seeing the zeroed `stats.n_gen == 0` and taking the first-token branch,
++    // `update_prompt_last()` -> `GGML_ASSERT(t_start > 0)`.  The CANCEL path (a client that disconnects, i.e.
++    // "abort") reaches exactly that: with two long generations in flight it released a slot the decode arm was
++    // mid-round on.  Two steps, both under `arms_mtx`:
++    //   1. take the slot AWAY from the arm (`arm = ARM_PREFILL`), so no LATER round can claim it;
++    //   2. wait for the round that already holds it to finish (`arm_busy`), so no CURRENT round can touch it.
++    // The wait is one decode round (~10-100 ms) and it cannot deadlock: the decode arm never waits on anything
++    // this thread holds -- it only clears the claim and notifies at the end of its round.
++    void release_slot(server_slot & slot) {
++        if (ctx_dec != nullptr) {
++            std::unique_lock<std::mutex> lk(arms_mtx);
++            slot.arm           = ARM_PREFILL;
++            slot.finish_pending = false;
++            arms_step_cv.wait(lk, [&] { return !slot.arm_busy; });
++        }
++        slot.release();
++    }
++
+     // the main thread's half of a stop that happened on the decode arm
+     void arms_finish_pending_slots() {
+         std::vector<server_slot *> done;
+@@ -1644,7 +1677,7 @@ private:
+             // the lifecycle, on the thread that owns it (invariant 5)
+             slot->print_timings();
+             send_final_response(*slot);
+-            slot->release();
++            release_slot(*slot);
+         }
+     }
+ 
+@@ -1698,27 +1731,56 @@ private:
+                 if (arms_stop) {
+                     return;
+                 }
+-                // collect under the mutex: the ownership flag is the only cross-thread slot state
++                // COLLECT AND CLAIM THE ROUND'S SLOTS IN ONE CRITICAL SECTION ("the decode arm is inside this
++                // slot").  Both halves must be here: a `release_slot()` that slips between a separate collect and
++                // a separate claim would set `arm = ARM_PREFILL`, find `arm_busy == false`, tear the slot down
++                // (state -> IDLE, `stats = {}`, `task.reset()`) and then this round would still claim and step it.
++                // Under one lock, a release either happened BEFORE the collection (the slot is no longer
++                // GENERATING, so it is not collected) or WAITS for this round's claim to clear.
++                //
++                // The claim is on the FITTED set, not the collected one: a slot that does not fit in this round's
++                // batch is never touched, so it must not hold a release up.
+                 for (auto & slot : slots) {
+                     if (slot.arm == ARM_DECODE && slot.state == SLOT_STATE_GENERATING && slot.has_next_token) {
+                         owned.push_back(&slot);
+                     }
+                 }
+-            }
+-            if (owned.empty()) {
+-                continue;
+-            }
+-            if (spec_n_max > 0) {
+-                // a slot needs 1 + n_spec_max rows, so the number of slots that FIT is what bounds the round --
+-                // never assert at run time: a slot that does not fit waits for the next round
+-                const size_t n_fit = (size_t) llama_n_batch(ctx_dec) / (size_t) (1 + spec_n_max);
+-                if (owned.size() > n_fit) {
+-                    owned.resize(n_fit);
++                if (owned.empty()) {
++                    continue;
++                }
++                if (spec_n_max > 0) {
++                    // a slot needs 1 + n_spec_max rows, so the number of slots that FIT is what bounds the round --
++                    // never assert at run time: a slot that does not fit waits for the next round
++                    const size_t n_fit = (size_t) llama_n_batch(ctx_dec) / (size_t) (1 + spec_n_max);
++                    if (owned.size() > n_fit) {
++                        owned.resize(n_fit);
++                    }
++                } else if ((int64_t) owned.size() > llama_n_batch(ctx_dec)) {
++                    owned.resize((size_t) llama_n_batch(ctx_dec));
++                }
++                for (auto * slot : owned) {
++                    GGML_ASSERT(!slot->arm_busy && "a slot was claimed by two decode rounds");
++                    slot->arm_busy = true;
+                 }
+-            } else if ((int64_t) owned.size() > llama_n_batch(ctx_dec)) {
+-                owned.resize((size_t) llama_n_batch(ctx_dec));
+             }
+ 
++            // Cleared on EVERY path out of the round (the error/nack `continue`s, a stop, the normal end), because
++            // a claim that is never released would block that slot's next `release_slot()` forever.
++            struct round_claims {
++                server_context_impl & s;
++                const std::vector<server_slot *> & owned;
++                ~round_claims() {
++                    if (owned.empty()) {
++                        return;
++                    }
++                    std::lock_guard<std::mutex> lk(s.arms_mtx);
++                    for (auto * slot : owned) {
++                        slot->arm_busy = false;
++                    }
++                    s.arms_step_cv.notify_all();
++                }
++            } round_done{*this, owned};
++
+             drafting.clear();
+             int ret = 0;
+             bool spec_ok = true;
+@@ -3659,7 +3721,7 @@ private:
+                         slot.task->id == id_parent ||
+                         slot.task->id_parent == id_parent
+                 )) {
+-                    slot.release();
++                    release_slot(slot);
+                 }
+             }
+         };
+@@ -4117,7 +4179,7 @@ private:
+                     // release slot linked with the task id
+                     for (auto & slot : slots) {
+                         if (slot.task && slot.task->id == task.id_target) {
+-                            slot.release();
++                            release_slot(slot);
+                             break;
+                         }
+                     }
+@@ -4450,7 +4512,7 @@ private:
+                 } catch (const std::exception & e) {
+                     SLT_ERR(slot, "got exception: %s\n", e.what());
+                     send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+-                    slot.release();
++                    release_slot(slot);
+                 }
+             }
+         }
+@@ -4463,7 +4525,7 @@ private:
+             } catch (const std::exception & e) {
+                 SLT_ERR(*slot, "got exception: %s\n", e.what());
+                 send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+-                slot->release();
++                release_slot(*slot);
+             }
+         }
+     }
+@@ -4472,7 +4534,7 @@ private:
+         for (auto & slot : slots) {
+             if (slot.is_processing()) {
+                 send_error(slot, reason, ERROR_TYPE_SERVER);
+-                slot.release();
++                release_slot(slot);
+             }
+         }
+     }
+@@ -4556,7 +4618,7 @@ private:
+         }
+         if (n == -2) {
+             send_error(slot, "audio stream error", ERROR_TYPE_SERVER);
+-            slot.release();
++            release_slot(slot);
+             return false;
+         }
+ 
+@@ -4565,7 +4627,7 @@ private:
+         slot.has_next_token = false;
+         slot.print_timings();
+         send_final_response(slot);
+-        slot.release();
++        release_slot(slot);
+         return false;
+     }
+ 
+@@ -4735,7 +4797,7 @@ private:
+             }
+             if (!slot.rt->update()) {
+                 send_error(slot, slot.rt->error, slot.rt->error_type);
+-                slot.release();
++                release_slot(slot);
+                 return;
+             }
+             slot.audio_wait = slot.rt->is_idle();
+@@ -4754,7 +4816,7 @@ private:
+                 const int32_t ret = slot.tts.ctx.step_prompt(llama_n_batch(ctx_tgt));
+                 if (ret < 0) {
+                     send_error(slot, "TTS prompt processing failed", ERROR_TYPE_SERVER);
+-                    slot.release();
++                    release_slot(slot);
+                 } else if (ret == 0) {
+                     // done prompt, do sample and save h_state_prompt
+                     slot.tts.sampled = common_sampler_sample(slot.smpl.get(), ctx_tgt, -1);
+@@ -4778,7 +4840,7 @@ private:
+                 } else {
+                     send_tts_result(slot, sample_rate, data, data_len, true);
+                 }
+-                slot.release();
++                release_slot(slot);
+                 return;
+             }
+ 
+@@ -4786,7 +4848,7 @@ private:
+             bool          stop         = false;
+             if (slot.tts.ctx.step_gen(slot.tts.sampled, slot.tts.h_state, &h_state_next, &stop) != 0) {
+                 send_error(slot, "TTS generation failed", ERROR_TYPE_SERVER);
+-                slot.release();
++                release_slot(slot);
+                 return;
+             }
+             if (h_state_next == nullptr) {
+@@ -4809,7 +4871,7 @@ private:
+                 size_t       data_len    = 0;
+                 if (slot.tts.ctx.get_output(&sample_rate, &data, &data_len) != 0) {
+                     send_error(slot, "TTS streaming output failed", ERROR_TYPE_SERVER);
+-                    slot.release();
++                    release_slot(slot);
+                 } else if (data_len > 0) {
+                     send_tts_result(slot, sample_rate, data, data_len, false);
+                 }
+@@ -4836,7 +4898,7 @@ private:
+                     // this check is redundant (for good)
+                     // we should never get here, because generation should already stopped in process_token()
+                     send_error(slot, "context shift is disabled", ERROR_TYPE_SERVER);
+-                    slot.release();
++                    release_slot(slot);
+                     return;
+                 }
+ 
+@@ -4848,7 +4910,7 @@ private:
+ 
+                 if (slot.task->is_parent() || slot.task->is_child()) {
+                     send_error(slot, "context shift cannot be used for shared prompt", ERROR_TYPE_SERVER);
+-                    slot.release();
++                    release_slot(slot);
+                     return;
+                 }
+ 
+@@ -5143,7 +5205,7 @@ private:
+ 
+                             slot.print_timings();
+                             send_final_response(slot);
+-                            slot.release();
++                            release_slot(slot);
+ 
+                             return;
+                         }
+@@ -5152,7 +5214,7 @@ private:
+                         // a decision reads its logits from the one batch of its prompt
+                         if (slot.task->need_logits() && !llama_get_memory(ctx_tgt) && slot.task->type != SERVER_TASK_TYPE_DECISION) {
+                             send_error(slot, "the current context does not support logits computation. skipping", ERROR_TYPE_SERVER);
+-                            slot.release();
++                            release_slot(slot);
+                             return;
+                         }
+ 
+@@ -5164,7 +5226,7 @@ private:
+                                                "size (current batch size: %d)",
+                                                slot.task->n_tokens(), n_ubatch),
+                                            ERROR_TYPE_SERVER);
+-                                slot.release();
++                                release_slot(slot);
+                                 return;
+                             }
+ 
+@@ -5175,7 +5237,7 @@ private:
+                                         "input (%d tokens) is larger than the max context size (%d tokens). skipping",
+                                         slot.task->n_tokens(), slot.n_ctx),
+                                     ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+-                                slot.release();
++                                release_slot(slot);
+                                 return;
+                             }
+                         } else {
+@@ -5185,7 +5247,7 @@ private:
+                                                          "tokens), try increasing it",
+                                                          slot.task->n_tokens(), slot.n_ctx),
+                                            ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+-                                slot.release();
++                                release_slot(slot);
+                                 return;
+                             }
+ 
+@@ -5197,7 +5259,7 @@ private:
+                                                          "increase the batch size (current batch size: %d)",
+                                                          slot.task->n_tokens() - n_decision_first, n_batch),
+                                            ERROR_TYPE_INVALID_REQUEST);
+-                                slot.release();
++                                release_slot(slot);
+                                 return;
+                             }
+ 
+@@ -5518,7 +5580,7 @@ private:
+                         if (res != 0) {
+                             SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
+                             send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+-                            slot.release();
++                            release_slot(slot);
+                             return; // the slot is done, skip it entirely
+                         }
+ 
+@@ -5746,7 +5808,7 @@ private:
+                 // the batch must not keep the entries of a released slot
+                 batch.truncate(n_tokens_prev);
+                 send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+-                slot.release();
++                release_slot(slot);
+                 return false;
+             }
+ 
+@@ -5828,7 +5890,7 @@ private:
+                     for (auto & slot : slots) {
+                         if (slot.is_processing()) {
+                             send_error(slot, err);
+-                            slot.release();
++                            release_slot(slot);
+ 
+                             // note: it's complicated to keep track of how much of the current batch has been
+                             //       processed before the error occurred, so we simply clear the entire context
+@@ -6190,7 +6252,7 @@ private:
+                 }
+                 slot.print_timings();
+                 send_final_response(slot);
+-                slot.release();
++                release_slot(slot);
+ 
+                 return false;
+             }
+@@ -6245,7 +6307,7 @@ private:
+             // release slot because of stop condition
+             slot.print_timings();
+             send_final_response(slot);
+-            slot.release();
++            release_slot(slot);
+ 
+             return false;
+         }
+@@ -6295,21 +6357,21 @@ private:
+                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
+                     // prompt evaluated for embedding
+                     send_embedding(slot, batch.view);
+-                    slot.release();
++                    release_slot(slot);
+                     slot.i_batch = -1;
+                     return;
+                 }
+ 
+                 if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
+                     send_rerank(slot, batch.view);
+-                    slot.release();
++                    release_slot(slot);
+                     slot.i_batch = -1;
+                     return;
+                 }
+ 
+                 if (slot.task->type == SERVER_TASK_TYPE_DECISION) {
+                     send_decision(slot, batch.view, slot.i_batch - off);
+-                    slot.release();
++                    release_slot(slot);
+                     slot.i_batch = -1;
+                     return;
+                 }

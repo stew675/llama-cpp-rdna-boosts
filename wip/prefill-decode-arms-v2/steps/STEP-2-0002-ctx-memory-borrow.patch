@@ -1,0 +1,155 @@
+diff --git a/include/llama.h b/include/llama.h
+index eec23b49d..6684f95f3 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -512,6 +512,22 @@ extern "C" {
+         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
+         struct llama_context * ctx_other;
+ 
++        // Use `ctx_memory`'s llama_memory INSTEAD of creating a private one: literally the same object -- the
++        // same cells, the same recurrent state, the same indexer cache -- for the whole life of this context.
++        // Nothing is copied between the two contexts, and this context never frees the borrowed memory.
++        //
++        // Contract:
++        //   * the owner and the borrower must be contexts of the SAME model;
++        //   * the OWNER's context must outlive this one (free the borrower first);
++        //   * a borrow and `ctx_other` are mutually exclusive on one context (`ctx_other` already means "MTP
++        //     draft target" / "assistant view" / "token_embd donor", and each of those keeps its OWN memory);
++        //   * everything above the memory stays per context (batch, ubatch, scheduler, compute buffers, logits,
++        //     sampler): two contexts sharing one memory may each be inside llama_decode() at the same time, and
++        //     the memory module serialises its own bookkeeping.
++        //
++        // DEFAULT null: every existing caller gets its own private memory, exactly as before.
++        struct llama_context * ctx_memory;
++
+         // --- the delivery's KV-placement options (block 15; all three are also command-line flags, and all
+         // three DEFAULT TO OFF: a placement that changes decode cannot be a default) ---
+         int32_t spec_draft_kv_window;  // MTP draft context only (`--spec-draft-kv-window`): its KV window in
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 8518e09fe..69434bd4d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -996,6 +996,44 @@ llama_context::llama_context(
+ 
+     // init the memory module
+     if (!hparams.vocab_only) {
++        // A BORROWED memory (params.ctx_memory): use the owner's llama_memory object ITSELF.  No copy, no second
++        // cell map, no transfer, no per-module "shared view" concept -- for every architecture, and for any module
++        // that is added later, because there is only ever one object.  Everything above it (batch, ubatch,
++        // scheduler, compute buffers, logits, sampler) stays this context's.  See llama_context_params::ctx_memory.
++        if (params.ctx_memory != nullptr) {
++            const llama_context * mem_owner = params.ctx_memory;
++            if (&mem_owner->get_model() != &model) {
++                throw std::runtime_error(format(
++                        "%s: ctx_memory must be a context of the SAME model: this context's model is '%s', the "
++                        "owner's is '%s'",
++                        __func__, model.arch_name().c_str(), mem_owner->get_model().arch_name().c_str()));
++            }
++            if (params.ctx_other != nullptr) {
++                // ctx_other already means "MTP draft target" / "assistant view" / "token_embd donor", and each of
++                // those paths keeps its OWN memory (it passes that context's memory in as `mem_other`).  Asking for
++                // both on one context is a contradiction, so refuse it rather than silently pick one.  The check is
++                // on the REQUESTED `params.ctx_other`, not on `cparams.ctx_other`: the constructor filters the
++                // latter down to `nullptr` for every architecture that does not need it, which would let a
++                // contradictory request through on exactly the models where it is meaningless rather than refused.
++                throw std::runtime_error(format(
++                        "%s: ctx_memory and ctx_other are mutually exclusive on one context (ctx_other means an "
++                        "MTP draft target, an assistant view or a token_embd donor, and each keeps its own memory)",
++                        __func__));
++            }
++            memory = mem_owner->get_memory();
++            if (memory == nullptr) {
++                throw std::runtime_error(format(
++                        "%s: the ctx_memory owner has no memory (was it created vocab_only?)", __func__));
++            }
++            memory_borrowed = true;
++            // Two pointers and both widths, so a log reader can check the identity (I1) without a debugger.  This
++            // line is INFO and appears ONLY when the pair is on, so the default path's startup log is unchanged.
++            LLAMA_LOG_INFO("%s: this context %p BORROWS the memory of context %p (memory %p): one memory object, "
++                    "two contexts; the owner must outlive this one (n_batch %u, n_ubatch %u; the owner's are %u, %u)\n",
++                    __func__, (const void *) this, (const void *) mem_owner, (const void *) memory,
++                    cparams.n_batch, cparams.n_ubatch, mem_owner->get_cparams().n_batch,
++                    mem_owner->get_cparams().n_ubatch);
++        } else {
+         llama_memory_params params_mem = {
+             /*.type_k    =*/ params.type_k,
+             /*.type_v    =*/ params.type_v,
+@@ -1011,7 +1049,9 @@ llama_context::llama_context(
+         cparams.type_k = params_mem.type_k;
+         cparams.type_v = params_mem.type_v;
+ 
+-        memory.reset(model.create_memory(params_mem, cparams));
++            memory_own.reset(model.create_memory(params_mem, cparams));
++            memory = memory_own.get();
++        }
+     }
+ 
+     // init backends
+@@ -1219,6 +1259,15 @@ llama_context::llama_context(
+ }
+ 
+ llama_context::~llama_context() {
++    // I2: a BORROWED memory is not ours to free.  `memory_own` is null in that case, so nothing is released here
++    // -- and the contract is that the owner outlives this context (a server frees the borrower first, then the
++    // owner).  The line is INFO and appears only for a borrower, so the default path's log is unchanged; it is
++    // the teardown half of the pair's trace, and the pointer pair lets a log reader match it with the
++    // "BORROWS the memory of" line at construction.
++    if (memory_borrowed) {
++        LLAMA_LOG_INFO("%s: context %p releases its BORROWED memory %p (the owner frees it)\n",
++                __func__, (const void *) this, (const void *) memory);
++    }
+     for (auto & be : state_pipe_evs) {
+         for (ggml_backend_event_t ev : be.second) {
+             if (ev != nullptr) {
+@@ -1589,11 +1638,11 @@ const std::vector<llama_kv_cache *> & llama_context::kq_mask_kvs() const {
+     if (memory && !kq_mask_kvs_done) {
+         kq_mask_kvs_store.clear();
+ 
+-        if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
++        if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) {
+             kq_mask_kvs_store = { kv };
+-        } else if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
++        } else if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory)) {
+             kq_mask_kvs_store = { hybrid->get_mem_attn() };
+-        } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
++        } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory)) {
+             kq_mask_kvs_store = { iswa->get_base(), iswa->get_swa() };
+         }
+ 
+@@ -1970,7 +2019,7 @@ uint32_t llama_context::n_threads_batch() const {
+ }
+ 
+ llama_memory_t llama_context::get_memory() const {
+-    return memory.get();
++    return memory;
+ }
+ 
+ bool llama_context::memory_update(bool optimize) {
+@@ -6516,6 +6565,7 @@ llama_context_params llama_context_default_params() {
+         /*.sampler                     =*/ nullptr,
+         /*.n_sampler                   =*/ 0,
+         /*.ctx_other                   =*/ nullptr,
++        /*.ctx_memory                  =*/ nullptr,
+         /*.spec_draft_kv_window        =*/ 0,
+         /*.kv_region_pool              =*/ 0,
+         /*.kv_resident_cells           =*/ 0,
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 9ab266537..afa8ddf02 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -400,7 +400,14 @@ private:
+     // MTP draft vocabulary subset used by this context's graphs (nullptr = full vocabulary)
+     std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft;
+ 
+-    llama_memory_ptr memory;
++    // THE MEMORY.  Exactly one of these two is populated:
++    //   * `memory_own` -- this context created it (every caller that does not set `params.ctx_memory`);
++    //   * `memory`     -- BORROWED from `params.ctx_memory->get_memory()`: the same object, never freed here.
++    // `memory` is what every graph builder and every llama_memory_* call uses, so there is one code path and no
++    // question of which memory a context is on.  See `llama_context_params::ctx_memory` for the contract.
++    llama_memory_ptr memory_own;
++    llama_memory_t   memory = nullptr;
++    bool             memory_borrowed = false;
+     llama_moe_cache_ptr moe_cache;
+ 
+     // decode output (2-dimensional array: [n_outputs][n_vocab])

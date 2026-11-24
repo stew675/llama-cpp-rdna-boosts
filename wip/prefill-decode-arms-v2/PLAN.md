@@ -14,11 +14,12 @@ step**, and so that each step is independently reviewable.
 | 5 | **`llama_memory_recurrent` contextified** | `mem->n`, `mem->rs_z` as graph-visible state; the `s_copy()` getter mutation | per-batch `placement` in the context | inert single-context (text + MTP four-axis); then `gate-arms-recurrent-shared.sh` |
 | 6 | the server's two arms | the whole handover state machine | `ctx_dec` (borrow), the decode thread, slot ownership, the pairing predicate | `gate-arms-n1-memory.sh`, `gate-arms-multislot.sh` |
 | 7 | `--spec-type` refused/off on the pair | — | one guard | the guard fires; the pair runs without a drafter |
+| 7a | **the host-expert fault** (found by STEP 6's soak) | one narrow slab work base for every context; a process-wide routing flag | one pinned AUX region per extra context + a `thread_local` routing slot (`DESIGN.md` I9) | the host-tier soak PASSes (it faulted), the 4B soak/n1-memory/itl still PASS, A1-A6 unchanged |
 | 8 | the gate set + the census | — | 4 gates under `gates/`, `--json` where useful | each gate green **and** non-vacuous |
 | 9 | the shape/latency matrix + records | — | `WORKLOG.md`, `ENVIRONMENT.md`, `INVARIANTS.md` rows | the matrix reproduces text on every shape |
 | 10 | re-admit the speculator on the pair | the STEP 7 guard | the draft/verify/accept on the decode arm | 3-way cold text + the four axes |
 | 11 | the delivery regression sweep | — | — | `validate-set.sh` + the delivery ladder |
-| 12 | the candidate patch + the promotion ask | — | `beta/<name>/` | the maintainer's decision (never a gate outcome) |
+| 12 | the candidate patch + the promotion ask | — | `beta/prefill-decode-arms/` (replaces it whole) | the block-17 promotion is the maintainer's decision (never a gate outcome) |
 
 ---
 
@@ -389,8 +390,22 @@ must be **non-vacuous**: it asserts that the mechanism it depends on actually ha
 Rules: one GPU job at a time; every server run under `setsid` + `timeout`, process group killed; every log checked
 with `check-gpu-faults.sh --since <before the run>`; text arms take **no** `-lv`, census arms `-lv 4`.
 
+**Written (2026-11-23):** all five exist and are green.  The two this step owed:
+
+* `gates/gate-arms-default-inert.sh` — the shapes, their cli text anchors (with each row's **provenance**) and
+  their startup shapes live in `baseline/inert-anchors.tsv` and `baseline/inert-shapes/`; the 4B startup shape's
+  expectation IS `baseline/A6-startup-shape.txt` (the STEP 0 file, not a copy), and the gate also runs the same
+  server with the pair ON to prove the comparison can see a change (4 added lines, same responses).  `--record`
+  writes only a MISSING anchor, so an anchor can never be quietly re-recorded into agreement.
+* `gates/gate-arms-recurrent-shared.sh` — `probe-recurrent-shared.cpp` promoted: §1 the placements must DIFFER,
+  §2 concurrent == `--solo` byte for byte, §3 the four-axis `none` == adaptive **with a non-zero draft/accept
+  count** (the non-vacuity line that caught an adaptive drafter refusing to initialise at `n_max 2` and the run
+  silently continuing plain -- which was the HARNESS's invalid flag pair, not the feature; the gate now uses a
+  valid ceiling and FAILs on 0 drafts).  Two models, both on a **3-device `-sm tensor -mg 0`** split: 35B-A3B and
+  Flash-Next/qwen4exp + its external shared MTP head (`--axis-shape host` for the delivery's host-expert arm).
+
 **Exit:** all five green, and each gate's non-vacuity line present in its output.  Record the numbers in this
-directory (`RUNS.md`), not in `WORKLOG.md` (that gets the landing entry).
+directory (`RUNS.md`), not in `WORKLOG.md` (that gets the landing entry).  **Met 2026-11-23.**
 
 ---
 
@@ -410,9 +425,34 @@ Run, on the maintainer's box, one arm at a time:
   `--prefill-decode-arms-mode`, and nothing else unless a gate needs it); `INVARIANTS.md` entries for the facts
   (I1-I8 candidates, the measurement that set the reserve, the Meta slot identity).
 
+**Done 2026-11-23** with `baseline/shape-matrix.sh` (+ `server-arm.sh --vram-probe`), 3 repeats per arm:
+7/7 shapes text-identical (the seventh is the designed refusal for a drafter-bound shape), the cost is
++53..+154 MiB of VRAM (+149/154 per device on the tensor splits) plus one 1280 MiB slab aux region on a host
+tier, and the trade is ITL −22.8 % at `-ub 2048` / −23.9 % at `-ub 4096` with prefill **+24.1 % / +19.4 %**
+(the win grows with the chunk width; the prefill is faster because the decoder's row leaves the prefill's batch).
+`ENVIRONMENT.md` §24 carries the rows (marked wip / NOT shipped).  Two corrections came out of it: **STEP 7f** (a
+borrower's `cparams.type_k`/`type_v` were uninitialized -- Flash-Next + the pair aborted 2 of 3 runs) and
+`gate-arms-itl.sh` no longer makes a byte claim in the one configuration where a byte claim is a lottery.
+
+**The tensor-split rows (added after the maintainer asked for them):** Flash-Next 3 devices `-sm tensor`,
+`-ub 4096`, **53.83 -> 22.89 ms/token (ITL −57.5 %)** with the pair's graph capture off, prefill +21.8 %; 27B 3
+devices `-sm tensor`, `-ub 2048`, 64.45 -> 60.30 (−6.4 %, prefill +35.6 %).  Measuring them found **STEP 7g** (the
+Meta split-state cache was per buffer, not per view slot -- two arms raced it) and left **one blocking decision**
+(`HANDOVER-2026-11-24-campaign.md` §7.7): with hipBLASLt AND capture on, a tensor-split pair arm aborts
+(`'operation would make the legacy stream depend on a capturing blocking stream'`), so the pair must pin one of
+capture-off (fast) or hipBLASLt-off (1.8x slower) until a capture barrier exists.
+
 ---
 
-## STEP 10 — re-admit the speculator on the pair
+## STEP 10 — re-admit the speculator on the pair  — **DONE 2026-11-24** (`f3e34859d`)
+
+> Landed as `steps/STEP-10-0018-speculator-on-the-pair.patch` (+ 10a, `e7ae0b470`).  The scope below was met; the
+> four things it did NOT anticipate are in `RUNS.md` §6 and were fixed in the same landing: the drafter's target
+> rows must follow the arm that ran the batch (`common_batch::ctx`), an embedded-MTP draft context keeps no
+> `ctx_other` and therefore had no pinned slab region (`llama_context_params::ctx_aux`), a compute-buffer
+> allocation and a cross-stream event wait may not overlap the other arm's graph capture, and the slab's aux
+> regions needed the floor's slot off-by-one fixed + growth-when-idle + a mapping for a region stacked under
+> another.  Gate: `gates/gate-arms-spec.sh`.  Open follow-ups: `HANDOVER-2026-11-24-campaign.md` §7.2/§7.8/§7.9.
 
 Only after STEPs 4-9 are green.
 
@@ -452,9 +492,12 @@ a text comparison, always).
 
 * Regenerate the patch **from a canonical chain**, never from the working branch:
   `scripts/make-patches.sh` on a tree built by `scripts/apply-all.sh` at `release.json.base`.
-* Put it in `beta/<new-name>/` with `README.md` (what it is, the applied tree, the shapes it reaches and the ones
-  it refuses, the measured numbers) and `BETA-TESTING.md` (the ladder a tester runs).  **Do not** reuse the old
-  beta directory's name — this artifact is a different design and must not inherit its readers' expectations.
+* Put it in **`beta/prefill-decode-arms/`**, REPLACING that artifact in its entirety (the maintainer's decision,
+  2026-11-24): the old directory's design text, README and patch are deleted, not kept beside it, because this is a
+  different design and must not inherit its readers' expectations.  `README.md` (what it is, the applied tree, the
+  shapes it reaches and the ones it refuses, the measured numbers) and `BETA-TESTING.md` (the ladder a tester
+  runs), and it stays **ONE self-contained patch** — on promotion it is **delivery block 17**, a modification to
+  the lower-numbered blocks, cut against the release tree (`release.json`), never against the working branch.
 * Report to the maintainer: the measured ITL/prefill trade, the memory cost, the shapes validated and not, and the
   open items.  **Promotion into `patches/` is a new block and is the maintainer's decision** — ask, do not cut.
 
@@ -482,3 +525,28 @@ a text comparison, always).
 `WORKLOG.md` gets the landing entries; `benchmarks/` gets anything that outlives the campaign; `INVARIANTS.md`
 gets the facts.  **A gate's output is never the record of a claim** — the claim lives in the record with its
 hash/rate and its shape.
+
+## STEP 15 — never issue a 2-D device->host copy into host memory — **DONE 2026-11-24** (`67946d6f0`)
+
+> Landed as `steps/STEP-15-0022-no-2d-d2h.patch` from a beta tester's third crash.  The work order
+> (`HANDOVER.md`) suspected the Meta backend's split arithmetic; measurement refuted that (per-device chunks
+> 331092 / 331092 / 331096 sum exactly to the meta row, and device 0's copy of the same arguments succeeded) and the
+> driver log named the real cause: a 2-D D2H copy needs a peer grant on the destination's pinned allocation
+> (`hsa_amd_agents_allow_access ... err 4096`), and this box refuses those grants.  The CUDA backend now serves every
+> row-block read as 1-D copies (`ggml_cuda_rows_to_host`), device-staged when it may synchronize; both 2-D read entry
+> points use it; the async read also selects its device (its write twin already did) and the staged arm can no longer
+> gather a row larger than the staging chunk.  Records: `WORKLOG.md` 261124.007, `INVARIANTS.md` r384-wip, `RUNS.md`
+> (2026-11-24, STEP 15).  Promotion obligation unchanged: cut into the delivery as a **block-09 amendment**
+> (`TODO` #376).
+
+## STEP 16 — the pair keeps the compute-buffer drop, fenced by the other arm's step boundary — **DONE 2026-11-24** (`56fdcbaff`)
+
+> Landed as `steps/STEP-16-0023-pair-keeps-the-drop.patch` from the maintainer's report that uncontested decode is
+> ~half speed with the pair on.  It was not the pair: disabling the drop keeps the slab's wide band armed, and
+> ggml-cuda refuses to capture a graph while the band is armed, so every decode step ran direct (45.9 t/s against
+> 83.2 on the single-context server, and 46.5 with only `LLAMA_DROP_COMPUTE_BUFFERS=0` on that same server).  The
+> drop now runs, fenced by the OTHER arm's step window through `llama_context_set_drop_boundary()` — the capture
+> barrier alone does not cover a replay, which is one `cudaGraphLaunch` whose GEMMs never take it.  Pair decode
+> 88.4 t/s, capture restored (3140), arena back +5.6 GiB.  Records: `WORKLOG.md` 261124.009, `INVARIANTS.md`
+> r385-wip, `RUNS.md` (2026-11-24 STEP 16).  Delivery-level: at promotion it is a second block-09 amendment
+> (`TODO` #376).

@@ -1,0 +1,22 @@
+# recorded 2026-11-23 by --record on the arms-v2 tree (POST-CHANGE lock)
+# shape: Qwen3.6-35B-A3B-Q8_0.gguf devices 0 extra '-ncmoe 40' np=2 ctx=8192
+I srv llama_server: initializing ...
+I cmn common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+I srv init_listene: The UI is disabled
+I srv init_listene: Use --ui/--no-ui (or deprecated --webui/--no-webui) to enable/disable
+W srv server_setup: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+I srv load_model: loading model '/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf'
+W common_params_fit_impl -: host-resident MoE experts active: reserving the slab headroom plus the expert-cache arena (auto floor: MOE_EXPERT_CACHE_MIN_MIB / MIN_RES_PCT) in the --fit margin before fitting the context (6387 MiB this pass over 32640 MiB of host experts). --fit sizes the context around it; the arena then takes any remaining free device memory keeping MOE_EXPERT_CACHE_RESERVE_MIB=1024 MiB per device.
+W llama_model_loader -: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+W report_host_expert_placement -: host experts: pinned N MiB of N MiB (cap N MiB), pageable N MiB, 120/120 pool sources registered; auto -> a pinned per-EXPERT pool of N MiB of N MiB: the whole host expert set -- a mirror IF the pool can hold it (the pool reports its RESOLVED coverage when it is built)
+W resolve_fused_ops -: layer 3 is assigned to device ROCm0 but Flash Attention over K/V rows is assigned to device CPU (usually due to missing support)
+W resolve_fused_ops -: Flash Attention over K/V rows not supported, set to disabled
+W ggml_cuda_slab_init_locked -: device 0: slab N GiB (chunk N MiB): work N GiB + arena N GiB (N GiB reserve, N GiB VA spare for `ggml_cuda_slab_extend`; ring region pending (above the narrow floor))
+I cmn init: llama threadpool init, n_threads = 16
+W alloc_all_locked -: MoE expert cache (auto): arena N MiB of N MiB host experts (N% residency). MOE_EXPERT_CACHE_MIB=0 disables the cache; set a positive value to size it explicitly.
+W pool_report_layout_once_locked -: host pool layout (RESOLVED, first table): 256/256 slots = N % coverage -> a MIRROR (every expert of the table is resident); the arena exchange is INERT for it (no reserve, no demote). Budget: a DERIVED budget of N MiB (the loader's `-lme auto` resolution), under the RAM ceiling.
+I srv load_model: initializing, n_slots = 2, n_ctx_slot = 8192, kv_unified = 'true'
+I srv load_model: prefill admission: fair share = on, chunk = n_ubatch, skew = 1, duty = 16, no-decode = n_batch
+W srv init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+I srv server_run_i: model loaded
+I srv server_on_li: listening on http://N.N:PORT

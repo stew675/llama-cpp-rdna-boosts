@@ -83,6 +83,7 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 LLAMA_SERVER="${LLAMA_SERVER:-$HOME/llama.cpp/build-rocm/bin/llama-server}"
 MODEL="${MODEL:-/llm/models/Qwen3.8/27B/IQ3_S/Qwen3.8-27B-UD-IQ3_S.gguf}"
 PROMPT="${PROMPT:-$REPO_DIR/prompts/prose-rdna-boosts.txt}"
@@ -165,7 +166,7 @@ start_arm() {
     # START_CTX / START_NPAR / START_ENV / START_MODEL override the shared arm globals for one invocation
     # (the multimodal arm needs its own context, one slot, a smaller draft ubatch and a projector)
     local ctx="${START_CTX:-$CTX}" npar="${START_NPAR:-$NPAR}"
-    env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}" \
+    env LD_LIBRARY_PATH="$(rocm_ld_library_path)" \
         HIP_VISIBLE_DEVICES="$DEVS" ${START_ENV:-} \
         "$LLAMA_SERVER" -m "${START_MODEL:-$MODEL}" \
         -ngl 999 -sm "$SM" -ncmoe "$NCMOE" -fa on -c "$ctx" -np "$npar" --kv-unified \
@@ -316,7 +317,7 @@ policy_arm() {   # policy_arm <arm> <ctx> <npar> <arg...>
     local arm="$1" ctx="$2" npar="$3"; shift 3
     local dir="$KEEPOUT/$arm"
     mkdir -p "$dir"
-    env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}" \
+    env LD_LIBRARY_PATH="$(rocm_ld_library_path)" \
         HIP_VISIBLE_DEVICES="$DEVS" \
         "$LLAMA_SERVER" -m "$MODEL" \
         -ngl 999 -sm "$SM" -ncmoe "$NCMOE" -fa on -c "$ctx" -np "$npar" --kv-unified \

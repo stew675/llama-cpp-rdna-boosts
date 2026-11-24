@@ -66,6 +66,7 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 LLAMA_SERVER="${LLAMA_SERVER:-$HOME/llama.cpp/build-rocm/bin/llama-server}"
 LLAMA_CLI="${LLAMA_CLI:-$(dirname "$LLAMA_SERVER")/llama-cli}"
 MODEL="${MODEL:-/llm/models/Qwen3.8/Flash-Next/STEW675-IQ4_NL/Qwen3.8-Flash-Next-MTP4-IQ4_NL-00001-of-00002.gguf}"
@@ -143,7 +144,7 @@ run_seq() {
     local arm=seq dir="$KEEPOUT/seq"
     mkdir -p "$dir"
     DEVS="$SEQ_GPU"
-    env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}" \
+    env LD_LIBRARY_PATH="$(rocm_ld_library_path)" \
         HIP_VISIBLE_DEVICES="$DEVS" \
         MOE_EXPERT_HEATMAP="$HEATMAP" \
         MOE_HOST_POOL_RAM_PCT="${MOE_HOST_POOL_RAM_PCT:-75}" \
@@ -209,7 +210,7 @@ run_fault() {
     DEVS="$FAULT_DEVS"
     local envs=()
     [ "$arm" = "fault" ] && envs+=(MOE_EXPERT_TAKEOVER_FAULT=1)
-    env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}" \
+    env LD_LIBRARY_PATH="$(rocm_ld_library_path)" \
         HIP_VISIBLE_DEVICES="$DEVS" \
         MOE_EXPERT_HEATMAP="$HEATMAP" \
         "${envs[@]}" \

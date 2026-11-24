@@ -127,6 +127,7 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 LLAMA_SERVER="${LLAMA_SERVER:-$HOME/llama.cpp/build-rocm/bin/llama-server}"
 LLAMA_CLI="${LLAMA_CLI:-$(dirname "$LLAMA_SERVER")/llama-cli}"
 MODEL="${MODEL:-/llm/models/Qwen3.8/27B/Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf}"
@@ -271,7 +272,7 @@ run_arm() {
     mkdir -p "$dir"
 
     # LLAMA_RS_ROLLBACK_DEBUG=1 is the split instrument (see the header)
-    env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}" \
+    env LD_LIBRARY_PATH="$(rocm_ld_library_path)" \
         HIP_VISIBLE_DEVICES="$devs" \
         ROCBLAS_USE_HIPBLASLT=0 \
         LLAMA_RS_ROLLBACK_DEBUG=1 \
@@ -399,7 +400,7 @@ fi
 echo "--> n_seq == 1 arm (llama-cli, one sequence)"
 for knob in 0 1; do
     dir="$KEEPOUT/cli-$knob"; mkdir -p "$dir"
-    env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}" \
+    env LD_LIBRARY_PATH="$(rocm_ld_library_path)" \
         HIP_VISIBLE_DEVICES=0,2 LLAMA_SPEC_ALIGN="$knob" ROCBLAS_USE_HIPBLASLT=0 \
         timeout 900 "$LLAMA_CLI" -m "$MODEL" --spec-type "$SPEC" --spec-draft-n-max "$NMAX" \
         -sm "$SM" -ngl 99 -c 8192 -t 8 -fa on --seed 42 --temp 0 -n "$NGEN_SINGLE" \

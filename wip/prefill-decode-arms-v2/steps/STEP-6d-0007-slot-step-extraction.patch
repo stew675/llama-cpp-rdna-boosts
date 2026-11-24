@@ -1,0 +1,126 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 1afffb178..03714ca44 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -5506,6 +5506,70 @@ private:
+         return true;
+     }
+ 
++    // ONE generating step for ONE slot: sample the row the batch just produced, accept it into the sampler,
++    // emit it, run the stop conditions and -- on a stop -- finish the response.
++    //
++    // WHY IT IS A FUNCTION: the two-arm server has TWO implementations of "run a batch and step its slots" (the
++    // prefill arm's post_decode() and the decode arm's loop), and a round implemented twice is a round that
++    // drifts.  The SAMPLING/EMIT/STOP block is the part both need byte for byte; the batch composition is the
++    // part that differs.  `ctx` is the context that RAN the batch (its output buffer holds the row), so the same
++    // function serves ctx_tgt and ctx_dec.
++    //
++    // The RESPONSE LIFECYCLE stays wherever this is called from: with the pair OFF that is the main thread, as
++    // before; the pair's invariant 5 (DESIGN §8) keeps it there when the decode arm is a second thread.
++    // Returns false when the slot was finished here (stop condition), true when generation continues.
++    bool slot_step(server_slot & slot, llama_context * ctx, int32_t tok_idx) {
++        const auto accept_special_token = [&](llama_token token) {
++            return params_base.special ||
++                slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
++        };
++
++        llama_token id;
++        {
++            scoped_timer timer(t_sampl, n_sampl);
++            id = common_sampler_sample(slot.smpl.get(), ctx, tok_idx);
++        }
++
++        slot.i_batch = -1;
++
++        common_sampler_accept(slot.smpl.get(), id, true);
++
++        // here we have synchronized the context (due to the sampling above), so we can do time measurement
++        const int64_t t_now = ggml_time_us();
++
++        slot.stats.n_gen += 1;
++
++        if (slot.stats.n_gen == 1) {
++            slot.stats.update_prompt_last();
++            slot.t_print_last = t_now;
++            slot.n_gen_last = 0;
++        }
++
++        slot.stats.update_gen_last();
++
++        completion_token_output result;
++        result.tok          = id;
++        result.text_to_send = common_token_to_piece(ctx, result.tok, accept_special_token(result.tok));
++        result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
++
++        if (slot.task->params.sampling.n_probs > 0) {
++            populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
++        }
++
++        if (!process_token(result, slot)) {
++            // release slot because of stop condition
++            slot.print_timings();
++            send_final_response(slot);
++            slot.release();
++
++            return false;
++        }
++
++        slot.print_timings_tg();
++
++        return true;
++    }
++
+     void post_decode(int32_t n_batch_tokens, int32_t off) {
+         // for checking if a given batch index is inside the current sub-batch
+         auto is_inside_view = [&](int32_t idx) {
+@@ -5582,48 +5646,8 @@ private:
+             // shifted according to the current sub-batch
+             const int tok_idx = slot.i_batch - off;
+ 
+-            llama_token id;
+-            {
+-                scoped_timer timer(t_sampl, n_sampl);
+-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+-            }
+-
+-            slot.i_batch = -1;
+-
+-            common_sampler_accept(slot.smpl.get(), id, true);
+-
+-            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+-            const int64_t t_now = ggml_time_us();
+-
+-            slot.stats.n_gen += 1;
+-
+-            if (slot.stats.n_gen == 1) {
+-                slot.stats.update_prompt_last();
+-                slot.t_print_last = t_now;
+-                slot.n_gen_last = 0;
+-            }
+-
+-            slot.stats.update_gen_last();
+-
+-            completion_token_output result;
+-            result.tok          = id;
+-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+-            result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+-
+-            if (slot.task->params.sampling.n_probs > 0) {
+-                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+-            }
+-
+-            if (!process_token(result, slot)) {
+-                // release slot because of stop condition
+-                slot.print_timings();
+-                send_final_response(slot);
+-                slot.release();
+-
+-                return;
+-            }
+-
+-            slot.print_timings_tg();
++            // ONE implementation of sample/emit/stop (see slot_step()), shared with the decode arm
++            slot_step(slot, slot.ctx_tgt, tok_idx);
+         });
+ 
+         // speculative decoding - main model sample and accept

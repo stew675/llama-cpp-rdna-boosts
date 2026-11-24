@@ -1,0 +1,26 @@
+# recorded 2026-11-24 by --record on the arms-v2 tree (POST-CHANGE lock)
+# shape: Qwen3.8-27B-Q8_0.gguf devices 0,1,2 extra '-sm tensor -mg 0' np=2 ctx=8192
+I srv llama_server: initializing ...
+I cmn common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+I srv init_listene: The UI is disabled
+I srv init_listene: Use --ui/--no-ui (or deprecated --webui/--no-webui) to enable/disable
+W srv server_setup: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+I srv load_model: loading model '/llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf'
+W common_fit_params -: failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort
+W common_fit_params -: a placement can buy the KV back -- --fit will not take it on your behalf:
+W common_fit_params -: --kv-window N keep the newest N cells of the attention KV in VRAM and the
+W common_fit_params -: older ones in pinned system RAM (ONE copy, LOSSLESS, any model).
+W common_fit_params -: Costs decode in proportion to the depth past N, and nothing when
+W common_fit_params -: N is at or above your run depth;
+W common_fit_params -: `--kv-window auto` lets this fit choose N for the -c you pinned.
+W common_fit_params -: it changes no token (ENVIRONMENT.md 17). Lowering -c, -ngl or the quant also fits, and
+W common_fit_params -: always ends in a clean refusal rather than an allocator abort.
+W all-reduce -: NOT bringing up a second RCCL comm layer -- each one costs ~646 open descriptors on a 3-device split and two of them cross FD_SETSIZE (1024), which aborts the process in a library's select(); this context uses the copy-engine chain instead, and its tensors are decode-sized (the internal pipeline serves them either way)
+W resolve_fused_ops -: layer 3 is assigned to device Meta() but Flash Attention over K/V rows is assigned to device CPU (usually due to missing support)
+W resolve_fused_ops -: Flash Attention over K/V rows not supported, set to disabled
+I cmn init: llama threadpool init, n_threads = 16
+I srv load_model: initializing, n_slots = 2, n_ctx_slot = 8192, kv_unified = 'true'
+I srv load_model: prefill admission: fair share = on, chunk = n_ubatch, skew = 1, duty = 16, no-decode = n_batch
+W srv init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+I srv server_run_i: model loaded
+I srv server_on_li: listening on http://N.N:PORT

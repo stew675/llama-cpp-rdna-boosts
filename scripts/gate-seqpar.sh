@@ -72,6 +72,7 @@ set -uo pipefail
 
 SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPTS/.." && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 
 MODEL="${MODEL:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}"
 BUILD_BIN="${BUILD_BIN:-$HOME/llama.cpp/build-rocm/bin}"
@@ -106,7 +107,7 @@ case "$MODEL" in
     *) echo "ERROR: this gate is the qwen4exp hyper-connection path; point MODEL at a Flash-Next gguf" >&2; exit 2 ;;
 esac
 
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}"
+export LD_LIBRARY_PATH="$(rocm_ld_library_path)"
 export MOE_EXPERT_HEATMAP="${MOE_EXPERT_HEATMAP:-load}"   # pin the residency prior (GREEDY-PURITY.md §89)
 export ROCBLAS_USE_HIPBLASLT=0                           # pin the per-start hipBLASLt choice (INVARIANTS.md §44)
 

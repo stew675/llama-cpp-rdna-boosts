@@ -48,6 +48,7 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 LLAMA_SERVER="${LLAMA_SERVER:-$HOME/llama.cpp/build-rocm/bin/llama-server}"
 MODEL="${MODEL:-/llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf}"
 DRAFT="${DRAFT:-}"
@@ -106,7 +107,7 @@ run_arm() {
     local dir="$KEEPOUT/$arm"
     mkdir -p "$dir"
     local pid
-    env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/opt/rocm-10.1.0-gfx120X/lib}" \
+    env LD_LIBRARY_PATH="$(rocm_ld_library_path)" \
         HIP_VISIBLE_DEVICES="$DEVS" \
         "$@" \
         "$LLAMA_SERVER" -m "$MODEL" \

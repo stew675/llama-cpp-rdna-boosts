@@ -35,7 +35,7 @@
 #   --build-dir NAME BUILD_DIR     build directory inside it (default: build-rocm; must match the
 #                                  canonical build's name so the compiler command lines match)
 #   --jobs N         JOBS          build parallelism (default: nproc)
-#   --rocm DIR       ROCM_DIR      ROCm install (default /opt/rocm-10.1.0-gfx120X)
+#   --rocm DIR       ROCM_DIR      ROCm install (default: resolved from the build, scripts/rocmlib.sh)
 #   --gpu-target T   GPU_TARGETS   default gfx1201
 #   --fast                         build llama-cli/server/bench/perplexity + test-backend-ops only
 #                                  (the delta does not change: `all` costs ~0 extra on a warm ccache,
@@ -47,12 +47,13 @@
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname "${BASH_SOURCE[0]}")/rocmlib.sh"
 MANIFEST="$REPO_DIR/release.json"
 FORK="${SCRATCH_FORK:-$REPO_DIR/../llama.cpp}"
 SCRATCH="${SCRATCH_PATH:-$HOME/llama-scratch}"
 BUILD_DIR="${BUILD_DIR:-build-rocm}"
 JOBS="${JOBS:-$(nproc)}"
-ROCM_DIR="${ROCM_DIR:-${ROCM_714:-/opt/rocm-10.1.0-gfx120X}}"
+ROCM_DIR="${ROCM_DIR:-${ROCM_714:-$(rocm_dir)}}"
 GPU_TARGETS="${GPU_TARGETS:-gfx1201}"
 FAST=0
 CCACHE_ON="${CCACHE:-1}"

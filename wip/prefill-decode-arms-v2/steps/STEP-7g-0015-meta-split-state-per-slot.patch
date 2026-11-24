@@ -1,0 +1,103 @@
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 3db613815..bb3b23916 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -896,10 +896,22 @@ struct ggml_backend_meta_buffer_context {
+             return std::hash<const void *>()(k.first) ^ (size_t) k.second;
+         }
+     };
+-    std::unordered_map<std::pair<const ggml_tensor *, bool>, split_state_entry, split_state_key_hash> split_state_cache[n_split_state_caches];
+-    int      split_state_cache_cur = 0;
+-    uint64_t split_state_cache_used[n_split_state_caches] = {0};
+-    uint64_t split_state_cache_tick = 0;
++    // PER VIEW SLOT, like the containers above -- and for the same reason, measured the hard way: the cache is
++    // a per-BUFFER object, the buffer is the tensor-split backend's and is shared by every context on those
++    // devices, and so two arms computing at once (the two-arm server, or any two contexts on two threads) both
++    // resolved split states through ONE version pointer.  One thread's miss clears or recycles a version the
++    // other thread is holding an iterator into, and the walk dereferences it: SEGV inside
++    // ggml_backend_meta_get_split_state on the decode arm's thread while the prefill arm was computing
++    // (measured 2026-11-23: Flash-Next, 3 devices `-sm tensor`, the pair, one slot decoding while another
++    // prefills -- 2 of 3 runs; the same shape with ONE request in flight never crashed, which is why every
++    // sequential gate passed).  `g_meta_view_slot` is the same `thread_local` selector the containers use, so
++    // one slot per (thread, context) partitions the cache the same way.  The version bookkeeping
++    // (`cur`/`used`/`tick`) moves with it, because it describes this slot's set of versions.
++    std::unordered_map<std::pair<const ggml_tensor *, bool>, split_state_entry, split_state_key_hash>
++        split_state_cache[n_view_slots][n_split_state_caches];
++    int      split_state_cache_cur[n_view_slots] = {0};
++    uint64_t split_state_cache_used[n_view_slots][n_split_state_caches] = {{0}};
++    uint64_t split_state_cache_tick[n_view_slots] = {0};
+ 
+     ggml_backend_meta_buffer_context(
+             ggml_backend_meta_simple_tensor_container & stc_static,
+@@ -2090,9 +2102,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+ 
+     // Current-version cache test, used only to prune the walk (a false negative just visits a node that
+     // the nested lookup then resolves from another version, so pruning is always safe).
++    // this thread's/context's slot: the cache partitions exactly like the view containers do
++    const int ss_slot = g_meta_view_slot;
++    GGML_ASSERT(ss_slot >= 0 && ss_slot < g_meta_n_view_slots);
+     auto ss_cached = [&](const ggml_tensor * t) -> bool {
+         const std::pair k = std::make_pair(t, true);
+-        const auto & c = buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
++        const auto & c = buf_ctx->split_state_cache[ss_slot][buf_ctx->split_state_cache_cur[ss_slot]];
+         const auto itc = c.find(k);
+         return itc != c.end() && memcmp(itc->second.bytes, (const char *) t, sizeof(itc->second.bytes)) == 0;
+     };
+@@ -2101,10 +2116,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+     // other versions for an entry byte-identical to the tensor, else a recycle of the least recently used
+     // one; under the pin a nested lookup only invalidates its own stale entry instead.
+     const std::pair key = std::make_pair(tensor, assume_sync);
+-    auto * cache = &buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
++    auto * cache = &buf_ctx->split_state_cache[ss_slot][buf_ctx->split_state_cache_cur[ss_slot]];
+     auto it = cache->end();
+     auto ss_resolve = [&]() {
+-        cache = &buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
++        cache = &buf_ctx->split_state_cache[ss_slot][buf_ctx->split_state_cache_cur[ss_slot]];
+         it = cache->find(key);
+         if (it == cache->end() || memcmp(it->second.bytes, (const char *) tensor, sizeof(it->second.bytes)) == 0) {
+             return;
+@@ -2119,26 +2134,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+         // the tensor changed: switch to the cache version in which it is unchanged, else recycle the least recently used one
+         int k_new = -1;
+         for (int k = 0; k < buf_ctx->n_split_state_caches && k_new < 0; k++) {
+-            if (k == buf_ctx->split_state_cache_cur) {
++            if (k == buf_ctx->split_state_cache_cur[ss_slot]) {
+                 continue;
+             }
+-            auto it_k = buf_ctx->split_state_cache[k].find(key);
+-            if (it_k != buf_ctx->split_state_cache[k].end() && memcmp(it_k->second.bytes, (const char *) tensor, sizeof(it_k->second.bytes)) == 0) {
++            auto it_k = buf_ctx->split_state_cache[ss_slot][k].find(key);
++            if (it_k != buf_ctx->split_state_cache[ss_slot][k].end() && memcmp(it_k->second.bytes, (const char *) tensor, sizeof(it_k->second.bytes)) == 0) {
+                 k_new = k;
+             }
+         }
+         if (k_new < 0) {
+             for (int k = 0; k < buf_ctx->n_split_state_caches; k++) {
+-                if (k != buf_ctx->split_state_cache_cur &&
+-                        (k_new < 0 || buf_ctx->split_state_cache_used[k] < buf_ctx->split_state_cache_used[k_new])) {
++                if (k != buf_ctx->split_state_cache_cur[ss_slot] &&
++                        (k_new < 0 || buf_ctx->split_state_cache_used[ss_slot][k] < buf_ctx->split_state_cache_used[ss_slot][k_new])) {
+                     k_new = k;
+                 }
+             }
+-            buf_ctx->split_state_cache[k_new].clear();
++            buf_ctx->split_state_cache[ss_slot][k_new].clear();
+         }
+-        buf_ctx->split_state_cache_cur = k_new;
+-        buf_ctx->split_state_cache_used[k_new] = ++buf_ctx->split_state_cache_tick;
+-        cache = &buf_ctx->split_state_cache[k_new];
++        buf_ctx->split_state_cache_cur[ss_slot] = k_new;
++        buf_ctx->split_state_cache_used[ss_slot][k_new] = ++buf_ctx->split_state_cache_tick[ss_slot];
++        cache = &buf_ctx->split_state_cache[ss_slot][k_new];
+         it = cache->find(key);
+     };
+     ss_resolve();
+@@ -2207,7 +2222,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             ss_verify_active = false;
+         }
+         // the calculation recurses into the sources and may have switched the current version
+-        cache = &buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
++        cache = &buf_ctx->split_state_cache[ss_slot][buf_ctx->split_state_cache_cur[ss_slot]];
+         auto & entry = (*cache)[key];
+         entry.set(ss, n_bufs);
+         memcpy(entry.bytes, tensor, sizeof(entry.bytes));

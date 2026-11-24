@@ -23,7 +23,7 @@
 #   3. apply the DEFAULT set (patches/0000-0015 then patches/0300) with
 #      scripts/apply-all.sh (strict `git am`) and assert the applied tree ==
 #      release.json.tree; the optional 01xx artifacts are NOT applied,
-#   4. build the full / light / server images against ROCm 7.14.1 and 10.1
+#   4. build the full / light / server images against ROCm 7.14.1 and 10.2
 #      (both -full base).  ROCm 7.2 (-complete) is slower and remains
 #      requestable via the dispatch input.
 #   5. push to ghcr.io/<owner>/<repo> (nothing is pushed if `push` is unchecked).
@@ -39,7 +39,7 @@ on:
       rocm_versions:
         description: "Space-separated ROCm release lines to build (7.2 is manual-only: it can exceed the 6 h runner timeout)"
         required: true
-        default: "7.14.1 10.1"
+        default: "7.14.1 10.2"
         type: string
       push:
         description: "Push the built images to GHCR (uncheck for build-only validation)"
@@ -120,7 +120,7 @@ jobs:
         id: m
         shell: bash
         env:
-          REQUESTED: ${{ github.event.inputs.rocm_versions || '7.14.1 10.1' }}
+          REQUESTED: ${{ github.event.inputs.rocm_versions || '7.14.1 10.2' }}
         run: |
           set -euo pipefail
           items='[]'
@@ -130,7 +130,7 @@ jobs:
               # timeout.  Requesting it explicitly still works, but it is not built automatically.
               7.2)  full="7.2.4";  suffix="complete" ;;
               7.14.1) full="7.14.1"; suffix="full" ;;
-              10.1) full="10.1.0"; suffix="full" ;;
+              10.2) full="10.2.0"; suffix="full" ;;
               *) echo "unsupported ROCm release line: $v" >&2; exit 1 ;;
             esac
             items="$(jq -c --arg v "$v" --arg f "$full" --arg s "$suffix" \
@@ -219,7 +219,7 @@ jobs:
             echo "cache=${image}:buildcache-rocm-${v}"
           } >> "$GITHUB_OUTPUT"
           server="${image}:server-rocm-${v},${image}:server-rocm-${v}-${fp},${image}:rocm-${v}"
-          if [ "$v" = "10.1" ]; then
+          if [ "$v" = "10.2" ]; then
             server="${server},${image}:latest"
           fi
           echo "server=$server" >> "$GITHUB_OUTPUT"

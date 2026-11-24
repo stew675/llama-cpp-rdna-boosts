@@ -1,0 +1,40 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index cec35d005..5c57b622e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1611,6 +1611,15 @@ void llama_context::sched_new(const sched_params & params) {
+ }
+ 
+ void llama_context::sched_alt_select(bool alt) {
++    // Bind the Meta view slot BEFORE the no-op early return.  The slot is `thread_local`, and a thread that runs
++    // two contexts (target + draft head, or the pair's two arms once the speculator is re-admitted) has last
++    // bound whichever context built a graph most recently -- so "the requested state is already the current
++    // state" says nothing about the SLOT.  Rebinding is a thread-local int store; without it the context's
++    // graph is built AND allocated under the other context's view containers, and the Meta backend's view
++    // lookup returns a null tensor for a buffer the two share (`GGML_ASSERT(tensor)` in
++    // ggml_backend_tensor_set_async, measured 2026-11-23: Flash-Next + the external shared MTP head on 3
++    // devices `-sm tensor`, which the r353 delivery build runs and STEP 4 broke).
++    meta_bind_view_slot(alt);
+     if (alt == sched_alt_in_use) {
+         return;
+     }
+@@ -1627,7 +1636,6 @@ void llama_context::sched_alt_select(bool alt) {
+     std::swap(sched, sched_alt);
+     std::swap(gf_res_prev_active, gf_res_prev_active_alt);
+     sched_alt_in_use = alt;
+-    meta_bind_view_slot(alt);
+ }
+ 
+ bool llama_context::sched_alt_for(const llama_ubatch & ubatch) const {
+@@ -4760,6 +4768,11 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph
+ ggml_status llama_context::graph_compute(
+             ggml_cgraph * gf,
+                    bool   batched) {
++    // Resolving a graph is a Meta-view-slot operation, so bind on this path too: it is the one choke point that
++    // every resolve goes through, including the ones that do not pass `sched_alt_select()` (the KV cache's own
++    // cache-compute graph).  Same thread-local store, same reason as in sched_alt_select().
++    meta_bind_view_slot(sched_alt_in_use);
++
+     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
+     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
+ 
