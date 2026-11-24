@@ -8,6 +8,33 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — STEP 10a: the draft round extracted for both arms (`WORKLOG.md` 261123.027)
+
+`steps/STEP-10a-0017-draft-round-extraction.patch` (`~/llama.cpp` `e7ae0b470`), `tools/server/server-context.cpp`
++161/-155.  `slot_accept_draft_round(slot, ctx, seq_rm_type)` now holds the verify/accept/rollback/emit round that
+was inline in `post_decode`, with the context as a PARAMETER (the decode arm's verify batch runs on `ctx_dec`,
+which borrows the same memory, so positions and rollback are the same object) and that context's `seq_rm_type` as
+its capability.  The two separate `accept_special_token` lambdas became one member helper.  This is the same
+shape as STEP 6d-1's `slot_step()` extraction: no behaviour change, and it is what lets the decode arm run the
+round at all.
+
+**Verified on the drafter path, pair OFF** (27B Q8_0, 3 devices `-sm tensor`, `draft-mtp-adaptive` n_max 7,
+`-n 600`, `baseline/mtp-axis.sh`):
+
+| axis | text | acceptance (drafts/gen tokens) | the STEP 0 A5 record |
+|---|---|---|---|
+| K | **`a87c4318b649`** (2174 chars) | **74 / 73 / 435 / 423**, pos-1 0.986 | `a87c4318b649`, **74 / 73 / 435 / 423** -- identical |
+| R | `28c205358077` (3156 chars) | 187 / 145 / 715 / 411, pos-1 0.775 | (A5's R is `-n 3000`; not comparable by length) |
+
+**Still owed by STEP 10** (the next landing): the decode arm's draft round (mirror the prefill arm's
+`draft params -> common_speculative_draft -> handle_last_sampled_token -> process -> slot_accept_draft_round`),
+the speculator mutex across the two arms, the slot's speculative state reset on BOTH handover directions, the
+predicate change that admits `draft-mtp`/`-adaptive`/`draft-simple`/ngram while keeping the layer-input families
+and a gemma4 assistant refused, and then the three-way cold text oracle on 3 devices f16 / 3 devices q8_0 /
+2 devices f16.
+
+---
+
 ## 2026-11-23 — STEP 9: the shape / latency / memory matrix — and the two defects it found (`WORKLOG.md` 261123.023)
 
 `baseline/shape-matrix.sh` (new) + `server-arm.sh --vram-probe` (new).  Both landings it needed are

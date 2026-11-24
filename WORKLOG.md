@@ -1,3 +1,24 @@
+## 261123.027 (no release; `prefill-decode-arms` v2 STEP 10a) -- the verify/accept round is extracted so BOTH arms can run it
+
+STEP 10 re-admits the speculator on the pair, and the decode arm must run the same draft/verify/accept round the
+prefill arm runs.  First half: `slot_accept_draft_round(slot, ctx, seq_rm_type)`, extracted out of `post_decode`
+(`e7ae0b470`, +161/-155 -- the same shape as STEP 6d-1's `slot_step()` extraction).  The context is a parameter,
+not `slot.ctx_tgt`, because the decode arm's verify batch runs on `ctx_dec` (which borrows the same memory, so
+positions and rollback are the same object), and `seq_rm_type` is that context's own capability.  The two
+`accept_special_token` lambdas collapsed into one member helper (an extracted function at class scope could not
+see either).
+
+Verified on the drafter path with the pair OFF, against the STEP 0 A5 record: 27B Q8_0, 3 devices `-sm tensor`,
+`draft-mtp-adaptive` n_max 7, `-n 600` -- axis K `a87c4318b649` with acceptance **74/73/435/423** (A5: the same
+hash and the same four counts), axis R completes normally.  A pure refactor, so a change there would have been a
+defect in the extraction.
+
+Still owed by STEP 10: the decode arm's draft round, the speculator mutex across the arms, the slot's speculative
+state reset on both handover directions, the predicate that admits `draft-mtp`/`-adaptive`/`draft-simple`/ngram
+while keeping the layer-input families and a gemma4 assistant refused, and the three-way cold text oracle.
+
+---
+
 ## 261123.026 (no release; `prefill-decode-arms` v2 STEP 9, the 27B row at defaults) -- the pair's ITL win is a property of the shape, not of the feature: 27B gains 7.5 %, Flash-Next 57 %
 
 The 27B tensor-split row was only measurable with hipBLASLt off before STEP 7h.  At delivery defaults (barrier on)
