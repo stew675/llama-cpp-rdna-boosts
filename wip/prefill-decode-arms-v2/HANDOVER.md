@@ -38,6 +38,13 @@ candidate patch + the ask (STEP 12).**  Read `§0.0 START HERE` first; it is the
   replay reproduces the campaign tree `14dfb1f64` **exactly**.
 * **Correction recorded:** §12.1's `git diff 919794500` is wrong — a `beta/` candidate is applied AFTER the blocks and
   must be release-tree-relative `format-patch` output.
+* **STEP 13 (added 2026-11-24, from the maintainer's beta testing) — a crash the STEP 11 sweep could not see:**
+  aborting one of two concurrent generations killed the server (`GGML_ASSERT(t_start > 0)`), because the CANCEL
+  path released a slot the decode arm was mid-round on.  Fixed by `release_slot()` (quiesce the arm, then
+  release), gated by the new `gates/gate-arms-cancel.sh` (fails pre-fix, passes after).  A second tester crash
+  (`-sm tensor` on 3 devices: `FD_SETSIZE` exhausted by RCCL's IPC rings, doubled by the second context) is
+  **diagnosed and recorded as a Known issue in the beta artifact, not yet fixed** — `GGML_CUDA_ALLREDUCE=ce` is
+  the measured workaround (11 fds), and the maintainer's decision is a true fix.  `INVARIANTS.md` r381/r382-wip.
 * **NOT taken:** promotion into `patches/` as block 17.  That is the maintainer's decision, and a validated window
   comes first.
 
@@ -659,6 +666,11 @@ gates/     gate-arms-default-inert.sh  pair OFF on 4 shapes: cli text + startup 
                                      the four-axis protocol ON the pair, and the non-vacuity lines (the
                                      decode-arm census, drafts AND accepted drafts).  `--nreq 1` on the
                                      axis arms, `-lv 4` for the statistics (the text comes over HTTP)
+           gate-arms-cancel.sh       STEP 13's gate (a beta tester's crash): two concurrent generations, ABORT
+                                     one (a client disconnect -> a CANCEL), N rounds per arm; the server must
+                                     survive, the decode arm must provably have run (`finish_pending` is what
+                                     prints the census, so one round lets a request FINISH), and the pair-OFF
+                                     control must survive too.  FAILS on the pre-fix build (round 2)
            probe-*.cpp              the five non-vacuity probes (host stream, ctx-memory, kv reservation,
                                     meta slots, recurrent placement) -- each compiles against the built tree:
    e.g.  /opt/rocm-10.2.0-gfx120X/lib/llvm/bin/clang++ -std=c++17 -O1 -pthread probes.cpp \

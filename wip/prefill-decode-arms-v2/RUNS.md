@@ -1,3 +1,64 @@
+## 2026-11-24 — STEP 13: a beta tester's abort crash (FIXED) and the `-sm tensor` FD ceiling (diagnosed) — `WORKLOG.md` 261124.004
+
+### 1. Crash: aborting one of two concurrent generations
+
+Reproducer (`/tmp/repro-cancel.sh`, kept as `gates/gate-arms-cancel.sh`): 4B Q8_0, 1 GPU, `-np 2`, two streaming
+generations, `kill -9` one client (the server enqueues a CANCEL), then check `/health`.
+
+| build | pair | result |
+|---|---|---|
+| pre-fix | ON | **died on abort attempt 2 of 2 runs** — `GGML_ASSERT(t_start > 0)` (`server-common.h:463`) |
+| pre-fix | OFF | survived 25/25 |
+| fixed | ON | survived 25/25 |
+| fixed | ON, tester's shape (Flash-Next `-ncmoe 48`, pool, `-sm tensor`) | survived 6/6 rounds, 0 errors |
+
+Non-vacuity: `the decode arm is generating: 2158 step(s), 25 handover(s), widest batch 2 slot(s)` (from a round
+that lets one request FINISH — an aborted request never sets `finish_pending`, so abort rounds alone are vacuous).
+
+The new gate, both ways round (the reason it is a gate and not a test):
+
+```
+pre-fix build : FAIL — "the server DIED on abort round 2" / GGML_ASSERT(t_start > 0)
+fixed build   : PASS — 12 abort rounds, census 2158/25/2, pair-OFF control passes, journal clean
+```
+
+### 2. Crash: long generation + a ~77K-token prefill, `-sm tensor`, 3 devices
+
+Reproducer: Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, pool (`LLAMA_KV_REGION_POOL=102400`), `-c 204800`, `-np 2`,
+`draft-mtp-adaptive` n_max 7 with the `-Q8_0` head, `-sm tensor -mg 0`, pair ON; a streaming 10000-word request,
+then 5 s later a 340 KB / ~77K-token prompt on the other slot.
+
+```
+round 1, ~6 s after the prefill started:  *** bit out of range 0 - FD_SETSIZE on fd_set ***: terminated  -> Aborted
+```
+
+**fd census** (same shape, after load, before any request):
+
+| shape | open fds | `/dev/shm/nccl-*` | verdict |
+|---|---|---|---|
+| 1 GPU, pair ON | 10 | — | fine |
+| 3 dev `-sm tensor`, pair OFF | 686 | 646 | fine |
+| 2 dev `-sm tensor`, pair ON | 568 | ~548 | fine (prefill processed: `http=200`, acceptance 0.72, arm 342 steps) |
+| 3 dev `-sm tensor`, pair ON | 1356 | 1292 | **abort** |
+| 3 dev `-sm tensor`, `GGML_CUDA_ALLREDUCE=ce`, pair OFF | **11** | 0 | fine |
+| 3 dev `-sm tensor`, `GGML_CUDA_ALLREDUCE=ce`, pair ON | **11** | 0 | fine |
+
+The 646 is RCCL's IPC rings: `auto` initialises RCCL eagerly (host-expert or not), and the pair's second
+`llama_context` doubles it.  `FD_SETSIZE` is compile-time and the tripping `select()` is in a prebuilt library, so
+it cannot be raised from here; `ulimit -n` is 524288 and irrelevant.  `ce` (no RCCL) has no fds at all and does
+not grow with a second context.
+
+**Not fixed yet.**  The maintainer's decision is a true fix.  Sharing one communicator is unsound (concurrent
+arms cannot guarantee a matching collective order across ranks — see `INVARIANTS.md` r382-wip item 4), so the
+candidates are a per-context all-reduce chain for the decode context, or a smaller RCCL descriptor footprint.
+
+### 3. Regression set for STEP 13 (all green)
+
+`gate-arms-cancel.sh` (new) PASS, `gate-arms-default-inert.sh --no-cli` PASS (4 shapes, pair-OFF shapes
+byte-identical, the pair-ON sensitivity arm still reads the same responses), `gate-arms-multislot.sh` PASS
+(`9 step(s), 3 handover(s), widest batch 3`, 0 errors), `gate-arms-spec.sh` **36/36 PASS**,
+`scripts/gate-park-idle-slots.sh` PASS, `scripts/gate-ckpt-reuse.sh` PASS, whole-set `all` build clean.
+
 ## 2026-11-24 — STEP 11 (the delivery regression sweep) and STEP 12 (the candidate) — `WORKLOG.md` 261124.003
 
 ### STEP 11: 16/16 delivery gates green on `ffaee2c52`

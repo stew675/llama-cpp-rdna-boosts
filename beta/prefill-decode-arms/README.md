@@ -15,10 +15,10 @@ and **nothing is copied between them**.
 | | |
 |---|---|
 | patch | `prefill-decode-arms.patch` — **one** commit, cut against the current `release.json` tree |
-| sha256 | `a4e207c96898b5c6a1075d55de340a4d2793a24f95e9cb0e34bbf87c4687585e` |
-| size | 42 files, **+2854 / −715** (317 302 bytes) |
+| sha256 | `77bd3a72f2bf3a45f7fe9c7ae278d09eca23b1ca0d51d32f1135de97b0d2a03f` |
+| size | 42 files, **+2942 / −741** (329 429 bytes) |
 | cut against | `release.json` base `919794500`, tree **`27db9bfd4ef7f41c7df60f704410de28863beac3`** |
-| **applied tree** | **`84ffb1ef1c5fd56f2a02f44f9068bef839a95d98`** (release tree + this patch; verified twice, below) |
+| **applied tree** | **`fdcd86d81c1251339a4214a5eb90cff254491270`** (release tree + this patch; verified twice, below) |
 | options | `--prefill-decode-arms` / `--no-prefill-decode-arms` (`LLAMA_ARG_PREFILL_DECODE_ARMS`), `--prefill-decode-arms-mode off\|on\|auto` (`LLAMA_ARG_PREFILL_DECODE_ARMS_MODE`) — **both default OFF** |
 | campaign record | `wip/prefill-decode-arms-v2/` (`DESIGN.md`, `RUNS.md`, `HANDOVER.md`, `gates/`, `baseline/`) |
 
@@ -29,15 +29,15 @@ git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 919794500
 bash <delivery>/scripts/apply-all.sh --include-beta .
 #   18 delivery blocks (tip 089f90067, tree 27db9bfd4...), then this patch
-#   applied tree: 84ffb1ef1c5fd56f2a02f44f9068bef839a95d98
+#   applied tree: fdcd86d81c1251339a4214a5eb90cff254491270
 ```
 
 **The round-trip was verified on this box:** a fresh clone at the release tree (`089f90067`, tree `27db9bfd4…`)
-`git am`s this patch strictly and reads tree **`84ffb1ef1c…`**; and the full tester path
+`git am`s this patch strictly and reads tree **`fdcd86d81c…`**; and the full tester path
 (`apply-all.sh --include-beta .`) from `919794500` reports the same applied tree.  The patch was cut from a
-canonical chain — `apply-all.sh` on a clean checkout at `919794500`, then the campaign's 19 `steps/` replayed in
+canonical chain — `apply-all.sh` on a clean checkout at `919794500`, then the campaign's 20 `steps/` replayed in
 order, then the generated docs regenerated — and the replayed tree equals the campaign's own tree
-(`14dfb1f64…` before the doc regeneration) **exactly**.
+(`f191c7bf1…` before the doc regeneration) **exactly**.
 
 ## What it does
 
@@ -53,13 +53,16 @@ and one plain lock on the memory, with a reservation bitmap; a per-**context** M
 split-state cache; the contextified `llama_memory_recurrent` placement; **one pinned slab work region per extra
 context**, routed by the allocating context's own identity (`thread_local`), so the prefill arm's compute view can
 no longer alias the decode arm's (that alias is a `MEMORY_APERTURE_VIOLATION` page fault); the pair's
-compute-buffer drop disabled (it races the other arm's graph capture); and a **capture/library-GEMM barrier**
+compute-buffer drop disabled (it races the other arm's graph capture); a **capture/library-GEMM barrier**
 (graph capture exclusive, library GEMMs shared, `cublas_handle()`/`cublaslt_handle()` **creation** exclusive — the
-creation is what actually tripped).
+creation is what actually tripped); and `release_slot()`, the main-thread teardown that quiesces the decode arm
+before releasing a slot it may be mid-round on (the CANCEL/abort path — a tester's crash, `gate-arms-cancel.sh`).
 
 ## Shapes it reaches
 
-A server shape is admitted when `common_arms_pair_possible()` returns no reason.  It was measured on: 4B Q8_0
+A server shape is admitted when `common_arms_pair_possible()` returns no reason.  **A `-sm tensor` split on 3 or
+more devices with `GGML_CUDA_ALLREDUCE=auto` does NOT work yet** (see *Known issue* below) — 1-2 devices are fine.
+It was measured on: 4B Q8_0
 (1 GPU), phi-4 IQ4_XS (1 GPU dense), 27B Q8_0 (3 GPU `-sm tensor`), 35B-A3B Q8_0 (1 GPU, `-ncmoe 40`, host-expert
 tier), Flash-Next GSQ IQ3_S (3 GPU `-sm tensor`, qwen4exp), Gemma4 26B-A4B (iswa), and **Gemma4 26B-A4B + its
 external MTP head** (`-ncmoe 20`, both aux regions pinned).
@@ -152,6 +155,43 @@ Once per slot the slab logs the region's measured size and the reserve that woul
 5. **One request in flight for a byte claim.**  Two requests in flight pick their own batch composition (and even
    the unmodified server varies run to run), so a *byte* claim under concurrency is a lottery; the concurrency arms
    assert the census, the ITL bound and a clean fault scan instead.
+
+## Known issue — `-sm tensor` on 3+ devices exhausts `FD_SETSIZE` (open; a true fix is agreed, not in this patch)
+
+Found by the same beta tester, 2026-11-24.  A long generation plus a ~77K-token prefill on the other slot aborts
+the server with
+
+```
+*** bit out of range 0 - FD_SETSIZE on fd_set ***: terminated        (then: Aborted)
+```
+
+**It is NOT a memory bug — it is the file-descriptor count.**  Each `llama_context` brings up its own RCCL comm
+layer under `GGML_CUDA_ALLREDUCE=auto`, and RCCL's IPC rings cost one `/dev/shm/nccl-*` descriptor per peer per
+channel.  Measured here on the Flash-Next `-ncmoe 48` / attendance-pool shape:
+
+| shape | open fds | of which `/dev/shm/nccl-*` | verdict |
+|---|---|---|---|
+| 1 GPU, pair ON | 10 | — | fine |
+| 3 dev `-sm tensor`, pair OFF | 686 | 646 | fine (the delivery alone sits at 63 % of the ceiling) |
+| 2 dev `-sm tensor`, pair ON | 568 | ~548 | fine |
+| **3 dev `-sm tensor`, pair ON** | **1356** | **1292** | **abort** — the second context's comm layer doubles the 646 |
+
+`FD_SETSIZE` is 1024 and **compile-time**: the check is glibc's inline `__FD_SET`, expanded in the *caller's*
+translation unit, and the `select()` that trips it is inside a **prebuilt** library (RCCL/ROCr — there is no
+`select()` anywhere in this tree; the vendored httplib is thread-per-connection).  `ulimit -n` is irrelevant
+(524288 here).
+
+**Workaround, measured:** `GGML_CUDA_ALLREDUCE=ce` never brings RCCL up (the copy-engine chain needs no
+descriptors), and the count becomes **11 for both pair-OFF and pair-ON** on the same 3-device split.  It is a
+supported value of the delivery's all-reduce selector, and the CE large-tensor arm measures *faster* than RCCL's
+on a 3-device config (`ggml-cuda.cu`: pp2048 2227 vs 2187 t/s) — but the delivery prefers the RCCL ring for
+host-expert shapes, so this is a trade, not a free substitution.
+
+**The fix is NOT in this patch.**  Note that simply *sharing* one communicator between the two contexts is not
+sound: the two arms compute concurrently, and a collective's order must match on every rank, which two
+unsynchronised arms cannot guarantee.  The sound candidates are (a) a per-context all-reduce chain for the decode
+context (CE — its tensors are decode-sized anyway) or (b) reducing RCCL's descriptor footprint.  Until then, add
+`GGML_CUDA_ALLREDUCE=ce` to a 3+-device `-sm tensor` run.
 
 ## Not covered by the delivery's release gates
 

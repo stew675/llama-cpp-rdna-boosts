@@ -3082,3 +3082,48 @@ it removed an abort (r374-wip) -- so the per-shape rule above stands, now on the
    three gates whose anchors DO bind them to a model class, and it is not one of them).  The rule for the next
    sweep: check that every gate's default model exists BEFORE running the ladder, and read the failure as `check
    the box` first, `check the diff` second.
+
+## r381-wip (2026-11-24, `WORKLOG.md` 261124.004) — a slot teardown must QUIESCE the arm that may be mid-round on it (`prefill-decode-arms` v2 STEP 13, from a beta tester)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/`, `beta/prefill-decode-arms/`.
+
+1. **A main-thread `release()` of a DECODE-owned slot is a data race on the slot, and `server_slot::release()` had
+   no arm guard on the CANCEL path.**  Aborting one of two long generations (a client disconnect -> a
+   `SERVER_TASK_TYPE_CANCEL`) released the slot the decode arm had ALREADY collected for its round: `reset()`
+   zeroed `stats` (`t_start = 0`, `n_gen = 0`) and the task, and the arm's per-slot step -- which runs after
+   `llama_process()` returns -- saw `n_gen == 0`, took the first-token branch, and aborted at
+   `GGML_ASSERT(t_start > 0)` (`tools/server/server-common.h`).  **The rule:** taking a slot away from an arm is
+   two steps, both under the arms mutex -- (a) clear the ownership so no LATER round claims it, (b) wait for the
+   round that already holds it.  `release_slot()` is that; the claim (`server_slot::arm_busy`) must be taken in
+   the SAME critical section that COLLECTS the round's slots (a separate claim leaves a window in between), and
+   cleared on every exit path (an uncleared claim deadlocks the next release).
+2. **Reproduce with `pair OFF` before blaming the feature, and the other way round:** the same recipe died 2 of 2
+   with the pair ON and survived 25 of 25 with it OFF -- that pair of numbers is what classifies a crash as the
+   arms path.  `gates/gate-arms-cancel.sh` is the regression instrument: it fails on the pre-fix build (round 2)
+   and passes after, and it asserts non-vacuity (`the decode arm is generating: 2158 step(s), 25 handover(s),
+   widest batch 2`) because an ABORTED request never sets `finish_pending` and so can never print the census line
+   -- abort rounds alone are vacuous.
+
+## r382-wip (2026-11-24, `WORKLOG.md` 261124.004) — the FD ceiling: RCCL's IPC rings cost ~646 descriptors per context, and `FD_SETSIZE` is not raisable for a prebuilt library (`prefill-decode-arms` v2, beta tester report)
+
+*No delivery revision:* the measurement only; the fix is not landed.
+
+1. **A `-sm tensor` split on 3 devices + the pair aborts with `*** bit out of range 0 - FD_SETSIZE on fd_set ***`,
+   and it is descriptor exhaustion, not memory.**  Measured on Flash-Next `-ncmoe 48` + the attendance pool:
+   **686 fds (646 `/dev/shm/nccl-*`) with the pair OFF, 1356 (1292) with it ON, 568 with 2 devices, 10 on one
+   GPU.**  Every `llama_context` brings up its own RCCL comm layer (`GGML_CUDA_ALLREDUCE=auto` inits RCCL
+   EAGERLY, host-expert shape or not), so a second context doubles the rings past `FD_SETSIZE` = 1024.  Note the
+   DELIVERY alone already sits at 646/1024 on this shape.
+2. **`FD_SETSIZE` cannot be raised for the offender.**  It is a compile-time constant of the TU that expands
+   `__FD_SET` (glibc's inline check), and the `select()` in question is inside a PREBUILT library -- there is no
+   `select()` in this tree at all (the vendored httplib 0.67 is thread-per-connection).  `ulimit -n` is unrelated
+   (524288 here).
+3. **`GGML_CUDA_ALLREDUCE=ce` removes the whole class: 11 fds with the pair OFF and 11 with it ON.**  The CE chain
+   never brings RCCL up.  It is a supported selector value and its large-tensor arm measures FASTER than RCCL's on
+   a 3-device config (pp2048 2227 vs 2187 t/s), but `ggml-cuda.cu`'s dual-arm default prefers the RCCL ring for
+   host-resident experts, so it is a trade until the pair stops carrying a second RCCL.
+4. **Do NOT "fix" this by sharing one communicator between the two contexts.**  The two arms compute concurrently
+   (that is the feature) and a collective's ORDER must match on every rank; two unsynchronised arms cannot
+   guarantee that, and any local lock orders them differently per rank.  The sound directions are a per-context
+   all-reduce chain for the decode context (it only ever reduces decode-sized tensors) or a smaller RCCL
+   descriptor footprint.

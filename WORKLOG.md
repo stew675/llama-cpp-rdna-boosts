@@ -1,3 +1,54 @@
+## 261124.004 (no release; `prefill-decode-arms` v2 STEP 13, from BETA TESTER reports) -- aborting one of two generations killed the server (FIXED, gated), and "-sm tensor on 3 devices" dies of FD exhaustion, not memory (diagnosed, fix agreed)
+
+Both found by the maintainer beta-testing the candidate on `Qwen3.8-Flash-Next/GSQ-IQ3_XXS` (his `runme`, which is
+`--prefill-decode-arms-mode auto -np 2`).  Neither is in `patches/`; the candidate was re-cut.
+
+1. **Crash 1 -- `GGML_ASSERT(t_start > 0)` on abort.  FIXED.**  Two long generations, abort one (the client
+   disconnects, the server enqueues a CANCEL), and the server aborted:
+   `slot release: id 1 | task 304 | stop processing: n_tokens = 71453` then
+   `server-common.h:463: GGML_ASSERT(t_start > 0) failed`.  `SERVER_TASK_TYPE_CANCEL` released the slot on the MAIN
+   thread with **no arm guard**, while the DECODE arm had already collected that slot for its round: `reset()`
+   zeroed the stats (`t_start = 0`, `n_gen = 0`) and the task, and the arm's per-slot step (which runs after
+   `llama_process()` returns) saw `n_gen == 0`, took the first-token branch and asserted.  Reproduced on a 4B /
+   1 GPU / np 2 shape: **pair ON died on abort attempt 2 of 2 runs, pair OFF survived 25/25** -- so it is the
+   arms path, not "aborting is unsafe".  Fix (`STEP-13-0020-cancel-release-barrier.patch`):
+   `server_context_impl::release_slot()` takes the slot away from the arm (`arm = ARM_PREFILL`) so no later round
+   claims it, and waits for `server_slot::arm_busy` -- claimed for a whole decode round in the SAME critical
+   section that collects the round's slots, cleared by an RAII guard on every exit path -- so no current round
+   touches it.  All 30 main-thread teardown sites now route through it; with the pair off it is exactly
+   `slot.release()`.  Verified: pair ON 25/25 aborts survived (and the tester's Flash-Next `-ncmoe 48` / pool /
+   `-sm tensor` shape, 6/6 rounds, 0 errors), non-vacuous (`2158 step(s), 25 handover(s), widest batch 2`).
+   **New gate `gates/gate-arms-cancel.sh` -- it FAILS on the pre-fix build (died at round 2 with the same assert)
+   and PASSES on the fixed one**, with a pair-OFF control and two non-vacuity lines.  Also re-ran green:
+   `gate-arms-default-inert` (4 shapes), `gate-arms-multislot` (widest batch 3), `gate-arms-spec` (36/36),
+   `scripts/gate-park-idle-slots.sh`, `scripts/gate-ckpt-reuse.sh`, and the whole-set build.
+2. **Crash 2 -- `-sm tensor` on 3 devices: `*** bit out of range 0 - FD_SETSIZE on fd_set ***: terminated`.
+   DIAGNOSED; it is FILE DESCRIPTORS, not memory.**  Reproduced exactly with the tester's recipe (a long
+   generation, then a ~77K-token prefill on the other slot: abort at round 1, ~6 s in).  Measured on the
+   Flash-Next `-ncmoe 48` / pool shape: **3 devices pair OFF = 686 fds (646 of them `/dev/shm/nccl-*`), 3 devices
+   pair ON = 1356 (1292 shm), 2 devices pair ON = 568 (fine), 1 GPU = 10.**  Each `llama_context` brings up its
+   own RCCL comm layer under `GGML_CUDA_ALLREDUCE=auto`, and the second one doubles the IPC rings past
+   `FD_SETSIZE` (1024); the abort is glibc's inline `__FD_SET` check inside a PREBUILT library (there is no
+   `select()` in this tree, and the vendored httplib is thread-per-connection), so **a compile-time `FD_SETSIZE`
+   bump cannot be applied to it** and `ulimit -n` (524288 here) is irrelevant.  **`GGML_CUDA_ALLREDUCE=ce` (RCCL
+   never brought up) measures 11 fds for BOTH pair OFF and pair ON on the same split** -- the workaround, and a
+   supported selector value whose CE large-tensor arm is measured *faster* than RCCL's on a 3-device config
+   (pp2048 2227 vs 2187 t/s), though the delivery prefers the RCCL ring for host-expert shapes.  **Not fixed yet.**
+   The maintainer's decision is a true fix (not a refusal): the natural "share one comm layer" is NOT sound --
+   the two arms compute concurrently and a collective's order must match on every rank, which unsynchronised arms
+   cannot guarantee -- so the candidates are a per-context all-reduce chain for the decode context (CE) or a
+   smaller RCCL descriptor footprint.
+3. **A tester-side harness bug, fixed by the maintainer:** the `runme`'s `LD_LIBRARY_PATH` default pointed at
+   ROCm **10.1** (`/opt/rocm-10.1.0-gfx120X/lib`, which exists on this box), and `LD_LIBRARY_PATH` beats the
+   build's RUNPATH -- i.e. a 10.2 build loading 10.1 libraries, the trap `INVARIANTS.md` r359-wip records.  Every
+   fresh-process comparison made that way is a coin flip.
+4. **Candidate re-cut** with crash 1's fix folded in: `beta/prefill-decode-arms/prefill-decode-arms.patch`, sha256
+   `77bd3a72f2bf3a45f7fe9c7ae278d09eca23b1ca0d51d32f1135de97b0d2a03f`, 42 files, **+2942/-741**, applying to tree
+   **`fdcd86d81c`**; the canonical replay (20 `steps/` now) reproduces the campaign tree `f191c7bf1` exactly, and a
+   fresh clone at the release tree `git am`s it back to `fdcd86d81c`.  `beta/prefill-decode-arms/README.md`
+   carries crash 2 as a **Known issue** with the numbers and the `ce` workaround, so a tester is not left to
+   discover it.
+
 ## 261124.003 (no release; `prefill-decode-arms` v2 STEP 11+12) -- the delivery regression sweep is GREEN, and the candidate that REPLACES `beta/prefill-decode-arms/` is cut and verified (promotion NOT taken: it is a block decision)
 
 The two closing steps of the v2 campaign.  Neither touches `patches/`, `release.json`, `MANIFESTS.md`, `BASELINE.md`
