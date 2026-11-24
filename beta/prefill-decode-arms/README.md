@@ -15,10 +15,10 @@ and **nothing is copied between them**.
 | | |
 |---|---|
 | patch | `prefill-decode-arms.patch` — **one** commit, cut against the current `release.json` tree |
-| sha256 | `a2badad1933248a0a4660c77a846b471626e7fc5e31bf72202866808e366fe3c` |
-| size | 42 files, **+3073 / −741** |
+| sha256 | `f51a78b00d73bf9c000a158f99e1d7fadff9ca18f1a8169c6f275c03582d35bb` |
+| size | 42 files, **+3147/−776** |
 | cut against | `release.json` base `919794500`, tree **`27db9bfd4ef7f41c7df60f704410de28863beac3`** |
-| **applied tree** | **`e24d88b31e06c38d3063a5d34f4ee6326ca8a9c0`** (release tree + this patch; verified twice, below) |
+| **applied tree** | **`29c9644350e5ae594da2725ebc6ef1794982f42f`** (release tree + this patch; verified twice, below) |
 | options | `--prefill-decode-arms` / `--no-prefill-decode-arms` (`LLAMA_ARG_PREFILL_DECODE_ARMS`), `--prefill-decode-arms-mode off\|on\|auto` (`LLAMA_ARG_PREFILL_DECODE_ARMS_MODE`) — **both default OFF** |
 | campaign record | `wip/prefill-decode-arms-v2/` (`DESIGN.md`, `RUNS.md`, `HANDOVER.md`, `gates/`, `baseline/`) |
 
@@ -29,13 +29,13 @@ git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 919794500
 bash <delivery>/scripts/apply-all.sh --include-beta .
 #   18 delivery blocks (tip 089f90067, tree 27db9bfd4...), then this patch
-#   applied tree: e24d88b31e06c38d3063a5d34f4ee6326ca8a9c0
+#   applied tree: 29c9644350e5ae594da2725ebc6ef1794982f42f
 ```
 
 **The round-trip was verified on this box:** a fresh clone at the release tree (`089f90067`, tree `27db9bfd4…`)
-`git am`s this patch strictly and reads tree **`e24d88b31e…`**; and the full tester path
+`git am`s this patch strictly and reads tree **`29c9644350…`**; and the full tester path
 (`apply-all.sh --include-beta .`) from `919794500` reports the same applied tree.  The patch was cut from a
-canonical chain — `apply-all.sh` on a clean checkout at `919794500`, then the campaign's 21 `steps/` replayed in
+canonical chain — `apply-all.sh` on a clean checkout at `919794500`, then the campaign's 22 `steps/` replayed in
 order, then the generated docs regenerated — and the replayed tree equals the campaign's own tree
 (`1ac30b82f…` before the doc regeneration) **exactly**.
 
@@ -180,23 +180,44 @@ to the internal pipeline.
 An auxiliary context costs **zero** extra descriptors, and the refusal is logged.  Text is unchanged:
 `gate-arms-spec` 36/36, `gate-spec-purity` PASS with the same hashes, `gate-prefill-logits` KLD 0.000000.
 
-## Open: a 2-D state-save read of a row-split `result_output` fails on a 3-device split
+## FIXED (STEP 15): the 2-D read of a row-split `result_output` on a 3-device split
 
-**With the fd abort gone, the tester's recipe reaches a SECOND, independent defect** (~6 s into the big prefill,
-pair ON + MTP, 3 devices; pair OFF survives the identical recipe, and it reproduces with `GGML_CUDA_ALLREDUCE=ce`
-so it is not the all-reduce chain):
+**With the fd abort gone, the tester's recipe reached a SECOND, independent defect** (~6 s into the big prefill,
+pair ON + MTP, 3 devices):
 
 ```
 E ggml_backend_cuda_get_tensor_2d_async: device 1: 2-D read of 'result_output' failed (invalid argument):
   331092 bytes x 5 copies, tensor pitch 331092, host pitch 993280, offset 0 (ROCm1 buffer)
 ```
 
-`host pitch = 3 x tensor pitch` — a **vocabulary/row-split** 2-D tensor, whose per-device slice is a third of the
-meta row.  The caller is the state/checkpoint save (`llama_io_write_host` batches its pieces into one
-`ggml_backend_tensor_get_n`, which collapses 5 single-row reads into one 2-D read with `n_copies=5`), and the Meta
-backend's chunked 2-D path (`ggml-backend-meta.cpp`, the `AXIS_0/1/2` "simple tensors as chunks" branch) hands the
-per-device read a range that runs past that device's slice.  Not fixed yet; it is a **delivery**-level path
-(`ggml-backend-meta.cpp`) that the pair's per-round draft checkpoint reaches, and it needs its own landing.
+**It was NOT the Meta backend's arithmetic** (the campaign's first suspicion): measured at the abort, the split
+state is `axis=0, n_segments=1, nr[0]=1, ne={82773,82773,82774}` on an f32 `[248320, 5]` tensor, so the per-device
+chunks are 331092 / 331092 / 331096 — they sum EXACTLY to the meta row (993280) and to `ggml_nbytes`, and device 0's
+copy of the *same arguments* succeeded.  **It was the transport**: `AMD_LOG_LEVEL=3` names
+`Allow p2p access failed - hsa_amd_agents_allow_access with err 4096` immediately before HIP returns
+`hipErrorInvalidValue`.  A `hipMemcpy2DAsync` device->host copy needs a peer grant of the DESTINATION's pinned
+allocation for the copying device's agent; this server's pinned output buffer is one device's `ROCm_Host` allocation
+read from all three, and this box refuses that grant (as it refuses `hipMemSetAccess` — which is why
+`ggml_cuda_peer_copy_ok` exists).  The same bytes as 1-D copies are accepted from every device.
+
+**The fix (STEP 15, `steps/STEP-15-0022-no-2d-d2h`):** the CUDA backend issues **no 2-D device->host copy into host
+memory**.  `ggml_cuda_rows_to_host()` serves a tight block or a single copy as ONE 1-D copy, a big synchronous block
+through the device-staged form (2-D device-to-**device** gather into the reading device's own staging buffer, one
+1-D D2H per chunk into that device's own pinned chunk, host scatter), and the async form / a small block as one 1-D
+copy per row.  Both 2-D read entry points use it (`ggml_backend_cuda_get_tensor_2d_async`, which is what aborted,
+and the buffer's synchronous `ggml_backend_cuda_buffer_get_tensor_2d`).  Also fixed in passing: the async read never
+selected its own device (its write twin does).
+
+**Gate:** `../../wip/prefill-decode-arms-v2/gates/gate-arms-state-split.sh` — the crash recipe for N rounds with
+the big prefill really served (`prompt_n = 77100`), the decode arm's non-vacuity census, the multi-row verify batch
+present, and the pair-OFF control (which provably does NOT reach the read on this box, see the gate header).
+Numbers and the full ladder: `WORKLOG.md` 261124.007, `INVARIANTS.md` r384-wip, `RUNS.md` (2026-11-24 STEP 15).
+
+**Promotion-time obligation (unchanged, `TODO` #376):** this is a **delivery-level** defect in `ggml-cuda.cu`'s
+2-D read path, reachable by any multi-row read of a split tensor into a pinned host buffer.  When block 17 is
+promoted, the fix must be cut into the delivery set **on its own** (a block-09 amendment — the 2-D read path is
+block 09's), re-cut, `check-rung-file-sets.py` + `validate-set.sh` run, and only then is this hunk dropped from the
+beta artifact.  It is a block amendment, so it is asked first.
 
 ## Not covered by the delivery's release gates
 

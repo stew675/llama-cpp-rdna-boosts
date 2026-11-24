@@ -1,3 +1,98 @@
+## 2026-11-24 — STEP 15: the split-tensor 2-D read was the PEER GRANT, not the split arithmetic — FIXED (`WORKLOG.md` 261124.007)
+
+### The measurement that refuted the work order
+
+Instrumented at the abort (`result_output`, 3-device `-sm tensor`, 5-token ubatch, `GGML_META_2D_DEBUG`):
+
+| quantity | value |
+|---|---|
+| meta tensor | f32 `ne=[248320,5,1,1]`, `nb=[4,993280,4966400,4966400]`, `nbytes=4966400` |
+| read | `offset=0 size=4966400` (the WHOLE tensor: the per-ubatch logits readback, `n_outputs=5`) |
+| split state | `axis=0 n_segments=1 nr[0]=1 ne[]={82773,82773,82774}` |
+| per-device | dev 0 `[82773,5] nb[1]=331092`, dev 1 `[82773,5] nb[1]=331092`, dev 2 `[82774,5] nb[1]=331096` |
+| chunk arithmetic | `331092 + 331092 + 331096 = 993280` = the meta row = `nb[1]`; `GGML_ASSERT(offset_j == chunk_size_full)` holds |
+| who failed | **device 1**, on the FIRST 5-row read; dev 0's identical copy (same pitches, same destination) SUCCEEDED |
+| host destination | `0x...0d54` = the pinned output buffer (`buf_output`, reallocated 2 068 480 -> 5 621 760 B) + 331 092 — a `ROCm_Host` allocation registered by device 2 |
+
+So the "4-byte discrepancy" is one extra ELEMENT on device 2, not a broken pitch, and the chunked path is exact.
+
+### The mechanism (driver log, same run)
+
+`AMD_LOG_LEVEL=3` on the aborting build, immediately before HIP returns the error:
+
+```
+rocdevice.cpp:2376: Allow p2p access failed - hsa_amd_agents_allow_access with err 4096
+hip_memory.cpp:2593: hipMemcpy2DAsync: Returned hipErrorInvalidValue
+hipMemcpy2DAsync (0x7ed55a450d54, 993280, 0x7f1b3fc96100, 331092, 331092, 5, hipMemcpyDeviceToHost, ...)
+```
+
+A 2-D D2H copy needs a peer grant of the DESTINATION's pinned allocation for the copying device's agent; this box
+refuses those grants (it refuses `hipMemSetAccess` too — `hsa_amd_vmem_set_access ... status:4096` in the same log,
+which is why `ggml_cuda_peer_copy_ok` exists).  The pinned output buffer is ONE device's allocation read from all
+three; device 0 owns it and needed no grant.
+
+### What was tried and did NOT help (recorded so it is not re-tried)
+
+| probe | result |
+|---|---|
+| `ggml_cuda_set_device(ctx->device)` before the copy (its write twin does it) | still refused — kept anyway, the asymmetry was real |
+| `hipDeviceSynchronize()` on the copying device first | still refused (nothing in flight was the blocker) |
+| `GGML_CUDA_ASYNC_INPUT=0` (the async-input ring off) | still refused |
+| the identical call twice: retry after the failure | **succeeds** — the refusal is state-dependent, so a retry must never be the fix |
+| `n_copies` 1-D copies straight into the caller's pitch | **succeeds** on every device (this is the fix) |
+| a standalone HIP probe of every argument combination (`repro/probe-hip-2d-copy.cpp`) | **all succeed** on an idle box: pitches, 1..6 copies, 1/4/16/64-aligned destinations, `Default`/`Portable`/`Mapped`/pageable hosts, a destination pinned by ANOTHER device, two copies in flight from different devices, bounce+scatter — so this class is only provable end-to-end |
+
+### The fix
+
+`ggml_cuda_rows_to_host(device, src, data, size, n_copies, stride_tensor, stride_data, stream, sync)` — the
+KV-region `rows_to_host` generalised to any device — backs both 2-D read entry points
+(`ggml_backend_cuda_get_tensor_2d_async`, `ggml_backend_cuda_buffer_get_tensor_2d`): a tight block or one copy is
+ONE 1-D copy; a big synchronous block is device-gathered (2-D **device-to-device**) and read as one 1-D D2H per
+chunk into the device's own pinned chunk, then scattered on the host; the async form / a small block is one 1-D
+copy per row.  No 2-D D2H exists any more.  Also: the async read now selects its own device, and the staged arm
+requires `size <= ggml_cuda_pin_chunk_bytes` (it could overflow the 64 MiB chunk for a bigger row).
+
+### Verification
+
+| check | result |
+|---|---|
+| `repro/repro-mtp-prefill.sh` `ROUNDS=3` (pair ON, the tester's shape) | **SURVIVED 3 rounds**; `http=200` + content in every round; `the decode arm is generating: 415 step(s), 2 handover(s)`; draft acceptance 0.611; fd trace 686 / max 688 / 11 |
+| `repro/repro-mtp-prefill.sh MODE=off` (pre-fix control) | survived — and its ubatch census never contains `ubatch of 5 tokens`, so it never composes the failing read (see `gates/gate-arms-state-split.sh`) |
+| `gates/gate-arms-state-split.sh` (new) | **PASS 11/11** — 2 rounds, best `prompt_n 77100`, both rounds `http=200`, 445 steps + 4 handovers, the 5-token verify batch present, pair-OFF control survives |
+| `gates/gate-arms-cancel.sh` | **PASS** (39 s) |
+| `gates/gate-arms-fd-budget.sh` | **PASS** (81 s) — 686 / 686 / 686, a second RCCL actually refused |
+| `gates/gate-arms-default-inert.sh --no-cli` | **PASS** (4 shapes) — after item (b) below |
+| `gates/gate-arms-multislot.sh` | **PASS** (32 s) — 20 rounds x 4 slots |
+| `gates/gate-arms-spec.sh` | **PASS 36/36** (493 s) — one text across four arms on 3 devices f16/q8_0, drafts accepted on the decode arm (181 drafted / 157 accepted), the decode arm really ran (182 steps, 1 handover) |
+| `scripts/gate-ckpt-reuse.sh` | **PASS** (13 s) — a kept restored checkpoint moves no token |
+| `scripts/gate-state-pipe.sh` | **PASS** (115 s) — the batched / plain / pipelining-off / save-only / synchronous arms restore byte-identical text |
+| `scripts/gate-meta-seg-drain.sh` | **PASS** (45 s) — the segmented async arm is live, the drain is wired, the fix is text-neutral |
+| `scripts/gate-seqpar.sh` | **PASS** — arm 2 (OFF identity vs the base) **mean KLD -0.000000, same top p 100.000 %**; arm 3a/3b unchanged from the tip (0.010360 against its own 0.014351 control).  NOTE: this gate had NO Flash-Next prefill-logit base on this box (only the 27B one), so it could not pass on ANY build; the base was recorded the gate's documented way (`--record`) on the **STEP-14 tip**, then the fixed build was compared against it |
+| `scripts/gate-spec-purity.sh` | **PASS** (506 s) — plain == draft-mtp on q8_0 and bf16, 3-device `-sm tensor`; width-probe maxdiff 0 |
+| `scripts/gate-prefill-logits.sh` | **PASS** (24 s) — mean KLD 0.000000, same top p 100.000 % (27B base) |
+| whole-set `all` build (`~/bin/build-llama-rocm`) | **clean** (rc 0, no errors) |
+| `check-windows-portability.sh` / `check-windows-paths.sh` | **PASS** |
+| `scripts/check-gpu-faults.sh --since <window>` | **PASS** in every gate above (each gate runs it) |
+
+### Findings (reported, not papered over)
+
+1. **The work order's diagnosis was wrong** — see the table above; `INVARIANTS.md` r384-wip records the real one
+   and r383-wip item 4 is corrected in place.
+2. **`gate-arms-default-inert.sh`'s `27b-3gpu-tensor` anchor was stale since STEP 14**: STEP 14 added the
+   `all-reduce: NOT bringing up a second RCCL comm layer` WARN (this shape creates an auxiliary band context), and
+   the anchor was recorded at STEP 8.  Measured: the **STEP-14 tip** (fix stashed) fails that check **twice**, so
+   261124.005's "PASS (4 shapes)" never held for that shape.  Re-recorded from the tip with the gate's own
+   `--record` (2 header + 24 shape lines); a re-recorded anchor is a lock, not evidence.
+3. **`--record` does not honour `--force`** in that gate (it only records a MISSING shape), so the stale anchor had
+   to be removed by hand before re-recording.  The header promises otherwise.
+4. **`gate-seqpar` had no Flash-Next prefill-logit base here** (only the 27B one), so its arm 2 could not pass on any
+   build: recorded the base from the **STEP-14 tip** with the gate's documented `--record` (tip PASS, `13:55-14:00`),
+   after which the fixed build reads **mean KLD -0.000000 / same top p 100.000 %** — prefill-logit neutral.  Fresh-box
+   gap: `TODO` #377.
+5. **Kernel GPU page faults exist at 12:20-12:24 only** — the pre-fix `GGML_ABORT` runs and the `-9` kills of those
+   aborted servers.  `scripts/check-gpu-faults.sh --since 12:56` (and every gate's own window, and the run after
+   12:24:30) is clean: nothing in the fixed build faulted.
+
 ## 2026-11-24 — STEP 14: `-sm tensor` on 3 devices was FD exhaustion, not memory — FIXED (`WORKLOG.md` 261124.005)
 
 ### The numbers (Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, pool, `-sm tensor -mg 0`, `-np 2`)

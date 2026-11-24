@@ -3147,9 +3147,50 @@ it removed an abort (r374-wip) -- so the per-shape rule above stands, now on the
    where it applies: an auxiliary context only reduces decode-sized tensors, which every chain routes to the
    internal pipeline; the PREFILL context keeps the ring (pp2048 809 vs 604 t/s on CE, `ggml-cuda.cu`).  Measured
    after: 686 / 686 / 686 (base / pair+drafter / pair+drafter) = **0 extra fds**, text unchanged.
-4. **Behind it (OPEN, recorded in the artifact):** the state/checkpoint save batches pieces into one
-   `ggml_backend_tensor_get_n`, which collapses N single-row reads into ONE 2-D read with `n_copies = N`; on a
-   ROW-SPLIT (vocab-split) 2-D tensor the Meta backend's chunked path ("simple tensors as chunks",
-   `ggml-backend-meta.cpp`) hands a per-device read a range past that device's slice -> `invalid argument` ->
-   `GGML_ABORT` (`331092 bytes x 5 copies, tensor pitch 331092, host pitch 993280`).  Pair-off does not reach it,
-   and it is independent of the all-reduce chain (`ce` reproduces it).
+4. **Behind it (OPEN at the time, FIXED in STEP 15 / r384-wip):** a 2-D read with `n_copies > 1` of a row-split
+   (vocab-split) 2-D tensor aborted with `invalid argument` (`331092 bytes x 5 copies, tensor pitch 331092, host
+   pitch 993280`).  The first reading of it here — "the Meta backend's chunked path hands a per-device read a range
+   past that device's slice" — was **WRONG**: the per-device arithmetic is exact for that shape.  The refusal is
+   the peer grant a 2-D device->host copy needs on the destination's pinned allocation; see r384-wip.
+
+## r384-wip (2026-11-24, `WORKLOG.md` 261124.007) — a 2-D D2H copy into a pinned buffer ANOTHER device owns is refused on this box: row blocks are read as 1-D copies (`prefill-decode-arms` v2 STEP 15)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/`, `beta/prefill-decode-arms/`.
+
+1. **The Meta backend's 2-D arithmetic was not the defect** (it was the campaign's first suspect).  Measured at the
+   abort, `result_output` = f32 `ne=[248320,5,1,1]`, `nb[1]=993280`, `split_state.axis=0`, `n_segments=1`,
+   `nr[0]=1`, `ne[] = {82773,82773,82774}` — per-device chunks 331092 / 331092 / 331096, which sum exactly to the
+   meta row (993280) and to `ggml_nbytes` (4 966 400).  `simple_offset = i_start*chunk_size_j` and
+   `n_copies = i_stop - i_start` are correct for this shape, and **device 0's copy of the same arguments
+   succeeded**.  (A multi-segment / multi-repeat state never reaches that branch: the walk above it handles those.)
+2. **The refusal is the peer grant on the DESTINATION.**  `AMD_LOG_LEVEL=3` on the aborting run names it
+   immediately before HIP returns the error:
+   `rocdevice.cpp: Allow p2p access failed - hsa_amd_agents_allow_access with err 4096` ->
+   `hip_memory.cpp: hipMemcpy2DAsync: Returned hipErrorInvalidValue`.  A `hipMemcpy2DAsync` D2H asks the runtime to
+   grant the COPYING device's agent access to the destination's pinned allocation.  llama.cpp's pinned output buffer
+   is ONE device's `ROCm_Host` allocation (`llama_context::output_host_buft`) read from every device of a
+   `-sm tensor` split, so every non-owner device needs a grant — and this box refuses these grants (it refuses
+   `hipMemSetAccess` too, which is why `ggml_cuda_peer_copy_ok` / the staged peer copy exist).  Device 0 owns it and
+   needs nothing, which is exactly the observed asymmetry.
+3. **A 1-D copy of the same bytes is accepted from every device.**  Measured in the aborting process: `n_copies`
+   1-D copies of the same block succeeded on device 1 straight after the 2-D form was refused.  A REPEAT of the
+   identical 2-D call also succeeded, so the refusal is state-dependent — never use "the 2-D copy failed" as a
+   probe, and never rely on a retry.
+4. **The rule: the CUDA backend issues NO 2-D device->host copy into host memory** (the class is already recorded
+   for the movable-boundary slab — r183/r253 — and for the mixed KV region — r204/#313).  `ggml_cuda_rows_to_host()`
+   serves a tight block (both pitches = the width) or a single copy as ONE 1-D copy; a big synchronous block through
+   the device-staged form (2-D device-to-**device** gather into the reading device's own staging buffer — a device
+   buffer needs no grant — one 1-D D2H per chunk into that device's own pinned chunk, then a host scatter); and the
+   ASYNC form (which must not synchronize) or a small block as one 1-D copy per row.  The write direction needs no
+   change: every pitched upload already goes through the device's own pinned slot (`splice_pin_ring`,
+   `ggml_cuda_stage_pin`) and never starts from a foreign pinned buffer.
+5. **Reachability: it is the ORDINARY logits readback, not a state save.**  The caller is
+   `process_ubatch` -> `ggml_backend_tensor_get_async(backend_res, t_logits, …)` for a ubatch with 5 output rows.
+   That multi-row verify batch is composed by the two-arm decode arm's draft verification: the pair-OFF control on
+   the identical shape never produces it (`not engaged: ubatch of 2/8/13 tokens` and no 5-token ubatch), which is
+   why the pair-OFF reproducers "survived" the defect.  It is nevertheless DELIVERY code (`ggml-cuda.cu`), reachable
+   by any multi-row read of a split tensor into a pinned host buffer — see `TODO` #376 for the promotion obligation.
+6. **A standalone HIP probe cannot reproduce it** (`wip/prefill-decode-arms-v2/repro/probe-hip-2d-copy.cpp`: every
+   argument combination, cross-device destinations, 1..6 copies, mapped/default flags, in-flight pairs — all
+   succeed on an idle box).  The refusal depends on the machine's grant state, so the gate is end-to-end
+   (`gates/gate-arms-state-split.sh`) and the driver log is the primary evidence.

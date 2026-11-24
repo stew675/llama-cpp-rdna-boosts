@@ -1,4 +1,17 @@
-# HANDOVER — the REAL fix for the 2-D state-save read of a SPLIT tensor (`result_output`, 3-device `-sm tensor`)
+# HANDOVER — the 2-D read of a SPLIT tensor (`result_output`, 3-device `-sm tensor`) — **FIXED 2026-11-24 (STEP 15)**
+
+> **STATUS: DONE, and the work order's diagnosis was WRONG.**  The failing read is not the Meta backend's split
+> arithmetic (it is exact: per-device chunks 331092 / 331092 / 331096 sum to the meta row 993280, and device 0's copy
+> of the same arguments succeeded).  It is the **transport**: a `hipMemcpy2DAsync` D2H copy needs a peer grant on the
+> destination's pinned allocation for the copying device's agent, and this box refuses those grants
+> (`hsa_amd_agents_allow_access ... err 4096`, found with `AMD_LOG_LEVEL=3`).  The CUDA backend now issues **no** 2-D
+> D2H into host memory (`ggml_cuda_rows_to_host`), landed as `steps/STEP-15-0022-no-2d-d2h.patch` on `67946d6f0`;
+> gate `gates/gate-arms-state-split.sh`; records `WORKLOG.md` 261124.007, `INVARIANTS.md` r384-wip, `RUNS.md`
+> (2026-11-24 STEP 15).  Read §2 below as the *original* work order (its suspects were refuted in §3.2 terms — see
+> the record); §5's promotion obligation (`TODO` #376) stands, and §9's open questions are answered in the record:
+> the fix is delivery code in `ggml-cuda.cu` (a block-09 amendment, not block 13), the pair-OFF control provably
+> never reaches the path (no multi-row verify batch), and `result_output` was never in a checkpoint — the read is the
+> ordinary per-ubatch logits readback.
 
 **Read this file first. It is one task, not a campaign.**  The campaign that produced the block-17 candidate is
 finished and recorded: its reasoning and traps are in [`HANDOVER-2026-11-24-campaign.md`](HANDOVER-2026-11-24-campaign.md),

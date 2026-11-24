@@ -525,3 +525,16 @@ a text comparison, always).
 `WORKLOG.md` gets the landing entries; `benchmarks/` gets anything that outlives the campaign; `INVARIANTS.md`
 gets the facts.  **A gate's output is never the record of a claim** — the claim lives in the record with its
 hash/rate and its shape.
+
+## STEP 15 — never issue a 2-D device->host copy into host memory — **DONE 2026-11-24** (`67946d6f0`)
+
+> Landed as `steps/STEP-15-0022-no-2d-d2h.patch` from a beta tester's third crash.  The work order
+> (`HANDOVER.md`) suspected the Meta backend's split arithmetic; measurement refuted that (per-device chunks
+> 331092 / 331092 / 331096 sum exactly to the meta row, and device 0's copy of the same arguments succeeded) and the
+> driver log named the real cause: a 2-D D2H copy needs a peer grant on the destination's pinned allocation
+> (`hsa_amd_agents_allow_access ... err 4096`), and this box refuses those grants.  The CUDA backend now serves every
+> row-block read as 1-D copies (`ggml_cuda_rows_to_host`), device-staged when it may synchronize; both 2-D read entry
+> points use it; the async read also selects its device (its write twin already did) and the staged arm can no longer
+> gather a row larger than the staging chunk.  Records: `WORKLOG.md` 261124.007, `INVARIANTS.md` r384-wip, `RUNS.md`
+> (2026-11-24, STEP 15).  Promotion obligation unchanged: cut into the delivery as a **block-09 amendment**
+> (`TODO` #376).

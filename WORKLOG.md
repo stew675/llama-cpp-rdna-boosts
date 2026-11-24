@@ -1,3 +1,97 @@
+## 261124.007 (no release; `prefill-decode-arms` v2 STEP 15) -- the split-tensor 2-D read is FIXED, and it was never the split arithmetic: it is the peer grant a 2-D D2H needs on a pinned buffer another device owns
+
+Follows 261124.006 (the work order).  Same tester, same shape (Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, the attendance
+pool, `-sm tensor -mg 0` on 3 devices, `-np 2`, `draft-mtp-adaptive` with the external `-Q8_0` head, pair ON).
+
+1. **The work order's diagnosis was WRONG, and the first job was to refute it.**  It suspected the Meta backend's
+   chunked 2-D path of ignoring `split_state.n_segments`/`nr[]` (and of a 4-byte discrepancy: `3 x 331092 = 993276
+   != 993280`).  Instrumented at the abort, the split state is `axis=0, n_segments=1, nr[0]=1,
+   ne={82773,82773,82774}` on an f32 `[248320, 5]` tensor — the per-device chunks are **331092 / 331092 / 331096**,
+   i.e. the split is uneven by one ELEMENT (82774 on device 2), they sum EXACTLY to the meta row (993280) and to
+   `ggml_nbytes` (4 966 400), and `simple_offset = i_start*chunk_size_j` / `n_copies = i_stop - i_start` are
+   correct for it.  Decisive: **device 0's copy of the same arguments SUCCEEDED** and device 1's failed, so the
+   arguments were not what the driver refused.  (The `GGML_ASSERT(offset_j == chunk_size_full)` the work order
+   expected to fire is in fact satisfied.)
+2. **The mechanism, from the driver's own log** (`AMD_LOG_LEVEL=3` on the aborting run):
+   `rocdevice.cpp: Allow p2p access failed - hsa_amd_agents_allow_access with err 4096` immediately followed by
+   `hip_memory.cpp: hipMemcpy2DAsync: Returned hipErrorInvalidValue`.  A 2-D device->host copy makes the runtime
+   grant the COPYING device's agent access to the destination's pinned allocation.  llama.cpp's pinned output
+   buffer is ONE device's `ROCm_Host` allocation (`llama_context::output_host_buft`) read from all three devices of
+   the split, and this box refuses these grants — the same refusal `ggml_cuda_peer_copy_ok` and the staged peer copy
+   exist for (`hipMemSetAccess` is refused here too).  Device 0 owns the allocation, needs no grant, and worked.
+   The same bytes as 1-D copies are accepted from every device (measured in the aborting process: five 1-D copies on
+   device 1 succeeded straight after the 2-D form was refused, and a REPEAT of the 2-D call also succeeded — the
+   refusal is state-dependent, which is why the fix does not rely on a retry).
+3. **The caller is the ORDINARY logits readback, not a state save** — another correction to the work order:
+   `process_ubatch` -> `ggml_backend_tensor_get_async(backend_res, t_logits, …)` for a ubatch with 5 output rows.
+   That multi-row verify batch is composed by the two-arm decode arm's draft verification (the pair-ON census shows
+   `ubatch of 5 tokens`; the pair-OFF control on the identical recipe shows only `ubatch of 2/8/13` and never
+   produces it), which is why every pair-OFF reproducer "survived" and why the work order attributed it to the
+   draft checkpoint.  It is still **delivery** code — `ggml-cuda.cu`'s async 2-D read, reachable by any multi-row
+   read of a split tensor into a pinned host buffer.
+4. **The fix (STEP 15, `steps/STEP-15-0022-no-2d-d2h`): the CUDA backend issues NO 2-D device->host copy into host
+   memory.**  `ggml_cuda_rows_to_host()` (the KV region's own `rows_to_host` generalised to any device) serves a
+   tight block or a single copy as ONE 1-D copy; a big synchronous block through the device-staged form (2-D
+   device-to-**device** gather into the reading device's own staging buffer — a device buffer needs no grant — one
+   1-D D2H per chunk into that device's own pinned chunk, then a host scatter); and the ASYNC form (which must not
+   synchronize) or a small block as one 1-D copy per row.  Both 2-D read entry points use it: the async
+   `ggml_backend_cuda_get_tensor_2d_async` (which aborted) and the buffer's synchronous
+   `ggml_backend_cuda_buffer_get_tensor_2d` (which had the same defect for a pinned destination).  Two things
+   found on the way: the async read never selected its own device (its write twin, `set_tensor_2d_async`, does —
+   now it does too), and the staged arm of the KV-region helper would gather a row LARGER than the 64 MiB staging
+   pair into it (a latent overflow); the arm now requires `size <= ggml_cuda_pin_chunk_bytes` and falls back to
+   per-row copies.  The write direction needed no change: every pitched upload already stages through the device's
+   own pinned slot (`splice_pin_ring`, `ggml_cuda_stage_pin`).
+5. **Verification** (the work order's ladder).  The reproducer survives 3 rounds, every round serving the big
+   prefill (`prompt_n 77100`) with real content, no `2-D read`, fd trace 686 / 688 / 11:
+
+| check | result |
+|---|---|
+| `repro/repro-mtp-prefill.sh` (pair ON, `ROUNDS=3`) | **SURVIVED 3 rounds**, `http=200` + content each round, `the decode arm is generating: 415 step(s), 2 handover(s)`, draft acceptance 0.611, fd trace 686 / max 688 / 11 |
+| `gates/gate-arms-state-split.sh` (new, 11 checks) | **PASS** — 2 rounds served (`prompt_n 77100`), 445 decode-arm steps + 4 handovers, the 5-token verify batch present, pair-OFF control survives |
+| `gates/gate-arms-cancel.sh` | **PASS** (STEP 13) |
+| `gates/gate-arms-fd-budget.sh` | **PASS** — 686 / 686 / 686 |
+| `gates/gate-arms-default-inert.sh --no-cli` | **PASS** (4 shapes) — see finding (b): its 27b anchor was stale since STEP 14 and had to be re-recorded from the tip |
+| `gates/gate-arms-multislot.sh` | **PASS** — 20 rounds x 4 slots |
+| `gates/gate-arms-spec.sh` | **PASS 36/36** (493 s) — one text across four arms on 3 devices f16/q8_0, drafts accepted on the decode arm (181 drafted / 157 accepted), the decode arm really ran (182 steps, 1 handover) |
+| `scripts/gate-ckpt-reuse.sh` | **PASS** (13 s) — a kept restored checkpoint moves no token |
+| `scripts/gate-state-pipe.sh` | **PASS** (115 s) — the batched / plain / pipelining-off / save-only / synchronous arms restore byte-identical text |
+| `scripts/gate-meta-seg-drain.sh` | **PASS** (45 s) — the segmented async arm is live, the drain is wired, the fix is text-neutral |
+| `scripts/gate-seqpar.sh` | **PASS** — arm 2 (OFF identity vs the base) **mean KLD -0.000000, same top p 100.000 %**; arm 3a/3b unchanged from the tip (0.010360 vs its 0.014351 control).  NOTE: this gate had NO Flash-Next prefill-logit base on this box (only the 27B one), so it could not pass on ANY build; the base was recorded the gate's documented way (`--record`) on the **STEP-14 tip** (`61513fab`, `gate-seqpar` PASS there too), then the fixed build was compared against it |
+| `scripts/gate-spec-purity.sh` | **PASS** (506 s) — plain == draft-mtp on q8_0 and bf16, 3-device `-sm tensor`; hashes `4d87b7b221f7` / `eb89102cb7d8` / `a87c4318b649` unchanged; width-probe maxdiff 0 |
+| `scripts/gate-prefill-logits.sh` | **PASS** (24 s) — mean KLD 0.000000, same top p 100.000 % (27B base) |
+| whole-set `all` build (`~/bin/build-llama-rocm`) | **PASS 36/36** (493 s) — one text across four arms on 3 devices f16/q8_0, drafts accepted on the decode arm (181 drafted / 157 accepted), the decode arm really ran (182 steps, 1 handover) |
+| `scripts/check-windows-portability.sh` / `check-windows-paths.sh` | **PASS** — 525 files, no unguarded POSIX call / POSIX-only type / macro collision; 4672 paths safe |
+| `repro/probe-hip-2d-copy.cpp` (the isolation attempt) | **cannot reproduce it** — every argument combination, a destination pinned by another device, 1..6 copies, mapped/default/portable flags, two copies in flight and the bounce shape all SUCCEED on an idle box, so this class is provable only end-to-end |
+
+6. **Findings reported (no gate was edited to make anything pass):**
+   (a) the work order's split-arithmetic diagnosis is refuted by measurement — recorded in `INVARIANTS.md` r384-wip,
+       and the earlier r383-wip item 4 (which repeated it) is corrected in place;
+   (b) `gate-arms-default-inert.sh`'s `27b-3gpu-tensor` anchor had been stale since STEP 14 added the
+       "NOT bringing up a second RCCL comm layer" WARN — measured: the STEP-14 **tip** fails that check twice with
+       my fix stashed, so it was never green there (261124.005's "PASS (4 shapes)" does not hold for that shape).
+       The anchor is re-recorded from the tip (2 header lines + 24 shape lines, now carrying the WARN), which is the
+       gate's own `--record` path — a re-recorded anchor is a lock, not evidence, and this note is why it moved;
+   (c) the gate's header promises `--record` honours `--force` for an EXISTING anchor; the implementation only
+       records a MISSING one (`--force` is unused there), so the anchor had to be removed by hand.  Recorded, not
+       silently worked around;
+   (d) the campaign's `repro/repro-statesave.sh` "pair-off survives" evidence was mis-read as attribution: the
+       pair-off arms never compose the multi-row verify batch at all (see item 3);
+   (e) `scripts/gate-seqpar.sh` had **no Flash-Next prefill-logit base** on this box (only the 27B one), so its
+       arm 2 could not pass on any build — the red result is plumbing, not a regression.  The base is recorded the
+       gate's documented way (`--record`, on the **STEP-14 tip**, which passes) and the fixed build then reads
+       `mean KLD -0.000000 / same top p 100.000 %` against it, i.e. the fix is prefill-logit neutral.  The
+       fresh-box gap is `TODO` #377;
+   (f) the kernel journal has GPU page faults at **12:20-12:24 only**, i.e. from the pre-fix `GGML_ABORT` runs and
+       the `-9` kills of those aborted servers; `check-gpu-faults.sh` is clean from 12:24:30 to the end of the
+       ladder (every gate's `--since` window included), so nothing in the fixed build faulted.
+7. **Records:** `INVARIANTS.md` r384-wip (appended, and r383-wip item 4 corrected), `RUNS.md` (this date, STEP 15),
+   `beta/prefill-decode-arms/README.md` (the "Open" section became FIXED, with the corrected mechanism and the
+   promotion-time pointer), `repro/README.md` (the new probe), `steps/STEP-15-0022-no-2d-d2h.patch`, and the
+   re-cut candidate artifact.  `TODO` #376 is unchanged: at promotion this is cut into the delivery on its own, as
+   a **block-09 amendment** (the 2-D read path is block 09's), re-cut + `check-rung-file-sets.py` +
+   `validate-set.sh`, and only then does the beta artifact drop the hunk.
+
 ## 261124.006 (no release; `prefill-decode-arms` v2, handover prep) -- the third tester crash is written up as a work order: the real fix for the split-tensor 2-D state-save read
 
 No code change.  Follows 261124.005, which landed the two crashes that are fixed (the CANCEL teardown and the
