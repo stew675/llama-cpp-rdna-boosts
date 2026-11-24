@@ -1,0 +1,144 @@
+From 000917c848592598ca47e8a17f0934d43193398d Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 06:49:30 +0800
+Subject: [PATCH] CUDA/HIP: the GDN norm-gate fusion matches once per GDN
+ layer, not twice (host time)
+
+ggml_cuda_gdn_norm_gate_match() ends with three reader counts over the whole graph (ggml_cuda_count_uses for the
+RMS_NORM and its MUL, and the gate MUL's inside ggml_cuda_find_mul_q8_1_matmul), and it ran twice per GDN layer: at
+the RMS_NORM (the skip) and again at the gate node, which then called ggml_cuda_find_mul_q8_1_matmul once more.  Seven
+whole-graph walks per GDN layer where the unfused gate takes one, on every graph_compute that runs the node loop
+(graphs off, a direct run or recapture after a graph change, prefill, multi-token verify).
+
+- The gate node takes the skip's decision instead of matching again: the skip records the gate node
+  (gdn_norm_gate_at), and the pending norm has exactly one reader, the gate's MUL, so no other node can match it.
+  The norm is the pending MUL's RMS_NORM source and the matmul the node after the gate MUL (or after its no-op
+  reshape), the ones ggml_cuda_find_mul_q8_1_matmul accepted.
+- The three counts are taken in one walk (ggml_cuda_count_uses3); ggml_cuda_find_mul_q8_1_matmul takes an already
+  counted reader count through a defaulted parameter.  The conditions are the same, so the decisions are.
+
+The fused path now walks the graph once per GDN layer, as the unfused gate does.  Bit-identical: the same kernels,
+launch for launch.
+
+Found while looking at issue #359, but it does not explain that report: in the reported deep no-draft
+case decode replays the graph for nearly every step, so this host time is not paid there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu | 56 +++++++++++++++++++-----
+ 1 file changed, 44 insertions(+), 12 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 7caad189c..a42ff332f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -259,8 +259,9 @@ static void mul_q8_1_trace_decline(const ggml_tensor * mul, int uses, int want)
+ 
+ // If the MUL output feeds a single mmvq matmul (directly or via a no-op
+ // reshape at the next node), return that matmul; otherwise return nullptr.
++// uses_known >= 0: ggml_cuda_count_uses(cgraph, mul), already counted by the caller.
+ static const ggml_tensor * ggml_cuda_find_mul_q8_1_matmul(const ggml_cgraph * cgraph,
+-                                                          int mul_idx, const ggml_tensor * mul) {
++                                                          int mul_idx, const ggml_tensor * mul, int uses_known = -1) {
+     const int n = cgraph->n_nodes;
+     const ggml_tensor * n1 = (mul_idx + 1 < n) ? cgraph->nodes[mul_idx + 1] : nullptr;
+     if (n1 == nullptr) {
+@@ -284,7 +285,7 @@ static const ggml_tensor * ggml_cuda_find_mul_q8_1_matmul(const ggml_cgraph * cg
+     // A LoRA-free graph reads exactly `want` (it did before this check: the reshape counts directly and the matmul
+     // through it), so the fusion still fires there.
+     const int want = n1 == mm ? 1 : 2;
+-    const int uses = ggml_cuda_count_uses(cgraph, mul);
++    const int uses = uses_known >= 0 ? uses_known : ggml_cuda_count_uses(cgraph, mul);
+     if (uses != want) {
+         mul_q8_1_trace_decline(mul, uses, want);
+         return nullptr;
+@@ -1896,6 +1897,26 @@ static int ggml_cuda_count_uses(const ggml_cgraph * cgraph, const ggml_tensor *
+     return uses;
+ }
+ 
++// ggml_cuda_count_uses for three tensors in one walk of the graph: uses[k] is what ggml_cuda_count_uses(cgraph, t[k])
++// returns.  Each walk visits every source of every node, so a matcher that needs several counts pays once.
++static void ggml_cuda_count_uses3(const ggml_cgraph * cgraph, const ggml_tensor * const t[3], int uses[3]) {
++    uses[0] = uses[1] = uses[2] = 0;
++    for (int j = 0; j < cgraph->n_nodes; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        for (int s = 0; s < GGML_MAX_SRC; ++s) {
++            const ggml_tensor * src = n->src[s];
++            if (src == nullptr) {
++                continue;
++            }
++            for (int k = 0; k < 3; ++k) {
++                if (src == t[k] || src->view_src == t[k]) {
++                    uses[k]++;
++                }
++            }
++        }
++    }
++}
++
+ // CONT(view) -> UNARY -> MUL -> decode matmul (the qwen4exp attention output gate: the gate half of each Q head):
+ // the gate -> Q8_1 kernel reads the row-strided view itself, so the CONT launches nothing.  The CONT is an exact
+ // copy, so the result is bit-identical.  GGML_CUDA_FUSE_CONT_GATE_Q8_1=0: off.  Returns the extra nodes consumed.
+@@ -1981,8 +2002,7 @@ static int ggml_cuda_gdn_norm_gate_match(const ggml_cgraph * cgraph, int s, bool
+             nm->type != GGML_TYPE_F32 || !w || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != 128 ||
+             ggml_nelements(w) != 128 || !xn || xn->type != GGML_TYPE_F32 || xn->ne[0] != 128 || xn->nb[0] != sizeof(float) ||
+             xn->ne[3] != 1 || !ggml_are_same_shape(rn, nm) || !ggml_are_same_shape(nm, z) || !ggml_is_contiguous(nm) ||
+-            !ggml_is_contiguous(z) || ggml_nelements(mul) % 256 != 0 || ggml_nelements(mul) != ggml_nelements(z) ||
+-            ggml_cuda_count_uses(cgraph, rn) != 1 || ggml_cuda_count_uses(cgraph, nm) != 1) {
++            !ggml_is_contiguous(z) || ggml_nelements(mul) % 256 != 0 || ggml_nelements(mul) != ggml_nelements(z)) {
+         return -1;
+     }
+     // nothing between the norm and the gate writes over its input or weight
+@@ -1999,7 +2019,15 @@ static int ggml_cuda_gdn_norm_gate_match(const ggml_cgraph * cgraph, int s, bool
+             return -1;
+         }
+     }
+-    if (ggml_cuda_find_mul_q8_1_matmul(cgraph, s + 1, mul) == nullptr) {
++    // The norm, its MUL and the gate MUL each need a reader count over the whole graph: one walk for the three
++    // (the counts and the decision are the same as three separate ggml_cuda_count_uses calls).
++    const ggml_tensor * const counted[3] = { rn, nm, mul };
++    int uses[3];
++    ggml_cuda_count_uses3(cgraph, counted, uses);
++    if (uses[0] != 1 || uses[1] != 1) {
++        return -1;
++    }
++    if (ggml_cuda_find_mul_q8_1_matmul(cgraph, s + 1, mul, uses[2]) == nullptr) {
+         return -1;
+     }
+     return m - 1;
+@@ -2027,21 +2055,25 @@ static int ggml_cuda_gdn_norm_gate_skip(ggml_backend_cuda_context * cuda_ctx, co
+ }
+ 
+ // At the gate: the skipped norm computed by the gate -> Q8_1 kernel.  Returns the extra nodes consumed.
++// The skip already matched this gate to the pending norm on this graph (ggml_cuda_gdn_norm_gate_skip records the gate
++// node), so the decision is taken from there instead of being matched again: the match walks the whole graph for its
++// reader counts, and repeating it at every gate cost a decode step one graph walk per GDN layer per count whenever the
++// node loop runs (no graph replay).  It is the same decision -- the pending norm has one reader, the gate's MUL, so
++// no other node can match it -- and the same kernel, norm (the MUL's RMS_NORM source) and matmul.
+ static int ggml_cuda_gdn_norm_gate_try_fuse(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int s) {
+     const ggml_tensor * un = cgraph->nodes[s];
+-    if (cuda_ctx->gdn_norm_pending == nullptr || un->op != GGML_OP_UNARY) {
+-        return 0;
+-    }
+-    const int r = ggml_cuda_gdn_norm_gate_match(cgraph, s, ggml_cuda_gdn_norm_gate_silu_on());
+-    if (r < 0 || cgraph->nodes[r + 1] != cuda_ctx->gdn_norm_pending) {
++    if (cuda_ctx->gdn_norm_pending == nullptr || un->op != GGML_OP_UNARY || s != cuda_ctx->gdn_norm_gate_at) {
+         return 0;
+     }
++    const ggml_tensor * rn = cuda_ctx->gdn_norm_pending->src[0];
+     cuda_ctx->gdn_norm_pending = nullptr;
+     cuda_ctx->gdn_norm_gate_at = -1;
+     cuda_ctx->gdn_norm_gate_census[ggml_get_unary_op(un) == GGML_UNARY_OP_SILU ? 1 : 0]++;
+     ggml_tensor * mul = cgraph->nodes[s + 1];
+-    const ggml_tensor * mm = ggml_cuda_find_mul_q8_1_matmul(cgraph, s + 1, mul);
+-    ggml_cuda_op_unary_mul_q8_1(*cuda_ctx, cgraph->nodes[s], mul, mm, nullptr, cgraph->nodes[r]);
++    // the matmul the match accepted (ggml_cuda_find_mul_q8_1_matmul): the next node, or the one after a no-op reshape
++    const ggml_tensor * mm = cgraph->nodes[s + 2]->op == GGML_OP_MUL_MAT ? cgraph->nodes[s + 2] : cgraph->nodes[s + 3];
++    GGML_ASSERT(mm->op == GGML_OP_MUL_MAT && rn->op == GGML_OP_RMS_NORM);
++    ggml_cuda_op_unary_mul_q8_1(*cuda_ctx, cgraph->nodes[s], mul, mm, nullptr, rn);
+     return cgraph->nodes[s + 2] == mm ? 1 : 2;
+ }
+ 
+-- 
+2.43.0
+
