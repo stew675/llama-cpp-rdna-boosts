@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 517c6fd2d..74ce56816 100644
+index 517c6fd2d..11f5a2180 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -4264,6 +4264,9 @@ ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buffer_type(int device) {
@@ -115,10 +115,10 @@ index 517c6fd2d..74ce56816 100644
 +                          "FD_SETSIZE (1024) and aborts the process in a library's select(); `ce` is the "
 +                          "value that avoids it\n", pinned);
 +        } else {
-+            GGML_LOG_INFO("all-reduce: this context BORROWS another context's memory (a two-arm server "
-+                          "arm) -- the copy-engine chain, and RCCL is NOT brought up a second time (a "
-+                          "second RCCL comm layer crosses FD_SETSIZE on a 3-device split; its tensors are "
-+                          "decode-sized anyway)\n");
++            GGML_LOG_INFO("all-reduce: this is an AUXILIARY context (a borrower, a draft view or an "
++                          "auxiliary decoder-band context) -- the copy-engine chain, and RCCL is NOT brought "
++                          "up for it (a second RCCL comm layer crosses FD_SETSIZE on a 3-device split; an "
++                          "auxiliary context's tensors are decode-sized, which the internal pipeline serves)\n");
 +            const bool ce_ok = ggml_backend_cuda_comm_init_ce_chain(ret, false);
 +            if (!ce_ok) {
 +                GGML_LOG_WARN("all-reduce: the copy-engine chain did not come up for this context; it "

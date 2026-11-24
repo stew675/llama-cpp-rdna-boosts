@@ -31,7 +31,7 @@ It must print `Applied tip: 089f90067 (...)`, then apply `beta/prefill-decode-ar
 
 ```
       release.json tree: 27db9bfd4ef7f41c7df60f704410de28863beac3
-      applied tree:      2c63a657e1d4977f8b1dd6578acd60eecfcfefef
+      applied tree:      e24d88b31e06c38d3063a5d34f4ee6326ca8a9c0
 ```
 
 **If the applied tree is different, stop and report it** — do not proceed (the patch was cut against exactly that

@@ -33,10 +33,10 @@ candidate patch + the ask (STEP 12).**  Read `§0.0 START HERE` first; it is the
   **missing from the box**, not stale gate debt: the gate PASSed on `GSQ-RCO-IQ3_S` and then on its own defaults once
   the model tree was restored, and `TODO` #369 stays at three gates.  `INVARIANTS.md` r380-wip.
 * **STEP 12 — the candidate**: `beta/prefill-decode-arms/` replaced whole (three files), ONE `format-patch` commit,
-  sha256 `8f3a8d10…b643e0258`, 42 files, +3073/−741, cut against the **release tree** `27db9bfd4` and applying to
-  tree **`2c63a657e1`** — re-cut twice since (STEP 13's cancel fix, STEP 14's one-RCCL-per-process fix), each verified
+  sha256 `a2badad1…e366fe3c`, 42 files, +3073/−741, cut against the **release tree** `27db9bfd4` and applying to
+  tree **`e24d88b31e`** — re-cut twice since (STEP 13's cancel fix, STEP 14's one-RCCL-per-process fix), each verified
   by a fresh clone + strict `git am` and by `apply-all.sh --include-beta`.  The 21 `steps/` replay reproduces the
-  campaign tree `ae5530a1a` **exactly**.
+  campaign tree `1ac30b82f` **exactly**.
 * **Correction recorded:** §12.1's `git diff 919794500` is wrong — a `beta/` candidate is applied AFTER the blocks and
   must be release-tree-relative `format-patch` output.
 * **STEP 13 (added 2026-11-24, from the maintainer's beta testing) — a crash the STEP 11 sweep could not see:**

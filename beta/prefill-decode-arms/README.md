@@ -15,10 +15,10 @@ and **nothing is copied between them**.
 | | |
 |---|---|
 | patch | `prefill-decode-arms.patch` — **one** commit, cut against the current `release.json` tree |
-| sha256 | `8f3a8d10935a0e3766e685813e382ee154e4d17700becbb59d3f957b643e0258` |
+| sha256 | `a2badad1933248a0a4660c77a846b471626e7fc5e31bf72202866808e366fe3c` |
 | size | 42 files, **+3073 / −741** |
 | cut against | `release.json` base `919794500`, tree **`27db9bfd4ef7f41c7df60f704410de28863beac3`** |
-| **applied tree** | **`2c63a657e1d4977f8b1dd6578acd60eecfcfefef`** (release tree + this patch; verified twice, below) |
+| **applied tree** | **`e24d88b31e06c38d3063a5d34f4ee6326ca8a9c0`** (release tree + this patch; verified twice, below) |
 | options | `--prefill-decode-arms` / `--no-prefill-decode-arms` (`LLAMA_ARG_PREFILL_DECODE_ARMS`), `--prefill-decode-arms-mode off\|on\|auto` (`LLAMA_ARG_PREFILL_DECODE_ARMS_MODE`) — **both default OFF** |
 | campaign record | `wip/prefill-decode-arms-v2/` (`DESIGN.md`, `RUNS.md`, `HANDOVER.md`, `gates/`, `baseline/`) |
 
@@ -29,15 +29,15 @@ git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 919794500
 bash <delivery>/scripts/apply-all.sh --include-beta .
 #   18 delivery blocks (tip 089f90067, tree 27db9bfd4...), then this patch
-#   applied tree: 2c63a657e1d4977f8b1dd6578acd60eecfcfefef
+#   applied tree: e24d88b31e06c38d3063a5d34f4ee6326ca8a9c0
 ```
 
 **The round-trip was verified on this box:** a fresh clone at the release tree (`089f90067`, tree `27db9bfd4…`)
-`git am`s this patch strictly and reads tree **`2c63a657e1…`**; and the full tester path
+`git am`s this patch strictly and reads tree **`e24d88b31e…`**; and the full tester path
 (`apply-all.sh --include-beta .`) from `919794500` reports the same applied tree.  The patch was cut from a
 canonical chain — `apply-all.sh` on a clean checkout at `919794500`, then the campaign's 21 `steps/` replayed in
 order, then the generated docs regenerated — and the replayed tree equals the campaign's own tree
-(`ae5530a1a…` before the doc regeneration) **exactly**.
+(`1ac30b82f…` before the doc regeneration) **exactly**.
 
 ## What it does
 

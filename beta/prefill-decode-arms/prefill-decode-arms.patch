@@ -1,6 +1,6 @@
-From 78c3d3028ae081ed1c5dbda2dacaabdcecc7ecf0 Mon Sep 17 00:00:00 2001
+From 0cf308201d4666b7caacfe255e94f53d795bef14 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
-Date: Tue, 24 Nov 2026 11:58:11 -0600
+Date: Tue, 24 Nov 2026 12:02:03 -0600
 Subject: [PATCH] rdna-boosts: block 17: the two-arm server -- ONE
  llama_memory, TWO llama_contexts
 
@@ -1857,7 +1857,7 @@ index 7570a3b06..4095cac16 100644
  bool   ggml_cuda_slab_compute_plain();
  size_t ggml_cuda_slab_headroom_bytes();
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a8241b6c9..74ce56816 100644
+index a8241b6c9..11f5a2180 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -181,6 +181,40 @@ int ggml_cuda_get_device() {
@@ -2516,10 +2516,10 @@ index a8241b6c9..74ce56816 100644
 +                          "FD_SETSIZE (1024) and aborts the process in a library's select(); `ce` is the "
 +                          "value that avoids it\n", pinned);
 +        } else {
-+            GGML_LOG_INFO("all-reduce: this context BORROWS another context's memory (a two-arm server "
-+                          "arm) -- the copy-engine chain, and RCCL is NOT brought up a second time (a "
-+                          "second RCCL comm layer crosses FD_SETSIZE on a 3-device split; its tensors are "
-+                          "decode-sized anyway)\n");
++            GGML_LOG_INFO("all-reduce: this is an AUXILIARY context (a borrower, a draft view or an "
++                          "auxiliary decoder-band context) -- the copy-engine chain, and RCCL is NOT brought "
++                          "up for it (a second RCCL comm layer crosses FD_SETSIZE on a 3-device split; an "
++                          "auxiliary context's tensors are decode-sized, which the internal pipeline serves)\n");
 +            const bool ce_ok = ggml_backend_cuda_comm_init_ce_chain(ret, false);
 +            if (!ce_ok) {
 +                GGML_LOG_WARN("all-reduce: the copy-engine chain did not come up for this context; it "

@@ -34,9 +34,9 @@ pool, `-sm tensor` on 3 devices, `-np 2`, `draft-mtp-adaptive` with the external
    it is independent of the all-reduce chain; it is a DELIVERY-level path that the pair's per-round draft
    checkpoint reaches.  Recorded in `beta/prefill-decode-arms/README.md` as the open item; needs its own landing.
 4. **Candidate re-cut** with both fixes: sha256
-   `8f3a8d10935a0e3766e685813e382ee154e4d17700becbb59d3f957b643e0258`, 42 files, **+3073/-741**, applied tree
-   **`2c63a657e1`**; the canonical replay (21 `steps/`) reproduces the campaign tree `ae5530a1a` exactly, and a fresh
-   clone at the release tree `git am`s it back to `2c63a657e1`.
+   `a2badad1933248a0a4660c77a846b471626e7fc5e31bf72202866808e366fe3c`, 42 files, **+3073/-741**, applied tree
+   **`e24d88b31e`**; the canonical replay (21 `steps/`) reproduces the campaign tree `1ac30b82f` exactly, and a fresh
+   clone at the release tree `git am`s it back to `e24d88b31e`.
 
 ## 261124.004 (no release; `prefill-decode-arms` v2 STEP 13, from BETA TESTER reports) -- aborting one of two generations killed the server (FIXED, gated), and "-sm tensor on 3 devices" dies of FD exhaustion, not memory (diagnosed, fix agreed)
 
