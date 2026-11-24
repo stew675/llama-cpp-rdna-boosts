@@ -159,8 +159,9 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── wiki/                  # source for the GitHub wiki (Home, MTP & Adaptive MTP, Quick Reference); see wiki/README.md
 ├── wip/                   # ACTIVE exploration only, never applied; index: wip/CAMPAIGNS.md
 ├── beta/                  # promotion-candidate patches pending a beta test (NOT part of the delivery;
-│                          #   apply with `apply-all.sh --include-beta`; currently: the withdrawn two-arm
-│                          #   server (block 17), see beta/README.md
+│                          #   apply with `apply-all.sh --include-beta`; currently: the two-arm server
+│                          #   (v2, replacing the withdrawn block 17) as three patch files -- KNOWN OPEN
+│                          #   DEFECT, it corrupts under heavy concurrent load (TODO #378); see beta/README.md
 ├── optional/              # opt-in blocks 0100/0101 (NOT part of the default delivery; apply with
 │                          #   `apply-all.sh --include-optional` and a [y/N] per artifact, numeric order)
 ├── upstream/              # upstream-PR candidates: one sub-directory each (README.md + patch) + index

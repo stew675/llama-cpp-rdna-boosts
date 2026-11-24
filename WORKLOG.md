@@ -1,3 +1,43 @@
+## 261124.010 (release `v17-919794500-r354`) -- the `prefill-decode-arms` v2 campaign lands on `main` as a BETA artifact: same delivery bytes, a three-patch candidate, and a known open corruption
+
+Merge of the campaign branch (`prefill-decode-arms-v2`, 40 commits) into `main` as a `--no-ff` landing commit.  **No
+block is created, renumbered or promoted**: block 17 stays WITHDRAWN, `patches/`, `optional/`,
+`rdna-boosts-all.patch` and the block counts are untouched, and `release.json` moves by exactly one field
+(`release`), which `scripts/make-release.sh` derives and `scripts/validate-set.sh` confirms:
+
+```
+blocks 20 -> 20   files 571 -> 571   defines 172 -> 172   envs 577 -> 577   options 14 -> 14
+==> 0 unexplained;  ==> OK: base 919794500, 17 official + 1 temporary = 18 default blocks, 2 optional;
+    applied tree 27db9bfd4ef7f41c7df60f704410de28863beac3
+```
+
+1. **What lands:** the v2 two-arm server as `beta/prefill-decode-arms/` — **three patch files** applied in filename
+   order by `apply-all.sh --include-beta` (block 17 itself `a2badad1…e366fe3c`, plus two DELIVERY-level fixes the
+   candidate carries until they are folded in as block-09 amendments: STEP 15, the 2-D read peer-grant fix
+   `b3f0645a…c2a7336b`, and STEP 16, the fenced compute-buffer drop that restores CUDA graph capture
+   `fd50d736…d31030963`; the three apply to tree `c0c261e45`); its campaign record (`wip/prefill-decode-arms-v2/`,
+   `PLAN.md` STEPs 0-16, `RUNS.md`, the gate set and repro harnesses); and the engineering facts `INVARIANTS.md`
+   r353-wip .. r385-wip.  `AGENTS.md`'s `beta/` policy now states that a candidate may carry several patch files
+   applied in filename order, and that its README must name which one is dropped at promotion.
+2. **The three fixes that got it here** (all from the beta testers, all recorded above): STEP 13 the cancel
+   teardown, STEP 14 one RCCL comm layer per process (the `FD_SETSIZE` abort), STEP 15 the split-tensor 2-D read
+   (a refused peer grant, not the split arithmetic), STEP 16 the disabled drop costing CUDA graph capture
+   (uncontested pair decode 45.9 -> 88.4 t/s).
+3. **KNOWN OPEN DEFECT — the candidate is NOT bug free.**  The maintainer reproduced a **corruption under heavy
+   concurrent load** (pair ON, pushed hard).  No reproducer, no captured run, no localisation yet; the same build
+   passes the crash/state/text/gate ladders.  Recorded as `TODO` **#378** (with a re-entry condition), in the
+   artifact README's "KNOWN OPEN DEFECT" section, and here.  The merge message says the same thing, so a reader of
+   `git log` on `main` cannot mistake the artifact for a finished feature.
+4. **Release mechanics:** `release.json` refreshed to `v17-919794500-r354` (base/tip/tree/counts and every
+   per-artifact sha256 are unchanged — the delivery is byte-identical, because the release is about the repo state,
+   not a re-cut).  The fork's `rdna-boosts` branch already carries `.tip` `089f90067` (`gh api` check), so no
+   fork re-cut/push was owed; the tag push is what the off-host container watcher polls, so the ROCm images follow
+   from the tag as usual.
+5. **What promotion would still owe** (`TODO` #376, unchanged in substance): the two delivery-level fixes are cut
+   into the delivery on their own as block-09 amendments, the candidate is re-cut against the new tree, and block 17
+   itself becomes a block only by the maintainer's decision.  `TODO` #378 must be closed (or explicitly accepted as
+   a documented limitation) before that decision is worth taking.
+
 ## 261124.009 (no release; `prefill-decode-arms` v2 STEP 16) -- the pair HALVED uncontested decode, and it was never the pair: the disabled compute-buffer drop keeps the slab's wide band armed, so no CUDA graph is ever captured
 
 Reported by the maintainer: with `--prefill-decode-arms-mode auto`, *uncontested* decode is about half the speed

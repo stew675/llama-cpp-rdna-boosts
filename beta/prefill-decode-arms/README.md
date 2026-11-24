@@ -54,6 +54,17 @@ from.  Patch 1 was cut from a canonical chain (`apply-all.sh` at `919794500`, th
 STEP 14), patch 2 from one more `steps/` replay to STEP 15, with the generated docs regenerated — and the replayed
 trees equal the campaign's own trees exactly.
 
+## KNOWN OPEN DEFECT — this candidate is NOT bug free
+
+**The maintainer reproduced a CORRUPTION under heavy concurrent load on 2026-11-24** (pair ON, pushing the server
+hard; the same build passes the crash, split-state, text-identity and gate ladders below).  There is no reproducer
+yet, so there is no shape, request pattern or symptom recorded beyond "pushed hard", and no localisation.
+
+Read this as: **tremendously better than the block-17 implementation on the previous `main`, and not finished.**  It
+is why the two-arm server ships as a BETA artifact (`TODO` **#378**) and why no block 17 is created by the merge.
+A tester should treat any output that differs from the single-context server at the same seed as this defect and
+report the shape with the run.
+
 ## What it does
 
 An opt-in `llama-server` mode with two `llama_context`s on one model: the **prefill arm** is the existing main loop
