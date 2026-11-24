@@ -3045,3 +3045,35 @@ it removed an abort (r374-wip) -- so the per-shape rule above stands, now on the
    text identical.  The slab's calibration line states the total to set (`3328 MiB would host every auxiliary
    region (headroom 1536 + aux 1792)`), and the region grows with the verify width (`n_parallel x (n_max+1)`), so
    a much wider verify batch is a re-measurement, not an assumption.
+
+## r380-wip (2026-11-24, `WORKLOG.md` 261124.003) — a stale TOOL binary beside a fresh `libllama` segfaults, and the delivery sweep owes the whole-set build FIRST (`prefill-decode-arms` v2 STEP 11/12)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/`, `beta/prefill-decode-arms/`.
+
+1. **`llama-perplexity` (and `llama-gen-docs`) segfaulted with ESegv on start, and it was a STALE BUILD ARTIFACT --
+   not a defect in the change under test.**  The tools are thin execs plus a `libllama-<tool>-impl.so` plugin linked
+   against `libllama`; the campaign only ever rebuilt `llama-cli`/`llama-server`, so those two plugins were 8 hours
+   older than the `libllama` that later landings changed (a struct layout moved), and they died before printing a
+   line.  **Rule:** build the whole `all` profile (`~/bin/build-llama-rocm`) BEFORE the gate ladder, not after, and
+   when a tool segfaults on start read `ls -la build-*/bin` before reading the diff.  Four `llama-*-cli` binaries
+   from an older CMake config (`llama-{minicpmv,qwen2vl,llava,gemma3}-cli`, 2026-11-21) are still sitting there the
+   current config does not build; no gate uses them.
+2. **`check-gen-docs.sh` FAILing on a campaign tree is the EXPECTED answer when the campaign adds an option** -- the
+   rows appear in `tools/server/README.md` and nothing else.  The delivery's rule (one regeneration, folded into the
+   last block that touches `common/arg.cpp`) means the regeneration belongs to the CANDIDATE, and the check is green
+   on the applied candidate tree.  A campaign tree is never the tree that check is green on; do not "fix" it early.
+3. **A `beta/` candidate is `format-patch` output, cut against the RELEASE TREE, and neither is optional.**
+   `apply-all.sh --include-beta` runs `git am <beta>/*/*.patch` AFTER the release blocks (strictly, one commit
+   each), so (a) a base-relative patch cannot apply, and (b) a plain `git diff` is not `git am`-able at all
+   ("Patch format detection failed").  Both were true of `HANDOVER.md` §12.1's `git diff <base>` instruction and the
+   previous artifact (30 files, release-tree-relative) was the counter-example on disk.
+4. **The candidate is `release.json.tree -> campaign tree` (`27db9bfd4 -> 84ffb1ef1c`, 42 files, +2854/-715) and the
+   replay is the proof it is the campaign:** `apply-all.sh` at `919794500` reproduces `.tip` `089f90067` exactly (the
+   deterministic-commit-ids contract), the 19 `steps/` replayed in chronological order reproduce the campaign tree
+   `14dfb1f64` exactly, and one `git am` of the candidate on the release tree reproduces `84ffb1ef1c` exactly.  A
+   tree that matched by *hand-fixing* the patch would not say that.
+5. **`gate-kv-residency.sh`'s default `MODEL_POOL` is stale** (`.../Flash-Next/GSQ-IQ3_XXS/...`, and its
+   `-mtp-...-Q8_0` sidecar) while `gate-draft-ctx.sh` defaults to `GSQ-RCO-IQ3_S`: the gate must be run with
+   `MODEL_POOL=` on this box.  A gate whose default model is absent fails as a usage error, which reads like a
+   defect; the arms are self-referential, so a same-family substitute does not weaken the verdict -- but the default
+   path is owed a `TODO.md` row.

@@ -1,3 +1,55 @@
+## 261124.003 (no release; `prefill-decode-arms` v2 STEP 11+12) -- the delivery regression sweep is GREEN, and the candidate that REPLACES `beta/prefill-decode-arms/` is cut and verified (promotion NOT taken: it is a block decision)
+
+The two closing steps of the v2 campaign.  Neither touches `patches/`, `release.json`, `MANIFESTS.md`, `BASELINE.md`
+or a release gate, and no block exists yet.
+
+1. **STEP 11, the delivery regression sweep: 16/16 gates green on the campaign tip `ffaee2c52`.**  The point of the
+   step is that the campaign edits files the DELIVERY owns (`include/llama.h`/`llama-cparams.h`/
+   `llama-context.{h,cpp}`, `ggml-cuda-slab.cu`, `ggml-cuda.cu`, `common/`, `tools/server/`), all inert with one
+   context -- and "inert by argument" is not a gate.  Verdicts: `validate-set.sh` PASS (18 default + 2 optional,
+   tree `27db9bfd4`, file-set reconciliation 0 unexplained); `check-shlib-symbols.sh` PASS (16 libs);
+   `check-windows-portability.sh`/`-paths.sh` PASS (525 files, 4660 paths); `gate-prefill-logits.sh` **KLD
+   0.000000 / same-top-p 100.000 %**; `gate-state-pipe.sh`, `gate-park-idle-slots.sh` (A-D byte-identical),
+   `gate-kv-residency.sh`, `gate-host-pool.sh` (**59/59**, every arm `83d058e8af9c`) -- the three that actually
+   cover this campaign's edits -- `gate-mtp-dev-rows.sh` (`bbb051e2aeab`, 87/119 both arms, no `h_nextn` buffer by
+   default), `gate-spec-purity.sh` (plain == draft-mtp, q8_0 + bf16 x 4 axes, width probe maxdiff 0),
+   `gate-draft-ctx.sh` (11 checks, external head `e7aae6034b4f`, own KV cache, acceptance 0.814),
+   `gate-moe-promise.sh`, `gate-node-budget.sh`, `gate-graph-replay-width.sh`, `gate-ckpt-reuse.sh`: all PASS.  The
+   whole-set `all` build at the tip is clean and `check-gpu-faults.sh` over the sweep window finds nothing.
+2. **`check-gen-docs.sh` FAILs on the campaign tree, and that is the expected answer:** exactly two new rows in
+   `tools/server/README.md` (`--prefill-decode-arms`, `-mode`).  The delivery's rule is one regeneration folded into
+   the last block that touches `common/arg.cpp`, so the regeneration is folded into the CANDIDATE (`INVARIANTS.md`
+   r380-wip) -- on the applied candidate tree the check is green.
+3. **Two findings, neither this campaign's defect** (`INVARIANTS.md` r380-wip has the general lesson):
+   (a) two segfaults, both a **stale tool binary**: `llama-perplexity` + its `-impl.so` and `llama-gen-docs` were
+   dated 8 hours before the `libllama` they link (the campaign only ever rebuilt `llama-cli`/`llama-server`), and
+   the first segfault read exactly like a defect in the change under test.  `~/bin/build-llama-rocm` (the whole
+   `all` profile) fixes it -- so the sweep must run the whole-set build BEFORE the gates, not after;  (b)
+   `gate-kv-residency.sh`'s default `MODEL_POOL` names `Flash-Next/GSQ-IQ3_XXS/...`, which was absent on this box
+   (and so is its `-mtp-...-Q8_0` sidecar), while `gate-draft-ctx.sh` already defaults to `GSQ-RCO-IQ3_S`; the gate
+   was run on `GSQ-RCO-IQ3_S` + its Q8_0 sidecar and PASSed (its arms are self-referential, so the verdict stands).
+   The default path is a `TODO.md` nit, not a code defect.
+4. **STEP 12, the candidate: `beta/prefill-decode-arms/` REPLACED in its entirety** (the maintainer's decision of
+   2026-11-24) -- the old artifact's design text, README and patch are gone, the directory holds exactly the three
+   files the beta contract expects.  ONE patch, `prefill-decode-arms.patch`, sha256
+   `a4e207c96898b5c6a1075d55de340a4d2793a24f95e9cb0e34bbf87c4687585e`, 42 files, **+2854/-715**, cut against the
+   release tree `27db9bfd4` and applying to the applied tree **`84ffb1ef1c`**.  **Cut from a canonical chain**, not
+   from the working branch: `apply-all.sh` on a clean checkout at `919794500` (tip `089f90067` = `release.json.tip`,
+   exact), then the campaign's 19 `steps/` replayed in chronological order, then the generated docs regenerated --
+   and the replayed tree equals the campaign's own tree `14dfb1f64` **exactly**, which is what makes the candidate
+   the campaign rather than a re-derivation of it.  Verified twice: a fresh clone at the release tree `git am`s the
+   patch strictly to `84ffb1ef1c`, and the documented tester path (`apply-all.sh --include-beta .` from
+   `919794500`) reports the same applied tree.
+5. **Correction to the campaign's own handover (recorded, not silently taken):** `HANDOVER.md` §12.1 said to cut the
+   patch with `git diff 919794500` (base-relative).  That contradicts the delivery's beta contract -- `beta/README.md`
+   and `apply-all.sh --include-beta` apply the candidate AFTER the release blocks, strictly, one commit each (the
+   previous artifact was 30 files against the release tree for exactly this reason).  The candidate is therefore
+   release-tree-relative and a `format-patch` single commit (a plain `git diff` is not `git am`-able at all: "Patch
+   format detection failed"), which is also what a block 17 must be on promotion.
+6. **Not taken, and it is the maintainer's call:** the promotion into `patches/` as **block 17**.  A green ladder is
+   not permission (`AGENTS.md`), the block structure is the maintainer's, and a validated window on someone else's
+   hardware comes first.  `BETA-TESTING.md` is the ladder handed over for that window.
+
 ## 261124.002 (no release; `prefill-decode-arms` v2, the maintainer's decisions on STEP 10) -- the arena reserve is a PER-AUX-CONTEXT COUNT, the soak's drafter arm runs 20 rounds, and this work replaces `beta/prefill-decode-arms/` as ONE block (block 17 on promotion)
 
 Four decisions from the review of STEP 10, all taken the same day:

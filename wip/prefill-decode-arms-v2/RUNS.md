@@ -1,3 +1,68 @@
+## 2026-11-24 — STEP 11 (the delivery regression sweep) and STEP 12 (the candidate) — `WORKLOG.md` 261124.003
+
+### STEP 11: 16/16 delivery gates green on `ffaee2c52`
+
+Run order and verdicts (one GPU job at a time, under `flock ~/.cache/rdna-boosts/gpu.lock`; every server arm with
+`HIP_VISIBLE_DEVICES` pinned):
+
+| # | gate | verdict |
+|---|---|---|
+| 1 | `scripts/validate-set.sh` | PASS — 18 default + 2 optional, tree `27db9bfd4`, 0 unexplained file-set rows |
+| 2 | `scripts/check-shlib-symbols.sh` | PASS — 16/16 libs |
+| 3 | `scripts/check-gen-docs.sh` | **FAIL, expected** — 2 rows in `tools/server/README.md` (the candidate's obligation) |
+| 4 | `check-windows-portability.sh` / `check-windows-paths.sh` | PASS — 525 files, 4660 paths |
+| 5 | `gate-prefill-logits.sh` | PASS — KLD **0.000000**, same-top-p **100.000 %** |
+| 6 | `gate-state-pipe.sh` | PASS — pipe 0.48x sync |
+| 7 | `gate-park-idle-slots.sh` | PASS — A-D byte-identical, 6 parks / 2 unparks traced |
+| 8 | `gate-kv-residency.sh` | PASS — window + pool + 2-device pool section (89.10 % hit rate); run with `MODEL_POOL=.../GSQ-RCO-IQ3_S/...` (see the finding) |
+| 9 | `gate-host-pool.sh` | PASS **59/59**, every arm `83d058e8af9c` |
+| 10 | `gate-mtp-dev-rows.sh` | PASS — `bbb051e2aeab` both arms, 87/119, `h_nextn` buffer only in the device arm |
+| 11 | `gate-spec-purity.sh` | PASS — plain == draft-mtp on q8_0 + bf16 x 4 axes; width probe maxdiff 0 |
+| 12 | `gate-draft-ctx.sh` | PASS 11 checks — `e7aae6034b4f`, own KV cache, acceptance 0.814 |
+| 13 | `gate-moe-promise.sh` | PASS — `stale=1152` (non-vacuous), repair 238/238, text `c0e7e91d84c4` |
+| 14 | `gate-node-budget.sh` | PASS — 4 arms `a1b7eb2ee7a6` |
+| 15 | `gate-graph-replay-width.sh` | PASS — default untouched, kill switch, 21 prefill captures |
+| 16 | `gate-ckpt-reuse.sh` | PASS — keep 3 / eager 3, `==` on all four requests |
+
+Plus the whole-set `all` build at the tip and `scripts/check-gpu-faults.sh --since` over the whole sweep window:
+journal clean.
+
+**Two findings, neither a defect in this campaign** (`INVARIANTS.md` r380-wip):
+
+1. **Two segfaults were STALE BUILD ARTIFACTS.**  `llama-perplexity` + `libllama-perplexity-impl.so` and
+   `llama-gen-docs` were dated `11-23 15:17` beside a `libllama` from `11-24 08:13` (the campaign only rebuilt
+   `llama-cli`/`llama-server`).  `~/bin/build-llama-rocm` fixed both; the `all` build now precedes the ladder.
+2. **`gate-kv-residency.sh`'s default `MODEL_POOL`** (`.../GSQ-IQ3_XXS/...`) and its derived `-Q8_0` sidecar were
+   absent on this box, while `gate-draft-ctx.sh` already defaults to `GSQ-RCO-IQ3_S`.  Run with
+   `MODEL_POOL=.../GSQ-RCO-IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf` (its Q8_0 sidecar is
+   present); the arms are self-referential so the verdict stands.  Recorded as `TODO` #369 (the fourth such gate).
+
+### STEP 12: the candidate — `beta/prefill-decode-arms/` replaced, one patch, round-tripped
+
+Cut from a canonical chain, not from `arms-v2`:
+
+```
+git clone ~/llama.cpp ~/cand-chain     # clean checkout at 919794500
+apply-all.sh .                         # -> tip 089f90067 (== release.json.tip), tree 27db9bfd4 (== .tree)
+19 steps/ applied in order             # -> tree 14dfb1f64 == arms-v2 ffaee2c52^{tree}  EXACTLY
+llama-gen-docs                         # the candidate's regeneration: 1 file, +2 rows
+git diff 089f90067 857f18168           # 42 files, +2854/-715 ; single format-patch commit
+```
+
+| | |
+|---|---|
+| patch sha256 | `a4e207c96898b5c6a1075d55de340a4d2793a24f95e9cb0e34bbf87c4687585e` |
+| size | 42 files, +2854 / -715 (317 302 bytes) |
+| applied tree | **`84ffb1ef1c5fd56f2a02f44f9068bef839a95d98`** |
+| round-trip | clone at `089f90067` + `git am` -> `84ffb1ef1c` (clean) |
+| tester path | `apply-all.sh --include-beta .` from `919794500` -> reports the same applied tree |
+| `check-gen-docs.sh` on the applied tree | **ok** (the regeneration is inside the patch) |
+
+**A correction to `HANDOVER.md` §12.1:** the cut base is the **release tree** `089f90067`, not `919794500`.  A
+`beta/` candidate is applied by `apply-all.sh --include-beta` **after** the blocks, strictly, one commit each, so a
+base-relative patch cannot apply; and a plain `git diff` is not `git am`-able at all ("Patch format detection
+failed").  The candidate is therefore `format-patch` output over `release.json.tree -> campaign tree`.
+
 # RUNS — dated measurement record for `prefill-decode-arms` v2
 
 One section per landing, newest first.  A line here is the **record of a claim**: the command, the

@@ -13,8 +13,34 @@ candidate patch + the ask (STEP 12).**  Read `§0.0 START HERE` first; it is the
 | build | `~/bin/build-llama-rocm` → `build-rocm` (ROCm **10.2.0**); fast loop `cmake --build build-rocm --target llama-cli llama-server -j 16` |
 | extra build dirs | **`build-ref`** = a build of the delivery tip `089f90067` (the "pre-change build": the reference for a regression question), **`build-bisect`** = the last bisect rung's build.  Both at the same source path, so ccache stays warm |
 | landings | STEP 0-6e, **7a**, **7d**, **7c**, **7e** (STEP 4 broke the external draft head on a tensor split), **8** (the gate set), **7f** (a borrowing context carried an uninitialized `cparams.type_k`), **9** (the shape/latency/memory matrix), **10a/10/10b** (the speculator on the pair, six memory defects, the per-aux-context reserve) — §1.2 |
-| **next action** | **STEP 11 — the delivery regression sweep** (§3): 16 delivery gates + one whole-set build, on the CURRENT tip.  Then **STEP 12** (§3): one self-contained patch, cut from a canonical chain, that REPLACES `beta/prefill-decode-arms/` |
-| what is NOT done | nothing in `patches/` changes; no `beta/` artifact exists for this design yet; the campaign's own gates are green but are NOT delivery gates |
+| **next action** | **STEP 11 and STEP 12 are DONE (2026-11-24)** — see the STATUS block below.  The delivery sweep is green (16/16 gates on `ffaee2c52`) and `beta/prefill-decode-arms/` has been REPLACED by this design's candidate (tree `84ffb1ef1c`).  **The only open item is the maintainer's promotion decision (block 17)**, plus the residuals in §7 |
+| what is NOT done | nothing in `patches/` changes; **no block exists**; the candidate is a `beta/` artifact awaiting an external validation window (`BETA-TESTING.md`).  The campaign's own gates are green but are NOT delivery gates |
+
+---
+
+## STATUS (2026-11-24, the STEP 11/12 session) — `WORKLOG.md` 261124.003, `RUNS.md` 2026-11-24
+
+**Both closing steps are complete; this HANDOVER is now a record, not a work order.**
+
+* **STEP 11 — the delivery regression sweep: 16/16 gates green on `ffaee2c52`** (`validate-set`, `check-shlib-symbols`,
+  `check-windows-portability`/`-paths`, `gate-prefill-logits` **KLD 0.000000**, `gate-state-pipe`, `gate-park-idle-slots`,
+  `gate-kv-residency`, `gate-host-pool` 59/59, `gate-mtp-dev-rows`, `gate-spec-purity`, `gate-draft-ctx`,
+  `gate-moe-promise`, `gate-node-budget`, `gate-graph-replay-width`, `gate-ckpt-reuse`), plus the whole-set `all` build
+  and a clean fault scan.  `check-gen-docs` FAILs on the campaign tree by design (the candidate owes the
+  regeneration) and is green on the applied candidate tree.
+* **Two findings, both environmental** — the two segfaults were **stale tool binaries** (build the whole `all` profile
+  BEFORE the ladder, not after), and `gate-kv-residency.sh`'s default `MODEL_POOL` is a retired model path (`TODO`
+  #369, now four gates).  `INVARIANTS.md` r380-wip.
+* **STEP 12 — the candidate**: `beta/prefill-decode-arms/` replaced whole (three files), ONE `format-patch` commit,
+  sha256 `a4e207c9…c4687585e`, 42 files, +2854/−715, cut against the **release tree** `27db9bfd4` and applying to tree
+  **`84ffb1ef1c`** — verified by a fresh clone + strict `git am` and by `apply-all.sh --include-beta`.  The 19 `steps/`
+  replay reproduces the campaign tree `14dfb1f64` **exactly**.
+* **Correction recorded:** §12.1's `git diff 919794500` is wrong — a `beta/` candidate is applied AFTER the blocks and
+  must be release-tree-relative `format-patch` output.
+* **NOT taken:** promotion into `patches/` as block 17.  That is the maintainer's decision, and a validated window
+  comes first.
+
+---
 
 ---
 

@@ -1745,6 +1745,14 @@ workaround, and a first line in the relevant block's `patches/README.md` note.
 
 ## 23. The two-arm server (block 17) — a prefill arm and a decode arm co-owning one KV — **opt-in, default OFF; BETA ONLY since r352**
 
+> **SUPERSEDED 2026-11-24 — read §24, not this section, for the current rows.**  The candidate this section
+> documented (the r346-r352 design: a second context that *views* and *co-owns* the first's memory, recurrent
+> state copied between two modules) was **replaced in its entirety** by the v2 design, which is now what
+> `beta/prefill-decode-arms/` holds: ONE `llama_memory_i`, TWO `llama_context`s, the prefill arm owns and the
+> decode arm **borrows** (`llama_context_params::ctx_memory`), nothing copied.  §24 is that candidate's variable
+> catalogue and it is authoritative for every name below that survived; the paragraphs here are kept only as the
+> r346-r352 record (the old design's reasoning, its withdrawal diagnosis and its measurements).
+>
 > **BETA ONLY since r352.**  Block 17 was **withdrawn from the delivery** at r352 (the two-arm server is not
 > release-ready).  Every variable in this section belongs to the candidate in
 > [`beta/prefill-decode-arms/`](beta/prefill-decode-arms/README.md) and is **absent from a default
