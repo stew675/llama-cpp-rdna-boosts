@@ -1,0 +1,187 @@
+diff --git a/include/llama.h b/include/llama.h
+index d542596e9..5fbf3a592 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -711,7 +711,23 @@ extern "C" {
+     // intermittent `operation failed due to a previous error during capture` on the two-arm server; disabling
+     // the drop gave 3/3 clean soaks where the default failed ~50 %% of its runs).  The two-arm server calls this
+     // for both arms; the slab reclaims the wide layout on the next wide view anyway.
+-    LLAMA_API void llama_context_disable_compute_buffer_drop(struct llama_context * ctx);LLAMA_API void llama_context_drop_compute_buffers(struct llama_context * ctx);
++    LLAMA_API void llama_context_disable_compute_buffer_drop(struct llama_context * ctx);
++    LLAMA_API void llama_context_drop_compute_buffers(struct llama_context * ctx);
++
++    // Tell the context who must be QUIET while it performs the prefill -> decode compute-buffer drop.
++    //
++    // The drop is a process-wide mutation: it frees the wide compute layout (moving the movable-boundary
++    // slab's boundary) and re-arms the MoE expert-cache arena.  A second context computing on the same
++    // process -- the two-arm server's decode arm -- must therefore not be inside a batch while it runs: a
++    // capture would bake addresses that the drop is about to free, and a replay already dispatched would
++    // read an arena the drop returns to the slab's free list.  The CONTEXT cannot see another context, so
++    // the embedding server supplies the fence: `cb(ud, true)` must block until the other arm has left its
++    // step window and keep it out until `cb(ud, false)`.  The CALLING context's own step is not waited for
++    // (the drop runs inside it).
++    //
++    // Unset (the default, and every single-context server): the drop takes no fence.
++    typedef void (*llama_context_drop_boundary_cb)(void * user_data, bool enter);
++    LLAMA_API void llama_context_set_drop_boundary(struct llama_context * ctx, llama_context_drop_boundary_cb cb, void * user_data);
+     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index dfb8584b7..b00ac2287 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2028,6 +2028,11 @@ void llama_context::disable_compute_buffer_drop() {
+     drop_compute_buffers_disabled = true;
+ }
+ 
++void llama_context::set_drop_boundary(llama_context_drop_boundary_cb cb, void * user_data) {
++    drop_boundary_cb = cb;
++    drop_boundary_ud = user_data;
++}
++
+ void llama_context::drop_compute_buffers() {
+     // WIP r42 (TODO #42): release the grow-only compute buffers so the next alloc_graph re-reserves them
+     // from the graph at hand.  See ggml_backend_sched_drop_buffers().
+@@ -2041,6 +2046,13 @@ void llama_context_disable_compute_buffer_drop(struct llama_context * ctx) {
+     ctx->disable_compute_buffer_drop();
+ }
+ 
++void llama_context_set_drop_boundary(struct llama_context * ctx, llama_context_drop_boundary_cb cb, void * user_data) {
++    if (ctx == nullptr) {
++        return;
++    }
++    ctx->set_drop_boundary(cb, user_data);
++}
++
+ void llama_context_drop_compute_buffers(struct llama_context * ctx) {
+     if (ctx == nullptr) {
+         return;
+@@ -3151,6 +3163,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+     }
+     if (drop_now) {
++        // The whole block below is a process-wide mutation of the SHARED slab + the MoE expert cache
++        // (the boundary move frees the wide layout and stands arena tables down; the re-arm rebuilds
++        // them).  A second context in this process -- the two-arm server's decode arm -- must not be
++        // inside a batch for any of it: its capture would bake addresses this frees and its in-flight
++        // replay would read a table that is about to go back to the slab's free list.  The embedding
++        // server supplies that fence through llama_context_set_drop_boundary(); unset, this is a no-op.
++        struct drop_boundary_guard {
++            llama_context_drop_boundary_cb cb;
++            void * ud;
++            explicit drop_boundary_guard(llama_context_drop_boundary_cb cb_, void * ud_) : cb(cb_), ud(ud_) {
++                if (cb != nullptr) {
++                    cb(ud, true);
++                }
++            }
++            ~drop_boundary_guard() {
++                if (cb != nullptr) {
++                    cb(ud, false);
++                }
++            }
++            drop_boundary_guard(const drop_boundary_guard &) = delete;
++            drop_boundary_guard & operator=(const drop_boundary_guard &) = delete;
++        } drop_fence(drop_boundary_cb, drop_boundary_ud);
++
+         ggml_backend_sched_drop_buffers(sched.get());
+         // re-reserve the widest post-prefill (verify) layout so the first decode graphs fit.
+         // The reserve must use the CURRENT ubatch's sequence count, not a fixed 1: the memory context
+diff --git a/src/llama-context.h b/src/llama-context.h
+index a6eba3f86..4ed24df3f 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -59,6 +59,7 @@ struct llama_context {
+     //   - etc.
+     void sched_reserve();
+     void disable_compute_buffer_drop();
++    void set_drop_boundary(llama_context_drop_boundary_cb cb, void * user_data);
+ 
+     // WIP r42 (TODO #42): free the scheduler's compute buffers so the next graph re-reserves them from
+     // that graph (the buffers are otherwise grow-only).  Used to release a wide-prefill layout before
+@@ -429,6 +430,10 @@ private:
+     // the prefill -> decode compute-buffer drop is a process-wide memory mutation; a paired server turns it off
+     // so it cannot race the other arm's graph capture (see llama_context_disable_compute_buffer_drop)
+     bool             drop_compute_buffers_disabled = false;
++    // called with (true) before and (false) after the drop's process-wide mutation; see
++    // llama_context_set_drop_boundary() (the two-arm server fences the other arm out with it)
++    void *                       drop_boundary_ud = nullptr;
++    llama_context_drop_boundary_cb drop_boundary_cb = nullptr;
+ 
+     // wip/moe-verify-fusions (narrow-2) / prefill-decode-arms v2: which pinned AUXILIARY narrow compute
+     // region THIS context's COMPUTE buffers belong to -- 0 = none (the target's own views), 1 = an MTP
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index e13e18999..38d8f9cb4 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1191,6 +1191,12 @@ private:
+     std::condition_variable arms_cv;        // "a slot changed hands / finished"
+     std::condition_variable arms_step_cv;   // the step barrier and the boundary
+ 
++    // `arms_peer_boundary[a]` = arm `a` is inside a process-wide memory mutation (the compute-buffer drop)
++    // and the OTHER arm must not START a step until it leaves.  Unlike `arms_boundary` it does NOT wait for
++    // the holder's own arm: the drop runs inside that arm's step (llama_process -> process_ubatch), so it
++    // could never acquire it.  Written only under `arms_mtx`.
++    bool                    arms_peer_boundary[2] = {false, false};
++
+     // THE SPECULATOR LOCK (DESIGN V4): the speculator is ONE object for the whole server, and BOTH arms call
+     // into it -- the draft setup, the draft, the draft-context checkpoints, the verify-batch process, the accept
+     // round and the per-slot begin/state hooks.  `common_speculative_get_draft_params()` hands out a reference
+@@ -1547,7 +1553,7 @@ private:
+         const int arm;
+         arm_step_guard(server_context_impl & s_, int arm_) : s(s_), arm(arm_) {
+             std::unique_lock<std::mutex> lk(s.arms_mtx);
+-            s.arms_step_cv.wait(lk, [&] { return !s.arms_boundary; });
++            s.arms_step_cv.wait(lk, [&] { return !s.arms_boundary && !s.arms_peer_boundary[1 - arm]; });
+             s.arms_in_step[arm]++;
+         }
+         ~arm_step_guard() {
+@@ -1561,6 +1567,32 @@ private:
+ 
+     // A request-boundary memory operation (a prompt-cache / checkpoint restore): the shared memory is mutated
+     // outside init_batch/apply, so neither arm may be inside a step.
++    // The context-side counterpart, called from `llama_process` while the PREFILL arm is inside its own
++    // step (llama_context_set_drop_boundary()): wait until the other arm has left its step, then keep it
++    // out until the drop is done.  The drop moves the slab boundary, frees the wide compute layout and
++    // re-arms the expert arena -- a capture or replay on the other arm would bake or read addresses it is
++    // mutating, which is the intermittent `operation failed due to a previous error during capture` class
++    // this used to be avoided by disabling the drop outright (at the cost of never reclaiming the wide
++    // band, i.e. no CUDA graph capture and ~half the decode rate; see `arms_peer_drop_boundary`).
++    void arms_peer_boundary_enter(int arm) {
++        std::unique_lock<std::mutex> lk(arms_mtx);
++        arms_step_cv.wait(lk, [&] { return arms_in_step[1 - arm] == 0; });
++        arms_peer_boundary[arm] = true;
++    }
++    void arms_peer_boundary_leave(int arm) {
++        std::lock_guard<std::mutex> lk(arms_mtx);
++        arms_peer_boundary[arm] = false;
++        arms_step_cv.notify_all();
++    }
++    static void arms_peer_drop_boundary_prefill(void * ud, bool enter) {
++        auto * s = (server_context_impl *) ud;
++        if (enter) { s->arms_peer_boundary_enter(ARM_PREFILL); } else { s->arms_peer_boundary_leave(ARM_PREFILL); }
++    }
++    static void arms_peer_drop_boundary_decode(void * ud, bool enter) {
++        auto * s = (server_context_impl *) ud;
++        if (enter) { s->arms_peer_boundary_enter(ARM_DECODE); } else { s->arms_peer_boundary_leave(ARM_DECODE); }
++    }
++
+     struct arms_boundary_guard {
+         server_context_impl & s;
+         explicit arms_boundary_guard(server_context_impl & s_) : s(s_) {
+@@ -2153,8 +2185,13 @@ private:
+                 // both arms' layouts reserved: the slab reclaims the wide view on the next wide pass anyway,
+                 // and the measured cost on the host-expert shape is nil (arena 25537 MiB and hit rate 1.0 in
+                 // both arms).
+-                llama_context_disable_compute_buffer_drop(ctx_tgt);
+-                llama_context_disable_compute_buffer_drop(ctx_dec);
++                // ... and it is fenced, not disabled: the drop must still run (it is what releases the
++                // slab's wide band, without which ggml-cuda refuses to capture and every decode step runs
++                // direct -- measured 45.9 t/s against 83.5 t/s on Flash-Next).  The context calls back into
++                // this server around the mutation, and the callback keeps the OTHER arm out of its step for
++                // its duration; the drop's caller is inside its own step and is not waited for.
++                llama_context_set_drop_boundary(ctx_tgt, &server_context_impl::arms_peer_drop_boundary_prefill, this);
++                llama_context_set_drop_boundary(ctx_dec, &server_context_impl::arms_peer_drop_boundary_decode, this);
+ 
+                 // Reserve the decode arm ONCE, at its WIDEST batch, before any request.
+                 //

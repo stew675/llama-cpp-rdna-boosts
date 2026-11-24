@@ -23,11 +23,14 @@ tested (its sha256 is unchanged through this split).
 | patch 1 (block 17) | `prefill-decode-arms.patch` — cut against the current `release.json` tree |
 | sha256 | `a2badad1933248a0a4660c77a846b471626e7fc5e31bf72202866808e366fe3c` |
 | size | 42 files, **+3073/−741** |
-| patch 2 (STEP 15, delivery-level) | `state-split-2d-read.patch` — cut **on top of patch 1** (it edits `ggml-cuda.cu`, which block 17 also edits), so it MUST be applied second (its name sorts after, `p` < `s`) |
+| patch 2 (STEP 15, delivery-level) | `state-split-2d-read.patch` — cut **on top of patch 1** (it edits `ggml-cuda.cu`, which block 17 also edits) |
 | sha256 | `b3f0645abfe75c422ec4107a5ec21e38ff3ed9dbb00a39ec5196e204c2a7336b` |
 | size | 1 file, **+85/−46** |
+| patch 3 (STEP 16, delivery-level) | `two-arm-drop-boundary.patch` — the pair keeps the prefill→decode compute-buffer drop, fenced by the other arm's step boundary; it is what restores CUDA graph capture (pair decode **45.9 → 88.4 t/s** on the Flash-Next shape) |
+| sha256 | `fd50d736e4ee959175d5f99f98afd3a8c0f9c219e47ad0c2da4f301d31030963` |
+| size | 4 files, **+97/−4** |
 | cut against | `release.json` base `919794500`, tree **`27db9bfd4ef7f41c7df60f704410de28863beac3`** |
-| **applied tree** | **`29c9644350e5ae594da2725ebc6ef1794982f42f`** (release tree + both patches; verified three ways, below) |
+| **applied tree** | **`c0c261e45cd63fcb5d34cb34e4753d0a22603132`** (release tree + all three patches; verified below) |
 | options | `--prefill-decode-arms` / `--no-prefill-decode-arms` (`LLAMA_ARG_PREFILL_DECODE_ARMS`), `--prefill-decode-arms-mode off\|on\|auto` (`LLAMA_ARG_PREFILL_DECODE_ARMS_MODE`) — **both default OFF** |
 | campaign record | `wip/prefill-decode-arms-v2/` (`DESIGN.md`, `RUNS.md`, `HANDOVER.md`, `gates/`, `baseline/`) |
 
@@ -39,8 +42,9 @@ git checkout 919794500
 bash <delivery>/scripts/apply-all.sh --include-beta .
 #   18 delivery blocks (tip 089f90067, tree 27db9bfd4...), then 2 beta candidate patches:
 #     prefill-decode-arms.patch     (block 17, the two-arm server)
-#     state-split-2d-read.patch     (STEP 15, the 2-D read fix -- delivery-level, dropped at promotion)
-#   applied tree: 29c9644350e5ae594da2725ebc6ef1794982f42f
+#     state-split-2d-read.patch     (STEP 15, the 2-D read fix  -- delivery-level, dropped at promotion)
+#     two-arm-drop-boundary.patch   (STEP 16, the drop fence      -- delivery-level, dropped at promotion)
+#   applied tree: c0c261e45cd63fcb5d34cb34e4753d0a22603132
 ```
 
 **Verified three ways on this box**, all reading tree **`29c9644350…`**: the tester path

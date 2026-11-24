@@ -7,7 +7,11 @@
 > (`hsa_amd_agents_allow_access ... err 4096`, found with `AMD_LOG_LEVEL=3`).  The CUDA backend now issues **no** 2-D
 > D2H into host memory (`ggml_cuda_rows_to_host`), landed as `steps/STEP-15-0022-no-2d-d2h.patch` on `67946d6f0`;
 > gate `gates/gate-arms-state-split.sh`; records `WORKLOG.md` 261124.007, `INVARIANTS.md` r384-wip, `RUNS.md`
-> (2026-11-24 STEP 15).  Read §2 below as the *original* work order (its suspects were refuted in §3.2 terms — see
+> (2026-11-24 STEP 15).  **STEP 16 (same date)** then fixed the pair's other measured regression: uncontested
+> pair decode was running at HALF the single-context rate because the pair disabled the prefill->decode
+> compute-buffer drop (keeping the slab's wide band armed, so no CUDA graph was ever captured); the drop now
+> runs fenced by the other arm's step boundary, 45.9 -> 88.4 t/s (`WORKLOG.md` 261124.009, `INVARIANTS.md`
+> r385-wip, `steps/STEP-16-0023-pair-keeps-the-drop.patch`).  Read §2 below as the *original* work order (its suspects were refuted in §3.2 terms — see
 > the record); §5's promotion obligation (`TODO` #376) stands, and §9's open questions are answered in the record:
 > the fix is delivery code in `ggml-cuda.cu` (a block-09 amendment, not block 13), the pair-OFF control provably
 > never reaches the path (no multi-row verify batch), and `result_output` was never in a checkpoint — the read is the

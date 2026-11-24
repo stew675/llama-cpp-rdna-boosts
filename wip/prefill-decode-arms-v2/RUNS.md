@@ -1,3 +1,35 @@
+## 2026-11-24 — STEP 16: the pair halved uncontested decode via a disabled drop (no graph capture) — FIXED (`WORKLOG.md` 261124.009)
+
+Shape: the maintainer's `runme` (Flash-Next GSQ-IQ3_XXS, `-ncmoe 47`, attendance pool, `-sm tensor` on 2 devices,
+`-np 2`, `draft-mtp` Q4_K_M, `-ub 4096`), their Three.js prompt, 1000 tokens, `GGML_CUDA_GRAPH_TRACE=1`.
+No `ROCBLAS_USE_HIPBLASLT` override (it makes no difference here: 50.4 vs 45.9 t/s).
+
+| arm | decode | captures | slab wide band | arena |
+|---|---|---|---|---|
+| `--prefill-decode-arms-mode off` | **83.2 t/s** | 2922 | not armed | 39 375 MiB |
+| `off` + `LLAMA_DROP_COMPUTE_BUFFERS=0` (the pair's condition, no pair) | **46.5 t/s** | **none** | 5248 MiB armed | 33 938 MiB |
+| `auto` (before STEP 16) | **45.9 t/s** | **none** | 5248 MiB armed | 31 551 MiB |
+| `auto` (after STEP 16) | **88.4 t/s** | 3140 | released | 37 199 MiB |
+
+Draft counts identical in every arm (1298 drafted / 565 accepted).  The `LLAMA_DROP_COMPUTE_BUFFERS=0` row is the
+attribution: the same single-context server, only the drop withheld, halves.
+
+Mechanism: the pair disabled the prefill→decode compute-buffer drop (STEP 7d/7f) to keep its process-wide mutation
+away from the other arm's capture; with no drop the slab's wide band stays armed for the process's life,
+`ggml_cuda_graph_compute` refuses to capture while it is armed, and the band-armed warmup branch defers
+`capture_deferred` **silently** — so no decode graph is ever captured.  Fix: the drop runs again, fenced by the
+OTHER arm's step boundary (`llama_context_set_drop_boundary()`), which is stronger than the capture barrier (that
+one does not cover a replay).  The eviction's `ggml_cuda_graph_mem_freed()` bump is what already keeps captures
+from baking a freed arena address (TODO #70).
+
+Verification: `gates/gate-arms-state-split.sh` **PASS 11/11 twice** (concurrent prefill+decode — the race window),
+`gate-arms-multislot.sh` **PASS** (20 rounds x 4 slots), `gate-arms-spec.sh` **PASS 36/36**,
+`scripts/gate-prefill-logits.sh` **PASS**, whole-set `all` build clean, `check-windows-portability.sh` PASS.
+
+Harness trap: do NOT wrap `gate-arms-state-split.sh` in `timeout` — the script becomes a process-group leader,
+its `setsid` forks, `$!` names the short-lived parent, and the gate reports a false "the server aborted" while the
+server is healthy (measured twice; unwrapped it passes).  The gate header now says so.
+
 ## 2026-11-24 — STEP 15: the split-tensor 2-D read was the PEER GRANT, not the split arithmetic — FIXED (`WORKLOG.md` 261124.007)
 
 ### The measurement that refuted the work order

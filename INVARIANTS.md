@@ -3194,3 +3194,32 @@ it removed an abort (r374-wip) -- so the per-shape rule above stands, now on the
    argument combination, cross-device destinations, 1..6 copies, mapped/default flags, in-flight pairs — all
    succeed on an idle box).  The refusal depends on the machine's grant state, so the gate is end-to-end
    (`gates/gate-arms-state-split.sh`) and the driver log is the primary evidence.
+
+## r385-wip (2026-11-24, `WORKLOG.md` 261124.009) — a disabled compute-buffer drop silently costs CUDA graph capture, and that is ~half the decode rate: fence the drop, do not disable it (`prefill-decode-arms` v2 STEP 16)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/`, `beta/prefill-decode-arms/`.
+
+1. **With the pair on, uncontested decode was half of the single-context rate and the pair was innocent.**
+   Measured on the maintainer's `runme` shape (Flash-Next GSQ-IQ3_XXS, `-ncmoe 47`, pool, `-sm tensor` 2 devices,
+   `-np 2`, `draft-mtp`, `-ub 4096`, 1000 tokens): pair off **83.2 t/s**, pair `auto` **45.9 t/s** — and the same
+   single-context server with only `LLAMA_DROP_COMPUTE_BUFFERS=0` reads **46.5 t/s**.  Identical draft counts
+   (1298/565) everywhere, so it is not speculation; it holds with experts on the GPU, so it is not the arena.
+2. **The mechanism: no compute-buffer drop -> the slab's wide band stays armed -> ggml-cuda refuses to capture.**
+   `ggml_cuda_graph_compute` will not start a capture while `ggml_cuda_slab_wide_available()`, and the band-armed
+   warmup branch sets `capture_deferred` **without a log line** (it is silent even under
+   `GGML_CUDA_GRAPH_TRACE=1`).  The pair had disabled the drop outright (STEP 7d/7f) to keep its process-wide
+   mutation away from the other arm's capture, so it never captured a graph at all: 0 captures against 2922 in the
+   single-context arm.
+3. **The rule: fence the drop, never disable it.**  `llama_context_set_drop_boundary()` is called around the whole
+   `drop_now` block and the two-arm server implements it with `arms_peer_boundary[]` — the drop waits until the
+   OTHER arm is between steps and keeps it out for the mutation.  The capture barrier alone is NOT sufficient: it
+   fences captures and library GEMM calls, while a REPLAY is one `cudaGraphLaunch` whose GEMMs are never dispatched
+   and so never take it.  The calling arm is not waited for (the drop runs inside its step).
+4. **Result:** 45.9 -> **88.4 t/s**, 3140 captures, arena 31 551 -> 37 199 MiB (the stood-down tables come back via
+   the drop's own `moe_cache_rearm`), prefill 66 -> 116 t/s, single-context unchanged.  Consequence for any future
+   "disable X to avoid a race" decision in this codebase: X usually also disables a *reclamation*, and the
+   reclamation is where the rate lives.
+5. **`ggml_cuda_graph_mem_freed()` is what makes the capture side safe** (TODO #70): an eviction bumps the graph
+   memory generation, so a capture that baked a freed arena address is invalidated instead of replayed.  A
+   *replay already dispatched* is the residual hazard, which is why the fence is the step boundary and not the
+   barrier.

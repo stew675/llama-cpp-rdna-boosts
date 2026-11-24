@@ -1,3 +1,63 @@
+## 261124.009 (no release; `prefill-decode-arms` v2 STEP 16) -- the pair HALVED uncontested decode, and it was never the pair: the disabled compute-buffer drop keeps the slab's wide band armed, so no CUDA graph is ever captured
+
+Reported by the maintainer: with `--prefill-decode-arms-mode auto`, *uncontested* decode is about half the speed
+of the same server with the pair off, on their own `runme` shape, regardless of `-ncmoe`.
+
+1. **Reproduced, and the pair's own work is not the cost.**  Their exact server (Flash-Next GSQ-IQ3_XXS,
+   `-ncmoe 47`, the attendance pool, `-sm tensor` on 2 devices, `-np 2`, `draft-mtp` Q4_K_M, `-ub 4096`,
+   their Three.js prompt, 1000 tokens), `GGML_CUDA_GRAPH_TRACE=1`:
+
+   | arm | decode | graph captures | slab wide band | arena |
+   |---|---|---|---|---|
+   | pair off | **83.2 t/s** | 2922 | not armed | 39 375 MiB |
+   | pair off + `LLAMA_DROP_COMPUTE_BUFFERS=0` | **46.5 t/s** | **none** | 5248 MiB armed | 33 938 MiB |
+   | pair `auto` (before) | **45.9 t/s** | **none** | 5248 MiB armed | 31 551 MiB |
+   | pair `auto` (after, STEP 16) | **88.4 t/s** | **3140** | released | 37 199 MiB |
+
+   The identical draft counts (1298 / 565) in every arm rule out speculation; the second row is the attribution —
+   the SAME single-context server, with only the drop withheld, halves.
+2. **The chain.**  STEP 7d/7f disabled the prefill→decode compute-buffer drop in the pair
+   (`llama_context_disable_compute_buffer_drop`), because the drop's process-wide mutation (the slab boundary
+   move + the MoE arena re-arm) raced the other arm's capture.  With the drop disabled the slab's WIDE band is
+   never reclaimed; `ggml_cuda_graph_compute` refuses to start a capture while the band is armed, and the
+   band-armed warmup branch defers `capture_deferred` **silently** (no log even with `GGML_CUDA_GRAPH_TRACE=1`),
+   so no decode graph is ever captured and every step runs direct.  Two secondary costs fell out of the same
+   cause: 21-24 arena tables (~3 GiB) stood down "until the compute-buffer drop re-arms them" and never
+   re-armed, and prefill 75 → 66 t/s.  (The delivery's own drop site already warns about exactly this class:
+   r85, "the second request keeps the wide work buffer and a small arena, decode ~half speed".)
+3. **The fix (STEP 16, `steps/STEP-16-0023-pair-keeps-the-drop.patch`).**  The drop runs again, fenced by the
+   **other arm's step boundary** — the capture barrier alone would NOT do: it fences captures and library GEMM
+   calls, but a captured graph's REPLAY is one `cudaGraphLaunch` whose GEMMs are never dispatched, so it never
+   takes the barrier, and a drop that returns an arena to the slab's free list under a queued replay is the
+   silent-corruption/fault class.  So: one new hook, `llama_context_set_drop_boundary()` (no-op when unset, i.e.
+   every single-context server and all delivery paths), called around the whole `drop_now` block; the server
+   implements it as `arms_peer_boundary[arm]` + `arm_step_guard` waiting on the peer's flag.  The drop's own arm
+   is not waited for (it is inside its step, which is where the drop runs).  The capture side was already safe:
+   the eviction bumps `ggml_cuda_graph_mem_freed()`, so a capture that baked a freed arena address is
+   invalidated rather than replayed (TODO #70).
+4. **Verification.**  pair 45.9 → **88.4 t/s** with capture restored; single-context unchanged (83.5 → 83.2);
+   `gates/gate-arms-state-split.sh` **PASS 11/11 twice** (the concurrent prefill+decode crash recipe — the shape
+   the drop-vs-capture race needs), `gate-arms-multislot.sh` **PASS** (20 rounds x 4 slots), `gate-arms-spec.sh`
+   **PASS 36/36**, `scripts/gate-prefill-logits.sh` **PASS**, whole-set `all` build clean,
+   `check-windows-portability.sh` PASS.
+5. **Risks, stated (the maintainer asked before the work):** (a) the intermittent
+   `operation failed due to a previous error during capture` class returns if the fence is incomplete — it is
+   fenced by the step boundary, which is strictly stronger than the barrier that class was previously handled
+   with, and the two crash-recipe gates above are the instrument; (b) silent corruption via an in-flight replay
+   — same fence, plus mem-gen invalidation; (c) the drop now stalls the other arm for one step's length once per
+   prefill→decode transition (not per token) — that is the price of releasing the band; (d) lock-order: a step
+   waits for `!peer_boundary`, the fence waits for `in_step[other] == 0`, neither waits while holding a lock the
+   other needs.
+6. **Harness defect found (recorded so it is not re-discovered):** `gate-arms-state-split.sh` must NOT be wrapped
+   in `timeout` — that makes the script a process-group leader, `setsid` then forks, `$!` names the short-lived
+   parent, and the gate reports a FALSE "the server aborted" while the server is healthy (measured twice; the
+   same gate passes unwrapped).  Its header now says so.
+7. **The candidate is THREE patch files** (`261124.008`'s layout, extended): `prefill-decode-arms.patch` (block 17,
+   `a2badad1…`), `state-split-2d-read.patch` (STEP 15, `b3f0645a…`), `two-arm-drop-boundary.patch` (STEP 16,
+   `fd50d736…`, 4 files +97/−4).  `apply-all.sh --include-beta` from `919794500` applies all three and reports
+   applied tree **`c0c261e45`**; both STEP-15 and STEP-16 fixes stay separable for the promotion fold
+   (`TODO` #376 — now two block-09 amendments rather than one).
+
 ## 261124.008 (no release; `prefill-decode-arms` v2, artifact layout) -- the candidate carries STEP 15 as its OWN patch file, so the delivery-level fix is separable before promotion
 
 No code change; the artifact is re-laid-out on the maintainer's instruction (2026-11-24): the STEP-15 fix must be

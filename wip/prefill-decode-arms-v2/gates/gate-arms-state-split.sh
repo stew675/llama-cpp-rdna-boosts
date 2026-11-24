@@ -58,6 +58,11 @@
 #   --wait bounds the post-prefill observation window per round; the pre-fix build aborted ~6 s into it.
 #   `--rounds 3` is the release-class run (HANDOVER.md §4.4 asks for N >= 3 in the reproducer's own transcript).
 #
+#   DO NOT wrap this gate in `timeout(1)`: that makes it a PROCESS-GROUP LEADER, so its own `setsid` forks,
+#   `$!` names the short-lived parent, and the liveness check reports a FALSE "the server aborted" while the
+#   server is healthy (measured twice, 2026-11-24; the same gate passes unwrapped).  It takes the GPU flock on
+#   its own, so it must not be wrapped in flock either.
+#
 # Exit: 0 = pass, 1 = fail, 2 = usage/startup error.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

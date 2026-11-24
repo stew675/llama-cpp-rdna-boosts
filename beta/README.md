@@ -46,9 +46,10 @@ move happens with a "refuted" status.  A finished candidate leaves `beta/`; no s
   measured numbers, the residuals, the shapes it refuses),
   [`prefill-decode-arms/BETA-TESTING.md`](prefill-decode-arms/BETA-TESTING.md) (the apply, build and arm ladder)
   and [`prefill-decode-arms/prefill-decode-arms.patch`](prefill-decode-arms/prefill-decode-arms.patch)
-  (**TWO** patch files: `prefill-decode-arms.patch` — block 17, sha256 `a2badad1…e366fe3c`, 42 files,
-  +3073/−741 — then `state-split-2d-read.patch`, the delivery-level STEP 15 2-D-read fix carried by the
-  candidate for now, sha256 `b3f0645a…c2a7336b`, 1 file, +85/−46; applied in filename order, one commit each).
+  (**THREE** patch files, applied in filename order, one commit each: `prefill-decode-arms.patch` — block 17,
+  sha256 `a2badad1…e366fe3c`, 42 files, +3073/−741 — then two delivery-level fixes the candidate carries for
+  now, `state-split-2d-read.patch` (STEP 15, sha256 `b3f0645a…c2a7336b`, 1 file, +85/−46) and
+  `two-arm-drop-boundary.patch` (STEP 16, sha256 `fd50d736…d31030963`, 4 files, +97/−4)).
   Campaign record:
   [`../wip/prefill-decode-arms-v2/`](../wip/prefill-decode-arms-v2/README.md); its own gate set is
   `wip/prefill-decode-arms-v2/gates/gate-arms-*.sh` (beta-only, never delivery gates).

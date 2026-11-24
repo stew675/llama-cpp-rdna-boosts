@@ -538,3 +538,15 @@ hash/rate and its shape.
 > gather a row larger than the staging chunk.  Records: `WORKLOG.md` 261124.007, `INVARIANTS.md` r384-wip, `RUNS.md`
 > (2026-11-24, STEP 15).  Promotion obligation unchanged: cut into the delivery as a **block-09 amendment**
 > (`TODO` #376).
+
+## STEP 16 — the pair keeps the compute-buffer drop, fenced by the other arm's step boundary — **DONE 2026-11-24** (`56fdcbaff`)
+
+> Landed as `steps/STEP-16-0023-pair-keeps-the-drop.patch` from the maintainer's report that uncontested decode is
+> ~half speed with the pair on.  It was not the pair: disabling the drop keeps the slab's wide band armed, and
+> ggml-cuda refuses to capture a graph while the band is armed, so every decode step ran direct (45.9 t/s against
+> 83.2 on the single-context server, and 46.5 with only `LLAMA_DROP_COMPUTE_BUFFERS=0` on that same server).  The
+> drop now runs, fenced by the OTHER arm's step window through `llama_context_set_drop_boundary()` — the capture
+> barrier alone does not cover a replay, which is one `cudaGraphLaunch` whose GEMMs never take it.  Pair decode
+> 88.4 t/s, capture restored (3140), arena back +5.6 GiB.  Records: `WORKLOG.md` 261124.009, `INVARIANTS.md`
+> r385-wip, `RUNS.md` (2026-11-24 STEP 16).  Delivery-level: at promotion it is a second block-09 amendment
+> (`TODO` #376).
