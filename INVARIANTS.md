@@ -2788,3 +2788,47 @@ r363-wip item 1, whose diagnosis was wrong.
    with the arena's mapped top exactly at slot 1's base).  Track the arena's extent separately (`mapped_arena`:
    seeded at init, grown by `slab_extend`, never moved by a pin) and read it in `arena_top()` and in the pin.
 
+\n
+## r368-wip (2026-11-23, `WORKLOG.md` 261123.021) — a `thread_local` slot that selects state inside a SHARED buffer must be bound on every path that builds or resolves a graph, not only when a state variable changes (`prefill-decode-arms` v2 STEP 7e)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 7e (a defect in this campaign's STEP 4).
+
+1. **A "the requested state is already the current state" early return is not a statement about a
+   `thread_local` selection.**  STEP 4 made the Meta backend's view slot a per-context identity and bound it in
+   `sched_reserve()` and after the early return in `sched_alt_select()`; the main scheduler's state is the
+   default, so the ordinary `llama_process()` path returned before binding and the slot stayed whatever the
+   **last context on that thread** had bound.  Two contexts whose graphs share one Meta buffer then build,
+   allocate AND resolve under each other's view containers, and the view lookup yields a null tensor:
+   `GGML_ASSERT(tensor)` in `ggml_backend_tensor_set_async` (measured: Flash-Next GSQ-RCO IQ3_S + the external
+   shared MTP head, 3 devices `-sm tensor -mg 0`; the delivery build reads 86 chars `be69e274b66d`, the
+   campaign's STEP 4 build aborts rc=134, and binding before the early return plus at the top of
+   `graph_compute()` restores the delivery's text).  Bind where the graph is built/resolved, not where a flag
+   changes -- the cost is a thread-local store.
+2. **A gate's shape can be the reason a defect survives it.**  `scripts/gate-draft-ctx.sh` owns the external
+   draft head and passed on the broken build, because its arms are 1 device `-sm layer` (no Meta backend in the
+   path) while the arm it documents as negative-tested at r348 -- 3 devices `-sm tensor` -- is the one that
+   broke.  A gate that validates a *feature* on the cheapest shape it can run does not validate the *splits*
+   the feature is used on; the check belongs on a shape where the shared object is actually shared.
+
+## r369-wip (2026-11-23, `WORKLOG.md` 261123.022) — a gate's non-vacuity line is what catches a silent fallback, and an anchor's PROVENANCE decides what it can prove (`prefill-decode-arms` v2 STEP 8)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 8.
+
+1. **A "plain == drafter" text comparison is vacuous when the drafter never initialised, and the library only
+   WARNS.**  `--spec-type draft-mtp-adaptive --spec-draft-n-max 2` prints
+   `E failed to initialize speculative decoding context: invalid adaptive draft range: n_min_adaptive=3, n_max=2`
+   and then runs the whole arm as a PLAIN run (0 drafts generated).  Any purity claim read off that arm compares
+   two plain runs.  The gate must assert the MECHANISM (`#gen drafts > 0` and `#acc drafts > 0`) and name the
+   initialisation error, which is why the four-axis arms here use the delivery default ceiling (`--nmax 7`).
+   (Delivery-level wart, not this campaign's code: the pair is valid, so the run silently degrades instead of
+   refusing to start.)
+2. **An inertness anchor is only evidence if it predates the change, so the gate must print each anchor's
+   provenance.**  A1/A2/A3 and the 4B server startup shape were recorded at STEP 0 on the r353 delivery tree;
+   phi-4's row and the other three startup shapes were recorded at STEP 8 and are therefore a regression LOCK,
+   not evidence of inertness.  Recording an anchor after the fact and calling the gate green would launder the
+   change it is supposed to catch -- so `--record` refuses to overwrite an existing row and every row prints its
+   provenance.
+3. **A gate must not hold the GPU flock across a harness that takes the same flock.**  `flock` is not reentrant
+   across processes: the gate's whole-run lock plus `mtp-axis.sh`'s own lock deadlocked silently (the box idle
+   for 5+ minutes with `flock -w 900 9` waiting on the gate's own fd).  Hence `mtp-axis.sh --no-lock` for a
+   caller that already holds it.

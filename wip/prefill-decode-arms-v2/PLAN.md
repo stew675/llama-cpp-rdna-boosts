@@ -390,8 +390,21 @@ must be **non-vacuous**: it asserts that the mechanism it depends on actually ha
 Rules: one GPU job at a time; every server run under `setsid` + `timeout`, process group killed; every log checked
 with `check-gpu-faults.sh --since <before the run>`; text arms take **no** `-lv`, census arms `-lv 4`.
 
+**Written (2026-11-23):** all five exist and are green.  The two this step owed:
+
+* `gates/gate-arms-default-inert.sh` — the shapes, their cli text anchors (with each row's **provenance**) and
+  their startup shapes live in `baseline/inert-anchors.tsv` and `baseline/inert-shapes/`; the 4B startup shape's
+  expectation IS `baseline/A6-startup-shape.txt` (the STEP 0 file, not a copy), and the gate also runs the same
+  server with the pair ON to prove the comparison can see a change (4 added lines, same responses).  `--record`
+  writes only a MISSING anchor, so an anchor can never be quietly re-recorded into agreement.
+* `gates/gate-arms-recurrent-shared.sh` — `probe-recurrent-shared.cpp` promoted: §1 the placements must DIFFER,
+  §2 concurrent == `--solo` byte for byte, §3 the four-axis `none` == adaptive **with a non-zero draft/accept
+  count** (the non-vacuity line that caught an adaptive drafter refusing to initialise at `n_max 2` and the run
+  silently continuing plain).  Two models: 35B-A3B (3 devices `-sm tensor`) and Flash-Next/qwen4exp + its
+  external shared MTP head (the host-expert shape).
+
 **Exit:** all five green, and each gate's non-vacuity line present in its output.  Record the numbers in this
-directory (`RUNS.md`), not in `WORKLOG.md` (that gets the landing entry).
+directory (`RUNS.md`), not in `WORKLOG.md` (that gets the landing entry).  **Met 2026-11-23.**
 
 ---
 

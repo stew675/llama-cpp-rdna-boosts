@@ -8,6 +8,90 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — STEP 8: the two owed gates (`WORKLOG.md` 261123.022)
+
+`gates/gate-arms-default-inert.sh` (new, pair OFF on four shapes) and `gates/gate-arms-recurrent-shared.sh`
+(new, the probe promoted to a gate on two recurrent models), plus `baseline/inert-anchors.tsv` and
+`baseline/inert-shapes/` (the expectations they compare against) and `--no-lock` on `baseline/mtp-axis.sh`.
+
+### default-inert (`gate-arms-default-inert.sh`, no `-lv` on the cli arms; servers at their default verbosity)
+
+| shape | cli text (prose, seed 42, temp 0) | anchor provenance | startup shape |
+|---|---|---|---|
+| 4B Q8_0, 1 device | **251 chars `be904e86f248`** | **PRE-CHANGE** STEP 0 A1 (r353 tree) | **13 lines == `baseline/A6-startup-shape.txt`** (PRE-CHANGE) |
+| phi-4 IQ4_XS, 1 device | 272 chars `db5ab8e63e11` | recorded STEP 8 (post-change lock) | 13 lines == `inert-shapes/phi4-1gpu.shape` |
+| 27B Q8_0, 3 devices `-sm tensor -mg 0`, `-n 96` | **399 chars `10a82b5559a9`** | **PRE-CHANGE** STEP 0 A2 | 23 lines == `inert-shapes/27b-3gpu-tensor.shape` |
+| 35B-A3B Q8_0, 1 device `-ncmoe 40`, `MOE_EXPERT_HEATMAP=load` | **262 chars `e9db5cb8db0b`** | **PRE-CHANGE** STEP 0 A3 | 20 lines == `inert-shapes/35b-a3b-host.shape` |
+
+Non-vacuity (printed by the gate):
+* the cli text is **run-stable** over 2 fresh processes on the sensitivity shape (`be904e86f248` twice);
+* the SAME server with the pair ON prints a **different** shape and it is the recorded pair-ON shape
+  (`inert-shapes/4b-1gpu.pair-on.shape`): the delta is exactly 4 lines -- the two `resolve_fused_ops` WARNs the
+  second context resolves for itself, the `two-arm server: ... ONE memory ...` INFO, and
+  `arms_start: decode arm started (own batch of 2 rows)`;
+* the pair-ON responses are the pair-OFF responses as a **set** (`{142 ch 7bd542418112, 207 ch 6ce1f88dd5f7}`),
+  which is the A6 anchor -- the pair is a latency change, not an answer change.
+
+Server shape lines are cut at `listening on` and normalised by `baseline/norm-log.sh`; the 4B shape's
+expectation IS the STEP 0 file (no copy), the others carry a `# recorded` header the gate ignores.
+
+### recurrent-shared (`gate-arms-recurrent-shared.sh --n 600`, 3 devices; Flash-Next's four-axis arms on the
+host-expert shape `1 device -sm layer -ncmoe 48 -c 8192 -md mtp-...-shared-Q8_0.gguf`)
+
+| model | §1 placements (non-vacuity) | §2 concurrent vs `--solo` | §3 four-axis `none` == adaptive |
+|---|---|---|---|
+| 35B-A3B Q8_0 (embedded MTP, `-sm tensor`) | `A: head=0 n=1 rs_z=0 \| B: head=1 n=1 rs_z=1` | `arm_a=9eaff8b3b77dc104 arm_b=b17fc93ec1b442e4` **identical, round_ms=822** | R `8a8d0e7e2055` (182 drafts/153 acc), K `5ebd156073f6` (73/73), P `a7a7307e59bf` (168/146), C `3512551cd3c9` (123/115) -- **plain == drafter on all four** |
+| Flash-Next GSQ-RCO IQ3_S + shared head (qwen4exp) | `A: head=0 n=1 rs_z=0 \| B: head=1 n=1 rs_z=1` | `arm_a=9eaff8b3b77dc104 arm_b=8d9f63064b455c95` **identical, round_ms=1182** | R `f0d0bce6eb50` (219/163), K `a87c4318b649` (75/74), P `a738bc5e3b57` (150/131), C `904de4851b41` (106/102) -- **plain == drafter on all four** |
+
+The gate refuses a model with no recurrent module (`PASS this model HAS a recurrent module`), so the
+placement claim is never asserted against nothing.  `arm_a`'s digest is **model-insensitive** by construction
+(it is the greedy continuation of a repeated-text prefill, and 27B/35B/Flash-Next all read
+`9eaff8b3b77dc104`); `arm_b`'s is the discriminator, and the comparison that matters is concurrent vs `--solo`
+**within one model**, which is what the gate does.
+
+Two arms that would have been vacuous were caught by the gate's own non-vacuity lines (both recorded here, not
+fixed by hand):
+* `--spec-draft-n-max 2` with `draft-mtp-adaptive`: `E ... invalid adaptive draft range: n_min_adaptive=3,
+  n_max=2` and the run **continues as a plain run** -- 0 drafts generated, so "plain == drafter" was a
+  comparison of two plain runs.  The gate now FAILs on 0 drafts and names the initialisation error; the
+  Flash-Next arms use the delivery default ceiling `--nmax 7`.
+* the first version of the gate held the exclusive GPU flock for its whole run AND called `mtp-axis.sh`, which
+  takes the same lock: the box sat idle with `flock -w 900 9` waiting on the gate's own fd (5+ minutes).  Hence
+  `mtp-axis.sh --no-lock` (documented as "the caller already holds the lock").
+
+---
+
+## 2026-11-23 — STEP 7e: STEP 4 broke the EXTERNAL DRAFT HEAD on a tensor split, and no gate was shaped to see it (`WORKLOG.md` 261123.021)
+
+Found while choosing the recurrent gate's shapes, not by a gate: the campaign build aborts where a build of the
+delivery tip runs.
+
+| arm (Qwen3.8 Flash-Next GSQ-RCO IQ3_S + `mtp-...-shared-Q8_0`, 3 devices `-sm tensor -mg 0`, `-c 16384 --load-mode mmap --spec-type draft-mtp`, `-p "The capital of France is"`) | result |
+|---|---|
+| build of the delivery tip `089f90067` (a reference build in `~/llama.cpp/build-ref`) | **86 chars `be69e274b66d`** |
+| campaign tip `16131c077` (7c) | **rc=134**: `ggml/src/ggml-backend.cpp:789: GGML_ASSERT(tensor) failed` in `ggml_backend_tensor_set_async`, after `sched_graph_realloc: nodes = 5538 (changed = 1), n_diff = 2` |
+| the same command with `--load-mode none` instead of `mmap` | rc=134 (so the load mode is not the trigger) |
+| campaign STEP 5 `25b73cfaf` | rc=134 |
+| campaign STEP 3 `16c08ba70` | **rc=0** -- so the bisect lands on 4 |
+| campaign STEP 4 `23552dea2` | rc=134 |
+| STEP 7e fix (`3013e880a`) | **86 chars `be69e274b66d`** == the delivery's text |
+
+Mechanism: STEP 4 bound the `thread_local` Meta view slot only in `sched_reserve()` and in `sched_alt_select()`,
+and `sched_alt_select()` returns early when the requested state already is the current state -- so the ordinary
+`llama_process()` path bound nothing and the slot stayed whatever the last context on that thread had bound.
+`scripts/gate-draft-ctx.sh` (which owns the external head) did not see it because its arms are 1 device
+`-sm layer`, where the Meta backend is not in the path; the Flash-Next `-sm tensor` arm it documents as
+negative-tested at r348 is the shape that broke.
+
+Re-verified after the fix (all green, in this order): the reproducer (`be69e274b66d`), `scripts/gate-draft-ctx.sh`
+--quick (PASS 11 checks, `e7aae6034b4f`, acceptance 0.81429), the pair on 27B 3-device `-sm tensor`
+(`gate-arms-n1-memory.sh`: identical text `8f396b237f0f`/`04116b9a99ad` both arms, 31 steps/1 handover,
+0 of 8192 cells reserved), the 4-slot host-tier soak (`gate-arms-multislot.sh`: 20 rounds, 80 requests,
+0 errors, 8 steps/3 handovers/widest 3, aux `narrow-3` pinned), `gate-arms-default-inert.sh` (4/4 shapes) and
+`gate-arms-recurrent-shared.sh` (both models).
+
+---
+
 ## 2026-11-23 — STEP 7c (retaken on top of 7d): the aux reserve is an approximation, and the slab now **tells the operator the number to set** (`WORKLOG.md` 261123.020)
 
 7c was rejected before 7d because it changed table placement and thereby exposed the drop/capture race; with the

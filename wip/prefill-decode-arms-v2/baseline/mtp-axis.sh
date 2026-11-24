@@ -12,12 +12,19 @@
 #
 # Usage:
 #   mtp-axis.sh --axis R|K|P|C --spec none|draft-mtp [--kv f16|q8_0] [--n 3000] [--out DIR]
+#               [--model FILE] [--devices LIST] [--sm tensor|layer] [--ncmoe N] [--ctx N]
+#               [--load mlock|mmap|none] [--md FILE] [--tag-prefix S] [--no-lock]
+#
+# The shape options exist so a DIFFERENT model can be driven through the same protocol without editing this
+# harness (STEP 8's recurrent gate: 35B-A3B on a tensor split, and Flash-Next + its external shared MTP head on
+# the host-expert shape).  Every default reproduces the command line the delivery's own four-axis records use,
+# so an existing record stays reproducible.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 AXIS=""; SPEC="none"; KV="f16"; N=3000; NMAX=7; OUT="$HOME/.cache/rdna-boosts/arms-v2/mtp"
 MODEL="/llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf"
-RUNTO=1200; DEVICES="0,1,2"
+RUNTO=1200; DEVICES="0,1,2"; SM="tensor"; NCMOE=""; CTX=102400; LOAD="mlock"; MD=""; LAZY=""; TAGP=""; NOLOCK=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -30,6 +37,14 @@ while [ $# -gt 0 ]; do
         --model) MODEL="$2"; shift 2 ;;
         --timeout) RUNTO="$2"; shift 2 ;;
         --devices) DEVICES="$2"; shift 2 ;;
+        --sm) SM="$2"; shift 2 ;;
+        --ncmoe) NCMOE="$2"; shift 2 ;;
+        --ctx) CTX="$2"; shift 2 ;;
+        --load) LOAD="$2"; shift 2 ;;
+        --md) MD="$2"; shift 2 ;;
+        --lazy) LAZY="$2"; shift 2 ;;
+        --tag-prefix) TAGP="$2"; shift 2 ;;
+        --no-lock) NOLOCK=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -53,7 +68,14 @@ case "$SPEC" in
     none|draft-mtp) ;;
     *) echo "spec must be none|draft-mtp|adaptive" >&2; exit 2 ;;
 esac
-TAG="mtp-$AXIS-$SPEC-$KV-n$N"
+TAG="${TAGP}mtp-$AXIS-$SPEC-$KV-n$N"
+
+# the split mode: `tensor` keeps the historical `-sm tensor -mg 0` (the delivery's canonical three-device shape);
+# any other mode is passed through on its own, because `-mg` is the tensor arm's main-GPU pick
+if [ "$SM" = tensor ]; then SM_ARGS=(-sm tensor -mg 0); else SM_ARGS=(-sm "$SM"); fi
+NCMOE_ARGS=(); [ -n "$NCMOE" ] && NCMOE_ARGS=(--n-cpu-moe "$NCMOE")
+MD_ARGS=();    [ -n "$MD" ]    && MD_ARGS=(-md "$MD")
+LAZY_ARGS=();  [ -n "$LAZY" ]  && LAZY_ARGS=(--lazy-mode "$LAZY")
 CLI="$HOME/llama.cpp/build-rocm/bin/llama-cli"
 cd "$HOME/llama.cpp" || exit 1
 
@@ -61,21 +83,26 @@ cd "$HOME/llama.cpp" || exit 1
 # arm launched beside this one waits up to LOCK_WAIT seconds and then FAILS LOUDLY -- two concurrent
 # arms contaminate every rate (and once already produced two different "same-seed" texts because the
 # near-tie flipped under the interference).
-LOCK="${MTP_LOCK:-$HOME/.cache/rdna-boosts/gpu.lock}"
-LOCK_WAIT="${LOCK_WAIT:-900}"
-mkdir -p "$(dirname "$LOCK")"
-exec 9>"$LOCK"
-if ! flock -w "$LOCK_WAIT" 9; then
-    echo "FAIL($TAG): another GPU job holds $LOCK (waited ${LOCK_WAIT}s) -- refusing to run two arms at once" >&2
-    exit 1
+if [ "$NOLOCK" = 1 ]; then
+    echo "  ($TAG) --no-lock: the CALLER holds the exclusive GPU lock" >&2
+else
+    LOCK="${MTP_LOCK:-$HOME/.cache/rdna-boosts/gpu.lock}"
+    LOCK_WAIT="${LOCK_WAIT:-900}"
+    mkdir -p "$(dirname "$LOCK")"
+    exec 9>"$LOCK"
+    if ! flock -w "$LOCK_WAIT" 9; then
+        echo "FAIL($TAG): another GPU job holds $LOCK (waited ${LOCK_WAIT}s) -- refusing to run two arms at once" >&2
+        exit 1
+    fi
 fi
 
 t0=$SECONDS
 # shellcheck disable=SC2086
 HIP_VISIBLE_DEVICES="$DEVICES" ROCBLAS_USE_HIPBLASLT=0 timeout "$RUNTO" "$CLI" \
     -m "$MODEL" --fit false --top-k 20 -t 8 --parallel 1 --top-p 0.95 --min-p 0.001 \
-    -n "$N" --load-mode mlock --cache-ram 16384 -c 102400 --flash-attn auto \
-    --temp 0 --batch-size 1024 --ubatch-size 1024 -ngl 99 -sm tensor -mg 0 \
+    -n "$N" --load-mode "$LOAD" --cache-ram 16384 -c "$CTX" --flash-attn auto \
+    --temp 0 --batch-size 1024 --ubatch-size 1024 -ngl 99 "${SM_ARGS[@]}" "${NCMOE_ARGS[@]}" \
+    "${MD_ARGS[@]}" "${LAZY_ARGS[@]}" \
     -ctk "$KV" -ctv "$KV" --ctx-checkpoints 64 --reasoning-budget 65536 --reasoning-preserve \
     --repeat-penalty 1.0 --presence-penalty 1.5 --seed 42 --single-turn \
     --spec-type "$SPEC_TYPE" "${SPEC_EXTRA[@]}" --reasoning "$REA" -lv 4 \

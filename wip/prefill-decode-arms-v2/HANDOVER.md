@@ -1,4 +1,4 @@
-# HANDOVER — `prefill-decode-arms` v2, campaign state + the next task (STEP 8)
+# HANDOVER — `prefill-decode-arms` v2, campaign state + the next task (STEP 9)
 
 **Read this file first, then work top to bottom.**  Written for a session with *no* memory of the campaign: what
 exists, what is green, what is open, what to do first.  Everything below was measured on this box; a plan that has
@@ -6,12 +6,13 @@ not been run says so.
 
 | | |
 |---|---|
-| delivery repo | `~/llama-cpp-rdna-boosts`, branch **`prefill-decode-arms-v2`**, HEAD **`1c2cf47b`** (pushed; **`main` untouched** at `91a81505`) |
-| work tree | `~/llama.cpp`, branch **`arms-v2`** (**local only, never pushed**), tip **`16131c077`**, tree clean |
+| delivery repo | `~/llama-cpp-rdna-boosts`, branch **`prefill-decode-arms-v2`**, HEAD = the **STEP 7e/8 landing** (the commit that carries this file; **`main` untouched** at `91a81505`) |
+| work tree | `~/llama.cpp`, branch **`arms-v2`** (**local only, never pushed**), tip **`3013e880a`** (STEP 7e), tree clean |
 | build | `~/bin/build-llama-rocm` → `build-rocm` (ROCm **10.2.0**); fast loop `cmake --build build-rocm --target llama-cli llama-server -j 16` |
-| landings | STEP 0-6e, then **7a** (host-tier fault: slab work-base alias), **7d** (host-tier intermittency: the drop races a capture), **7c** (the aux reserve + its calibration log) — §1.2 |
-| **next action** | **STEP 8 — the two missing gates** (`gate-arms-default-inert.sh`, `gate-arms-recurrent-shared.sh`), §3 |
-| after that | STEP 9 shape/latency matrix + records, STEP 10 speculator re-admission, STEP 11 delivery sweep, STEP 12 candidate patch + the promotion ask |
+| extra build dirs | **`build-ref`** = a build of the delivery tip `089f90067` (the "pre-change build": the reference for a regression question), **`build-bisect`** = the last bisect rung's build.  Both at the same source path, so ccache stays warm |
+| landings | STEP 0-6e, **7a**, **7d**, **7c**, **7e** (STEP 4 broke the external draft head on a tensor split), **8** (the gate set is complete) — §1.2 |
+| **next action** | **STEP 9 — the shape/latency matrix + the records**, §3 |
+| after that | STEP 10 speculator re-admission, STEP 11 delivery sweep, STEP 12 candidate patch + the promotion ask |
 
 ---
 
@@ -59,8 +60,10 @@ nothing is copied between them.**  `llama_context_params::ctx_memory` is the onl
 | STEP 7a | `STEP-7a-0010-aux-narrow-regions.patch` | **the aux narrow region stack**: one pinned slab work region per extra context (slot 0 = draft, slot 1 = a borrowing context), `thread_local` routing from the allocating context's identity, the iface rename; the `-ncmoe` refusal **removed** (§2.1-2.5) |
 | STEP 7d | `STEP-7d-0011-pair-drop-disable.patch` | `llama_context_disable_compute_buffer_drop()` for both arms: the prefill→decode drop races the other arm's graph capture (§2.7) |
 | STEP 7c | `STEP-7c-0012-aux-reserve-calibration.patch` | the aux region is charged to the slab **reserve** (approximation), the slab logs the measured size + the reserve to set **once per slot**, and `mapped_arena` separates the arena's extent from the slab's (§2.8) |
+| STEP 7e | `STEP-7e-0013-meta-slot-per-graph.patch` | **STEP 4's defect**: the `thread_local` Meta view slot must be bound where a graph is built/resolved, not where a flag changes — `sched_alt_select()` bound only after its no-op early return, so on `-sm tensor` a second context's graph resolved under the first's view containers (`GGML_ASSERT(tensor)`) (§3, and `INVARIANTS.md` r368-wip) |
+| STEP 8 | — (gates + anchors, no code) | `gate-arms-default-inert.sh` + `gate-arms-recurrent-shared.sh`, `baseline/inert-anchors.tsv`, `baseline/inert-shapes/`, `mtp-axis.sh` shape flags + `--no-lock` (§3) |
 
-Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077` (branch `arms-v2`, local only).
+Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077`, 7e `3013e880a` (branch `arms-v2`, local only).
 
 ### 1.3 Green, with the number that proves it (all re-measured after 7c)
 
@@ -74,13 +77,17 @@ Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077` (branch `arms-v2`, loc
 | **the draft slot** | Gemma4 26B-A4B Q8_0 (MoE) `-ncmoe 20` + `-md mtp-gemma-4-26B-A4B-it.gguf`: **both** aux regions (`narrow-2` draft, `narrow-3` borrowing) map from the spare at `GGML_CUDA_SLAB_RESERVE_MIB=2560` (the slab's own recommendation), 0 evictions; `none` == `draft-mtp` == **481 chars `a195d3d6953c`**, stable over 3 cold `none` runs |
 | GPU-resident soak | 4B, 4 slots × 20 rounds, 80 requests, 0 errors, **widest decode batch 4** |
 | the probes | `probe-kv-reservation.cpp` (I4), `probe-recurrent-shared.cpp` (I5), `probe-ctx-memory.cpp`, `probe-meta-slots.cpp`, `probe-host-stream.cpp` |
+| **default path untouched (the gate)** | `gates/gate-arms-default-inert.sh` **PASS** on 4 shapes: cli text `be904e86f248` / `db5ab8e63e11` / `10a82b5559a9` / `e9db5cb8db0b` (the first, third and fourth are **pre-change** STEP 0 anchors) and startup shapes identical (the 4B one to `baseline/A6-startup-shape.txt` **byte for byte**), plus the pair-ON sensitivity arm (4 added lines, same responses) |
+| **one memory, two contexts on a RECURRENT model (the gate)** | `gates/gate-arms-recurrent-shared.sh` **PASS** on 35B-A3B (3 devices `-sm tensor`) and Flash-Next/qwen4exp + the shared MTP head (host-expert shape): placements differ (`head=0 n=1` vs `head=1 n=1`), concurrent digests == `--solo`, and the four-axis `none` == adaptive text with 73..219 drafts accepted on every axis |
+| the 7e fix | the reproducer (Flash-Next + external head, 3 devices `-sm tensor`) reads the delivery's text `be69e274b66d` again; `gate-draft-ctx.sh` PASS; the pair on 27B tensor identical (`8f396b237f0f`/`04116b9a99ad`); the host-tier soak PASS |
 | the build | whole set builds; `scripts/check-shlib-symbols.sh` **OK** (16 libs) after the iface rename |
 
 ### 1.4 Open
 
-* **STEP 8 (next):** two gates are owed — `gate-arms-default-inert.sh`, `gate-arms-recurrent-shared.sh` (§3).
-  Three exist and are green (`gate-arms-{n1-memory,itl,multislot}.sh`).
-* **STEP 9:** the shape/latency matrix (host-tier + draft rows now available) and the `ENVIRONMENT.md` rows.
+* **STEP 9 (next):** the shape/latency matrix (host-tier + draft rows now available) and the `ENVIRONMENT.md` rows.
+* **Closed at STEP 8:** the five-gate set is complete and green (`gate-arms-{default-inert,n1-memory,itl,`
+  `multislot,recurrent-shared}.sh`), each printing its own non-vacuity line.  `RUNS.md` has the numbers;
+  `INVARIANTS.md` r368/r369-wip the facts.
 * **STEP 10:** re-admit the speculator on the pair.  Two prerequisites are *new* in this session: a drafter adds
   two more compute layouts (the reserve question, §7.2) and the always-reserved layout (§2.7) needs re-measuring.
 * **STEPs 11-12:** delivery sweep, then the candidate patch + the promotion ask (§3).
@@ -210,14 +217,33 @@ The reserve in force is 2816 MiB; 2816 MiB would host every auxiliary region (he
 
 `PLAN.md` has each step's own detail.  Order and what is left:
 
-### STEP 8 — the gate set (NEXT)
+### STEP 8 — the gate set (CLOSED 2026-11-23)
 
-Three gates exist and are green: `gates/gate-arms-n1-memory.sh` (one memory, byte text, decode-arm census, the I4
+**Done.**  Five gates, each printing its own non-vacuity line, all green:
+
+| gate | what it asserts |
+|---|---|
+| `gate-arms-default-inert.sh` | pair OFF on **4 shapes** == the anchors: cli text vs `baseline/inert-anchors.tsv` (provenance printed: 3 of 4 rows are PRE-CHANGE STEP 0 rows), server startup shape vs `baseline/inert-shapes/` (the 4B one IS `baseline/A6-startup-shape.txt`).  Sensitivity: pair ON must print a DIFFERENT shape (4 lines) and read the SAME responses |
+| `gate-arms-n1-memory.sh` | one memory, byte text, the decode-arm census, the I4 reservation census |
+| `gate-arms-itl.sh` | the latency claim at a stated `-ub` |
+| `gate-arms-multislot.sh` | the 4-slot soak (`ARMS=` for the pair-OFF control, the heat prior pinned, fails if a slab-armed shape gave the decode arm no region) |
+| `gate-arms-recurrent-shared.sh` | **new**: the probe promoted -- placements DIFFER (`head=0 n=1` vs `head=1 n=1`), concurrent == `--solo`, and the four-axis `none` == adaptive with a non-zero draft/accept count, on **35B-A3B and Flash-Next/qwen4exp** |
+
+Two arms the new gate caught while being written (both in `RUNS.md`): an adaptive drafter at `n_max 2` never
+initialises (`n_min_adaptive=3`) and the library **continues as a plain run** (0 drafts), and a gate that holds
+the GPU flock across `mtp-axis.sh` deadlocks on its own fd (`mtp-axis.sh --no-lock`).
+
+Also closed here, because STEP 8's shape survey found it: **STEP 7e** -- STEP 4's `thread_local` Meta view slot
+was bound only after `sched_alt_select()`'s no-op early return, so on `-sm tensor` a second context's graph
+resolved under the first's view containers (`GGML_ASSERT(tensor)`; the delivery build runs that shape).  Fixed,
+re-verified, `INVARIANTS.md` r368-wip.
+
+The original STEP 8 scope, for the record: three gates existed and were green: `gates/gate-arms-n1-memory.sh` (one memory, byte text, decode-arm census, the I4
 reservation census), `gates/gate-arms-itl.sh` (the latency claim at a stated `-ub`), `gates/gate-arms-multislot.sh`
 (the 4-slot soak; it now takes **`ARMS=`** for the pair-OFF control, pins `MOE_EXPERT_HEATMAP=load`, and **fails
 if a slab-armed shape did not give the decode arm its own region**).
 
-Owed:
+What was owed (both now written):
 
 * **`gate-arms-default-inert.sh`** — the pair **OFF** must (a) print a startup shape **byte-identical** to
   `baseline/A6-startup-shape.txt` (normalise with `baseline/norm-log.sh`, cut at the `listening on` line) and
@@ -295,15 +321,23 @@ into `patches/` is a new block and is the maintainer's decision** (§6).
 
 ```
 baseline/  r353-anchors.md        the anchors A1-A7 and how to re-run them
-           A6-startup-shape.txt   the 13-line pair-OFF startup shape (the default-inert anchor)
+           A6-startup-shape.txt   the 13-line pair-OFF startup shape (the default-inert anchor, 4B)
+           inert-anchors.tsv      the default-inert cli TEXT anchors + each row's PROVENANCE (pre-change vs lock)
+           inert-shapes/          one recorded startup shape per shape (+ the 4B pair-ON sensitivity fixture)
            server-arm.sh          start a server arm, drive N requests, hashes + the log; ONE TERM then wait
            itl-arm.sh             the ITL-through-a-prefill measurement (slot A decodes while B prefills)
-           mtp-axis.sh            one four-axis MTP arm (GPU flock; --spec none|draft-mtp|adaptive)
+           mtp-axis.sh            one four-axis MTP arm (GPU flock; --spec none|draft-mtp|adaptive).
+                                  Shape options for another model: --sm/--ncmoe/--ctx/--load/--md/--tag-prefix;
+                                  **--no-lock** when the CALLER already holds the GPU lock (a gate)
            norm-log.sh            a log's SHAPE (keeps both log line forms, masks addresses/decimals)
-gates/     gate-arms-n1-memory.sh    both arms, ONE memory, byte text, decode-arm census, reservation census
-           gate-arms-itl.sh         the latency claim (same text, ITL no worse) at a stated -ub
-           gate-arms-multislot.sh   4 slots x 20 rounds soak; ARMS= for the pair-OFF control; pins the heat
-                                    prior; FAILS if a slab-armed shape gave the decode arm no region of its own
+gates/     gate-arms-default-inert.sh  pair OFF on 4 shapes: cli text + startup shape vs the anchors, with the
+                                    pair-ON sensitivity arm; `--record` writes a MISSING anchor (never overwrites)
+           gate-arms-n1-memory.sh    both arms, ONE memory, byte text, decode-arm census, reservation census
+           gate-arms-itl.sh          the latency claim (same text, ITL no worse) at a stated -ub
+           gate-arms-multislot.sh    4 slots x 20 rounds soak; ARMS= for the pair-OFF control; pins the heat
+                                     prior; FAILS if a slab-armed shape gave the decode arm no region of its own
+           gate-arms-recurrent-shared.sh  the probe as a gate on 35B-A3B + Flash-Next: placements DIFFER,
+                                     concurrent == --solo, four-axis none == adaptive with drafts accepted
            probe-*.cpp              the five non-vacuity probes (host stream, ctx-memory, kv reservation,
                                     meta slots, recurrent placement) -- each compiles against the built tree:
    e.g.  /opt/rocm-10.2.0-gfx120X/lib/llvm/bin/clang++ -std=c++17 -O1 -pthread probes.cpp \
@@ -312,7 +346,8 @@ gates/     gate-arms-n1-memory.sh    both arms, ONE memory, byte text, decode-ar
 ```
 
 Every number of record is in `RUNS.md` (newest first) with its command and shape; the anchors are in
-`baseline/r353-anchors.md`.  The campaign's facts are in `INVARIANTS.md` under `r353-wip` … `r367-wip`.
+`baseline/r353-anchors.md` (+ `inert-anchors.tsv` for the default-inert rows).  The campaign's facts are in
+`INVARIANTS.md` under `r353-wip` … `r369-wip`.
 
 ---
 
@@ -355,3 +390,13 @@ Every number of record is in `RUNS.md` (newest first) with its command and shape
 4. **The Step-9 byte-claim rule** ("one request in flight") is this campaign's reading of DESIGN V8.  If a byte
    claim *under* concurrency is wanted, the batch composition has to be pinned first — a separate instrument, not
    a gate tweak.
+5. **A delivery wart STEP 8 found (not this campaign's code):** `--spec-type draft-mtp-adaptive` with
+   `--spec-draft-n-max 2` logs `E failed to initialize speculative decoding context: invalid adaptive draft
+   range: n_min_adaptive=3, n_max=2` and then runs the whole arm as a **plain** run — 0 drafts, no refusal to
+   start.  A user asking for adaptive MTP at n_max 2 silently gets none, and any purity claim read off that arm
+   compares two plain runs.  Should the parameter validation refuse the start instead (`INVARIANTS.md`
+   r369-wip item 1)?  A refusal is a one-line change in the delivery's speculative option handling.
+6. **STEP 7e's shape is now in the campaign's own sweep:** the external-head-on-`-sm tensor` arm (3 devices) is
+   the one that broke and no delivery gate covers it (`gate-draft-ctx.sh` runs 1 device `-sm layer`).  Should the
+   pair's or the delivery's gate set gain that arm, and does that belong to this campaign or to the delivery's
+   own gate work (`INVARIANTS.md` r368-wip item 2)?

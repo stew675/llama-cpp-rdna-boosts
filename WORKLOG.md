@@ -1,3 +1,94 @@
+## 261123.022 (no release; `prefill-decode-arms` v2 STEP 8) -- the two owed gates: the pair-OFF default path is byte-identical on four shapes, and one recurrent memory serves two contexts on both recurrent models
+
+STEP 8 is the gate half of the campaign.  Three gates existed (`gate-arms-{n1-memory,itl,multislot}.sh`); the two
+that were owed are now written, run, and green, and each prints its own non-vacuity line.
+
+### `gates/gate-arms-default-inert.sh` -- the pair OFF changes nothing
+
+Four shapes (4B 1 GPU, phi-4 IQ4_XS 1 GPU, 27B Q8_0 3 GPU `-sm tensor -mg 0`, 35B-A3B Q8_0 1 GPU `-ncmoe 40`),
+two instruments per shape: the greedy cli TEXT against `baseline/inert-anchors.tsv`, and the server STARTUP SHAPE
+(every line up to `listening on`, normalised by `baseline/norm-log.sh`) against `baseline/inert-shapes/`.
+
+* the three pre-change text anchors hold: `be904e86f248`, `10a82b5559a9`, `e9db5cb8db0b`; phi-4's row
+  (`db5ab8e63e11`) is recorded now and the gate says so;
+* the 4B startup shape is **byte-identical to the STEP 0 file** (`baseline/A6-startup-shape.txt`, 13 lines); the
+  other three shapes are locks recorded now (`inert-shapes/`);
+* SENSITIVITY (the non-vacuity that matters): the same server with the pair ON prints a **different** shape --
+  exactly 4 added lines (two `resolve_fused_ops` WARNs, the `two-arm server: ... ONE memory ...` INFO, and
+  `arms_start: decode arm started (own batch of 2 rows)`) -- and reads the **same** two responses
+  (`7bd542418112`/`6ce1f88dd5f7` as a set).  A shape comparison that could not see the pair would pass anything.
+
+The anchor file carries a **provenance column** and the gate prints it: a row recorded after the change is a
+regression lock, not evidence of inertness, and `--record` refuses to overwrite an existing row without `--force`.
+
+### `gates/gate-arms-recurrent-shared.sh` -- the probe promoted, on both recurrent models
+
+`gates/probe-recurrent-shared.cpp` becomes a gate with three claims per model, on 35B-A3B Q8_0 (3 devices
+`-sm tensor`, embedded MTP head) and Flash-Next GSQ-RCO IQ3_S + the external shared MTP head (qwen4exp):
+
+1. **the placement** (non-vacuity): two live batch contexts on ONE recurrent memory hold `head=0 n=1 rs_z=0` and
+   `head=1 n=1 rs_z=1` at the same instant, each pointing at its own sequence's cell.  The STEP 4 control (a
+   module-held placement) printed `head=1 n=1` for BOTH, so the gate is satisfied by DIFFERENCE;
+2. **the text**: the two-thread arm (a 512-token prefill on one context while the other takes 16 single-token
+   steps) reads the same `arm_a`/`arm_b` digests as the same program run one arm at a time (`--solo`), byte for
+   byte;
+3. **the drafter's rollback plane**: the four-axis protocol (`--n 600`) with `none` == the adaptive drafter on
+   all four axes, WITH a non-zero draft/accept count (all four axes, both models -- 73..219 drafts, 73..163
+   accepted).
+
+Two vacuous arms the gate caught while it was being written are recorded in `RUNS.md`: an adaptive drafter at
+`n_max 2` never initialises (`n_min_adaptive=3`) and the library **continues as a plain run** (0 drafts), and a
+gate that holds the GPU flock across `mtp-axis.sh` deadlocks on its own fd (hence `--no-lock`).
+
+The recurrent gate's Flash-Next four-axis arms use the host-expert shape (1 device `-sm layer -ncmoe 48`), which
+is `scripts/gate-draft-ctx.sh`'s proven arm for the external head.
+
+### Recorded
+`RUNS.md` (both gates' numbers), `INVARIANTS.md` r369-wip, `baseline/inert-anchors.tsv`,
+`baseline/inert-shapes/`, `baseline/mtp-axis.sh` (`--sm/--ncmoe/--ctx/--load/--md/--tag-prefix/--no-lock`).
+
+---
+
+## 261123.021 (no release; `prefill-decode-arms` v2 STEP 7e) -- STEP 4 broke the EXTERNAL DRAFT HEAD on a tensor split: a `thread_local` slot must be bound where the graph is built, not where a flag changes
+
+Found while choosing STEP 8's gate shapes, and it is the campaign's own defect: on
+
+```
+Qwen3.8 Flash-Next GSQ-RCO IQ3_S + mtp-Qwen3.8-Flash-Next-shared-Q8_0, 3 devices -sm tensor -mg 0,
+-c 16384 --load-mode mmap --spec-type draft-mtp
+```
+
+a build of the delivery tip `089f90067` reads 86 chars `be69e274b66d`, and this branch aborted with
+`GGML_ASSERT(tensor) failed` in `ggml_backend_tensor_set_async` right after the first draft's
+`sched_graph_realloc ... n_diff = 2`.
+
+**Bisected** (a second build dir, `build-bisect`, and a reference build of the delivery tip, `build-ref`):
+delivery tip clean, STEP 3 clean, STEP 4 aborts, STEP 5 aborts, tip aborts.  So STEP 4.
+
+**Mechanism.**  STEP 4 turned the Meta backend's view slot into a per-context identity (`thread_local`, one pair
+per `llama_context` from a process-wide counter) and bound it in `sched_reserve()` and at the END of
+`sched_alt_select()` -- after its `if (alt == sched_alt_in_use) return;`.  The main scheduler's state is the
+default, so the ordinary `llama_process()` path returned BEFORE binding and the thread-local slot stayed whatever
+the last context on that thread had bound.  With two contexts whose graphs share one Meta buffer (target + draft
+head on `-sm tensor`), the target's graph was built, allocated and resolved under the draft's view containers,
+and the view lookup returned a null tensor.
+
+**Fix (STEP 7e, `steps/STEP-7e-0013-meta-slot-per-graph.patch`).**  Bind before the early return in
+`sched_alt_select()` (every ubatch path) and at the top of `graph_compute()` (the resolve choke point, which also
+covers the KV cache's own graph).  A thread-local store; no behaviour change on the default path.
+
+**Why no gate saw it.**  `scripts/gate-draft-ctx.sh` owns this exact feature and passed on the broken build,
+because its arms are 1 device `-sm layer` -- no Meta backend in the path.  The 3-device `-sm tensor` arm its own
+header says was negative-tested at r348 is the one that broke.  That is r368-wip item 2.
+
+**Re-verified after the fix:** the reproducer (`be69e274b66d`, the delivery's text), `gate-draft-ctx.sh --quick`
+(PASS 11, `e7aae6034b4f`), the pair on 27B 3-device `-sm tensor` (identical text `8f396b237f0f`/`04116b9a99ad`,
+31 steps/1 handover, 0 of 8192 cells reserved), the 4-slot host-tier soak (20 rounds, 80 requests, 0 errors,
+8 steps/3 handovers/widest 3, aux `narrow-3` pinned), `gate-arms-default-inert.sh` 4/4, and
+`gate-arms-recurrent-shared.sh` on both models.
+
+---
+
 ## 261123.020 (no release; `prefill-decode-arms` v2 STEP 7c, retaken) -- the auxiliary compute region is charged to the slab reserve up front, the slab logs the calibrated value for the next run, and a residual accounting defect (`mapped` vs the arena's extent) is fixed
 
 7c was implemented and rejected earlier today (261123.018 was 7b; the 7c attempt is in the 7d entry's history)
