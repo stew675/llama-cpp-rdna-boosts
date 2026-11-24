@@ -7,18 +7,27 @@ and **nothing is copied between them**.
 > **Status (2026-11-24): beta candidate, replacing the withdrawn artifact.**
 > This directory used to hold the *previous* design for block 17 (withdrawn at r352).  The maintainer's decision of
 > 2026-11-24 is that this work **replaces it in its entirety**, and that on promotion it becomes **delivery block
-> 17 as ONE self-contained patch** — a modification to the lower-numbered blocks (it edits files blocks 12/15 own,
+> 17 as ONE self-contained patch-BLOCK** (here: two files, the block plus the delivery-level STEP 15 fix it carries) — a modification to the lower-numbered blocks (it edits files blocks 12/15 own,
 > `ggml-cuda-slab.cu`, plus the `llama_context`/`llama.h` layer).  **Nothing here is part of `patches/`,
 > `release.json` or `rdna-boosts-all.patch`, and no default `apply-all.sh` checkout contains it.**  Promotion is a
 > block-structure decision and is asked first; a green gate ladder is not permission.
 
+**The candidate is TWO patch files**, applied in filename order by `apply-all.sh --include-beta` (`beta/*/*.patch`),
+one commit each.  They are split on purpose: `state-split-2d-read.patch` is a **delivery-level** fix that the
+candidate merely carries until it is cut into the delivery (a block-09 amendment, `TODO` #376), so at promotion that
+file is **dropped** and the block-17 patch is not touched; block 17's own patch is exactly the one that was already
+tested (its sha256 is unchanged through this split).
+
 | | |
 |---|---|
-| patch | `prefill-decode-arms.patch` — **one** commit, cut against the current `release.json` tree |
-| sha256 | `f51a78b00d73bf9c000a158f99e1d7fadff9ca18f1a8169c6f275c03582d35bb` |
-| size | 42 files, **+3147/−776** |
+| patch 1 (block 17) | `prefill-decode-arms.patch` — cut against the current `release.json` tree |
+| sha256 | `a2badad1933248a0a4660c77a846b471626e7fc5e31bf72202866808e366fe3c` |
+| size | 42 files, **+3073/−741** |
+| patch 2 (STEP 15, delivery-level) | `state-split-2d-read.patch` — cut **on top of patch 1** (it edits `ggml-cuda.cu`, which block 17 also edits), so it MUST be applied second (its name sorts after, `p` < `s`) |
+| sha256 | `b3f0645abfe75c422ec4107a5ec21e38ff3ed9dbb00a39ec5196e204c2a7336b` |
+| size | 1 file, **+85/−46** |
 | cut against | `release.json` base `919794500`, tree **`27db9bfd4ef7f41c7df60f704410de28863beac3`** |
-| **applied tree** | **`29c9644350e5ae594da2725ebc6ef1794982f42f`** (release tree + this patch; verified twice, below) |
+| **applied tree** | **`29c9644350e5ae594da2725ebc6ef1794982f42f`** (release tree + both patches; verified three ways, below) |
 | options | `--prefill-decode-arms` / `--no-prefill-decode-arms` (`LLAMA_ARG_PREFILL_DECODE_ARMS`), `--prefill-decode-arms-mode off\|on\|auto` (`LLAMA_ARG_PREFILL_DECODE_ARMS_MODE`) — **both default OFF** |
 | campaign record | `wip/prefill-decode-arms-v2/` (`DESIGN.md`, `RUNS.md`, `HANDOVER.md`, `gates/`, `baseline/`) |
 
@@ -28,16 +37,18 @@ and **nothing is copied between them**.
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 919794500
 bash <delivery>/scripts/apply-all.sh --include-beta .
-#   18 delivery blocks (tip 089f90067, tree 27db9bfd4...), then this patch
+#   18 delivery blocks (tip 089f90067, tree 27db9bfd4...), then 2 beta candidate patches:
+#     prefill-decode-arms.patch     (block 17, the two-arm server)
+#     state-split-2d-read.patch     (STEP 15, the 2-D read fix -- delivery-level, dropped at promotion)
 #   applied tree: 29c9644350e5ae594da2725ebc6ef1794982f42f
 ```
 
-**The round-trip was verified on this box:** a fresh clone at the release tree (`089f90067`, tree `27db9bfd4…`)
-`git am`s this patch strictly and reads tree **`29c9644350…`**; and the full tester path
-(`apply-all.sh --include-beta .`) from `919794500` reports the same applied tree.  The patch was cut from a
-canonical chain — `apply-all.sh` on a clean checkout at `919794500`, then the campaign's 22 `steps/` replayed in
-order, then the generated docs regenerated — and the replayed tree equals the campaign's own tree
-(`1ac30b82f…` before the doc regeneration) **exactly**.
+**Verified three ways on this box**, all reading tree **`29c9644350…`**: the tester path
+(`apply-all.sh --include-beta .` from `919794500`, which prints two applied patches and the tree); a `git am` of
+both files in filename order on a checkout already at `089f90067`; and the squashed tree the two patches were cut
+from.  Patch 1 was cut from a canonical chain (`apply-all.sh` at `919794500`, then the campaign's `steps/` to
+STEP 14), patch 2 from one more `steps/` replay to STEP 15, with the generated docs regenerated — and the replayed
+trees equal the campaign's own trees exactly.
 
 ## What it does
 
@@ -200,7 +211,7 @@ allocation for the copying device's agent; this server's pinned output buffer is
 read from all three, and this box refuses that grant (as it refuses `hipMemSetAccess` — which is why
 `ggml_cuda_peer_copy_ok` exists).  The same bytes as 1-D copies are accepted from every device.
 
-**The fix (STEP 15, `steps/STEP-15-0022-no-2d-d2h`):** the CUDA backend issues **no 2-D device->host copy into host
+**The fix (STEP 15, second patch here: `state-split-2d-read.patch`; campaign history `steps/STEP-15-0022-no-2d-d2h`):** the CUDA backend issues **no 2-D device->host copy into host
 memory**.  `ggml_cuda_rows_to_host()` serves a tight block or a single copy as ONE 1-D copy, a big synchronous block
 through the device-staged form (2-D device-to-**device** gather into the reading device's own staging buffer, one
 1-D D2H per chunk into that device's own pinned chunk, host scatter), and the async form / a small block as one 1-D

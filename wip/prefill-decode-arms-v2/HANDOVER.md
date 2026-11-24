@@ -265,8 +265,10 @@ block.  When the time comes:
    reading the patches, not by file mtime; if the fix spans both, it is two changes into two blocks.
 2. Re-cut that block's patch in place (`scripts/make-patches.sh` from a canonical chain), then
    `scripts/check-rung-file-sets.py` for the rung and `scripts/validate-set.sh` — a block must not shrink.
-3. The beta artifact then drops that hunk (it becomes a no-op on the new delivery tree), and the candidate is
-   re-cut against the new `release.json` — the two-arm block keeps only what is *its*.
+3. The beta artifact then drops that fix — since 2026-11-24 it is **its own patch file**
+   (`beta/prefill-decode-arms/state-split-2d-read.patch`), so "dropping it" is deleting that file, not re-cutting the
+   block-17 patch; the candidate is still re-cut against the new `release.json` (the lower blocks moved), and the
+   two-arm block keeps only what is *its*.
 4. Record the split in `WORKLOG.md` and in the beta artifact's README, so a reader of either can see that the fix
    exists twice-transitionally and once permanently.
 

@@ -74,6 +74,21 @@ requires `size <= ggml_cuda_pin_chunk_bytes` (it could overflow the 64 MiB chunk
 | `check-windows-portability.sh` / `check-windows-paths.sh` | **PASS** |
 | `scripts/check-gpu-faults.sh --since <window>` | **PASS** in every gate above (each gate runs it) |
 
+### The artifact's layout (261124.008)
+
+`beta/prefill-decode-arms/` carries the fix as its **own patch file**, so it can be dropped whole at promotion
+instead of re-cutting the block-17 patch:
+
+| file | what | sha256 | size |
+|---|---|---|---|
+| `prefill-decode-arms.patch` | block 17 — unchanged from the tested STEP-14 artifact | `a2badad1…e366fe3c` | 42 files, +3073/−741 |
+| `state-split-2d-read.patch` | STEP 15, cut **on top of** patch 1 (block 17 edits `ggml-cuda.cu` too) | `b3f0645a…c2a7336b` | 1 file, +85/−46 |
+
+`apply-all.sh --include-beta` applies `beta/*/*.patch` in filename order (one commit each), so the order the fix
+needs is the order the names give.  Verified: the tester path from `919794500` applies both and reports applied tree
+**`29c9644350`** — the tree every result above was measured on — and a `git am` of both in filename order on a
+checkout at `089f90067` reads the same tree.
+
 ### Findings (reported, not papered over)
 
 1. **The work order's diagnosis was wrong** — see the table above; `INVARIANTS.md` r384-wip records the real one

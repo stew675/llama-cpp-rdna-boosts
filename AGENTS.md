@@ -218,7 +218,11 @@ shipping"). Anything also applicable to unadulterated upstream gets a copy under
 reports the resulting tree); nothing in `beta/` is ever picked up without that flag.  A candidate that
 cannot sit in `wip/` because it edits a file a block owns, but is not yet validated on the reporter's
 platform, goes to `beta/<name>/` (a `README.md`, a `BETA-TESTING.md` and a patch cut against the
-current `release.json` tree; nothing in it is applied by `apply-all.sh`).  On confirmation or
+current `release.json` tree; nothing in it is applied by `apply-all.sh`).  A candidate may carry **more than one
+patch file** in its directory when it also carries a fix that belongs to a LOWER layer: `apply-all.sh
+--include-beta` applies `beta/*/*.patch` in filename order, one commit each, so the candidate's own patch is
+`prefill-decode-arms.patch` and a delivery-level fix it merely carries until promotion sorts after it — the
+candidate's `README.md` must say which file is which and that the delivery-level one is dropped at promotion.  On confirmation or
 refutation it moves to `archive/work/<name>/` and is recorded in `WORKLOG.md` — same no-stub rule as
 `wip/`.
 

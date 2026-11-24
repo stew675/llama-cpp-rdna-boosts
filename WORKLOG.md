@@ -1,3 +1,29 @@
+## 261124.008 (no release; `prefill-decode-arms` v2, artifact layout) -- the candidate carries STEP 15 as its OWN patch file, so the delivery-level fix is separable before promotion
+
+No code change; the artifact is re-laid-out on the maintainer's instruction (2026-11-24): the STEP-15 fix must be
+part of the `beta/prefill-decode-arms/` set *for now*, and as a **second patch file** rather than folded into the
+block-17 patch.
+
+1. **`beta/prefill-decode-arms/prefill-decode-arms.patch` is back to the block-17 patch alone** — sha256
+   `a2badad1…e366fe3c`, 42 files, +3073/−741, applied tree `e24d88b31e`.  It is byte-identical to the artifact that
+   was already beta-tested at STEP 14, so this split changes nothing about the block's own content.
+2. **`beta/prefill-decode-arms/state-split-2d-read.patch` is new** — sha256 `b3f0645a…c2a7336b`, 1 file
+   (`ggml/src/ggml-cuda/ggml-cuda.cu`), +85/−46, cut **on top of** the block-17 patch because block 17 also edits
+   that file.  `apply-all.sh --include-beta` globs `beta/*/*.patch` and applies them in **filename order**, one
+   commit each, and `prefill-decode-arms.patch` sorts before `state-split-2d-read.patch` (`p` < `s`) — the required
+   order, stated in both READMEs rather than left to luck.
+3. **The pair reproduces the verified tree exactly**: `apply-all.sh --include-beta .` from `919794500` applies two
+   patches and reports applied tree **`29c9644350`**, the same tree the whole STEP-15 ladder ran on (repro 3 rounds,
+   `gate-arms-state-split` 11/11, the campaign and delivery gates, the `all` build).  A `git am` of both files in
+   filename order on a checkout at `089f90067` reads the same tree.
+4. **Why it is worth the second file:** `TODO` #376 owes the fold of this fix into the delivery as a **block-09
+   amendment**.  With the split, that landing *deletes one file* from `beta/prefill-decode-arms/` while the block-17
+   patch is untouched (its sha256 never moves through the transition), instead of re-cutting the whole artifact to
+   drop a hunk from it.  The maintainer's "ONE self-contained patch-block" decision for block 17 is unaffected: the
+   block is one patch; the delivery-level fix is the candidate's passenger, and both READMEs say which is which.
+5. `AGENTS.md`'s `beta/` policy now states that a candidate may carry more than one patch file, that they are
+   applied in filename order, and that the `README.md` must name which one is dropped at promotion.
+
 ## 261124.007 (no release; `prefill-decode-arms` v2 STEP 15) -- the split-tensor 2-D read is FIXED, and it was never the split arithmetic: it is the peer grant a 2-D D2H needs on a pinned buffer another device owns
 
 Follows 261124.006 (the work order).  Same tester, same shape (Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, the attendance
