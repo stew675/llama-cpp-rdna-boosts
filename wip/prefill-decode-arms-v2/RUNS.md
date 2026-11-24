@@ -160,7 +160,7 @@ git diff 089f90067 857f18168           # 42 files, +2854/-715 ; single format-pa
 | tester path | `apply-all.sh --include-beta .` from `919794500` -> reports the same applied tree |
 | `check-gen-docs.sh` on the applied tree | **ok** (the regeneration is inside the patch) |
 
-**A correction to `HANDOVER.md` §12.1:** the cut base is the **release tree** `089f90067`, not `919794500`.  A
+**A correction to `HANDOVER-2026-11-24-campaign.md` §12.1:** the cut base is the **release tree** `089f90067`, not `919794500`.  A
 `beta/` candidate is applied by `apply-all.sh --include-beta` **after** the blocks, strictly, one commit each, so a
 base-relative patch cannot apply; and a plain `git diff` is not `git am`-able at all ("Patch format detection
 failed").  The candidate is therefore `format-patch` output over `release.json.tree -> campaign tree`.
@@ -184,7 +184,7 @@ is reset at every handover; `common_arms_pair_possible()` admits `draft-simple` 
 
 Re-admitting the drafter exposed six defects that only a SECOND context, a THIRD layout or a live drafter can
 reach.  Four were mine to fix here (they are correctness); the two slab *sizing* ones are recorded as follow-ups
-(`HANDOVER.md` §7.2/§7.8).
+(`HANDOVER-2026-11-24-campaign.md` §7.2/§7.8).
 
 ### 1. The claim: one cold greedy TEXT across four arms, three shapes
 
@@ -298,7 +298,7 @@ Re-verified after it: `gate-arms-default-inert.sh --no-cli` PASS (the term is 0 
 ### 9. What is NOT claimed
 
 * no throughput claim: the numbers above are single runs at one request in flight, printed as a cost row;
-* the two slab SIZING items are follow-ups, not fixed here (`HANDOVER.md` §7.2/§7.8): `COMMON_ARMS_RESERVE_MIB`
+* the two slab SIZING items are follow-ups, not fixed here (`HANDOVER-2026-11-24-campaign.md` §7.2/§7.8): `COMMON_ARMS_RESERVE_MIB`
   is still one constant for a decode arm whose layout now depends on the drafter's verify width, and a
   second/third aux context would need a per-context count (the slab's calibration line is the mechanism today);
 * `LLAMA_MTP_DEV_ROWS=1` is inert on the pair (the device h-row path binds `ctx_dft`'s state source to ONE
@@ -437,7 +437,7 @@ same chunk wait is a smaller fraction).  **The prefill is faster on every shape*
    the same family as STEP 7d's drop-vs-capture defect (a process-wide/library state vs a second arm's capture).
    **Disabling either hipBLASLt or the capture removes it**; capture-off is the better escape by far (23 vs 41
    ms/token), i.e. the pair's capture is worth ~18 ms/token of decoder latency on this shape.  Which one the pair
-   should pin is a maintainer decision (`HANDOVER.md` §7.7) -- a crash is not an acceptable default either way.
+   should pin is a maintainer decision (`HANDOVER-2026-11-24-campaign.md` §7.7) -- a crash is not an acceptable default either way.
 
 ### 3c. The tensor-split blocker is FIXED (STEP 7h): the capture/hipBLASLt barrier, and the ITL with everything on
 

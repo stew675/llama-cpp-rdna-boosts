@@ -438,7 +438,7 @@ borrower's `cparams.type_k`/`type_v` were uninitialized -- Flash-Next + the pair
 `-ub 4096`, **53.83 -> 22.89 ms/token (ITL −57.5 %)** with the pair's graph capture off, prefill +21.8 %; 27B 3
 devices `-sm tensor`, `-ub 2048`, 64.45 -> 60.30 (−6.4 %, prefill +35.6 %).  Measuring them found **STEP 7g** (the
 Meta split-state cache was per buffer, not per view slot -- two arms raced it) and left **one blocking decision**
-(`HANDOVER.md` §7.7): with hipBLASLt AND capture on, a tensor-split pair arm aborts
+(`HANDOVER-2026-11-24-campaign.md` §7.7): with hipBLASLt AND capture on, a tensor-split pair arm aborts
 (`'operation would make the legacy stream depend on a capturing blocking stream'`), so the pair must pin one of
 capture-off (fast) or hipBLASLt-off (1.8x slower) until a capture barrier exists.
 
@@ -452,7 +452,7 @@ capture-off (fast) or hipBLASLt-off (1.8x slower) until a capture barrier exists
 > `ctx_other` and therefore had no pinned slab region (`llama_context_params::ctx_aux`), a compute-buffer
 > allocation and a cross-stream event wait may not overlap the other arm's graph capture, and the slab's aux
 > regions needed the floor's slot off-by-one fixed + growth-when-idle + a mapping for a region stacked under
-> another.  Gate: `gates/gate-arms-spec.sh`.  Open follow-ups: `HANDOVER.md` §7.2/§7.8/§7.9.
+> another.  Gate: `gates/gate-arms-spec.sh`.  Open follow-ups: `HANDOVER-2026-11-24-campaign.md` §7.2/§7.8/§7.9.
 
 Only after STEPs 4-9 are green.
 

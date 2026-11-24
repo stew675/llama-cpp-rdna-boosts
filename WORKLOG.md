@@ -1,3 +1,30 @@
+## 261124.006 (no release; `prefill-decode-arms` v2, handover prep) -- the third tester crash is written up as a work order: the real fix for the split-tensor 2-D state-save read
+
+No code change.  Follows 261124.005, which landed the two crashes that are fixed (the CANCEL teardown and the
+RCCL/FD_SETSIZE ceiling).  With those in, the tester's recipe reaches a **third, independent** failure -- a 2-D read
+of a row-split `result_output` walking past device 1's slice (`331092 bytes x 5 copies, tensor pitch 331092, host
+pitch 993280`) -- and the maintainer's instruction is the **real** fix, not the per-copy fallback, in a new session.
+
+1. **`wip/prefill-decode-arms-v2/HANDOVER.md` is now a single-task work order** for that fix: the evidence and what
+   is ruled out (not the AR chain -- it reproduces with `GGML_CUDA_ALLREDUCE=ce`; not reachable in the pair-OFF
+   checks tried), the call chain as far as it is established (`arms_decode_loop` -> the state writer ->
+   `ggml_backend_tensor_get_n` -> the Meta backend's chunked 2-D branch), the two unknowns and how to settle them
+   (a symbolized backtrace -- the build is Release and `gdb` dies on this abort -- and the split state at the
+   failure), the suspects in order (`split_state.n_segments`/`nr[]` ignored by `simple_offset = i_start *
+   chunk_size_j` and by the `i_stop - i_start` copy count; the 4-byte discrepancy `3 x 331092 = 993276 != 993280`),
+   the design of the proper fix (walk the split state per device/segment/repeat with that device's own pitches; and
+   check the write side), the verification ladder, and the exact re-cut procedure.  The campaign record it replaces
+   is preserved verbatim as `HANDOVER-2026-11-24-campaign.md` (with the campaign's own cross-references repointed).
+2. **The live reproducers are now committed** under `wip/prefill-decode-arms-v2/repro/` (they existed only in
+   `/tmp`): the crash recipe, the fd census, the cancel reproducer, the pair-OFF prompt-cache save that attributed
+   the failure to the draft checkpoint, and the prompt builder -- with a README naming the traps that made runs
+   vacuous (a `-c` too small for the 77K prompt to reach a slot, a Python `false` that emptied the request body).
+3. **`TODO` #376** records the promotion-time obligation the maintainer set: the fix goes into the beta candidate
+   **for now**, and at promotion it must be folded into the **owning delivery block** (block 09 for the chunked 2-D
+   path and `ggml_backend_meta_get_2d_any`; block 13 if it is confined to the axis-1 row-split call site)
+   **independently of the two-arm block**, with the artifact re-cut so block 17 keeps only what is its own.  It is a
+   block amendment, so it is asked first.
+
 ## 261124.005 (no release; `prefill-decode-arms` v2 STEP 14, from the same beta testing) -- the `-sm tensor` abort is FD exhaustion, and it is FIXED: an auxiliary context may add NO RCCL comm layer
 
 Follows 261124.004 (the cancel crash).  Same tester, same shape (Flash-Next GSQ-IQ3_XXS, `-ncmoe 48`, the attendance

@@ -90,11 +90,12 @@ delivery's host-expert tier, so it stays.
 | **361** | the r334 RDNA2 items (PR #338) are validated on the contributor's V620, not on the released tree: blocks 05/08/10 now carry an RDNA2-only FA tile-cap removal, a one-warp narrow `RMS_NORM`, a `H * n_seqs` GDN chunked gate and a rows-abreast MoE K walk, and no RDNA2 device is in the maintainer's fleet | validation / external (delivery) | **WAITING on `@jstamagal`** -- re-run on the r334 tree: full `test-backend-ops` on `gfx1030` at default flags (**especially `FLASH_ATTN_EXT` with the caps gone: the failure mode is `GGML_ASSERT(max_blocks_per_sm > 0)` in `launch_fattn`, not a rate**), `MUL_MAT_ID` with `GGML_CUDA_MOE_ROWS_ABREAST` on and off, `RMS_NORM*` in the default/`NARROW=0`/`VEC=1` arms, a model-level decode+prefill (a GDN model for the chunked gate, a MoE for the K walk) and an MTP-acceptance run; **it should also confirm that PR #339's BF16 `RMS_NORM + MUL (+ ADD)` abort is gone there** (fixed at r328 by the re-base, `archive/work/can-fuse-bf16-rms-norm-r324/` -- `RMS_NORM_MUL_ADD` now includes `type=bf16,type_w=f32` and `type=bf16,type_w=f32,type_add=bf16` arms); §361 |
 | **363** | `-of`/`--optional-features` exists with ONE tag (`tp-ffn-even`); the delivery's other env-only opt-in features are still environment-only, so a user who reads `--help` still cannot find them | tooling / docs (delivery) | **OPEN** -- migrate them one at a time: add the row to `common_optional_features()` with its switch, confirm the tag produces exactly what the env var produces (the arm `gate-ffn-even-split.sh` C-section runs), and delete the row if the feature gets a first-class option; candidates are the opt-in switches `ENVIRONMENT.md` already marks as such (§4 `LLAMA_KV_N_PAD_MIN`, §7.6 `--wmma-verify`-adjacent switches are options already, §1.2's arena knobs, block 14's `LLAMA_KV_SPILL_RAM_PCT`); §363 |
 | **369** | three gates still name the RETIRED Flash-Next `GSQ-IQ3_XXS` tree (`gate-hc-base-copy`, `gate-hc-fusions`, `gate-host-expert-text`) and were deliberately NOT repointed at r346, because each carries recorded text/KLD anchors for that class | tooling (delivery) | **OPEN** -- repoint each AND re-record its anchors on the new class (the STEW675 IQ4_NL tree) in the same change, then run each once. §369 |
+| **376** | the block-17 beta artifact (`beta/prefill-decode-arms/`) carries a fix for a DELIVERY-level defect -- the Meta backend's chunked 2-D read of a split tensor (`ggml-backend-meta.cpp`), reached as `2-D read of 'result_output' failed (invalid argument): 331092 bytes x 5 copies, tensor pitch 331092, host pitch 993280` -- so on promotion that fix must be folded into the OWNING delivery block (block 09, or block 13 if it is confined to the axis-1 row-split copy) **independently of the two-arm block**, and the beta artifact re-cut against the new tree | delivery / block structure (maintainer) | **OPEN** -- the fix itself is the current work (`wip/prefill-decode-arms-v2/HANDOVER.md`, `WORKLOG.md` 261124.004/005); the FOLD is owed at promotion and is a block amendment, so it is asked first |
 
 
 ## Handle numbering
 
-**New handles append after the highest issued so far, so the next free handle is `#376` (`#375` was issued at r352 for the cache-off page fault).  `#364`-`#372` and `#374` were issued for the block-17 follow-ups and **retracted (void) on 2026-11-23**; a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
+**New handles append after the highest issued so far, so the next free handle is `#377` (`#376` is the block-17 promotion-time fold, `#375` the cache-off page fault).  `#364`-`#372` and `#374` were issued for the block-17 follow-ups and **retracted (void) on 2026-11-23**; a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
 subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
 
 * **issued and retired the same day** (2026-11-16): `#337` — the attendance pool *does* engage on
@@ -274,6 +275,43 @@ self-referential (no recorded anchors to re-record), and once the model tree was
 defaults unchanged.  Recorded in `WORKLOG.md` 261124.003 / `INVARIANTS.md` r380-wip so the next session does not
 re-report it.
 
+
+
+## 376. On promotion, the block-17 beta artifact's Meta-backend fix must be folded into its OWNING block
+
+**Record:** the defect is `WORKLOG.md` 261124.004/005 and `INVARIANTS.md` r383-wip item 4; the work order is
+`wip/prefill-decode-arms-v2/HANDOVER.md`.  The maintainer's instruction (2026-11-24) is explicit: the fix goes into
+the beta candidate **for now**, and at promotion it is folded back **independently of the two-arm block**.
+
+A 3-device `-sm tensor` split, with the two-arm server on and an MTP drafter, aborts while the decode arm saves a
+draft checkpoint:
+
+```
+E ggml_backend_cuda_get_tensor_2d_async: device 1: 2-D read of 'result_output' failed (invalid argument):
+    331092 bytes x 5 copies, tensor pitch 331092, host pitch 993280, offset 0 (ROCm1 buffer)
+```
+
+`host pitch = 3 x tensor pitch` -- a SPLIT 2-D tensor read against one device's slice.  The buggy code is
+**delivery** code: `ggml_backend_meta_get_tensor_impl()`'s chunked 2-D branch and
+`ggml_backend_meta_get_2d_any()` in `ggml/src/ggml-backend-meta.cpp`, whose per-device offset/copy-count
+arithmetic ignores `split_state.n_segments`/`nr[]`.  The pair only *reaches* it (a per-round draft checkpoint);
+the defect is reachable in principle by any state/checkpoint save of a split tensor.
+
+**Why it must not simply stay in the two-arm block:** block 17 is a beta candidate that may never be promoted, and
+this is a defect in blocks 09/13's code.  Leaving the fix only in block 17 means a delivery that ships without the
+pair still carries the bug -- and a promoted block 17 would silently modify a lower block's behaviour.
+
+**The work at promotion:** cut the fix against the release tree as a delta on the owning block (determine it from
+`patches/`: `ggml_backend_meta_get_2d_any` and the chunked branch come from **block 09**; block 13 added the
+axis-1 row-split call site), re-cut that block's patch in place, run `scripts/check-rung-file-sets.py` for the rung
+plus `scripts/validate-set.sh` (a block must not shrink), then re-cut the beta artifact against the new tree so the
+candidate keeps only what is its own.  Record the transition in `WORKLOG.md` and in the beta artifact's README.
+
+## Re-entry / does it block promotion?
+
+The two-arm candidate is **not** blocked on this fix for testing (the fd work landed; this defect needs a drafter
+on a 3-device tensor split and a big prefill).  It **is** a blocker for folding the pair into the delivery: a
+promotion that swallowed a lower block's bug would be the wrong shape.
 
 ## Accepted limitations (deliberately not fixed — do not re-report)
 

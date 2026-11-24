@@ -115,8 +115,10 @@ boundary.  Every defect register entry in `DESIGN.md` §5 comes from that duplic
 | `README.md` | this file: scope, reading rules, deliverables, definition of done, environment |
 | [`DESIGN.md`](DESIGN.md) | the target architecture, the ownership table, the **defect register V1-V11**, what is deleted, the `llama_memory_recurrent` refactor design, the risks |
 | [`PLAN.md`](PLAN.md) | the step-by-step: STEP 0-12, each with its files, edits, oracle and exit criteria; the gate list; the promotion path |
-| [`HANDOVER.md`](HANDOVER.md) | **state + next task for a fresh session** (fresh-session entry point, incl. the open host-tier defect) |
+| [`HANDOVER.md`](HANDOVER.md) | **the LIVE handover: one task** -- the real fix for the 2-D state-save read of a split tensor (a beta tester's crash #3).  Start a session here |
+| [`HANDOVER-2026-11-24-campaign.md`](HANDOVER-2026-11-24-campaign.md) | the **campaign record** (STEPs 0-14): design decisions, the traps, the per-step reasoning and anchors |
 | [`RUNS.md`](RUNS.md) | the dated measurement record: one section per landing, with the command, the shape and the hash/rate |
+| [`repro/`](repro/) | the live reproducers behind the three beta-tester crashes (`repro-mtp-prefill.sh` is the one the open defect needs) |
 | [`steps/`](steps/) | one reviewable patch per landing (`STEP-<n>-<NNNN>-<name>.patch`, cut from the `arms-v2` tree) |
 | [`baseline/`](baseline/) | the STEP 0 anchors (`r353-anchors.md`) and the arm harnesses: `mtp-axis.sh` (one four-axis arm, GPU-locked), `server-arm.sh` (a server arm + request driver), `norm-log.sh` (a log's *shape*, for the line-identical assertions) |
 
