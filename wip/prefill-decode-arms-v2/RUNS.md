@@ -35,13 +35,18 @@ Non-vacuity (printed by the gate):
 Server shape lines are cut at `listening on` and normalised by `baseline/norm-log.sh`; the 4B shape's
 expectation IS the STEP 0 file (no copy), the others carry a `# recorded` header the gate ignores.
 
-### recurrent-shared (`gate-arms-recurrent-shared.sh --n 600`, 3 devices; Flash-Next's four-axis arms on the
-host-expert shape `1 device -sm layer -ncmoe 48 -c 8192 -md mtp-...-shared-Q8_0.gguf`)
+### recurrent-shared (`gate-arms-recurrent-shared.sh --n 600`; BOTH models' four-axis arms on a **3-device
+`-sm tensor -mg 0`** split -- the campaign's validation shape and the shape STEP 7e broke.  `AXIS_SHAPE=host`
+switches to the delivery's host-expert arm for the external head)
 
 | model | §1 placements (non-vacuity) | §2 concurrent vs `--solo` | §3 four-axis `none` == adaptive |
 |---|---|---|---|
 | 35B-A3B Q8_0 (embedded MTP, `-sm tensor`) | `A: head=0 n=1 rs_z=0 \| B: head=1 n=1 rs_z=1` | `arm_a=9eaff8b3b77dc104 arm_b=b17fc93ec1b442e4` **identical, round_ms=822** | R `8a8d0e7e2055` (182 drafts/153 acc), K `5ebd156073f6` (73/73), P `a7a7307e59bf` (168/146), C `3512551cd3c9` (123/115) -- **plain == drafter on all four** |
-| Flash-Next GSQ-RCO IQ3_S + shared head (qwen4exp) | `A: head=0 n=1 rs_z=0 \| B: head=1 n=1 rs_z=1` | `arm_a=9eaff8b3b77dc104 arm_b=8d9f63064b455c95` **identical, round_ms=1182** | R `f0d0bce6eb50` (219/163), K `a87c4318b649` (75/74), P `a738bc5e3b57` (150/131), C `904de4851b41` (106/102) -- **plain == drafter on all four** |
+| Flash-Next GSQ-RCO IQ3_S + shared head (qwen4exp), **3 devices `-sm tensor -mg 0`, `-c 16384 -md mtp-...-shared-Q8_0`** | `A: head=0 n=1 rs_z=0 \| B: head=1 n=1 rs_z=1` | `arm_a=9eaff8b3b77dc104 arm_b=8d9f63064b455c95` **identical, round_ms=1183** | R `76ff3a7f59bb` (213/158, 104 t/s), K `a87c4318b649` (75/74, 167 t/s), P `b297abb3126d` (140/125, 133 t/s), C `82519c1d9ee1` (107/103, 153 t/s) -- **plain == drafter on all four** |
+
+(The same Flash-Next four axes were also measured on the host-expert shape `1 device -sm layer -ncmoe 48 -c 8192`
+-- R `f0d0bce6eb50` 219/163, K `a87c4318b649` 75/74, P `a738bc5e3b57` 150/131, C `904de4851b41` 106/102 -- so
+both shapes are green; `--axis-shape host` is the arm to use when the 3-device split is out of memory.)
 
 The gate refuses a model with no recurrent module (`PASS this model HAS a recurrent module`), so the
 placement claim is never asserted against nothing.  `arm_a`'s digest is **model-insensitive** by construction
@@ -49,14 +54,20 @@ placement claim is never asserted against nothing.  `arm_a`'s digest is **model-
 `9eaff8b3b77dc104`); `arm_b`'s is the discriminator, and the comparison that matters is concurrent vs `--solo`
 **within one model**, which is what the gate does.
 
-Two arms that would have been vacuous were caught by the gate's own non-vacuity lines (both recorded here, not
-fixed by hand):
-* `--spec-draft-n-max 2` with `draft-mtp-adaptive`: `E ... invalid adaptive draft range: n_min_adaptive=3,
-  n_max=2` and the run **continues as a plain run** -- 0 drafts generated, so "plain == drafter" was a
-  comparison of two plain runs.  The gate now FAILs on 0 drafts and names the initialisation error; the
-  Flash-Next arms use the delivery default ceiling `--nmax 7`.
-* the first version of the gate held the exclusive GPU flock for its whole run AND called `mtp-axis.sh`, which
-  takes the same lock: the box sat idle with `flock -w 900 9` waiting on the gate's own fd (5+ minutes).  Hence
+Two vacuous arms were caught by the gate's own non-vacuity lines, and BOTH were the harness's fault, not the
+library's:
+* the first version ran the Flash-Next adaptive arms at `--spec-draft-n-max 2` (copied from
+  `scripts/gate-draft-ctx.sh`, whose `draft-mtp` arm is NOT adaptive).  The adaptive controller's
+  `n_min_adaptive` default is **3** and it landed WITH that validation in delivery **block 02**
+  (`git log -S n_min_adaptive`), so the pair is self-contradictory and has never been a working configuration:
+  the delivery says so loudly (`E failed to initialize speculative decoding context: invalid adaptive draft
+  range: n_min_adaptive=3, n_max=2`) and continues as a PLAIN run, 0 drafts.  Checked on a build of the delivery
+  tip `089f90067` with the identical invocation: the same error, the same 0 drafts -- the campaign neither
+  introduced nor changed it, and no delivery change is proposed: the flag pair is invalid, the feature is fine
+  (the same gate's `--nmax 7` arms on the same shapes draft and accept, 73..213 drafts per axis).  The gate now
+  FAILs on 0 drafts and names the initialisation error, so a harness bug of this shape cannot read as a pass.
+* the first version held the exclusive GPU flock for its whole run AND called `mtp-axis.sh`, which takes the
+  same lock: the box sat idle with `flock -w 900 9` waiting on the gate's own fd (5+ minutes).  Hence
   `mtp-axis.sh --no-lock` (documented as "the caller already holds the lock").
 
 ---

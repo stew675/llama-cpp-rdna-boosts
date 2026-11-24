@@ -36,12 +36,18 @@ regression lock, not evidence of inertness, and `--record` refuses to overwrite 
    all four axes, WITH a non-zero draft/accept count (all four axes, both models -- 73..219 drafts, 73..163
    accepted).
 
-Two vacuous arms the gate caught while it was being written are recorded in `RUNS.md`: an adaptive drafter at
-`n_max 2` never initialises (`n_min_adaptive=3`) and the library **continues as a plain run** (0 drafts), and a
-gate that holds the GPU flock across `mtp-axis.sh` deadlocks on its own fd (hence `--no-lock`).
+Both models' four-axis arms run on a **3-device `-sm tensor -mg 0`** split (the maintainer's decision: that shape
+is part of this campaign, and it is the shape STEP 7e broke, so the gate is the fix's regression instrument).
+Flash-Next's own numbers there: R `76ff3a7f59bb` (213/158), K `a87c4318b649` (75/74), P `b297abb3126d` (140/125),
+C `82519c1d9ee1` (107/103); the host-expert shape (`--axis-shape host`, 1 device `-sm layer -ncmoe 48`) is kept
+runnable and was measured too.
 
-The recurrent gate's Flash-Next four-axis arms use the host-expert shape (1 device `-sm layer -ncmoe 48`), which
-is `scripts/gate-draft-ctx.sh`'s proven arm for the external head.
+Two vacuous arms the gate caught while it was being written are recorded in `RUNS.md`, and **both were harness
+bugs**: the first version drove the adaptive drafter at `--spec-draft-n-max 2` (an invalid pair -- the adaptive
+floor is 3, from delivery block 02; the same arm on a build of the delivery tip `089f90067` behaves identically,
+so nothing was broken and no delivery change is proposed -- the run goes plain with 0 drafts and the gate now
+FAILs on that), and a gate that holds the GPU flock across `mtp-axis.sh` deadlocks on its own fd (hence
+`--no-lock`).
 
 ### Recorded
 `RUNS.md` (both gates' numbers), `INVARIANTS.md` r369-wip, `baseline/inert-anchors.tsv`,

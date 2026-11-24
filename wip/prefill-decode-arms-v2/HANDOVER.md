@@ -78,7 +78,7 @@ Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077`, 7e `3013e880a` (branc
 | GPU-resident soak | 4B, 4 slots × 20 rounds, 80 requests, 0 errors, **widest decode batch 4** |
 | the probes | `probe-kv-reservation.cpp` (I4), `probe-recurrent-shared.cpp` (I5), `probe-ctx-memory.cpp`, `probe-meta-slots.cpp`, `probe-host-stream.cpp` |
 | **default path untouched (the gate)** | `gates/gate-arms-default-inert.sh` **PASS** on 4 shapes: cli text `be904e86f248` / `db5ab8e63e11` / `10a82b5559a9` / `e9db5cb8db0b` (the first, third and fourth are **pre-change** STEP 0 anchors) and startup shapes identical (the 4B one to `baseline/A6-startup-shape.txt` **byte for byte**), plus the pair-ON sensitivity arm (4 added lines, same responses) |
-| **one memory, two contexts on a RECURRENT model (the gate)** | `gates/gate-arms-recurrent-shared.sh` **PASS** on 35B-A3B (3 devices `-sm tensor`) and Flash-Next/qwen4exp + the shared MTP head (host-expert shape): placements differ (`head=0 n=1` vs `head=1 n=1`), concurrent digests == `--solo`, and the four-axis `none` == adaptive text with 73..219 drafts accepted on every axis |
+| **one memory, two contexts on a RECURRENT model (the gate)** | `gates/gate-arms-recurrent-shared.sh` **PASS** on 35B-A3B and Flash-Next/qwen4exp + the shared MTP head, **both on a 3-device `-sm tensor -mg 0` split** (that shape is part of this campaign and is the one STEP 7e broke): placements differ (`head=0 n=1` vs `head=1 n=1`), concurrent digests == `--solo`, and the four-axis `none` == adaptive text with 73..213 drafts accepted on every axis.  `--axis-shape host` runs the delivery's host-expert arm for the external head instead |
 | the 7e fix | the reproducer (Flash-Next + external head, 3 devices `-sm tensor`) reads the delivery's text `be69e274b66d` again; `gate-draft-ctx.sh` PASS; the pair on 27B tensor identical (`8f396b237f0f`/`04116b9a99ad`); the host-tier soak PASS |
 | the build | whole set builds; `scripts/check-shlib-symbols.sh` **OK** (16 libs) after the iface rename |
 
@@ -227,11 +227,13 @@ The reserve in force is 2816 MiB; 2816 MiB would host every auxiliary region (he
 | `gate-arms-n1-memory.sh` | one memory, byte text, the decode-arm census, the I4 reservation census |
 | `gate-arms-itl.sh` | the latency claim at a stated `-ub` |
 | `gate-arms-multislot.sh` | the 4-slot soak (`ARMS=` for the pair-OFF control, the heat prior pinned, fails if a slab-armed shape gave the decode arm no region) |
-| `gate-arms-recurrent-shared.sh` | **new**: the probe promoted -- placements DIFFER (`head=0 n=1` vs `head=1 n=1`), concurrent == `--solo`, and the four-axis `none` == adaptive with a non-zero draft/accept count, on **35B-A3B and Flash-Next/qwen4exp** |
+| `gate-arms-recurrent-shared.sh` | **new**: the probe promoted -- placements DIFFER (`head=0 n=1` vs `head=1 n=1`), concurrent == `--solo`, and the four-axis `none` == adaptive with a non-zero draft/accept count, on **35B-A3B and Flash-Next/qwen4exp**, both on a **3-device `-sm tensor`** split (`--axis-shape host` for the delivery's host-expert arm) |
 
-Two arms the new gate caught while being written (both in `RUNS.md`): an adaptive drafter at `n_max 2` never
-initialises (`n_min_adaptive=3`) and the library **continues as a plain run** (0 drafts), and a gate that holds
-the GPU flock across `mtp-axis.sh` deadlocks on its own fd (`mtp-axis.sh --no-lock`).
+Two arms the new gate caught while being written (both in `RUNS.md`, and both the HARNESS's bug): an adaptive
+drafter driven at `--spec-draft-n-max 2` -- an invalid pair, since the adaptive floor is 3 (delivery block 02);
+the same arm on a build of the delivery tip behaves identically, so nothing was broken and **no delivery change
+is proposed** (the maintainer's decision) -- and a gate that holds the GPU flock across `mtp-axis.sh` deadlocks
+on its own fd (`mtp-axis.sh --no-lock`).
 
 Also closed here, because STEP 8's shape survey found it: **STEP 7e** -- STEP 4's `thread_local` Meta view slot
 was bound only after `sched_alt_select()`'s no-op early return, so on `-sm tensor` a second context's graph
@@ -390,13 +392,15 @@ Every number of record is in `RUNS.md` (newest first) with its command and shape
 4. **The Step-9 byte-claim rule** ("one request in flight") is this campaign's reading of DESIGN V8.  If a byte
    claim *under* concurrency is wanted, the batch composition has to be pinned first — a separate instrument, not
    a gate tweak.
-5. **A delivery wart STEP 8 found (not this campaign's code):** `--spec-type draft-mtp-adaptive` with
-   `--spec-draft-n-max 2` logs `E failed to initialize speculative decoding context: invalid adaptive draft
-   range: n_min_adaptive=3, n_max=2` and then runs the whole arm as a **plain** run — 0 drafts, no refusal to
-   start.  A user asking for adaptive MTP at n_max 2 silently gets none, and any purity claim read off that arm
-   compares two plain runs.  Should the parameter validation refuse the start instead (`INVARIANTS.md`
-   r369-wip item 1)?  A refusal is a one-line change in the delivery's speculative option handling.
-6. **STEP 7e's shape is now in the campaign's own sweep:** the external-head-on-`-sm tensor` arm (3 devices) is
-   the one that broke and no delivery gate covers it (`gate-draft-ctx.sh` runs 1 device `-sm layer`).  Should the
-   pair's or the delivery's gate set gain that arm, and does that belong to this campaign or to the delivery's
-   own gate work (`INVARIANTS.md` r368-wip item 2)?
+5. **ANSWERED by the maintainer (2026-11-23): `draft-mtp-adaptive` stays as it is — do not constrain a flagship
+   feature.**  The "adaptive drafter at `--spec-draft-n-max 2` runs plain" observation was this campaign's
+   HARNESS bug, not a delivery defect: the adaptive floor `n_min_adaptive = 3` landed with its validation in
+   delivery **block 02**, so max 2 is a self-contradictory pair that never worked, and a build of the delivery
+   tip `089f90067` behaves identically (same `E ... invalid adaptive draft range`, 0 drafts).  The gate now
+   drives it at a valid ceiling (`--nmax 7`) and FAILs if a drafter arm generates 0 drafts.  Recorded in
+   `INVARIANTS.md` r369-wip item 1 as a harness rule.
+6. **ANSWERED by the maintainer (2026-11-23): a 3-device `-sm tensor` split IS part of this campaign.**  So the
+   recurrent gate now runs both models' four-axis arms on it (`--axis-shape tensor` is the default), which makes
+   the gate the regression instrument for STEP 7e.  Whether the DELIVERY's own `scripts/gate-draft-ctx.sh` should
+   also gain a `-sm tensor` arm — its documented-but-unrun one, `INVARIANTS.md` r368-wip item 2 — is delivery
+   gate work, not a decision this campaign takes.

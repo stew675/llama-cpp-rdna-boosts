@@ -76,7 +76,9 @@ if [ "$SM" = tensor ]; then SM_ARGS=(-sm tensor -mg 0); else SM_ARGS=(-sm "$SM")
 NCMOE_ARGS=(); [ -n "$NCMOE" ] && NCMOE_ARGS=(--n-cpu-moe "$NCMOE")
 MD_ARGS=();    [ -n "$MD" ]    && MD_ARGS=(-md "$MD")
 LAZY_ARGS=();  [ -n "$LAZY" ]  && LAZY_ARGS=(--lazy-mode "$LAZY")
-CLI="$HOME/llama.cpp/build-rocm/bin/llama-cli"
+# LLAMA_CLI lets the SAME harness drive a second build (a reference build of the delivery tip, say) so an
+# A/B of two binaries is one variable, not two harnesses.
+CLI="${LLAMA_CLI:-$HOME/llama.cpp/build-rocm/bin/llama-cli}"
 cd "$HOME/llama.cpp" || exit 1
 
 # ONE GPU JOB AT A TIME, enforced rather than remembered: a project-wide exclusive lock.  A second

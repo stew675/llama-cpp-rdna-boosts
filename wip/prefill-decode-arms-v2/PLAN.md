@@ -400,8 +400,9 @@ with `check-gpu-faults.sh --since <before the run>`; text arms take **no** `-lv`
 * `gates/gate-arms-recurrent-shared.sh` — `probe-recurrent-shared.cpp` promoted: §1 the placements must DIFFER,
   §2 concurrent == `--solo` byte for byte, §3 the four-axis `none` == adaptive **with a non-zero draft/accept
   count** (the non-vacuity line that caught an adaptive drafter refusing to initialise at `n_max 2` and the run
-  silently continuing plain).  Two models: 35B-A3B (3 devices `-sm tensor`) and Flash-Next/qwen4exp + its
-  external shared MTP head (the host-expert shape).
+  silently continuing plain -- which was the HARNESS's invalid flag pair, not the feature; the gate now uses a
+  valid ceiling and FAILs on 0 drafts).  Two models, both on a **3-device `-sm tensor -mg 0`** split: 35B-A3B and
+  Flash-Next/qwen4exp + its external shared MTP head (`--axis-shape host` for the delivery's host-expert arm).
 
 **Exit:** all five green, and each gate's non-vacuity line present in its output.  Record the numbers in this
 directory (`RUNS.md`), not in `WORKLOG.md` (that gets the landing entry).  **Met 2026-11-23.**

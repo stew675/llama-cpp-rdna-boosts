@@ -2814,14 +2814,19 @@ r363-wip item 1, whose diagnosis was wrong.
 
 *No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 8.
 
-1. **A "plain == drafter" text comparison is vacuous when the drafter never initialised, and the library only
-   WARNS.**  `--spec-type draft-mtp-adaptive --spec-draft-n-max 2` prints
-   `E failed to initialize speculative decoding context: invalid adaptive draft range: n_min_adaptive=3, n_max=2`
-   and then runs the whole arm as a PLAIN run (0 drafts generated).  Any purity claim read off that arm compares
-   two plain runs.  The gate must assert the MECHANISM (`#gen drafts > 0` and `#acc drafts > 0`) and name the
-   initialisation error, which is why the four-axis arms here use the delivery default ceiling (`--nmax 7`).
-   (Delivery-level wart, not this campaign's code: the pair is valid, so the run silently degrades instead of
-   refusing to start.)
+1. **A "plain == drafter" text comparison is vacuous when the drafter never initialised, so a gate must assert
+   the MECHANISM (`#gen drafts > 0` AND `#acc drafts > 0`) and name the initialisation error.**  Measured here on
+   a HARNESS bug: the Flash-Next adaptive arms were first run at `--spec-draft-n-max 2` (copied from
+   `scripts/gate-draft-ctx.sh`, whose `draft-mtp` arm is not adaptive).  The adaptive controller's
+   `n_min_adaptive` default is **3** and landed WITH its validation in delivery **block 02**
+   (`git log -S n_min_adaptive`), so max 2 is a self-contradictory pair that has never been a working
+   configuration: the library says so (`E failed to initialize speculative decoding context: invalid adaptive
+   draft range: n_min_adaptive=3, n_max=2`) and continues as a PLAIN run with 0 drafts -- on the campaign build
+   and on a build of the delivery tip `089f90067` alike (checked with the identical invocation).  So this was
+   the gate's bug, not the feature's: the SAME arms at `--nmax 7` draft and accept on both models (73..213
+   drafts per axis).  **No delivery change is proposed** (the maintainer's decision, 2026-11-23): an invalid
+   flag pair is rejected loudly enough, and `draft-mtp-adaptive` is a shipping feature this campaign must not
+   constrain.  A harness that drives it must use a valid ceiling.
 2. **An inertness anchor is only evidence if it predates the change, so the gate must print each anchor's
    provenance.**  A1/A2/A3 and the 4B server startup shape were recorded at STEP 0 on the r353 delivery tree;
    phi-4's row and the other three startup shapes were recorded at STEP 8 and are therefore a regression LOCK,

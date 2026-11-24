@@ -37,6 +37,9 @@
 #   --n N           generated tokens per four-axis arm (default 600 -- the protocol's 3000 exists for RATE
 #                   comparability; the claim here is byte identity plus a non-zero acceptance, so a shorter
 #                   stream is enough and keeps the gate affordable on a host-expert shape).  The gate PRINTS it.
+#   --axis-shape S  tensor (default) | host -- the shape the four-axis arms run on.  `tensor` = 3 devices
+#                   `-sm tensor -mg 0` (the campaign's validation shape, and STEP 7e's regression shape);
+#                   `host` = 1 device `-sm layer -ncmoe 48` (the arm `scripts/gate-draft-ctx.sh` validates)
 #   --no-mtp        skip the four-axis arms (probe only)
 #
 # PINS (all mandatory, they are what makes an arm a point): HIP_VISIBLE_DEVICES per model, MOE_EXPERT_HEATMAP=load
@@ -52,11 +55,17 @@ OUT="${OUT:-$HOME/.cache/rdna-boosts/gates/arms-recurrent}"
 MODELS="35b-a3b,flashnext"
 AXES="R,K,P,C"
 N=600
+# Which shape the FOUR-AXIS arms run on.  `tensor` is the campaign's default (a 3-device `-sm tensor` split is a
+# shape this campaign validates AND the one STEP 7e broke -- it is what makes this gate a regression instrument
+# for that fix).  `host` is the delivery's host-expert arm for the external head (1 device `-sm layer -ncmoe 48`),
+# which is what `scripts/gate-draft-ctx.sh` validates; keep it runnable, the two arms answer different questions.
+AXIS_SHAPE="${AXIS_SHAPE:-tensor}"
 DO_MTP=1; KEEP=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --models) MODELS="$2"; shift 2 ;;
         --axes)   AXES="$2"; shift 2 ;;
+        --axis-shape) AXIS_SHAPE="$2"; shift 2 ;;
         --n)      N="$2"; shift 2 ;;
         --no-mtp) DO_MTP=0; shift ;;
         --keep)   KEEP=1; shift ;;
@@ -77,13 +86,20 @@ model_var() {
         flashnext:model)  echo /llm/models/Qwen3.8/Flash-Next/GSQ-RCO-IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf ;;
         flashnext:devices) echo 0,1,2 ;;   # the probe loads on 0,1,2 (n_gpu_layers=99, layer split)
         flashnext:probe)  echo "" ;;
-        # the host-expert shape (1 device) -- the arm scripts/gate-draft-ctx.sh validates for the external head.
-        # n_max 7 is the delivery default ceiling and it is REQUIRED here: the adaptive controller's default
-        # `n_min_adaptive = 3` must be <= n_max, and at n_max 2 the drafter REFUSES to initialise and the run
-        # silently continues as a plain one (`E failed to initialize speculative decoding context: invalid
-        # adaptive draft range`) -- measured 2026-11-23, and the reason the drafts/accepted check below is a HARD
-        # one: without it this arm "passed" a text comparison between two plain runs.
-        flashnext:axis)   echo "--devices 0 --sm layer --ncmoe 48 --ctx 8192 --load mmap --md $MTPHEAD --nmax 7" ;;
+        # A 3-DEVICE `-sm tensor` arm is part of this campaign (the maintainer, 2026-11-23) and it is the shape
+        # STEP 7e broke, so it is the default here; `AXIS_SHAPE=host` switches to the delivery's host-expert arm
+        # (1 device `-sm layer -ncmoe 48`), which is what `scripts/gate-draft-ctx.sh` validates.
+        #
+        # `--nmax 7` is the delivery default ceiling.  The ADAPTIVE controller's `n_min_adaptive` default is 3
+        # (block 02), so an adaptive arm's `--spec-draft-n-max` must be >= 3.  `--nmax 2`
+        # (the value scripts/gate-draft-ctx.sh uses for its NON-adaptive `draft-mtp` arm) makes the drafter refuse
+        # to initialise and the run continues PLAIN -- which is what the drafts/accepted check below is for.  An
+        # invalid flag pair is a harness bug, not a feature question.
+        flashnext:axis)   if [ "$AXIS_SHAPE" = host ]; then
+                              echo "--devices 0 --sm layer --ncmoe 48 --ctx 8192 --load mmap --md $MTPHEAD --nmax 7"
+                          else
+                              echo "--devices 0,1,2 --sm tensor --ctx 16384 --load mmap --md $MTPHEAD --nmax 7"
+                          fi ;;
         *) echo "" ;;
     esac
 }
@@ -188,7 +204,8 @@ for m in "${want_models[@]}"; do
                 "axis $a: the plain and the drafter arms read ONE text ($n_sha)"
             hard "$([ "${acc:-0}" -gt 0 ] && [ "${acd:-0}" -gt 0 ] && echo 1 || echo 0)" \
                 "axis $a: the drafter really drafted and really accepted (${acc:-0} drafts, ${acd:-0} accepted)"
-            # the specific failure mode that makes the arm above vacuous rather than merely empty
+            # the specific failure mode that makes the arm above vacuous rather than merely empty (an invalid
+            # flag pair -- e.g. an adaptive arm at n_max below n_min_adaptive's default of 3 -- not a defect)
             if grep -qa "failed to initialize speculative decoding context" "$OUT/mtp/$m-mtp-$a-adaptive-f16-n$N.err" 2>/dev/null; then
                 echo "FAIL  axis $a: the drafter never INITIALISED -- $(grep -a 'failed to initialize speculative' "$OUT/mtp/$m-mtp-$a-adaptive-f16-n$N.err" | tail -1 | sed 's/.*: //')"
                 fails=$((fails+1))
