@@ -2,11 +2,21 @@
 # gate-arms-itl -- the feature's own claim: a decoder's ITL through a long prefill.
 #
 # WHAT IT CHECKS
-#   * the decode arm really ran while the other slot prefilled (`the decode arm is generating: ...`)
-#   * the two arms read the SAME text (the pair changes latency, not answers)
+#   * the decode arm really ran while the other slot prefilled (`the decode arm is generating: ...`)   [HARD]
 #   * the decoder's ITL through the prefill is no worse with the pair on, and the prefill is not slowed
-#     (both numbers are PRINTED -- a number that moves is a result, not a regression by itself)
-#   * no GPU fault
+#     (both numbers are PRINTED -- a number that moves is a result, not a regression by itself)         [HARD]
+#   * no GPU fault                                                                                     [HARD]
+#   * the two arms' answers, PRINTED and compared as INFO ONLY -- see below.
+#
+# WHY THE TEXT IS NOT A HARD CHECK HERE (corrected 2026-11-23, STEP 9).  This gate is the ONE arm whose whole
+# point is TWO REQUESTS IN FLIGHT, and that is exactly the configuration in which a byte claim is a lottery: the
+# concurrent arm's batch composition (and therefore the kernel set) depends on arrival timing, so even the
+# UNMODIFIED single-context server reads a different answer run to run on some shapes (`INVARIANTS.md` r362-wip
+# item 5).  Measured: at `-ub 2048` one gate run read `36216e77db27` (off) vs `68584f8dcc40` (on), and THREE
+# repeats per arm then read `36216e77db27` 6/6; at `-ub 4096` the OFF arm itself read `3c54ba65350c` where the
+# 512/2048 arms read `36216e77db27`.  A hard assertion on that line reports a near-tie as a defect.  The byte
+# claim lives where it can be made -- one request in flight -- in `gate-arms-n1-memory.sh`, and both hashes are
+# printed here so a real divergence is still visible to a reader.
 #
 # THE SHAPE MATTERS: the win needs a WIDE prefill chunk, because that is the stall the single-context server
 # cannot bound (DESIGN §1).  At the delivery's default `-ub 512` this 4B arm is FLAT (13.3 vs 13.2 ms/token at
@@ -43,8 +53,14 @@ itl_on="$( sed -n 's/.*A eval: \([0-9.]*\) ms \/ *64 tokens.*/\1/p' "$OUT/itl-on
 a_off="$(python3 -c "import json,hashlib;print(hashlib.sha256(json.load(open('$OUT/itl-off.a.json'))['content'].encode()).hexdigest()[:12])" 2>/dev/null || echo OFF-MISSING)"
 a_on="$(python3 -c "import json,hashlib;print(hashlib.sha256(json.load(open('$OUT/itl-on.a.json'))['content'].encode()).hexdigest()[:12])" 2>/dev/null || echo ON-MISSING)"
 
-hard "$( [ "$a_off" != "OFF-MISSING" ] && [ "$a_on" != "ON-MISSING" ] && [ "$a_off" = "$a_on" ] && echo 1 || echo 0)" \
-    "the decoder read the SAME text with the pair off and on ($a_off vs $a_on)"
+if [ "$a_off" = "OFF-MISSING" ] || [ "$a_on" = "ON-MISSING" ]; then
+    hard 0 "both arms produced a decoder response (a missing arm is a FAIL, never a pass)"
+elif [ "$a_off" = "$a_on" ]; then
+    echo "INFO  the decoder read the same text on both arms ($a_off) -- not a hard claim here (concurrent arm)"
+else
+    echo "INFO  the decoder read DIFFERENT text off=$a_off on=$a_on -- a concurrent arm's answers are timing-"
+    echo "      dependent (near-tie class, INVARIANTS r362-wip item 5); the byte claim is gate-arms-n1-memory.sh"
+fi
 hard "$(grep -q 'the decode arm is generating:' "$OUT/itl-on.log" && echo 1 || echo 0)" \
     "the decode arm ran during the prefill (census present)"
 # the bound: the pair must not be WORSE than the single-context server at this width
@@ -63,7 +79,7 @@ fi
 
 echo
 if [ "$fails" -eq 0 ]; then
-    echo "==> PASS: the pair keeps the decoder's cadence through a $UB-wide prefill and reads the same text"
+    echo "==> PASS: the pair keeps the decoder's cadence through a $UB-wide prefill (text: see INFO above)"
     exit 0
 fi
 echo "==> FAIL ($fails check(s))  (logs: $OUT)"

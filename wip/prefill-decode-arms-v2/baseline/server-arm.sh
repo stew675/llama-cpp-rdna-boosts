@@ -35,6 +35,11 @@
 #   --req-timeout N    per-request curl timeout seconds (default 300)
 #   --timeout N        hard server timeout seconds (default 600)
 #   --concurrent       fire the requests at once (default: sequential)
+#   --vram-probe       while the server is LOADED (after the requests, before the teardown), write
+#                      $TAG.vram: one `gpu<N> total_bytes=... used_bytes=...` line per device, the server's
+#                      RSS, and the `sched_reserve` compute-buffer sizes from the log.  This is what makes
+#                      "what the second context COSTS" a measured difference between two arms instead of a
+#                      claim (STEP 9's memory row).
 #
 # Caller must still pin HIP_VISIBLE_DEVICES (0,2 / 0,1,2) and put the whole thing under `timeout`.
 set -uo pipefail
@@ -43,7 +48,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 OUT=""; TAG=""; MODEL=""; EXTRA=""; EXTRA_ENV=""
 NP=2; CTX=8192; NPRED=48; PORT=""
 PROMPT="$REPO/prompts/prose-rdna-boosts.txt"; PROMPT2="$REPO/prompts/reasoning.txt"
-READY=60; REQT=300; STIMEOUT=600; CONC=0
+READY=60; REQT=300; STIMEOUT=600; CONC=0; VRAM=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -62,6 +67,7 @@ while [ $# -gt 0 ]; do
         --req-timeout) REQT="$2"; shift 2 ;;
         --timeout) STIMEOUT="$2"; shift 2 ;;
         --concurrent) CONC=1; shift ;;
+        --vram-probe) VRAM=1; shift ;;
         -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -152,6 +158,31 @@ else
     done
 fi
 echo "  [$TAG] requests done in $((SECONDS - t0)) s" >&2
+
+# The memory row: WHOLE-server VRAM while it is loaded, per device, plus RSS and the per-context compute-buffer
+# sizes the library printed.  Taken here (requests finished, process alive) so the teardown cannot hide it.
+if [ "$VRAM" = 1 ]; then
+    {
+        echo "# tag=$TAG rss_kib=$(ps -o rss= -p "$SPID" 2>/dev/null | tr -d ' ')"
+        rocm-smi --showmeminfo vram 2>/dev/null | python3 -c '
+import re, sys
+cur = {}
+for line in sys.stdin:
+    m = re.match(r"GPU\[(\d+)\]\s*:.*?(Total|Used) Memory.*: (\d+)", line)
+    if m:
+        gpu, kind, val = m.groups()
+        cur.setdefault(gpu, {})[kind.lower()] = int(val)
+for gpu in sorted(cur, key=int):
+    d = cur[gpu]
+    print("gpu%s total_bytes=%s used_bytes=%s" % (gpu, d.get("total", 0), d.get("used", 0)))
+'
+        grep -a "compute buffer size" "$LOG" 2>/dev/null | sed 's/^/reserve: /'
+        grep -a "two-arm server:" "$LOG" 2>/dev/null | sed 's/^/pair: /'
+        grep -a "aux narrow-" "$LOG" 2>/dev/null | sed 's/^/aux: /'
+        grep -a "decode arm is generating" "$LOG" 2>/dev/null | sed 's/^/census: /'
+    } > "$OUT/$TAG.vram"
+    echo "  [$TAG] vram probe -> $OUT/$TAG.vram" >&2
+fi
 
 python3 - "$TMPD" "$RESP" "$HASH" <<'PY' || die "could not parse responses"
 import hashlib, json, sys, os

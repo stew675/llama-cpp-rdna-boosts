@@ -8,6 +8,83 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-23 — STEP 9: the shape / latency / memory matrix — and the two defects it found (`WORKLOG.md` 261123.023)
+
+`baseline/shape-matrix.sh` (new) + `server-arm.sh --vram-probe` (new).  Both landings it needed are
+`WORKLOG.md` 261123.021 (STEP 7e) and this entry's **STEP 7f** — the matrix found 7f, and 7f is why the
+Flash-Next row below is green.
+
+### 1. Text identity, pair OFF vs ON, one request in flight, 3 fresh processes per arm
+
+Command: `baseline/shape-matrix.sh` (7 shapes; `$OUT/shape-matrix.tsv` has the machine-readable table).
+
+| shape | np | text | run-stable (off / on) | hashes |
+|---|---|---|---|---|
+| 4B Q8_0, 1 GPU | 2 | **IDENTICAL** | 3/3 / 3/3 | `7bd542418112`, `6ce1f88dd5f7` |
+| phi-4 IQ4_XS, 1 GPU | 2 | **IDENTICAL** | 3/3 / 3/3 | `997e53774f78`, `66075569e702` |
+| 27B Q8_0, 3 GPU `-sm tensor -mg 0` | 2 | **IDENTICAL** | 3/3 / 3/3 | `f2753e13e419`, `c5f2fdc43642` |
+| 35B-A3B Q8_0, 1 GPU `-ncmoe 40` (host tier) | 4 | **IDENTICAL** | 3/3 / 3/3 | `50f4872a9ab8`, `f124fe95ee72` |
+| Flash-Next GSQ IQ3_S, 3 GPU `-sm tensor -mg 0` (qwen4exp) | 3 | **IDENTICAL** | 3/3 / 3/3 | `4dbb571b8bdb`, `f1c288a48245` |
+| Gemma4 26B-A4B QAT (iswa), 1 GPU | 2 | **IDENTICAL** | 3/3 / 3/3 | `c67b75fa272d`, `e2159222cb60` |
+| Gemma4 26B-A4B + its shared MTP head, `-ncmoe 20` | 2 | **REFUSED-AS-DESIGNED** | 1/1 (pair OFF) | `5d4a679e2b8d`, `b23288ddab15` |
+
+The refusal row is a designed answer, not a gap: the server prints
+`cannot run the two-arm server: a speculator's draft/verify round is not admitted on the pair yet (--spec-type
+none); the layer-input families and a gemma4 assistant are refused permanently ...` and refuses to start with
+`--prefill-decode-arms`, while the pair-OFF arm on that shape runs normally (it is the draft-aux-slot shape,
+`STEP 7c`).
+
+**Defect found by this row (STEP 7f, `steps/STEP-7f-0014-borrower-kv-types.patch`).**  The first matrix run read
+`flashnext/on` as **1 of 3 runs completing** (r2 and r3 aborted with
+`GGML_ASSERT(type >= 0 && type < GGML_TYPE_COUNT)`).  Under `gdb` the stack was
+`ggml_new_tensor_4d <- qwen4exp_qsa_sparse <- qwen4exp_want_derived_vis <- build_layer_attn <- graph <-
+graph_reserve <- resolve_fused_ops` — i.e. the DECODE arm's fused-op probe.  Instrumenting both boundaries gave
+the mechanism in one run: the context's **`cparams.type_k` was already garbage at the borrow branch**
+(`DBG borrow cparams.type_k=22095`, and the value differed per run: 21900, 22095, ...).  STEP 2 assigned
+`cparams.type_k`/`type_v` only in the own-memory branch, and `llama_cparams` declares them with **no default
+initializer**, so a borrower carried uninitialized stack.  Fix: a borrower mirrors the OWNER's types.  Verified
+5/5 clean afterwards, and the q8_0-KV arm reads the same text on both arms (`-ctk q8_0 -ctv q8_0`:
+`18de3d2a3286`, `4dbb571b8bdb`), which is the check that the inherited type is the *cache's*.
+
+### 2. What the pair costs (whole-server VRAM while loaded, `--vram-probe`)
+
+| shape | VRAM delta | RSS delta | reserve / aux region |
+|---|---|---|---|
+| 4B | **+78 MiB** (gpu0) | +25 MiB | — |
+| phi-4 | +53 MiB | +23 MiB | — |
+| 27B 3 GPU tensor | **+149 MiB per device** | +1808 MiB | — |
+| 35B-A3B host tier np 4 | +60 MiB | +4231 MiB | **declares 1280 MiB**; the slab pins `aux narrow-3` 1280 MiB from its unmapped VA spare |
+| Flash-Next 3 GPU tensor | +154 MiB per device | +1823 MiB | — |
+| Gemma4 26B-A4B iswa | +140 MiB | +34 MiB | — |
+
+### 3. The ITL / prefill trade (`baseline/itl-arm.sh`, 4B Q8_0, 1 GPU; slot A decodes 64 tokens while slot B
+prefills `prompts/prose-rdna-boosts.txt` = 5246 tokens; **3 repeats per arm**)
+
+| `-ub` | ITL OFF (ms/token) | ITL ON | Δ | prefill OFF | prefill ON | Δ |
+|---|---|---|---|---|---|---|
+| 512 | 14.36 / 14.34 / 14.31 | 13.35 / 13.36 / 13.36 | **−6.8 %** | 4726 / 4732 / 4738 | 5693 / 5669 / 5667 | **+20.0 %** |
+| 2048 | 20.45 / 20.32 / 20.37 | 15.16 / 17.00 / 15.06 | **−22.8 %** | 4889 / 4925 / 4913 | 6138 / 5986 / 6145 | **+24.1 %** |
+| 4096 | 20.79 / 21.14 / 20.57 | 16.00 / 15.72 / 15.82 | **−23.9 %** | 5096 / 5010 / 5169 | 6068 / 6088 / 6081 | **+19.4 %** |
+
+The win grows with the chunk width (the decoder stops waiting for a WHOLE chunk), and the prefill is faster on
+every width: the decoder's single row no longer joins the prefill's batch, so the prefill graph stays wide.
+
+**A measurement, not a rate, is what a single run gives here.**  One `gate-arms-itl.sh` run in this session read
+`-ub 2048` as 1028.8 ms (OFF) → 961.9 ms (ON), i.e. −6.5 %, and a `-ub 4096` OFF arm as 1319.2 ms.  The repeats
+above put OFF at 1300-1310 ms and 1316-1353 ms.  The single run's baseline was the outlier; the pair's own number
+is stable (964-1088 ms).  A claim from one run of this gate would have been wrong in BOTH directions.
+
+### 4. A gate correction this section owes: `gate-arms-itl.sh`'s text check is not a byte claim
+
+The ITL gate is the ONE arm whose point is two requests in flight, and that is the configuration in which a byte
+claim is a lottery (`INVARIANTS.md` r362-wip item 5): at `-ub 2048` one run read `36216e77db27` (off) vs
+`68584f8dcc40` (on), and **three repeats per arm then read `36216e77db27` 6/6**; at `-ub 4096` the *OFF* arm
+itself read `3c54ba65350c` where the 512/2048 arms read `36216e77db27`.  The gate now prints both hashes as
+INFO and keeps the byte claim where it can be made (`gate-arms-n1-memory.sh`, one request in flight); its HARD
+checks are the census, the ITL bound and the fault scan.
+
+---
+
 ## 2026-11-23 — STEP 8: the two owed gates (`WORKLOG.md` 261123.022)
 
 `gates/gate-arms-default-inert.sh` (new, pair OFF on four shapes) and `gates/gate-arms-recurrent-shared.sh`

@@ -1,4 +1,4 @@
-# HANDOVER — `prefill-decode-arms` v2, campaign state + the next task (STEP 9)
+# HANDOVER — `prefill-decode-arms` v2, campaign state + the next task (STEP 10)
 
 **Read this file first, then work top to bottom.**  Written for a session with *no* memory of the campaign: what
 exists, what is green, what is open, what to do first.  Everything below was measured on this box; a plan that has
@@ -7,12 +7,12 @@ not been run says so.
 | | |
 |---|---|
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`prefill-decode-arms-v2`**, HEAD = the **STEP 7e/8 landing** (the commit that carries this file; **`main` untouched** at `91a81505`) |
-| work tree | `~/llama.cpp`, branch **`arms-v2`** (**local only, never pushed**), tip **`3013e880a`** (STEP 7e), tree clean |
+| work tree | `~/llama.cpp`, branch **`arms-v2`** (**local only, never pushed**), tip **`f61fcb03f`** (STEP 7f), tree clean |
 | build | `~/bin/build-llama-rocm` → `build-rocm` (ROCm **10.2.0**); fast loop `cmake --build build-rocm --target llama-cli llama-server -j 16` |
 | extra build dirs | **`build-ref`** = a build of the delivery tip `089f90067` (the "pre-change build": the reference for a regression question), **`build-bisect`** = the last bisect rung's build.  Both at the same source path, so ccache stays warm |
-| landings | STEP 0-6e, **7a**, **7d**, **7c**, **7e** (STEP 4 broke the external draft head on a tensor split), **8** (the gate set is complete) — §1.2 |
-| **next action** | **STEP 9 — the shape/latency matrix + the records**, §3 |
-| after that | STEP 10 speculator re-admission, STEP 11 delivery sweep, STEP 12 candidate patch + the promotion ask |
+| landings | STEP 0-6e, **7a**, **7d**, **7c**, **7e** (STEP 4 broke the external draft head on a tensor split), **8** (the gate set), **7f** (a borrowing context carried an uninitialized `cparams.type_k`), **9** (the shape/latency/memory matrix) — §1.2 |
+| **next action** | **STEP 10 — re-admit the speculator on the pair**, §3 |
+| after that | STEP 11 delivery sweep, STEP 12 candidate patch + the promotion ask |
 
 ---
 
@@ -62,8 +62,11 @@ nothing is copied between them.**  `llama_context_params::ctx_memory` is the onl
 | STEP 7c | `STEP-7c-0012-aux-reserve-calibration.patch` | the aux region is charged to the slab **reserve** (approximation), the slab logs the measured size + the reserve to set **once per slot**, and `mapped_arena` separates the arena's extent from the slab's (§2.8) |
 | STEP 7e | `STEP-7e-0013-meta-slot-per-graph.patch` | **STEP 4's defect**: the `thread_local` Meta view slot must be bound where a graph is built/resolved, not where a flag changes — `sched_alt_select()` bound only after its no-op early return, so on `-sm tensor` a second context's graph resolved under the first's view containers (`GGML_ASSERT(tensor)`) (§3, and `INVARIANTS.md` r368-wip) |
 | STEP 8 | — (gates + anchors, no code) | `gate-arms-default-inert.sh` + `gate-arms-recurrent-shared.sh`, `baseline/inert-anchors.tsv`, `baseline/inert-shapes/`, `mtp-axis.sh` shape flags + `--no-lock` (§3) |
+| STEP 7f | `STEP-7f-0014-borrower-kv-types.patch` | **STEP 2's defect**: `cparams.type_k`/`type_v` (no default initializer) were assigned only in the own-memory branch, so a BORROWING context carried stack garbage that qwen4exp's QSA probe fed to `ggml_new_tensor_4d` -- Flash-Next + the pair aborted 2 of 3 runs (`GGML_ASSERT(type >= 0 ...)`).  A borrower now mirrors the OWNER's types |
+| STEP 9 | — (`baseline/shape-matrix.sh` + `server-arm.sh --vram-probe`) | the shape/latency/memory matrix: 7/7 shapes text-identical (3 repeats per arm), the cost table (+53..+154 MiB, 1280 MiB aux region on a host tier), the ITL/prefill trade (ITL −22.8 % at `-ub 2048`, prefill **+24 %**), and two corrections (the ITL gate's text check, one-run-vs-rate) |
 
-Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077`, 7e `3013e880a` (branch `arms-v2`, local only).
+Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077`, 7e `3013e880a`, 7f `f61fcb03f` (branch `arms-v2`,
+local only).
 
 ### 1.3 Green, with the number that proves it (all re-measured after 7c)
 
@@ -79,12 +82,16 @@ Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077`, 7e `3013e880a` (branc
 | the probes | `probe-kv-reservation.cpp` (I4), `probe-recurrent-shared.cpp` (I5), `probe-ctx-memory.cpp`, `probe-meta-slots.cpp`, `probe-host-stream.cpp` |
 | **default path untouched (the gate)** | `gates/gate-arms-default-inert.sh` **PASS** on 4 shapes: cli text `be904e86f248` / `db5ab8e63e11` / `10a82b5559a9` / `e9db5cb8db0b` (the first, third and fourth are **pre-change** STEP 0 anchors) and startup shapes identical (the 4B one to `baseline/A6-startup-shape.txt` **byte for byte**), plus the pair-ON sensitivity arm (4 added lines, same responses) |
 | **one memory, two contexts on a RECURRENT model (the gate)** | `gates/gate-arms-recurrent-shared.sh` **PASS** on 35B-A3B and Flash-Next/qwen4exp + the shared MTP head, **both on a 3-device `-sm tensor -mg 0` split** (that shape is part of this campaign and is the one STEP 7e broke): placements differ (`head=0 n=1` vs `head=1 n=1`), concurrent digests == `--solo`, and the four-axis `none` == adaptive text with 73..213 drafts accepted on every axis.  `--axis-shape host` runs the delivery's host-expert arm for the external head instead |
+| **the shape matrix (STEP 9)** | `baseline/shape-matrix.sh`: **7/7 shapes text-identical** with the pair OFF vs ON, 3 fresh processes per arm, one request in flight (4B, phi-4, 27B-3GPU-tensor, 35B-A3B host tier np 4, Flash-Next-3GPU-tensor np 3, Gemma4 iswa) + the designed REFUSAL row (Gemma4 + its shared MTP head).  Cost **+53..+154 MiB** of VRAM (+149/154 per device on the tensor splits) and one 1280 MiB aux region on a host tier |
+| **the ITL/prefill trade (STEP 9)** | 4B, A decodes 64 tokens while B prefills 5246 tokens, **3 repeats per arm**: `-ub 512` 14.34 -> 13.36 ms/token (−6.8 %) and 4732 -> 5676 t/s; `-ub 2048` 20.38 -> 15.74 (−22.8 %) and 4909 -> 6090 (**+24.1 %**); `-ub 4096` 20.83 -> 15.85 (−23.9 %) and 5092 -> 6079 (+19.4 %) |
+| the 7f fix | 5/5 pair-ON runs clean on Flash-Next-3GPU-tensor (was 1/3), reading the pair-OFF answers; `-ctk q8_0 -ctv q8_0` identical on both arms |
 | the 7e fix | the reproducer (Flash-Next + external head, 3 devices `-sm tensor`) reads the delivery's text `be69e274b66d` again; `gate-draft-ctx.sh` PASS; the pair on 27B tensor identical (`8f396b237f0f`/`04116b9a99ad`); the host-tier soak PASS |
 | the build | whole set builds; `scripts/check-shlib-symbols.sh` **OK** (16 libs) after the iface rename |
 
 ### 1.4 Open
 
-* **STEP 9 (next):** the shape/latency matrix (host-tier + draft rows now available) and the `ENVIRONMENT.md` rows.
+* **STEP 10 (next):** re-admit the speculator on the pair (§3).  STEP 9 closed the matrix, the cost table and the
+  `ENVIRONMENT.md` §24 rows.
 * **Closed at STEP 8:** the five-gate set is complete and green (`gate-arms-{default-inert,n1-memory,itl,`
   `multislot,recurrent-shared}.sh`), each printing its own non-vacuity line.  `RUNS.md` has the numbers;
   `INVARIANTS.md` r368/r369-wip the facts.
@@ -258,7 +265,16 @@ What was owed (both now written):
   defective.  Two hard-won rules for the gate scripts: pin `MOE_EXPERT_HEATMAP=load`, and state the repeats (a
   "PASS 3/3" on an intermittent arm is a lottery ticket, not a rate).
 
-### STEP 9 — the shape/latency matrix + the records
+### STEP 9 — the shape/latency matrix + the records (CLOSED 2026-11-23)
+
+**Done**: `baseline/shape-matrix.sh` (7 shapes x 3 repeats x 2 arms, one request in flight, VRAM probed while
+loaded) and `server-arm.sh --vram-probe`.  Results in `RUNS.md` and `ENVIRONMENT.md` §24: 7/7 text-identical, the
+cost is +53..+154 MiB (+149/154 per device on a tensor split; one 1280 MiB slab aux region on a host tier), and
+the trade is ITL **−22.8 %** at `-ub 2048` with prefill **+24.1 %** (3 repeats per arm).  It also found **STEP
+7f** (a borrowing context carried an uninitialized `cparams.type_k`; Flash-Next + the pair aborted 2 of 3 runs)
+and corrected `gate-arms-itl.sh`'s text check (a byte claim under concurrency is a lottery).
+
+The original scope, for the record:
 
 4B (1 GPU), phi-4 IQ4_XS (1 GPU, dense), 27B Q8_0 (3 GPU `-sm tensor`), 35B-A3B Q8_0 (`-ncmoe 40`, host tier),
 Flash-Next IQ4_NL (3 GPU tensor, 3 slots `--kv-unified`), Gemma4 (iswa), **plus** the external-MTP-head shape
@@ -326,7 +342,10 @@ baseline/  r353-anchors.md        the anchors A1-A7 and how to re-run them
            A6-startup-shape.txt   the 13-line pair-OFF startup shape (the default-inert anchor, 4B)
            inert-anchors.tsv      the default-inert cli TEXT anchors + each row's PROVENANCE (pre-change vs lock)
            inert-shapes/          one recorded startup shape per shape (+ the 4B pair-ON sensitivity fixture)
-           server-arm.sh          start a server arm, drive N requests, hashes + the log; ONE TERM then wait
+           server-arm.sh          start a server arm, drive N requests, hashes + the log; ONE TERM then wait;
+                                  `--vram-probe` = whole-server VRAM/RSS while LOADED (STEP 9's memory row)
+           shape-matrix.sh        STEP 9's measurement: N repeats x {pair off, on} per shape, text identity as a
+                                  set + run-stability, VRAM delta per device, the reserve/aux/census lines
            itl-arm.sh             the ITL-through-a-prefill measurement (slot A decodes while B prefills)
            mtp-axis.sh            one four-axis MTP arm (GPU flock; --spec none|draft-mtp|adaptive).
                                   Shape options for another model: --sm/--ncmoe/--ctx/--load/--md/--tag-prefix;
@@ -381,7 +400,7 @@ Every number of record is in `RUNS.md` (newest first) with its command and shape
    calibration, no reserve change), but if the campaign is promoted they land in whichever block owns the slab —
    a block decision.
 2. **STEP 10's reserve.**  One aux region costs one chunk-rounded narrow layout (1280 MiB on the 35B-A3B shape,
-   512 MiB on Gemma4).  A pair **plus** a drafter means two more layouts, and the reserve is a single
+   512 MiB on Gemma4; the pair alone costs +53..+154 MiB of VRAM, STEP 9's table).  A pair **plus** a drafter means two more layouts, and the reserve is a single
    approximation (`COMMON_ARMS_RESERVE_MIB`) plus the draft's own derived estimate.  Should the pair's constant
    become a per-aux-context count, or is the slab's calibration log (set `GGML_CUDA_SLAB_RESERVE_MIB` from it)
    the accepted mechanism?

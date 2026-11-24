@@ -2837,3 +2837,44 @@ r363-wip item 1, whose diagnosis was wrong.
    across processes: the gate's whole-run lock plus `mtp-axis.sh`'s own lock deadlocked silently (the box idle
    for 5+ minutes with `flock -w 900 9` waiting on the gate's own fd).  Hence `mtp-axis.sh --no-lock` for a
    caller that already holds it.
+
+## r370-wip (2026-11-23, `WORKLOG.md` 261123.023) — a context that BORROWS a memory must inherit the memory's KV types: `llama_cparams::type_k`/`type_v` have no default initializer, so an unassigned one is stack garbage (`prefill-decode-arms` v2 STEP 7f)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 7f (a defect in this campaign's STEP 2).
+
+1. **`llama_cparams::type_k`/`type_v` are plain `ggml_type` fields with no default initializer, and they were
+   assigned ONLY in the context's own-memory branch.**  A borrowing context therefore carried uninitialized
+   stack, and the graph builders that pick between quantized-aware attention arms read it: qwen4exp's
+   `qwen4exp_qsa_sparse()` hands `cparams.type_k` to `qsa_op_supported()`, which builds a probe tensor of that
+   type, so the value reached `ggml_new_tensor_4d` and aborted at
+   `GGML_ASSERT(type >= 0 && type < GGML_TYPE_COUNT)` (measured: Flash-Next + the pair on 3 devices
+   `-sm tensor`, 2 of 3 runs; the instrumented values differed per run -- 21900, 22095 -- which is why it was
+   intermittent, and it is invisible on models whose builders never read the field, i.e. 27B and 35B-A3B).
+   **Rule:** a field that selects a code path and has no default initializer must be assigned on EVERY branch of
+   the constructor, or the branch that skips it trades a compile-time default for run-time garbage.  A borrower's
+   KV types are a property of the memory it borrows: mirror the OWNER's, not the requester's tag (verified with
+   `-ctk q8_0 -ctv q8_0`: both arms read the same text).
+2. **A defect that only bites when a *second* consumer exists is invisible to every single-context gate, and a
+   shape matrix is the instrument that finds it.**  STEP 8's five gates all passed on this build, including a
+   3-device `-sm tensor` four-axis arm, because the field is only read by a builder the *borrower* reaches
+   differently (a probe at `n_ubatch = 3` vs 512).  STEP 9's per-shape matrix read the same binary 3x per arm and
+   caught it at 2/3.
+
+## r371-wip (2026-11-23, `WORKLOG.md` 261123.023) — a byte claim inside the ITL gate is a lottery, and one run of a throughput harness is a measurement, not a rate (`prefill-decode-arms` v2 STEP 9)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 9.
+
+1. **The one gate whose point is two requests in flight cannot also make a byte claim.**  `gate-arms-itl.sh`
+   asserts a decoder's ITL through a 5k-token prefill -- two requests, deliberately.  In that configuration the
+   concurrent arm's batch composition (and so the kernel set) depends on arrival timing, so the answers are
+   timing-dependent even on the UNMODIFIED single-context server (`r362-wip` item 5).  Measured: one run read
+   `36216e77db27` (off) vs `68584f8dcc40` (on); 3 repeats per arm then read `36216e77db27` **6/6**; and at
+   `-ub 4096` the *OFF* arm itself read `3c54ba65350c` where the 512/2048 arms read `36216e77db27`.  A hard text
+   check there reports a near-tie as a defect.  Keep the byte claim where it can be made (one request in flight)
+   and print the hashes as INFO.
+2. **A single run of a throughput harness is a measurement, not a rate -- and it can be wrong in both
+   directions.**  One ITL run read `-ub 2048` as 1028.8 ms (off) -> 961.9 ms (on), i.e. −6.5 %; the 3-repeat set
+   puts the same arm at 1300-1310 ms -> 964-1088 ms, i.e. −22.8 %.  The pair's own number was stable; the
+   baseline was the outlier.  The measured trade (4B, 5246-token prefill against a 64-token decode): `-ub 512`
+   ITL −6.8 % / prefill +20.0 %, `-ub 2048` −22.8 % / +24.1 %, `-ub 4096` −23.9 % / +19.4 % -- the win grows with
+   the chunk width, and the prefill is FASTER because the decoder's row no longer joins the prefill's batch.

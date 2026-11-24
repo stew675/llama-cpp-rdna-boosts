@@ -1,3 +1,61 @@
+## 261123.023 (no release; `prefill-decode-arms` v2 STEP 9) -- the shape/latency/memory matrix is green on 7 shapes, and it found one real defect (a BORROWING context carried an uninitialized `cparams.type_k`) plus one gate whose text check was a lottery
+
+STEP 9 answers the three questions a promotion decision needs: does the pair change any answer, what does it
+cost, and what does it buy.  The instrument is `baseline/shape-matrix.sh` (`server-arm.sh --vram-probe` gives the
+loaded VRAM), and every claim below is 3 fresh processes per arm, one request in flight.
+
+### 1. Answers: 7/7 shapes identical, 3/3 stable per arm
+
+4B Q8_0 (1 GPU), phi-4 IQ4_XS (1 GPU), 27B Q8_0 (3 GPU `-sm tensor -mg 0`), 35B-A3B Q8_0 (`-ncmoe 40`, np 4),
+Flash-Next GSQ IQ3_S (3 GPU `-sm tensor`, np 3), Gemma4 26B-A4B QAT (iswa, 1 GPU) -- and the seventh row is the
+**designed refusal**: Gemma4 26B-A4B + its shared MTP head (`-md`) is refused by the pair predicate, with the
+reason on stderr, while the pair-OFF arm on that shape runs normally.  Hashes per shape in `RUNS.md`.
+
+### 2. Cost: one narrow compute layout per extra context
+
+4B **+78 MiB**, phi-4 +53, 27B **+149 MiB per device**, 35B-A3B host tier +60 MiB VRAM (and the slab pins its
+`aux narrow-3` 1280 MiB region out of the unmapped VA spare, which the server declares as the reserve), Flash-Next
++154 MiB per device, Gemma4 +140 MiB.  It does not scale with context size or slot count: the second context is
+`n_parallel × (n_max + 1)` rows.
+
+### 3. The win: ITL **−23 %** at a wide chunk and prefill **+19…24 %** (not a cost)
+
+4B, slot A decodes 64 tokens while slot B prefills 5246 tokens, 3 repeats per arm: `-ub 512` 14.34 → 13.36
+ms/token (−6.8 %) and 4732 → 5676 t/s prefill; `-ub 2048` 20.38 → 15.74 (−22.8 %) and 4909 → 6090 (+24.1 %);
+`-ub 4096` 20.83 → 15.85 (−23.9 %) and 5092 → 6079 (+19.4 %).  The prefill being FASTER is the design showing
+through: the decoder's single row no longer joins the prefill's batch.  The withdrawn block 17 measured a
+−21…−24 % prefill COST; this design does not.
+
+**Correction owed:** an earlier single run of `gate-arms-itl.sh` in this session read −6.5 % at `-ub 2048`
+(OFF 1028.8 ms), and the repeats above show the OFF arm at 1300-1310 ms -- the single run's baseline was the
+outlier.  One run of that gate is a measurement, not a rate.
+
+### 4. The defect it found (STEP 7f, `steps/STEP-7f-0014-borrower-kv-types.patch`)
+
+Flash-Next + the pair aborted in **2 of 3** runs (`GGML_ASSERT(type >= 0 && type < GGML_TYPE_COUNT)`).  `gdb`
+localised it to the decode arm's `resolve_fused_ops()` probe -> `build_layer_attn` ->
+`qwen4exp_want_derived_vis` -> `qwen4exp_qsa_sparse`, and instrumenting both boundaries gave it in one run: the
+context's `cparams.type_k` was **already garbage at the borrow branch** (21900, 22095, ... per run).  STEP 2
+assigned `type_k`/`type_v` only in the own-memory branch and `llama_cparams` gives them no default initializer,
+so a borrower carried uninitialized stack -- which the qwen4exp QSA probe feeds straight into
+`ggml_new_tensor_4d`.  Fixed by mirroring the OWNER's types (the KV types belong to the memory that is borrowed).
+5/5 clean afterwards; with `-ctk q8_0 -ctv q8_0` both arms read the same text, which is the check that the
+inherited type is the cache's and not the requester's tag.  Invisible on 27B/35B: no builder there reads it.
+
+### 5. A gate correction (`gate-arms-itl.sh`)
+
+Its text check was HARD.  That gate's whole point is two requests in flight, i.e. exactly the configuration in
+which a byte claim is a lottery (`INVARIANTS.md` r362-wip item 5): one run read `36216e77db27` vs
+`68584f8dcc40`, and 3 repeats per arm then read the same hash 6/6; at `-ub 4096` the OFF arm itself read
+`3c54ba65350c`.  It now prints both hashes as INFO; the byte claim stays in `gate-arms-n1-memory.sh`.
+
+### 6. Records
+
+`ENVIRONMENT.md` §24 (the knobs, marked **wip / NOT shipped**, with the cost and win tables),
+`RUNS.md` (this section), `INVARIANTS.md` r370/r371-wip, `HANDOVER.md`, `PLAN.md` STEP 9.
+
+---
+
 ## 261123.022 (no release; `prefill-decode-arms` v2 STEP 8) -- the two owed gates: the pair-OFF default path is byte-identical on four shapes, and one recurrent memory serves two contexts on both recurrent models
 
 STEP 8 is the gate half of the campaign.  Three gates existed (`gate-arms-{n1-memory,itl,multislot}.sh`); the two

@@ -1,0 +1,24 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 5c57b622e..85dd85ac9 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1048,6 +1048,19 @@ llama_context::llama_context(
+                         "%s: the ctx_memory owner has no memory (was it created vocab_only?)", __func__));
+             }
+             memory_borrowed = true;
++            // The KV types are a property of the MEMORY, and this context borrows the owner's, so it inherits them.
++            // They are assigned ONLY in the own-memory branch below, and `llama_cparams::type_k`/`type_v` carry no
++            // default initializer, so a borrower used to leave them as UNINITIALIZED stack garbage.  The graph
++            // builders that choose between quantized-aware attention arms read `cparams.type_k` (qwen4exp's
++            // `qwen4exp_qsa_sparse` asks the backend whether the fused QSA kernel can read that type), so the
++            // probe built `ggml_new_tensor_4d(ctx, <garbage type>, ...)` and aborted with
++            // `GGML_ASSERT(type >= 0 && type < GGML_TYPE_COUNT)` -- measured 2026-11-23 on 35B/27B (not reached:
++            // no arm reads it there) and Flash-Next `-sm tensor` (2 of 3 runs, the pair's decode arm; the value
++            // varied per run: 21900, 22095, ... i.e. stack garbage, sometimes a valid type, which is why it was
++            // intermittent).  The same reasoning as the own-memory branch: hand the graph builders the types the
++            // memory module was actually given.
++            cparams.type_k = mem_owner->get_cparams().type_k;
++            cparams.type_v = mem_owner->get_cparams().type_v;
+             // I4: tell the memory (and, through a composite, each module it holds) that it is now used by two
+             // contexts, so a KV cache starts reserving the cells find_slot() hands out.
+             memory->notify_borrowed();

@@ -1813,3 +1813,50 @@ operator should expect:
   larger of the two);
 * `-ib` and `LLAMA_SERVER_PREFILL_DUTY` stay DEPRECATED and inert on this path (they are work-arounds for a
   shared step, and there is none) — a speculator does not change that.
+
+## 24. The two-arm server, v2 design (`wip/prefill-decode-arms-v2/`) — **wip: NOT shipped, NOT in any block**
+
+> **NOT PART OF THE DELIVERY.**  This section documents the **v2** two-arm server, which lives in
+> [`wip/prefill-decode-arms-v2/`](wip/prefill-decode-arms-v2/README.md) and is **absent from a default
+> `apply-all.sh` build**.  It is a *different design* from §23's withdrawn block 17 (there: a second context that
+> VIEWED and co-owned the first's cells and copied recurrent state between two memory modules; here: one
+> `llama_memory_i`, two `llama_context`s, the prefill arm OWNS the memory, the decode arm BORROWS it, and nothing
+> is copied).  The rows are written now because STEP 9 of that campaign owes them and they are what a promotion
+> would publish; **the numbers are today's measurements on the maintainer's box, and nothing here is a delivery
+> default.**  Promotion is a block decision and is not made.
+
+| variable | default | class | notes |
+|---|---|---|---|
+| `--prefill-decode-arms` / `--no-prefill-decode-arms`<br/>(env `LLAMA_ARG_PREFILL_DECODE_ARMS`) | **off** | **opt-in** | Run the server with the two arms: a **decode arm** (its own `llama_context`, its own thread) that **borrows** the prefill arm's `llama_memory` (`llama_context_params::ctx_memory`; `llama_get_memory(ctx_dec) == llama_get_memory(ctx_tgt)`), so a reply keeps generating while another slot's prompt is processed.  It REFUSES to start when `common_arms_pair_possible()` names a reason (`-np 1`, mmproj, embeddings/rerank, LoRA, backend sampling, `--sleep-idle`, `--context-shift`, and **any** speculator — the draft/verify round is STEP 10, and a gemma4 assistant / the layer-input drafters stay refused permanently). |
+| `--prefill-decode-arms-mode`<br/>(env `LLAMA_ARG_PREFILL_DECODE_ARMS_MODE`) | **`off`** | **opt-in** | `off` \| `on` \| `auto`.  `on` = refuse rather than silently run one arm; `auto` = create the pair when the shape can carry it and **fall back to the single-context server with the reason** otherwise; `off` = never create the second context.  The last of the three spellings wins. |
+| `LLAMA_RS_DEBUG_PLACEMENT` | unset | **diagnostic** | Presence-gated (any value, including `0`).  One line per `apply()` **per context** with the recurrent batch placement `(head, n, rs_z)` the graph will read.  This is the census that makes STEP 5's claim checkable at run time: with two contexts the lines must show **different** placements at the same instant, and a build that kept the placement on the module prints one value for both.  No effect on the default path. |
+
+**What it costs (measured 2026-11-23, `baseline/shape-matrix.sh`, 3 repeats per arm, one request in flight, VRAM
+of the whole server while loaded):**
+
+| shape | the pair's cost | answers |
+|---|---|---|
+| 4B Q8_0, 1 GPU, np 2 | **+78 MiB** VRAM (one device), +25 MiB RSS | identical |
+| phi-4 IQ4_XS, 1 GPU, np 2 | +53 MiB, +23 MiB RSS | identical |
+| 27B Q8_0, 3 GPU `-sm tensor`, np 2 | **+149 MiB per device** (447 MiB in total), +1.8 GiB RSS | identical |
+| 35B-A3B Q8_0, 1 GPU `-ncmoe 40`, np 4 | +60 MiB VRAM, +4.2 GiB RSS; the slab pins an **aux `narrow-3` region of 1280 MiB** from its unmapped VA spare and the server declares the 1280 MiB reserve (`COMMON_ARMS_RESERVE_MIB`) before the arena claims the space | identical |
+| Flash-Next GSQ IQ3_S (qwen4exp), 3 GPU `-sm tensor`, np 3 | +154 MiB per device, +1.8 GiB RSS | identical |
+| Gemma4 26B-A4B QAT (iswa), 1 GPU, np 2 | +140 MiB, +34 MiB RSS | identical |
+| Gemma4 26B-A4B + its shared MTP head (`-md`), `-ncmoe 20` | — (the pair is **refused**: a speculator is not admitted on the pair yet) | pair-OFF arm normal; refusal message names the reason |
+
+The cost is **one narrow compute layout per extra context** (it does not scale with the context size or the slot
+count: it is `n_parallel × (n_max + 1)` rows), plus — on a slab-armed host tier — that aux region, which is why
+the server declares the reserve up front and the slab logs the measured size and the reserve to set.
+
+**What it buys (4B Q8_0, 1 GPU; slot A decodes 64 tokens while slot B prefills a 5246-token prompt; 3 repeats per
+arm; `baseline/itl-arm.sh`):**
+
+| `-ub` | decoder ITL, pair OFF | pair ON | Δ | prefill, pair OFF | pair ON | Δ |
+|---|---|---|---|---|---|---|
+| 512 | 14.34 ms/token | 13.36 | **−6.8 %** | 4732 t/s | 5676 | **+20.0 %** |
+| 2048 | 20.38 | 15.74 | **−22.8 %** | 4909 | 6090 | **+24.1 %** |
+| 4096 | 20.83 | 15.85 | **−23.9 %** | 5092 | 6079 | **+19.4 %** |
+
+The win grows with the chunk width, because what the pair bounds is the decoder's wait for a WHOLE chunk; and
+the prefill is **faster, not slower** (the decoder's single row no longer joins the prefill's batch, so the
+prefill graph stays wide) — which is the opposite of the withdrawn design's −21…−24 % prefill cost.

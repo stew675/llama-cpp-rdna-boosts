@@ -425,6 +425,15 @@ Run, on the maintainer's box, one arm at a time:
   `--prefill-decode-arms-mode`, and nothing else unless a gate needs it); `INVARIANTS.md` entries for the facts
   (I1-I8 candidates, the measurement that set the reserve, the Meta slot identity).
 
+**Done 2026-11-23** with `baseline/shape-matrix.sh` (+ `server-arm.sh --vram-probe`), 3 repeats per arm:
+7/7 shapes text-identical (the seventh is the designed refusal for a drafter-bound shape), the cost is
++53..+154 MiB of VRAM (+149/154 per device on the tensor splits) plus one 1280 MiB slab aux region on a host
+tier, and the trade is ITL −22.8 % at `-ub 2048` / −23.9 % at `-ub 4096` with prefill **+24.1 % / +19.4 %**
+(the win grows with the chunk width; the prefill is faster because the decoder's row leaves the prefill's batch).
+`ENVIRONMENT.md` §24 carries the rows (marked wip / NOT shipped).  Two corrections came out of it: **STEP 7f** (a
+borrower's `cparams.type_k`/`type_v` were uninitialized -- Flash-Next + the pair aborted 2 of 3 runs) and
+`gate-arms-itl.sh` no longer makes a byte claim in the one configuration where a byte claim is a lottery.
+
 ---
 
 ## STEP 10 — re-admit the speculator on the pair
