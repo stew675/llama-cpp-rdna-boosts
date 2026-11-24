@@ -114,6 +114,47 @@ same chunk wait is a smaller fraction).  **The prefill is faster on every shape*
    ms/token), i.e. the pair's capture is worth ~18 ms/token of decoder latency on this shape.  Which one the pair
    should pin is a maintainer decision (`HANDOVER.md` §7.7) -- a crash is not an acceptable default either way.
 
+### 3c. The tensor-split blocker is FIXED (STEP 7h): the capture/hipBLASLt barrier, and the ITL with everything on
+
+`steps/STEP-7h-0016-capture-blas-barrier.patch` (`~/llama.cpp` `f4540afd0`).  Flash-Next GSQ IQ3_S, 3 devices
+`-sm tensor -mg 0`, np 2, `-c 8192`, `-ub 4096`, **delivery defaults** (hipBLASLt ON, graph capture ON), slot A
+decoding 64 tokens while slot B prefills 5246:
+
+| arm | runs | decoder ITL | prefill |
+|---|---|---|---|
+| pair OFF | 3 | 53.91 / 54.08 / 53.99 ms/token | 1788 / 1780 / 1784 t/s |
+| pair ON, barrier (GEMM side shared) | 3 | **22.78 / 23.63 / 23.51** | 2160 / 2156 / 2172 t/s |
+| pair ON, barrier (GEMM side exclusive) | 5 | 23.52 / 23.08 / 23.16 / **45.33** / 23.32 | 2159 / 2195 / 2154 / 2116 / 2173 t/s |
+
+**Δ ITL −56.9 % (53.99 -> 23.31), prefill +21.7 %** -- the best configuration measured on this shape, with
+neither feature disabled.  (The GEMM side may be shared: it reads the same numbers, so two arms' GEMMs overlap as
+before and only creation and capture are exclusive.  The single 45.3 ms run is a scheduling outlier -- the
+decoder lost its slot in that pass; the other four agree to 0.4 ms.)
+
+**What the abort actually was, and the three wrong answers it took to find it.**  The evidence chain, because the
+next reader will start where I did:
+
+* `gdb` on the failing run put the abort in the DECODE arm inside `ggml_cuda_graph_evaluate_and_capture` ->
+  `ggml_cuda_compute_forward` -> `ggml_cuda_op_swiglu` -> `unary_gated_cuda` -- a plain **kernel launch**, whose
+  sticky error had been set *elsewhere*.  The thread that dies is not the thread that failed.
+* Hypothesis 1 ("the other arm's GEMM collides with my capture") -> **killed**: making every library GEMM
+  exclusive against the capture did not move the failure rate (2 of 3 either way).
+* Hypothesis 2 ("hipBLASLt is being RECORDED into the capture") -> **killed**: an instrumented build logged
+  **zero** BLAS calls inside a capture on this shape.
+* Hypothesis 3, the answer: the library's **lazy handle creation** (`hipblasCreate` initialises hipBLASLt, which
+  synchronises the LEGACY stream) -- the first GEMM of every (context, stream, device), i.e. exactly the call a
+  freshly started decode arm makes while the prefill arm is recording.  Guarding creation took the shape from
+  **2 of 3 aborts to 7 of 7 clean** (5 exclusive-GEMM + 3 shared-GEMM runs above, minus the one overlap).
+
+The shape needs all three of {two arms overlapping, graph capture, hipBLASLt}: one request in flight never
+overlaps two computes (which is why every sequential gate passed), `GGML_CUDA_GRAPH_MAX_TOKENS=0` is clean, and
+`ROCBLAS_USE_HIPBLASLT=0` is clean.  `GGML_CUDA_CAPTURE_BLAS_BARRIER=0` restores the old behaviour (A/B and
+bisect; a pair arm then needs one of those two pins).
+
+**Inertness of the barrier:** Flash-Next text identity unchanged (`4dbb571b8bdb` / `f1c288a48245`, 2 repeats per
+arm, both arms), `gate-arms-default-inert.sh --shapes 4b-1gpu` PASS (startup shape still byte-identical to the
+recorded one, so the barrier adds no log line), `gate-arms-itl.sh -ub 2048` PASS.
+
 ### 4. A gate correction this section owes: `gate-arms-itl.sh`'s text check is not a byte claim
 
 The ITL gate is the ONE arm whose point is two requests in flight, and that is the configuration in which a byte

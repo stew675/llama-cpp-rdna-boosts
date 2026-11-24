@@ -7,11 +7,11 @@ not been run says so.
 | | |
 |---|---|
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`prefill-decode-arms-v2`**, HEAD = the **STEP 7e/8 landing** (the commit that carries this file; **`main` untouched** at `91a81505`) |
-| work tree | `~/llama.cpp`, branch **`arms-v2`** (**local only, never pushed**), tip **`ffbde9a41`** (STEP 7g), tree clean |
+| work tree | `~/llama.cpp`, branch **`arms-v2`** (**local only, never pushed**), tip **`f4540afd0`** (STEP 7h), tree clean |
 | build | `~/bin/build-llama-rocm` → `build-rocm` (ROCm **10.2.0**); fast loop `cmake --build build-rocm --target llama-cli llama-server -j 16` |
 | extra build dirs | **`build-ref`** = a build of the delivery tip `089f90067` (the "pre-change build": the reference for a regression question), **`build-bisect`** = the last bisect rung's build.  Both at the same source path, so ccache stays warm |
 | landings | STEP 0-6e, **7a**, **7d**, **7c**, **7e** (STEP 4 broke the external draft head on a tensor split), **8** (the gate set), **7f** (a borrowing context carried an uninitialized `cparams.type_k`), **9** (the shape/latency/memory matrix) — §1.2 |
-| **next action** | **STEP 10 — re-admit the speculator on the pair**, §3.  **Before it: §7.7 needs a decision** (a tensor-split pair still aborts with hipBLASLt + graph capture on) |
+| **next action** | **STEP 10 — re-admit the speculator on the pair**, §3 |
 | after that | STEP 11 delivery sweep, STEP 12 candidate patch + the promotion ask |
 
 ---
@@ -64,10 +64,11 @@ nothing is copied between them.**  `llama_context_params::ctx_memory` is the onl
 | STEP 8 | — (gates + anchors, no code) | `gate-arms-default-inert.sh` + `gate-arms-recurrent-shared.sh`, `baseline/inert-anchors.tsv`, `baseline/inert-shapes/`, `mtp-axis.sh` shape flags + `--no-lock` (§3) |
 | STEP 7f | `STEP-7f-0014-borrower-kv-types.patch` | **STEP 2's defect**: `cparams.type_k`/`type_v` (no default initializer) were assigned only in the own-memory branch, so a BORROWING context carried stack garbage that qwen4exp's QSA probe fed to `ggml_new_tensor_4d` -- Flash-Next + the pair aborted 2 of 3 runs (`GGML_ASSERT(type >= 0 ...)`).  A borrower now mirrors the OWNER's types |
 | STEP 7g | `STEP-7g-0015-meta-split-state-per-slot.patch` | the Meta backend's split-state cache is a per-**buffer** member (`split_state_cache[8]` + one version pointer) on a buffer every context shares, so two arms computing at once raced it -- SEGV in `ggml_backend_meta_get_split_state`, 2 of 3 runs on a tensor-split pair arm.  Now indexed by the same `thread_local` view slot as the containers |
+| STEP 7h | `STEP-7h-0016-capture-blas-barrier.patch` | **the tensor-split blocker, fixed as the maintainer chose (a barrier, neither feature disabled)**: a graph capture holds one process-wide mutex exclusively, library GEMMs hold it shared, and `cublas_handle()`/`cublaslt_handle()` **creation** holds it exclusively — creation (`hipblasCreate` -> hipBLASLt -> legacy-stream sync) is what actually tripped, not the GEMM (`INVARIANTS.md` r374-wip).  Flash-Next tensor-split pair: **23.31 ms/token vs 53.99** (−56.9 %), 7 of 7 clean |
 | STEP 9 | — (`baseline/shape-matrix.sh` + `server-arm.sh --vram-probe`) | the shape/latency/memory matrix: 7/7 shapes text-identical (3 repeats per arm), the cost table (+53..+154 MiB, 1280 MiB aux region on a host tier), the ITL/prefill trade (ITL −22.8 % at `-ub 2048`, prefill **+24 %**), and two corrections (the ITL gate's text check, one-run-vs-rate) |
 
-Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077`, 7e `3013e880a`, 7f `f61fcb03f`, 7g `ffbde9a41`
-(branch `arms-v2`, local only).
+Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077`, 7e `3013e880a`, 7f `f61fcb03f`, 7g `ffbde9a41`,
+7h `f4540afd0` (branch `arms-v2`, local only).
 
 ### 1.3 Green, with the number that proves it (all re-measured after 7c)
 
@@ -425,15 +426,11 @@ Every number of record is in `RUNS.md` (newest first) with its command and shape
    also gain a `-sm tensor` arm — its documented-but-unrun one, `INVARIANTS.md` r368-wip item 2 — is delivery
    gate work, not a decision this campaign takes.
 
-7. **NEW, blocking (2026-11-23): what should a TENSOR-SPLIT pair pin?**  With the delivery default (hipBLASLt
-   on, graph capture on) a pair arm on a `-sm tensor` split **aborts** -- `Hip error: 'operation would make the
-   legacy stream depend on a capturing blocking stream' (906)` from `hipblaslt.cpp` inside
-   `ggml_cuda_graph_evaluate_and_capture` on the decode arm, 2 of 3 runs (Flash-Next 3 devices; `INVARIANTS.md`
-   r372-wip item 2).  Either pin removes it and they cost very differently: capture off
-   (`GGML_CUDA_GRAPH_MAX_TOKENS=0`) reads **22.89 ms/token** (ITL −57.5 %) against hipBLASLt off
-   (`ROCBLAS_USE_HIPBLASLT=0`) **41.20** (ITL −13.8 %) -- i.e. the pair's own capture is worth ~18 ms/token of
-   decoder latency on that shape.  Options: (a) the pair pins capture off by default (a decode-throughput cost on
-   `-sm tensor`, measured above); (b) it pins hipBLASLt off (a bigger cost); (c) implement the barrier so a
-   capture can run while the other arm issues no library calls -- the §7.3 answer, one step of its own.  A crash
-   is not an acceptable default, and the campaign must not silently keep two arms out of each other's way by
-   disabling a feature the rest of the delivery relies on.  **Ask before STEP 10 or STEP 12 depends on it.**
+7. **ANSWERED by the maintainer (2026-11-23): option 3 — build the barrier, keep both features on, do not take a
+   slower decode.**  Implemented as **STEP 7h**: a capture/hipBLASLt barrier in ggml-cuda (capture exclusive,
+   library GEMMs shared, `cublas_handle()`/`cublaslt_handle()` **creation** exclusive — creation is what actually
+   tripped: `hipblasCreate` initialises hipBLASLt, which synchronises the legacy stream).  Flash-Next 3 devices
+   `-sm tensor`, `-ub 4096`, all defaults: **53.99 -> 23.31 ms/token (−56.9 %)**, prefill +21.7 %, **7 of 7 runs
+   clean** (was 2 of 3 aborts).  Text identity unchanged, the default-path startup shape unchanged, and
+   `GGML_CUDA_CAPTURE_BLAS_BARRIER=0` is the kill switch.  `INVARIANTS.md` r374-wip records the three hypotheses
+   that measurement killed on the way there.

@@ -1870,8 +1870,15 @@ prefill graph stays wide) — which is the opposite of the withdrawn design's �
 | ... the same with `ROCBLAS_USE_HIPBLASLT=0` (capture on) | 47.82 | 41.20 | −13.8 % | +18.3 % |
 | 27B Q8_0, 3 dev `-sm tensor`, `-ub 2048`, `ROCBLAS_USE_HIPBLASLT=0` | 64.45 | 60.30 | −6.4 % | +35.6 % |
 
-**A tensor-split pair arm must pin ONE of `GGML_CUDA_GRAPH_MAX_TOKENS=0` or `ROCBLAS_USE_HIPBLASLT=0`** until the
-capture/library barrier exists: with neither, hipBLASLt inside the decode arm's graph capture aborts the server
-(`Hip error: 'operation would make the legacy stream depend on a capturing blocking stream' (906)`, 2 of 3 runs
-on Flash-Next — `INVARIANTS.md` r372-wip item 2).  Capture-off is also the faster escape by ~1.8× here, because
-it is the pair's own capture that costs the decoder latency.  Which one a promotion pins is an open decision.
+**No pin is needed any more (STEP 7h).**  The abort that used to make a tensor-split pair arm die
+(`Hip error: 'operation would make the legacy stream depend on a capturing blocking stream' (906)`) is removed by
+a **capture/hipBLASLt barrier** inside ggml-cuda: a graph capture holds one process-wide `shared_mutex`
+exclusively, every library GEMM holds it shared (two arms still overlap), and `cublas_handle()` /
+`cublaslt_handle()` **creation** — the call that actually tripped it, because `hipblasCreate` initialises
+hipBLASLt which synchronises the legacy stream — holds it exclusively.  With everything at its default
+(hipBLASLt on, capture on) the Flash-Next tensor-split pair reads **23.31 ms/token against 53.99** (−56.9 %,
+prefill +21.7 %), 7 of 7 runs clean.
+
+| variable | default | class | notes |
+|---|---|---|---|
+| `GGML_CUDA_CAPTURE_BLAS_BARRIER` | **`1` (on)** | **kill switch** | The capture/library barrier above.  `0` restores the pre-barrier behaviour: a pair arm on a `-sm tensor` split then needs `GGML_CUDA_GRAPH_MAX_TOKENS=0` or `ROCBLAS_USE_HIPBLASLT=0`, or it aborts 2 of 3 runs (`INVARIANTS.md` r374-wip).  Inert with one context — the barrier is a `shared_mutex` pair around a capture and a library call, and a single context never has the two in flight at once. |

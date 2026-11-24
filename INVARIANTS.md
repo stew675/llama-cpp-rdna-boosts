@@ -2915,3 +2915,26 @@ Flash-Next 3 devices `-sm tensor` `-ub 4096` 53.83 -> 22.89 (**−57.5 %**, pref
 where a chunk is long against a short decode, and it shrinks to ~6 % on a shape whose decode is already 64 ms
 per token.  The PREFILL is faster on every shape (+18…+36 %): the decoder's row no longer joins the prefill's
 batch.  A shape matrix that quotes one number for "the pair's speedup" is therefore wrong by construction.
+
+## r374-wip (2026-11-23, `WORKLOG.md` 261123.025) — the library call that cannot run during a capture is its LAZY HANDLE CREATION, and the thread that aborts is not the thread that failed (`prefill-decode-arms` v2 STEP 7h)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 7h.
+
+1. **A HIP library that touches the LEGACY (blocking) stream cannot be used while another thread records a graph
+   -- and on this ROCm line the call that trips is `hipblasCreate`, not the GEMM.**  Creation initialises
+   hipBLASLt, which synchronises the legacy stream, and it happens lazily on the FIRST GEMM of every
+   (context, stream, device) -- i.e. exactly what a freshly started decode arm issues while the prefill arm
+   records.  Guarding the GEMM dispatch alone left the abort at 2 of 3 runs; guarding creation took it to 7 of 7
+   clean, and no GEMM is ever recorded INTO a capture on that shape (an instrumented run logged zero).  **Rule:**
+   when a library is not capture-safe, guard its *initialisation* as well as its dispatch -- a lazy-create inside
+   a hot call is the easiest one to miss, and it is the one a fresh second context makes first.
+2. **The aborting thread is not the failing thread.**  The sticky HIP error surfaced on the capturing thread's
+   next kernel launch (`ggml_cuda_op_swiglu` -> `unary_gated_cuda`), while the library error was set by the other
+   arm.  Three hypotheses were tested and killed by measurement before the right one: exclusive GEMMs did not
+   move the failure rate; an instrumented build showed zero BLAS calls inside any capture; and the stack alone
+   pointed at a `swiglu` launch.  A crash whose stack names a kernel launch is evidence about the *sticky* error,
+   not about the failing call -- instrument the boundary (who creates what, when) rather than reading the stack.
+3. **The trigger is a conjunction, so every single-variable probe comes back "clean":** it needs two arms that
+   overlap, a graph capture, AND hipBLASLt.  With one request in flight (every gate), or capture off, or
+   `ROCBLAS_USE_HIPBLASLT=0`, the shape passes -- which is why five gates and a 7-shape matrix were green on the
+   same binary.  A concurrency defect on a two-context design needs an arm with two computes in flight.

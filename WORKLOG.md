@@ -1,3 +1,51 @@
+## 261123.025 (no release; `prefill-decode-arms` v2 STEP 7h) -- the tensor-split pair no longer aborts: the capture barrier, and the library call it had to guard (handle creation, not the GEMM)
+
+The maintainer chose the barrier over pinning either feature off, so both stay on: **hipBLASLt ON, graph capture
+ON**, and a pair arm on a `-sm tensor` split now runs 7 of 7 (was 2 of 3 aborts).
+
+### The answer is `hipblasCreate`, not the GEMM
+
+The abort was `Hip error: 'operation would make the legacy stream depend on a capturing blocking stream'(906)`
+from hipBLASLt, followed by `operation failed due to a previous error during capture`.  Three hypotheses died
+before the right one, each killed by a measurement rather than by argument:
+
+| hypothesis | the measurement that killed it |
+|---|---|
+| "the other arm's GEMM collides with my capture" | making every library GEMM exclusive against the capture changed nothing (2 of 3 aborts either way) |
+| "hipBLASLt is being RECORDED into the capture" | an instrumented build logged **zero** BLAS calls inside a capture on that shape |
+| "the stack names the culprit" | the aborting thread is inside the capture on a plain `swiglu` KERNEL LAUNCH: it is only reporting a *sticky* error set by the other arm |
+
+What it is: the library's **lazy handle creation**.  `hipblasCreate` initialises hipBLASLt, which synchronises
+the legacy stream -- illegal while another thread records a graph -- and every (context, stream, device) creates
+its handle on its FIRST GEMM, which is precisely what a freshly started decode arm does while the prefill arm is
+capturing.  Guarding creation took the shape from 2 of 3 aborts to 7 of 7 clean.
+
+### The barrier
+
+One process-wide `shared_mutex` in `ggml-cuda`: a graph CAPTURE holds it exclusively; every library GEMM holds it
+shared (two arms' GEMMs still overlap -- measured identical speed); `cublas_handle()`/`cublaslt_handle()`
+CREATION holds it exclusively; the recording thread skips the GEMM side (its calls are captured, not executed).
+`GGML_CUDA_CAPTURE_BLAS_BARRIER=0` restores the old behaviour for A/B and bisect.
+
+### The number, with everything on
+
+Flash-Next IQ3_S, 3 devices `-sm tensor`, np 2, `-ub 4096`: single-context **53.99 ms/token** (3 runs) against
+the pair's **23.31** (7 runs, one 45.3 scheduling outlier) -- **ITL −56.9 %, prefill +21.7 %** (1784 → 2168 t/s).
+That is the best configuration measured on this shape, with neither hipBLASLt nor the capture given up.
+
+### Inertness
+
+Flash-Next text identity unchanged (`4dbb571b8bdb` / `f1c288a48245`, 2 repeats per arm, both arms);
+`gate-arms-default-inert.sh --shapes 4b-1gpu` PASS with the startup shape still byte-identical (the barrier adds
+no log line); `gate-arms-itl.sh -ub 2048` PASS.
+
+### Records
+
+`RUNS.md` §3c (the runs, the three killed hypotheses), `INVARIANTS.md` r374-wip, `ENVIRONMENT.md` §24 (the pin
+paragraph is replaced by the barrier + its kill switch), `HANDOVER.md` §7.7 answered, `PLAN.md`.
+
+---
+
 ## 261123.024 (no release; `prefill-decode-arms` v2 STEP 9, continued) -- the ITL answer on a TENSOR SPLIT (Flash-Next **−57 %**), and the two defects that stood in front of it: a per-buffer cache two arms raced on, and hipBLASLt inside a capture
 
 STEP 9's first pass measured the ITL trade on ONE shape (4B, 1 GPU) and text/VRAM on seven.  The maintainer asked
