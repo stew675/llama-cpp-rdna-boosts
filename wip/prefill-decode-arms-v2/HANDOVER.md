@@ -29,8 +29,9 @@ candidate patch + the ask (STEP 12).**  Read `§0.0 START HERE` first; it is the
   and a clean fault scan.  `check-gen-docs` FAILs on the campaign tree by design (the candidate owes the
   regeneration) and is green on the applied candidate tree.
 * **Two findings, both environmental** — the two segfaults were **stale tool binaries** (build the whole `all` profile
-  BEFORE the ladder, not after), and `gate-kv-residency.sh`'s default `MODEL_POOL` is a retired model path (`TODO`
-  #369, now four gates).  `INVARIANTS.md` r380-wip.
+  BEFORE the ladder, not after), and `gate-kv-residency.sh`'s default `MODEL_POOL` (+ its `-Q8_0` sidecar) was
+  **missing from the box**, not stale gate debt: the gate PASSed on `GSQ-RCO-IQ3_S` and then on its own defaults once
+  the model tree was restored, and `TODO` #369 stays at three gates.  `INVARIANTS.md` r380-wip.
 * **STEP 12 — the candidate**: `beta/prefill-decode-arms/` replaced whole (three files), ONE `format-patch` commit,
   sha256 `a4e207c9…c4687585e`, 42 files, +2854/−715, cut against the **release tree** `27db9bfd4` and applying to tree
   **`84ffb1ef1c`** — verified by a fresh clone + strict `git am` and by `apply-all.sh --include-beta`.  The 19 `steps/`

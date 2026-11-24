@@ -14,7 +14,7 @@ Run order and verdicts (one GPU job at a time, under `flock ~/.cache/rdna-boosts
 | 5 | `gate-prefill-logits.sh` | PASS — KLD **0.000000**, same-top-p **100.000 %** |
 | 6 | `gate-state-pipe.sh` | PASS — pipe 0.48x sync |
 | 7 | `gate-park-idle-slots.sh` | PASS — A-D byte-identical, 6 parks / 2 unparks traced |
-| 8 | `gate-kv-residency.sh` | PASS — window + pool + 2-device pool section (89.10 % hit rate); run with `MODEL_POOL=.../GSQ-RCO-IQ3_S/...` (see the finding) |
+| 8 | `gate-kv-residency.sh` | PASS — window + pool + 2-device pool section; first run with `MODEL_POOL=.../GSQ-RCO-IQ3_S/...` (89.10 % hit rate, the model tree was missing), then **on its own defaults** once the tree was restored (`GSQ-IQ3_XXS` + its `-Q8_0` sidecar, PASS, 89.07 %) |
 | 9 | `gate-host-pool.sh` | PASS **59/59**, every arm `83d058e8af9c` |
 | 10 | `gate-mtp-dev-rows.sh` | PASS — `bbb051e2aeab` both arms, 87/119, `h_nextn` buffer only in the device arm |
 | 11 | `gate-spec-purity.sh` | PASS — plain == draft-mtp on q8_0 + bf16 x 4 axes; width probe maxdiff 0 |
@@ -33,9 +33,10 @@ journal clean.
    `llama-gen-docs` were dated `11-23 15:17` beside a `libllama` from `11-24 08:13` (the campaign only rebuilt
    `llama-cli`/`llama-server`).  `~/bin/build-llama-rocm` fixed both; the `all` build now precedes the ladder.
 2. **`gate-kv-residency.sh`'s default `MODEL_POOL`** (`.../GSQ-IQ3_XXS/...`) and its derived `-Q8_0` sidecar were
-   absent on this box, while `gate-draft-ctx.sh` already defaults to `GSQ-RCO-IQ3_S`.  Run with
-   `MODEL_POOL=.../GSQ-RCO-IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf` (its Q8_0 sidecar is
-   present); the arms are self-referential so the verdict stands.  Recorded as `TODO` #369 (the fourth such gate).
+   absent from this box at the sweep's start, while `gate-draft-ctx.sh` already defaults to `GSQ-RCO-IQ3_S`.  Run
+   first with `MODEL_POOL=.../GSQ-RCO-IQ3_S/...` (PASS), then **on its own defaults** after the maintainer restored
+   the tree (`GSQ-IQ3_XXS` + `-Q8_0` sidecar; PASS, 89.07 %) -- an **environment gap, not gate debt**: its arms are
+   self-referential, so nothing needs repointing and `TODO` #369 stays at three gates.
 
 ### STEP 12: the candidate — `beta/prefill-decode-arms/` replaced, one patch, round-tripped
 

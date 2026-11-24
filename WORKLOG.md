@@ -25,10 +25,12 @@ or a release gate, and no block exists yet.
    dated 8 hours before the `libllama` they link (the campaign only ever rebuilt `llama-cli`/`llama-server`), and
    the first segfault read exactly like a defect in the change under test.  `~/bin/build-llama-rocm` (the whole
    `all` profile) fixes it -- so the sweep must run the whole-set build BEFORE the gates, not after;  (b)
-   `gate-kv-residency.sh`'s default `MODEL_POOL` names `Flash-Next/GSQ-IQ3_XXS/...`, which was absent on this box
-   (and so is its `-mtp-...-Q8_0` sidecar), while `gate-draft-ctx.sh` already defaults to `GSQ-RCO-IQ3_S`; the gate
-   was run on `GSQ-RCO-IQ3_S` + its Q8_0 sidecar and PASSed (its arms are self-referential, so the verdict stands).
-   The default path is a `TODO.md` nit, not a code defect.
+   `gate-kv-residency.sh`'s default `MODEL_POOL` names `Flash-Next/GSQ-IQ3_XXS/...`, which was absent on this box at
+   the time (and so was the `-mtp-...-Q8_0` sidecar its `DRAFT_POOL` derives), while `gate-draft-ctx.sh` already
+   defaults to `GSQ-RCO-IQ3_S`; the gate was first run on `GSQ-RCO-IQ3_S` + its Q8_0 sidecar and PASSed, and then --
+   the maintainer restored the model tree the same session -- **on its own defaults, PASS again** (89.07 % pool hit
+   rate).  So this is an **environment gap, not delivery gate debt**: nothing to repoint, no anchors to re-record,
+   and `TODO` #369 stays at three gates (a note there records why this one is not a fourth).
 4. **STEP 12, the candidate: `beta/prefill-decode-arms/` REPLACED in its entirety** (the maintainer's decision of
    2026-11-24) -- the old artifact's design text, README and patch are gone, the directory holds exactly the three
    files the beta contract expects.  ONE patch, `prefill-decode-arms.patch`, sha256

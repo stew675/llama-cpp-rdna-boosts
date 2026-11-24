@@ -52,7 +52,7 @@ plan (`README.md`, `DESIGN.md`, `PLAN.md`).  It is a clean-slate redesign rather
 **not** live in this file: a forward-looking row here would duplicate a plan that is already five times more
 specific, and the retracted rows described a design (a second context that *views* and *co-owns* the first's
 cells, with the recurrent state copied between two memory modules) that the redesign deletes.  The numbers are
-**void and never reused**; `#369` stays because its subject is **delivery gate debt** (four gate defaults
+**void and never reused**; `#369` stays because its subject is **delivery gate debt** (three gate defaults
 affected by a retired model tree), not the feature, and it no longer cites a campaign.  The old follow-up
 campaign is archived at `archive/work/prefill-decode-arms-followups/` (`WORKLOG.md` 261123.005).
 
@@ -89,7 +89,7 @@ delivery's host-expert tier, so it stays.
 | **273** | three prefill transports where one should do | architecture (delivery) | **OPEN** — the host-set SIZE is the primary lever, residency secondary; ONE transport for a partly resident table — §273 |
 | **361** | the r334 RDNA2 items (PR #338) are validated on the contributor's V620, not on the released tree: blocks 05/08/10 now carry an RDNA2-only FA tile-cap removal, a one-warp narrow `RMS_NORM`, a `H * n_seqs` GDN chunked gate and a rows-abreast MoE K walk, and no RDNA2 device is in the maintainer's fleet | validation / external (delivery) | **WAITING on `@jstamagal`** -- re-run on the r334 tree: full `test-backend-ops` on `gfx1030` at default flags (**especially `FLASH_ATTN_EXT` with the caps gone: the failure mode is `GGML_ASSERT(max_blocks_per_sm > 0)` in `launch_fattn`, not a rate**), `MUL_MAT_ID` with `GGML_CUDA_MOE_ROWS_ABREAST` on and off, `RMS_NORM*` in the default/`NARROW=0`/`VEC=1` arms, a model-level decode+prefill (a GDN model for the chunked gate, a MoE for the K walk) and an MTP-acceptance run; **it should also confirm that PR #339's BF16 `RMS_NORM + MUL (+ ADD)` abort is gone there** (fixed at r328 by the re-base, `archive/work/can-fuse-bf16-rms-norm-r324/` -- `RMS_NORM_MUL_ADD` now includes `type=bf16,type_w=f32` and `type=bf16,type_w=f32,type_add=bf16` arms); §361 |
 | **363** | `-of`/`--optional-features` exists with ONE tag (`tp-ffn-even`); the delivery's other env-only opt-in features are still environment-only, so a user who reads `--help` still cannot find them | tooling / docs (delivery) | **OPEN** -- migrate them one at a time: add the row to `common_optional_features()` with its switch, confirm the tag produces exactly what the env var produces (the arm `gate-ffn-even-split.sh` C-section runs), and delete the row if the feature gets a first-class option; candidates are the opt-in switches `ENVIRONMENT.md` already marks as such (§4 `LLAMA_KV_N_PAD_MIN`, §7.6 `--wmma-verify`-adjacent switches are options already, §1.2's arena knobs, block 14's `LLAMA_KV_SPILL_RAM_PCT`); §363 |
-| **369** | three gates still name the RETIRED Flash-Next `GSQ-IQ3_XXS` tree (`gate-hc-base-copy`, `gate-hc-fusions`, `gate-host-expert-text`) and were deliberately NOT repointed at r346, because each carries recorded text/KLD anchors for that class; a **fourth**, `gate-kv-residency` (+ its derived `-Q8_0` MTP sidecar), has self-referential arms and only needs the path | tooling (delivery) | **OPEN** -- repoint each AND re-record its anchors on the new class (the STEW675 IQ4_NL tree) in the same change, then run each once; `gate-kv-residency` can move to `GSQ-RCO-IQ3_S` with its sidecar. §369 |
+| **369** | three gates still name the RETIRED Flash-Next `GSQ-IQ3_XXS` tree (`gate-hc-base-copy`, `gate-hc-fusions`, `gate-host-expert-text`) and were deliberately NOT repointed at r346, because each carries recorded text/KLD anchors for that class | tooling (delivery) | **OPEN** -- repoint each AND re-record its anchors on the new class (the STEW675 IQ4_NL tree) in the same change, then run each once. §369 |
 
 
 ## Handle numbering
@@ -248,7 +248,7 @@ spill/window budgets (`LLAMA_KV_SPILL_RAM_PCT`, §1.2's `MOE_EXPERT_CACHE_MIB`-a
 opt-in -- check the row's class before migrating), and the `GGML_CUDA_*` opt-ins §7 lists as "opt-in, default
 OFF".  A tag is only for a feature that is **off by default**; a kill-switch is not a tag.
 
-## 369. Four gate defaults still name the RETIRED Flash-Next IQ3_XXS tree
+## 369. Three more gate defaults still name the RETIRED Flash-Next IQ3_XXS tree
 
 **Record:** the repointing work is recorded in `WORKLOG.md` 261122.027 (the r346 change that repointed the first
 three gates); this row is the residue of it.
@@ -263,21 +263,16 @@ a new model is a new class, so a path edit alone would leave a gate that passes 
 * `gate-hc-fusions.sh` (`MODEL_ROOT/GSQ-IQ3_XXS/...`, and its header records the measured hashes for that class),
 * `gate-host-expert-text.sh` (its header sizes the run at 75.8 GB / ~71 GiB peak RSS).
 
-A **fourth** was found by the v2 campaign's delivery sweep (2026-11-24, `WORKLOG.md` 261124.003,
-`INVARIANTS.md` r380-wip item 5) and is the cheap one, because its arms are **self-referential** (they compare
-their own arms against each other, not against recorded anchors):
+The work is one change: repoint each to the STEW675 IQ4_NL tree, re-record its anchors **on that class** (the
+`--kld`/record paths already exist), and correct the headers' numbers.  Until then those three refuse at the
+model check rather than run on a wrong anchor — which is the correct failure, not a defect.
 
-* `gate-kv-residency.sh` — `MODEL_POOL` names `.../GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf`
-  **and** `DRAFT_POOL` derives its `mtp-...-shared-Q8_0.gguf` sidecar from the same directory.  Both were absent at
-  the r353 sweep; the gate was run with `MODEL_POOL=.../GSQ-RCO-IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf`
-  (+ that directory's `-Q8_0` sidecar) and PASSed.  Note the restored `GSQ-IQ3_XXS/` tree carries `-Q4_K_M`, not
-  `-Q8_0`, so the sidecar default needs fixing with the model path.  Until then this gate needs `MODEL_POOL=` on
-  this box, and its failure mode is a `no model at ...` usage error that reads like a defect.
-
-The work is one change: repoint each to the STEW675 IQ4_NL tree (or `GSQ-RCO-IQ3_S` for the self-referential
-gate), re-record its anchors **on that class** (the `--kld`/record paths already exist), and correct the headers'
-numbers.  Until then those three refuse at the model check rather than run on a wrong anchor — which is the
-correct failure, not a defect.
+**Not a row, and closed on the spot (2026-11-24):** the v2 campaign's sweep hit one more gate whose default model
+was missing from the box, `gate-kv-residency.sh` (`MODEL_POOL` + the `-Q8_0` MTP sidecar its `DRAFT_POOL` derives).
+That was an **environment gap, not gate debt** — those names are this gate's own documented shape, its arms are
+self-referential (no recorded anchors to re-record), and once the model tree was back the gate passed on its
+defaults unchanged.  Recorded in `WORKLOG.md` 261124.003 / `INVARIANTS.md` r380-wip so the next session does not
+re-report it.
 
 
 ## Accepted limitations (deliberately not fixed — do not re-report)

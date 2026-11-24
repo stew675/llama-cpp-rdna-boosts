@@ -3072,8 +3072,13 @@ it removed an abort (r374-wip) -- so the per-shape rule above stands, now on the
    deterministic-commit-ids contract), the 19 `steps/` replayed in chronological order reproduce the campaign tree
    `14dfb1f64` exactly, and one `git am` of the candidate on the release tree reproduces `84ffb1ef1c` exactly.  A
    tree that matched by *hand-fixing* the patch would not say that.
-5. **`gate-kv-residency.sh`'s default `MODEL_POOL` is stale** (`.../Flash-Next/GSQ-IQ3_XXS/...`, and its
-   `-mtp-...-Q8_0` sidecar) while `gate-draft-ctx.sh` defaults to `GSQ-RCO-IQ3_S`: the gate must be run with
-   `MODEL_POOL=` on this box.  A gate whose default model is absent fails as a usage error, which reads like a
-   defect; the arms are self-referential, so a same-family substitute does not weaken the verdict -- but the default
-   path is owed a `TODO.md` row.
+5. **A gate whose default model is ABSENT fails as a `no model at ...` usage error, and that reads exactly like a
+   defect.**  `gate-kv-residency.sh`'s `MODEL_POOL` (`.../Flash-Next/GSQ-IQ3_XXS/...`) and the `-Q8_0` MTP sidecar
+   its `DRAFT_POOL` derives from the same directory were both missing from this box at the sweep's start, while
+   `gate-draft-ctx.sh` already defaulted to `GSQ-RCO-IQ3_S` -- so the sweep first ran the gate on `GSQ-RCO-IQ3_S`
+   (PASS), then, with the model tree restored, on **its own defaults** (PASS, 89.07 % pool hit rate).  **This is an
+   environment gap and NOT delivery gate debt** -- the name is the gate's own documented shape and its arms are
+   self-referential, so there are no recorded anchors to re-record and nothing to repoint (`TODO` #369 covers the
+   three gates whose anchors DO bind them to a model class, and it is not one of them).  The rule for the next
+   sweep: check that every gate's default model exists BEFORE running the ladder, and read the failure as `check
+   the box` first, `check the diff` second.
