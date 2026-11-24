@@ -1,3 +1,55 @@
+## 261123.024 (no release; `prefill-decode-arms` v2 STEP 9, continued) -- the ITL answer on a TENSOR SPLIT (Flash-Next **−57 %**), and the two defects that stood in front of it: a per-buffer cache two arms raced on, and hipBLASLt inside a capture
+
+STEP 9's first pass measured the ITL trade on ONE shape (4B, 1 GPU) and text/VRAM on seven.  The maintainer asked
+the obvious next question -- what does a decoder's cadence look like on the shape where the feature matters, a
+large model on a 3-device tensor split -- and answering it found two defects.
+
+### 1. The answer (np 2, `-c 8192`, A decodes 64 tokens while B prefills 5246; 2-3 repeats per arm)
+
+| shape | OFF | pair ON | Δ ITL | prefill |
+|---|---|---|---|---|
+| 4B Q8_0, 1 GPU, `-ub 2048` | 20.38 ms/tok | 15.74 | −22.8 % | +24.1 % |
+| Flash-Next IQ3_S, 3 dev `-sm tensor`, `-ub 4096`, capture off | 53.83 | **22.89** | **−57.5 %** | +21.8 % |
+| 27B Q8_0, 3 dev `-sm tensor`, `-ub 2048`, `ROCBLAS_USE_HIPBLASLT=0` | 64.45 | 60.30 | −6.4 % | +35.6 % |
+
+The mechanism is the chunk wait the pair removes, so the relative win is largest where a prefill chunk is long
+against the shape's own decode cost (Flash-Next: a ~2 s chunk, a ~23 ms decode) and small where the decode is
+already 64 ms/token (27B).  The prefill is faster on all three.
+
+### 2. STEP 7g: the Meta backend's split-state cache was per BUFFER, not per view slot
+
+The Flash-Next pair arm crashed (SEGV) in `ggml_backend_meta_get_split_state` on the decode arm's thread, 2 of 3
+runs, while the prefill arm was computing.  STEP 4 partitioned the view *containers* per slot and assumed the
+split-state cache went with them; it is a per-buffer member with ONE version pointer, so one thread's miss
+recycled a version the other held an iterator into.  Fixed by indexing the cache set and its version bookkeeping
+by the same `thread_local` view slot (`ffbde9a41`, `steps/STEP-7g-0015-meta-split-state-per-slot.patch`).  It is
+invisible with one request in flight -- every sequential gate passed on the same binary -- and invisible on one
+device, where no Meta backend is armed.
+
+### 3. The still-open blocker: hipBLASLt inside a graph capture with a second context
+
+After 7g the delivery default still aborts on that shape:
+`Hip error: 'operation would make the legacy stream depend on a capturing blocking stream' (906)` from
+`hipblaslt.cpp`, inside `ggml_cuda_graph_evaluate_and_capture` on the decode arm.  This is STEP 7d's family (a
+library/process-wide hazard versus a second arm's capture), and the escapes cost very differently:
+
+| pin | pair ITL (ub 4096) | verdict |
+|---|---|---|
+| none (hipBLASLt on, capture on) | — | **aborts 2 of 3** |
+| `GGML_CUDA_GRAPH_MAX_TOKENS=0` (capture off) | **22.89 ms/token** (3 of 3 + 2 of 2 clean) | best number, and it is the pair's own capture that costs the 18 ms |
+| `ROCBLAS_USE_HIPBLASLT=0` (Lt off) | 41.20 (2-3 of 3 clean) | works, but ~1.8x worse than capture-off |
+
+**This needs the maintainer's decision** (`HANDOVER.md` §7.7): pin capture off for the pair, pin hipBLASLt off for
+it, or implement the barrier that lets a capture run while the other arm issues no library calls (the general
+answer, and the same one §7.3 asks for on the drop path).
+
+### 4. Records
+
+`RUNS.md` §3b (both tables + the failure text), `INVARIANTS.md` r372/r373-wip, `ENVIRONMENT.md` §24 (the ITL
+table now has the tensor-split rows and the pin), `HANDOVER.md` (landing +7g, §7.7), `PLAN.md`.
+
+---
+
 ## 261123.023 (no release; `prefill-decode-arms` v2 STEP 9) -- the shape/latency/memory matrix is green on 7 shapes, and it found one real defect (a BORROWING context carried an uninitialized `cparams.type_k`) plus one gate whose text check was a lottery
 
 STEP 9 answers the three questions a promotion decision needs: does the pair change any answer, what does it

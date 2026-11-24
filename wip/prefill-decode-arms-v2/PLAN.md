@@ -434,6 +434,14 @@ tier, and the trade is ITL −22.8 % at `-ub 2048` / −23.9 % at `-ub 4096` wit
 borrower's `cparams.type_k`/`type_v` were uninitialized -- Flash-Next + the pair aborted 2 of 3 runs) and
 `gate-arms-itl.sh` no longer makes a byte claim in the one configuration where a byte claim is a lottery.
 
+**The tensor-split rows (added after the maintainer asked for them):** Flash-Next 3 devices `-sm tensor`,
+`-ub 4096`, **53.83 -> 22.89 ms/token (ITL −57.5 %)** with the pair's graph capture off, prefill +21.8 %; 27B 3
+devices `-sm tensor`, `-ub 2048`, 64.45 -> 60.30 (−6.4 %, prefill +35.6 %).  Measuring them found **STEP 7g** (the
+Meta split-state cache was per buffer, not per view slot -- two arms raced it) and left **one blocking decision**
+(`HANDOVER.md` §7.7): with hipBLASLt AND capture on, a tensor-split pair arm aborts
+(`'operation would make the legacy stream depend on a capturing blocking stream'`), so the pair must pin one of
+capture-off (fast) or hipBLASLt-off (1.8x slower) until a capture barrier exists.
+
 ---
 
 ## STEP 10 — re-admit the speculator on the pair

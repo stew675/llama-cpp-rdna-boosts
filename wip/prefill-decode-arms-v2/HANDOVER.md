@@ -7,11 +7,11 @@ not been run says so.
 | | |
 |---|---|
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`prefill-decode-arms-v2`**, HEAD = the **STEP 7e/8 landing** (the commit that carries this file; **`main` untouched** at `91a81505`) |
-| work tree | `~/llama.cpp`, branch **`arms-v2`** (**local only, never pushed**), tip **`f61fcb03f`** (STEP 7f), tree clean |
+| work tree | `~/llama.cpp`, branch **`arms-v2`** (**local only, never pushed**), tip **`ffbde9a41`** (STEP 7g), tree clean |
 | build | `~/bin/build-llama-rocm` → `build-rocm` (ROCm **10.2.0**); fast loop `cmake --build build-rocm --target llama-cli llama-server -j 16` |
 | extra build dirs | **`build-ref`** = a build of the delivery tip `089f90067` (the "pre-change build": the reference for a regression question), **`build-bisect`** = the last bisect rung's build.  Both at the same source path, so ccache stays warm |
 | landings | STEP 0-6e, **7a**, **7d**, **7c**, **7e** (STEP 4 broke the external draft head on a tensor split), **8** (the gate set), **7f** (a borrowing context carried an uninitialized `cparams.type_k`), **9** (the shape/latency/memory matrix) — §1.2 |
-| **next action** | **STEP 10 — re-admit the speculator on the pair**, §3 |
+| **next action** | **STEP 10 — re-admit the speculator on the pair**, §3.  **Before it: §7.7 needs a decision** (a tensor-split pair still aborts with hipBLASLt + graph capture on) |
 | after that | STEP 11 delivery sweep, STEP 12 candidate patch + the promotion ask |
 
 ---
@@ -63,10 +63,11 @@ nothing is copied between them.**  `llama_context_params::ctx_memory` is the onl
 | STEP 7e | `STEP-7e-0013-meta-slot-per-graph.patch` | **STEP 4's defect**: the `thread_local` Meta view slot must be bound where a graph is built/resolved, not where a flag changes — `sched_alt_select()` bound only after its no-op early return, so on `-sm tensor` a second context's graph resolved under the first's view containers (`GGML_ASSERT(tensor)`) (§3, and `INVARIANTS.md` r368-wip) |
 | STEP 8 | — (gates + anchors, no code) | `gate-arms-default-inert.sh` + `gate-arms-recurrent-shared.sh`, `baseline/inert-anchors.tsv`, `baseline/inert-shapes/`, `mtp-axis.sh` shape flags + `--no-lock` (§3) |
 | STEP 7f | `STEP-7f-0014-borrower-kv-types.patch` | **STEP 2's defect**: `cparams.type_k`/`type_v` (no default initializer) were assigned only in the own-memory branch, so a BORROWING context carried stack garbage that qwen4exp's QSA probe fed to `ggml_new_tensor_4d` -- Flash-Next + the pair aborted 2 of 3 runs (`GGML_ASSERT(type >= 0 ...)`).  A borrower now mirrors the OWNER's types |
+| STEP 7g | `STEP-7g-0015-meta-split-state-per-slot.patch` | the Meta backend's split-state cache is a per-**buffer** member (`split_state_cache[8]` + one version pointer) on a buffer every context shares, so two arms computing at once raced it -- SEGV in `ggml_backend_meta_get_split_state`, 2 of 3 runs on a tensor-split pair arm.  Now indexed by the same `thread_local` view slot as the containers |
 | STEP 9 | — (`baseline/shape-matrix.sh` + `server-arm.sh --vram-probe`) | the shape/latency/memory matrix: 7/7 shapes text-identical (3 repeats per arm), the cost table (+53..+154 MiB, 1280 MiB aux region on a host tier), the ITL/prefill trade (ITL −22.8 % at `-ub 2048`, prefill **+24 %**), and two corrections (the ITL gate's text check, one-run-vs-rate) |
 
-Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077`, 7e `3013e880a`, 7f `f61fcb03f` (branch `arms-v2`,
-local only).
+Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077`, 7e `3013e880a`, 7f `f61fcb03f`, 7g `ffbde9a41`
+(branch `arms-v2`, local only).
 
 ### 1.3 Green, with the number that proves it (all re-measured after 7c)
 
@@ -83,7 +84,7 @@ local only).
 | **default path untouched (the gate)** | `gates/gate-arms-default-inert.sh` **PASS** on 4 shapes: cli text `be904e86f248` / `db5ab8e63e11` / `10a82b5559a9` / `e9db5cb8db0b` (the first, third and fourth are **pre-change** STEP 0 anchors) and startup shapes identical (the 4B one to `baseline/A6-startup-shape.txt` **byte for byte**), plus the pair-ON sensitivity arm (4 added lines, same responses) |
 | **one memory, two contexts on a RECURRENT model (the gate)** | `gates/gate-arms-recurrent-shared.sh` **PASS** on 35B-A3B and Flash-Next/qwen4exp + the shared MTP head, **both on a 3-device `-sm tensor -mg 0` split** (that shape is part of this campaign and is the one STEP 7e broke): placements differ (`head=0 n=1` vs `head=1 n=1`), concurrent digests == `--solo`, and the four-axis `none` == adaptive text with 73..213 drafts accepted on every axis.  `--axis-shape host` runs the delivery's host-expert arm for the external head instead |
 | **the shape matrix (STEP 9)** | `baseline/shape-matrix.sh`: **7/7 shapes text-identical** with the pair OFF vs ON, 3 fresh processes per arm, one request in flight (4B, phi-4, 27B-3GPU-tensor, 35B-A3B host tier np 4, Flash-Next-3GPU-tensor np 3, Gemma4 iswa) + the designed REFUSAL row (Gemma4 + its shared MTP head).  Cost **+53..+154 MiB** of VRAM (+149/154 per device on the tensor splits) and one 1280 MiB aux region on a host tier |
-| **the ITL/prefill trade (STEP 9)** | 4B, A decodes 64 tokens while B prefills 5246 tokens, **3 repeats per arm**: `-ub 512` 14.34 -> 13.36 ms/token (−6.8 %) and 4732 -> 5676 t/s; `-ub 2048` 20.38 -> 15.74 (−22.8 %) and 4909 -> 6090 (**+24.1 %**); `-ub 4096` 20.83 -> 15.85 (−23.9 %) and 5092 -> 6079 (+19.4 %) |
+| **the ITL/prefill trade (STEP 9)** | 4B, A decodes 64 tokens while B prefills 5246 tokens, **3 repeats per arm**: `-ub 512` 14.34 -> 13.36 ms/token (−6.8 %) and 4732 -> 5676 t/s; `-ub 2048` 20.38 -> 15.74 (−22.8 %) and 4909 -> 6090 (**+24.1 %**); `-ub 4096` 20.83 -> 15.85 (−23.9 %) and 5092 -> 6079 (+19.4 %).  On tensor splits (2-3 repeats per arm): **Flash-Next 3 dev `-sm tensor`** `-ub 4096` **53.83 -> 22.89 ms/token (−57.5 %)** with capture off (+21.8 % prefill), or 47.82 -> 41.20 (−13.8 %) with `ROCBLAS_USE_HIPBLASLT=0`; **27B 3 dev `-sm tensor`** `-ub 2048` 64.45 -> 60.30 (−6.4 %, +35.6 % prefill) |
 | the 7f fix | 5/5 pair-ON runs clean on Flash-Next-3GPU-tensor (was 1/3), reading the pair-OFF answers; `-ctk q8_0 -ctv q8_0` identical on both arms |
 | the 7e fix | the reproducer (Flash-Next + external head, 3 devices `-sm tensor`) reads the delivery's text `be69e274b66d` again; `gate-draft-ctx.sh` PASS; the pair on 27B tensor identical (`8f396b237f0f`/`04116b9a99ad`); the host-tier soak PASS |
 | the build | whole set builds; `scripts/check-shlib-symbols.sh` **OK** (16 libs) after the iface rename |
@@ -423,3 +424,16 @@ Every number of record is in `RUNS.md` (newest first) with its command and shape
    the gate the regression instrument for STEP 7e.  Whether the DELIVERY's own `scripts/gate-draft-ctx.sh` should
    also gain a `-sm tensor` arm — its documented-but-unrun one, `INVARIANTS.md` r368-wip item 2 — is delivery
    gate work, not a decision this campaign takes.
+
+7. **NEW, blocking (2026-11-23): what should a TENSOR-SPLIT pair pin?**  With the delivery default (hipBLASLt
+   on, graph capture on) a pair arm on a `-sm tensor` split **aborts** -- `Hip error: 'operation would make the
+   legacy stream depend on a capturing blocking stream' (906)` from `hipblaslt.cpp` inside
+   `ggml_cuda_graph_evaluate_and_capture` on the decode arm, 2 of 3 runs (Flash-Next 3 devices; `INVARIANTS.md`
+   r372-wip item 2).  Either pin removes it and they cost very differently: capture off
+   (`GGML_CUDA_GRAPH_MAX_TOKENS=0`) reads **22.89 ms/token** (ITL −57.5 %) against hipBLASLt off
+   (`ROCBLAS_USE_HIPBLASLT=0`) **41.20** (ITL −13.8 %) -- i.e. the pair's own capture is worth ~18 ms/token of
+   decoder latency on that shape.  Options: (a) the pair pins capture off by default (a decode-throughput cost on
+   `-sm tensor`, measured above); (b) it pins hipBLASLt off (a bigger cost); (c) implement the barrier so a
+   capture can run while the other arm issues no library calls -- the §7.3 answer, one step of its own.  A crash
+   is not an acceptable default, and the campaign must not silently keep two arms out of each other's way by
+   disabling a feature the rest of the delivery relies on.  **Ask before STEP 10 or STEP 12 depends on it.**

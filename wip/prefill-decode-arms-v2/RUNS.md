@@ -74,6 +74,46 @@ every width: the decoder's single row no longer joins the prefill's batch, so th
 above put OFF at 1300-1310 ms and 1316-1353 ms.  The single run's baseline was the outlier; the pair's own number
 is stable (964-1088 ms).  A claim from one run of this gate would have been wrong in BOTH directions.
 
+
+### 3b. The same trade on a TENSOR SPLIT (the `-sm tensor` shapes), and what it took to measure it
+
+`baseline/itl-arm.sh`, np 2, `-c 8192`, slot A decodes 64 tokens while slot B prefills
+`prompts/prose-rdna-boosts.txt` (5246 tokens).  Two repeats minimum per arm; every arm's repeats are tight.
+
+**Flash-Next GSQ-RCO IQ3_S, 3 devices `-sm tensor -mg 0`** -- the shape where the feature matters most (a large
+MoE whose prefill chunks are ~2 s):
+
+| config | OFF (ms/token) | ON | Δ ITL | prefill OFF -> ON |
+|---|---|---|---|---|
+| delivery default (hipBLASLt on, graph capture on) | 53.85 / 54.46 / 54.00 (ub 4096) | **ABORTS** 2 of 3 | -- | -- |
+| `GGML_CUDA_GRAPH_MAX_TOKENS=0` (capture off, hipBLASLt on) | 53.73 / 53.78 / 53.99 | **23.14 / 22.64** | **−57.5 %** | 1794/1790/1784 -> 2188/2169 (**+21.8 %**) |
+| `ROCBLAS_USE_HIPBLASLT=0` (Lt off, capture on) | 47.60 / 47.91 / 47.95 | 41.25 / 41.01 / 41.33 | −13.8 % | 2054/2052/2069 -> 2265/2517/2519 (+18.3 %) |
+| ... at `-ub 2048` (Lt off, capture on) | 47.97 / 47.69 / 48.26 | 42.33 / 41.34 / 38.16 | −15.3 % | 1847 -> 2378 (+28.8 %) |
+
+**27B Q8_0, 3 devices `-sm tensor -mg 0`, `-ub 2048`, `ROCBLAS_USE_HIPBLASLT=0`:**
+
+| OFF | ON | Δ ITL | prefill |
+|---|---|---|---|
+| 64.29 / 64.61 ms/token | 60.01 / 60.58 | **−6.4 %** | 1396 -> 1893 t/s (**+35.6 %**) |
+
+So the ITL win is **shape-dependent** and it is the chunk wait it removes: 4B −23 % (its own decode is 14 ms),
+Flash-Next **−57 %** (a ~2 s chunk against a ~23 ms decode), 27B only −6.4 % (its own decode is 64 ms, so the
+same chunk wait is a smaller fraction).  **The prefill is faster on every shape** (+18…+36 %).
+
+**Two defects this measurement found, both fixed in this landing:**
+
+1. **STEP 7g — the Meta backend's split-state cache was per BUFFER, not per view slot.**  SEGV inside
+   `ggml_backend_meta_get_split_state` on the decode arm's thread, 2 of 3 runs (`steps/STEP-7g-*.patch`).
+   STEP 4 partitioned the view *containers* per slot and assumed the cache went with them; it did not.  It is
+   invisible with one request in flight -- every sequential gate passed on the same binary.
+2. **The delivery default still aborts on this shape: hipBLASLt inside a graph capture with a second context.**
+   After 7g the remaining failure is `Hip error: 'operation would make the legacy stream depend on a capturing
+   blocking stream' (906)` from `hipblaslt.cpp` during `ggml_cuda_graph_evaluate_and_capture` on the decode arm --
+   the same family as STEP 7d's drop-vs-capture defect (a process-wide/library state vs a second arm's capture).
+   **Disabling either hipBLASLt or the capture removes it**; capture-off is the better escape by far (23 vs 41
+   ms/token), i.e. the pair's capture is worth ~18 ms/token of decoder latency on this shape.  Which one the pair
+   should pin is a maintainer decision (`HANDOVER.md` §7.7) -- a crash is not an acceptable default either way.
+
 ### 4. A gate correction this section owes: `gate-arms-itl.sh`'s text check is not a byte claim
 
 The ITL gate is the ONE arm whose point is two requests in flight, and that is the configuration in which a byte

@@ -1860,3 +1860,18 @@ arm; `baseline/itl-arm.sh`):**
 The win grows with the chunk width, because what the pair bounds is the decoder's wait for a WHOLE chunk; and
 the prefill is **faster, not slower** (the decoder's single row no longer joins the prefill's batch, so the
 prefill graph stays wide) — which is the opposite of the withdrawn design's −21…−24 % prefill cost.
+
+**On a `-sm tensor` split the same measurement is shape-dependent, and it needs one pin on this ROCm line**
+(np 2, `-c 8192`, A decodes 64 tokens while B prefills 5246; 2-3 repeats per arm):
+
+| shape | pair OFF | pair ON | Δ ITL | prefill |
+|---|---|---|---|---|
+| Flash-Next GSQ IQ3_S, 3 dev `-sm tensor`, `-ub 4096`, **`GGML_CUDA_GRAPH_MAX_TOKENS=0`** | 53.83 ms/token | **22.89** | **−57.5 %** | +21.8 % |
+| ... the same with `ROCBLAS_USE_HIPBLASLT=0` (capture on) | 47.82 | 41.20 | −13.8 % | +18.3 % |
+| 27B Q8_0, 3 dev `-sm tensor`, `-ub 2048`, `ROCBLAS_USE_HIPBLASLT=0` | 64.45 | 60.30 | −6.4 % | +35.6 % |
+
+**A tensor-split pair arm must pin ONE of `GGML_CUDA_GRAPH_MAX_TOKENS=0` or `ROCBLAS_USE_HIPBLASLT=0`** until the
+capture/library barrier exists: with neither, hipBLASLt inside the decode arm's graph capture aborts the server
+(`Hip error: 'operation would make the legacy stream depend on a capturing blocking stream' (906)`, 2 of 3 runs
+on Flash-Next — `INVARIANTS.md` r372-wip item 2).  Capture-off is also the faster escape by ~1.8× here, because
+it is the pair's own capture that costs the decoder latency.  Which one a promotion pins is an open decision.

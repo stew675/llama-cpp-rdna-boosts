@@ -2878,3 +2878,40 @@ r363-wip item 1, whose diagnosis was wrong.
    baseline was the outlier.  The measured trade (4B, 5246-token prefill against a 64-token decode): `-ub 512`
    ITL −6.8 % / prefill +20.0 %, `-ub 2048` −22.8 % / +24.1 %, `-ub 4096` −23.9 % / +19.4 % -- the win grows with
    the chunk width, and the prefill is FASTER because the decoder's row no longer joins the prefill's batch.
+
+## r372-wip (2026-11-23, `WORKLOG.md` 261123.024) — a per-BUFFER cache inside a shared backend is shared state: the Meta split-state cache must be partitioned by view slot like the containers are (`prefill-decode-arms` v2 STEP 7g)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 7g (a defect in this campaign's STEP 4).
+
+1. **STEP 4 partitioned the Meta backend's view CONTAINERS per view slot and assumed the split-state cache went
+   with them; the cache is a per-BUFFER member (`split_state_cache[8]` + one `_cur`/`_used`/`_tick`), and the
+   buffer is the tensor-split backend's, shared by every context on those devices.**  `get_split_state()` WRITES
+   it while walking a graph (it erases, recycles an LRU version with `clear()`, moves `_cur`), so two contexts
+   computing at once resolved split states through one version pointer and one thread cleared a version the
+   other held an iterator into: SEGV in `ggml_backend_meta_get_split_state`, measured on the decode arm's thread
+   2 of 3 runs (Flash-Next, 3 devices `-sm tensor`, np 2, one slot decoding while another prefills).
+   **Rule:** a cache that lives on a per-BUFFER object is shared state the moment two threads compute; partition
+   it by the same selector the containers use (here the `thread_local` view slot), including its version
+   bookkeeping.  Invisible with one request in flight -- every sequential gate passed on the same binary -- and
+   invisible on one device, where no Meta backend is armed at all.
+2. **The same measurement found a second, still-open blocker: hipBLASLt inside a graph capture with a second
+   context.**  `Hip error: 'operation would make the legacy stream depend on a capturing blocking stream' (906)`
+   from `hipblaslt.cpp` in `ggml_cuda_graph_evaluate_and_capture`, on the decode arm, 2 of 3 runs, *after* the
+   cache fix.  Disabling either hipBLASLt (`ROCBLAS_USE_HIPBLASLT=0`) or the capture
+   (`GGML_CUDA_GRAPH_MAX_TOKENS=0`) removes it, and they cost very differently on that shape: capture-off reads
+   **22.9 ms/token** (ITL −57.5 % vs the single-context arm), hipBLASLt-off **41.2** (ITL −13.8 %).  This is the
+   STEP 7d family (a process-wide/library hazard vs a second arm's capture), so the same reasoning applies: the
+   exposure must be removed before promotion, and which escape the pair pins is a design decision, not a gate.
+
+## r373-wip (2026-11-23, `WORKLOG.md` 261123.024) — the ITL win is the CHUNK WAIT it removes, so it is shape-dependent: −57 % on a shape with a 2 s chunk against a 23 ms decode, −6 % on one whose own decode is 64 ms (`prefill-decode-arms` v2 STEP 9)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 9.
+
+Measured with 2-3 repeats per arm, slot A decoding 64 tokens while slot B prefills 5246 tokens
+(`baseline/itl-arm.sh`): 4B Q8_0 1 GPU `-ub 2048` 20.38 -> 15.74 ms/token (**−22.8 %**, prefill +24.1 %);
+Flash-Next 3 devices `-sm tensor` `-ub 4096` 53.83 -> 22.89 (**−57.5 %**, prefill +21.8 %); 27B Q8_0 3 devices
+`-sm tensor` `-ub 2048` 64.45 -> 60.30 (**−6.4 %**, prefill +35.6 %).  The single-context arm's ITL is
+`own decode cost + the chunk waits it eats`, and the pair removes the waits -- so the *relative* win is largest
+where a chunk is long against a short decode, and it shrinks to ~6 % on a shape whose decode is already 64 ms
+per token.  The PREFILL is faster on every shape (+18…+36 %): the decoder's row no longer joins the prefill's
+batch.  A shape matrix that quotes one number for "the pair's speedup" is therefore wrong by construction.
