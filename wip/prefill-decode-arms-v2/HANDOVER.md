@@ -288,13 +288,52 @@ concurrent arm's composition picks the kernels and even the unmodified server va
 measured reserve and the VRAM delta per extra slot (and the fact that an aux context's compute region costs one
 chunk-rounded layout, §2.4).
 
-### STEP 10 — re-admit the speculator on the pair
+### STEP 10 — re-admit the speculator on the pair (IN PROGRESS: 10a landed; the rest is THIS list)
 
-Three-way cold text claim (`pair+draft-mtp` == `pair+none` == `single+draft-mtp`), the MTP four axes,
-`LLAMA_SERVER_PARK_IDLE_SLOTS=0` pinned on every arm, the draft context's own `llama_process` **inside** the
-decode-band barrier, and the slot's speculative state reset on every handover.  Two prerequisites from this
-session: a drafter adds **two more** compute layouts (measure the reserve, §7.2), and the always-reserved layout
-(§2.3) must be re-measured with a drafter live.
+**10a landed** (`e7ae0b470`): `slot_accept_draft_round(slot, ctx, seq_rm_type)` -- ONE verify/accept/rollback/emit
+round for both arms, context as a parameter.  Verified as a pure refactor against STEP 0 A5 on the drafter path
+(27B, `draft-mtp-adaptive` n_max 7, pair OFF, `-n 600`: axis K `a87c4318b649`, acceptance **74/73/435/423**).
+
+**What is left, in order -- with the anchors and the traps, because this list IS the hand-off:**
+
+1. **Extract `slot_draft_setup(server_slot &)` and `slot_draft_ckpt(server_slot &, llama_context * ctx)`** from
+   `update_slots` the way 10a did the accept round.  The first fills
+   `common_speculative_get_draft_params(spec, slot.id)` (`drafting/n_max/pos0/id_last/prompt/result/result_q/temp/
+   seed`) and pushes the slot into `drafting`; the second is the checkpoint block right after
+   `common_speculative_draft()` (`ckpt.update_tgt(ctx, ...)`, `llama_memory_seq_rm(llama_get_memory(ctx_dft), ...)`,
+   the `use_ckpt_tgt`/`use_ckpt_dft` pair).  Then the decode arm's round in `arms_decode_loop` (which today does
+   exactly one row per owned slot): draft setup for the owned slots -> `common_speculative_draft(spec.get())` inside
+   `queue_tasks.yield_to_queue` -> checkpoints -> **`slot->handle_last_sampled_token(batch_dec)`** (it ALREADY
+   appends the sampled token plus every draft row and fills `spec_i_batch` -- do not hand-roll it) ->
+   `llama_process(ctx_dec, ...)` -> `common_speculative_process(spec.get(), batch_dec)` ->
+   `slot_accept_draft_round(*slot, ctx_dec, ctx_dec_seq_rm_type)` per slot, else the existing
+   `slot_step(*slot, ctx_dec, slot->i_batch, false)`.  **Add `ctx_dec_seq_rm_type = common_context_can_seq_rm(ctx_dec)`**
+   next to `ctx_tgt_seq_rm_type` (~line 1197): the accept round needs the capability of the context that ran it.
+2. **ONE speculator mutex** (`std::mutex arms_spec_mtx`) around every `common_speculative_*` call from *either* arm
+   -- `spec` is one object, `common_speculative_draft()` asserts `dp.result->empty()` for the slots it drafts, and
+   `process`/`accept` are not reentrant.  Hold it for the host-side drafting/accepting only, NEVER across
+   `llama_process()` (that would delete the feature).
+3. **Reset the slot's speculative state in BOTH handover directions** (`arms_hand_over`, `arms_take_back`):
+   `spec_draft.clear(); spec_i_batch.clear(); spec_ckpt.clear(); spec_is_replay = false;` -- `spec_i_batch` and
+   `spec_ckpt` describe a batch the OTHER arm ran.
+4. **`common_arms_pair_possible()`** refuses every `has_aux()` today; admit `draft-mtp`, `draft-mtp-adaptive`,
+   `draft-simple` and the ngram family, keep the layer-input families and a gemma4 assistant refused.  This must
+   land in the SAME change as 1-3: admitting a drafter the decode arm cannot drive is a broken configuration, not a
+   partial feature.  Charge the drafter's reserve -- `common_draft_reserve_derive()` already prints both terms (the
+   pair's `COMMON_ARMS_RESERVE_MIB` plus the draft context's `kv + compute + slack`), and on a slab-armed shape the
+   slab's calibration log restates the sum; §7.2 is answered from that log rather than by argument.
+5. **The oracle:** the three-way cold text claim (`pair+draft-mtp` == `pair+none` == `single+draft-mtp`), one fresh
+   process per arm, one cold prefill per request, on **3 devices f16 / 3 devices q8_0 / 2 devices f16**; the MTP
+   four-axis protocol on the pair AND off; **`LLAMA_SERVER_PARK_IDLE_SLOTS=0` pinned on every arm**.  Instruments:
+   `baseline/mtp-axis.sh` (now `--model/--sm/--ncmoe/--ctx/--load/--md/--tag-prefix/--no-lock`),
+   `baseline/server-arm.sh`, `baseline/shape-matrix.sh`.  Also re-measure the two prerequisites: a drafter adds
+   **two more** compute layouts (the reserve, §7.2) and the always-reserved layout (§2.3) with a drafter live.
+
+**Traps this session already paid for:** `accept_special_token` was a *lambda local to two different functions*
+(now a member helper -- an extracted function at class scope cannot see a lambda); `slot.ctx_dft` is null with an
+embedded MTP head (both ckpt helpers handle that); the decode arm's batch must be constructed with `ctx_dec`,
+because `common_speculative_process()` reads the hidden rows through the batch's own context; and a slot handed to
+the decode arm must never be batched by the prefill arm again afterwards (invariant 2, already guarded).
 
 ### STEP 11 — the delivery regression sweep
 
