@@ -15,18 +15,18 @@
 
 **Read this file first. It is one task, not a campaign.**  The campaign that produced the block-17 candidate is
 finished and recorded: its reasoning and traps are in [`HANDOVER-2026-11-24-campaign.md`](HANDOVER-2026-11-24-campaign.md),
-the numbers in [`RUNS.md`](RUNS.md), the dated entries in `WORKLOG.md` (261123.*, 261124.001-005), the engineering
-facts in `INVARIANTS.md` (r353-wip … r383-wip).
+the numbers in [`RUNS.md`](RUNS.md), the dated entries in `WORKLOG.md` (261123.*, 261124.001-007), the engineering
+facts in `INVARIANTS.md` (r353-wip … r384-wip).
 
 | | |
 |---|---|
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`prefill-decode-arms-v2`** (pushed), `main` untouched at `91a81505` |
 | release the candidate is cut against | `release.json`: base `919794500`, tip `089f90067`, tree `27db9bfd4ef7f41c7df60f704410de28863beac3`, 18 default blocks |
-| work tree | `~/llama.cpp`, branch **`arms-v2`** (local only, NEVER pushed), tip **`15fd7d832`** (STEP 14), tree clean |
+| work tree | `~/llama.cpp`, branch **`arms-v2`** (local only, NEVER pushed), tip **`67946d6f0`** (STEP 15), tree clean |
 | build | `~/bin/build-llama-rocm` → `build-rocm` (ROCm **10.2.0**); fast loop `cmake --build build-rocm --target llama-server -j 16` |
-| candidate artifact | `beta/prefill-decode-arms/prefill-decode-arms.patch`, sha256 **`a2badad1…e366fe3c`**, 42 files, +3073/−741, applied tree **`e24d88b31e`** |
-| campaign `steps/` | 21 patches, `STEP-1-0001` … `STEP-14-0021`; **the new one is `STEP-15-0022`** |
-| **the one open defect** | this file, §2 |
+| candidate artifact | `beta/prefill-decode-arms/prefill-decode-arms.patch`, sha256 **`f51a78b0…82d35bb`**, 42 files, +3147/−776, applied tree **`29c9644350`** (STEP 15 cut) |
+| campaign `steps/` | 22 patches, `STEP-1-0001` … `STEP-15-0022-no-2d-d2h` (landed `67946d6f0`) |
+| **the defect** | this file, §2 — **FIXED** (see the status banner; `WORKLOG.md` 261124.007, `INVARIANTS.md` r384-wip, gate `gates/gate-arms-state-split.sh`) |
 | what is NOT the task | rewriting the two-arm design, re-litigating the AR chain, promotion into `patches/` (that is the maintainer's, and it comes *after* this fix) |
 
 ---
