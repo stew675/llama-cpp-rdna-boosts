@@ -1,0 +1,113 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index 8fd979bb5..916ae5adc 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1326,20 +1326,56 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
+ // the reserve is charged ONLY when the pair will really be created (one predicate, DESIGN V2: a refused pair that
+ // was charged leaves the arena smaller for a context that never exists).
+ //
+-// MEASURED (2026-11-23): the decode arm's COMPUTE buffer is one narrow (n_parallel-row) layout, and it is what
+-// this reserve has to cover -- the slab maps it from the VA it leaves unmapped, so no arena table has to be
+-// evicted at load to make room:
+-//   * 35B-A3B Q8_0 `-ncmoe 40`, np 4 (host expert tier, slab armed): 1280 MiB (the same size class as the
+-//     prefill arm's narrow layout -- the 35B-A3B compute layout is size-independent);
+-//   * Gemma4 26B-A4B Q8_0 `-ncmoe 20` + an external MTP head: 512 MiB per auxiliary context.
++// ONE PINNED COMPUTE REGION PER AUXILIARY CONTEXT (the maintainer's decision, 2026-11-24): the charge is a COUNT
++// times a per-context size, not a single lump for "the pair", because every auxiliary context that arrives after
++// the arena is sized needs one region of its own and a pair may carry more than one (the decode arm, and the
++// drafter's context).  Which term charges which context is stated in the derivation below: the drafter's region
++// comes out of the draft reserve (`common_draft_reserve_derive()`, derived or flat, and always non-zero when a
++// drafter has a context), so counting it again here would spend ~1.3 GiB of arena for nothing -- 4864 MiB of
++// reserve on the measured shape, against 3584 + 1280 that the two regions and the draft's KV actually need.
++//
++// MEASURED (2026-11-23/24, `GGML_CUDA_WORK_ALLOC_DEBUG=1`): an auxiliary context's COMPUTE buffer is one narrow
++// layout, and it is what a region has to cover -- the slab maps it from the VA it leaves unmapped, so no arena
++// table has to be evicted at load to make room:
++//   * 35B-A3B Q8_0 `-ncmoe 40`, np 4 + `draft-mtp-adaptive` n_max 7 (host expert tier, slab armed): the DECODE
++//     ARM 1280 MiB at its verify width (`4 x (7+1)` = 32 rows), the DRAFT 512 MiB -- i.e. exactly one region per
++//     auxiliary context;
++//   * Gemma4 26B-A4B Q8_0 `-ncmoe 20` + its MTP head: 512 MiB for the draft's region (the pair refuses this
++//     shape: a gemma4 assistant shares the target's KV).
+ // The earlier "+157/+235 MiB per device" figure (27B/Q8_0/3-GPU tensor) measured the *arena shrink after the
+ // slab had already absorbed the buffer*, i.e. a different quantity -- a dense model arms no slab at all, so
+ // that arm could not see the real number.  THIS IS AN APPROXIMATION: the exact per-device figure is known only
+ // once the decode arm's own `sched_reserve` has run, and the slab logs a one-time recommendation for the next
+-// run at that point (`ggml_cuda_slab_aux_commit_locked`).  Withholding the widest measured value means the pin
+-// never has to evict on any validated shape; an over-estimate only costs arena on a shape whose aux layout is
+-// narrower, which the logged recommendation then fixes.
+-static const int COMMON_ARMS_RESERVE_MIB = 1280;
++// run at that point (`ggml_cuda_slab_aux_commit_locked`, which after r377-wip states the sum for EVERY region).
++// Withholding the widest measured value means the pin never has to evict on any validated shape; an over-estimate
++// only costs arena on a shape whose aux layout is narrower, which the logged recommendation then fixes.  A shape
++// whose verify batch is much wider than 32 rows (a large `-np` at a large `--spec-draft-n-max`) should be
++// re-measured, because the layout grows with that width.
++static const int COMMON_ARMS_RESERVE_MIB_PER_AUX = 1280;
++
++// The auxiliary contexts this configuration creates that need a pinned compute region charged HERE: the decode arm,
++// and any further decode-band context (`n_aux` is a count so a third one is charged when one is added).  A
++// drafter's context is auxiliary too, but its region is the draft reserve's term -- see the block above.
++struct common_arms_reserve {
++    int    n_aux = 0;    // auxiliary contexts charged by this term
++    size_t bytes = 0;    // what the arena holds back for them
++    bool   charged = false;
++};
++
++static common_arms_reserve common_arms_reserve_derive(const common_params & params) {
++    common_arms_reserve res;
++    if (params.prefill_decode_arms_mode == COMMON_ARMS_OFF) {
++        return res;
++    }
++    const char * why = common_arms_pair_possible(params);
++    if (why != nullptr) {
++        return res;   // refused: charge NOTHING (DESIGN V2)
++    }
++    res.n_aux   = 1;   // the decode arm
++    res.bytes   = (size_t) res.n_aux * (size_t) COMMON_ARMS_RESERVE_MIB_PER_AUX * 1024 * 1024;
++    res.charged = true;
++    return res;
++}
+ 
+ static common_draft_reserve common_draft_reserve_derive(const common_params & params) {
+     common_draft_reserve draft_reserve;
+@@ -1573,19 +1609,22 @@ common_init_result::common_init_result(common_params & params, bool model_only,
+         const bool has_aux = has_host_experts &&
+                 (params.speculative.has_dft() || params.speculative.has_mtp());
+ 
+-        // the two-arm server's decode arm, charged on the same preflight (see COMMON_ARMS_RESERVE_MIB)
++        // the two-arm server's AUXILIARY CONTEXTS, charged on the same preflight: one pinned compute region per
++        // context, counted (see COMMON_ARMS_RESERVE_MIB_PER_AUX)
+         size_t arms_bytes = 0;
+         if (has_host_experts && params.prefill_decode_arms_mode != COMMON_ARMS_OFF) {
+-            const char * why = common_arms_pair_possible(params);
+-            if (why == nullptr) {
+-                arms_bytes = (size_t) COMMON_ARMS_RESERVE_MIB * 1024 * 1024;
+-                LOG_WRN("%s: the two-arm server's decode arm reserves %d MiB (measured 1280 MiB on 35B-A3B "
+-                        "Q8_0 `-ncmoe 40` np 4 and 512 MiB on Gemma4 26B-A4B + MTP: one narrow context's "
+-                        "compute buffer arrives after this arena, and the slab maps it from the VA it leaves "
+-                        "unmapped so no arena table is evicted at load; the exact figure and the reserve to "
+-                        "set are logged once when the buffer is allocated)\n",
+-                        __func__, COMMON_ARMS_RESERVE_MIB);
++            const common_arms_reserve arms_reserve = common_arms_reserve_derive(params);
++            if (arms_reserve.charged) {
++                arms_bytes = arms_reserve.bytes;
++                LOG_WRN("%s: the two-arm server reserves %d auxiliary compute region(s) x %d MiB = %.0f MiB "
++                        "(the drafter's own region, when there is a drafter, is in the draft reserve term "
++                        "below -- one region per auxiliary context, and the slab maps each from the VA it "
++                        "leaves unmapped so no arena table is evicted at load; the exact figures and the "
++                        "reserve to set are logged once when the regions are pinned)\n",
++                        __func__, arms_reserve.n_aux, COMMON_ARMS_RESERVE_MIB_PER_AUX,
++                        (double) arms_bytes / 1048576.0);
+             } else {
++                const char * why = common_arms_pair_possible(params);
+                 LOG_INF("%s: the two-arm server is requested but cannot be built (%s), so it reserves NOTHING\n",
+                         __func__, why);
+             }
+@@ -1639,7 +1678,7 @@ common_init_result::common_init_result(common_params & params, bool model_only,
+         }
+         if (arms_bytes > 0) {
+             aux_bytes += arms_bytes;
+-            LOG_INF("%s: MoE arena reserve = %.0f MiB in total (draft %.0f + two-arm decode arm %.0f)\n",
++            LOG_INF("%s: MoE arena reserve = %.0f MiB in total (draft %.0f + two-arm auxiliary contexts %.0f)\n",
+                     __func__, (double) aux_bytes / 1048576.0, (double) (aux_bytes - arms_bytes) / 1048576.0,
+                     (double) arms_bytes / 1048576.0);
+         }

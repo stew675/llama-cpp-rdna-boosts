@@ -1,3 +1,33 @@
+## 261124.002 (no release; `prefill-decode-arms` v2, the maintainer's decisions on STEP 10) -- the arena reserve is a PER-AUX-CONTEXT COUNT, the soak's drafter arm runs 20 rounds, and this work replaces `beta/prefill-decode-arms/` as ONE block (block 17 on promotion)
+
+Four decisions from the review of STEP 10, all taken the same day:
+
+1. **The reserve is a per-aux-context count.**  `common_arms_reserve_derive()` replaces the single
+   `COMMON_ARMS_RESERVE_MIB` lump with `{n_aux, bytes}` = `n_aux x COMMON_ARMS_RESERVE_MIB_PER_AUX`, and the log
+   names which term charges which context: `the two-arm server reserves 1 auxiliary compute region(s) x 1280 MiB =
+   1280 MiB (the drafter's own region, when there is a drafter, is in the draft reserve term below)`.  `n_aux`
+   counts the contexts whose region is NOT already covered (today: the decode arm; the drafter's region is its own
+   reserve's `compute` term), because counting it twice withholds ~1.3 GiB of arena nothing uses -- the measured
+   reserve is 4864 MiB (draft 3584 + contexts 1280) against the 3584 + 1280 the regions and the draft's KV need.
+   **Verified on the 35B-A3B host-expert shape with `draft-mtp-adaptive`**: arena reserve 4864 MiB, the decode
+   arm's region grows 768 -> 1280 MiB, the draft's 512 MiB, both from the unmapped VA spare with zero evictions,
+   the slab's own recommendation 3328 MiB, text `cb8fa5a1790a` (unchanged).  Also re-verified:
+   `gate-arms-default-inert.sh --no-cli` PASS (the term is 0 with the pair off), `gate-arms-spec.sh` 19/19 on 2
+   shapes + the K axis, and the A5 anchor `a87c4318b649` / 74/73/435/423.
+2. **The soak's drafter arm runs 20 rounds** (accepted): `gate-arms-multislot.sh` now RAISES `ROUNDS` to 20 for a
+   `--spec-type` arm that is not `none` and prints why (a verify step emits up to `n_max+1` tokens, so a 16-token
+   request finishes in ~6 decode-arm steps and two decoders rarely share a batch at 10 rounds).  PASS at 20
+   rounds, `widest batch 2`.
+3. **`LLAMA_MTP_DEV_ROWS` stays inert on the pair**, with its log line (noted, no change).
+4. **Block ownership: ONE self-contained block, replacing the old artifact.**  This work **completely replaces
+   `beta/prefill-decode-arms/`** -- the old directory's design text, README and patch are deleted rather than kept
+   beside it -- and on promotion it is **delivery block 17 as a MODIFICATION to the lower-numbered blocks** (it
+   edits files blocks 12/15 own, `ggml-cuda-slab.cu`, plus the llama_context/`llama.h` layer, which is what a block
+   on top is for).  Recorded in `AGENTS.md`, `PLAN.md` STEP 12, `HANDOVER.md` §7.1.  Promotion is still a block
+   decision and is still asked first; no block exists yet.
+
+---
+
 ## 261124.001 (no release; `prefill-decode-arms` v2 STEP 10) -- the speculator is ON the pair, and re-admitting it exposed six memory defects that only a second context, a third layout or a live drafter can reach
 
 STEP 10 closes: the DECODE arm drives the whole draft/verify/accept round for the slots it owns (`draft params ->

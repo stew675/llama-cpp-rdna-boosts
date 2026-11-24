@@ -38,6 +38,21 @@ CTX="${CTX:-16384}"
 NPRED="${NPRED:-16}"
 PORT="${PORT:-19700}"
 ARMS="${ARMS:---prefill-decode-arms}"
+
+# A DRAFTER arm needs at least 20 rounds for this gate's own overlap check ("two decoders shared ONE decode
+# batch at least once").  A verify step emits up to `n_max + 1` tokens, so a 16-token request finishes in ~6
+# decode-arm steps and two slots rarely overlap: at 10 rounds one run in eight saw `widest batch 1` for the whole
+# soak -- no fault, no error, the CHECK failed (`INVARIANTS.md` r378-wip item 2, `HANDOVER.md` §7.10).  Raised
+# rather than lowered: the check is the non-vacuity proof, so the soak is made long enough to earn it.
+case "$ARMS $EXTRA" in
+    *--spec-type*)
+        # `--spec-type none` is not a drafter
+        if ! grep -q -- "--spec-type none" <<<"$ARMS $EXTRA" && [ "${ROUNDS:-0}" -lt 20 ]; then
+            echo "note: a speculator arm needs >= 20 rounds for the overlap check; raising ROUNDS $ROUNDS -> 20" >&2
+            ROUNDS=20
+        fi
+        ;;
+esac
 # PIN THE RESIDENCY PRIOR (AGENTS.md rule 5, GREEDY-PURITY.md §89): on a host-expert shape the expert-cache
 # RESIDENCY picks the MoE kernel set, and `MOE_EXPERT_HEATMAP` DEFAULT WRITES the persisted map, so two soaks
 # in a row start from different priors -- which flipped this gate's outcome (measured 2026-11-23: the same

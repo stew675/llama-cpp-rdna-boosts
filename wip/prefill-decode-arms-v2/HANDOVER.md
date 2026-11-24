@@ -7,7 +7,7 @@ not been run says so.
 | | |
 |---|---|
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`prefill-decode-arms-v2`**, HEAD = the **STEP 7e/8 landing** (the commit that carries this file; **`main` untouched** at `91a81505`) |
-| work tree | `~/llama.cpp`, branch **`arms-v2`** (**local only, never pushed**), tip **`f3e34859d`** (STEP 10), tree clean |
+| work tree | `~/llama.cpp`, branch **`arms-v2`** (**local only, never pushed**), tip **`ffaee2c52`** (STEP 10b), tree clean |
 | build | `~/bin/build-llama-rocm` → `build-rocm` (ROCm **10.2.0**); fast loop `cmake --build build-rocm --target llama-cli llama-server -j 16` |
 | extra build dirs | **`build-ref`** = a build of the delivery tip `089f90067` (the "pre-change build": the reference for a regression question), **`build-bisect`** = the last bisect rung's build.  Both at the same source path, so ccache stays warm |
 | landings | STEP 0-6e, **7a**, **7d**, **7c**, **7e** (STEP 4 broke the external draft head on a tensor split), **8** (the gate set), **7f** (a borrowing context carried an uninitialized `cparams.type_k`), **9** (the shape/latency/memory matrix), **10a/10** (the speculator on the pair + six memory defects) — §1.2 |
@@ -66,11 +66,12 @@ nothing is copied between them.**  `llama_context_params::ctx_memory` is the onl
 | STEP 7g | `STEP-7g-0015-meta-split-state-per-slot.patch` | the Meta backend's split-state cache is a per-**buffer** member (`split_state_cache[8]` + one version pointer) on a buffer every context shares, so two arms computing at once raced it -- SEGV in `ggml_backend_meta_get_split_state`, 2 of 3 runs on a tensor-split pair arm.  Now indexed by the same `thread_local` view slot as the containers |
 | STEP 7h | `STEP-7h-0016-capture-blas-barrier.patch` | **the tensor-split blocker, fixed as the maintainer chose (a barrier, neither feature disabled)**: a graph capture holds one process-wide mutex exclusively, library GEMMs hold it shared, and `cublas_handle()`/`cublaslt_handle()` **creation** holds it exclusively — creation (`hipblasCreate` -> hipBLASLt -> legacy-stream sync) is what actually tripped, not the GEMM (`INVARIANTS.md` r374-wip).  Flash-Next tensor-split pair: **23.31 ms/token vs 53.99** (−56.9 %), 7 of 7 clean |
 | STEP 10a | `STEP-10a-0017-draft-round-extraction.patch` | `slot_accept_draft_round(slot, ctx, seq_rm_type)` extracted out of `post_decode` so BOTH arms run ONE verify/accept/emit round (the context is a parameter: the decode arm verifies on `ctx_dec`, which borrows the same memory).  Verified as a pure refactor against STEP 0 A5: axis K `a87c4318b649`, acceptance **74/73/435/423** |
+| STEP 10b | `STEP-10b-0019-per-aux-context-reserve.patch` | the maintainer's decision: the arena reserve is a **per-aux-context COUNT** (`common_arms_reserve_derive()` = `n_aux x COMMON_ARMS_RESERVE_MIB_PER_AUX`, report in the log) instead of one lump for "the pair"; `n_aux` counts the contexts no other term covers (today the decode arm -- the drafter's region is its own reserve's `compute` term).  Reserve 4864 MiB on the measured shape, unchanged, with the count now explicit; text unchanged (`RUNS.md` 2026-11-24 §8) |
 | STEP 10 | `STEP-10-0018-speculator-on-the-pair.patch` | the DECODE arm drives the whole draft/verify/accept round for the slots it owns; ONE speculator lock over both arms' paths (recursive: the round ends by printing the statistics); a slot's speculative state reset at BOTH handover directions; the predicate admits `draft-simple`/`draft-mtp`/`-adaptive`/ngram and refuses the layer-input families + a gemma4 assistant (asked of the GGUF arch INSIDE the predicate, so the reserve and the pair decision still cannot disagree).  Six memory defects fell out of it: the draft's target rows follow the arm that ran the batch (`common_batch::ctx`); `ctx_aux` gives a qwen35 MTP draft its own slab region; an allocation and a cross-stream event wait may not overlap the other arm's capture; an aux region maps its own hole, can GROW, and its floor call had the slab slot off by one.  Oracle: `gates/gate-arms-spec.sh` 30/30 on 3 shapes + 4 axes, `a87c4318b649` on the pair-off drafter path, default-inert PASS (`RUNS.md` 2026-11-24) |
 | STEP 9 | — (`baseline/shape-matrix.sh` + `server-arm.sh --vram-probe`) | the shape/latency/memory matrix: 7/7 shapes text-identical (3 repeats per arm), the cost table (+53..+154 MiB, 1280 MiB aux region on a host tier), the ITL/prefill trade (ITL −22.8 % at `-ub 2048`, prefill **+24 %**), and two corrections (the ITL gate's text check, one-run-vs-rate) |
 
 Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077`, 7e `3013e880a`, 7f `f61fcb03f`, 7g `ffbde9a41`,
-7h `f4540afd0`, 10a `e7ae0b470`, 10 `f3e34859d` (branch `arms-v2`, local only).
+7h `f4540afd0`, 10a `e7ae0b470`, 10 `f3e34859d`, 10b `ffaee2c52` (branch `arms-v2`, local only).
 
 ### 1.3 Green, with the number that proves it (all re-measured after 7c)
 
@@ -359,9 +360,12 @@ adds options → the three generated docs must be regenerated), `check-windows-p
 
 ### STEP 12 — the candidate patch + the ask
 
-Regenerate from a **canonical** chain (`scripts/apply-all.sh` at `release.json.base`), put it in `beta/<a NEW
-name>/` (never the old beta directory), report the measured trade/memory/shapes to the maintainer.  **Promotion
-into `patches/` is a new block and is the maintainer's decision** (§6).
+Regenerate from a **canonical** chain (`scripts/apply-all.sh` at `release.json.base`), and put it in
+**`beta/prefill-decode-arms/`, replacing that artifact in its entirety** — the maintainer's decision of 2026-11-24
+(the old directory's design/README/patch are deleted, not kept beside it; the reading rules in `README.md` §0 still
+forbid reading them).  It stays **ONE self-contained patch**: on promotion it is **delivery block 17**, a
+modification to the lower-numbered blocks.  Report the measured trade/memory/shapes to the maintainer.
+**Promotion into `patches/` is a block decision and is the maintainer's** (§6).
 
 ---
 
@@ -456,22 +460,28 @@ Every number of record is in `RUNS.md` (newest first) with its command and shape
 
 ## 7. Open questions for the maintainer (ask before deciding alone)
 
-1. **Where should the slab changes live?**  STEPs 7a/7c touch a *delivery* file (`ggml-cuda-slab.cu`, the slab
-   owned by blocks 12/15).  They are inert for the default path (A1-A6 unchanged; no aux context → no region, no
-   calibration, no reserve change), but if the campaign is promoted they land in whichever block owns the slab —
-   a block decision.
-2. **STEP 10's reserve -- MEASURED 2026-11-24, the question is now a follow-up (see #8).**  On a slab-armed shape a
-   pair WITH a drafter needs **two** aux regions (draft 512 MiB + decode arm 1280 MiB on 35B-A3B Q8_0
-   `-ncmoe 40` np 4), and both are now pinned from the reserve rather than from the first request.  The slab's
-   calibration line states the right total: `3328 MiB would host every auxiliary region (headroom 1536 + aux
-   1792)`, and the reserve in force was 6400 MiB (draft 3584 + arms 1280 + headroom 1536), i.e. **the operator
-   sets `GGML_CUDA_SLAB_RESERVE_MIB=3328` from the log and both regions come from the spare with zero evictions**
-   -- the mechanism the question asked about does work.  What is NOT solved: `COMMON_ARMS_RESERVE_MIB` (1280) is
-   one constant for a decode arm whose narrow layout now depends on the DRAFTER's verify width (`np x (n_max+1)`
-   rows).  Measured cost of the current approximation on the shape above, single request each: arena 17467.5 ->
-   16192.5 MiB, hit rate 0.9173 -> 0.8968, generation 52.94 -> 48.22 t/s, text identical `cb8fa5a1790a`.  So the
-   pairing of the two terms is right (the decode arm's own layout is exactly 1280 MiB on this shape, whatever the
-   verify width) -- but it should be re-measured once on a shape where `n_parallel x (n_max+1)` is much larger.
+1. **Where should the slab changes live? -- ANSWERED by the maintainer (2026-11-24): ONE self-contained
+   patch-block, and it becomes delivery block 17.**  This work **completely replaces `beta/prefill-decode-arms/`**
+   (the old artifact's design/README/patch are deleted, `PLAN.md` STEP 12 / `AGENTS.md`), and on promotion it is
+   **block 17 as a MODIFICATION to the lower-numbered blocks** — it edits files blocks 12/15 own
+   (`ggml-cuda-slab.cu`) and the llama_context/llama.h layer, and that is exactly what a block on top is for.
+   It is therefore ONE patch cut against the release tree, never a series by file-owner; the campaign's own
+   `steps/` patches stay the review history.
+2. **STEP 10's reserve -- ANSWERED by the maintainer (2026-11-24): the per-aux-context count (done).**
+   `common_arms_reserve_derive()` now returns `{n_aux, bytes}` — **one pinned compute region per auxiliary
+   context**, `n_aux x COMMON_ARMS_RESERVE_MIB_PER_AUX` — instead of a single lump for "the pair", and the log
+   says which term charges which context: `the two-arm server reserves 1 auxiliary compute region(s) x 1280 MiB
+   = 1280 MiB (the drafter's own region, when there is a drafter, is in the draft reserve term below)`.  `n_aux`
+   counts the contexts whose region is NOT covered by another term (today: the decode arm; the drafter's region
+   is its own reserve's `compute` term, derived or flat), because counting it twice would withhold ~1.3 GiB of
+   arena that nothing uses — 4864 MiB of reserve against the 3584 + 1280 the two regions and the draft's KV
+   actually need.  **Measured** (35B-A3B Q8_0 `-ncmoe 40` np 4 + `draft-mtp-adaptive`, single request each):
+   arena 17467.5 -> 16192.5 MiB, hit rate 0.9173 -> 0.8968, generation 52.94 -> 48.22 t/s, text identical
+   `cb8fa5a1790a`; the two regions measured decode arm **1280 MiB** (32 verify rows) and draft **512 MiB**, and
+   the slab's calibration line states the total (`3328 MiB would host every auxiliary region (headroom 1536 + aux
+   1792)`), which is the `GGML_CUDA_SLAB_RESERVE_MIB` the operator sets (zero evictions).  **Still owed:** a
+   re-measurement on a shape whose verify width is much larger than `4 x (7+1)` rows, since the region grows with
+   it (that is §7.8's growth path, now implemented).
 3. **The drop barrier.**  STEP 7d removes the pair's exposure by never dropping.  The general fix — a barrier so a
    drop can run while the other arm is *not* inside `llama_process()` — is not implemented and would let the drop
    (and its arena win) come back.  Worth a step of its own before STEP 12, or a documented follow-up after
@@ -501,22 +511,25 @@ Every number of record is in `RUNS.md` (newest first) with its command and shape
    `GGML_CUDA_CAPTURE_BLAS_BARRIER=0` is the kill switch.  `INVARIANTS.md` r374-wip records the three hypotheses
    that measurement killed on the way there.
 
-8. **The aux-region SIZE, as a follow-up (new 2026-11-24).**  Two things are now fixed (the floor call's off-by-one
+8. **The aux-region SIZE -- acknowledged by the maintainer (2026-11-24): no decision needed; it is the hardening
+   note below, and the growth path it names is implemented.**  Two things are now fixed (the floor call's off-by-one
    and growth-when-idle), but the mechanism is still "a region is sized by what a context asked for, and only
    grows while nothing is live at that slot".  A shape where a context's widest layout arrives *after* a view is
    live would decline it (the log says `... exceeds the pinned ... and a view is live there; falling back` and the
    buffer takes `cudaMalloc`, i.e. the reserve was charged and not used).  Not observed on any arm here (the
    decode arm's widest layout arrives inside its FIRST reserve, which the pair now forces at creation), so it is a
-   hardening item, not a defect: the options are a per-aux-context reserve count (which the slab's calibration line
-   can state), or letting a pin be re-mapped while a view is idle.
+   hardening item, not a defect: the reserve is now a per-aux-context COUNT (§7.2) and the slab's calibration line
+   states the total, so what remains is letting a pin be re-mapped while a view is idle (today it declines).
 
-9. **`LLAMA_MTP_DEV_ROWS` is inert on the pair (new 2026-11-24).**  The device h-row path binds `ctx_dft`'s state
+9. **`LLAMA_MTP_DEV_ROWS` is inert on the pair -- NOTED by the maintainer (2026-11-24); keep the log line.**  The device h-row path binds `ctx_dft`'s state
    source to ONE target context (`llama_set_ctx_state_src`), and re-pointing it per round marks the scheduler for a
    re-reserve -- i.e. it would cost the feature.  So the pair keeps the host readback (the delivery DEFAULT since
    r293) and now SAYS so in the log rather than silently reading the other arm's rows.  A per-arm state source, if
    wanted, is a follow-up; the delivery's own `scripts/gate-mtp-dev-rows.sh` does not cover the pair.
 
-10. **The soak's overlap check needs `ROUNDS=20` when a drafter is live (new 2026-11-24).**  `gate-arms-multislot.sh`
+10. **The soak's overlap check needs `ROUNDS=20` when a drafter is live -- ACCEPTED by the maintainer (2026-11-24)
+    and ENFORCED in the gate**: `gate-arms-multislot.sh` raises `ROUNDS` to 20 for a `--spec-type` arm that is not
+    `none` and prints why, rather than lowering the check.  `gate-arms-multislot.sh`
     asserts that two decoders shared ONE decode batch at least once.  A verify step emits up to `n_max+1` tokens, so
     a 16-token request finishes in ~6 decode-arm steps and two slots rarely overlap: at `ROUNDS=10` one run in eight
     saw `widest batch 1` for the whole soak (no fault, no error -- the CHECK failed, not the server).  At

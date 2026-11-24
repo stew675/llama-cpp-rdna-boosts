@@ -19,7 +19,7 @@ step**, and so that each step is independently reviewable.
 | 9 | the shape/latency matrix + records | — | `WORKLOG.md`, `ENVIRONMENT.md`, `INVARIANTS.md` rows | the matrix reproduces text on every shape |
 | 10 | re-admit the speculator on the pair | the STEP 7 guard | the draft/verify/accept on the decode arm | 3-way cold text + the four axes |
 | 11 | the delivery regression sweep | — | — | `validate-set.sh` + the delivery ladder |
-| 12 | the candidate patch + the promotion ask | — | `beta/<name>/` | the maintainer's decision (never a gate outcome) |
+| 12 | the candidate patch + the promotion ask | — | `beta/prefill-decode-arms/` (replaces it whole) | the block-17 promotion is the maintainer's decision (never a gate outcome) |
 
 ---
 
@@ -492,9 +492,12 @@ a text comparison, always).
 
 * Regenerate the patch **from a canonical chain**, never from the working branch:
   `scripts/make-patches.sh` on a tree built by `scripts/apply-all.sh` at `release.json.base`.
-* Put it in `beta/<new-name>/` with `README.md` (what it is, the applied tree, the shapes it reaches and the ones
-  it refuses, the measured numbers) and `BETA-TESTING.md` (the ladder a tester runs).  **Do not** reuse the old
-  beta directory's name — this artifact is a different design and must not inherit its readers' expectations.
+* Put it in **`beta/prefill-decode-arms/`**, REPLACING that artifact in its entirety (the maintainer's decision,
+  2026-11-24): the old directory's design text, README and patch are deleted, not kept beside it, because this is a
+  different design and must not inherit its readers' expectations.  `README.md` (what it is, the applied tree, the
+  shapes it reaches and the ones it refuses, the measured numbers) and `BETA-TESTING.md` (the ladder a tester
+  runs), and it stays **ONE self-contained patch** — on promotion it is **delivery block 17**, a modification to
+  the lower-numbered blocks, cut against the release tree (`release.json`), never against the working branch.
 * Report to the maintainer: the measured ITL/prefill trade, the memory cost, the shapes validated and not, and the
   open items.  **Promotion into `patches/` is a new block and is the maintainer's decision** — ask, do not cut.
 

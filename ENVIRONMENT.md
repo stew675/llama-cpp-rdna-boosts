@@ -1836,7 +1836,9 @@ operator should expect:
 (53.5 -> 49.6 % residency of the host expert set), expert hit rate 0.9173 -> 0.8968, generation 52.94 -> 48.22 t/s,
 text identical.  That is the pair's 1 280 MiB `COMMON_ARMS_RESERVE_MIB` term coming out of the arena *plus* the
 draft's own 3 584 MiB term, which the single-context server pays too.  On the slab-armed host tier the pair needs
-**two** auxiliary compute regions (draft 512 MiB + decode arm 1 280 MiB on this shape): the slab's calibration line
+**two** auxiliary compute regions (draft 512 MiB + decode arm 1 280 MiB on this shape), and the reserve is charged
+as **one region per auxiliary context** (`n_aux x 1 280 MiB`, `n_aux` counting the contexts no other term covers --
+today the decode arm; the drafter's region is the draft reserve's own `compute` term): the slab's calibration line
 states the total (`3 328 MiB would host every auxiliary region (headroom 1536 + aux 1792)`), and setting
 `GGML_CUDA_SLAB_RESERVE_MIB` from it puts both in the unmapped VA spare with zero evictions.  Where the trade pays:
 slot A's ITL through a 5 246-token prefill on slot B measured **70 ms/token solo -> 1.26-1.28 ms/token** (5 of 5

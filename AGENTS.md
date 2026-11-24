@@ -41,7 +41,10 @@ the purity rulebook.
   **The artifact is FROZEN as a code reproduction (2026-11-23), and its repair is the standalone project
   `wip/prefill-decode-arms-v2/`** — read that campaign, not the archived follow-ups or the artifact's design
   section: v2 is a clean-slate redesign that deletes this memory model, and its `README.md` §0 says which
-  material may be read (it forbids the rest by policy, not by taste).
+  material may be read (it forbids the rest by policy, not by taste).  **The maintainer's decision
+  (2026-11-24): v2 REPLACES that artifact in its entirety and becomes block 17 as ONE self-contained
+  patch-block on promotion** — a modification to the lower-numbered blocks, cut against the release tree, not a
+  rewrite of them.  Promotion is still a block decision and is still asked first.
 * `0100`-`0199` — **optional** blocks under `optional/<name>/<NNNN>-<name>.patch`.  They are never in the
   default apply, the default tree, `rdna-boosts-all.patch`, the fork branch or the default release gates;
   `scripts/apply-all.sh --include-optional[-all]` applies them on the verified default tree in **numeric**

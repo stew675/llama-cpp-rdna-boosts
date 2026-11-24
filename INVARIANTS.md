@@ -3026,3 +3026,22 @@ it removed an abort (r374-wip) -- so the per-shape rule above stands, now on the
 3. **The pair's four-arm claim is `pair+draft == pair+none == single+draft == single+none`**, one fresh process per
    arm, one request in flight, `-lv 4` (the text comes over HTTP for a server arm, so the census cannot pollute it).
    Identical on 3 devices f16 (`f2753e13e419`), 3 devices q8_0 (`f2753e13e419`) and 2 devices f16 (`0f06ed90e017`).
+
+## r379-wip (2026-11-24, `WORKLOG.md` 261124.002) — the two-arm reserve is a COUNT of auxiliary compute regions, one per auxiliary context (`prefill-decode-arms` v2, the maintainer's decision)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/`.
+
+1. **A reserve for "the pair" is the wrong shape: what the arena must hold back is ONE pinned compute region per
+   auxiliary context.**  `common_arms_reserve_derive()` now returns `{n_aux, bytes}` and the log names the
+   arithmetic; it replaced the flat `COMMON_ARMS_RESERVE_MIB` (1280 MiB for "the decode arm") so a third
+   decode-band context is charged without editing a constant.
+2. **Do NOT count a context twice.**  A speculative drafter's context needs a region too, but its charge is
+   `common_draft_reserve_derive()`'s `compute` term (derived, or the flat `LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT`
+   fallback), so `n_aux` counts only the decode arm today.  Counting both would withhold 2560 instead of 1280 MiB
+   of arena on the measured shape -- reserve 6144 vs 4864 MiB, with nothing using the difference.
+3. **Measured, and the number to expect:** 35B-A3B Q8_0 `-ncmoe 40` np 4 + `draft-mtp-adaptive` n_max 7 (host
+   expert tier, slab armed) -- regions: decode arm 1280 MiB at 32 verify rows, draft 512 MiB; arena reserve
+   4864 MiB; arena 17467.5 -> 16192.5 MiB vs the pair off, hit rate 0.9173 -> 0.8968, generation 52.94 -> 48.22 t/s,
+   text identical.  The slab's calibration line states the total to set (`3328 MiB would host every auxiliary
+   region (headroom 1536 + aux 1792)`), and the region grows with the verify width (`n_parallel x (n_max+1)`), so
+   a much wider verify batch is a re-measurement, not an assumption.

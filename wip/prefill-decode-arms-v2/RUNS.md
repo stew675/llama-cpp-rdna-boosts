@@ -103,7 +103,32 @@ contexts live at once, #4 needs two aux regions, #5/#6 need a drafter's verify w
 `GGML_CUDA_WORK_ALLOC_DEBUG=1` where a layout question was open) are in the soak/ITL logs under
 `~/.cache/rdna-boosts/arms-v2/step10/`.
 
-### 7. What is NOT claimed
+### 8. STEP 10b -- the per-aux-context reserve count (the maintainer's decision, 2026-11-24)
+
+`steps/STEP-10b-0019-per-aux-context-reserve.patch` (`~/llama.cpp` `ffaee2c52`), `common/common.cpp`.
+`common_arms_reserve_derive()` replaces the single `COMMON_ARMS_RESERVE_MIB` term with `{n_aux, bytes}` =
+`n_aux x COMMON_ARMS_RESERVE_MIB_PER_AUX`, and `n_aux` counts the auxiliary contexts whose compute region no other
+term covers -- today the decode arm, because the drafter's region is `common_draft_reserve_derive()`'s `compute`
+term (derived, or the flat fallback).  Counting both would withhold 2560 instead of 1280 MiB and spend ~1.3 GiB of
+arena on nothing (6144 vs 4864 MiB of reserve on this shape).
+
+Re-measured on 35B-A3B Q8_0 `-ncmoe 40` np 4 + `draft-mtp-adaptive` n_max 7, one request, `-n 64`:
+
+| | value |
+|---|---|
+| log line | `the two-arm server reserves 1 auxiliary compute region(s) x 1280 MiB = 1280 MiB (the drafter's own region ... is in the draft reserve term below)` |
+| total reserve | `4864 MiB in total (draft 3584 + two-arm auxiliary contexts 1280)` -- unchanged |
+| the decode arm's region | grows `768 -> 1280 MiB` inside its first reserve (the growth path), from the unmapped VA spare, 0 evictions |
+| the draft's region | `512 MiB` |
+| the slab's recommendation | `3328 MiB would host every auxiliary region (headroom 1536 + aux 1792)` |
+| text | `cb8fa5a1790a` -- unchanged |
+
+Re-verified after it: `gate-arms-default-inert.sh --no-cli` PASS (the term is 0 with the pair off),
+`gate-arms-spec.sh` 19/19 on 27b-3gpu-f16 + 27b-2gpu-f16 with the K axis, the A5 anchor `a87c4318b649` with
+74/73/435/423, and `gate-arms-multislot.sh` with the drafter at its new enforced floor of 20 rounds (PASS,
+`widest batch 2`).
+
+### 9. What is NOT claimed
 
 * no throughput claim: the numbers above are single runs at one request in flight, printed as a cost row;
 * the two slab SIZING items are follow-ups, not fixed here (`HANDOVER.md` §7.2/§7.8): `COMMON_ARMS_RESERVE_MIB`
