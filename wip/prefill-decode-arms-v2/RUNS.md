@@ -8,6 +8,112 @@ Anchors (the inertness reference set) live in [`baseline/r353-anchors.md`](basel
 
 ---
 
+## 2026-11-24 — STEP 10: the speculator ON the pair, and the six memory defects it exposed (`WORKLOG.md` 261124.001)
+
+`steps/STEP-10-0018-speculator-on-the-pair.patch` (`~/llama.cpp` `f3e34859d`).  The decode arm runs the WHOLE
+speculative round for the slots it owns; one speculator lock covers both arms' paths; a slot's speculative state
+is reset at every handover; `common_arms_pair_possible()` admits `draft-simple` / `draft-mtp` /
+`draft-mtp-adaptive` / the n-gram family and keeps the layer-input families and a gemma4 assistant refused.
+
+Re-admitting the drafter exposed six defects that only a SECOND context, a THIRD layout or a live drafter can
+reach.  Four were mine to fix here (they are correctness); the two slab *sizing* ones are recorded as follow-ups
+(`HANDOVER.md` §7.2/§7.8).
+
+### 1. The claim: one cold greedy TEXT across four arms, three shapes
+
+`gates/gate-arms-spec.sh` (new; `--shapes 27b-3gpu-f16,27b-3gpu-q8,27b-2gpu-f16 --axes R,K`), 27B Q8_0 with its
+embedded MTP head, `draft-mtp-adaptive` at the delivery ceiling 7, one fresh process per arm, one request in
+flight, `ROCBLAS_USE_HIPBLASLT=0` on every arm, `LLAMA_SERVER_PARK_IDLE_SLOTS=0` (the harness pins it).
+**30/30 checks PASS.**
+
+| shape | single+none | single+mtp | pair+none | pair+mtp | drafts/acc (pair) |
+|---|---|---|---|---|---|
+| 3 dev f16 | `f2753e13e419` | `f2753e13e419` | `f2753e13e419` | `f2753e13e419` | 34 / 25 |
+| 3 dev q8_0 | `f2753e13e419` | `f2753e13e419` | `f2753e13e419` | `f2753e13e419` | 32 / 26 |
+| 2 dev f16 | `0f06ed90e017` | `0f06ed90e017` | `0f06ed90e017` | `0f06ed90e017` | 32 / 26 |
+
+Non-vacuity per arm: the pair arms print `the decode arm is generating: 47 step(s), 1 handover(s)` (no drafter)
+and `19 step(s), 1 handover(s)` (drafter -- a verify step emits more than one token, so the same 48-token
+request needs fewer steps), and every drafter arm reports `#gen drafts > 0` AND `#acc drafts > 0`.  The 3-device
+f16 text is the STEP 9 matrix's own row (`f2753e13e419`), so this shape's answer did not move.
+
+### 2. The four-axis protocol, ON the pair (one request per arm, `-n 600`)
+
+`gates/gate-arms-spec.sh --axes R,K,P,C` on 27b-3gpu-f16 (a server arm, because the pair is a server feature;
+`baseline/server-arm.sh --nreq 1` is new for exactly this).
+
+| axis | pair+none | pair+draft | drafts / accepted | decode-arm steps |
+|---|---|---|---|---|
+| R | `3a41e71cfaab` | `3a41e71cfaab` | 181 / 161 | 181 |
+| K | `8fe00a125d38` | `8fe00a125d38` | 74 / 73 | 74 |
+| P | `fb4519c618ef` | `fb4519c618ef` | 109 / 98 | 109 |
+| C | `4d46d5ab509d` | `4d46d5ab509d` | 181 / 157 | 182 |
+
+K is the STEP 0 A5 axis; its pair-off hash here is the SERVER's, not A5's cli value, so the two are not
+comparable by value -- what this row claims is pair+none == pair+draft.
+
+### 3. The default path did not move
+
+`gates/gate-arms-default-inert.sh` PASS (4 shapes: cli text `be904e86f248` / `db5ab8e63e11` /
+`10a82b5559a9` / `e9db5cb8db0b`, startup shapes byte-identical), `baseline/mtp-axis.sh --axis K --spec adaptive`
+on 27B 3-dev: **`a87c4318b649`, 74 / 73 / 435 / 423, pos-1 0.986** -- the STEP 0 A5 / STEP 10a value exactly, so
+the extracted draft helpers and the per-context target rows changed nothing on the single-context path.
+`gates/gate-arms-n1-memory.sh` PASS.  `gates/gate-arms-multislot.sh` with **no** drafter: PASS, `widest batch 3`.
+
+### 4. Concurrency: the host-expert shape with a drafter (the arm that found three of the defects)
+
+35B-A3B Q8_0 `-ncmoe 40`, np 4, `--spec-type draft-mtp-adaptive --spec-draft-n-max 7`,
+`MOE_EXPERT_HEATMAP=load`, `gates/gate-arms-multislot.sh` (3 devices, `-sm layer`), 20 rounds x 4 slots:
+**PASS 2/2 at `ROUNDS=20`** and 7 of 8 at `ROUNDS=10` (the one failure was the gate's own overlap check --
+`widest batch 1` for the whole soak, because a verify step emits up to 8 tokens and two decoders therefore rarely
+share a batch at 16 tokens per request; no fault, no error).  Census: `6 step(s), 2 handover(s), widest batch 2`.
+
+`baseline/itl-arm.sh` (slot A decodes 64 tokens while slot B prefills 5246), pair + drafter, 35B-A3B host tier,
+5 of 5 runs: no fault, **ITL 1.26-1.28 ms/token** through the prefill, `20-28` decode-arm steps,
+`2 handovers`, `widest batch 2` on three of them.
+
+### 5. The cost, measured (single request each, 1 device, 35B-A3B `-ncmoe 40` np 4, prompt 5246, `-n 64`)
+
+| | pair OFF + MTP | pair ON + MTP |
+|---|---|---|
+| text | `cb8fa5a1790a` | **`cb8fa5a1790a`** |
+| arena | 17467.5 MiB (53.5 % residency) | 16192.5 MiB (49.6 %) |
+| expert hit rate | 0.9173 | 0.8968 |
+| prompt | 316-365 t/s | 364 t/s |
+| generation | 52.94 t/s | 48.22 t/s |
+
+i.e. the charged reserve is real: the draft's 3584 MiB term is the same in both arms and the pair's 1280 MiB
+term comes out of the arena, for ~1.7 pt of hit rate and ~9 % of a single-request decode rate on this shape.
+The 20-round soak and the ITL arm are the shapes where that trade pays (ITL 70 ms/token -> 1.3 ms/token through a
+5 246-token prefill).
+
+### 6. The six defects, each with the measurement that named it
+
+| # | symptom | mechanism | fix |
+|---|---|---|---|
+| 1 | `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` in `rms_norm_mul_rope_f32_qk_pair`, 40/40 requests, 15 s into a 4-slot soak with a drafter | the DRAFT context of an embedded MTP head (`general.architecture = qwen35`) keeps no `ctx_other`, so `slab_aux_slot()` returned 0 and its 512 MiB compute buffer shared the target's base-0 narrow view -- safe only while the two are serialised on one thread, and the pair runs them concurrently | `llama_context_params::ctx_aux` (set by the spec init when the pair is live) routes it to the slab's draft region; `is_draft` follows the same test |
+| 2 | `ROCm error: operation failed due to a previous error during capture`, abort in `hipStreamSynchronize` | the PREFILL arm re-reserved a compute buffer (3 devices x 768 MiB) while the DECODE arm was capturing its verify graph; the driver refuses an allocation during a capture and poisons it | `ggml_cuda_capture_excl_guard` -- an allocation takes the STEP 7h capture barrier exclusively (skipped on the recording thread), and the decode arm is reserved once at its widest batch at pair creation |
+| 3 | `ROCm error: dependency created on uncaptured work in another stream` in `ggml_cuda_peer_copy_staged` (1 of 3 soaks) | a cross-stream `hipStreamWaitEvent` issued while another thread recorded a graph -- the same class as 2 | the event wait and the peer staging copy take the barrier SHARED (the recording thread skips it) |
+| 4 | `HSA_STATUS_ERROR_MEMORY_FAULT` ("Page not present") in `ggml_cuda_ain_batch` at LOAD, with both aux regions present | the SECOND aux region is stacked BELOW the first, in the hole the first pin left "mapped" (`s.mapped` jumps over it) but never mapped -- a device write there faults | the commit maps the region when it lies entirely below the extent (and declines if the range really is mapped) |
+| 5 | the decode arm's 1280 MiB verify buffer left the slab for a plain `cudaMalloc` while the arena had given up 1280 MiB for it | the aux floor call passed the 1-based slab slot where the CUDA side takes 0-based, so it pinned a PHANTOM region one slot up and the real one was always sized by the first allocation -- and an aux region could not grow | pass `slab_aux - 1`; and let a pin GROW when nothing is live at that slot (the decode arm's first reserve is 768 MiB, its verify-width one 1280) |
+| 6 | (following the 5 fix) the slab's own recommendation named 2304 MiB for a shape whose two regions need 3328 | the census line totals the pinned floors, so #5's phantom pin and the undersized region made the number wrong too | no code change: with #5 the line reads `3328 MiB would host every auxiliary region (headroom 1536 + aux 1792)`, matching `COMMON_ARMS_RESERVE_MIB` + the draft term |
+
+Every one of them was invisible on the single-context server and on every single-request arm: #1-#3 need two
+contexts live at once, #4 needs two aux regions, #5/#6 need a drafter's verify width.  Reproductions (all with
+`GGML_CUDA_WORK_ALLOC_DEBUG=1` where a layout question was open) are in the soak/ITL logs under
+`~/.cache/rdna-boosts/arms-v2/step10/`.
+
+### 7. What is NOT claimed
+
+* no throughput claim: the numbers above are single runs at one request in flight, printed as a cost row;
+* the two slab SIZING items are follow-ups, not fixed here (`HANDOVER.md` §7.2/§7.8): `COMMON_ARMS_RESERVE_MIB`
+  is still one constant for a decode arm whose layout now depends on the drafter's verify width, and a
+  second/third aux context would need a per-context count (the slab's calibration line is the mechanism today);
+* `LLAMA_MTP_DEV_ROWS=1` is inert on the pair (the device h-row path binds `ctx_dft`'s state source to ONE
+  target context); it now says so in the log instead of silently reading the wrong arms' rows.
+
+---
+
 ## 2026-11-23 — STEP 10a: the draft round extracted for both arms (`WORKLOG.md` 261123.027)
 
 `steps/STEP-10a-0017-draft-round-extraction.patch` (`~/llama.cpp` `e7ae0b470`), `tools/server/server-context.cpp`

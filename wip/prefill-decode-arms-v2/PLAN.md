@@ -444,7 +444,15 @@ capture-off (fast) or hipBLASLt-off (1.8x slower) until a capture barrier exists
 
 ---
 
-## STEP 10 — re-admit the speculator on the pair
+## STEP 10 — re-admit the speculator on the pair  — **DONE 2026-11-24** (`f3e34859d`)
+
+> Landed as `steps/STEP-10-0018-speculator-on-the-pair.patch` (+ 10a, `e7ae0b470`).  The scope below was met; the
+> four things it did NOT anticipate are in `RUNS.md` §6 and were fixed in the same landing: the drafter's target
+> rows must follow the arm that ran the batch (`common_batch::ctx`), an embedded-MTP draft context keeps no
+> `ctx_other` and therefore had no pinned slab region (`llama_context_params::ctx_aux`), a compute-buffer
+> allocation and a cross-stream event wait may not overlap the other arm's graph capture, and the slab's aux
+> regions needed the floor's slot off-by-one fixed + growth-when-idle + a mapping for a region stacked under
+> another.  Gate: `gates/gate-arms-spec.sh`.  Open follow-ups: `HANDOVER.md` §7.2/§7.8/§7.9.
 
 Only after STEPs 4-9 are green.
 

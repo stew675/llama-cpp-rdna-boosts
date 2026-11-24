@@ -2943,3 +2943,86 @@ it removed an abort (r374-wip) -- so the per-shape rule above stands, now on the
    overlap, a graph capture, AND hipBLASLt.  With one request in flight (every gate), or capture off, or
    `ROCBLAS_USE_HIPBLASLT=0`, the shape passes -- which is why five gates and a 7-shape matrix were green on the
    same binary.  A concurrency defect on a two-context design needs an arm with two computes in flight.
+
+---
+
+## r375-wip (2026-11-24, `WORKLOG.md` 261124.001) — a DRAFT context may keep no `ctx_other`, and then it shares the target's compute base (`prefill-decode-arms` v2 STEP 10)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 10.
+
+1. **`cparams.ctx_other` is not "am I a draft context" — the constructor keeps it only for the archs that need a
+   target VIEW** (`gemma4-assistant`, `eagle3`, `dflash`, `qwen4exp`; `llama-context.cpp`, "TODO: more generic").
+   An **embedded MTP head of a qwen35 target** (the 27B/35B MTP shapes, i.e. the delivery's own MTP path) has its
+   own `tok_embd`/`output`, so `ctx_other` is `nullptr` and `slab_aux_slot()` returned 0: the draft's compute
+   buffer took the same slab narrow base as the target's.  On the single-context server that is SAFE only because
+   the two contexts are serialised on one thread (both buffers are scratch, dead between steps); with two arms it
+   is two live views of one base.
+2. **Measured**: 35B-A3B Q8_0 `-ncmoe 40`, pair + `draft-mtp-adaptive` n_max 7, 4 slots, `GGML_CUDA_WORK_ALLOC_DEBUG=1`
+   -- `GRAPH_RESERVE ctx=<draft> is_draft=0` and `WORK_ALLOC need=512 narrow=1 ret_off=0.0` (base 0) for the draft
+   while the decode arm held its own region, and `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` in
+   `rms_norm_mul_rope_f32_qk_pair` 15 s into the soak (40/40 requests failed).  **Rule:** a context that runs
+   CONCURRENTLY with its target needs its own compute scratch, and the flag must be explicit
+   (`llama_context_params::ctx_aux`), because the arch-derived `ctx_other` answers a different question.
+3. **The same class covers `draft-simple`** (its own model, no `ctx_other`): the spec init sets `ctx_aux` for every
+   draft context it creates **when the pair is live** (`ctx_tgt_alt != nullptr`), and only then, so the
+   single-context layout (and every A1-A6 anchor and rate) is untouched.
+
+## r376-wip (2026-11-24, `WORKLOG.md` 261124.001) — an allocation and a cross-stream event wait are NOT capturable by another thread: the capture barrier must cover both (`prefill-decode-arms` v2 STEP 10)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 10, extending r374-wip's barrier.
+
+1. **A device allocation may not overlap another thread's graph capture.**  The driver refuses it and POISONS the
+   capture; every later launch on that device then fails with `operation failed due to a previous error during
+   capture` -- so the aborting thread (`hipStreamSynchronize` inside `ggml_backend_cuda_buffer_set_tensor`) is not
+   the failing one (r374-wip item 2 again).  Measured: 4 slots on the host tier + a drafter, the prefill arm
+   re-reserved 3 x 768 MiB while the decode arm captured its verify graph -> 40/40 requests failed.
+   **Rule:** `ggml_cuda_capture_excl_guard` (EXCLUSIVE, and skipped on the recording thread, whose own pool
+   allocations are part of the capture) in `ggml_backend_cuda_buffer_type_alloc_buffer` -- the slab path maps VA and
+   evicts arena tables, so it is an allocation too.
+2. **A dependency on another stream's work is not capturable either**: `hipStreamWaitEvent` issued while a graph is
+   being recorded fails with `dependency created on uncaptured work in another stream`.  Same fix, SHARED side:
+   `ggml_backend_cuda_event_wait` and the peer staging copy (`ggml_cuda_peer_copy_staged`, which waits on its own
+   `d3d`/`done` events).  Measured once in three soaks.
+3. **Reserve a lazily-reserved second context UP FRONT at its widest batch** (`llama_graph_reserve` at pair
+   creation): it removes both window classes on every shape (the widest layout is allocated before either arm has
+   anything in flight) and it is what lets the slab's aux region be sized from the real layout (r377-wip).
+
+## r377-wip (2026-11-24, `WORKLOG.md` 261124.001) — the slab's AUX regions: a slot off-by-one, a pin that could not grow, and a hole that was "mapped" but absent (`prefill-decode-arms` v2 STEP 10)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 10 (`ggml-cuda-slab.cu`, the file blocks 12/15 own).
+
+1. **The floor call passed a 1-based slot where the CUDA side takes 0-based** (`slab_aux_slot()` returns 1/2, the
+   alloc path does `g_slab_compute_aux - 1`, `llama-context.cpp` passed it un-subtracted).  So
+   `slab_aux_floor` pinned a PHANTOM region one slot up -- visible as a `could not map ... aux narrow-3` warning on
+   a shape with ONE aux context -- and the real region was always sized by the first ALLOCATION.  **Rule:** two
+   call sites of one 1-based/0-based convention must be fixed together; a "no-op in practice" call is a defect.
+2. **An aux region could not grow, and the first request is NOT always the widest layout** (the pin's own comment
+   claimed it was).  Measured: the pair's decode arm reserves its prompt graph first (768 MiB) and its verify-width
+   graph after (1280 MiB) -> the pin refused the second for the whole run and the buffer took a plain `cudaMalloc`
+   *while the arena had given up 1280 MiB for it*.  Now: a pin grows when nothing is live at its slot, and the
+   commit maps only the new part below the old base.
+3. **A second aux region stacks BELOW the first, into the hole the first pin left.**  `s.mapped` jumps to the pin's
+   END, so the VA between the arena's top and the pinned base counts as mapped and has no physical behind it -> a
+   device write there is `HSA_STATUS_ERROR_MEMORY_FAULT` ("Page not present"), measured at LOAD in
+   `ggml_cuda_ain_batch` with a 512 MiB draft region under a 1280 MiB borrowing region.  The commit now maps a
+   region that lies entirely below the extent (and declines if the range really is mapped).  **Rule:** `mapped` is
+   an extent, not a map -- anything placed inside it must be mapped explicitly.
+4. **The census line is the operator's mechanism**: after these fixes the log reads `3328 MiB would host every
+   auxiliary region (headroom 1536 + aux 1792)` on the 35B-A3B pair+MTP shape, which is the
+   `GGML_CUDA_SLAB_RESERVE_MIB` to set (zero evictions at that value, both regions from the unmapped spare).
+
+## r378-wip (2026-11-24, `WORKLOG.md` 261124.001) — re-admitting a drafter to two contexts: what the text oracle must assert (`prefill-decode-arms` v2 STEP 10)
+
+*No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 10.
+
+1. **A text claim alone is VACUOUS for a drafter on the pair.**  If the drafter reads the wrong target context (the
+   prefill arm's rows instead of the batch's), every draft is garbage, every one is rejected, and the text is
+   unchanged -- the run looks perfect and the feature is silently dead.  The gate must assert drafts were **accepted**
+   (`#gen drafts > 0` AND `#acc drafts > 0`) as well as the decode-arm census.  Measured non-vacuity on the pair:
+   34/25, 32/26, 32/26 (48-token arms) and 74-181 drafts with 73-161 accepted (600-token axes).
+2. **A verify step emits up to `n_max + 1` tokens, so a soak's "two decoders shared one decode batch" check needs
+   more rounds to see the overlap**: at 16 tokens per request a decoder finishes in ~6 decode-arm steps, and one of
+   eight 10-round soaks never saw `widest batch >= 2` (no fault, no error -- the CHECK failed).  20 rounds: 2/2.
+3. **The pair's four-arm claim is `pair+draft == pair+none == single+draft == single+none`**, one fresh process per
+   arm, one request in flight, `-lv 4` (the text comes over HTTP for a server arm, so the census cannot pollute it).
+   Identical on 3 devices f16 (`f2753e13e419`), 3 devices q8_0 (`f2753e13e419`) and 2 devices f16 (`0f06ed90e017`).

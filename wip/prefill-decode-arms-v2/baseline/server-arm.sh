@@ -34,6 +34,9 @@
 #   --ready N          readiness timeout seconds (default 60)
 #   --req-timeout N    per-request curl timeout seconds (default 300)
 #   --timeout N        hard server timeout seconds (default 600)
+#   --nreq N           requests to send (default 0 = min(np, 2), i.e. two distinct requests).  A caller that
+#                      needs a SINGLE cold request (a four-axis arm, where two requests would put the second on
+#                      another slot -- another cell placement -- and a byte claim is per slot) passes 1.
 #   --concurrent       fire the requests at once (default: sequential)
 #   --vram-probe       while the server is LOADED (after the requests, before the teardown), write
 #                      $TAG.vram: one `gpu<N> total_bytes=... used_bytes=...` line per device, the server's
@@ -48,7 +51,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 OUT=""; TAG=""; MODEL=""; EXTRA=""; EXTRA_ENV=""
 NP=2; CTX=8192; NPRED=48; PORT=""
 PROMPT="$REPO/prompts/prose-rdna-boosts.txt"; PROMPT2="$REPO/prompts/reasoning.txt"
-READY=60; REQT=300; STIMEOUT=600; CONC=0; VRAM=0
+READY=60; REQT=300; STIMEOUT=600; CONC=0; VRAM=0; NREQ=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -66,6 +69,7 @@ while [ $# -gt 0 ]; do
         --ready) READY="$2"; shift 2 ;;
         --req-timeout) REQT="$2"; shift 2 ;;
         --timeout) STIMEOUT="$2"; shift 2 ;;
+        --nreq) NREQ="$2"; shift 2 ;;
         --concurrent) CONC=1; shift ;;
         --vram-probe) VRAM=1; shift ;;
         -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
@@ -139,6 +143,7 @@ PY
 }
 
 nreq=$(( NP < 2 ? NP : 2 ))      # two distinct requests is enough to exercise two slots
+[ "$NREQ" -gt 0 ] && nreq="$NREQ"
 t0=$SECONDS
 if [ "$CONC" = 1 ]; then
     pids=()

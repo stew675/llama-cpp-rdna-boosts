@@ -321,7 +321,8 @@ request arrives ──► prefill arm: prompt ubatches on ctx_tgt (its own batch
 2. The prefill arm never batches a slot it does not own, and the decode arm never touches a slot it does not own.
 3. Only **one** context may be inside `llama_process()` in the *decode band* at a time (the MoE device remap
    table is process-wide).  The prefill arm's wide pass may overlap a decode step, which is the point of the
-   feature; the **speculator's draft context is decode-band**, so drafting is serialised with the decode step.
+   feature; the **speculator's draft context is decode-band**, so drafting is serialised with the decode step --
+   enforced by `arms_spec_mtx`, which the decode arm holds across its own `llama_process(ctx_dec)` as well.
    *Corrected 2026-11-23 (`HANDOVER.md` §2):* the pair's host-expert GPU fault was **not** this invariant being
    violated — it was two contexts' COMPUTE buffers sharing one slab work base (I9).  The remap rule above still
    stands on its own (it is why a decode step and a prefill pass may overlap but two decode-band contexts may
@@ -331,12 +332,28 @@ request arrives ──► prefill arm: prompt ubatches on ctx_tgt (its own batch
 5. The response lifecycle (`print_timings`, `send_final_response`, `release`, the prompt cache) is **main-thread
    only**.  The decode arm may `process_token()`/stream (it must, for latency), and nothing else.
 
-**The speculator.**  v2 keeps the pair's ability to run a drafter, but only under rule 3: the decode arm drives
-draft/verify/accept for its slots, the prefill arm's ingest is bracketed by the same barrier, and **both** arms'
-speculator entry points take the one speculator mutex (V4).  A drafter whose target side is bound to one context
-(the layer-input families: eagle3/dflash/dspark/dflash2/lilicorr) or that shares the target's KV (a gemma4
-assistant) stays **refused** with a message: with one shared memory their assumption ("I am the only other user")
-is not just wrong, it is unreachable.  `--spec-type` on the pair is **off by default and guarded separately**
+**The speculator** (STEP 10, landed 2026-11-24).  The decode arm drives draft/verify/accept for the slots it owns,
+the prefill arm's ingest is bracketed by the same lock, and **both** arms' speculator entry points take the one
+speculator mutex (V4).  Three facts the implementation settled, each measured:
+
+* **the drafter's target-side reads follow the arm that RAN the batch** (`common_batch::ctx`): `ctx_dec` on the
+  decode arm, `ctx_tgt` on the prefill arm, with the h_nextn extraction enabled on both.  Reading `ctx_tgt` from
+  the decode arm would verify against the prefill arm's last pass -- garbage drafts, every one rejected, and the
+  TEXT unchanged (which is why the gate asserts drafts were ACCEPTED, not just produced);
+* the speculator lock is also the DECODE-BAND lock: the decode arm holds it across its own `llama_process(ctx_dec)`,
+  so the draft context (decode-band, rule 3) can never run beside a decode step.  It is recursive because a round
+  can end by printing the statistics line through `print_timings()`.  The prefill arm's WIDE pass does not take it;
+* a slot's speculative state (`spec_draft`/`spec_i_batch`/`spec_ckpt`/`spec_is_replay`) names a batch the OTHER arm
+  could not restore, so it is reset at every handover, with an assert that nothing is pending.  A speculating slot
+  is handed over only after its accept round RESOLVED -- a replay round (a context that cannot roll back in place)
+  keeps its draft and must stay where its checkpoint came from.
+
+A drafter whose target side is bound to one context (the layer-input families: eagle3/dflash/dspark/dflash2/
+lilicorr) or that shares the target's KV (a gemma4 assistant) stays **refused** with a message: with one shared
+memory their assumption ("I am the only other user") is not just wrong, it is unreachable.  The family refusal is
+a property of `common_params`; the gemma4 one needs the draft GGUF's `general.architecture`, which the predicate
+reads (one metadata key) so that the arena reserve and the pair decision still cannot disagree (V2).  The
+admitted set is `draft-simple`, `draft-mtp`, `draft-mtp-adaptive` and the model-free n-gram family.  `--spec-type` on the pair is **off by default and guarded separately**
 (STEP 7) until the shared-memory ladder is green; that ordering is deliberate — the speculator is what made the
 old design's concurrency unexplainable, and it must be re-admitted onto a foundation that is already sound.
 

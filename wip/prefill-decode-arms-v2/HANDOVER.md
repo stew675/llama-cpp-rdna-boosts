@@ -7,12 +7,12 @@ not been run says so.
 | | |
 |---|---|
 | delivery repo | `~/llama-cpp-rdna-boosts`, branch **`prefill-decode-arms-v2`**, HEAD = the **STEP 7e/8 landing** (the commit that carries this file; **`main` untouched** at `91a81505`) |
-| work tree | `~/llama.cpp`, branch **`arms-v2`** (**local only, never pushed**), tip **`e7ae0b470`** (STEP 10a), tree clean |
+| work tree | `~/llama.cpp`, branch **`arms-v2`** (**local only, never pushed**), tip **`f3e34859d`** (STEP 10), tree clean |
 | build | `~/bin/build-llama-rocm` → `build-rocm` (ROCm **10.2.0**); fast loop `cmake --build build-rocm --target llama-cli llama-server -j 16` |
 | extra build dirs | **`build-ref`** = a build of the delivery tip `089f90067` (the "pre-change build": the reference for a regression question), **`build-bisect`** = the last bisect rung's build.  Both at the same source path, so ccache stays warm |
-| landings | STEP 0-6e, **7a**, **7d**, **7c**, **7e** (STEP 4 broke the external draft head on a tensor split), **8** (the gate set), **7f** (a borrowing context carried an uninitialized `cparams.type_k`), **9** (the shape/latency/memory matrix) — §1.2 |
-| **next action** | **STEP 10 — in progress**: `10a` (the verify/accept round extracted, verified against the A5 record) is landed; the decode arm's draft round + the predicate + the handover reset + the three-way oracle are next (§3) |
-| after that | STEP 11 delivery sweep, STEP 12 candidate patch + the promotion ask |
+| landings | STEP 0-6e, **7a**, **7d**, **7c**, **7e** (STEP 4 broke the external draft head on a tensor split), **8** (the gate set), **7f** (a borrowing context carried an uninitialized `cparams.type_k`), **9** (the shape/latency/memory matrix), **10a/10** (the speculator on the pair + six memory defects) — §1.2 |
+| **next action** | **STEP 11 — the delivery regression sweep** (§3).  STEP 10 (the speculator on the pair) is CLOSED: the decode arm drives the draft/verify/accept round, the three-way oracle is green on 3 shapes and the four axes on the pair, and the six memory defects re-admitting it exposed are recorded in `RUNS.md` |
+| after that | STEP 12 candidate patch + the promotion ask |
 
 ---
 
@@ -66,15 +66,18 @@ nothing is copied between them.**  `llama_context_params::ctx_memory` is the onl
 | STEP 7g | `STEP-7g-0015-meta-split-state-per-slot.patch` | the Meta backend's split-state cache is a per-**buffer** member (`split_state_cache[8]` + one version pointer) on a buffer every context shares, so two arms computing at once raced it -- SEGV in `ggml_backend_meta_get_split_state`, 2 of 3 runs on a tensor-split pair arm.  Now indexed by the same `thread_local` view slot as the containers |
 | STEP 7h | `STEP-7h-0016-capture-blas-barrier.patch` | **the tensor-split blocker, fixed as the maintainer chose (a barrier, neither feature disabled)**: a graph capture holds one process-wide mutex exclusively, library GEMMs hold it shared, and `cublas_handle()`/`cublaslt_handle()` **creation** holds it exclusively — creation (`hipblasCreate` -> hipBLASLt -> legacy-stream sync) is what actually tripped, not the GEMM (`INVARIANTS.md` r374-wip).  Flash-Next tensor-split pair: **23.31 ms/token vs 53.99** (−56.9 %), 7 of 7 clean |
 | STEP 10a | `STEP-10a-0017-draft-round-extraction.patch` | `slot_accept_draft_round(slot, ctx, seq_rm_type)` extracted out of `post_decode` so BOTH arms run ONE verify/accept/emit round (the context is a parameter: the decode arm verifies on `ctx_dec`, which borrows the same memory).  Verified as a pure refactor against STEP 0 A5: axis K `a87c4318b649`, acceptance **74/73/435/423** |
+| STEP 10 | `STEP-10-0018-speculator-on-the-pair.patch` | the DECODE arm drives the whole draft/verify/accept round for the slots it owns; ONE speculator lock over both arms' paths (recursive: the round ends by printing the statistics); a slot's speculative state reset at BOTH handover directions; the predicate admits `draft-simple`/`draft-mtp`/`-adaptive`/ngram and refuses the layer-input families + a gemma4 assistant (asked of the GGUF arch INSIDE the predicate, so the reserve and the pair decision still cannot disagree).  Six memory defects fell out of it: the draft's target rows follow the arm that ran the batch (`common_batch::ctx`); `ctx_aux` gives a qwen35 MTP draft its own slab region; an allocation and a cross-stream event wait may not overlap the other arm's capture; an aux region maps its own hole, can GROW, and its floor call had the slab slot off by one.  Oracle: `gates/gate-arms-spec.sh` 30/30 on 3 shapes + 4 axes, `a87c4318b649` on the pair-off drafter path, default-inert PASS (`RUNS.md` 2026-11-24) |
 | STEP 9 | — (`baseline/shape-matrix.sh` + `server-arm.sh --vram-probe`) | the shape/latency/memory matrix: 7/7 shapes text-identical (3 repeats per arm), the cost table (+53..+154 MiB, 1280 MiB aux region on a host tier), the ITL/prefill trade (ITL −22.8 % at `-ub 2048`, prefill **+24 %**), and two corrections (the ITL gate's text check, one-run-vs-rate) |
 
 Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077`, 7e `3013e880a`, 7f `f61fcb03f`, 7g `ffbde9a41`,
-7h `f4540afd0`, 10a `e7ae0b470` (branch `arms-v2`, local only).
+7h `f4540afd0`, 10a `e7ae0b470`, 10 `f3e34859d` (branch `arms-v2`, local only).
 
 ### 1.3 Green, with the number that proves it (all re-measured after 7c)
 
 | claim | evidence |
 |---|---|
+| **the speculator ON the pair (STEP 10)** | `gates/gate-arms-spec.sh` **30/30 PASS**: `pair+draft == pair+none == single+draft == single+none` on 3 dev f16 (`f2753e13e419`), 3 dev q8_0 (`f2753e13e419`), 2 dev f16 (`0f06ed90e017`), drafts accepted on the decode arm (34/25, 32/26, 32/26); the four axes on the pair R `3a41e71cfaab` / K `8fe00a125d38` / P `fb4519c618ef` / C `4d46d5ab509d` with 74-181 drafts accepted; the pair-off drafter path unchanged (`a87c4318b649`, 74/73/435/423) |
+| **concurrency with a drafter** | `gate-arms-multislot.sh` + `--spec-type draft-mtp-adaptive` on the 35B-A3B host tier (np 4, 3 devices): PASS at `ROUNDS=20` 2/2 (`6 step(s), 2 handovers, widest batch 2`); `baseline/itl-arm.sh` pair+drafter **5/5 clean, ITL 1.26-1.28 ms/token** through a 5246-token prefill (70 ms/token solo) |
 | default path inert (pair OFF) | A1 4B `be904e86f248`, A2 27B-3GPU-tensor `10a82b5559a9`, A3 35B-A3B-host `e9db5cb8db0b`, A4 prefill-logit **KLD 0.000000 / same-top-p 100.000 %**, A5 K axis `a87c4318b649` (151.4 t/s, acc 0.98649/0.97241, pos-1 0.986), A6 server `{7bd542418112, 6ce1f88dd5f7}` + the **13-line startup shape byte-identical** to `baseline/A6-startup-shape.txt` |
 | the pair reads the single-context text | 4B `7bd542418112`/`6ce1f88dd5f7`; `gate-arms-n1-memory.sh` PASS (`01c9cbe2e895`/`5e69982c7d94` both arms, 0 of 8192 cells reserved); 27B-3GPU-tensor `f2753e13e419`/`c5f2fdc43642` |
 | the decode arm really runs | census `the decode arm is generating: N step(s), M handover(s), widest batch W slot(s)` — e.g. 8/3/3 and 15/3/**4** in the soaks |
@@ -93,14 +96,16 @@ Code tips: 7a `e460f0dea`, 7d `55aaf5398`, 7c `16131c077`, 7e `3013e880a`, 7f `f
 
 ### 1.4 Open
 
-* **STEP 10 (next):** re-admit the speculator on the pair (§3).  STEP 9 closed the matrix, the cost table and the
-  `ENVIRONMENT.md` §24 rows.
-* **Closed at STEP 8:** the five-gate set is complete and green (`gate-arms-{default-inert,n1-memory,itl,`
-  `multislot,recurrent-shared}.sh`), each printing its own non-vacuity line.  `RUNS.md` has the numbers;
-  `INVARIANTS.md` r368/r369-wip the facts.
-* **STEP 10:** re-admit the speculator on the pair.  Two prerequisites are *new* in this session: a drafter adds
-  two more compute layouts (the reserve question, §7.2) and the always-reserved layout (§2.7) needs re-measuring.
-* **STEPs 11-12:** delivery sweep, then the candidate patch + the promotion ask (§3).
+* **STEP 11 (next):** the delivery regression sweep (§3) — `scripts/validate-set.sh` plus the delivery gates the
+  touched files owe.  Note that STEP 10 landed changes in files the DELIVERY owns even with the pair off:
+  `include/llama.h`/`llama-cparams.h`/`llama-context.{h,cpp}` (`ctx_aux`, the aux pin fixes, the capture guards)
+  and `ggml-cuda-slab.cu` — every one of them inert for a single context, but the sweep is what proves it.
+* **Closed at STEP 10:** the speculator on the pair (§1.3 row 1, `RUNS.md` 2026-11-24).  Six memory defects came
+  out of it, four fixed here and two recorded as follow-ups (§7.2/§7.8).
+* **Closed at STEP 8:** the five-gate set (`gate-arms-{default-inert,n1-memory,itl,multislot,recurrent-shared}.sh`)
+  plus STEP 10's `gate-arms-spec.sh`, each printing its own non-vacuity line.  `RUNS.md` has the numbers;
+  `INVARIANTS.md` r368/r369-wip and r375..r378-wip the facts.
+* **STEP 12:** the candidate patch + the promotion ask (§3).
 
 ---
 
@@ -288,54 +293,63 @@ concurrent arm's composition picks the kernels and even the unmodified server va
 measured reserve and the VRAM delta per extra slot (and the fact that an aux context's compute region costs one
 chunk-rounded layout, §2.4).
 
-### STEP 10 — re-admit the speculator on the pair (IN PROGRESS: 10a landed; the rest is THIS list)
+### STEP 10 — re-admit the speculator on the pair (CLOSED 2026-11-24)
 
-**10a landed** (`e7ae0b470`): `slot_accept_draft_round(slot, ctx, seq_rm_type)` -- ONE verify/accept/rollback/emit
-round for both arms, context as a parameter.  Verified as a pure refactor against STEP 0 A5 on the drafter path
-(27B, `draft-mtp-adaptive` n_max 7, pair OFF, `-n 600`: axis K `a87c4318b649`, acceptance **74/73/435/423**).
+**Done, in two landings.**  10a (`e7ae0b470`) extracted `slot_accept_draft_round(slot, ctx, seq_rm_type)`; 10
+(`f3e34859d`, `steps/STEP-10-0018-speculator-on-the-pair.patch`) is everything else:
 
-**What is left, in order -- with the anchors and the traps, because this list IS the hand-off:**
+* `slot_draft_setup(slot, ctx, seq_rm_type)` and `slot_draft_ckpt(slot, ctx, seq_rm_type)` extracted from
+  `update_slots` the same way, so BOTH arms run one draft round -- and the whole round (setup -> draft -> ckpt) is
+  ONE critical section, because `common_speculative_draft()` clears every `drafting` flag when it returns,
+  including the flags the other arm just set;
+* the decode arm's round: draft setup -> draft -> checkpoints -> `handle_last_sampled_token(batch_dec)` (it already
+  appends the sampled token plus every draft row and fills `spec_i_batch`) -> `llama_process(ctx_dec)` ->
+  `common_speculative_process` -> `slot_accept_draft_round(..., can_finish=false)` per slot, else `slot_step`;
+* `arms_spec_mtx`, a **recursive** mutex, held by both arms' speculator paths AND across the decode arm's own
+  `llama_process(ctx_dec)` (the draft context is decode-band, DESIGN §8 rule 3).  Recursive because a round can end
+  by printing the statistics line through `print_timings()`.  The prefill arm's WIDE pass does not take it;
+* the slot's speculative state is reset at every handover, with an ASSERT that nothing is pending -- and a
+  speculating slot is handed over only after its accept round resolved (a REPLAY round keeps `spec_draft` and must
+  stay on the arm whose checkpoint produced it);
+* `common_arms_pair_possible()` admits `draft-simple` / `draft-mtp` / `draft-mtp-adaptive` / the n-gram family and
+  refuses the layer-input families and a gemma4 assistant -- the latter asked of the draft GGUF's
+  `general.architecture` INSIDE the predicate, so the arena reserve and the pair decision still cannot disagree
+  (V2); the server asks the loaded model the same question as a belt-and-braces check;
+* `ctx_dec_seq_rm_type`, and the decode arm is reserved ONCE at its widest batch at pair creation.
 
-1. **Extract `slot_draft_setup(server_slot &)` and `slot_draft_ckpt(server_slot &, llama_context * ctx)`** from
-   `update_slots` the way 10a did the accept round.  The first fills
-   `common_speculative_get_draft_params(spec, slot.id)` (`drafting/n_max/pos0/id_last/prompt/result/result_q/temp/
-   seed`) and pushes the slot into `drafting`; the second is the checkpoint block right after
-   `common_speculative_draft()` (`ckpt.update_tgt(ctx, ...)`, `llama_memory_seq_rm(llama_get_memory(ctx_dft), ...)`,
-   the `use_ckpt_tgt`/`use_ckpt_dft` pair).  Then the decode arm's round in `arms_decode_loop` (which today does
-   exactly one row per owned slot): draft setup for the owned slots -> `common_speculative_draft(spec.get())` inside
-   `queue_tasks.yield_to_queue` -> checkpoints -> **`slot->handle_last_sampled_token(batch_dec)`** (it ALREADY
-   appends the sampled token plus every draft row and fills `spec_i_batch` -- do not hand-roll it) ->
-   `llama_process(ctx_dec, ...)` -> `common_speculative_process(spec.get(), batch_dec)` ->
-   `slot_accept_draft_round(*slot, ctx_dec, ctx_dec_seq_rm_type)` per slot, else the existing
-   `slot_step(*slot, ctx_dec, slot->i_batch, false)`.  **Add `ctx_dec_seq_rm_type = common_context_can_seq_rm(ctx_dec)`**
-   next to `ctx_tgt_seq_rm_type` (~line 1197): the accept round needs the capability of the context that ran it.
-2. **ONE speculator mutex** (`std::mutex arms_spec_mtx`) around every `common_speculative_*` call from *either* arm
-   -- `spec` is one object, `common_speculative_draft()` asserts `dp.result->empty()` for the slots it drafts, and
-   `process`/`accept` are not reentrant.  Hold it for the host-side drafting/accepting only, NEVER across
-   `llama_process()` (that would delete the feature).
-3. **Reset the slot's speculative state in BOTH handover directions** (`arms_hand_over`, `arms_take_back`):
-   `spec_draft.clear(); spec_i_batch.clear(); spec_ckpt.clear(); spec_is_replay = false;` -- `spec_i_batch` and
-   `spec_ckpt` describe a batch the OTHER arm ran.
-4. **`common_arms_pair_possible()`** refuses every `has_aux()` today; admit `draft-mtp`, `draft-mtp-adaptive`,
-   `draft-simple` and the ngram family, keep the layer-input families and a gemma4 assistant refused.  This must
-   land in the SAME change as 1-3: admitting a drafter the decode arm cannot drive is a broken configuration, not a
-   partial feature.  Charge the drafter's reserve -- `common_draft_reserve_derive()` already prints both terms (the
-   pair's `COMMON_ARMS_RESERVE_MIB` plus the draft context's `kv + compute + slack`), and on a slab-armed shape the
-   slab's calibration log restates the sum; §7.2 is answered from that log rather than by argument.
-5. **The oracle:** the three-way cold text claim (`pair+draft-mtp` == `pair+none` == `single+draft-mtp`), one fresh
-   process per arm, one cold prefill per request, on **3 devices f16 / 3 devices q8_0 / 2 devices f16**; the MTP
-   four-axis protocol on the pair AND off; **`LLAMA_SERVER_PARK_IDLE_SLOTS=0` pinned on every arm**.  Instruments:
-   `baseline/mtp-axis.sh` (now `--model/--sm/--ncmoe/--ctx/--load/--md/--tag-prefix/--no-lock`),
-   `baseline/server-arm.sh`, `baseline/shape-matrix.sh`.  Also re-measure the two prerequisites: a drafter adds
-   **two more** compute layouts (the reserve, §7.2) and the always-reserved layout (§2.3) with a drafter live.
+**The oracle** is `gates/gate-arms-spec.sh` (new): the four-arm cold text claim on 3 shapes + the four-axis
+protocol on the pair, with non-vacuity (the decode-arm census, drafts AND accepted drafts) -- 30/30 PASS, plus
+`a87c4318b649` on the pair-off drafter path (the A5/10a value) and default-inert PASS.  Numbers: `RUNS.md`
+2026-11-24.
 
-**Traps this session already paid for:** `accept_special_token` was a *lambda local to two different functions*
-(now a member helper -- an extracted function at class scope cannot see a lambda); `slot.ctx_dft` is null with an
-embedded MTP head (both ckpt helpers handle that); the decode arm's batch must be constructed with `ctx_dec`,
-because `common_speculative_process()` reads the hidden rows through the batch's own context; and a slot handed to
-the decode arm must never be batched by the prefill arm again afterwards (invariant 2, already guarded).
+**What re-admitting it cost, and where it now lives** (`RUNS.md` §6 has the table): six memory defects, four fixed
+in this landing and two recorded as follow-ups (§7.2/§7.8).  Three of them needed two contexts live at once and
+would have been invisible to any single-request arm: the embedded-MTP draft sharing the target's base-0 slab view,
+a compute-buffer allocation / a cross-stream event wait overlapping the other arm's graph capture, and a second aux
+region landing in the hole the first one's pin left mapped-but-absent.
+
+**Traps this step paid for** (keep them):
+* `accept_special_token` was a *lambda local to two different functions* (now a member helper);
+* `slot.ctx_dft` is null with an embedded MTP head (both ckpt helpers handle that);
+* the decode arm's batch must be constructed with `ctx_dec`, because the drafter's target-side reads follow the
+  context that RAN the batch (`common_batch::ctx`);
+* `populate_token_probs()` read `ctx_tgt` for the logits -- wrong on the decode arm (a `n_probs` request would have
+  reported another context's distribution);
+* a control arm's PASS is not proof a defect is gone: the ITL and soak arms below faulted intermittently, so every
+  fix here was re-run at least twice (and the soak's overlap check needs `ROUNDS=20` with a drafter, because a
+  verify step emits up to 8 tokens and two decoders rarely share a 16-token batch).
 
 ### STEP 11 — the delivery regression sweep
+
+**Two additional items STEP 10 created:**
+* STEP 10 landed changes in files the DELIVERY owns even with the pair off: `include/llama.h` +
+  `src/llama-cparams.h` + `src/llama-context.{h,cpp}` (`ctx_aux`, the aux floor slot, the aux pin growth, the
+  capture guards) and `ggml/src/ggml-cuda/{ggml-cuda.cu,common.cuh,ggml-cuda-slab.cu}`.  Every one is inert for a
+  single context (A1-A6 and `gate-arms-default-inert` re-verified after them), but the delivery gates listed below
+  are what proves it on the delivery's own configurations -- and `ggml-cuda-slab.cu` is the file blocks 12/15 own.
+* README's definition of done wants the **shape matrix with a speculator ON and OFF**.  Runner with a drafter on
+  the pair is `gates/gate-arms-spec.sh` (3 shapes, 4 arms + the four axes); `baseline/shape-matrix.sh` itself has
+  no drafter arm yet -- adding one for the MTP-capable shapes (27B, 35B-A3B, Gemma4+its head) is owed here.
 
 `scripts/validate-set.sh`, plus `gate-prefill-logits.sh`, `gate-state-pipe.sh`, `gate-park-idle-slots.sh`,
 `gate-kv-residency.sh`, `gate-host-pool.sh`, `gate-spec-purity.sh`, `gate-mtp-dev-rows.sh`,
@@ -385,7 +399,8 @@ baseline/  r353-anchors.md        the anchors A1-A7 and how to re-run them
            inert-anchors.tsv      the default-inert cli TEXT anchors + each row's PROVENANCE (pre-change vs lock)
            inert-shapes/          one recorded startup shape per shape (+ the 4B pair-ON sensitivity fixture)
            server-arm.sh          start a server arm, drive N requests, hashes + the log; ONE TERM then wait;
-                                  `--vram-probe` = whole-server VRAM/RSS while LOADED (STEP 9's memory row)
+                                  `--vram-probe` = whole-server VRAM/RSS while LOADED (STEP 9's memory row);
+                                  `--nreq N` = how many requests (1 for a single-cold-request axis arm)
            shape-matrix.sh        STEP 9's measurement: N repeats x {pair off, on} per shape, text identity as a
                                   set + run-stability, VRAM delta per device, the reserve/aux/census lines
            itl-arm.sh             the ITL-through-a-prefill measurement (slot A decodes while B prefills)
@@ -401,6 +416,10 @@ gates/     gate-arms-default-inert.sh  pair OFF on 4 shapes: cli text + startup 
                                      prior; FAILS if a slab-armed shape gave the decode arm no region of its own
            gate-arms-recurrent-shared.sh  the probe as a gate on 35B-A3B + Flash-Next: placements DIFFER,
                                      concurrent == --solo, four-axis none == adaptive with drafts accepted
+           gate-arms-spec.sh         STEP 10's gate: the four-arm cold text claim (pair x spec) on 3 shapes,
+                                     the four-axis protocol ON the pair, and the non-vacuity lines (the
+                                     decode-arm census, drafts AND accepted drafts).  `--nreq 1` on the
+                                     axis arms, `-lv 4` for the statistics (the text comes over HTTP)
            probe-*.cpp              the five non-vacuity probes (host stream, ctx-memory, kv reservation,
                                     meta slots, recurrent placement) -- each compiles against the built tree:
    e.g.  /opt/rocm-10.2.0-gfx120X/lib/llvm/bin/clang++ -std=c++17 -O1 -pthread probes.cpp \
@@ -441,11 +460,18 @@ Every number of record is in `RUNS.md` (newest first) with its command and shape
    owned by blocks 12/15).  They are inert for the default path (A1-A6 unchanged; no aux context → no region, no
    calibration, no reserve change), but if the campaign is promoted they land in whichever block owns the slab —
    a block decision.
-2. **STEP 10's reserve.**  One aux region costs one chunk-rounded narrow layout (1280 MiB on the 35B-A3B shape,
-   512 MiB on Gemma4; the pair alone costs +53..+154 MiB of VRAM, STEP 9's table).  A pair **plus** a drafter means two more layouts, and the reserve is a single
-   approximation (`COMMON_ARMS_RESERVE_MIB`) plus the draft's own derived estimate.  Should the pair's constant
-   become a per-aux-context count, or is the slab's calibration log (set `GGML_CUDA_SLAB_RESERVE_MIB` from it)
-   the accepted mechanism?
+2. **STEP 10's reserve -- MEASURED 2026-11-24, the question is now a follow-up (see #8).**  On a slab-armed shape a
+   pair WITH a drafter needs **two** aux regions (draft 512 MiB + decode arm 1280 MiB on 35B-A3B Q8_0
+   `-ncmoe 40` np 4), and both are now pinned from the reserve rather than from the first request.  The slab's
+   calibration line states the right total: `3328 MiB would host every auxiliary region (headroom 1536 + aux
+   1792)`, and the reserve in force was 6400 MiB (draft 3584 + arms 1280 + headroom 1536), i.e. **the operator
+   sets `GGML_CUDA_SLAB_RESERVE_MIB=3328` from the log and both regions come from the spare with zero evictions**
+   -- the mechanism the question asked about does work.  What is NOT solved: `COMMON_ARMS_RESERVE_MIB` (1280) is
+   one constant for a decode arm whose narrow layout now depends on the DRAFTER's verify width (`np x (n_max+1)`
+   rows).  Measured cost of the current approximation on the shape above, single request each: arena 17467.5 ->
+   16192.5 MiB, hit rate 0.9173 -> 0.8968, generation 52.94 -> 48.22 t/s, text identical `cb8fa5a1790a`.  So the
+   pairing of the two terms is right (the decode arm's own layout is exactly 1280 MiB on this shape, whatever the
+   verify width) -- but it should be re-measured once on a shape where `n_parallel x (n_max+1)` is much larger.
 3. **The drop barrier.**  STEP 7d removes the pair's exposure by never dropping.  The general fix — a barrier so a
    drop can run while the other arm is *not* inside `llama_process()` — is not implemented and would let the drop
    (and its arena win) come back.  Worth a step of its own before STEP 12, or a documented follow-up after
@@ -474,3 +500,24 @@ Every number of record is in `RUNS.md` (newest first) with its command and shape
    clean** (was 2 of 3 aborts).  Text identity unchanged, the default-path startup shape unchanged, and
    `GGML_CUDA_CAPTURE_BLAS_BARRIER=0` is the kill switch.  `INVARIANTS.md` r374-wip records the three hypotheses
    that measurement killed on the way there.
+
+8. **The aux-region SIZE, as a follow-up (new 2026-11-24).**  Two things are now fixed (the floor call's off-by-one
+   and growth-when-idle), but the mechanism is still "a region is sized by what a context asked for, and only
+   grows while nothing is live at that slot".  A shape where a context's widest layout arrives *after* a view is
+   live would decline it (the log says `... exceeds the pinned ... and a view is live there; falling back` and the
+   buffer takes `cudaMalloc`, i.e. the reserve was charged and not used).  Not observed on any arm here (the
+   decode arm's widest layout arrives inside its FIRST reserve, which the pair now forces at creation), so it is a
+   hardening item, not a defect: the options are a per-aux-context reserve count (which the slab's calibration line
+   can state), or letting a pin be re-mapped while a view is idle.
+
+9. **`LLAMA_MTP_DEV_ROWS` is inert on the pair (new 2026-11-24).**  The device h-row path binds `ctx_dft`'s state
+   source to ONE target context (`llama_set_ctx_state_src`), and re-pointing it per round marks the scheduler for a
+   re-reserve -- i.e. it would cost the feature.  So the pair keeps the host readback (the delivery DEFAULT since
+   r293) and now SAYS so in the log rather than silently reading the other arm's rows.  A per-arm state source, if
+   wanted, is a follow-up; the delivery's own `scripts/gate-mtp-dev-rows.sh` does not cover the pair.
+
+10. **The soak's overlap check needs `ROUNDS=20` when a drafter is live (new 2026-11-24).**  `gate-arms-multislot.sh`
+    asserts that two decoders shared ONE decode batch at least once.  A verify step emits up to `n_max+1` tokens, so
+    a 16-token request finishes in ~6 decode-arm steps and two slots rarely overlap: at `ROUNDS=10` one run in eight
+    saw `widest batch 1` for the whole soak (no fault, no error -- the CHECK failed, not the server).  At
+    `ROUNDS=20` it is 2/2.  The check stays hard; the drafter arm is run with 20 rounds.

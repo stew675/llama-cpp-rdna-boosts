@@ -1,3 +1,51 @@
+## 261124.001 (no release; `prefill-decode-arms` v2 STEP 10) -- the speculator is ON the pair, and re-admitting it exposed six memory defects that only a second context, a third layout or a live drafter can reach
+
+STEP 10 closes: the DECODE arm drives the whole draft/verify/accept round for the slots it owns (`draft params ->
+common_speculative_draft -> checkpoints -> handle_last_sampled_token -> llama_process(ctx_dec) ->
+common_speculative_process -> the accept round`), one recursive `arms_spec_mtx` covers both arms' speculator paths
+and the decode arm's own `llama_process(ctx_dec)` (the draft context is decode-band), a slot's speculative state is
+reset at every handover with an assert that nothing is pending, and the pair predicate admits `draft-simple` /
+`draft-mtp` / `draft-mtp-adaptive` / the n-gram family while refusing the layer-input families and a gemma4
+assistant.  `f3e34859d`, `steps/STEP-10-0018-speculator-on-the-pair.patch`.
+
+Oracle: `gates/gate-arms-spec.sh` (new) -- the four-arm cold text claim (`pair+draft == pair+none ==
+single+draft == single+none`) on 3 devices f16 / 3 devices q8_0 / 2 devices f16 (30/30 checks), plus the four-axis
+MTP protocol ON the pair (R/K/P/C, 74-181 drafts accepted each), plus the pair-off drafter path unchanged
+(`a87c4318b649`, 74/73/435/423 -- the STEP 0 A5 value) and default-inert PASS on 4 shapes.  Concurrency with a
+drafter live: the 35B-A3B host-tier soak (np 4) PASS at 20 rounds, and the ITL arm **5 of 5 clean at 1.26-1.28
+ms/token** through a 5246-token prefill (70 ms/token solo).
+
+**The six defects, because they are the record** (details and the mechanism table in `RUNS.md` 2026-11-24, facts in
+`INVARIANTS.md` r375..r378-wip):
+
+1. the embedded-MTP draft context of a qwen35 target keeps no `ctx_other`, so it had NO pinned slab compute region
+   and shared the target's base-0 narrow view -- safe only while the two are serialised on one thread, and the pair
+   runs them concurrently: `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` in `rms_norm_mul_rope_f32_qk_pair`, 15 s
+   into a 4-slot soak.  Fixed with `llama_context_params::ctx_aux` (set by the spec init when the pair is live);
+2. a compute-buffer allocation on the prefill arm may not overlap the decode arm's graph capture -- the driver
+   refuses it and poisons the capture ("operation failed due to a previous error during capture").  Fixed with
+   `ggml_cuda_capture_excl_guard` (the STEP 7h barrier, exclusive for an allocation, skipped on the recording
+   thread) plus reserving the decode arm once at its widest batch at pair creation;
+3. the same class for a cross-stream dependency: `hipStreamWaitEvent` in `ggml_cuda_peer_copy_staged` ("dependency
+   created on uncaptured work in another stream").  The event wait and the peer staging copy take the barrier
+   shared;
+4. a SECOND aux region is stacked BELOW the first, in the hole the first pin left "mapped" (the extent jumps over
+   it) but never mapped -> `HSA_STATUS_ERROR_MEMORY_FAULT` at load in `ggml_cuda_ain_batch`.  The commit maps a
+   region that lies entirely below the extent;
+5. the aux floor call passed the 1-based slab slot where the CUDA side takes 0-based, so it pinned a PHANTOM region
+   one slot up and the real one was sized by the first allocation -- and an aux region could not grow, so the
+   decode arm's 768 MiB prompt-graph pin refused its 1280 MiB verify layout for the whole run.  Both fixed;
+6. consequence of 5 in the slab's own census (the recommendation was 2304 MiB where the two regions need 3328) --
+   no code change, and the line now matches `COMMON_ARMS_RESERVE_MIB` + the draft term.
+
+**Not fixed, recorded as follow-ups:** the aux pin can still only grow while nothing is live at its slot
+(`HANDOVER.md` §7.8); `LLAMA_MTP_DEV_ROWS` is inert on the pair and now says so instead of reading the wrong arm's
+rows (§7.9); the soak's overlap check needs `ROUNDS=20` with a drafter (§7.10).  The pair's reserve is still one
+constant: measured cost on the 35B-A3B host shape (single request each) arena 17467.5 -> 16192.5 MiB, hit rate
+0.9173 -> 0.8968, generation 52.94 -> 48.22 t/s, text identical -- the trade the campaign expects.
+
+---
+
 ## 261123.027 (no release; `prefill-decode-arms` v2 STEP 10a) -- the verify/accept round is extracted so BOTH arms can run it
 
 STEP 10 re-admits the speculator on the pair, and the decode arm must run the same draft/verify/accept round the
