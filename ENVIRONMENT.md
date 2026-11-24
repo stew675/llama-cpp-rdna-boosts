@@ -1866,9 +1866,11 @@ prefill graph stays wide) — which is the opposite of the withdrawn design's �
 
 | shape | pair OFF | pair ON | Δ ITL | prefill |
 |---|---|---|---|---|
-| Flash-Next GSQ IQ3_S, 3 dev `-sm tensor`, `-ub 4096`, **`GGML_CUDA_GRAPH_MAX_TOKENS=0`** | 53.83 ms/token | **22.89** | **−57.5 %** | +21.8 % |
-| ... the same with `ROCBLAS_USE_HIPBLASLT=0` (capture on) | 47.82 | 41.20 | −13.8 % | +18.3 % |
-| 27B Q8_0, 3 dev `-sm tensor`, `-ub 2048`, `ROCBLAS_USE_HIPBLASLT=0` | 64.45 | 60.30 | −6.4 % | +35.6 % |
+| Flash-Next GSQ IQ3_S, 3 dev `-sm tensor`, `-ub 4096`, **defaults (barrier)** | 53.99 ms/token | **23.31** | **−56.9 %** | +21.7 % |
+| ... with `GGML_CUDA_GRAPH_MAX_TOKENS=0` (before STEP 7h) | 53.83 | 22.89 | −57.5 % | +21.8 % |
+| ... with `ROCBLAS_USE_HIPBLASLT=0` (before STEP 7h) | 47.82 | 41.20 | −13.8 % | +18.3 % |
+| 27B Q8_0, 3 dev `-sm tensor`, `-ub 2048`, defaults (barrier) | 64.51 | 59.64 | −7.5 % | +31.4 % |
+| 27B Q8_0, 3 dev `-sm tensor`, `-ub 4096`, defaults (barrier) | 64.03 | 60.93 | −4.8 % | +25.1 % |
 
 **No pin is needed any more (STEP 7h).**  The abort that used to make a tensor-split pair arm die
 (`Hip error: 'operation would make the legacy stream depend on a capturing blocking stream' (906)`) is removed by

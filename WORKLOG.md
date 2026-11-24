@@ -1,3 +1,21 @@
+## 261123.026 (no release; `prefill-decode-arms` v2 STEP 9, the 27B row at defaults) -- the pair's ITL win is a property of the shape, not of the feature: 27B gains 7.5 %, Flash-Next 57 %
+
+The 27B tensor-split row was only measurable with hipBLASLt off before STEP 7h.  At delivery defaults (barrier on)
+it reads:
+
+| `-ub` | pair OFF | pair ON | Δ ITL | prefill |
+|---|---|---|---|---|
+| 2048 | 64.41 / 64.43 / 64.68 ms/token | 58.98 / 61.43 / 58.52 | **−7.5 %** | 1396 -> 1834 t/s (**+31.4 %**) |
+| 4096 | 64.12 / 63.93 (2) | 61.00 / 60.85 | −4.8 % | 1571 -> 1964 t/s (**+25.1 %**) |
+
+So the 27B confirms its hipBLASLt-off number (−6.4 % then) and the contrast with Flash-Next (−56.9 %) stands: the
+difference is not the barrier, it is that 27B's own decode is **64 ms/token**, so the prefill chunk wait the pair
+removes is a small fraction of it.  What the pair *always* buys on these shapes is prefill (+19…+31 %).
+
+**Record:** `RUNS.md` (the 27B table), `ENVIRONMENT.md` §24 (the tensor-split table now has the defaults rows).
+
+---
+
 ## 261123.025 (no release; `prefill-decode-arms` v2 STEP 7h) -- the tensor-split pair no longer aborts: the capture barrier, and the library call it had to guard (handle creation, not the GEMM)
 
 The maintainer chose the barrier over pinning either feature off, so both stay on: **hipBLASLt ON, graph capture

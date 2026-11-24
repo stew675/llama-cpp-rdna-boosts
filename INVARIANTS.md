@@ -2916,6 +2916,11 @@ where a chunk is long against a short decode, and it shrinks to ~6 % on a shape 
 per token.  The PREFILL is faster on every shape (+18…+36 %): the decoder's row no longer joins the prefill's
 batch.  A shape matrix that quotes one number for "the pair's speedup" is therefore wrong by construction.
 
+**Confirmed at delivery defaults after STEP 7h's barrier** (hipBLASLt ON, capture ON): 27B 3 devices `-sm tensor`
+`-ub 2048` 64.51 -> 59.64 ms/token (**−7.5 %**, prefill +31.4 %) and `-ub 4096` 64.03 -> 60.93 (−4.8 %, +25.1 %);
+Flash-Next `-ub 4096` 53.99 -> 23.31 (**−56.9 %**, +21.7 %).  The barrier did not change the shape dependence --
+it removed an abort (r374-wip) -- so the per-shape rule above stands, now on the shipping defaults.
+
 ## r374-wip (2026-11-23, `WORKLOG.md` 261123.025) — the library call that cannot run during a capture is its LAZY HANDLE CREATION, and the thread that aborts is not the thread that failed (`prefill-decode-arms` v2 STEP 7h)
 
 *No delivery revision:* `wip/prefill-decode-arms-v2/` STEP 7h.

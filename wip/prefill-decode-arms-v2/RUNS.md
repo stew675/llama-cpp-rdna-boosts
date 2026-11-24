@@ -151,6 +151,19 @@ overlaps two computes (which is why every sequential gate passed), `GGML_CUDA_GR
 `ROCBLAS_USE_HIPBLASLT=0` is clean.  `GGML_CUDA_CAPTURE_BLAS_BARRIER=0` restores the old behaviour (A/B and
 bisect; a pair arm then needs one of those two pins).
 
+**27B Q8_0, 3 devices `-sm tensor -mg 0`, at delivery defaults (hipBLASLt on, capture on, barrier on)** -- the
+number the earlier table could only give with hipBLASLt OFF:
+
+| `-ub` | pair OFF | pair ON | Δ ITL | prefill |
+|---|---|---|---|---|
+| 2048 | 64.41 / 64.43 / 64.68 ms/token (3 runs) | 58.98 / 61.43 / 58.52 | **−7.5 %** | 1396 -> 1834 t/s (**+31.4 %**) |
+| 4096 | 64.12 / 63.93 (2 runs) | 61.00 / 60.85 | −4.8 % | 1571 -> 1964 t/s (**+25.1 %**) |
+
+So the 27B reads essentially the same as its hipBLASLt-off measurement (−6.4 % then, −7.5 % now): this model's own
+decode is 64 ms/token, so the chunk wait the pair removes is a small fraction of it -- while its PREFILL gains a
+quarter.  The pair's ITL win is not a property of the feature, it is a property of `(chunk wait) / (own decode
+cost)`; quote it per shape or not at all.
+
 **Inertness of the barrier:** Flash-Next text identity unchanged (`4dbb571b8bdb` / `f1c288a48245`, 2 repeats per
 arm, both arms), `gate-arms-default-inert.sh --shapes 4b-1gpu` PASS (startup shape still byte-identical to the
 recorded one, so the barrier adds no log line), `gate-arms-itl.sh -ub 2048` PASS.
