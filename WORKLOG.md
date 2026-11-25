@@ -71,7 +71,9 @@ gfx1151-only, which under-charged nobody and over-charged everyone else.
 the native arm), and passes 6/6 on r360.  `gate-prefill-logits.sh` **0.000000 / 100.000 %** (no GPU faults).
 Byte-identical greedy text against the r359 build on 1 GPU (`1c5d32ac537d`), 3-GPU `-sm tensor` (`1c5d32ac537d`) and
 the 16K q8_0 prefill (`990793afb918`); a real q8_0-KV FA run on the RDNA2 `gfx1036` iGPU generates (`f33aec64cbab`,
-14.0/3.2 t/s on 2 CUs).  `validate-set.sh` green (19 default + 2 optional, applied tree `4674dd9f2e…`), the optional
+14.0/3.2 t/s on 2 CUs).  `validate-set.sh` green (19 default + 2 optional; release.json now records the r360 **re-cut** tip
+`3be8b9bd1`, tree `4674dd9f2e…`, i.e. what `fork-refresh.sh` printed and pushed -- the patches were re-exported from
+that chain so their `From` lines name the commits the fork carries), the optional
 `0100`/`0101` re-cut onto the r360 tree (`831bc116a…` / `f455c3121…`, cumulative `8bd172df5…`; 0101 needed one
 textual conflict resolved because block 10 owns `fattn-rdna.cuh`), the file-set reconciliation reads 0 unexplained.
 
