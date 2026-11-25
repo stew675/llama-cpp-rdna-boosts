@@ -252,7 +252,11 @@ packaging stays in CI:
   still carries the *previous* release's digest.  Run it from anywhere after the worker reports
   `pushed` (anonymous read works, the package is public): it needs only `skopeo`, or `curl` + `jq` for
   ghcr.io.  `--push` runs the same check itself and now FAILS the push step if a tag does not resolve,
-  so the watcher's failure signal fires instead of a silent no-op.
+  so the watcher's failure signal fires instead of a silent no-op.  Run it on the tree whose
+  `release.json` you mean to verify — the release's tag/commit, or `main` when that *is* the release.  A tree
+  carrying a release that is still being cut (a bumped `release.json`, no tag yet) correctly reports the
+  new release's `-<release>` tags as `MISSING`; that is the check answering "has this release been
+  published", not a defect.
 - `docker-ghcr.yml` no longer runs automatically (no tag or schedule trigger);
   it is a manual `workflow_dispatch` fallback.
 
