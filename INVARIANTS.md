@@ -3404,3 +3404,48 @@ vacuous probe).  A `--kv-unified` AMD server therefore decoded with a CPU attent
    `sparse` by observation, every arm's text **`f6f0a8fd998b`** = the sha r311 pinned for the same-regime arms, i.e.
    the GPU rows path is bit-identical to the previously-validated dense form on that shape.  Negative controls: a
    `... assigned to device CPU` line, a stripped audited-probe verdict and `splits = 25` each still FAIL.
+
+## r359 (2026-11-25, `WORKLOG.md` 261125.002) — the `--kv-unified` K/V-rows form is a LOSS on RDNA at every shape this box can reach, and it silently costs the derived kq mask: it is opt-in (block 05, GitHub issue #365)
+
+r358 made the rows form run on the GPU on AMD (issue #363).  The reporter then measured it as a 17 % decode loss at
+90k on a single R9700 and asked whether it should be declined where the band applies.  The answer is stronger: it
+loses everywhere measurable, so the delivery's default went back to the dense form and the rows form became
+`LLAMA_KV_ROWS_DISABLE=0` (upstream's "do not disable" = the opt-in; unset/`1` = off).
+
+1. **A rows graph cannot take the derived (materialised-mask-free) kq mask — enabling the rows form silently DISABLES
+   the derived form, and the derived form is the cheaper of the two.**  The two are alternatives by construction: a
+   rows graph builds `ggml_flash_attn_ext_rows` and no plain `ggml_flash_attn_ext` node, so the derived-mask probe's
+   graph never contains its op and r308's `require_observed` disables it.  Measured on gfx1201, 27B Q8_0,
+   `-kvu -np 2`, `-lv 4`: rows on -> `derived kq mask flash attention was not used in the probe graph, set to
+   disabled`; rows off -> `derived kq mask flash attention enabled`.  A rows graph therefore MATERIALISES
+   `n_kv_rows x n_tokens` f16 of mask per ubatch and host-fills it, where the dense form allocates no mask at all and
+   the kernel derives causality from positions.  This is the mechanism behind the reporter's Flash-Next arm, where
+   the `LLAMA_KV_ROWS_DISABLE=1` run lost ~7 GiB of expert arena: the switch changes the mask form, not just the
+   attention kernel.  qwen4exp (Flash-Next) has neither the rows nor the derived probe reachable through its own
+   probe graph, so it reads the dense form either way (`INVARIANTS.md` r308's item 3 shape) — do not assume a
+   Flash-Next A/B is isolating the FA kernel.
+2. **The rows form is the stream-k MMA kernel, and at decode width the MMA family loses to the band/tile family at
+   EQUAL work — the compaction has to beat that, and it does not.**  gfx1201, ONE R9700, `--kv-unified -np 2`,
+   `-ctk/-ctv q8_0`, 94428-token prompt, greedy (`--temp 0 --top-k 1`), same-seed text identical across every arm:
+   * Qwen3.8-27B-UD-Q5_K_XL, `-c 131072`, the prompt into slot 0 (row list == the whole extent): rows on pp 833.6 /
+     tg 14.74 vs rows off pp 847.1 / **tg 23.41** (+59 %).  Then a 5246-token prompt into slot 1 while slot 0 stays
+     resident (row list 18x shorter, the shape the rows form exists for): 1219.3 / 25.96 vs 1223.2 / **27.23** (+5 %).
+   * Flash-Next GSQ-RCO-IQ3_XXS (host experts, `-ncmoe 47 --host-experts pool`): 1998.9 / 14.80 vs 1994.9 /
+     **18.20** (+23 %), and 1654.4 / 31.98 vs 1664.2 / **34.34** (+7 %) on the compacted shape.
+   * Inside the MMA family alone (`GGML_HIP_FA_BAND_WMMA=0`, dense model): rows 14.74 vs dense 21.78 — the row list
+     itself costs ~32 % at equal work (`use_indices` in the native q8_0 loader is a per-row gather where the dense
+     arm reads tile rows contiguously).
+   So a compaction of 18x does not pay for the kernel-family switch, let alone a compaction of 1x.  A user who wants
+   the form can have it (`LLAMA_KV_ROWS_DISABLE=0`), and it is still correct there (r358's three fixes) — it is just
+   not the delivery's default.
+3. **The opt-out must be measured on the shape the REPORT is about, and the two forms are a family switch, so text is
+   the wrong instrument for it.**  `-kvu` coherence (27B Q8_0, 20 greedy tokens, 1 GPU and 3 GPUs `-sm tensor`) reads
+   `42 chars sha=bdebe52759ef` on the r359 default and the same on an r356 build (whose AMD rows form was declined by
+   the probe) — i.e. the default is byte-identical to pre-r358.  Within the rows form, the r358 gates' text equality
+   still holds; ACROSS the two forms a text difference is expected and is not evidence of a defect.
+4. **A delivery default flip must be pinned by its gate, not left to the probe's phrasing.**  `gate-fused-probe-
+   splits.sh` gained a `default` arm (no env at all) that must log `K/V rows attention: dense form`, must never log a
+   rows-form claim, and must read the same greedy text as the `rows-off` control; every arm that exercises the form
+   now asks for it explicitly.  Measured (gfx1201, 3 GPUs `-sm layer`, Flash-Next GSQ-IQ3_XXS, bf16 KV,
+   `-c 32768 -np 2`, 5246-token prefill + 48 greedy tokens): 7 arms, `default` + `rows-off` identical, every graph
+   `splits = 4`, no CPU placement, no GPU fault.

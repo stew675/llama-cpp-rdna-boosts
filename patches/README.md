@@ -1349,6 +1349,28 @@ almost all of them `template-instances/*.cu`.
   rows form must not be PLACED ON THE CPU and `splits` stays bounded -- `enabled` itself is now the correct
   verdict, `KVROWS_EXPECT=enable|obs|place` pins the box) + `scripts/gate-prefill-logits.sh` (inert: 0.000000).
   `WORKLOG.md` r358 entry, `INVARIANTS.md` r358.
+
+  **Since r359 (GitHub issue #365) that form is OPT-IN: `LLAMA_KV_ROWS_DISABLE=0`.**  Making the rows form run on
+  the GPU exposed what it costs there, because it is the ONE attention form that only the MMA kernel reads, and the
+  reporter measured it as a 17 % decode loss at 90k on a single R9700.  Measured here (gfx1201, ONE R9700,
+  `--kv-unified -np 2`, `-ctk/-ctv q8_0`, 94428-token prompt, same-seed text identical in every arm -- so this is a
+  form/placement decision, not a numerics one): 27B UD-Q5_K_XL `-c 131072`, one resident slot -> rows on
+  pp 833.6 / tg 14.74 against rows off pp 847.1 / **tg 23.41**; the same server with a 5246-token prompt on the
+  second slot (a row list 18x shorter) -> 1219.3 / 25.96 against 1223.2 / **27.23**; Flash-Next GSQ-RCO-IQ3_XXS
+  (host experts) -> 1998.9 / 14.80 against 1994.9 / **18.20**, and 1654.4 / 31.98 against 1664.2 / **34.34** on the
+  compacted shape.  With the band disabled, i.e. inside the MMA family alone, the row list costs **~32 %** at equal
+  work (per-row `use_indices` gather vs contiguous tile rows).  An 18x compaction therefore does not pay for the
+  kernel-family switch.  The second half is a coupling that is invisible in a text gate: a rows graph builds
+  `flash_attn_ext_rows` and no plain `flash_attn_ext` node, so the **derived kq mask probe cannot observe its op and
+  the derived (materialised-mask-free) form is DISABLED** -- a rows graph then host-fills `n_kv_rows x n_tokens` f16
+  of mask per ubatch where the dense graph allocates none.  That is also what made the reporter's
+  `LLAMA_KV_ROWS_DISABLE=1` arm lose ~7 GiB of expert arena on Flash-Next: the switch changes the mask form, not just
+  the kernel.  The switch keeps upstream's meaning on both sides of the flip (`0` = do not disable = opt in,
+  unset/`1` = off), r358's three correctness fixes stay (they are what makes the opt-in arm usable), and the dense
+  default is byte-identical to a pre-r358 build (`-kvu` 27B Q8_0 20 greedy tokens: `42 chars sha=bdebe52...` on 1 and
+  3 GPUs, equal to an r356 build).  `scripts/gate-fused-probe-splits.sh` gained a `default` arm that pins the flip
+  (no env = `K/V rows attention: dense form`, no rows claim, text == the `rows-off` control) and every arm that
+  exercises the form now asks for it.  `WORKLOG.md` 261125.002, `INVARIANTS.md` r359, `DIAGNOSTIC.md` §8.
 * **The other fused-op probes say HOW they verified (r311, `TODO` #345).**  r308's fix was one flag on one
   probe; the class is wider.  `llm_fused_op_probe` gained `query_supports_op`: when the probe graph does not
   CONTAIN the audited node, `resolve_fused_ops()` asks the acting DEVICE instead

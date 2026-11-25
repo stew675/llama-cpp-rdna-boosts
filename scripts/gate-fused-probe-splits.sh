@@ -53,6 +53,12 @@
 #     (`PROBE_AUDIT` below).  A change to a model builder, to a descriptor, or to a `cparams.fused_*`
 #     default that moves a verdict fails here.  This is the cheap arm: no model load, one arch per arm,
 #     ~2-5 s each, and it covers every arch that builds these ops.
+#   * **(r359, issue #365) the DELIVERY DEFAULT takes the DENSE form**: the `default` arm sets no env at all
+#     and must log `K/V rows attention: dense form` and never a rows-form claim.  The upstream form became
+#     opt-in (`LLAMA_KV_ROWS_DISABLE=0`) after it measured 17-59 % of decode at 90k depth on gfx1201 and
+#     cost the derived (mask-free) kq mask -- measurements in `INVARIANTS.md` r365.  Every arm that
+#     exercises the rows form below therefore ASKS for it; `rows-off` is the same default spelled out and
+#     must read the same text as `default`.
 #   * the REAL-MODEL arms (llama-server, the default): the kv_rows behaviour r308 fixed --
 #     `dense-always` arm (the QSA policy gfx1100/gfx1201 use) and the `sparse` arm (`LLAMA_QSA_DENSE_
 #     DECODE_UNTIL=0`, which forces the same vacuity on ANY arch): `sparse` declines the op BY OBSERVATION
@@ -97,7 +103,9 @@
 #                 a box whose backend refuses it (the pre-r358 AMD state).  `dense-always`/`mtp-rdna34` accept either
 #                 -- the CPU-placement check and the `splits` bound are the hard part, never the verdict alone.
 #   SPLITS_MAX    the backend-segment bound (default: 1 on NGPU=1, NGPU+1 otherwise -- see above)
-#   ARMS          a space-separated subset of: plain dense-always sparse rows-off mtp mtp-rdna34
+#   ARMS          a space-separated subset of: default plain dense-always sparse rows-off mtp mtp-rdna34
+#                 (`default` = no env = the r359 delivery default, dense; every other arm but `rows-off`
+#                 asks for the rows form with LLAMA_KV_ROWS_DISABLE=0)
 #   PORT          base port (default 18113; each arm takes PORT+index)
 #
 # Exit: 0 = PASS, 1 = FAIL (gate), 2 = usage/prerequisite error.
@@ -366,19 +374,23 @@ if [ "$MTP" = 1 ] && { [ -z "$DRAFT" ] || [ ! -f "$DRAFT" ]; }; then
     MTP=0
 fi
 
-ARMS="${ARMS:-plain dense-always sparse rows-off}"
+ARMS="${ARMS:-default plain dense-always sparse rows-off}"
 [ "$MTP" = 1 ] && ARMS="$ARMS mtp mtp-rdna34"
 
 # arm -> env assignment (empty = none).  The policy arms re-create another arch's QSA policy on this box:
 # 1000000000 == "dense always" (gfx1100/gfx1201) and 0 == "sparse always" (forces the vacuity anywhere).
 arm_env() {
+    # r359: the rows form is OPT-IN (`LLAMA_KV_ROWS_DISABLE=0` -- upstream's "do not disable"), so every arm
+    # that is meant to EXERCISE it asks for it, `rows-off` is the same delivery default spelled out, and
+    # `default` is the delivery default with no env at all (the arm that asserts the opt-in is off).
     case "$1" in
-        plain)        echo "" ;;
-        dense-always) echo "LLAMA_QSA_DENSE_DECODE_UNTIL=1000000000" ;;
-        sparse)       echo "LLAMA_QSA_DENSE_DECODE_UNTIL=0" ;;
+        default)      echo "" ;;
+        plain)        echo "LLAMA_KV_ROWS_DISABLE=0" ;;
+        dense-always) echo "LLAMA_KV_ROWS_DISABLE=0 LLAMA_QSA_DENSE_DECODE_UNTIL=1000000000" ;;
+        sparse)       echo "LLAMA_KV_ROWS_DISABLE=0 LLAMA_QSA_DENSE_DECODE_UNTIL=0" ;;
         rows-off)     echo "LLAMA_KV_ROWS_DISABLE=1" ;;
-        mtp)          echo "" ;;
-        mtp-rdna34)   echo "LLAMA_QSA_DENSE_DECODE_UNTIL=1000000000" ;;
+        mtp)          echo "LLAMA_KV_ROWS_DISABLE=0" ;;
+        mtp-rdna34)   echo "LLAMA_KV_ROWS_DISABLE=0 LLAMA_QSA_DENSE_DECODE_UNTIL=1000000000" ;;
         *)            echo "ERROR" ;;
     esac
 }
@@ -520,6 +532,7 @@ box_want() { # arm -> obs|place|auto|enable|skip
         dense-always|mtp-rdna34) echo place ;;   # place on a box that cannot read the rows form, enable on one that can
         sparse)                  echo obs ;;     # arch-independent: the probe graph builds no rows node
         rows-off)                echo skip ;;    # LLAMA_KV_ROWS_DISABLE=1: the probe never runs (control)
+        default)                 echo skip ;;    # r359: no env at all -- the opt-in must be OFF (asserted below)
         *)                       echo "$KVROWS_EXPECT" ;;
     esac
 }
@@ -541,6 +554,24 @@ case " $ARMS " in
     *" rows-off "*) grep -q "Flash Attention over K/V rows enabled" "$KEEPOUT/rows-off.log" 2>/dev/null \
         && fail "rows-off: the control arm reported the rows form enabled" || pass "rows-off: no rows-form claim (control)" ;;
 esac
+# r359: the DELIVERY DEFAULT must be the dense form, with the probe never run.  This is the regression
+# (issue #365: the rows form cost 17-59 % of decode at depth, and its materialised compacted mask cost the
+# derived kq mask), so it is asserted, not reported.
+case " $ARMS " in
+    *" default "*)
+        if grep -q "Flash Attention over K/V rows enabled" "$KEEPOUT/default.log" 2>/dev/null; then
+            fail "default: the delivery default reported the rows form enabled -- it is opt-in since r359 (LLAMA_KV_ROWS_DISABLE=0), see INVARIANTS.md r365"
+        elif grep -q "K/V rows attention: dense form" "$KEEPOUT/default.log" 2>/dev/null; then
+            pass "default: the delivery default takes the dense form and never probes the rows form (opt-in, r359)"
+        else
+            fail "default: no 'K/V rows attention: dense form' line -- the r359 opt-in decision did not run (see $KEEPOUT/default.log)"
+        fi
+        if grep -q "K/V rows attention: requested" "$KEEPOUT/default.log" 2>/dev/null; then
+            fail "default: the opt-in was requested on an arm that sets no env -- something else turned the rows form on"
+        else
+            pass "default: nothing turned the rows form on without the opt-in"
+        fi ;;
+esac
 
 # the text must be identical across arms that decode the SAME regime.  `rows-off` is deliberately the OTHER
 # regime (the dense mask form), so it is only comparable when `plain` declined the rows form too (a box whose
@@ -561,6 +592,7 @@ HAVE() { case " $ARMS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 rows_regime() { # arm -> rows|dense
     case "$(decline_of "$1")" in enable) echo rows ;; *) echo dense ;; esac
 }
+if HAVE default && HAVE rows-off; then same_text default rows-off "default vs rows-off (both the dense form)"; fi
 if HAVE plain && HAVE rows-off && HAVE dense-always; then
     if [ "$(rows_regime plain)" = "$(rows_regime rows-off)" ]; then
         same_text plain rows-off "plain vs rows-off (same rows regime)"

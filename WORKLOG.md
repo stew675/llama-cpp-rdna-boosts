@@ -16,6 +16,81 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.002 (r359, release) -- the `--kv-unified` K/V-rows form is OPT-IN: it cost 17-59 % of decode at depth and silently disabled the derived (mask-free) kq mask (GitHub issue #365); `v18-919794500-r359`
+
+**Release v18-919794500-r359** -- base `919794500`, tip `003c88e1f`, default tree
+`3910c43846612385fbf120d6b8ae0f1b4ecf867a` (was `84d50a416...`), 19 default patches (18 official + `0300`),
+`rdna-boosts-all.patch`; both optional artifacts re-cut against the new tree (`0100` alone `0bf09806b`, `0101` alone
+`51de75b7b`, cumulative `707eb474c`) and both still apply strictly.  **One block changed: 05.**
+
+**The report (issue #365, @DanoPTT).**  After r358 their `--kv-unified -np 2` server stopped warning and the rows form
+began running on the GPU, and on a single R9700 it made deep decode **17 % slower** than the r345 dense form (Qwen3.8-27B
+UD-Q5_K_XL, q8_0 KV, 90k, MTP `draft-mtp n3`, acceptance unchanged at 0.590 vs 0.600): "the RDNA4 band and its q8_0
+fetch-ahead decline the rows form, so these head-256 q8_0 layers fall to the stream-k MMA path".  Asked whether the rows
+form could be declined when the band applies, and why `LLAMA_KV_ROWS_DISABLE=1` also changed prefill (-45 %) and the text
+on Flash-Next.  Context worth recording: the r358 release was cut by an agent after a request that had only asked for a
+reply to issue #363.
+
+**Reproduced on gfx1201** (ONE R9700, `--kv-unified -np 2`, `-ctk/-ctv q8_0`, a 94428-token prompt, greedy
+`--temp 0 --top-k 1`, each visit a fresh server).  Same-seed **text is identical in every arm and every shape**, so this
+is a form/placement decision, not a numerics one:
+
+| arm (rows on = r358 default) | 27B UD-Q5_K_XL `-c 131072`, prompt on slot 0 | Flash-Next GSQ-RCO-IQ3_XXS (host experts) |
+|---|---|---|
+| rows on (r358) | pp 833.6, tg 14.74 | pp 1998.9, tg 14.80 |
+| rows off (r345 default) | pp 847.1, **tg 23.41** (+59 %) | pp 1994.9, **tg 18.20** (+23 %) |
+| rows on, 5246-token prompt on slot 1 next to the resident 90k (row list 18x shorter) | pp 1219.3, tg 25.96 | pp 1654.4, tg 31.98 |
+| rows off, same shape | pp 1223.2, **tg 27.23** (+5 %) | pp 1664.2, **tg 34.34** (+7 %) |
+| rows on vs off with the band disabled (`GGML_HIP_FA_BAND_WMMA=0`), 27B | tg 14.74 vs **21.78** | -- |
+
+So the rows form loses even where it compacts an 18x-shorter row list, and inside the MMA family alone the row list
+itself costs ~32 % (its native q8_0 loader gathers row by row where the dense arm reads tile rows contiguously).
+
+**The second mechanism, and the answer to their question 2: enabling the rows form DISABLES the derived kq mask.**  The
+two are alternatives by construction: a rows graph builds `ggml_flash_attn_ext_rows` and no plain `ggml_flash_attn_ext`
+node, so the derived-mask probe's graph never contains its op, `require_observed` refuses it, and the mask is then
+MATERIALISED (`n_kv_rows x n_tokens` f16 per ubatch, host-filled) where the dense form allocates no mask at all and the
+kernel derives causality from positions.  Measured (`-lv 4`, 27B Q8_0 `-kvu -np 2`): rows on ->
+`derived kq mask ... was not used in the probe graph, set to disabled`; rows off -> `derived kq mask ... enabled`.  That
+is also the mechanism behind their Flash-Next `LLAMA_KV_ROWS_DISABLE=1` arm losing ~7 GiB of expert arena (a -45 %
+prefill / -40 % decode follow from the evictions), i.e. the switch was never isolating the FA kernel.  On our box the two
+arms' startup memory breakdowns were identical and both shapes read one text, so their absolute Flash-Next deltas are a
+VRAM-tight (Windows, 32 GB) effect, not a second defect.
+
+**The fix (block 05): the form is opt-in.**  `cparams.auto_fkvr` now requires `LLAMA_KV_ROWS_DISABLE=0` ("do not
+disable", so the variable means the same thing on both sides of the flip) plus `--kv-unified`; unset or `1` is the dense
+form, i.e. the pre-r308 behaviour, which is what a delivery default must be when the alternative is a measured loss.  r358's
+three correctness fixes stay -- they are what makes the opt-in arm usable, not a way to make it the default.  The probe
+still runs on request and still grades the hardware capability.  Verified: the default is byte-identical to a **pre-r358**
+build (`-kvu` 27B Q8_0, 20 greedy tokens, `42 chars sha=bdebe52759ef` on 1 GPU and on 3 GPUs `-sm tensor`, equal to an
+r356 build), the opt-in reproduces the r358 numbers and text, and the KLD point is unaffected.
+
+**Gates.**  `scripts/gate-fused-probe-splits.sh` (updated: a new `default` arm -- no env, must log
+`K/V rows attention: dense form`, must never claim the rows form, and must read the same text as `rows-off`; every arm
+that exercises the form now sets `LLAMA_KV_ROWS_DISABLE=0`) **PASS, 7 arms**, gfx1201 3 GPUs `-sm layer`, Flash-Next
+GSQ-IQ3_XXS, bf16 KV, `--kv-unified -c 32768 -np 2`, 5246-token prefill + 48 greedy tokens: `default` `decline=none` and
+`rows-off` both `f6f0a8fd998b` (the r311/r358 pinned sha for that shape), the four opt-in arms `enabled`, `sparse` by
+observation, every graph `splits = 4` (= the layout bound), no CPU placement, `check-gpu-faults.sh` clean.
+`scripts/gate-spec-purity.sh` **PASS** (manifest A `c1f9d0b3f5b6` / B `2fbc183348a8`, the eight axes `000b437b135b`,
+`c1f9d0b3f5b6`, `eb89102cb7d8`, `a87c4318b649`, `2fbc183348a8`, `4d87b7b221f7`, `eb89102cb7d8`, `a87c4318b649` -- all
+the shas r358 recorded -- and the width probe `worst maxdiff 0` on both cache types).  `scripts/gate-prefill-logits.sh`
+**mean KLD 0.000000** against the recorded 10.2 base.  `scripts/validate-set.sh` **OK** on the final tree (fresh-tarball
+strict apply, 19 + 2 checksums, both optional artifacts alone and cumulative, Windows portability 519 files, file-set
+reconciliation 0 unexplained, the header-closure check clean).  `check-shlib-symbols.sh` 16/16 libraries,
+`check-gen-docs.sh` clean (no option added), whole-set `all` build at the tip.  Coherence on the final build: `-kvu` 27B
+Q8_0 20 greedy tokens reads `42 chars sha=bdebe52759ef` on 1 GPU and on 3 GPUs `-sm tensor` -- the pre-r358 (and r356
+binary) value.  The last source edit after the ladder was a two-line COMMENT fix in `src/llama-context.cpp`; the probe
+gate was re-run on that final build (PASS) and the purity/KLD arms do not reach the changed lines.
+
+The frozen beta candidate (`beta/prefill-decode-arms/`, three patches) was re-applied on the new default tree and still
+applies strictly, producing tree `a8f070fb2`; it is not re-cut (it is frozen as a code reproduction, `AGENTS.md`) and
+its README's recorded tree predates this release.
+
+**Docs.**  `DIAGNOSTIC.md` §8 (the repointed opt-in, its default and why), `INVARIANTS.md` **r359** (four facts: the
+derived-mask coupling, the seven-arm form table, the family-switch caveat for text, and "the default is pinned by the
+gate"), `patches/README.md` block 05, `MANIFESTS.md` gate 05, `AGENTS.md`'s gate table (do not re-enable it by default),
+`scripts/README.md`.  The reporter's two questions are answered in the issue with the measurements.
+
 ## 261125.001 (no release; tooling) -- the r358 container images never existed: the worker's stale watcher pinned the RETIRED ROCm 10.1, and a push's exit status was treated as proof of publication (GitHub issue #364)
 
 Reported by **@tazmaniax**: `server-rocm-10.2-v18-919794500-r358` and `server-rocm-7.14.1-v18-919794500-r358` both
