@@ -1,7 +1,9 @@
 # ENVIRONMENT.md — environment variables that affect this repo
 
-**Block numbering (r288, count corrected r327).**  The default set is the 17 official blocks `0000`-`0016`
-plus the temporary `0300`; the optional blocks are `0100` (two-lane prefill) and `0101` (mixed K/V cache types).  Rows and
+**Block numbering (r288, count corrected r327 and r356).**  The default set is the 18 official blocks
+`0000`-`0017` plus the temporary `0300`; the optional blocks are `0100` (two-lane prefill) and `0101` (mixed K/V
+cache types).  Block 17 is the TQ1_0 / TQ2_0 (ternary) GPU path from r356 — it took the ordinal the two-arm server
+carried until r352, which is now `beta/prefill-decode-arms/` (§23/§24 below).  Rows and
 sections below name the block that owns the code; a row added before r288 keeps the number it was written
 with (an `rNN` row that says "block 15" means the streamed KV, today's block 14 — see `WORKLOG.md` r288).
 
@@ -1905,3 +1907,17 @@ prefill +21.7 %), 7 of 7 runs clean.
 | variable | default | class | notes |
 |---|---|---|---|
 | `GGML_CUDA_CAPTURE_BLAS_BARRIER` | **`1` (on)** | **kill switch** | The capture/library barrier above.  `0` restores the pre-barrier behaviour: a pair arm on a `-sm tensor` split then needs `GGML_CUDA_GRAPH_MAX_TOKENS=0` or `ROCBLAS_USE_HIPBLASLT=0`, or it aborts 2 of 3 runs (`INVARIANTS.md` r374-wip).  Inert with one context — the barrier is a `shared_mutex` pair around a capture and a library call, and a single context never has the two in flight at once. |
+
+## 25. TQ1_0 / TQ2_0 (ternary) weights on the GPU (block 17, r356)
+
+A ternary model had no CUDA/HIP path before r356: the two types were refused by `supports_op` and the CPU backend
+ran every matmul.  The block adds `MUL_MAT` / `GET_ROWS` / the dequantise rows for them, default-on.  All three
+variables are read once, on first use (`static const`), so they must be set before the process starts.  The
+surrounding contract (bit-identity to the CPU's AVX2 path, and why the accumulation must not be fused) is
+`patches/README.md` → block 17 and `GREEDY-PURITY.md` §109.
+
+| variable | default | class | notes |
+|---|---|---|---|
+| `GGML_CUDA_TQ` | **`1` (on)** | **kill switch** | `0` refuses `TQ1_0`/`TQ2_0` again in `supports_op` (both `MUL_MAT` and `GET_ROWS`), so the weights stay in host memory and the CPU backend runs them — the pre-r356 behaviour, and the arm any A/B against "what it used to be" must use.  The exit census then reports all five counters 0 (`gate-tq.sh` checks that, because a kill switch that leaves the path live is not a switch). |
+| `GGML_CUDA_TQ_FUSE` | **`1` (on)** | **kill switch** | `0` takes the two decode fusions *and* the decode-width `graph_optimize` reorder away: Q/K/V stop sharing one launch, gate+up+SWIGLU and matmul+residual-ADD go back to separate ops.  Every fused result is bit-identical to the separate ops, so this moves no text — it is the arm that proves the fusion is not needed for correctness, and the one `gate-tq.sh` uses to prove the census `vec_fused` counter is live. |
+| `GGML_CUDA_TQ_CENSUS` | `0` (off) | **diagnostic** | Prints one WARN line per device when the context is freed: `TQ_CENSUS dev=<d> mul_mat small=<n> mma=<n> get_rows=<n> vec=<n> vec_fused=<n>` — the small-batch kernel, the RDNA4 int8-WMMA kernel, `GET_ROWS`, decode launches, and the extra nodes those decode launches took on top of their first matmul.  Host-side counts: a replayed graph adds nothing.  `mma` is 0 on a non-RDNA4 device by construction, which is not a failure. |

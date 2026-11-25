@@ -1,5 +1,23 @@
 # The delivery patches — what each block is and what it does
 
+> **r356: a new official block 17 — TQ1_0 / TQ2_0 (ternary) weights on the GPU (contributor PR #358, `@overdoingism`).**
+> A ternary model (`BitNet` b1.58 and its conversions) had no CUDA/HIP path at all: `supports_op` refused the two
+> types, the weights stayed in host memory and the CPU backend ran every matmul, so `-ngl 99` decoded a TQ model at
+> CPU speed.  Block 17 adds `MUL_MAT` (not `MUL_MAT_ID`), `GET_ROWS` and the fp16/fp32/bf16 conversions, designed so
+> that the result is **bit-identical to the CPU backend's x86 AVX2 path** — `test-backend-ops` with
+> `LLAMA_TEST_OP_NMSE=1` reads **exactly 0 on all 305 `MUL_MAT` and all 84 `GET_ROWS` values**.  That identity is
+> an ACCUMULATION property: ggml-cpu's `_mm256_add_ps(_mm256_mul_ps(..), sumf)` is **not** contracted (vmulps +
+> vaddps, no vfmadd in either `ggml_vec_dot_tq*_0_q8_K`), so the kernels' per-Q8_K-block accumulation is an unfused
+> mul and add via `TQ_FMUL`/`TQ_FADD`.  The submitted patch used `fmaf` there and its "every reported error is
+> exactly 0" did **not** reproduce: 25 of 61 `MUL_MAT` cases read ~1e-14 and the split was diagnostic (all 36
+> `k=256` cases 0, all 25 `k>256` cases not) — the integration carries the fix, and `scripts/gate-tq.sh` is the
+> instrument (`GREEDY-PURITY.md` §109).  Two further integration adjustments: a strided TQ1_0 weight keeps the
+> small-batch kernel (the MMA path converts the weight flat and asserted on contiguity — a decline, not an abort),
+> and the commit's claims are restated to what reproduces here.  Block 17 is default-on (`GGML_CUDA_TQ=0` refuses
+> the types again) and inert for every non-TQ model (text and throughput identical, 1 GPU and 3-GPU `-sm tensor`).
+> The number 17 was the two-arm server's until r352 (it stays in `beta/prefill-decode-arms/`); the ordinal is
+> positional again, exactly as `0101`'s was after r288.
+
 > **r334: three RDNA2 (`gfx1030`) items from contributor PR #338, folded into the blocks that own the code —
 > blocks 05, 08 and 10 — each compile-gated to the RDNA2 device pass and armed at run time from the device's
 > `cc`, so gfx1201/gfx1151/gfx1100 keep their numerics (verified: byte-identical greedy text on three models,
@@ -719,7 +737,8 @@ packed one on a tile-selected layout, +0.6-1.3 % pp512 there and one abort class
 | 14 | `0014-…-block-14-the-streamed-KV-a-fixed-VRAM-re` | **streamed KV** (opt-in, `--kv-window N\|auto`; the attendance pool `--kv-attendance-pool on\|off`; the MTP draft window `--spec-draft-kv-window N\|auto`, default `0`) (+ r248: the MTP draft window is a true ring for batches whose positions do not advance, a drafter failure can no longer fail a request, and the reserve reads the draft context's own ubatch — issue #297; + r264: the attendance pool is NOT SUPPORTED on a shared host/device pool (refused by design, one WARN — `TODO` #300 retired), `--fit` offers a placement only where this model+device can take it and prints the advice at WARN, and `gate-kv-residency.sh` grades the refusal, the hint and its own UMA reference arm; + r286: a region-backed buffer's 2-D state directions are **1-D only in both interfaces** (a 2-D device copy on the window's VMM region is refused by the driver on some stacks, which aborted a mixed gfx1100+gfx1201 `-sm tensor` server's prompt-cache save — issue #313), the block is gathered/scattered on the device (`ggml_cuda_cpy_2d_rows`) so a slot save+load went 4 686 → 24.5 ms on a windowed split, `--kv-window`/`--kv-attendance-pool` are common options (they were missing from `llama-bench` and every other non-server tool), `llama-bench` accepts `--kv-window`, and the spill's per-token cost is modelled on the **calibrated in-place read rate** (16-29 GB/s on gfx1201, its own measurement rather than the copy engine's, which is the number that diverges on a card reading its aperture slowly) — `ENVIRONMENT.md` §17.0, `benchmarks/2026-11-14-kv-window-313.md`); **r294: this is the block that makes a hole MAPPING-BACKED, so it carries the storage/transport split** — `host_expert_master_mapped()` (a hole set exists and `llama_mmap::SUPPORTED`) replaces five `use_mmap` tests, in `host_expert_buft`, both pool gates, `init_mappings` and the per-tensor mapped-or-read decision, so NO load mode can turn `-lme` into "pin the whole set" (measured: `-lme 30` under `--load-mode dio` pinned 48 284.6 MiB with no pool before, 31 363.7 MiB with the pool after, 0 mapping memcpys in both); **r295: the shipped text loses the superseded `11-26 %` spill cost** — `common/arg.cpp`'s `--kv-window` help line and `common/fit.cpp`'s placement hint now say the cost is linear in the depth past the window (nothing at or above the run depth), which is what the docs have said since r292 -- `TODO` #331, no computed number moves | +8004 / −971 | 51 |
 | 15 | `0015-…-block-15-the-UMA-GTT-expert-store-an-APU` | **the UMA GTT expert store** (an APU's MoE expert set in one registered, mlocked region; `-lme` sizes it and is the streaming opt-in) | new in r263: the arena tier per `-lme`, the MTP head pinned outside that budget, the direct fill, the RDNA3_5 transport start arm and prefill streaming.  A model whose weights do not fit RAM is refused at load with the fix; the store/arena is inert on a discrete GPU (measured); **r294: the PLACEMENT transport is the one decision that must NOT follow `--load-mode`,** so `MOE_HOST_POOL_BULK_DIO` is renamed `MOE_HOST_POOL_PLACEMENT_MODE=dio|buffered` and is reported once per load (`+1 675 MiB` of page cache on `dio` against `+31 796 MiB` on `buffered` for a 47.9 GiB placement, measured cold), and `-lme mirror` reaches the GTT store's budget too; **r295: the pool exchange's inertness is NAMED** — the exit census reports `sink no-demote tables (...)`, the sub-mirror pools whose demote cannot be expressed (`n_slices != 0` or `host_bytes != expert_bytes`), so a `-sm tensor` split's `0 demoted / 0 declines / 0 retirements` carries its reason -- `TODO` #334; **r337: the ARENA arm declares its hole set, so its master is the read-only model mapping** (issue #347).  The arena makes no `-lme` plan by construction, so `host_expert_master_mapped()` said "not mapped" and the loader allocated a pageable copy of the WHOLE expert set on every `--load-mode` (18 662.0 MiB / 23 649 MiB peak `RssAnon` on 35B-A3B; 46 800 MiB in the reporter's Flash-Next).  `plan_gtt_expert_store()` now records its tables in `host_experts_holes`, and the predicate accepts the arena as a hole source; the two census lines that named the discrete pool on this tier were corrected | +4949 / −368 | 16 |
 | 16 | `0016-…-block-16-the-server-s-prompt-admission-p` | **the server's prompt admission policy**: the max-min fair share of the step, the per-step `CHUNK`, the shortest-remaining `SKEW` and the prefill/decode `DUTY` cycle (moved OUT of block 12 at r301 -- `TODO` #339; `ENVIRONMENT.md` §22) | +367 / −2 | 3 |
-| — | *(withdrawn)* | **block 17, the two-arm server — withdrawn from the delivery at r352**; it lives in [`../beta/prefill-decode-arms/`](../beta/prefill-decode-arms/README.md) (apply with `--include-beta`), it is not counted in `v<N>`, and its gates are beta-only | — | — |
+| 17 | `0017-…-block-17-TQ1_0-TQ2_0-ternary-weights-on-` | **TQ1_0 / TQ2_0 (ternary) weights on the GPU**: `MUL_MAT` + `GET_ROWS` + the fp16/fp32/bf16 conversions, bit-identical to the CPU's AVX2 path (default-on, `GGML_CUDA_TQ=0` refuses the types again) — contributor PR #358, r356 | +974 / −2 | 9 |
+| — | *(withdrawn)* | **the two-arm server — was block 17 until r352, withdrawn from the delivery**; it lives in [`../beta/prefill-decode-arms/`](../beta/prefill-decode-arms/README.md) (apply with `--include-beta`), it is not counted in `v<N>`, and its gates are beta-only | — | — |
 | 0300 | `0300-…-block-0300-relaxed-tensor-split-mode-TEM` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` (in the default apply, but NOT an official block: it is not counted in `v<N>`) | +130 / −17 | 12 |
 
 Block 05's file count is `template-instances/*.cu` (the FA kernel instantiations); block 10 is the
@@ -6342,7 +6361,76 @@ per-step cost is dominated by a fixed term (a pooled/streamed KV), where the tim
 or two steps and the prefill stretch is what is left; the gate reports that shape as "no room to improve"
 instead of pretending.
 
-## Block 17 — WITHDRAWN FROM THE DELIVERY AT r352 (the two-arm server)
+## Block 17 — TQ1_0 / TQ2_0 (ternary) weights on the GPU (new at r356, contributor PR #358)
+
+TQ1_0 (1.69 bpw) and TQ2_0 (2.06 bpw) are the ternary types a `BitNet` b1.58 model and its conversions use.
+`ggml-cuda` had no path for either: `supports_op` refused them, so with `-ngl 99` the weights stayed in host memory
+and the **CPU backend ran every matmul** — a TQ model decoded at ~11 t/s on a box with three R9700s.
+
+**What it owns.**  `tq.cu` + `tq.cuh` (new), `common.cuh` (the TQ1_0 trit decode and the `tq_census`), `convert.cu`
+(+ `dequantize.cuh`: the fp16/fp32/bf16 dequantise rows), `getrows.cu`, `mmvq.cu` (one predicate: TQ never takes
+mmvq), `ggml-cuda.cu` (`supports_op`, the `MUL_MAT` dispatch, the census at teardown, and the decode-width
+`graph_optimize` reorder) and one fusor in `ggml-cuda-try-fuse.cu`.  Nothing outside `ggml/src/ggml-cuda/` is
+touched, so the other backends keep refusing the types exactly as before.
+
+**The contract: bit-identical to the CPU backend's AVX2 path.**  This is the block's whole design, not a nice-to-have:
+a 2-bit weight multiplied by a Q8_K activation has no dynamic range to spare, so a "close enough" GPU result is a
+different model.  `ggml_vec_dot_tq{1,2}_0_q8_K` is reproduced exactly — src1 is quantised to Q8_K as
+`quantize_row_q8_K_ref` does (the float `+12582912.f` rounding trick, no contraction), each 256-value block's integer
+dot is split into the CPU's **eight 32-bit lanes** (lane L takes the values whose index mod 32 is `4L..4L+3`, minus
+the Q8_K `bsums` of values `32L..32L+31`), each lane is accumulated over the blocks with **one unfused mul and add**
+by `y.d*x.d`, and the eight lanes are summed in `hsum_float_8`'s order.  The disassembly is the evidence for the last
+point: a Release clang/GCC `ggml-cpu` emits `vmulps` + `vaddps` for the CPU's `_mm256_add_ps(_mm256_mul_ps(...))`
+and **no `vfmadd`** in either function, so `fmaf` in a kernel is a 1-ULP-per-block difference — invisible to every
+hash and every greedy text, visible only as a nonzero NMSE on every `k > 256` (`GREEDY-PURITY.md` §109; the
+submitted patch shipped it, and this block carries the fix).
+
+**The kernels.**  Decode (one src1 column) is a vec kernel where every thread block quantises src1 into shared memory
+itself (no separate quantise launch), eight threads per weight row, one per CPU lane; with `GGML_CUDA_TQ_FUSE`
+(default on) one launch also takes the Q, K and V projections (and `graph_optimize` moves V/K directly behind Q so
+they are adjacent — same nodes, one stream, so the values are those of the separate ops), gate + up + SWIGLU
+(computed as the GLU kernel computes it), or a matmul + its residual ADD.  2..16 columns take a small-batch `dp4a`
+kernel; larger batches on **RDNA4** take an int8 WMMA kernel (one K = 32 MMA per block and CPU lane, the accumulator
+starting at minus the lane's Q8_K sum, 16x16 output tiles read straight from global memory into the WMMA registers),
+with TQ1_0 converted to TQ2_0 first (the same trits, the same `d`); every other arch, and a TQ1_0 weight that is not
+contiguous, stays on the small-batch kernel, which takes any batch.  `GET_ROWS` dequantises 4 values a thread through
+the shared dequantise helpers, so the same code serves f16/f32/bf16.
+
+**Knobs** (`ENVIRONMENT.md` §25): `GGML_CUDA_TQ=0` is the kill switch — the types are refused again and the pre-block
+behaviour returns (the CPU backend runs them); `GGML_CUDA_TQ_FUSE=0` takes the decode fusions and the `graph_optimize`
+reorder away; `GGML_CUDA_TQ_CENSUS=1` prints, once per device at teardown,
+`TQ_CENSUS dev= mul_mat small= mma= get_rows= vec= vec_fused=`.
+
+**Measured** (one R9700, gfx1201, ROCm 10.2, `llama-bench -fa 1 -p 512 -n 128 -r 3`, mean t/s, against
+`GGML_CUDA_TQ=0` = the CPU backend, i.e. r355's behaviour): Llama3-8B-1.58 TQ2_0 pp512 **4177 vs 258**, tg128
+**181.5 vs 21.8**; TQ1_0 pp512 **3693 vs 99.5**, tg128 **198.2 vs 16.1**.  The same-seed greedy text is identical in
+all three arms (default / `TQ_FUSE=0` / `TQ=0`) on both models, at a 64-token and a 200-token generation, on 1 GPU
+and on a 3-GPU `-sm layer`/`-sm tensor` split.  A non-TQ model is untouched: Qwen3.5-4B Q8_0 pp512 8306 → 8325,
+tg128 105.04 → 104.97 (noise) and byte-identical text on 1 GPU and 3-GPU `-sm tensor`; the 35B-A3B Q8_0 host-expert
+shape byte-identical on 3 GPUs.
+
+**Gates.**  `scripts/gate-tq.sh` (MANIFESTS gate 42): the op oracle **with NMSE** (61/61 `MUL_MAT`, 16/16
+`GET_ROWS`, and every one of the 305/84 reported errors exactly 0, with the fused-accumulation failure diagnosed from
+its `k=256`-vs-`k>256` split), the three-arm text identity on both models, the census (the path ran, the fusions
+fired, and `TQ=0` leaves all five counters at 0), and the default-path neutrality hash.  A release also owes the
+ordinary ladder — block 17 touches block 10's dispatcher, so `gate-lora-fusion.sh` and `gate-prefill-logits.sh` are
+in the release's gate set.
+
+**Provenance.**  Contributor PR #358 (`@overdoingism`), one `git am` file cut against r353, integrated as a block at
+r356 with the accumulation fix, the contiguity decline and the restated claims; its campaign record (what was
+measured and what was refused) is [`../archive/work/tq-hip/`](../archive/work/tq-hip/README.md).
+
+**Not covered:** `MUL_MAT_ID` (a TQ MoE keeps its experts on the CPU backend, so a ternary MoE half-runs on the GPU —
+the model's own output layer may also stay on the host, as `models/bitnet.cpp`'s `tok_embd` FIXME does), draft/MTP
+decoding with a TQ model, the **CUDA (nvcc) build** of `tq.cu` (only HIP is compiled here; the `#pragma clang fp
+contract(off)` is clang-guarded and `TQ_FMUL`/`TQ_FADD` fall back to `__fmul_rn`/`__fadd_rn`, and `-use_fast_math`
+flushes subnormals, so a CUDA build's bit-identity is unverified), and a CPU reference other than x86 AVX2 (the
+oracle *is* the AVX2 path; an ARM build accumulates in another order).  A TQ1_0 prefill also converts the weight it
+is about to read, which costs one extra TQ2_0 copy of it per distinct layer size in the pool (~16 MB on an 8B
+model) — measured inert at the rates above.
+
+## The two-arm server — WITHDRAWN FROM THE DELIVERY AT r352 (it was block `0017` from r346 to r351; the official
+## number 17 is REUSED by the TQ block above from r356, exactly as `0101`'s was reused after r288)
 
 The two-arm server is **not in `patches/`** and is **not part of the delivery** as of **r352**.  It is
 releaseable, and its open issues (a GPU page fault on the cache-disabled host tier that reproduced with
@@ -6351,7 +6439,8 @@ have not been settled, so it was withdrawn rather than shipped.
 
 * It lives in [`../beta/prefill-decode-arms/`](../beta/prefill-decode-arms/README.md) as one optional
   candidate; apply it with `scripts/apply-all.sh --include-beta` (never by default).
-* `release.json` records **17 official blocks** (`n_blocks`), so the release prefix is `v17-`.
+* `release.json` recorded **17 official blocks** (`n_blocks`, prefix `v17-`) from r352 until r355; from r356 it
+  is 18 (`v18-`) because a different block 17 — the TQ block above — took the number.
 * The block's full per-block reference (what it contains, its knobs, its measured numbers and its gate
   ladder) moved verbatim into `beta/prefill-decode-arms/README.md` at r352 — this set no longer carries it.
 * Its gates (`gate-arms-spec.sh`, `gate-draft-ctx.sh`, `gate-arms-soak.sh`, and the block-17 rows of

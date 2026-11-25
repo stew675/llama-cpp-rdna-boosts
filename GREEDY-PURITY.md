@@ -3247,3 +3247,41 @@ two-slot unified server answered `209 5cc901c01994` / `316 6f84cc5be35a` in both
 **Record.**  This entry; `scripts/gate-gdn-norm-gate.sh`; `patches/README.md` block 10; `ENVIRONMENT.md` §7.1;
 `MANIFESTS.md` gate 41; `INVARIANTS.md` r353; `WORKLOG.md` 261123.004; §60 rule 2 (the fused-norm reduction
 contract this inherits) and §49 (the multi-sequence fusion class the `ne[3]` guard keeps it out of).
+
+## 109 (r356, block 17) — an "identical to the CPU" kernel matches the CPU's ROUNDING, not its source: an unfused CPU mul+add is not an fma, and the fused version moves no hash
+
+**Claim.**  Block 17 (TQ1_0 / TQ2_0 on the GPU, contributor PR #358) is designed to be **bit-identical to the CPU
+backend's x86 AVX2 path**, and the PR stated that `test-backend-ops … LLAMA_TEST_OP_NMSE=1` reported "every error
+exactly 0".  On the delivery's own build it did not: **25 of 61** `MUL_MAT` cases read NMSE ≈ 1e-14.
+
+**Rule.**  A kernel that reproduces a CPU dot product must reproduce the CPU's **arithmetic as compiled**, not the
+arithmetic in the source.  `ggml_vec_dot_tq{1,2}_0_q8_K` writes
+`sumf = _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(sumi0), d), sumf)` and a Release clang build of `ggml-cpu`
+emits `vmulps` + `vaddps` for it — **no `vfmadd` in either function** (disassembled, `-march=native`, the delivery's
+own `build-llama-rocm`).  The kernel's per-block accumulation therefore has to be an unfused mul and add
+(`TQ_FADD(TQ_FMUL(dot, y.d*x.d), acc)`), not `fmaf`.  The difference is 1 ULP per 256-value block and it is
+**invisible to every instrument the repo normally uses**: the greedy text is identical in all three arms, the
+`TQ_FUSE` kill-switch arm matches byte for byte, and the CPU-vs-GPU text comparison matches — because a 1e-14
+relative logit shift cannot flip a near-tie.  Only the op oracle's NMSE column sees it.
+
+**The diagnostic.**  The failure has a shape, and the shape is the diagnosis: with `fmaf` every `k=256` case (one
+Q8_K block, one addition onto a zero accumulator) is exactly 0 and **every** `k>256` case is not.  When a future
+change re-fuses the accumulation, `scripts/gate-tq.sh` prints exactly that split before it fails.  Generalised: a
+reduction that accumulates over N blocks can only be judged at N > 1, so a bit-identity arm must include a
+multi-block length (the same reason `hsum_float_8`'s order is checked at K ≥ 512).
+
+**Numbers** (gfx1201, ROCm 10.2, the delivery build): before the fix 280 of 305 reported NMSE values were 0 and 25
+were ~1e-14, with all 36 `k=256` cases 0 and all 25 `k>256` cases nonzero; after it **305/305 and 84/84 exactly 0**
+(`GET_ROWS` was already exact — it is a dequantise, not a reduction).  Text was identical before and after
+(`e5a9bb20d861`, `a3a0ae855c37`), as it is across the default / `GGML_CUDA_TQ_FUSE=0` / `GGML_CUDA_TQ=0` arms on
+both models, on 1 GPU and on a 3-GPU `-sm layer`/`-sm tensor` split; the fix costs no rate (TQ2_0 tg128 181.5 →
+180.7, TQ1_0 198.2 → 197.7, noise).
+
+**Why it is worth a rule.**  The block's design is predicated on the identity — it is the reason the kernels carry the
+CPU's eight-lane split and `hsum_float_8`'s summation order at all — so a fused accumulation is not a 1e-14
+inaccuracy, it is the one property the block exists to provide, silently absent.  And the same class will recur:
+every fusion this repo adds is an invitation to take one rounding out of a chain that a CPU oracle had as two.
+
+**Record.**  This entry; `scripts/gate-tq.sh` (arm 1, with the `k=256`-vs-`k>256` diagnosis); `patches/README.md`
+block 17; `ENVIRONMENT.md` §25; `MANIFESTS.md` gate 42; `INVARIANTS.md` r356; `WORKLOG.md` 261124.012;
+`archive/work/tq-hip/` (the campaign record and the submitted patch's own claim).

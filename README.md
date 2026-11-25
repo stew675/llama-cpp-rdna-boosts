@@ -10,8 +10,8 @@ support, and an attention-memory campaign that frees several GiB of VRAM.
 [`ENVIRONMENT.md`](ENVIRONMENT.md) documents every variable the set adds or repoints: its default, and
 whether it is a kill-switch (default-on, set to disable), an opt-in, a tuning value, or a diagnostic.
 
-It ships as **18 default patches** for a clean llama.cpp checkout at the fork point **`919794500`**
-(upstream master, the 2026-11-20 re-base): the **17 official supported blocks `0000`-`0016`** plus the **temporary block
+It ships as **19 default patches** for a clean llama.cpp checkout at the fork point **`919794500`**
+(upstream master, the 2026-11-20 re-base): the **18 official supported blocks `0000`-`0017`** plus the **temporary block
 `0300`**, which is applied last.  Each block is one `git am` commit, and the series is linear (a block
 assumes its predecessors), so the set is applied whole.  **Block `0300` is temporary** -- a local
 `-sm relaxed-tensor` relaxation for the MoE amax architectures, kept separate so it can be dropped; see
@@ -173,13 +173,14 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 > in `archive/docs/` (see also `archive/work/` for the closed experiments).
 > Do not mix them with the current `patches/` files.
 
-## The blocks: official `0000`-`0016` + temporary `0300` + optional `0100`/`0101`
+## The blocks: official `0000`-`0017` + temporary `0300` + optional `0100`/`0101`
 
 `release.json` (the current release).  Each row is one `git am` commit, applied in filename order:
-`0000`-`0016` then `0300`.  The optional `0100`/`0101` are **not** in this table and never in the default
+`0000`-`0017` then `0300`.  The optional `0100`/`0101` are **not** in this table and never in the default
 apply -- see [`optional/README.md`](optional/README.md).
 
-**r352 WITHDREW block 17 — the two-arm server — and it is no longer in the delivery.**  It shipped from r346
+**r352 WITHDREW the two-arm server (it was block 17 at r346-r351; today's block 17 is the TQ block below) and it is
+no longer in the delivery.**  It shipped from r346
 to r351 as an opt-in `llama-server --prefill-decode-arms` mode (two contexts on one model: a prefill arm and a
 decode arm co-owning the same KV, so a reply keeps generating while another slot's prompt is prefilled; measured
 at -21…-24 % prefill for a decoder cadence of 47-49 ms where the single-context server stalls 300-880 ms).  It
@@ -259,6 +260,7 @@ artifact and review: `archive/work/mixed-kv/`.
 | `0013` | **MTP draft vocabulary subset** (`--spec-draft-mtp-vocab N`, **opt-in**, default off) | the MTP draft scores only the LM-head rows for token ids < N (+ control/user ids) and scatters them into a full-vocab row of `-inf` — the target's verification is untouched, so the draft can only lose proposals; the `ggml-backend-meta` row-range read that makes it work under `-sm tensor` (r107) |
 | `0014` | **streamed KV** (**all three placements opt-in, default OFF since r247**: `--kv-window` / `--kv-attendance-pool` window and pool, and `--spec-draft-kv-window`, the MTP draft ring — see `ENVIRONMENT.md` §17 for why the draft ring's old default was a decode regression) | the KV's VRAM cost becomes a resident **window** of the newest `W` cells instead of `-c` cells: one VA reservation holds the cache, the window is VRAM and everything older is pinned system RAM, so a context that OOMed now runs (27B Q8_0 `-c 262144` = 128 MiB VRAM + 8576 MiB pinned host) and the VRAM the KV does not need *yet* goes to the expert-cache arena (+2.2…+2.9 GiB at `-c 262144`, `-n 2000`). A spilled KV is numerically transparent (prefill-logit KLD −0.000000 / 100.000 % on a spilling arm); unset = byte-identical to a build without it, including the OOM (r178, promoted from `archive/work/kv-residency`)  **The same block also carries the attendance pool** (r190, Goal B: `--kv-attendance-pool on\|off`, whose size is derived from the model since r247 — the KV's authoritative copy in a pinned host mirror plus a compact device pool of indexer-block pages the sparse decode resolves through, 204 MiB instead of 1.6-2.4 GiB of resident KV at 103k-180k, `--fit`-visible) and the streaming arm policy (a streamed cache takes the sparse decode arm, +34 %/+47 % on a spilled KV).  Both placements are **opt-in and default off**  + r204: the same **window across a `-sm tensor` split** (`TODO` #124): one VMM region per child device of the Meta wrapper, the grow fanned out to every child, `--fit` sizing it against the split's per-device budget (a MIRRORED dsv4/HRM cache still declines it); + r222: the provider binds the device at every driver-reaching entry point and a buffer type answers capability without touching the driver, so a **plain** 2-GPU `-sm tensor` run does no VMM driver call at all (issue #275: the construction-time probe ran cross-context, which crashed the first kernel launch on Windows); + r248: the MTP draft ring is a **true** ring, so a batch the position window cannot place (an M-RoPE image chunk) evicts the drafter's oldest cells instead of failing the request, and a drafter failure can no longer return a 500 (issue #297) |
 | `0015` | **the UMA GTT expert store** (an APU's MoE expert set in one registered region; `-lme` sizes it and is the streaming opt-in) | new in r263: the arena tier per `-lme`, the MTP head pinned outside that budget, the direct fill, the RDNA3_5 transport start arm, and prefill streaming.  Inert on a discrete GPU (measured) |
+| `0017` | **TQ1_0 / TQ2_0 (ternary) weights on the GPU** (**default-on**, `GGML_CUDA_TQ=0` refuses the types again) | a ternary model (`BitNet` b1.58 and its conversions) had no GPU path at all — `supports_op` refused the two types, so with `-ngl 99` the weights stayed in host memory and the CPU backend ran every matmul (~11 t/s decode on three R9700s).  This adds `MUL_MAT` (not `MUL_MAT_ID`), `GET_ROWS` and the fp16/fp32/bf16 dequantise rows, **bit-identical to the CPU backend's x86 AVX2 path** (the eight-lane integer dot, the Q8_K quantisation and `hsum_float_8`'s order, with an UNFUSED mul+add per block because ggml-cpu's is not contracted) — `test-backend-ops` with `LLAMA_TEST_OP_NMSE=1` reads exactly 0 on all 305 `MUL_MAT` and 84 `GET_ROWS` values.  Decode takes a vec kernel that quantises src1 in shared memory and can fuse Q/K/V, gate+up+SWIGLU or matmul+residual-ADD (`GGML_CUDA_TQ_FUSE=0` turns all of it off); prefill takes an int8-WMMA kernel on RDNA4 and a small-batch `dp4a` kernel elsewhere.  Measured (one R9700): TQ2_0 pp512 **4177 vs 258** and tg128 **181.5 vs 21.8** against the CPU-backend arm; TQ1_0 **3693 vs 99.5** / **198.2 vs 16.1**; every non-TQ model untouched (text and rate measured).  Contributor PR #358; gate `scripts/gate-tq.sh`; knobs `ENVIRONMENT.md` §25 |
 | `0300` | **`-sm relaxed-tensor`** (**TEMPORARY**, `flint`/`mellum`/`mistral4` only) | tensor split that also admits a replicated tensor whose values differ per GPU (the MoE amax row max, which no device can complete). Exact on RDNA/HIP, zero VRAM, and **not a supported feature**: it relaxes upstream #31081 and is expected to be dropped when upstream fixes the amax under a tensor split. Delete this patch to get back to the r136 tree |
 
 Phase-2 additionally moved each concern into a self-contained file: the `ggml_cuda_try_fuse` arms, the

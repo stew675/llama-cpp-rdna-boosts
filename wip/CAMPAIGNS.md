@@ -1,5 +1,14 @@
 # Open WIP campaigns (index)
 
+> **Promoted (r356, 2026-11-24):** `tq-hip` became **official block 17** (`GGML_CUDA_TQ` kill switch, the ternary
+> types on the GPU, default-on).  Its record moved to [`../archive/work/tq-hip/`](../archive/work/tq-hip/README.md)
+> with the three integration changes named there (the unfused accumulation that restores the bit-identity the patch
+> claimed, the TQ1_0 contiguity decline, and the restated claims), the submitted pre-fix patch kept as the
+> reproduction, and the campaign's own measurements.  It is not an open campaign and it is not kept here as a stub.
+> Its gate is `scripts/gate-tq.sh` (`MANIFESTS.md` gate 42); `TODO` #380 is the one thing it leaves open (the
+> CUDA/nvcc build is unverified), and the accepted limitations (`MUL_MAT_ID`, draft decoding, a non-AVX2 CPU
+> reference) are in `TODO.md` and `patches/README.md` block 17.
+>
 > **Retired (2026-11-23):** `prefill-decode-arms-followups` is **closed** and its record moved to
 > [`archive/work/prefill-decode-arms-followups/`](../archive/work/prefill-decode-arms-followups/README.md).  Its plan
 > was replaced by a **clean-slate redesign** (`prefill-decode-arms-v2/`, the first row below), because the design it

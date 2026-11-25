@@ -93,11 +93,12 @@ delivery's host-expert tier, so it stays.
 | **376** | the block-17 beta artifact (`beta/prefill-decode-arms/`) carries a fix for a DELIVERY-level defect -- the CUDA backend issued a 2-D device->host copy of a split tensor into a pinned host buffer another device owns, which the driver refuses (`2-D read of 'result_output' failed (invalid argument): 331092 bytes x 5 copies, tensor pitch 331092, host pitch 993280`; the mechanism is the peer grant, `hsa_amd_agents_allow_access ... err 4096`) -- so on promotion that fix must be folded into the OWNING delivery block (**block 09**, the CUDA iface/scheduler block; it is `ggml-cuda.cu`) **independently of the two-arm block**, and the beta artifact re-cut against the new tree | delivery / block structure (maintainer) | **OPEN (fold only)** -- the fix LANDED as STEP 15 (`WORKLOG.md` 261124.007, `INVARIANTS.md` r384-wip, `steps/STEP-15-0022-no-2d-d2h.patch`); the FOLD is owed at promotion and is a block amendment, so it is asked first.  **A SECOND fold rides with it (261124.009)**: STEP 16 -- the pair keeps the compute-buffer drop, fenced by the other arm's step window (`llama_context_set_drop_boundary()` in `include/llama.h` + `src/llama-context.*`, and the server fence) -- is delivery code too, so the delivery takes two amendments (or one, if block 09 is cut with both) |
 | **377** | `scripts/gate-seqpar.sh` needs a **Flash-Next prefill-logit base** (`~/.cache/rdna-boosts/gates/prefill-logit-*Flash-Next*`) that this box did not have -- only the 27B one existed, so its arm 2 ("the `LLAMA_SEQPAR=0` arm is the recorded base") could not pass on ANY build, and arms 3a/3b scored nothing.  The base is machine-local, so a fresh box or CI hits the same red gate | delivery / gate plumbing | **OPEN (housekeeping)** -- recorded 2026-11-24 on the STEP-14 tip with the gate's own `--record` (the documented first-run path), which makes `gate-seqpar` meaningful again here; the open part is that a *fresh* box has no base and the gate's failure message does not say "record one first".  `gate-seqpar --record` must be run on a PRE-change tree, never on the build under test |
 | **378** | the `beta/prefill-decode-arms/` two-arm server **corrupts output under heavy concurrent load**: the maintainer reproduced a corruption on 2026-11-24 by pushing it hard (pair ON, concurrent prefill + decode; the candidate otherwise passes its own crash/state/text/gate ladder).  No reproducer, no captured failing run and no localisation yet -- this is the campaign's last known open defect and it is why the artifact ships as BETA | beta candidate / correctness | **OPEN** -- needs a REPRODUCER first (the shape, the request pattern and the symptom are not recorded beyond "pushed hard"); then the usual split: text/KLD oracles on the same shape, the gate that owns the mechanism, and `INVARIANTS.md` for the fact.  Re-entry: any pair run that returns text differing from the single-context server at the same seed, or a `state-split`/`arms` gate failure that is not reproducible on the pair-off arm |
+| **380** | block 17's `ggml/src/ggml-cuda/tq.cu` (689 lines of new CUDA) has **only ever been compiled by HIP/clang**: the contributor states it, the delivery's CI compiles nothing, and there is no NVIDIA device or CUDA toolkit on any box in this fleet — so the CUDA (nvcc) build of the ternary path, and its bit-identity there, are unverified | validation / external (delivery) | **WAITING on an NVIDIA box (or a CUDA toolkit)** -- compile `tq.cu` with nvcc (`-DGGML_CUDA=ON`, any recent CUDA), then `test-backend-ops -o MUL_MAT -p type_a=tq` and `-o GET_ROWS -p type=tq` with `LLAMA_TEST_OP_NMSE=1`: the `#pragma clang fp contract(off)` is clang-guarded and `TQ_FMUL`/`TQ_FADD` fall back to `__fmul_rn`/`__fadd_rn`, but nvcc's `-use_fast_math` flushes subnormals, so **all 305/84 values reading exactly 0 is the claim to test**, not the text.  A `MUL_MAT_ID` (TQ experts stay on the CPU backend by design) or a draft/MTP TQ arm would be the follow-up; §380 |
 | **379** | `ggml_cuda_try_fuse` still costs ~7 ms per `graph_compute` on the 27B (~890 calls) even with the GDN norm-gate fold switched OFF: *other* matchers count readers over the whole graph too, and every count is a full node walk | performance / host time (delivery) | **OPEN** -- take the reader counts ONCE per graph (a per-graph `count_uses` cache, or a single pass that fills every tensor's count) and let the matchers read it instead of walking. It is a matcher-design change, not a fold: it must keep every matcher's decision identical (the r355 instrument -- re-run the pre-change matcher at every accept site and compare -- is the cheap oracle), and it pays only where the node loop runs (`GGML_CUDA_DISABLE_GRAPHS=1`, prefill, verify, recapture). Left out of PR #361 for that reason; `archive/work/gdn-norm-gate-once/`, `INVARIANTS.md` r355 |
 
 ## Handle numbering
 
-**New handles append after the highest issued so far, so the next free handle is `#380` (`#379` is the whole-graph reader-count cache the matchers still owe, `#378` the two-arm server's corruption under heavy load, `#377` the missing `gate-seqpar` prefill-logit base, `#376` the block-17 promotion-time fold, `#375` the cache-off page fault).  `#364`-`#372` and `#374` were issued for the block-17 follow-ups and **retracted (void) on 2026-11-23**; a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
+**New handles append after the highest issued so far, so the next free handle is `#381` (`#380` is block 17's unverified CUDA build, `#379` is the whole-graph reader-count cache the matchers still owe, `#378` the two-arm server's corruption under heavy load, `#377` the missing `gate-seqpar` prefill-logit base, `#376` the block-17 promotion-time fold, `#375` the cache-off page fault).  `#364`-`#372` and `#374` were issued for the block-17 follow-ups and **retracted (void) on 2026-11-23**; a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
 subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
 
 * **issued and retired the same day** (2026-11-16): `#337` — the attendance pool *does* engage on
@@ -314,6 +315,27 @@ reading is refuted and no block-13 delta is needed) -- re-cut that block's patch
 the beta artifact against the new tree so the candidate keeps only what is its own (the STEP-15 hunk becomes a
 no-op there).  Record the transition in `WORKLOG.md` and in the beta artifact's README.
 
+## 380. block 17's CUDA (nvcc) build is unverified — the ternary path has only ever been compiled by HIP
+
+Block 17 adds `ggml/src/ggml-cuda/tq.cu` + `tq.cuh` (966 lines net) and one fusor, and it touches seven shared
+`ggml-cuda` files.  Everything it does is inside `ggml/src/ggml-cuda/`, so the other backends keep refusing the two
+types — but "CRANKS" is not "compiles": the CUDA build of those files is compiled by nvcc, the delivery's CI compiles
+nothing at all, and no box in this fleet has an NVIDIA device or a CUDA toolkit.  The code reads nvcc-safe (the
+`#pragma clang fp contract(off)` blocks are `defined(__clang__)`-guarded, `TQ_FMUL`/`TQ_FADD` fall back to
+`__fmul_rn`/`__fadd_rn` which nvcc never contracts, and `TQ_MMA_*` is behind `AMD_WMMA_AVAILABLE && RDNA4`), and the
+same tree builds under HIP/clang — but "reads safe" is what the scope policy explicitly refuses to accept as
+evidence for a backend's build (`AGENTS.md`, "Scope policy").
+
+What closes it: a CUDA build of the applied tree (`cmake -DGGML_CUDA=ON`, any recent toolkit), then
+`test-backend-ops -o MUL_MAT -p type_a=tq` and `-o GET_ROWS -p type=tq` with `LLAMA_TEST_OP_NMSE=1`.  The claim to
+test is **all 305 MUL_MAT and 84 GET_ROWS values reading exactly 0**, not the text: `-use_fast_math` flushes
+subnormals, so a CUDA arm can be coherent and still not bit-identical (`GREEDY-PURITY.md` §109), and a nonzero
+error with the `k=256`-vs-`k>256` split is the same fused-accumulation diagnosis `gate-tq.sh` prints on HIP.
+
+Left out of r356 deliberately: the delivery is RDNA-first, the maintainer's fleet has no NVIDIA device, and an
+`optional/`-style hold would have kept a validated-on-this-hardware win out of the default build for a
+platform whose *behaviour* is out of scope anyway.  The build is the one part that is in scope.
+
 ## Re-entry / does it block promotion?
 
 The two-arm candidate is **not** blocked on this fix for testing (the fd work landed; this defect needs a drafter
@@ -486,3 +508,14 @@ wrong `qk`/`vdr` in the ksplit body for that type (the arithmetic is the body's,
 per-row dot product is unchanged by construction).  Do not add a KLD arm for it before the mechanism line is
 observed: an arm that never fires passes vacuously.  The same gap is recorded in the r304 release entry and in
 the PR #322 reply, so it is a stated limitation, not a claim.
+
+### No handle — TQ1_0 / TQ2_0 (`MUL_MAT_ID`, draft decoding, a non-AVX2 CPU reference)
+
+Block 17's `MUL_MAT_ID` is **not implemented**: a TQ (ternary) MoE keeps its expert tables on the CPU backend by
+design, so such a model runs half on the GPU.  Draft/MTP decoding with a TQ model is untested (a speculator's TQ
+weight would go through the same `MUL_MAT`, but no TQ model with an MTP head exists here), and the block's
+bit-identity is stated against the **x86 AVX2** CPU path only — an ARM build accumulates in another order, so the
+oracle itself does not exist there.  Re-entry: a TQ MoE GGUF (then `MUL_MAT_ID` is a feature, with the same
+`gate-tq.sh` oracle extended to the routed form), a TQ model with a draft head, or an ARM box whose
+`test-backend-ops` TQ run can be compared.  `scripts/gate-tq.sh` reports the first two as not covered rather than
+skipping them silently, and `patches/README.md` block 17 names all three.

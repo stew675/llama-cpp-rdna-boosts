@@ -1,4 +1,32 @@
-# wip/tq-hip — TQ1_0 / TQ2_0 (ternary) weights on the GPU, bit-identical to the CPU backend
+# tq-hip — TQ1_0 / TQ2_0 (ternary) weights on the GPU, bit-identical to the CPU backend
+
+Promoted to **block 17** at `v18-919794500-r356` (contributor PR #358, `@overdoingism`; the campaign was
+submitted as `wip/tq-hip/`).  The code is `patches/0017-...`; the block reference is `patches/README.md` block
+17; the facts are `INVARIANTS.md` r356; the rule is `GREEDY-PURITY.md` §109; the gate is
+`scripts/gate-tq.sh` (`MANIFESTS.md` gate 42); the narrative is `WORKLOG.md` 261124.012.
+
+**What the integration changed in the submission** (all three are in the block, not here):
+
+1. **The accumulation is an unfused mul and add.**  The submitted `tq.cu` accumulated each Q8_K block with
+   `fmaf` on the premise that the CPU's `sumf` accumulation is an fma.  A Release clang build of `ggml-cpu`
+   emits `vmulps` + `vaddps` for `_mm256_add_ps(_mm256_mul_ps(..), sumf)` and **no `vfmadd`**, so the shipped
+   claim ("every NMSE exactly 0") did not reproduce: 25 of 61 `MUL_MAT` cases read ~1e-14, and the split was
+   diagnostic — every `k=256` case exactly 0, every `k>256` case not.  Three lines (small / vec / MMA kernels)
+   now use the file's own `TQ_FMUL`/`TQ_FADD`; with that, all 305 `MUL_MAT` and all 84 `GET_ROWS` values read
+   exactly 0, at no cost (TQ2_0 tg128 181.5 → 180.7 t/s, TQ1_0 198.2 → 197.7, noise).  `GREEDY-PURITY.md` §109.
+2. **A strided TQ1_0 weight declines the MMA path instead of asserting.**  The int8-WMMA path converts the
+   weight to TQ2_0 flat, which needs a contiguous `src0`; the submission asserted that and would have aborted
+   where the honest answer is the small-batch kernel (which takes every batch).  Measured reachable-but-inert
+   on every validated split (a tensor-split slab is contiguous), so it is a decline, not a bug fixed in anger.
+3. **The claims are restated** to what reproduces here (the commit message and the block reference carry the
+   measured numbers, the gfx1201/gfx1100/gfx1151 arms and what is NOT covered).
+
+The submitted patch is kept here as `0001-CUDA-HIP-TQ1_0-TQ2_0-MUL_MAT-and-GET_ROWS-on-the-GPU.patch`
+(sha256 `c92485b54f81fba9…`, cut against r353, applied tree `d7e012237`) as the reproduction of the failure in
+(1) — `scripts/gate-tq.sh --self-test --build <a pre-fix binary>` is how to re-observe it.
+
+## The submitter's record (unchanged below)
+
 
 Written by Claude (AI).  One `git am` file made on `v17-919794500-r353` (tip `089f90067`, tree `27db9bfd4`); applied, the tree
 is `d7e012237`.
