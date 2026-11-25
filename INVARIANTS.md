@@ -3430,8 +3430,18 @@ loses everywhere measurable, so the delivery's default went back to the dense fo
    * Qwen3.8-27B-UD-Q5_K_XL, `-c 131072`, the prompt into slot 0 (row list == the whole extent): rows on pp 833.6 /
      tg 14.74 vs rows off pp 847.1 / **tg 23.41** (+59 %).  Then a 5246-token prompt into slot 1 while slot 0 stays
      resident (row list 18x shorter, the shape the rows form exists for): 1219.3 / 25.96 vs 1223.2 / **27.23** (+5 %).
-   * Flash-Next GSQ-RCO-IQ3_XXS (host experts, `-ncmoe 47 --host-experts pool`): 1998.9 / 14.80 vs 1994.9 /
-     **18.20** (+23 %), and 1654.4 / 31.98 vs 1664.2 / **34.34** (+7 %) on the compacted shape.
+   * Flash-Next GSQ-RCO-IQ3_XXS (host experts, `-ncmoe 47 --host-experts pool`), **2000 generated tokens** (the
+     length a host-expert decode must be measured at, see the note below): 1992.7 / 28.40 vs 1998.0 / **39.24**
+     (+38 %), and 1689.0 / 44.65 vs 1687.1 / **48.15** (+8 %) on the compacted shape.  A 32-token tail reads
+     14.80 / 18.20 on the same two arms: the first few dozen decode steps after a 94k prefill are still settling the
+     expert arena's resident set, so a short greedy arm understates this model's tg by ~2x and understates the LOSS
+     by 15 points.  Text: L1 identical across forms (`5e9cb91147dd`), S2 differs (`dc97a530611c` dense vs
+     `6379caff5414` rows) once the tail is long enough for a near-tie to reach a family switch -- a text comparison
+     ACROSS the two forms is not a purity claim (item 3).
+   * The same length check on the DENSE model (27B, no expert arena to settle): 23.41 / 27.25 dense and
+     14.76 / 25.99 rows at 2000 tokens against 23.41 / 27.24 and 14.73 / 25.95 at 32 -- unchanged, and text identical
+     on both shapes (`fa78a9826423`, `383dd3732894`).  Short arms are legitimate there; on a host-expert MoE they
+     are not (`WORKLOG.md` 261125.003).
    * Inside the MMA family alone (`GGML_HIP_FA_BAND_WMMA=0`, dense model): rows 14.74 vs dense 21.78 — the row list
      itself costs ~32 % at equal work (`use_indices` in the native q8_0 loader is a per-row gather where the dense
      arm reads tile rows contiguously).

@@ -16,6 +16,37 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.003 (no release; record correction) -- the r359 entry's Flash-Next tg numbers were 32-token cold-start numbers: at 2000 tokens the model reads 39.24 t/s and the rows form's LOSS is bigger, not smaller
+
+**Why this exists.**  The r359 measurements above used a 32-token greedy tail on a fresh `--no-warmup` server.  That is
+fine for a dense model and wrong for a host-expert MoE: the first few dozen decode steps after a 94428-token prefill are
+still settling the expert arena's resident set, so the mean over 32 tokens is not the model's decode rate.  Re-measured at
+**2000 generated tokens** (same box, same shapes, same arms):
+
+| arm | 27B UD-Q5_K_XL L1 / S2 tg | Flash-Next GSQ-RCO-IQ3_XXS L1 / S2 tg |
+|---|---|---|
+| 32 tokens, default (dense) | 23.41 / 27.24 | 18.20 / 34.34 |
+| 32 tokens, rows form (`LLAMA_KV_ROWS_DISABLE=0`) | 14.73 / 25.95 | 14.80 / 31.98 |
+| **2000 tokens, default (dense)** | **23.41 / 27.25** | **39.24 / 48.15** |
+| **2000 tokens, rows form** | **14.76 / 25.99** | **28.40 / 44.65** |
+
+So the dense model's numbers stand exactly (nothing to settle), and Flash-Next's were ~2x low on tg and understated the
+rows form's loss (23 % -> **38 %** at L1, 7 % -> 8 % at S2).  The conclusion does not move, it gets stronger, and the
+reporter's own L1 readings (48.3 rows-on, 51.8 r345) are in the corrected band rather than the 32-token one.
+
+**One claim corrected with it.**  The r359 entry says the same-seed greedy text is identical in every arm and shape.  True
+for every 32-token arm and for the 27B at 2000 tokens (`fa78a9826423`, `383dd3732894`), but at 2000 tokens Flash-Next's
+compacted shape reads `dc97a530611c` dense and `6379caff5414` rows: over a long tail a near-tie reaches the kernel-family
+switch between the two forms.  A text comparison ACROSS the rows and dense forms is not a purity claim; within one form
+it still is (`INVARIANTS.md` r359 item 3).
+
+**Rule for future arms:** a host-expert MoE decode is measured at >= 1000 (preferably 2000) generated tokens; a dense
+model may use short tails.  The 32-token table is kept in the r359 entry above as the dated record it was.
+
+**Still open:** the block 05 source comment (`src/llama-context.cpp`) quotes the 32-token Flash-Next pair (14.80 /
+18.20).  It is a comment, so the code and every gate are unaffected, but it is stale and this repo does not hand-edit
+`patches/`; it goes into the next block 05 amendment/re-cut.
+
 ## 261125.002 (r359, release) -- the `--kv-unified` K/V-rows form is OPT-IN: it cost 17-59 % of decode at depth and silently disabled the derived (mask-free) kq mask (GitHub issue #365); `v18-919794500-r359`
 
 **Release v18-919794500-r359** -- base `919794500`, tip `003c88e1f`, default tree
