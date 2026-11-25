@@ -1,3 +1,39 @@
+## 261124.013 (no release; docs) -- `ENVIRONMENT.md` is a catalogue again, not a campaign diary
+
+`ENVIRONMENT.md` had grown to 1 923 lines, of which the overwhelming majority was **not** a variable
+catalogue: per-row measurement narratives, dated `rNN` histories, campaign post-mortems (the transport
+`A B B A` protocols, the seed-policy sweeps, the Windows pinned-tier investigations), "why the cards sit
+near-full" essays and whole design documents for the beta/wip two-arm server.  None of that is this file's
+job — it is `WORKLOG.md`'s and `benchmarks/`'s — and it made the one thing the file exists for (what is this
+variable, what is its default, what class is it) hard to find.
+
+**What it is now:** one row per variable — `variable | default | class | what it does` — under the **same
+section numbers** (other docs reference `ENVIRONMENT.md` §7.4 and friends, so the numbering is a contract:
+`§1.1`, `§1.1b`, `§1.2`, `§1.2.1`, `§1.3`, `§2`…`§25` all still exist and still hold the same subjects),
+plus the class key, the two `getenv` idioms, the short "nothing needs to be set" list, the retired-variable
+table, the build-time gates and the re-derivation recipe in *Maintaining this file*.  1 020 lines, 452
+table rows.
+
+**What was dropped, and where it already lives:** every measurement and every dated history.  Each row keeps
+the *decision-relevant* part of it (the default is not free, the trap, the invariant that makes the switch
+safe) and names the record — `benchmarks/…`, `archive/work/…`, `INVARIANTS.md` `rNN`,
+`GREEDY-PURITY.md` §N — so nothing needs re-deriving and nothing is duplicated.  Nothing in the file was the
+only record of a measurement: the campaigns were written up in `WORKLOG.md` as they landed, and the ones that
+were not are named in the rows.
+
+**Preserved deliberately** (they are semantics, not history): the two-idiom warning, the "latched once"
+rule, the per-row class, the `r40` device-remap "do not re-add" rule, the arm-selection notes that change
+what an A/B *means* (`GGML_CUDA_FUSE_GATE_BETA_VERIFY` gates only the verify band; a `-sm tensor` hole makes
+the pinned demote decline; `GGML_CUDA_MMB_BF16_DENSE` only fires with `ROCBLAS_USE_HIPBLASLT=0`), and every
+retired/ignored name with its status.
+
+**No code change, no release, no gate.**  `scripts/validate-set.sh`, `release.json` and `patches/` are
+untouched.  Two stale cross-references were noticed while rewriting and are **not** fixed here (they are
+other files' text): `scripts/gate-graph-replay-width.sh` points at "`ENVIRONMENT.md` 1.1c", which has never
+existed (`GGML_CUDA_GRAPH_MAX_TOKENS` is §7.4), and `scripts/gate-kv-residency.sh` calls the streamed KV
+"block 15" (`§17`; block 15 is the UMA GTT store, §20).  Also noted: the old §3 prose called the MMVQ band
+`MOE_EXPERT_CACHE_MAX_TOK`, which is not a variable — the real name is `GGML_MOE_CACHE_MAX_TOK` (§1.2).
+
 ## 261124.012 (release `v18-919794500-r356`, contributed PR #358 promoted as **block 17**) -- TQ1_0 / TQ2_0 (ternary) weights on the GPU: bit-identical to the CPU's AVX2 path, 8-37x over the CPU fallback, and the claim that did not reproduce until the accumulation was unfused
 
 `v18-919794500-r356`: contributor PR #358 (`@overdoingism`, submitted as `wip/tq-hip/`) gives `ggml-cuda` a
