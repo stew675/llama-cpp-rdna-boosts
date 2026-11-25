@@ -109,6 +109,22 @@ is cold):
 +3.4 % L1 prefill, +2.2 % L1 decode, +24 % on the cache-hit revisit (which no longer re-evicts 6778 MiB / 41 tables),
 and the arena keeps 20 397 MiB through the whole run (`residency by layer: L1..L48 261/512`).
 
+## 4b. A second platform on a full-bandwidth link (`radix`)
+
+`radix` is a single R9700 on an uncontested PCIe 5.0 x16 link (93 GiB RAM).  Its own H2D probe reads **55.3 GB/s**
+against **28.7 GB/s** here, because this box's board bifurcates GPU0/GPU1 to x8 in the firmware (and the third card
+sits on an M.2 riser at x4), whatever `current_link_width` says.  Every number in §1-§4 above is therefore a
+half-bandwidth number.  The same-binary A/B there (same flags, same prompt, the kill switch as the old arm):
+
+| arm (`radix`) | L1 pp | L1 tg | stand-downs | text |
+|---|---:|---:|---|---|
+| `GGML_CUDA_SLAB_RING_MIB=6144` (the r361 hole) | 2245.7 / 2242.3 | 44.28 / 44.34 | 6038 MiB + 158 MiB | `98c4f67d6ed9` |
+| r362 (no hole on a pool tier) | 2292.9 / 2280.2 | 45.14 / 44.95 | none | `98c4f67d6ed9` |
+
+**+2.1 % prefill / +1.9 % decode** on a full-bandwidth link, against +3.4 % / +2.2 % on the x8 box: the narrower the
+link, the more the stand-down costs, which is the expected direction.  Three fresh starts on the third platform,
+still one state and one text, so the bimodality of issue #368 remains unreproduced on every box we have.
+
 ## 5. Gates
 
 * `scripts/gate-prefill-logits.sh` — **0.000000 / 100.000 %** (gfx1201, ROCm 10.2 base), no GPU faults.

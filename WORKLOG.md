@@ -42,10 +42,21 @@ reproduce here but the bimodality does not (nine fresh starts, one state, one te
 the remaining ask is two `MOE_EXPERT_CACHE_TABLES=1` residency maps from the reporter's good and slow visits.  The
 issue stays open deliberately: we cannot claim to have fixed a flip we never reproduced.
 
-**One correction to record.**  A suspected PCIe bifurcation on this box is NOT what the numbers show: GPU0 is
-`0000:03:00.0` at `current_link_width` **16** (the x8 links here are `01:00.0`/`07:00.0`, neither of which is a
-R9700 in the HIP device order), so the r362 measurements above are x16 numbers.  The shape is re-measured on
-`radix` (single R9700, x16, 93 GiB) as the independent platform.
+**The link width, measured rather than read off sysfs.**  `current_link_width` reads 16 for this box's R9700s, but
+the board bifurcates GPU0 and GPU1 to **PCIe 5.0 x8** in the firmware and the third card sits on an M.2 riser at
+x4, so sysfs is not the evidence.  The delivery's own probe is: `ggml_backend_cuda_stage_h2d_gbps` reads
+**28.7 GB/s** here against **55.3 GB/s** on `radix` (single R9700 on an uncontested x16 link), i.e. exactly the x8/x16
+ratio, and that is why every prefill number in 261125.008 is a half-bandwidth number.  Re-measured on `radix` (93 GiB,
+55.3 GB/s), same flags, same 89199-token prompt, same-binary A/B through the kill switch:
+
+| arm (radix) | L1 pp | L1 tg | stand-downs | text |
+|---|---:|---:|---|---|
+| `GGML_CUDA_SLAB_RING_MIB=6144` (the r361 hole) | 2245.7 / 2242.3 | 44.28 / 44.34 | 6038 MiB + 158 MiB stood down | `98c4f67d6ed9` |
+| r362 (no hole on a pool tier) | 2292.9 / 2280.2 | 45.14 / 44.95 | none | `98c4f67d6ed9` |
+
+So on a full-bandwidth link the same change is **+2.1 % prefill / +1.9 % decode** and removes the whole-table
+stand-down; on the x8 box it was +3.4 % / +2.2 %.  Still no bimodality on a third platform (three fresh starts, one
+state, one text).
 
 ## 261125.008 (r362) -- the pool tier no longer pays the slab's ring hole out of the expert arena (GitHub issue #368), and a residency map that names which tables stand down
 
