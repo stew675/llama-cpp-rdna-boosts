@@ -143,7 +143,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── ENVIRONMENT.md         # every env var the set adds or repoints, with its default and class
 ├── CONTAINERS.md          # the ROCm container images + the off-host build watcher
 ├── COMMUNITY-CONFIG.md    # running a model bigger than VRAM (`-ncmoe` + the expert cache)
-├── rdna-boosts-all.patch  # convenience: the entire 18-patch default net as ONE patch
+├── rdna-boosts-all.patch  # convenience: the entire 19-patch default net as ONE patch
 ├── patches/               # the delivery set: official 0000-0016 + temporary 0300 (one `git am` block each)
 │   ├── README.md          # apply instructions + block-12 env knobs + server config
 │   └── FILE-SET-RETIREMENTS.tsv # re-base decision rows: a deliberate retirement a block may lose (gate 38)

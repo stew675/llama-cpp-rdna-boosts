@@ -23,7 +23,7 @@ records it points at (`WORKLOG.md`, the campaign, the `benchmarks/` or `archive/
 **Numbers are never reused.**  `#NN` is a permanent handle: an old `WORKLOG.md` entry that cites `TODO #74`
 still means the same subject after that item is closed and removed from this file.  New items append.
 
-**Current state:** the **18-patch default set** (17 official blocks `0000`-`0016` + the temporary `0300`)
+**Current state:** the **19-patch default set** (18 official blocks `0000`-`0017` + the temporary `0300`)
 at fork point **`919794500`**; read `.release` in `release.json` for the release id -- it is the source of
 truth, not this line.  **Block 17 (the two-arm server) remains WITHDRAWN from the delivery** (r352) and its
 repair is the standalone project `wip/prefill-decode-arms-v2/` -- **this file carries no row for that feature**

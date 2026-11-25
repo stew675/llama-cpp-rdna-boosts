@@ -324,7 +324,7 @@
 > the generated text.  Record: `benchmarks/2026-11-16-pinlate-mixture-logits.md`, `INVARIANTS.md` r299,
 > `GREEDY-PURITY.md` §95.
 
-**17 official blocks (`0000`-`0016`) + the temporary block `0300` = 18 default patches** against
+**18 official blocks (`0000`-`0017`) + the temporary block `0300` = 19 default patches** against
 `release.json.base` (**`4f9dfa0e3`**; the base is the 2026-11-13 r278 re-base, which replaced the
 2026-11-08 r236 `a691b2345` base), one `git am` commit each, applied in filename order (`0000`-`0016`
 then `0300`).  The optional artifacts (`optional/*/01xx-*.patch`: `0100` two-lane prefill, `0101` mixed
