@@ -675,6 +675,27 @@ and `INVARIANTS.md` r357.  Gate: `scripts/gate-tool-text.sh`.
 
 ---
 
+---
+
+## 27. The exact top-k fast path and its penalty arm (block 12, r361)
+
+The S2 fast path hands the chain only the k tokens top-k will keep instead of the whole vocabulary
+(`common_sampler_fast_topk_k()`, `common/sampling.cpp`).  Since r361 it also reproduces a **penalties** sampler
+exactly, instead of standing down for one: the affected set is the logit-bias set plus the penalty's last-n window
+(at most 256 distinct tokens), each affected token's adjusted logit is recomputed from its raw value with the
+sampler's own arithmetic, in the chain's order, and the k tokens handed to the chain still carry their raw logits
+so the chain re-applies the bias and the penalty itself.  All three variables are read once, on first use; the
+delivery runs with none of them set.  Contract: `patches/README.md` (block 12, r361) and `INVARIANTS.md` r361.
+Gate: `scripts/gate-fast-topk-penalties.sh`.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `GGML_LF_FAST_TOPK` | **`1` (on)** | **kill switch** | `0` takes the fast path away entirely, so every sample builds the full-vocabulary candidate array — the pre-#80 behaviour, and the arm any "what it used to be" comparison must use.  It is also this gate's oracle: with a penalty set, `0` IS the pre-fix arm (the r360 build stood down for a penalty), so the fast arm's text must match it byte for byte. |
+| `GGML_LF_FAST_TOPK_CENSUS` | `0` (off) | **diagnostic** | One INFO line when the sampler is freed: `fast = <n>, full = <n>, fast with a penalty window = <n>, affected tokens max = <n>, self-check mismatches = <n>`.  This is what makes a text arm non-vacuous: identical text proves nothing if both arms fell back, so the gate requires `fast > 0`, the same count carrying a non-empty window, and `full = 0`.  It also reports the >256-token window fallback, which is the one configuration where a penalty DOES still cost decode. |
+| `GGML_LF_FAST_TOPK_SELFCHECK` | `0` (off) | **diagnostic** | `1` scores the whole vocabulary the way the chain would, on every sample, and logs an error naming the rank, both token ids and both adjusted logits when the fast path's k disagree with it.  `2` is its CONTROL arm: it keeps the check and swaps the fast path's two best-ranked tokens, so the oracle must fire and the text must move — which is what makes "the text is identical" a sensitive claim rather than an inert one.  The check shares the fast path's value function, so the independent arithmetic oracle is the full-path text arm; the self-check localises a broken candidate set (the raw-top extension, the strictness rule) to a rank and a sample. |
+
+---
+
 ## Maintaining this file
 
 The same recipe as [`ENVIRONMENT.md`](ENVIRONMENT.md) → *Maintaining this file* derives the names; this file is

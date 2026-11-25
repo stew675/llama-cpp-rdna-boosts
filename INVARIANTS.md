@@ -3497,3 +3497,29 @@ loses everywhere measurable, so the delivery's default went back to the dense fo
   user target is what the reserve used to hide.  Gates: `scripts/gate-fit-staging.sh` (with the r359 build as its
   negative control), `gate-prefill-logits.sh` 0.000000 / 100.000 %, byte-identical greedy text on 1 GPU, 3-GPU
   `-sm tensor` and a 16K-context q8_0 prefill.  Record: `WORKLOG.md` 261125.004, `MANIFESTS.md` gate 44.
+
+* **(r361, block 12, GitHub issue #366) A PENALTY NO LONGER STANDS THE EXACT TOP-K FAST PATH DOWN — and the reason it
+  can be reproduced is that a penalty is a per-token transform over a BOUNDED, OBSERVABLE set.**  Three facts worth
+  keeping:
+  (1) **The set is the logit-bias set plus the penalties sampler's last-n window, and both are readable from the
+  chain.**  `llama_sampler_penalties_get_params()` / `..._get_window()` (read-only, added for this) expose the
+  sampler's parameters and its `(token, count)` entries, so the fast path reads the chain's own state instead of
+  keeping a second copy of the map — a second copy is a state machine that drifts (the `penalty_last_n` the
+  sampler clamps, the ring buffer's eviction, `llama_sampler_reset`).  The window is re-read once per sample, so an
+  `accept` between two samples is seen.
+  (2) **The ORDER is bias → penalty, and the adjusted value is computed on the BIASED logit.**  `common_sampler_init`
+  adds the logit-bias sampler before the user's sampler list, and `llama_sampler_penalties_apply` is the piecewise
+  `x <= 0 ? x * r : x / r` followed by `x -= count * freq + (count > 0) * present`.  Reproducing the transform on
+  the raw logit, or the penalty before the bias, moves the ranking by a hair — it does not crash.
+  (3) **The fast path hands the chain RAW logits, never the adjusted ones.**  The chain then re-applies the bias and
+  the penalty to the `k` survivors, so their values stay bit-identical and only the candidate array is smaller; a
+  fast path that hands over pre-adjusted logits would round every kept token twice.  Its own oracle is therefore
+  `GGML_LF_FAST_TOPK=0` (the pre-r361 arm for any penalised profile) and its census is
+  `GGML_LF_FAST_TOPK_CENSUS=1` — text identity alone is not evidence, because two arms can both have fallen back.
+  A window past 256 distinct tokens (a very large `--repeat-last-n`) falls back per sample and moves no token; a
+  penalty that runs AFTER top-k is deliberately not reproduced, and two penalties samplers in one chain stand the
+  fast path down.
+  Measured: +4.3 % MTP decode here (3× R9700 `-sm tensor`, 78.26 vs 75.00 t/s), the reporter's 5.7 % on a
+  gfx1201+gfx1100 pair, and byte-identical text against the full-vocabulary arm on 7 profiles including a 700-token
+  run that crossed the cap.  Gates: `scripts/gate-fast-topk-penalties.sh` (`MANIFESTS.md` gate 45); knobs
+  `DIAGNOSTIC.md` §27; rule `GREEDY-PURITY.md` §110; record `archive/work/fast-topk-penalties/`.

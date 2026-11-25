@@ -270,7 +270,7 @@ leave the GPU IRQ cores free (`AGENTS.md`).
 | `GGML_CUDA_MMQ_J_MAX` | tuning | tuning | MMQ `J` tile width cap. |
 | `GGML_Q6_COMPACT_J` | tuning | tuning | Q6 compact-`J` variant. |
 | `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS` | off | **opt-in**, RDNA3.5 only | The qwen4exp weighted-down single-token chain. |
-| `GGML_CUDA_SPLICE_GATHER`, `GGML_CUDA_SCALE_UNARY`, `GGML_CUDA_HC_MIX_BAND`, `GGML_CUDA_HC_MIX_PREQ`, `GGML_CUDA_DISABLE_HC_COMB`, `GGML_CUDA_DISABLE_HC_MIX`, `LLAMA_FUSED_HC_MIX`, `LLAMA_FUSED_HC_COMBINE`, `LLAMA_FUSED_DSV4_HC_PRE`/`POST`, `LLAMA_HC_MIX_BF16`, `GGML_CUDA_LIGHTNING_INDEXER4_GFX1100`/`GFX1201`, `GGML_LF_FAST_TOPK`, `LLAMA_INDEXER_NOBLOCK`, `LLAMA_INDEXER_NOGROUP` | off / default-on | tuning | Model-specific fused chains; A/B only.  `DSV4_HC_POST` has a **split-mode-dependent default**: the fused op whenever a Meta (tensor-split) device is in play, the plain chain otherwise (the chain is faster on one device but not correct across a tensor split).  The qwen4exp `LLAMA_FUSED_HC_MIX` / `_HC_COMBINE` are two **independent** arms and each must reproduce its own chain **with the two DSV4 switches pinned OFF** — that is the oracle `scripts/gate-hc-fusions.sh` checks.  The fused mixer is a numeric arm (its inject half is the fused band dot, the chain's is the lora GEMM), so the gate anchors it per class and split state.  The three CUDA-side `GGML_CUDA_DISABLE_HC_*` knobs disable matchers over the unfused chain, so on a default qwen4exp build they are inert. |
+| `GGML_CUDA_SPLICE_GATHER`, `GGML_CUDA_SCALE_UNARY`, `GGML_CUDA_HC_MIX_BAND`, `GGML_CUDA_HC_MIX_PREQ`, `GGML_CUDA_DISABLE_HC_COMB`, `GGML_CUDA_DISABLE_HC_MIX`, `LLAMA_FUSED_HC_MIX`, `LLAMA_FUSED_HC_COMBINE`, `LLAMA_FUSED_DSV4_HC_PRE`/`POST`, `LLAMA_HC_MIX_BF16`, `GGML_CUDA_LIGHTNING_INDEXER4_GFX1100`/`GFX1201`, `LLAMA_INDEXER_NOBLOCK`, `LLAMA_INDEXER_NOGROUP` | off / default-on | tuning | Model-specific fused chains; A/B only.  `DSV4_HC_POST` has a **split-mode-dependent default**: the fused op whenever a Meta (tensor-split) device is in play, the plain chain otherwise (the chain is faster on one device but not correct across a tensor split).  The qwen4exp `LLAMA_FUSED_HC_MIX` / `_HC_COMBINE` are two **independent** arms and each must reproduce its own chain **with the two DSV4 switches pinned OFF** — that is the oracle `scripts/gate-hc-fusions.sh` checks.  The fused mixer is a numeric arm (its inject half is the fused band dot, the chain's is the lora GEMM), so the gate anchors it per class and split state.  The three CUDA-side `GGML_CUDA_DISABLE_HC_*` knobs disable matchers over the unfused chain, so on a default qwen4exp build they are inert. |
 | `GGML_CUDA_FA_KQ_BLOCKS_REUSE` | **off** = opt-in `=1` | **opt-in** | The packed FA KV-group bitmap is built ONCE per graph evaluation and shared by its attention layers (the first layer builds it into a context-owned 64 KiB buffer, later layers reuse it when the mask tensor, its `data` pointer, the stream and the producer's whole argument list match).  **Bit-identical by construction.**  Off by default because it buys nothing here — its case is launch cost (Windows/WDDM), which this repo does not validate.  Reach: needs a multi-sequence ubatch or the RDNA4 band at depth.  **The key is the producer's ARGUMENTS, not a hash of its body: re-audit it whenever the band's tile/KV split moves.** |
 | `GGML_CUDA_GRAPH_OPT` | off | **opt-in**, diagnostic/experimental | The concurrent fork/join scheduler: a decode graph whose `attn_norm` forks 3 ways runs the branches on their own streams and joins before attention.  The stream-number layout is a contract — `0` compute, `1..4` copy streams, `5..7` the branch streams, `static_assert`ed and printed by a `-lv 4` census.  Gate `scripts/gate-graph-opt-streams.sh` (**needs `--fit off`**, or no concurrent event is created and it fails rather than passing vacuously).  Measured effect is inside noise. |
 | `GGML_FORCE_NO_INTEGRATED` | off | tuning | Ignore integrated GPUs when picking devices. |
@@ -740,6 +740,21 @@ diagnostics — a kill switch and a census line — so they live in `DIAGNOSTIC.
 model: the strings come from the vocab and the chat template at load.
 
 *The kill switch and the census for this section are in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §26.*
+
+---
+
+---
+
+## 27. The exact top-k fast path and its penalty arm (block 12, r361)
+
+The sampler's exact top-k fast path is **on with nothing set** and adds **no end-user variable**: a presence,
+frequency or repeat penalty no longer stands it down (a penalty only moves the tokens in its last-n window, so it
+is scored like a logit bias), which is worth ~4-6 % of MTP decode on a profile that sets one.  The only
+configuration that still pays the full-vocabulary path is a penalty window **past 256 distinct tokens** (a very
+large `--repeat-last-n`), which falls back per sample and moves no token.  The kill switch and the two diagnostics
+live in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §27.
+
+*The kill switch, the census and the self-check for this section are in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §27.*
 
 ---
 

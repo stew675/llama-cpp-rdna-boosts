@@ -1139,6 +1139,33 @@ in CI.  The model-level gates are manual:
     change to the staging arena, to `ggml_cuda_fattn_tile_type` / a `_kv_*_supported` predicate, to
     `GGML_CUDA_FA_STAGE_MAX_MB`, or to `llama_context::memory_breakdown()`'s reserve accounting.
 
+45. **An exact sampler fast path must be checked against the path it replaces, not against itself** (r361, block 12,
+    GitHub issue #366) -- `scripts/gate-fast-topk-penalties.sh`.  The S2 fast path hands the chain only the `k` tokens
+    top-k will keep; since r361 it also reproduces a **penalties** sampler (the affected set is the logit-bias set
+    plus the penalty's last-n window, at most 256 distinct tokens, each scored with the sampler's own arithmetic in
+    the chain's order) instead of standing down for one, which is worth **4-6 %** of MTP decode on any profile that
+    sets a penalty.  Its failure mode is a slow text drift, so no arm may be read alone:
+    (A) **the ORACLE is the full-vocabulary arm**: `GGML_LF_FAST_TOPK=0` disables the fast path, which IS the r360
+    behaviour for a penalised profile, so the default arm's text must equal it byte for byte on a 3-device
+    `-sm tensor` MTP shape and a single-device shape, for presence 0.15, repeat 1.15, frequency 0.3, all three, a
+    penalty combined with a logit bias, and no penalty at all.  The arms must be LIVE: the penalised arm's text must
+    differ from the no-penalty arm's, and the bias+penalty arm's from the penalty-only arm's (else the pair proves
+    nothing about the combination);
+    (B) **the CENSUS is the non-vacuity check** (`GGML_LF_FAST_TOPK_CENSUS=1`, a separate `-lv 4` run -- a `-lv 4`
+    stream is never hashed): the penalised arm must read `samples fast > 0`, the same count `with a penalty
+    window`, and `full = 0`; the `GGML_LF_FAST_TOPK=0` arm the mirror image; the no-penalty arm `fast > 0` with an
+    EMPTY window.  Identical text proves nothing if both arms fell back;
+    (C) **the SELF-CHECK and its control**: `GGML_LF_FAST_TOPK_SELFCHECK=1` scores the whole vocabulary the way the
+    chain would, per sample, and must read 0 mismatches; `=2` swaps the fast path's two best-ranked tokens, so it
+    must report mismatches on every sample AND move the text -- that is what makes (A)'s "identical" sensitive to a
+    single rank swap instead of inert;
+    (D) **the cap falls back, exactly**: a 700-token run at `--top-k 60 --repeat-last-n 8192` must grow the window
+    past 256 distinct tokens, so the census must show `full > 0` and the run's text must still equal the
+    full-vocabulary arm's (a switch mid-run moves no token);
+    (E) `check-gpu-faults.sh` clean.  Required for every release and for any change to
+    `common_sampler_fast_topk_k()`, `set_logits_topk()`, the affected-set/penalty arithmetic, the two
+    `llama_sampler_penalties_get_*()` accessors, or the census/self-check.
+
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 
 ## Verification per block
@@ -1148,6 +1175,7 @@ on the tip.
 
 | block | verify | expected |
 |---|---|---|
+| 12 | **(r361, issue #366) a penalty no longer stands the exact top-k fast path down**: `scripts/gate-fast-topk-penalties.sh` -- the `GGML_LF_FAST_TOPK=0` full-vocabulary arm is the text ORACLE (7 profiles: presence, repeat, frequency, all three, a penalty combined with a logit bias, no penalty, and a second model on 1 GPU), the `GGML_LF_FAST_TOPK_CENSUS=1` arm is the non-vacuity check (`fast > 0`, all of them with a penalty window, `full = 0`, and the kill switch the mirror image), `GGML_LF_FAST_TOPK_SELFCHECK=1` (0 mismatches) is the selection oracle with `=2` as its rank-swap control, and a 700-token arm crosses the 256-token cap to prove the per-sample fallback moves no token; then the ordinary ladder the amendment owes because it edits `include/llama.h` and `src/llama-sampler.cpp` too: the whole-set `all` build, `scripts/validate-set.sh`, `check-shlib-symbols.sh`, and the same-seed greedy text against the previous build | r361: gate **PASS** (7/7 text pairs identical -- `67c54d9f671c` presence, `0c84fdf07bd4` repeat, `c59699f60e08` frequency, `ccc7bd9c3e08` all three, `20728e39c99f` bias+penalty, `948b9faff2c7` no penalty, `007ccf0fe930` dense 4B; census 128 fast / 0 full / 128 with a window on the penalised arm, 0 fast / 128 full on the kill switch, 128 fast / 0 window with no penalty; self-check 0 mismatches, its control 128 mismatches and a moved text; cap arm 472 fast / 228 full / affected max 256 with identical text `53389b2aa301`); MTP decode **78.26 -> 75.00 t/s (-4.2 % with the fast path off)**, 5 alternating rounds, text identical; cross-build neutrality against the r360 binary: 4B greedy `7e6229b260f6` on 1 GPU and 3-GPU tensor on BOTH builds, and **27B 3-GPU tensor + MTP + `--presence-penalty 0.15` reads `3651d4d825b9` on r360 (full path) and r361 (fast path)**; MTP Protocol A plain 31.3 / `draft-mtp` 52.7 t/s, acceptance 0.49092; `check-gen-docs.sh` ok, `check-shlib-symbols.sh` 16/16, KLD `0.000000 / 100.000 %` -- `WORKLOG.md` 261125.006, `INVARIANTS.md` r361, `GREEDY-PURITY.md` §110, `archive/work/fast-topk-penalties/` |
 | 09/10 | **(r360, issue #367) the `--fit` staging-arena reserve follows the launcher's predicate**: `scripts/gate-fit-staging.sh` on a q8_0-capable model (arms A-D: a native pair charges nothing and keeps the f16 control's layers, the `GGML_CUDA_FA_KV_NATIVE=0` arm still charges >= 900 MiB and loses layers, an unbounded cap charges the whole-F16-KV estimate, and a live run's compute buffer stays below the projection), plus the same-seed greedy text against the previous build on 1 GPU and a 3-GPU `-sm tensor`, and `gate-prefill-logits.sh` | gate **PASS** (control 515 MiB / `-ngl 59`, native 515 / 62, staged 1539 / 55, staged+unbounded 4675 / 34, live run 118.89 MiB); the r359 build **FAILS** A1/A2/B1 (+1024 MiB, `-ngl 55`); text identical (`1c5d32ac537d` 1 GPU and 3-GPU tensor, `990793afb918` at a 16K-context q8_0 prefill); KLD 0.000000 / 100.000 % |
 | 05 | **(r319, issue #330) the decode/verify KV split is a run constant**: `scripts/gate-spec-purity.sh` (`plain == draft-mtp` on q8_0 and bf16 at 3-device `-sm tensor`, the non-vacuity draft-rate check, `--control` on `GGML_CUDA_FA_SPLIT_CONST=0` must diverge, and the width probe's flat + 256-cell-boundary arms for both KV types); the four-axis MTP protocol on 1 GPU and on 3 GPU `-sm tensor` on BOTH cache types; the same-seed text of the arms the change cannot reach (4B 1 GPU, 27B 2 GPU tensor, 27B 3 GPU `-sm layer`) against the previous build; `llama-bench tg128` at d0..131k and `pp512` (flat); `test-backend-ops -o FLASH_ATTN_EXT`; `gate-prefill-logits.sh` | gate **PASS** (A `c1f9d0b3f5b6`, B `2fbc183348a8`, plain == draft; control diverges; probe flat + boundary maxdiff **0** for q8_0 AND bf16 where the pre-fix boundary arm reads 0.232868 / 0.196008); four-axis plain == draft on all four at `-n 3000` 1 GPU (acceptance 0.53656 / 0.80437 / 0.86819 / 0.99200) and all four at `-n 1000` on both caches 3 GPU tensor (0.57755 / 0.81776 / 0.86555 / 0.99200); unchanged `be6407e421c8` / `b1c84ba23a2c` / `f59aa0be6536`; tg128 46.6 / 45.6 / 42.3 / 39.3 / 36.8 / 34.6 at d0/8k/32k/65k/98k/131k both arms; 7381/7381; KLD 0.000000 / 100.000 % canonical and 0.000000 / 99.990 % 3-device tensor -- `WORKLOG.md` 261119.003 |
 | 10 | **(r319, issue #330) the width probe must straddle a 256-cell padding boundary**: `test-logits-width-probe MODEL prompts/prose-rdna-boosts.txt 4096 512` on `KV=q8_0` and `KV=bf16` at `SPLIT=tensor` (the flat arm plus the new boundary arm at `P=4348`), with the pre-fix arm as the control (`GGML_CUDA_FA_SPLIT_CONST=0` must FAIL the boundary arm) | flat PASS in both arms (maxdiff 0); boundary **PASS maxdiff 0** post-fix and **FAIL 0.232868 (q8_0) / 0.196008 (bf16)** pre-fix -- `benchmarks/2026-11-19-fa-split-boundary-purity.md` |

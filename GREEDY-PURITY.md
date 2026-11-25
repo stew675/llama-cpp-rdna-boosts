@@ -3285,3 +3285,41 @@ every fusion this repo adds is an invitation to take one rounding out of a chain
 **Record.**  This entry; `scripts/gate-tq.sh` (arm 1, with the `k=256`-vs-`k>256` diagnosis); `patches/README.md`
 block 17; `DIAGNOSTIC.md` §25; `MANIFESTS.md` gate 42; `INVARIANTS.md` r356; `WORKLOG.md` 261124.012;
 `archive/work/tq-hip/` (the campaign record and the submitted patch's own claim).
+
+## 110 (r361, block 12) — an "exact" fast path may re-derive a chain's per-token transform, but it must re-derive the SAME ONE: a filter is exact for free, a penalty has to reproduce the arithmetic and the order
+
+**Claim.**  The S2 sampler fast path (`common_sampler_fast_topk_k()`, block 12) hands the chain only the `k` tokens
+that top-k will keep instead of the whole vocabulary.  It is exact by a *candidate-set* argument: whatever the chain
+does to a logit, it does per token, so the fast path only has to know WHICH tokens the samplers ahead of top-k can
+move (the logit-bias set; since r361 the penalties sampler's last-n window too), score those tokens the way the
+chain will, and take the `k + 1` largest.  It never has to score the other 248k tokens, and it never changes what
+the chain then does to the `k` survivors — they still carry their RAW logits, so the bias sampler and the penalties
+sampler run on them exactly as on the full array.
+
+**Rule.**  A fast path around a sampler chain is exact only when (a) the set of tokens a sampler can move is bounded
+and observable, (b) the value used for RANKING is the value the chain will produce, computed with that sampler's
+own arithmetic and in the chain's order, and (c) the values handed on are the inputs the chain expects, not the
+pre-computed outputs.  Break (a) and a moved token is dropped from the candidate set; break (b) and the `k` chosen
+are not the chain's `k`; break (c) and the survivors are rounded twice.  And the *ordering* rule: a fast path that
+emits a strictly descending `k` must fall back on a TIE among the `k + 1` largest, because the full path's order
+inside a tie is decided by its array order, which the fast path does not reproduce.
+
+**Numbers.**  RDNA4 (3× R9700, `-sm tensor`, MTP, `top-k 20`, `--presence-penalty 0.15`, 300 tokens): the fast path
+is **+4.3 %** decode (78.26 vs 75.00 t/s, 5 alternating rounds, text byte-identical); the reporter measured
+**+5.7 %** (69.7 → 73.7 t/s) on a gfx1201 + gfx1100 pair.  Exactness, over 7 profiles: presence / repeat /
+frequency / all three / a penalty combined with a logit bias / no penalty / a second model — every fast arm's text
+equals the `GGML_LF_FAST_TOPK=0` full-vocabulary arm byte for byte, including a 700-token run where the window
+outgrew the 256-token cap mid-run (472 fast samples / 228 fallbacks, text identical).  Two independent oracles keep
+it honest: the full-vocabulary text arm (the arithmetic), and `GGML_LF_FAST_TOPK_SELFCHECK=1`, which scores the whole
+vocabulary per sample and compares the `k` (0 mismatches over 400 samples) — with `=2` as its control, a single
+rank swap that fires the check on every sample and moves the text.
+
+**Why this is a § and not a TODO.**  The trap is that the fast path's failure mode is a SLOW TEXT DRIFT, not a
+crash: it survives every text arm that uses the same settings on both sides, and it survives a hash comparison
+against a build that also fell back.  So the arm needs a census (did the fast path run?) next to the oracle.  Same
+class as §109's "the claim was about the accumulation": here the claim is about which tokens the chain was allowed
+to see.
+
+**Record.**  This entry; `scripts/gate-fast-topk-penalties.sh`; `patches/README.md` block 12 (r361); `DIAGNOSTIC.md`
+§27; `MANIFESTS.md` gate 45; `INVARIANTS.md` r361; `WORKLOG.md` 261125.006; `archive/work/fast-topk-penalties/`;
+GitHub issue #366.

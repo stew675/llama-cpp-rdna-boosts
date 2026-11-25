@@ -16,6 +16,59 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.006 (r361) -- a penalty no longer costs decode: the exact top-k fast path reproduces the penalties sampler (issue #366)
+
+**The report.**  GitHub issue #366 (`@mjohanning99`): a presence penalty of `0.15` cost **5.7 %** of MTP decode on
+their gfx1201 + gfx1100 pair (69.7 vs 73.7 t/s, acceptance unchanged), and their agent had traced it to the S2 fast
+path standing down for any non-trivial penalties sampler.  Reproduced on this box first, before touching anything:
+3x R9700, `-sm tensor`, Qwen3.8-27B UD-Q4_K_M, `--spec-type draft-mtp`, `top-k 20`, `--presence-penalty` the only
+difference, 300 tokens, 4 arms in one loop — **79.4 / 71.5 / 80.1 / 71.8 t/s**, i.e. -10 % and perfectly alternating.
+
+**The fix (block 12 amendment).**  A penalty is the logit bias's shape, not a reason to give up: it moves only the
+tokens in its last-n window, so the affected set is the bias set plus that window, the raw top `k + 1 + |affected|`
+still holds the top `k + 1` of the untouched tokens, and each affected token's adjusted logit is recomputed from its
+RAW logit with `llama_sampler_penalties_apply()`'s own arithmetic **in the chain's order** (the bias sampler runs
+first, so the penalty applies to the biased value).  The `k` tokens handed to the chain still carry their raw logits,
+so the chain re-applies the bias and the penalty itself and the values stay bit-identical — only the candidate array
+is smaller.  Two read-only accessors (`llama_sampler_penalties_get_params()`, `..._get_window()`) expose the
+sampler's parameters and its window, so the fast path reads the chain's own state instead of keeping a second copy
+of the map; the window is re-read once per sample.  Everything else still stands the path down (DRY, top-n-sigma,
+an unknown sampler, two penalties samplers), a penalty **after** top-k is deliberately not reproduced, and a window
+past 256 distinct tokens falls back per sample.
+
+**Measured, after.**  5 alternating rounds, same text in both arms: **78.26 t/s fast against 75.00 t/s with
+`GGML_LF_FAST_TOPK=0`** (+4.3 %), 3x R9700 `-sm tensor` MTP.  Exactness is the claim, so it was checked 7 ways
+against the full-vocabulary arm (presence / repeat / frequency / all three / a penalty combined with a logit bias /
+no penalty / a 4B model on one GPU) — every pair byte-identical, plus a 700-token `--top-k 60 --repeat-last-n 8192`
+run that grew the window past the cap (472 fast / 228 fallbacks) and still read the full arm's text.  Two traps hit
+on the way, both worth recording: hashing a `-lv 4` log (the census needs `-lv 4`, the hash needs none) invented a
+"mismatch" that the self-check then disproved, and comparing two *different* sampling profiles for rate is
+meaningless with MTP because the acceptance profile moves with the text.
+
+**Instruments (new).**  `GGML_LF_FAST_TOPK_CENSUS=1` — which path each sample took, how many carried a penalty
+window, the largest affected set and the self-check's mismatches; without it a text arm cannot tell a fast path
+from a quiet fallback.  `GGML_LF_FAST_TOPK_SELFCHECK=1` — the whole vocabulary scored the way the chain would and
+compared with the fast path's `k`, per sample, 0 mismatches over 400 samples; `=2` is its **control** (it swaps the
+two best-ranked tokens: 128/128 mismatches and the text moves), which is what makes "the text is identical" a
+sensitive claim.
+
+**Gates.**  `scripts/gate-fast-topk-penalties.sh` (`MANIFESTS.md` gate 45): 7/7 text pairs identical against the
+full-vocabulary arm, census 128 fast / 0 full with a penalty window on the penalised arm and 0 fast / 128 full on the
+kill switch, self-check 0 mismatches with its rank-swap control at 128 and a moved text, the 700-token cap arm
+472 fast / 228 full with identical text, no GPU faults.  Cross-build neutrality against the ACTUAL r360 binary
+(checked out `3be8b9bd1`, rebuilt, and back): 4B greedy `7e6229b260f6` on 1 GPU and on 3-GPU `-sm tensor`, identical
+on both builds, and — the one that matters — **27B 3-GPU `-sm tensor` + MTP + `--presence-penalty 0.15` reads
+`3651d4d825b9` on r360 (its full path) and r361 (its fast path)**, i.e. the whole fix in one line.  MTP Protocol A
+(dense 27B UD-Q4_K_XL, 1 GPU, prose prompt, `-n 2000`, `--presence-penalty 1.5`): plain **31.3 t/s**, `draft-mtp`
+**52.7 t/s**, acceptance **0.49092** (> the ~0.45 floor).  `check-gen-docs.sh` ok (no option is added),
+`check-shlib-symbols.sh` 16/16, `gate-prefill-logits.sh` **0.000000 / 100.000 %**, `validate-set.sh` green.
+
+**The cut.**  `v18-919794500-r361` = `c7a4f0b6c`, base `919794500`, tree
+`8962b7a40ea7e509a60d763b96a2ceeb0902521a`, 18 official + 1 temporary = 19 default blocks; optional `0100` tree
+`35ab35cf5`, `0101` tree `30a57b9a2`, cumulative `ae4981eac` (both re-applied strictly on the new default tree).
+`validate-set.sh` green, `0 unexplained` in the rung reconciliation with the two new variables counted as additions.
+Record: `archive/work/fast-topk-penalties/`, `GREEDY-PURITY.md` §110, `INVARIANTS.md` r361, `DIAGNOSTIC.md` §27.
+
 ## 261125.005 (r360, release cut) -- tagged, pushed, the fork branch refreshed to the re-cut tip, the images are building on the worker
 
 **The cut.**  `v18-919794500-r360` = `07611562`, base `919794500`, tree `4674dd9f2e83894895d71b7e987a06d80fa70813`, 18

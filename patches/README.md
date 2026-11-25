@@ -4390,6 +4390,34 @@ cannot tell the two arms apart).  Record: `archive/work/qsa-topk-regular/`.
 
 ## Block 12 — campaign remainder
 
+> **r361 amendment (GitHub issue #366, `@mjohanning99`): THE S2 EXACT TOP-K FAST PATH NOW REPRODUCES A PENALTY
+> instead of standing down for one.**  `common_sampler_fast_topk_k()` returned 0 for any non-trivial penalties
+> sampler, so every profile with a presence / frequency / repeat penalty sampled from a FULL-vocabulary candidate
+> array — an array build plus a `token_count` hash lookup per candidate, for every sampled token, and with MTP
+> several per step.  It cost the reporter **5.7 %** of decode (a gfx1201 + gfx1100 pair, `-sm tensor`, MTP n5:
+> 69.7 → 73.7 t/s, acceptance unchanged) and this box **4.3 %** (3× R9700, `-sm tensor`, MTP, `top-k 20`, 300
+> tokens, `--presence-penalty 0.15`: **78.26 → 75.00 t/s** mean of 5 alternating rounds, text identical).
+>
+> * A penalty moves only the tokens in its last-n window, so it has the **logit bias's shape**: the affected set is
+>   the bias set plus that window (≤ **256** distinct tokens), the raw top `k + 1 + |affected|` still holds the top
+>   `k + 1` of the untouched tokens, and each affected token's adjusted logit is recomputed from its RAW logit with
+>   `llama_sampler_penalties_apply()`'s own arithmetic, in the chain's order (the bias sampler runs first, so the
+>   penalty applies to the biased value).  The k tokens handed to the chain still carry their raw logits — the chain
+>   re-applies the bias and the penalty itself — so the values are **bit-identical** and only the candidate array is
+>   smaller.  Everything else that moves a logit ahead of top-k still stands the path down (DRY, top-n-sigma, an
+>   unknown sampler, two penalties samplers in one chain), and a penalty that runs *after* top-k is not reproduced.
+> * Two **read-only** accessors, `llama_sampler_penalties_get_params()` and `llama_sampler_penalties_get_window()`,
+>   expose the sampler's parameters and its (token, count) window, so the fast path reads the chain's own state
+>   instead of keeping a second copy of the map.  The window is re-read once per sample (it moves as tokens are
+>   accepted); a window **past 256 distinct tokens** (a very large `--repeat-last-n`) falls back per sample and
+>   moves no token — the one configuration where a penalty still costs decode, and measured on a 700-token run
+>   (472 fast / 228 full, text identical to the full-path arm).
+> * Host-side C++ only (`common/sampling.cpp`, two accessors in `src/llama-sampler.cpp` and their declarations), so
+>   no ggml, kernel or backend file is touched and every backend runs it.  Gate:
+>   `scripts/gate-fast-topk-penalties.sh` (`MANIFESTS.md` gate 44) — the full-vocabulary arm is the oracle, the
+>   census is the non-vacuity check, and the self-check's rank-swap control proves the text arms are sensitive.
+>   Knobs: `DIAGNOSTIC.md` §27.  Record: `archive/work/fast-topk-penalties/`.
+
 > **r357 amendment (contributor PR #360, `@overdoingism`): the server keeps a tool result's special-token strings as
 > TEXT.**  A tool result (role `tool` / `function`), the arguments of an assistant's tool call and an assistant's own
 > content/reasoning are DATA — text that came from a file, a web page, a database row, or that the model copied out of
@@ -5363,7 +5391,8 @@ had no other home.
   can resolve to `buffered`; forcing either fill mode still works.  Reporter's log lines (92 GiB box,
   `MOE_HOST_POOL_FRAC` 80 vs 50) land on the two arms the rule predicts.
 
-**Knobs.**  `LLAMA_OUTPUT_PINNED`, `MTP_DRAFT_N_UBATCH`, `LLAMA_DFLASH_DEV`, `GGML_LF_FAST_TOPK`,
+**Knobs.**  `LLAMA_OUTPUT_PINNED`, `MTP_DRAFT_N_UBATCH`, `LLAMA_DFLASH_DEV`, `GGML_LF_FAST_TOPK`
+(and, r361, `GGML_LF_FAST_TOPK_CENSUS` / `GGML_LF_FAST_TOPK_SELFCHECK`),
 `LLAMA_DFLASH_INGEST_TAIL` (r130), `LLAMA_STATE_GET_MERGE_GAP`, `LLAMA_STATE_ASYNC`, `LLAMA_STATE_ASYNC_MAX_MIB`,
 `LLAMA_STATE_ASYNC_READ`, `LLAMA_STATE_PIPE_GROUPS` (r151), `LLAMA_STATE_COPY_THREADS` and
 `LLAMA_STATE_TIMING` (r152), `LLAMA_STATE_STAGE_MIB` (r157),

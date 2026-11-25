@@ -1,4 +1,4 @@
-From 9c377c04d58bbcd0d381fb932324095e88db5789 Mon Sep 17 00:00:00 2001
+From d62a639b1478c4a31e9e0dbc6bad09c29f4049d5 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/18] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -59,11 +59,82 @@ It is a correctness/security change, not a performance claim, and every backend 
 ggml, kernel or backend file is touched).  Gate: scripts/gate-tool-text.sh (gate 43).
 Knobs: DIAGNOSTIC.md section 26 (both are diagnostics -- a kill switch and a census).
 Record: archive/work/tool-text/ (the submitted patch is kept there as the reproduction).
+
+The r361 amendment: the exact top-k fast path now reproduces a PENALTY instead of standing
+down for one (GitHub issue #366, reported by @mjohanning99).
+
+A presence, frequency or repeat penalty used to switch the S2 fast path off entirely
+(common_sampler_fast_topk_k() returned 0 for a non-trivial penalties sampler), so every
+profile with a penalty sampled from a full-vocabulary candidate array -- an array build plus
+a token_count hash lookup per candidate, for every sampled token, and with MTP several per
+step.  It cost the reporter 5.7 % of decode (a gfx1201 + gfx1100 pair, 69.7 -> 73.7 t/s,
+acceptance unchanged) and this box 4.3 % (3x R9700 gfx1201, -sm tensor, MTP, top-k 20,
+--presence-penalty 0.15: 78.26 vs 75.00 t/s, 5 alternating rounds, same text).
+
+  * A penalty moves only the tokens in its last-n window, so it has the logit bias's shape.
+    The affected set is the bias set plus that window (<= 256 distinct tokens; past it the
+    full path runs), the raw top (k + 1 + |affected|) still holds the top k + 1 of the
+    untouched tokens, and each affected token's adjusted logit is computed from its RAW logit
+    with llama_sampler_penalties_apply()'s own arithmetic, in the chain's order (the bias
+    sampler runs first, so the penalty applies to the biased value).  The k tokens handed to
+    the chain still carry their raw logits: the chain re-applies the bias and the penalty
+    itself, so the values stay bit-identical and only the CANDIDATE ARRAY is smaller.
+  * Two read-only accessors -- llama_sampler_penalties_get_params() and
+    llama_sampler_penalties_get_window() -- expose the sampler's parameters and its
+    (token, count) window, so the fast path reads the chain's own state rather than keeping a
+    second copy of the map.  The window is re-read once per sample (it moves as tokens are
+    accepted), and a window past the cap falls back per sample and moves no token.
+  * Everything else that moves a logit ahead of top-k still stands the fast path down (DRY,
+    top-n-sigma, an unknown sampler, two penalties samplers in one chain), and a penalty
+    that runs AFTER top-k is deliberately not reproduced -- it changes a set the fast path
+    never saw.
+  * GGML_LF_FAST_TOPK_CENSUS=1 (new) logs which path each sample took, how many carried a
+    penalty window and the largest affected set.  GGML_LF_FAST_TOPK_SELFCHECK=1 (new) scores
+    the whole vocabulary the way the chain would and compares it with the k tokens the fast
+
+The r361 amendment: the exact top-k fast path now reproduces a PENALTY instead of standing
+down for one (GitHub issue #366, reported by @mjohanning99).
+
+A presence, frequency or repeat penalty used to switch the S2 fast path off entirely
+(common_sampler_fast_topk_k() returned 0 for a non-trivial penalties sampler), so every
+profile with a penalty sampled from a full-vocabulary candidate array -- an array build plus
+a token_count hash lookup per candidate, for every sampled token, and with MTP several per
+step.  It cost the reporter 5.7 % of decode (a gfx1201 + gfx1100 pair, 69.7 -> 73.7 t/s,
+acceptance unchanged) and this box 4.3 % (3x R9700 gfx1201, -sm tensor, MTP, top-k 20,
+--presence-penalty 0.15: 78.26 vs 75.00 t/s, 5 alternating rounds, same text).
+
+  * A penalty moves only the tokens in its last-n window, so it has the logit bias's shape.
+    The affected set is the bias set plus that window (<= 256 distinct tokens; past it the
+    full path runs), the raw top (k + 1 + |affected|) still holds the top k + 1 of the
+    untouched tokens, and each affected token's adjusted logit is computed from its RAW logit
+    with llama_sampler_penalties_apply()'s own arithmetic, in the chain's order (the bias
+    sampler runs first, so the penalty applies to the biased value).  The k tokens handed to
+    the chain still carry their raw logits: the chain re-applies the bias and the penalty
+    itself, so the values stay bit-identical and only the CANDIDATE ARRAY is smaller.
+  * Two read-only accessors -- llama_sampler_penalties_get_params() and
+    llama_sampler_penalties_get_window() -- expose the sampler's parameters and its
+    (token, count) window, so the fast path reads the chain's own state rather than keeping a
+    second copy of the map.  The window is re-read once per sample (it moves as tokens are
+    accepted), and a window past the cap falls back per sample and moves no token.
+  * Everything else that moves a logit ahead of top-k still stands the fast path down (DRY,
+    top-n-sigma, an unknown sampler, two penalties samplers in one chain), and a penalty
+    that runs AFTER top-k is deliberately not reproduced -- it changes a set the fast path
+    never saw.
+  * GGML_LF_FAST_TOPK_CENSUS=1 (new) logs which path each sample took, how many carried a
+    penalty window and the largest affected set.  GGML_LF_FAST_TOPK_SELFCHECK=1 (new) scores
+    the whole vocabulary the way the chain would and compares it with the k tokens the fast
+    path picked, once per sample; =2 is its control arm (it swaps the two best-ranked tokens,
+    so the oracle must fire and the text must move).
+
+It is a sampler change -- host-side C++ only (common/sampling.cpp, plus the two accessors in
+src/llama-sampler.cpp and their declarations in include/llama.h) -- so no backend, kernel or
+ggml file is touched and every backend runs it.  Gate: scripts/gate-fast-topk-penalties.sh
+(gate 45).  Knobs: DIAGNOSTIC.md section 27 (both are diagnostics).
 ---
  common/arg.cpp                                |   32 +-
  common/common.cpp                             |   11 +
  common/common.h                               |    7 +
- common/sampling.cpp                           |  224 +-
+ common/sampling.cpp                           |  440 +-
  common/speculative.cpp                        |  103 +-
  ggml/include/ggml-alloc.h                     |    7 +-
  ggml/include/ggml-backend.h                   |   27 +
@@ -88,7 +159,7 @@ Record: archive/work/tool-text/ (the submitted patch is kept there as the reprod
  ggml/src/ggml-cuda/wddm-mem.cu                |  124 +
  ggml/src/ggml-rpc/ggml-rpc.cpp                |    3 +
  ggml/src/ggml.c                               |   57 +-
- include/llama.h                               |   20 +-
+ include/llama.h                               |   40 +-
  src/llama-batch.cpp                           |   11 +-
  src/llama-batch.h                             |    6 +-
  src/llama-context.cpp                         | 1226 +++-
@@ -114,6 +185,7 @@ Record: archive/work/tool-text/ (the submitted patch is kept there as the reprod
  src/llama-model-loader.h                      |   16 +-
  src/llama-model.cpp                           |  108 +-
  src/llama-model.h                             |   13 +-
+ src/llama-sampler.cpp                         |   48 +
  src/llama.cpp                                 |    7 +
  src/models/dflash.cpp                         |  233 +
  src/models/dflash2.cpp                        |   21 +-
@@ -127,7 +199,7 @@ Record: archive/work/tool-text/ (the submitted patch is kept there as the reprod
  tools/server/server-slot-sched.cpp            |  114 +-
  tools/server/server-slot-sched.h              |   14 +
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 67 files changed, 10567 insertions(+), 1270 deletions(-)
+ 68 files changed, 10850 insertions(+), 1271 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index f36b39cf0..ebd7320eb 100644
@@ -258,10 +330,10 @@ index fae3744ad..dfd33c266 100644
  
  //
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 078bfd984..9e0050591 100644
+index 078bfd984..f29693d65 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
-@@ -109,6 +109,54 @@ struct ring_buffer {
+@@ -109,6 +109,58 @@ struct ring_buffer {
      std::vector<T> data;
  };
  
@@ -313,26 +385,141 @@ index 078bfd984..9e0050591 100644
 +static bool topk_block_scan_avx2_ok() { return false; }
 +#endif
 +
++// S2: the most tokens the exact top-k fast path reproduces (the logit-bias set and the penalties window together, and
++// the raw values it has to keep around them).  Beyond it the full vocabulary path runs.
++static constexpr int S2_MAX_AFFECTED = 256;
++
  struct common_sampler {
      common_params_sampling params;
  
-@@ -131,7 +179,102 @@ struct common_sampler {
+@@ -131,7 +183,261 @@ struct common_sampler {
          llama_sampler_reset(chain);
      }
  
 -    void set_logits(struct llama_context * ctx, int idx) {
-+    // Llama-Frankenstein S2: exact top-k fast path.  When the samplers ahead of top-k leave the logits alone (logit bias
-+    // aside) and the k largest (biased) logits are distinct and strictly above the (k+1)-th, the chain's top-k keeps
-+    // exactly those k tokens in one order, whatever else is in the array; so only they are handed to the chain (with
-+    // their raw logits: the chain still adds the bias) instead of the whole vocabulary.  Otherwise the full array.
-+    bool set_logits_topk(const float * logits, int n_vocab) {
-+        const int k  = fast_k;
-+        const int nb = (int) fast_bias_ids.size();
-+        if (nb > 0 && fast_bias_ids.back() >= n_vocab) {
++    // S2: a token whose logit the chain changes before top-k, and how.  `count` is the penalties sampler's count for it
++    // (0 = not in its window -- the token_count map never holds a zero), `bias`/`has_bias` the chain's logit bias.
++    struct fast_affected_t {
++        llama_token id       = 0;
++        int32_t     count    = 0;
++        float       bias     = 0.0f;
++        bool        has_bias = false;
++    };
++
++    // S2: read the penalties sampler's window (it moves as tokens are accepted, so once per sample).  False when it
++    // holds more distinct tokens than the fast path reproduces (a large --repeat-last-n): the full path then runs.
++    bool read_penalty_window() {
++        fast_pen_n = 0;
++        if (fast_pen == nullptr) {
++            return true;
++        }
++        const int32_t n = llama_sampler_penalties_get_window(fast_pen,
++                fast_pen_ids.data(), fast_pen_cnt.data(), S2_MAX_AFFECTED);
++        if (n > S2_MAX_AFFECTED) {
 +            return false;
 +        }
-+        // the raw top (k + 1 + nb) holds the top k + 1 of the tokens without a bias
-+        const int m  = k + 1 + nb;
++        fast_pen_n = n;
++        return true;
++    }
++
++    // S2: the affected set -- the penalties window plus the biased tokens -- sorted by id, one entry per token (a token
++    // can be both: the chain applies the bias first and the penalties to the biased value).
++    void build_affected() {
++        fast_aff.clear();
++        for (int32_t i = 0; i < fast_pen_n; ++i) {
++            fast_aff.push_back({ fast_pen_ids[i], fast_pen_cnt[i], 0.0f, false });
++        }
++        for (const auto & b : fast_bias) {
++            // fast_bias_ids is unique, so a token carries at most one bias here
++            fast_aff.push_back({ b.token, 0, b.bias, true });
++        }
++        std::sort(fast_aff.begin(), fast_aff.end(), [](const fast_affected_t & a, const fast_affected_t & b) {
++            return a.id < b.id;
++        });
++        for (size_t i = 1; i < fast_aff.size(); ) {
++            if (fast_aff[i - 1].id != fast_aff[i].id) {
++                ++i;
++                continue;
++            }
++            fast_aff[i - 1].count    = std::max(fast_aff[i - 1].count, fast_aff[i].count);
++            fast_aff[i - 1].has_bias = fast_aff[i - 1].has_bias || fast_aff[i].has_bias;
++            if (fast_aff[i].has_bias) {
++                fast_aff[i - 1].bias = fast_aff[i].bias;
++            }
++            fast_aff.erase(fast_aff.begin() + i);
++        }
++    }
++
++    // S2: the token's logit as the chain would leave it -- the logit-bias sampler, then the penalties sampler, in the
++    // order common_sampler_init adds them and with llama_sampler_penalties_apply's exact arithmetic.
++    float affected_logit(const fast_affected_t & a, const float * logits) const {
++        float x = logits[a.id];
++        if (a.has_bias) {
++            x += a.bias;
++        }
++        if (a.count > 0) {
++            // the repeat penalty only divides, which would raise a negative logit, so that half is multiplied instead
++            if (x <= 0) {
++                x *= fast_pen_repeat;
++            } else {
++                x /= fast_pen_repeat;
++            }
++            x -= float(a.count) * fast_pen_freq + float(a.count > 0) * fast_pen_present;
++        }
++        return x;
++    }
++
++    bool affected_has(llama_token id) const {
++        const auto it = std::lower_bound(fast_aff.begin(), fast_aff.end(), id,
++                [](const fast_affected_t & a, llama_token t) { return a.id < t; });
++        return it != fast_aff.end() && it->id == id;
++    }
++
++    // S2: bind the chain's penalties sampler (if any) -- exactly one enabled one, and only when it runs before top-k,
++    // because a penalty applied after top-k changes a set the fast path never saw.
++    void bind_penalties(bool ahead) {
++        fast_pen = nullptr;
++        int n_pen = 0;
++        for (int i = 0; i < llama_sampler_chain_n(chain); ++i) {
++            struct llama_sampler * s = llama_sampler_chain_get(chain, i);
++            if (llama_sampler_penalties_get_params(s, nullptr, nullptr, nullptr, nullptr)) {
++                fast_pen = s;
++                ++n_pen;
++            }
++        }
++        if (!ahead) {
++            fast_pen = nullptr; // nothing to reproduce: any penalties sampler here runs after top-k
++            return;
++        }
++        if (n_pen != 1) {
++            fast_k = 0; // two penalties samplers in one chain: the composition is not reproduced here
++            fast_pen = nullptr;
++            return;
++        }
++        llama_sampler_penalties_get_params(fast_pen, nullptr, &fast_pen_repeat, &fast_pen_freq, &fast_pen_present);
++    }
++
++    // Llama-Frankenstein S2: exact top-k fast path.  When the samplers ahead of top-k only change the logits of a small,
++    // known set of tokens (the logit-bias set, and the last-n window of a penalties sampler, whose adjusted value is
++    // computable from the raw logit and the count -- see affected_logit()) and the k largest adjusted logits are
++    // distinct and strictly above the (k+1)-th, the chain's top-k keeps exactly those k tokens in one order, whatever
++    // else is in the array; so only they are handed to the chain (with their RAW logits: the chain still applies the
++    // bias and the penalties, in its own order and with its own arithmetic) instead of the whole vocabulary.
++    // Otherwise the full array.
++    bool set_logits_topk(const float * logits, int n_vocab) {
++        const int k = fast_k;
++        if (!read_penalty_window()) {
++            return false;
++        }
++        build_affected();
++        for (const auto & a : fast_aff) {
++            if (a.id >= n_vocab) {
++                return false;
++            }
++        }
++        dbg_aff = std::max(dbg_aff, (int) fast_aff.size());
++        // the raw top (k + 1 + affected) holds the top k + 1 of the tokens the chain leaves alone
++        const int m  = k + 1 + (int) fast_aff.size();
 +        auto & top = fast_top; // descending by value
 +        top.clear();
 +        float thr = -INFINITY;
@@ -377,23 +564,19 @@ index 078bfd984..9e0050591 100644
 +        if (bad || (int) top.size() < m) {
 +            return false;
 +        }
-+        if (nb > 0) {
-+            // drop the raw values of the biased tokens, add their biased values (added in the chain's order)
++        if (!fast_aff.empty()) {
++            // drop the raw values of the affected tokens and add each one's adjusted value -- what the chain would make
++            // of it, so the k largest are the chain's own k largest whatever the penalties did to the order
 +            top.erase(std::remove_if(top.begin(), top.end(), [&](const std::pair<float, llama_token> & e) {
-+                return std::binary_search(fast_bias_ids.begin(), fast_bias_ids.end(), e.second);
++                return affected_has(e.second);
 +            }), top.end());
-+            for (const llama_token id : fast_bias_ids) {
-+                float x = logits[id];
-+                for (const auto & b : fast_bias) {
-+                    if (b.token == id) {
-+                        x += b.bias;
-+                    }
-+                }
++            for (const auto & a : fast_aff) {
++                const float x = affected_logit(a, logits);
 +                if (x != x) {
 +                    return false;
 +                }
 +                if (x > -INFINITY) {
-+                    top.emplace_back(x, id);
++                    top.emplace_back(x, a.id);
 +                }
 +            }
 +            std::sort(top.begin(), top.end(), [](const std::pair<float, llama_token> & a, const std::pair<float, llama_token> & b) {
@@ -413,29 +596,86 @@ index 078bfd984..9e0050591 100644
 +            const llama_token id = top[j].second;
 +            cur[j] = llama_token_data{id, logits[id], 0.0f};
 +        }
++        self_check(logits, n_vocab);
 +        return true;
++    }
++
++    // S2: the fast path's own oracle (GGML_LF_FAST_TOPK_SELFCHECK=1).  It scores the whole vocabulary the way the chain
++    // would and compares the k tokens it selects with the fast path's, so a fast path that quietly stops reproducing the
++    // chain is a logged mismatch instead of a slow text drift nobody attributes to the sampler.  =2 is the CONTROL arm:
++    // it keeps the check and swaps the two best-ranked tokens the fast path picked, so the check must fire and the text
++    // must move -- which is what makes "the text is identical" in the gate a sensitive claim rather than an inert one.
++    void self_check(const float * logits, int n_vocab) {
++        static const int level = [] { const char * e = getenv("GGML_LF_FAST_TOPK_SELFCHECK"); return e ? atoi(e) : 0; }();
++        if (level <= 0 || fast_k < 2) {
++            return;
++        }
++        const int k = fast_k;
++        if (level >= 2) {
++            std::swap(cur[0], cur[1]);
++        }
++        std::vector<std::pair<float, llama_token>> ref;
++        ref.reserve(n_vocab);
++        for (int i = 0; i < n_vocab; ++i) {
++            fast_affected_t a;
++            a.id = i;
++            const auto it = std::lower_bound(fast_aff.begin(), fast_aff.end(), (llama_token) i,
++                    [](const fast_affected_t & x, llama_token t) { return x.id < t; });
++            if (it != fast_aff.end() && it->id == i) {
++                a = *it;
++            }
++            ref.emplace_back(affected_logit(a, logits), (llama_token) i);
++        }
++        std::partial_sort(ref.begin(), ref.begin() + k + 1, ref.end(),
++                [](const std::pair<float, llama_token> & a, const std::pair<float, llama_token> & b) { return a.first > b.first; });
++        for (int j = 0; j < k; ++j) {
++            if (ref[j].second == cur[j].id) {
++                continue;
++            }
++            LOG_ERR("%s: SELF-CHECK FAILED at rank %d: the fast path picked %d (raw %.6f, adjusted %.6f), the full "
++                    "vocabulary picks %d (raw %.6f, adjusted %.6f)\n", __func__, j, cur[j].id, logits[cur[j].id],
++                    affected_logit_of(cur[j].id, logits), ref[j].second, logits[ref[j].second], ref[j].first);
++            ++dbg_bad;
++            return;
++        }
++    }
++
++    float affected_logit_of(llama_token id, const float * logits) const {
++        const auto it = std::lower_bound(fast_aff.begin(), fast_aff.end(), id,
++                [](const fast_affected_t & a, llama_token t) { return a.id < t; });
++        fast_affected_t a;
++        a.id = id;
++        if (it != fast_aff.end() && it->id == id) {
++            a = *it;
++        }
++        return affected_logit(a, logits);
 +    }
 +
 +    void set_logits(struct llama_context * ctx, int idx, bool allow_fast = false) {
          const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
          const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
          const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
-@@ -156,9 +299,11 @@ struct common_sampler {
+@@ -156,10 +462,16 @@ struct common_sampler {
          } else {
              const auto * logits = llama_get_logits_ith(ctx, idx);
              GGML_ASSERT(logits != nullptr);
 -            cur.resize(n_vocab);
 -            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
 -                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
-+            if (!(allow_fast && fast_k > 0 && fast_k < n_vocab && set_logits_topk(logits, n_vocab))) {
++            const bool fast = allow_fast && fast_k > 0 && fast_k < n_vocab && set_logits_topk(logits, n_vocab);
++            if (!fast) {
 +                cur.resize(n_vocab);
 +                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
 +                    cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
 +                }
              }
++            dbg_fast += fast;
++            dbg_full += !fast;
++            dbg_pen  += fast && fast_pen_n > 0;
          }
  
-@@ -170,8 +315,46 @@ struct common_sampler {
+         cur_p = { cur.data(), cur.size(), -1, false };
+@@ -170,8 +482,66 @@ struct common_sampler {
      }
  
      mutable int64_t t_total_us = 0;
@@ -444,22 +684,42 @@ index 078bfd984..9e0050591 100644
 +    std::vector<llama_logit_bias> fast_bias = {};                // S2: the chain's logit biases, in the chain's order
 +    std::vector<llama_token> fast_bias_ids = {};                 // S2: the biased tokens, sorted, unique
 +    std::vector<std::pair<float, llama_token>> fast_top = {};    // S2: scratch
++
++    struct llama_sampler * fast_pen = nullptr;   // S2: the chain's penalties sampler when the fast path reproduces it
++    float fast_pen_repeat  = 1.0f;               // S2: its parameters, read once at init
++    float fast_pen_freq    = 0.0f;
++    float fast_pen_present = 0.0f;
++    int32_t fast_pen_n     = 0;                  // S2: entries of its window in the scratch below, 0 = none
++    std::vector<llama_token>     fast_pen_ids = {};   // S2: scratch, S2_MAX_AFFECTED entries
++    std::vector<int32_t>         fast_pen_cnt = {};   // S2: scratch, parallel to fast_pen_ids
++    std::vector<fast_affected_t> fast_aff     = {};   // S2: the affected set, sorted by id, unique
++
++    int64_t dbg_fast    = 0;                     // S2 census: samples that took the fast path
++    int64_t dbg_full    = 0;                     // S2 census: samples that fell back to the full vocabulary
++    int64_t dbg_pen     = 0;                     // S2 census: fast-path samples whose penalty window was not empty
++    int64_t dbg_bad     = 0;                     // S2 census: self-check mismatches (GGML_LF_FAST_TOPK_SELFCHECK=1)
++    int     dbg_aff     = 0;                     // S2 census: the largest affected set seen
  };
  
-+// S2: the fast path's k when every sampler ahead of top-k is a no-op for these parameters (logit bias is handled by the
-+// fast path itself), else 0.  GGML_LF_FAST_TOPK=0 turns it off.
-+static int common_sampler_fast_topk_k(const common_params_sampling & p) {
++// S2: the fast path's k when every sampler ahead of top-k only moves the logits of a small, known set of tokens (the
++// logit-bias set, which the fast path evaluates itself, and a penalties sampler, whose window it evaluates too), else 0.
++// `pen_ahead` reports whether an enabled penalties sampler runs before top-k.  GGML_LF_FAST_TOPK=0 turns it off.
++static int common_sampler_fast_topk_k(const common_params_sampling & p, bool * pen_ahead) {
 +    static const bool off = [] { const char * e = getenv("GGML_LF_FAST_TOPK"); return e && atoi(e) == 0; }();
 +    if (off || p.mirostat != 0 || p.top_k <= 0) {
 +        return 0;
 +    }
++    *pen_ahead = false;
 +    for (const auto s : p.samplers) {
 +        switch (s) {
 +            case COMMON_SAMPLER_TYPE_TOP_K:
 +                return p.top_k;
 +            case COMMON_SAMPLER_TYPE_PENALTIES:
 +                if (!(p.penalty_last_n == 0 || (p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f))) {
-+                    return 0;
++                    if (*pen_ahead) {
++                        return 0; // two penalties samplers: the composition is not reproduced
++                    }
++                    *pen_ahead = true;
 +                }
 +                break;
 +            case COMMON_SAMPLER_TYPE_DRY:
@@ -482,7 +742,7 @@ index 078bfd984..9e0050591 100644
  std::string common_params_sampling::print() const {
      char result[1024];
  
-@@ -335,9 +518,8 @@ struct common_sampler * common_sampler_init(
+@@ -335,9 +705,8 @@ struct common_sampler * common_sampler_init(
      }
  
      // logit bias: user biases + model suppress tokens (-INFINITY)
@@ -493,11 +753,12 @@ index 078bfd984..9e0050591 100644
          int32_t n_suppress = 0;
          const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
          for (int32_t i = 0; i < n_suppress; ++i) {
-@@ -451,6 +633,21 @@ struct common_sampler * common_sampler_init(
+@@ -451,6 +820,26 @@ struct common_sampler * common_sampler_init(
          /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
      };
  
-+    result->fast_k = common_sampler_fast_topk_k(params);
++    bool pen_ahead = false;
++    result->fast_k = common_sampler_fast_topk_k(params, &pen_ahead);
 +    if (result->fast_k > 0) {
 +        result->fast_bias = merged;
 +        for (const auto & b : merged) {
@@ -506,16 +767,44 @@ index 078bfd984..9e0050591 100644
 +        std::sort(result->fast_bias_ids.begin(), result->fast_bias_ids.end());
 +        result->fast_bias_ids.erase(std::unique(result->fast_bias_ids.begin(), result->fast_bias_ids.end()), result->fast_bias_ids.end());
 +        // many biases, a token biased twice (the chain may add them in another order) or a negative id: the full path
-+        if (result->fast_bias_ids.size() > 256 || result->fast_bias_ids.size() != merged.size() ||
++        if (result->fast_bias_ids.size() > S2_MAX_AFFECTED || result->fast_bias_ids.size() != merged.size() ||
 +                (!result->fast_bias_ids.empty() && result->fast_bias_ids.front() < 0)) {
 +            result->fast_k = 0;
 +        }
++        // S2: the penalties sampler's window is scored by the fast path itself, so bind the sampler it reproduces
++        result->fast_pen_ids.assign(S2_MAX_AFFECTED, 0);
++        result->fast_pen_cnt.assign(S2_MAX_AFFECTED, 0);
++        result->bind_penalties(pen_ahead);
 +    }
 +
      return result;
  }
  
-@@ -530,9 +727,13 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+@@ -459,6 +848,16 @@ void common_sampler_free(struct common_sampler * gsmpl) {
+         return;
+     }
+ 
++    // S2: the exact-top-k census -- it says which path each sample took, which is the only way to tell a fast arm from a
++    // fast path that quietly fell back (a tie, a window that grew past the cap, a sampler the fast path does not model)
++    static const bool census = [] { const char * e = getenv("GGML_LF_FAST_TOPK_CENSUS"); return e && atoi(e) != 0; }();
++    if (census) {
++        LOG_TRC("%s: exact top-k fast path: k = %d, samples fast = %lld, full = %lld, fast with a penalty window = %lld, "
++                "affected tokens max = %d, self-check mismatches = %lld\n", __func__, gsmpl->fast_k,
++                (long long) gsmpl->dbg_fast, (long long) gsmpl->dbg_full, (long long) gsmpl->dbg_pen, gsmpl->dbg_aff,
++                (long long) gsmpl->dbg_bad);
++    }
++
+     llama_sampler_free(gsmpl->grmr);
+     llama_sampler_free(gsmpl->rbudget);
+     llama_sampler_free(gsmpl->chain);
+@@ -524,16 +923,32 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
+ }
+ 
+ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+-    return new common_sampler {
++    auto * result = new common_sampler {
+         /* .params  = */ gsmpl->params,
+         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
          /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
          /* .chain   = */ llama_sampler_clone(gsmpl->chain),
          /* .prev    = */ gsmpl->prev,
@@ -529,9 +818,22 @@ index 078bfd984..9e0050591 100644
 +        /* .fast_bias */ gsmpl->fast_bias,
 +        /* .fast_bias_ids */ gsmpl->fast_bias_ids,
      };
++
++    // S2: the clone's chain is a deep copy, so the penalties sampler is a different object than the source's
++    result->fast_pen_repeat  = gsmpl->fast_pen_repeat;
++    result->fast_pen_freq    = gsmpl->fast_pen_freq;
++    result->fast_pen_present = gsmpl->fast_pen_present;
++    result->fast_pen_ids.assign(S2_MAX_AFFECTED, 0);
++    result->fast_pen_cnt.assign(S2_MAX_AFFECTED, 0);
++    if (gsmpl->fast_pen != nullptr) {
++        result->bind_penalties(true);
++    }
++
++    return result;
  }
  
-@@ -624,7 +825,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+@@ -624,7 +1039,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
      auto & chain = gsmpl->chain;
      auto & cur_p = gsmpl->cur_p; // initialized by set_logits
  
@@ -10670,7 +10972,7 @@ index c1b187880..22875b31b 100644
      GGML_ASSERT(cgraph->size > cgraph->n_nodes);
      cgraph->nodes[cgraph->n_nodes] = tensor;
 diff --git a/include/llama.h b/include/llama.h
-index f2f880c34..3e42212de 100644
+index f2f880c34..3d083f6aa 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -212,6 +212,11 @@ extern "C" {
@@ -10721,6 +11023,33 @@ index f2f880c34..3e42212de 100644
      // WIP r42: aggregate the MoE expert cache arena's cumulative hit/miss counters for per-turn logging
      // (a before/after delta gives the turn's decode hit rate).  Returns false when no cache is active.
      LLAMA_API bool llama_moe_cache_stats(const struct llama_model * model, int64_t * hits, int64_t * misses, int64_t * arena_bytes);
+@@ -1673,6 +1691,26 @@ extern "C" {
+                                float   penalty_freq,     // must be finite, 0.0 = disabled
+                                float   penalty_present); // must be finite, 0.0 = disabled
+ 
++    /// Read a penalties sampler's parameters.  Returns false when `smpl` is not a penalties sampler (a disabled one is
++    /// created as an empty sampler, so it is not one).  A caller that has to reproduce the sampler's effect itself --
++    /// the exact top-k fast path in common/sampling.cpp -- reads the parameters and the window instead of duplicating
++    /// the state machine.  Any output pointer may be NULL.
++    LLAMA_API bool llama_sampler_penalties_get_params(
++              const struct llama_sampler * smpl,
++                                    int32_t * penalty_last_n,
++                                      float * penalty_repeat,
++                                      float * penalty_freq,
++                                      float * penalty_present);
++
++    /// The (token, count) entries of a penalties sampler's last-n window.  Returns the number of distinct tokens in
++    /// the window (0 when `smpl` is not a penalties sampler); when `tokens` and `counts` are both non-NULL, the first
++    /// min(n, return) entries are written.  The order is unspecified.
++    LLAMA_API int32_t llama_sampler_penalties_get_window(
++              const struct llama_sampler * smpl,
++                                 llama_token * tokens,
++                                    int32_t  * counts,
++                                    int32_t    n);
++
+     /// maximum number of distinct DRY sequence breakers, duplicates not counted
+     /// processing each breaker scans the entire vocabulary, so the init cost is O(num_breakers x n_vocab)
+     #define LLAMA_DRY_MAX_SEQ_BREAKERS 64
 diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
 index 2bda61ab2..08e45c746 100644
 --- a/src/llama-batch.cpp
@@ -14042,6 +14371,65 @@ index 14bde0611..a98784082 100644
      // total number of parameters in the model
      uint64_t n_elements() const;
  
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index b12278874..f6b16cc9f 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -3197,6 +3197,54 @@ struct llama_sampler * llama_sampler_init_penalties(
+     );
+ }
+ 
++bool llama_sampler_penalties_get_params(
++        const struct llama_sampler * smpl,
++        int32_t * penalty_last_n,
++        float   * penalty_repeat,
++        float   * penalty_freq,
++        float   * penalty_present) {
++    if (smpl == nullptr || smpl->iface != &llama_sampler_penalties_i) {
++        return false;
++    }
++
++    const auto * ctx = (const llama_sampler_penalties *) smpl->ctx;
++
++    if (penalty_last_n ) { *penalty_last_n  = ctx->penalty_last_n;  }
++    if (penalty_repeat ) { *penalty_repeat  = ctx->penalty_repeat;  }
++    if (penalty_freq   ) { *penalty_freq    = ctx->penalty_freq;    }
++    if (penalty_present) { *penalty_present = ctx->penalty_present; }
++
++    return true;
++}
++
++int32_t llama_sampler_penalties_get_window(
++        const struct llama_sampler * smpl,
++        llama_token * tokens,
++        int32_t     * counts,
++        int32_t       n) {
++    if (smpl == nullptr || smpl->iface != &llama_sampler_penalties_i) {
++        return 0;
++    }
++
++    const auto * ctx = (const llama_sampler_penalties *) smpl->ctx;
++
++    const int32_t n_used = (int32_t) ctx->token_count.size();
++
++    if (tokens != nullptr && counts != nullptr) {
++        int32_t i = 0;
++        for (const auto & entry : ctx->token_count) {
++            if (i == n || i == n_used) {
++                break;
++            }
++            tokens[i] = entry.first;
++            counts[i] = entry.second;
++            ++i;
++        }
++    }
++
++    return n_used;
++}
++
+ // top-n-sigma
+ 
+ struct llama_sampler_top_n_sigma {
 diff --git a/src/llama.cpp b/src/llama.cpp
 index e2574ebcb..4e0bbd8a5 100644
 --- a/src/llama.cpp
