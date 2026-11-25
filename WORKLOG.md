@@ -32,10 +32,10 @@ tree, built it, ran its gates and pushed:
 which is what `release.json.tip` records.
 
 **The images.**  The worker (`radiance`) picked the tag up on its 17:10 poll (`new release v18-919794500-r362 (last
-built: v18-919794500-r361); building (attempt 1/3)`) and is building both ROCm lines off-host.  Still open by
-policy: `scripts/build-containers.sh --verify-only` must read all 23 tags resolving and every moving tag carrying
-this release before the release is finished (issue #364); at the time of writing it reads 15/23 with the versioned
-r362 tags missing, which is the correct reading for a tag the worker has just started on.
+built: v18-919794500-r361); building (attempt 1/3)`) and published both ROCm lines off-host by 17:35;
+`scripts/build-containers.sh --verify-only` then reads **all 23 tags resolve and every moving tag carries this
+release** (`latest` and the 10.2 line at `sha256:e672bea8f16e`), which is the check issue #364 exists for.  The
+release is finished.
 
 **The issue.**  GitHub issue #368 answered (a comment, not a close): the geometry and the eviction pattern
 reproduce here but the bimodality does not (nine fresh starts, one state, one text), so the fix is the ring hole and
