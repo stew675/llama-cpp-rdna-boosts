@@ -16,6 +16,27 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.005 (r360, release cut) -- tagged, pushed, the fork branch refreshed to the re-cut tip, the images are building on the worker
+
+**The cut.**  `v18-919794500-r360` = `07611562`, base `919794500`, tree `4674dd9f2e83894895d71b7e987a06d80fa70813`, 18
+official + 1 temporary = 19 default blocks, 2 optional (`0100` tree `831bc116a…`, `0101` tree `f455c3121…`, cumulative
+`8bd172df5…`).  `scripts/validate-set.sh` green on the committed set; the GitHub Release carries its 4 assets.
+
+**The fork.**  `scripts/fork-refresh.sh --build --gates --push` re-cut the branch deterministically, asserted the
+applied tree against `release.json`, built it, ran `check-shlib-symbols.sh` + coherence + `gate-prefill-logits.sh`
+(**0.000000 / 100.000 %**, no GPU faults) and pushed:
+`gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` reads **`3be8b9bd1`**, which is what
+`release.json.tip` records.  The patches were then re-exported FROM that re-cut chain (so their `From` lines name the
+commits the fork carries, and the 19 hashes in `release.json` are the re-exported set), and the optional `0100`/`0101`
+were re-cut on it: their produced trees are byte-identical to the pre-re-cut values, only the export ids moved.  A
+rebase onto `761fcb43` (`wip/pr362`) was needed first: the tag had been pushed from a tree that predated it.
+
+**One open item, by policy.**  The images are built off-host and were still building when this entry was written
+(the worker picked `r360` up at 14:00 worker time and was at the HIP compile stage).  `scripts/build-containers.sh
+--verify-only` on this tree is the check that finishes the release: a missing tag or a moving tag still carrying
+`r359`'s digest exits 1, and that is the only honest proof (`GitHub issue #364`).
+
+
 ## 261125.004 (r360) -- `--fit` charged 1024 MiB of FA staging reserve on a q8_0 K/V cache the kernels read natively, and on a 12 GiB card that was eight layers of offload (GitHub issue #367, RDNA2)
 
 **The report.**  `@pkrasicki` runs an RX 6700 XT (`gfx1031`, 12 GiB) on a DDR3 platform and measured the r354/r355 tree

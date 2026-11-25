@@ -3484,7 +3484,11 @@ loses everywhere measurable, so the delivery's default went back to the dense fo
   (3) **The answer is the same on RDNA2.**  gfx1036 (a real RDNA2 device on this box) reads a q8_0 pair natively too:
   its fit projects 495 MiB for both the f16 and the q8_0 arm and 1519 MiB for the `GGML_CUDA_FA_KV_NATIVE=0` arm.
   So the "RDNA3_5 is the only arch that reads natively" special case was a leftover from when the native q8_0 arm
-  was RDNA3_5-only, and it under-charged nobody else while over-charging everyone.
+  was RDNA3_5-only, and it under-charged nobody else while over-charging everyone.  The predicate really is per
+  device, and bf16 KV is the arm that shows it: `-ctk bf16 -ctv bf16` projects 515 MiB on gfx1201 (bf16 MMA, so the
+  tile type is BF16 and nothing is converted) and 1519 MiB on gfx1036 (no bf16 MMA, so the pair stages and the
+  reserve is the same 1024 MiB it was).  A roomy card is unaffected either way: at the default `--fit-target` the
+  same 27B reads `-ngl -1` on both r359 and r360.
   (4) **What still costs a reserve, and how much risk the change carries.**  A pair that really stages (a mixed
   K/V pair, bf16 where bf16 MMA is absent, `GGML_CUDA_FA_KV_NATIVE=0`, `GGML_CUDA_FA_STAGE_MAX_MB=0`) still
   reserves the same way.  The accounting is an ESTIMATE of an allocation the compute buffer does not contain (a
