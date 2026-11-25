@@ -109,13 +109,13 @@ difference and named rather than guessed.
 
 | what | MiB | evidence |
 |---|---:|---|
-| **slab** — one VMM reservation, `size(VA)=21.19 GiB` | **21 696** | `SLAB_STATS … mapped=21696.0 MiB` |
-|   ├─ arena **span** (the experts' VA) | 19 904 | same line `arena=19904.0 MiB` |
-|   ├─ arena **slot banks** actually allocated | **17 404.7** | `report_locked: … slots=26907, arena=17404.7 MiB` |
-|   └─ *work* region = the compute buffer | 1 792 | `compute buffer 1792.00 MiB from the slab work region (boundary 1792.00)` |
-| model weights, dense tensors | 3 983 | `load_tensors: ROCm0 model buffer size = 3983.00 MiB` |
-| MTP draft weights (a second model) | 1 808 | `load_tensors: ROCm0 model buffer size = 1808.36 MiB` |
-| main KV, q8_0, 204 800 cells × 12 layers | 2 550 | `llama_kv_cache: ROCm0 KV buffer size = 2550.00 MiB` |
+| **slab** — one VMM reservation, `size(VA)=21.19 GiB` | **21696** | `SLAB_STATS … mapped=21696.0 MiB` |
+|   ├─ arena **span** (the experts' VA) | 19904 | same line `arena=19904.0 MiB` |
+|   ├─ arena **slot banks** actually allocated | **17404** | `report_locked: … slots=26907, arena=17404.7 MiB` |
+|   └─ *work* region = the compute buffer | 1792 | `compute buffer 1792.00 MiB from the slab work region (boundary 1792.00)` |
+| model weights, dense tensors | 3983 | `load_tensors: ROCm0 model buffer size = 3983.00 MiB` |
+| MTP draft weights (a second model) | 1808 | `load_tensors: ROCm0 model buffer size = 1808.36 MiB` |
+| main KV, q8_0, 204 800 cells × 12 layers | 2550 | `llama_kv_cache: ROCm0 KV buffer size = 2550.00 MiB` |
 | indexer KV (QSA lightning indexer, K only) | 319 | `… KV buffer size = 318.76 MiB`, `V (q8_0): 0.00` |
 | SSM recurrent state (48 layers) | 450 | `llama_memory_recurrent: ROCm0 RS buffer size = 450.28 MiB` |
 | rope rotation buffers (256-d + 128-d indexer) | 4 | `init_rotation: … 3.19 / 0.75 MiB` |
@@ -123,7 +123,7 @@ difference and named rather than guessed.
 | `h_nextn` — the MTP head's device scratch | 640 | `h_nextn_dev_alloc: … h_nextn buffer size = 640.04 MiB`; also the slab's `outside_max=640.0` |
 | HIP context, hipBLASLt Tensile code objects + workspace, FA-prefill staging (16 MiB), workspace-pool high-water | ~536 | by difference; the class `ENVIRONMENT.md` §1 calls un-routeable |
 | free (live, post-turn) | 399 | `mem_info_vram_used` = 32 225 of 32 624 MiB; run low-water `free_min=826.0 MiB` |
-| **card** | **32 624** | `ggml_backend_dev_memory` / `mem_info_vram_total` |
+| **card** | **32624** | `ggml_backend_dev_memory` / `mem_info_vram_total` |
 
 > Do **not** read the `free=` field of `SLAB_STATS` as the live free VRAM: it is printed at
 > context exit, i.e. *inside* the teardown that is already un-sizing the arena's slot banks
