@@ -4,7 +4,8 @@ Cross-project tracker so important state survives context compaction.
 
 **Forward-looking only.**  This file lists open work, items waiting on someone else, accepted limitations
 and parked ideas.  **A closed or resolved item is not kept here** — it is one dated entry in
-[`WORKLOG.md`](WORKLOG.md) plus the campaign record that entry points to (`archive/work/<campaign>/`).
+[`WORKLOG.md`](WORKLOG.md) — today's entries at its top, earlier days under `archive/worklog/` — plus the
+campaign record that entry points to (`archive/work/<campaign>/`).
 Details never live here: they live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`,
 `GREEDY-PURITY.md`, `ENVIRONMENT.md`, `wip/*` and `benchmarks/`.
 
@@ -32,8 +33,8 @@ repair is the standalone project `wip/prefill-decode-arms-v2/` -- **this file ca
 attendance pool and the MTP draft window -- all three opt-in, default off); block 15 is the UMA GTT expert
 store.  The **mixed K/V cache types** are **optional block `0101`** since the r288 block-number re-org (they
 were numbered block 17 in r287, PR #312 -- a different block from today's `0017`; the one native pair, head 256
-only), and `0100` is two-lane prefill.  `release.json` is the source of truth for the tip/tree, counts and hashes; the top of `WORKLOG.md`
-is the newest record.  **Block `0300` is temporary** (item #104).
+only), and `0100` is two-lane prefill.  `release.json` is the source of truth for the tip/tree, counts and hashes; the top of `WORKLOG.md` is the
+newest record.  **Block `0300` is temporary** (item #104).
 The r278 re-base (`archive/work/upstream-rebase-261113/`, base `4f9dfa0e3`) is **cut and released into
 `patches/`**: its 17 blocks are replayed, both rung-repairs are squashed into their owning blocks, and the gates
 are recorded in `WORKLOG.md` 261113.015.  What it left open -- #322 (a stale `gate-server-arms` baseline), #323 (the

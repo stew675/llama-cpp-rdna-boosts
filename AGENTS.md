@@ -5,12 +5,12 @@ This guide is for humans AND LLM coding agents. Read it before changing anything
 in and out of scope, how a change is verified and how a release is cut. It is deliberately short and it
 carries **no findings and no numbers of record** — the engineering facts, invariants and "do not do that
 again" rules live in [`INVARIANTS.md`](INVARIANTS.md), the purity rules in `GREEDY-PURITY.md`, the dated
-record in `WORKLOG.md` (newest first) and `archive/`. The pre-2026-10-04 AGENTS.md is preserved verbatim in
-`archive/docs/AGENTS-HISTORY.md`.
+record in `WORKLOG.md` (today, newest first) and `archive/worklog/` (every earlier day, one file per day), and
+in `archive/`.  The pre-2026-10-04 AGENTS.md is preserved verbatim in `archive/docs/AGENTS-HISTORY.md`.
 
 **Current state:** `release.json` is the single source of truth (fork point, canonical tip/tree, block
-count, per-artifact sha256); the top of `WORKLOG.md` is the newest dated record. Do not restate release
-history here.
+count, per-artifact sha256); the top of `WORKLOG.md` is the newest dated record, and the index at its end maps
+every earlier day to `archive/worklog/WORKLOG-YYYYMMDD.md`.  Do not restate release history here.
 
 ## What this repo is
 
@@ -89,8 +89,10 @@ touch.
    section is added to both (with a one-line pointer where one file carries nothing).
 10. **Do not regress a documented invariant**: if the code and an `INVARIANTS.md` entry disagree, fix the
     entry in the same change — and if the invariant itself must change, say so before shipping.
-11. **Record the work**: a dated `WORKLOG.md` entry (newest first) for anything delivery-affecting, plus the
-    per-block note in `patches/README.md` when a block's contents change.
+11. **Record the work**: a dated entry at the top of `WORKLOG.md` (newest first) for anything
+    delivery-affecting — and at the first entry of a new day, move the previous day's block to
+    `archive/worklog/WORKLOG-<YYYYMMDD>.md` and add its row to the index — plus the per-block note in
+    `patches/README.md` when a block's contents change.
 12. **Report findings before you commit, not after** (see the next section).
 13. **ALWAYS ask before creating a new delivery patch block.**  A new block, a block renumbering, or a
     change that moves a feature across block boundaries is the maintainer's decision — never a gate
@@ -262,7 +264,8 @@ Docs each have one job: **this file** is policy; [`INVARIANTS.md`](INVARIANTS.md
 [`GREEDY-PURITY.md`](GREEDY-PURITY.md) is the purity rulebook; [`MANIFESTS.md`](MANIFESTS.md) is the apply
 order + verification contract; [`BASELINE.md`](BASELINE.md) is provenance + the drift policy;
 [`ENVIRONMENT.md`](ENVIRONMENT.md) catalogues the end-user variables and [`DIAGNOSTIC.md`](DIAGNOSTIC.md) the
-kill-switches/A-B arms/diagnostics; [`WORKLOG.md`](WORKLOG.md) is the dated record (newest first);
+kill-switches/A-B arms/diagnostics; [`WORKLOG.md`](WORKLOG.md) is the dated record — today's entries, plus the
+index of earlier days, which live in [`archive/worklog/`](archive/worklog/);
 [`release.json`](release.json) is the single source of truth for the release.
 
 | path | what |
@@ -270,6 +273,8 @@ kill-switches/A-B arms/diagnostics; [`WORKLOG.md`](WORKLOG.md) is the dated reco
 | `README.md` | consumer overview + workflow (start here) |
 | `ENVIRONMENT.md` | **every end-user variable** the delivery adds or repoints — the opt-ins, the tuning values, the options and the one numerics selector, with their defaults. The switches that only turn a default-on feature *off*, the A/B and bisect arms, the test hooks and the diagnostics are in `DIAGNOSTIC.md` (same section numbers). Read whichever applies before adding a variable or changing a default |
 | `DIAGNOSTIC.md` | **the kill-switches, A/B arms, test hooks and diagnostics** — everything that exists to disable a default-on behaviour, prove an arm ran, bisect a regression or reproduce a fault, with its default and what turning it off restores. Never needed to run the delivery; nothing here is a supported configuration |
+| `WORKLOG.md` | **the dated delivery record**: today's entries (newest first) followed by a one-row-per-day index (date, entry count, entry-id range, link) of every earlier day.  A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — in this file if it is today's, otherwise via the index |
+| `archive/worklog/` | **the earlier days of the dated record** — one `WORKLOG-YYYYMMDD.md` per completed day of work, newest entry first. Part of the LIVE record, not a retired one: a day rolls over here when its successor's first entry is written |
 | `INVARIANTS.md` | **the engineering facts** (the `do not re-derive` list: measured facts, invariants and "do not do that again" rules, each tagged with the `rNN` that established it). Correct an entry in place when it changes; the narrative is in `WORKLOG.md`. Extracted from this file in 2026-11 |
 | `release.json` | **delivery single source of truth** (fork point, canonical tip/tree, block counts, per-artifact sha256) — read by `apply-all.sh`, `validate-set.sh` and CI; regenerate with `scripts/make-release.sh`, never hand-edit hashes.  `n_blocks` is the **official** count (it names `v<N>`), `n_temporary` the default-applied `03xx` blocks, `n_default` the **apply** count (`n_blocks + n_temporary`), `n_optional` (+ the `optional` map and `optional_tree`) the opt-in `01xx` artifacts |
 | `MANIFESTS.md` | apply order + the verification contract (release gates, per-block verification, failure handling). Its dated validation history is in `archive/docs/validation-history.md` |
@@ -518,7 +523,7 @@ gates stay on the primary box. A fast smoke: `scripts/build-containers.sh --rocm
   to the personal fork (see the Pushing policy). Never push to upstream `ggml-org/llama.cpp`.
 - Do not present old docs as current: `MANIFESTS.md`/`BASELINE.md` are contracts, their dated history
   is in `archive/docs/`; current claims are their current-state headers + `patches/README.md` +
-  `release.json` + the newest `WORKLOG.md` entry.
+  `release.json` + the top of `WORKLOG.md`.
 - Do not add new WIP experiments to the delivery set, and **never apply anything from `wip/`** or
   `archive/work/` unless the user explicitly asks for that specific item.
 
@@ -526,8 +531,9 @@ gates stay on the primary box. A fast smoke: `scripts/build-containers.sh --rocm
 
 The docs have a freshness problem by design: historical records are kept, and the CURRENT state lives in the
 current-state headers (`patches/README.md`, `README.md`, `MANIFESTS.md`, `BASELINE.md`, `INVARIANTS.md`,
-`release.json`) plus the newest `WORKLOG.md` entry. When you change the delivery, update those headers and
-add a new dated `WORKLOG.md` entry (newest first) — never edit dated validation records in place.
+`release.json`) plus the top of `WORKLOG.md`. When you change the delivery, update those headers and add a new
+dated entry at the top of `WORKLOG.md` (and roll the previous day over when the day turns) — never edit dated
+validation records in place.
 
 **Three of the files the delivery ships are GENERATED** (`tools/cli/README.md`, `tools/completion/README.md`,
 `tools/server/README.md`, from `llama-gen-docs` + `common/arg.cpp`).  A block that adds or changes an option owes a
@@ -543,7 +549,7 @@ waiting, accepted-limitation, parked — a closed item is one `WORKLOG.md` entry
 `ENVIRONMENT.md` is the end-user variable catalogue and `DIAGNOSTIC.md` its switch/diagnostic half (same
 section numbers); `INVARIANTS.md` is the engineering facts (current state — correct
 an entry in place, with the `rNN` of the change); `AGENTS.md` is **policy only** (no findings, no numbers of
-record, no release narrative).  **Release narrative belongs in `WORKLOG.md` and nowhere else** — do not paste
+record, no release narrative).  **Release narrative belongs in the WORKLOG and nowhere else** — do not paste
 a release summary into `README.md`, `BASELINE.md` or `MANIFESTS.md`; point at `WORKLOG.md` instead.
 
 **A new fact goes to `INVARIANTS.md`, appended** (its entries are ordered by when they were learned, so
@@ -559,7 +565,8 @@ tags** (`git tag --list 'v*-r*' | sort -V | tail -1`), never from a flat max ove
 that reads a campaign's 30-odd `-wip` numbers as delivery revisions (the r355 cut was first numbered
 `r386` that way on 2026-11-24 and corrected within the hour).
 
-**WORKLOG dated headers use `YYMMDD.VVV`** (e.g. `## 261011.005 (r47) -- ...`).  `YYMMDD` is the
+**WORKLOG dated headers use `YYMMDD.VVV`** (e.g. `## 261011.005 (r47) -- ...`), today's entries at the top of
+`WORKLOG.md` and each earlier day in `archive/worklog/WORKLOG-YYYYMMDD.md`.  `YYMMDD` is the
 real local calendar date and `VVV` is a per-date, monotonically increasing 3-digit sequence number in
 file order (the topmost/newest entry of a date carries the highest number).  The date is only a
 date — never treat it as a version; the revision is the explicit `(rNN)` tag.  A new entry takes

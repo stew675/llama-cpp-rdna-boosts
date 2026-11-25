@@ -24,9 +24,10 @@ the **official** block count (`N` = 17); `0300` and the optional blocks are not 
 release is **`v17-919794500-r355`** (read `.release` in `release.json` -- it is the source of truth, not this
 line): the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
-[`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is the top of
-[`WORKLOG.md`](WORKLOG.md) (newest first; it is the only dated record).  This README describes the set,
-not the changelog.
+[`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is at the top of
+[`WORKLOG.md`](WORKLOG.md) (today's entries, newest first; earlier days are one file per day under
+[`archive/worklog/`](archive/worklog/), indexed at the end of `WORKLOG.md`, which is the only dated record).  This
+README describes the set, not the changelog.
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -48,7 +49,8 @@ bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 18 default bl
   and [`DIAGNOSTIC.md`](DIAGNOSTIC.md) (the switches, A/B arms and diagnostics)
 - **Running a model bigger than your VRAM on one card** (`-ncmoe` + the MoE expert cache, with the
   measured config tables and the measurement method): [`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md)
-- What changed recently: [`WORKLOG.md`](WORKLOG.md)
+- What changed recently: [`WORKLOG.md`](WORKLOG.md) (today's entries at the top, the index of earlier days at
+  the end)
 - Current status and validation: [`release.json`](release.json) (source of truth) and [`MANIFESTS.md`](MANIFESTS.md)
 
 ## Releases
@@ -59,7 +61,7 @@ count in the tag is the **official** `00xx` count, so `v15-*` tags are the 15-bl
 `v16-*` the 16-official-block releases from r178 on.  The temporary `0300` and the optional `01xx` blocks are
 never counted (`AGENTS.md`).  `r1` is the
 re-base of the set onto that fork point and every later `rN` is a dated change recorded in
-[`WORKLOG.md`](WORKLOG.md), newest first).
+[`WORKLOG.md`](WORKLOG.md), newest first, with the earlier days in [`archive/worklog/`](archive/worklog/)).
 
 ## Supported architectures
 
@@ -140,8 +142,9 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── BASELINE.md            # fork point, what the patches are, how they are cut, drift policy
 ├── TODO.md                # forward-looking tracker: open items, limitations, parked ideas only
 ├── GREEDY-PURITY.md       # purity rulebook: invariants + one summary entry per finding (read before shipping)
-│                          #   narratives/evidence: WORKLOG.md + benchmarks/ (and pre-r100: archive/docs/GREEDY-PURITY-FINDINGS.md)
-├── WORKLOG.md             # dated delivery records (newest first; the only release history)
+│                          #   narratives/evidence: archive/worklog/ + benchmarks/ (and pre-r100: archive/docs/GREEDY-PURITY-FINDINGS.md)
+├── WORKLOG.md             # the dated record: today's entries, then an index of the earlier days
+├── archive/worklog/       # the record's earlier days, one file per day (newest first; the only release history)
 ├── ENVIRONMENT.md         # the end-user env vars (opt-in/tuning/options), with default and class
 ├── DIAGNOSTIC.md          # the kill-switches, A/B arms, test hooks and diagnostics
 ├── CONTAINERS.md          # the ROCm container images + the off-host build watcher
