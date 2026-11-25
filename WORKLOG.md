@@ -16,6 +16,83 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261124.017 (r358, release) -- block 05 AMENDMENT: the `--kv-unified` K/V-rows attention now RUNS ON THE GPU on AMD (GitHub issue #363), and the reporter's one-line fix would have aborted a two-slot server; `v18-919794500-r358`
+
+**Release v18-919794500-r358** -- base `919794500`, tip `dcee0fc34`, default tree
+`84d50a416183a159c504fab508a84c0d5ddb859f` (was `24c3d4b36...`), 19 default patches (18 official + `0300`),
+`rdna-boosts-all.patch`; optional artifacts re-cut against the new tree (`0100` alone `6fa3dea67`, `0101` alone
+`cca36b57f`, cumulative `b00ce41dd`) -- both still apply strictly and their own diffs are unchanged.
+
+**The report.**  `kapitalmouse` (issue #363) saw, in a mixed RDNA3+RDNA4 `-sm tensor` server with `--kv-unified=1`:
+`layer 3 is assigned to device Meta() but Flash Attention over K/V rows is assigned to device CPU (usually due to
+missing support)` -> `Flash Attention over K/V rows not supported, set to disabled`.  Their diagnosis ("the
+architecture check is a little bit too tight") is right, and it is not about mixed architectures at all: the branch is
+`GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)`, so EVERY AMD device fails it.  Reproduced on this box
+(gfx1201 x3, single arch) with `llama-server -kvu -sm tensor`, byte-identical warning.  Consequence: with
+`--kv-unified` (the default whenever the slot count is auto) every joint attention layer of an AMD server ran its FA
+on the CPU backend -- `INVARIANTS.md` r308 item 3's shape, ~3x decode loss, silent.
+
+**Why the suggested one-line fix is not shippable as-is.**  `mma_available = NVIDIA ? turing_mma_available : (amd_mfma
+|| amd_wmma)` in `ggml_cuda_get_best_fattn_kernel`'s `kv_rows` branch is correct as far as it goes, but it opens a path
+nothing else was ready for.  Reviewing it against the kernel found three holes, and TWO of them were measured here:
+1. **The batch-wide packed fully-masked-group bitmap asserted `mask->ne[0] == K->ne[1]`** (`fattn-common.cuh`).  The
+   rows form's mask is compacted to `kv_rows->ne[0]` while `K->ne[1]` is the padded extent of that stream's cells, so
+   the two differ whenever `LLAMA_KV_N_PAD_PREFILL` widens the extent or another slot's cells are in the cache.
+   **Measured abort**: 2-slot `--kv-unified` server, slot 0 = 275 tokens, slot 1 = a 5246-token prompt ->
+   `GGML_ASSERT(mask->ne[0] == K->ne[1]) failed` at `fattn-common.cuh:2243`, server dead.  Both the assert and the
+   group count now follow `n_kv_cols` (a no-op without the rows form).
+2. **The native K/V loaders ignored the row list** (`fattn-mma-f16.cuh`): the q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl and
+   bf16 arms read `k_VKQ_0 + i` unless `use_sparse`, so at the `<= 8`-row widths -- where the native read is chosen --
+   a quantized or bf16 KV cache would have attended whatever cells happened to sit at those offsets.  Silently wrong,
+   no fault, no log.  They now take `use_indices` and read through `indices` like the half2 loader.
+3. **The RDNA4 band and its q8_0 fetch-ahead arm have no index path** -- the band's 2-D `process_tile` calls pass a
+   null index list and the fetch-ahead ring is addressed by row index, so `ggml_cuda_fattn_band_wmma_applies()` and the
+   fetch-ahead predicate now DECLINE the rows form (it falls through to the ordinary stream-k MMA path, which is what
+   upstream runs with it on NVIDIA).  Code review, not measured: our box reaches the band only on head-128/256 RDNA4
+   shapes with a work-gate pass, and the rows form there is now declined.
+Plus the chooser's own condition: **`gqa_opt_applies`**, because every AMD instance of that kernel is compiled out
+unless the GQA-optimised layout is chosen (`ncols2 >= 2`, `ncols >= 16`; the WMMA instances have no `ncols2 == 1` arm),
+and the dispatcher falls back to `switch_ncols1<..., 1>` for an MHA/odd-ratio graph -- a launch that sets
+`NO_DEVICE_CODE` and leaves the output untouched.
+
+**Verification.**
+* `scripts/gate-fused-probe-splits.sh` (updated, see below) **PASS, 6 arms**, gfx1201 3 GPUs `-sm layer`, Flash-Next
+  GSQ-IQ3_XXS, bf16 KV, `--kv-unified -c 32768 -np 2`, 5246-token prefill + 48 greedy tokens: every arm `splits = 4`
+  (= the layout bound, no CPU segment), `plain`/`dense-always`/`mtp`/`mtp-rdna34` read `enabled`, `sparse` declines by
+  observation, and **every arm's text is `f6f0a8fd998b` -- the sha r311 pinned for the same-regime arms**, so the GPU
+  rows path is BIT-IDENTICAL to the previously-validated dense form there.  `check-gpu-faults.sh` clean.
+* q8_0 and bf16 caches: native (`GGML_CUDA_FA_KV_NATIVE=0` as the A/B) vs staged read ONE text on each (4B Q8_0,
+  3 GPUs `-sm tensor`), i.e. hole 2 is closed.
+* Semantic check of the row selection (no op-level oracle exists -- `test-backend-ops` has no `kv_rows` case): with a
+  275-token prompt on slot 0, slot 0's 32-token greedy answer is unchanged by slot 1 holding a resident 5246-token
+  context (T(alone) == T(foreign slot resident)), same on the `LLAMA_KV_ROWS_DISABLE=1` control.
+* Neutrality: same-seed greedy text identical against an r357 build of the same tree -- 4B Q8_0 `b065f37593b3`
+  (1 and 3 GPUs `-sm tensor`, and a q8_0 KV arm), 27B Q8_0 3 GPU `da2e2d192e21` (= the sha r311 recorded).  The
+  default path is inert by construction (every new condition tests `kv_rows`/`src[5]`) and the prefill-logit point
+  agrees: **mean KLD 0.000000 / same-top-p 100.000 %** against the recorded 10.2.0 base.
+* `scripts/gate-spec-purity.sh` **PASS** (the gate every release that touches block 05 owes): 27B Q8_0, 3 GPUs
+  `-sm tensor`, `-n 512` -- manifest A (q8_0, prose) and B (bf16, reasoning) `plain == draft-mtp`
+  (`c1f9d0b3f5b6`, `2fbc183348a8`, draft 2.4x faster = non-vacuity), all four axes plain == draft (`000b437b135b`,
+  `c1f9d0b3f5b6`, `eb89102cb7d8`, `a87c4318b649`), and the width probe `PASS` with worst maxdiff 0 on both the flat
+  and the 256-cell-boundary arm for q8_0 and bf16.
+* `check-gen-docs.sh` clean (no option added), `check-shlib-symbols.sh` 16/16 libraries clean, `validate-set.sh` **OK**
+  (fresh-tarball strict apply, 19 + 2 checksums, both optional artifacts alone and cumulative, Windows portability 519
+  files, file-set reconciliation 0 unexplained).
+
+**Gate defect found and fixed on the way** -- `gate-fused-probe-splits.sh` asserted "no arm may log `Flash Attention
+over K/V rows enabled` on AMD", which was the SYMPTOM of a box fact (no AMD kernel read the form) rather than the
+invariant it exists for (the rows form must never be PLACED ON THE CPU, and must not add a backend segment).  The gate
+now grades (a) no `... is assigned to device CPU` line for the rows form, (b) `splits` within the LAYOUT bound,
+(c) `sparse` by observation (arch-independent), (d) `dense-always`/`mtp-rdna34` by placement OR by `enabled`
+(`KVROWS_EXPECT=enable|obs|place` pins the box), and compares text only between arms in the same rows regime.
+Negative controls re-run: a CPU placement line, a stripped audited-probe verdict and `splits = 25` each FAIL.
+
+**Docs.**  `patches/README.md` block 05 (the four fixes, the why, the measured numbers); `MANIFESTS.md` gate 35 and
+block 05's row; `INVARIANTS.md` r308 item 2 CORRECTED in place + a new **r358** entry (five facts); `AGENTS.md`'s gate
+table gains the rows-form row; `DIAGNOSTIC.md` §8 gains `LLAMA_KV_ROWS_DISABLE` (upstream's A/B arm, which the delivery
+repoints by probing it); `scripts/README.md`; the `src/llama-context.cpp` comment that claimed no AMD kernel reads the
+form.  The reporter's suggested patch is answered in the issue with the corrected form and the reason.
+
 ## 261124.016 (r357, release) -- block 12 AMENDMENT: the server keeps a tool result's special-token strings as TEXT (contributor PR #360, `@overdoingism`); `v18-919794500-r357`
 
 **Release v18-919794500-r357** -- base `919794500`, tip `1a7689a8e`, default tree `24c3d4b367946ede7c8e2405561a6cd56f20876c`

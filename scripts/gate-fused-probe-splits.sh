@@ -29,9 +29,15 @@
 #
 # WHAT IT CHECKS (HARD unless marked INFO)
 #   * no arm aborts, and `scripts/check-gpu-faults.sh` reads the kernel journal clean over this gate's window
-#   * no arm's log carries `Flash Attention over K/V rows enabled` -- no AMD kernel reads the rows form (the
-#     kv_rows branch of `ggml_cuda_get_best_fattn_kernel` returns NONE on every AMD arch), so enabling it can
-#     only mean it was never verified.  This is the line r307 printed.
+#   * **the rows form never runs on the CPU.**  That is the r307 defect, and it is graded where it is visible:
+#     the probe's placement line (`... but Flash Attention over K/V rows is assigned to device CPU`) and the
+#     `splits = N` bound below.  Whether `enabled` is ACCEPTED on a box depends on the box's HIP FA kernels: since
+#     r358 (issue #363) an AMD MMA kernel (CDNA MFMA / RDNA WMMA, GQA-optimised layout) reads the rows form, so on
+#     an RDNA box `enabled` is the CORRECT verdict and the defect this gate hunts is a CPU placement, not the
+#     verdict.  On a box whose HIP backend cannot read it, the same placement line must appear (the decline) --
+#     `KVROWS_EXPECT=enable|obs|place` pins which box you mean, `auto` accepts either as long as no CPU placement
+#     and no extra split appears.  A bare `enabled` claim is still impossible to fake: `require_observed` (r308)
+#     makes the probe disable the feature when its graph never built the node.
 #   * no `sched_graph_realloc` line in an arm reports more backend segments than its LAYOUT can produce --
 #     `SPLITS_MAX`, 1 on a single device or a tensor split (the Meta backend is one backend) and `NGPU + 1`
 #     on a layer split (the output layer is placed back on the first device, so 3 devices read 4).  A fused
@@ -48,13 +54,15 @@
 #     default that moves a verdict fails here.  This is the cheap arm: no model load, one arch per arm,
 #     ~2-5 s each, and it covers every arch that builds these ops.
 #   * the REAL-MODEL arms (llama-server, the default): the kv_rows behaviour r308 fixed --
-#     `dense-always` arm (the QSA policy gfx1100/gfx1201 use) declines the op BY PLACEMENT (`is assigned
-#     to device CPU`) where the box's own policy declines it, and the `sparse` arm (`LLAMA_QSA_DENSE_
-#     DECODE_UNTIL=0`, which forces the same vacuity on ANY arch) declines it BY OBSERVATION
-#     (`was not used in the probe graph`) -- that line IS the fix firing.  The MTP arms: the verify band
-#     (`n_tokens <= max(8, n_rs_batch)`) takes the same dense arm as W=1, so a drafter multiplies the
-#     defect by every verify step and adds the drafter's OWN unified context.  Greedy text is byte-identical
-#     across the dense-decode arms it can compare.  INFO generation t/s per arm; NOT a threshold.
+#     `dense-always` arm (the QSA policy gfx1100/gfx1201 use) and the `sparse` arm (`LLAMA_QSA_DENSE_
+#     DECODE_UNTIL=0`, which forces the same vacuity on ANY arch): `sparse` declines the op BY OBSERVATION
+#     (`was not used in the probe graph`) -- that line IS the fix firing -- and `dense-always` declines BY
+#     PLACEMENT (`is assigned to device CPU`) on a box whose HIP backend cannot read the rows form, or reads
+#     `enabled` on one that can (r358: the AMD MMA kernel does).  Either way the hard assertions are that the
+#     rows form is never PLACED ON THE CPU and that no graph gains a CPU segment.  The MTP arms: the verify band
+#     (`n_tokens <= max(8, n_rs_batch)`) takes the same dense arm as W=1, so a drafter multiplies the defect by
+#     every verify step and adds the drafter's OWN unified context.  Greedy text is byte-identical across the
+#     arms that decode the same regime.  INFO generation t/s per arm; NOT a threshold.
 #
 #   WHAT IT CANNOT FORCE.  The kv_rows vacuity needs a model whose probe arm differs from its runtime arm,
 #   i.e. qwen4exp (QSA) on gfx1151 at `-c >= 32768`; `MODEL` defaults to a Flash-Next GGUF for that reason.
@@ -83,8 +91,11 @@
 #   NGPU          GPU count for HIP_VISIBLE_DEVICES (default 1)
 #   KV            KV cache type (default bf16 -- the field report's `-ctk bf16 -ctv bf16`)
 #   EXTRA_ARGS    extra llama-server args (default: the field report's MoE flags for the default MODEL)
-#   KVROWS_EXPECT obs|place|auto -- which decline the box's own QSA policy must produce (default auto:
-#                 derived from the arm's own verdict, so the gate is box-independent)
+#   KVROWS_EXPECT obs|place|enable|auto -- the kv_rows verdict `plain`/`mtp` must produce.  `auto` (default) derives
+#                 it from the arm's own log, so the gate is box-independent; `enable` pins a box whose HIP FA kernel
+#                 reads the rows form (r358: RDNA3/3.5/4 WMMA and CDNA MFMA with the GQA-optimised layout), `place`
+#                 a box whose backend refuses it (the pre-r358 AMD state).  `dense-always`/`mtp-rdna34` accept either
+#                 -- the CPU-placement check and the `splits` bound are the hard part, never the verdict alone.
 #   SPLITS_MAX    the backend-segment bound (default: 1 on NGPU=1, NGPU+1 otherwise -- see above)
 #   ARMS          a space-separated subset of: plain dense-always sparse rows-off mtp mtp-rdna34
 #   PORT          base port (default 18113; each arm takes PORT+index)
@@ -194,8 +205,8 @@ grade_log() { # tag logfile [want_splits]
     if grep -qE "GGML_ASSERT|terminate called|Segmentation fault|Aborted" "$log"; then
         fail "$tag: the process aborted (see $log)"
     fi
-    if grep -q "Flash Attention over K/V rows enabled" "$log"; then
-        fail "$tag: the kv_rows probe reported ENABLED -- no AMD kernel reads the rows form, so this can only be a vacuous probe; the decode graph then runs every attention layer on the CPU (r307; the r308 fix)"
+    if grep -q "but Flash Attention over K/V rows is assigned to device CPU" "$log"; then
+        fail "$tag: the rows form was placed on the CPU -- that is the r307 defect (one CPU attention launch per joint layer per step, 3x decode loss); see $log"
     fi
     if [ "$want_splits" = 1 ]; then
         local worst
@@ -455,18 +466,20 @@ text_of() {
     [ -s "$f" ] || { echo "none"; return; }
     sha256sum "$f" | cut -c1-12
 }
-decline_of() { # arm -> "obs" | "place" | "both" | "none" | "missing"  (kv_rows probe only)
+decline_of() { # arm -> "obs" | "place" | "both" | "enable" | "none" | "missing"  (kv_rows probe only)
     local log="$KEEPOUT/$1.log"
     [ -s "$log" ] || { echo missing; return; }
     # scoped to the kv_rows probe: other probes print the same strings (the derived kq mask observes-and-
     # declines on many shapes), and grepping them unscoped reports a decline that belongs to a different
     # probe -- the r308 gate only had one probe that could print either
-    local o=0 p=0
+    local o=0 p=0 e=0
     grep -q "Flash Attention over K/V rows was not used in the probe graph, set to disabled" "$log" && o=1
     grep -q "is assigned to device CPU (usually due to missing support)"                     "$log" && p=1
+    grep -q "Flash Attention over K/V rows enabled"                                          "$log" && e=1
     if [ "$o" = 1 ] && [ "$p" = 1 ]; then echo both
     elif [ "$o" = 1 ]; then echo obs
     elif [ "$p" = 1 ]; then echo place
+    elif [ "$e" = 1 ]; then echo enable
     else echo none; fi
 }
 
@@ -475,28 +488,38 @@ for arm in $ARMS; do
     echo "    $arm: text sha=$(text_of "$arm")  decline=$(decline_of "$arm")  probes: $(probe_verdict "$KEEPOUT/$arm.log" "fused top-k mask" | tr -d '\n')"
 done
 
-# per-arm expectations that DISTINGUISH the two decline mechanisms
+# per-arm expectations that DISTINGUISH the decline mechanisms from a genuine enable
+#   obs    declined BY OBSERVATION (r308: the probe graph contained no rows node)
+#   place  declined BY PLACEMENT (the node landed on the CPU -- the box's HIP backend cannot read it)
+#   enable the node was PROBED AND PLACED on the acting device, i.e. this box's HIP kernel reads the rows form
+#          (r358, issue #363: the AMD MMA kernel does; the no-CPU-placement check above is what makes this safe)
+#   any    any of the three, as long as the arm's log is clean (auto: KVROWS_EXPECT)
 expect() { # arm want
     local arm="$1" want="$2" got
     got="$(decline_of "$arm")"
     case "$want" in
-        any)  [ "$got" = none ] && fail "$arm: the probe neither observed-and-declined nor declined by placement (see $KEEPOUT/$arm.log)" \
-                              || pass "$arm: declined ($got)" ;;
+        any)  [ "$got" = none ] && fail "$arm: the probe neither observed, placed nor enabled the node -- it did not run (see $KEEPOUT/$arm.log)" \
+                              || pass "$arm: kv_rows verdict = $got" ;;
         obs)  case "$got" in obs|both) pass "$arm: declined by OBSERVATION (was not used in the probe graph)" ;;
                                 *) fail "$arm: expected the observation decline, got '$got' (see $KEEPOUT/$arm.log)" ;; esac ;;
         place) case "$got" in place|both) pass "$arm: declined by PLACEMENT (the node landed on the CPU)" ;;
-                                  *) fail "$arm: expected the placement decline, got '$got' (see $KEEPOUT/$arm.log)" ;; esac ;;
+                                  enable) info "$arm: enabled -- this box's HIP backend reads the rows form (r358); no CPU placement" ;;
+                                  *) fail "$arm: expected the placement decline or an enable, got '$got' (see $KEEPOUT/$arm.log)" ;; esac ;;
+        enable) case "$got" in enable) pass "$arm: enabled, i.e. the rows form runs on this box's GPU (r358)" ;;
+                                   *) fail "$arm: expected 'enabled' (KVROWS_EXPECT=enable pins a box whose HIP kernel reads the rows form), got '$got'" ;; esac ;;
     esac
 }
 # `plain`/`mtp` run the BOX's own QSA policy, and that policy differs per arch: the sparse arm on gfx1151
 # (dense-decode crossover 32768) and the dense arm on gfx1100/gfx1201 (unbounded).  So the expectation is
 # derived from the arm itself unless KVROWS_EXPECT pins it -- a gate that only passes on one box is a
-# hazard, and r308's own numbers were halo points.
-box_want() { # arm -> obs|place|auto|skip
+# hazard, and r308's own numbers were halo points.  Since r358 a SECOND box property decides the verdict
+# (does the box's HIP FA kernel read the rows form), and `dense-always` used to decline BY PLACEMENT only
+# because no AMD arch could -- it is box-derived now too, with the CPU-placement check above as the hard part.
+box_want() { # arm -> obs|place|auto|enable|skip
     case "$1" in
-        dense-always|mtp-rdna34) echo place ;;
-        sparse)                  echo obs ;;
-        rows-off)                echo skip ;;   # LLAMA_KV_ROWS_DISABLE=1: the probe never runs (control)
+        dense-always|mtp-rdna34) echo place ;;   # place on a box that cannot read the rows form, enable on one that can
+        sparse)                  echo obs ;;     # arch-independent: the probe graph builds no rows node
+        rows-off)                echo skip ;;    # LLAMA_KV_ROWS_DISABLE=1: the probe never runs (control)
         *)                       echo "$KVROWS_EXPECT" ;;
     esac
 }
@@ -506,8 +529,8 @@ for arm in $ARMS; do
         skip) : ;;
         auto) got="$(decline_of "$arm")"
               case "$got" in
-                  obs|both|place) info "$arm: box-policy decline = $got (derived; KVROWS_EXPECT pins it)" ;;
-                  none)  fail "$arm: the box's own policy neither observed nor placed the node -- the probe did not run (see $KEEPOUT/$arm.log)" ;;
+                  obs|both|place|enable) info "$arm: box-policy verdict = $got (derived; KVROWS_EXPECT pins it)" ;;
+                  none)  fail "$arm: the box's own policy neither observed, placed nor enabled the node -- the probe did not run (see $KEEPOUT/$arm.log)" ;;
                   *)     : ;;   # missing: already failed by run_arm
               esac ;;
         *)    expect "$arm" "$want" ;;
@@ -519,7 +542,10 @@ case " $ARMS " in
         && fail "rows-off: the control arm reported the rows form enabled" || pass "rows-off: no rows-form claim (control)" ;;
 esac
 
-# the text must be identical across arms that decode the SAME regime
+# the text must be identical across arms that decode the SAME regime.  `rows-off` is deliberately the OTHER
+# regime (the dense mask form), so it is only comparable when `plain` declined the rows form too (a box whose
+# HIP backend cannot read it, i.e. the pre-r358 state); otherwise the two are different kernel forms and a
+# near-tie may legitimately flip, which is reported and never asserted.
 same_text() { # label a b
     local ta tb
     ta="$(text_of "$1")"; tb="$(text_of "$2")"
@@ -532,8 +558,24 @@ same_text() { # label a b
     fi
 }
 HAVE() { case " $ARMS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
-if HAVE plain && HAVE rows-off;   then same_text plain rows-off   "plain vs rows-off";   fi
-if HAVE plain && HAVE dense-always; then same_text plain dense-always "plain vs dense-always"; fi
+rows_regime() { # arm -> rows|dense
+    case "$(decline_of "$1")" in enable) echo rows ;; *) echo dense ;; esac
+}
+if HAVE plain && HAVE rows-off && HAVE dense-always; then
+    if [ "$(rows_regime plain)" = "$(rows_regime rows-off)" ]; then
+        same_text plain rows-off "plain vs rows-off (same rows regime)"
+    else
+        info "plain(rows sha=$(text_of plain)) vs rows-off(dense sha=$(text_of rows-off)): different K/V row forms by design, text reported not asserted (r358)"
+    fi
+    same_text plain dense-always "plain vs dense-always (same QSA policy AND same rows regime on this box)"
+elif HAVE plain && HAVE rows-off; then
+    if [ "$(rows_regime plain)" = "$(rows_regime rows-off)" ]; then
+        same_text plain rows-off "plain vs rows-off (same rows regime)"
+    else
+        info "plain(rows sha=$(text_of plain)) vs rows-off(dense sha=$(text_of rows-off)): different K/V row forms by design, text reported not asserted (r358)"
+    fi
+fi
+if HAVE plain && HAVE dense-always && ! HAVE rows-off; then same_text plain dense-always "plain vs dense-always"; fi
 if HAVE mtp   && HAVE mtp-rdna34; then same_text mtp   mtp-rdna34   "mtp vs mtp-rdna34";   fi
 if HAVE sparse; then info "sparse arm text sha=$(text_of sparse) (a different decode regime by design; reported, not asserted)"; fi
 

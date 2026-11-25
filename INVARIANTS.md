@@ -534,6 +534,10 @@ Established by the `--kv-unified` kv_rows defect (gfx1151 field report; `WORKLOG
    turing-MMA with a mask; every AMD arch gets `NONE`, i.e. the node is placed on the CPU backend.  Enabling it
    costs one CPU attention launch per joint layer per step plus a device→host round trip of every K/V view.  The
    arm is still worth probing (the delivery claims portability), but a PASS there is a defect signal on AMD.
+   **CORRECTED at r358 (issue #363): the AMD MMA kernel does read the rows form** (MFMA/WMMA with the
+   GQA-optimised layout), so on this delivery the arm now runs on the GPU and `enabled` is the *correct* verdict;
+   the defect this entry describes is the CPU PLACEMENT, which item 3's `splits` oracle still catches.  See
+   `r358` below.
 3. **A CPU-placed attention node is silent, so judge it by `splits`, never by text.**  The text is byte-identical
    (the CPU rows FA computes the same thing), there is no fault, and on an APU the K/V is already host memory, so
    the only visible symptom is a 3x decode loss.  `sched_graph_realloc: … splits = N` (N > 1) at `-lv 4` is the
@@ -3351,3 +3355,52 @@ it removed an abort (r374-wip) -- so the per-shape rule above stands, now on the
    (stock keeps a 1654-byte prompt holding both noncharacters; the submission's OFF arm read 1652).  Arming the strip
    with the feature makes the kill-switch arm byte-identical to stock on every probe, which is the only thing an A/B
    can rest on.
+
+## r358 (2026-11-24, `WORKLOG.md` 261124.012) — the kv_rows (unified-KV row list) form now RUNS ON THE GPU on AMD: enabling it needs three other fixes, and the AMD instance set dictates WHERE it may be offered (block 05, GitHub issue #363)
+
+`ggml_cuda_get_best_fattn_kernel`'s kv_rows branch offered the MMA kernel to `GGML_CUDA_CC_IS_NVIDIA(cc) &&
+turing_mma_available(cc)` only, so on every AMD arch the rows form returned `NONE` and the scheduler placed each
+joint attention layer on the CPU backend — the r308 defect's *consequence*, not its cause (r308's cause was the
+vacuous probe).  A `--kv-unified` AMD server therefore decoded with a CPU attention launch per joint layer per step.
+`--kv-unified` is on by default whenever the slot count is auto, so this was the common server configuration.
+
+1. **The AMD MMA instance set decides WHERE the rows form may be offered, not just whether the arch has MMA.**  Every
+   AMD instance in `flash_attn_ext_f16` is compiled out unless the GQA-optimised layout is chosen
+   (`AMD_WMMA_AVAILABLE`: `ncols1*ncols2 < 16 || ncols2 == 1` → `NO_DEVICE_CODE`; `AMD_MFMA_AVAILABLE`:
+   `ncols1*ncols2 < 16`), and that layout is exactly what `gqa_opt_applies` selects in the ncols dispatcher.  Without
+   the gate, an MHA graph (or any `gqa_ratio == 1` shape, which falls through to `switch_ncols1<..., 1>`) launches a
+   kernel that returns without writing its output: no abort, no log, an unusable result.  This is the same shape of
+   trap as r308's: a backend predicate that is *arch*-shaped while the real condition is *layout*-shaped.
+2. **A compacted K/V row list breaks every place that assumes `mask->ne[0] == K->ne[1]` — and the delivery's own
+   padding makes that assumption false, not just multi-slot occupancy.**  The rows form's mask has `n_kv_cols =
+   kv_rows->ne[0]` columns while `K->ne[1]` is the padded extent of the cells in that stream; they coincide only by
+   luck.  The batch-wide packed fully-masked-group bitmap asserted equality and sized the bitmap from `K->ne[1]`;
+   with `LLAMA_KV_N_PAD_PREFILL` (default 8192 on a multi-device split once the used extent passes 4096) or a second
+   resident slot's cells, a >8-row prefill ABORTS (`GGML_ASSERT(mask->ne[0] == K->ne[1]) failed`, measured on a
+   2-slot `--kv-unified` server, 275 + 5246 tokens, gfx1201).  Both now follow `n_kv_cols`, which is a no-op without
+   the rows form.  Note what the abort *hid*: had the assert been relaxed alone, the bitmap would have been built for
+   the wrong group count and the kernel would have read past its word run.
+3. **A native (non-staged) K/V read must index through the row list; "the launcher staged an F16 copy" is not the
+   only way an operand reaches the kernel.**  The q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl and bf16 MMA loaders honoured
+   `indices` only in their `use_sparse` arm, so at the `<= 8`-row widths (where the native read is chosen:
+   `native_width`, and on RDNA3_5 at every width) a quantized or bf16 KV cache would have read rows `k_VKQ_0 + i`,
+   i.e. whatever cells sit at those offsets — silently wrong text, no fault.  They take `use_indices` now, like the
+   half2 loader.  Measured: q8_0 and bf16 caches read the SAME greedy text with `GGML_CUDA_FA_KV_NATIVE=0` (staged)
+   and by default (native), and both equal the f16 arm — the staged and native paths stage identical F16 tiles.
+4. **A tuned fast path that never had an index arm must DECLINE the rows form, not inherit it.**  The RDNA4 band's 2-D
+   launch passes a null index list into `process_tile` (so its round-robin blocks read rows by position) and its q8_0
+   fetch-ahead ring is row-addressed.  Both are now declined for `dst->src[5] != nullptr`, which costs the band's
+   decode win on `--kv-unified` head-128/256 RDNA4 shapes and is still a strict improvement over the CPU fallback;
+   the shape falls through to the ordinary stream-k MMA path, which is what upstream runs with the rows form on
+   NVIDIA (the band is RDNA4-only, so nothing validated changes there).
+5. **A box property can flip a gate's expectation; grade the invariant, not the verdict.**  `gate-fused-probe-splits.sh`
+   asserted "no arm may log `Flash Attention over K/V rows enabled` on AMD" — which was the *symptom* of "no AMD
+   kernel reads the rows form".  The invariant the r308 gate exists for is that the rows form must never be PLACED
+   ON THE CPU and never add a backend segment, so the gate now grades (a) no `... is assigned to device CPU` line for
+   the rows form, (b) `splits` within the LAYOUT's bound, (c) `sparse` declines by observation (arch-independent),
+   and (d) `dense-always`/`mtp-rdna34` by placement OR `enabled` (`KVROWS_EXPECT=enable|obs|place` pins the box).
+   Measured (gfx1201, 3 GPUs `-sm layer`, Flash-Next GSQ-IQ3_XXS, bf16 KV, `-c 32768 -np 2`, 5246-token prefill + 48
+   greedy tokens): all six arms `splits = 4` (= the bound), `plain`/`dense-always`/`mtp`/`mtp-rdna34` `enabled`,
+   `sparse` by observation, every arm's text **`f6f0a8fd998b`** = the sha r311 pinned for the same-regime arms, i.e.
+   the GPU rows path is bit-identical to the previously-validated dense form on that shape.  Negative controls: a
+   `... assigned to device CPU` line, a stripped audited-probe verdict and `splits = 25` each still FAIL.

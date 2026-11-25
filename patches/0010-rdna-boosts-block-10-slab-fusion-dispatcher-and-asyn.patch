@@ -1,4 +1,4 @@
-From 2a0e346f2d9f3be8e57484c6bf092651c4dbce29 Mon Sep 17 00:00:00 2001
+From 1686d320907e8804fc8fe28d124f0384c334ed87 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/18] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -2519,7 +2519,7 @@ index 2d0b3cfea..ecb0a13f6 100644
  
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index e0cb09858..0e23194bc 100644
+index 410f29752..e6687996b 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -3,6 +3,8 @@
@@ -3046,7 +3046,7 @@ index e0cb09858..0e23194bc 100644
              if (ggml_is_contiguously_allocated(V)) {
                  to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                  to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
-@@ -1904,21 +2241,41 @@ void launch_fattn(
+@@ -1908,21 +2245,41 @@ void launch_fattn(
          const int64_t s33        = mask->nb[3] / sizeof(half);
  
          const int64_t n_words_total = int64_t(n_streams)*ntiles_x*words_per_tile;
@@ -3100,7 +3100,7 @@ index e0cb09858..0e23194bc 100644
      }
  
      const int * kv_max_arg = KV_max.ptr;
-@@ -1958,7 +2315,10 @@ void launch_fattn(
+@@ -1962,7 +2319,10 @@ void launch_fattn(
      const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
  
      dim3 blocks_num;
@@ -3112,7 +3112,7 @@ index e0cb09858..0e23194bc 100644
          // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
          const bool prefer_whole_tiles = GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_GB10 && async_kv_preload && scan_mask;
  
-@@ -2135,6 +2495,180 @@ void launch_fattn(
+@@ -2139,6 +2499,180 @@ void launch_fattn(
          CUDA_CHECK(cudaGetLastError());
      }
  
@@ -3293,7 +3293,7 @@ index e0cb09858..0e23194bc 100644
      ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
      ggml_cuda_kernel_launch(fattn_kernel, launch_params,
          (const char *) Q->data,
-@@ -2157,55 +2691,65 @@ void launch_fattn(
+@@ -2161,55 +2695,65 @@ void launch_fattn(
          cell_pos ? (const int *) cell_pos->data : nullptr,
          tok_lo   ? (const int *) tok_lo  ->data : nullptr,
          tok_hi   ? (const int *) tok_hi  ->data : nullptr,
@@ -3398,10 +3398,10 @@ index e0cb09858..0e23194bc 100644
      CUDA_CHECK(cudaGetLastError());
  }
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index f46f5b1cd..608dde6d5 100644
+index 2e716c67f..ab842fe07 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-@@ -1880,6 +1880,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1890,6 +1890,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
          const int zt_gqa,
          const int kb0_start,
          const int kb0_stop, const kq_derived_t derived, const fattn_kv_native_t kv_native,
@@ -3413,7 +3413,7 @@ index f46f5b1cd..608dde6d5 100644
          // > 1 only in the decode/verify band, where the block processes the KV iterations
          // kb0_start, kb0_start + kb0_step, ... (< kb0_stop) and may own none of them.
          const int kb0_step = 1) {
-@@ -2072,7 +2077,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2082,7 +2087,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              // the bitmap is produced only where that pipeline does not exist (AMD has no cp_async),
              // so every block can take last_iter=false and the accumulation is unchanged.
              for (; kb0 < kb0_stop; kb0 += kb0_step) {
@@ -3422,7 +3422,7 @@ index f46f5b1cd..608dde6d5 100644
                      continue;
                  }
                  constexpr bool last_iter = false;
-@@ -2132,7 +2137,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2142,7 +2147,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
            if constexpr (band_depth == 1) {
              // The next iteration is the next KV block that is not fully masked (the stream continues into it).
              auto unmasked = [&](int k) {
@@ -3431,7 +3431,7 @@ index f46f5b1cd..608dde6d5 100644
                      k += kb0_step;
                  }
                  return k;
-@@ -2155,7 +2160,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2165,7 +2170,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              }
            } else {
              for (; kb0 < kb0_stop; kb0 += kb0_step) {
@@ -3440,7 +3440,7 @@ index f46f5b1cd..608dde6d5 100644
                      continue;
                  }
                  constexpr bool last_iter = false;
-@@ -2362,7 +2367,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2372,7 +2377,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
          if (((!needs_fixup && !is_fixup) || np > 1) && thread_should_write) {
              ((float2 *) tile_Q)[jc_cwm*(tile_stride/2) + nbatch_combine/2] = KQ_cmr;
          }
@@ -3448,7 +3448,7 @@ index f46f5b1cd..608dde6d5 100644
          __syncthreads();
  
          if (np == 1) {
-@@ -2437,6 +2441,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2447,6 +2451,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                      meta_ptr[imeta * warp_size * tile_stride/2] = make_float2(KQ_cms[imeta], KQ_crs);
                  }
              }
@@ -3461,7 +3461,7 @@ index f46f5b1cd..608dde6d5 100644
  
              // Combined KQ max + rowsum.
              static_assert(cols_per_warp <= warp_size);
-@@ -2566,8 +2576,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -2576,8 +2586,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
  
                          if (!needs_fixup && !is_fixup) {
                              const float KQ_rowsum_j = meta_j[1];
@@ -3485,7 +3485,7 @@ index f46f5b1cd..608dde6d5 100644
                          }
  
                          if (is_fixup) {
-@@ -2640,7 +2663,12 @@ static __global__ void flash_attn_ext_f16(
+@@ -2650,7 +2673,12 @@ static __global__ void flash_attn_ext_f16(
          const int    * __restrict__ tok_hi_ptr,
          // Native (V4 q8_0 / block-15 bf16) K/V: byte-addressed rows, read natively by the loaders
          // (null / FATTN_KV_NATIVE_NONE when the launcher staged F16).
@@ -3499,7 +3499,7 @@ index f46f5b1cd..608dde6d5 100644
      ggml_cuda_pdl_sync(); // TODO optimize placement
  #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
      const char * GGML_CUDA_RESTRICT Q              = Q_ptr;
-@@ -2659,6 +2687,8 @@ static __global__ void flash_attn_ext_f16(
+@@ -2669,6 +2697,8 @@ static __global__ void flash_attn_ext_f16(
      const int  * GGML_CUDA_RESTRICT KV_max        = KV_max_ptr;
      float      * GGML_CUDA_RESTRICT dst            = dst_ptr;
      float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
@@ -3508,7 +3508,7 @@ index f46f5b1cd..608dde6d5 100644
  
      // Skip unused kernel variants for faster compilation:
      if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
-@@ -2766,20 +2796,24 @@ static __global__ void flash_attn_ext_f16(
+@@ -2776,20 +2806,24 @@ static __global__ void flash_attn_ext_f16(
              const int kb0_stop  = iter_k;
              const int kb0_step  = gridDim.y;
  
@@ -3535,7 +3535,7 @@ index f46f5b1cd..608dde6d5 100644
              }
              return;
          }
-@@ -2812,6 +2846,11 @@ static __global__ void flash_attn_ext_f16(
+@@ -2822,6 +2856,11 @@ static __global__ void flash_attn_ext_f16(
          const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
              (const half *) (mask + nb33*(sequence % ne33) + nb32*(zt_Q % ne32));
          float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
@@ -3547,7 +3547,7 @@ index f46f5b1cd..608dde6d5 100644
  
          const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
  
-@@ -2836,19 +2875,23 @@ static __global__ void flash_attn_ext_f16(
+@@ -2846,19 +2885,23 @@ static __global__ void flash_attn_ext_f16(
          if (use_sparse) {
              kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
          } else if (KV_max) {
@@ -3574,7 +3574,7 @@ index f46f5b1cd..608dde6d5 100644
          }
  
          // The next process_tile call reuses the tile_Q buffer for its Q/K tiles, so all warps must
-@@ -2880,6 +2923,9 @@ static __global__ void flash_attn_ext_f16(
+@@ -2890,6 +2933,9 @@ static __global__ void flash_attn_ext_f16(
      const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
          (const half *) (mask + nb33*(sequence % ne33) + nb32*(zt_Q % ne32));
      float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
@@ -3584,7 +3584,7 @@ index f46f5b1cd..608dde6d5 100644
  
      const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
      const fattn_kv_native_t kv_native = {
-@@ -2902,14 +2948,16 @@ static __global__ void flash_attn_ext_f16(
+@@ -2912,14 +2958,16 @@ static __global__ void flash_attn_ext_f16(
      if (use_sparse) {
          kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
      } else if (KV_max) {
@@ -3603,7 +3603,7 @@ index f46f5b1cd..608dde6d5 100644
  #else
      GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale, kq_blocks_ptr,
          max_bias, m0, m1, n_head_log2, logit_softcap,
-@@ -2919,7 +2967,8 @@ static __global__ void flash_attn_ext_f16(
+@@ -2929,7 +2977,8 @@ static __global__ void flash_attn_ext_f16(
                nb11, nb12, nb13,
                nb21, nb22, nb23,
                ne31, ne32, ne33,
@@ -3613,7 +3613,7 @@ index f46f5b1cd..608dde6d5 100644
      NO_DEVICE_CODE;
  #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
  }
-@@ -3083,7 +3132,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+@@ -3096,7 +3145,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
  
      const bool async_kv_preload = nstages == 2 && !use_sparse;
      launch_fattn<DV, ncols1, ncols2>
@@ -3657,7 +3657,7 @@ index 493399c0d..59e77e005 100644
  #ifdef FLASH_ATTN_AVAILABLE
      const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 785096ec5..227c79024 100644
+index ff6d477e6..a22a4988c 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -5,6 +5,8 @@
@@ -3678,7 +3678,7 @@ index 785096ec5..227c79024 100644
              if (band_wide_on && ggml_cuda_fattn_band_wmma_ncols1(dst) == 4 && Q->ne[1] > 4 && K->ne[1] >= 4096) {
                  ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 8, true>(ctx, dst);
              } else if (ggml_cuda_fattn_band_wmma_ncols1(dst) == 4) {
-@@ -973,6 +975,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -982,6 +984,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
      return f16_extra.end - (uintptr_t) dst->data;
  }
  
@@ -3687,7 +3687,7 @@ index 785096ec5..227c79024 100644
  void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      ggml_cuda_set_device(ctx.device);
      switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
-@@ -1004,3 +1008,112 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+@@ -1013,3 +1017,112 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
      }
      return true;
  }
@@ -27055,7 +27055,7 @@ index 289a9d936..89c303d8d 100644
              }
              view_src = view_src->view_src;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index deaf6efd9..48b2c0c4f 100644
+index 0ee769639..d5c85926c 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,7 @@
@@ -27066,7 +27066,7 @@ index deaf6efd9..48b2c0c4f 100644
  #include "llama-arch.h"
  #include "llama-graph.h"
  #include "llama-impl.h"
-@@ -508,6 +509,13 @@ llama_context::llama_context(
+@@ -512,6 +513,13 @@ llama_context::llama_context(
      }
  
      cparams.n_rs_seq = params.n_rs_seq;
@@ -27080,7 +27080,7 @@ index deaf6efd9..48b2c0c4f 100644
      if (cparams.n_rs_seq > 0 && (!llm_arch_supports_rs_rollback(model.arch) || !hparams.causal_attn)) {
          LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
                          __func__, cparams.n_rs_seq);
-@@ -564,7 +572,7 @@ llama_context::llama_context(
+@@ -568,7 +576,7 @@ llama_context::llama_context(
          cparams.ctx_other = params.ctx_other;
      }
  
@@ -27089,7 +27089,7 @@ index deaf6efd9..48b2c0c4f 100644
          if (model.tok_embd == nullptr || model.output == nullptr) {
              if (params.ctx_other == nullptr) {
                  throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
-@@ -707,8 +715,52 @@ llama_context::llama_context(
+@@ -711,8 +719,52 @@ llama_context::llama_context(
  
      cparams.fused_dsv4_hc_pre  = true;
      cparams.fused_dsv4_hc_comb = true;
@@ -27143,7 +27143,7 @@ index deaf6efd9..48b2c0c4f 100644
  
      // only the indexer models build this mask, skip the probe for the others
      cparams.fused_top_k_mask = true;
-@@ -719,6 +771,19 @@ llama_context::llama_context(
+@@ -723,6 +775,19 @@ llama_context::llama_context(
  
      cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
  
@@ -27163,7 +27163,7 @@ index deaf6efd9..48b2c0c4f 100644
      cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
      cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
              cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
-@@ -1010,6 +1075,10 @@ llama_context::llama_context(
+@@ -1014,6 +1079,10 @@ llama_context::llama_context(
  }
  
  llama_context::~llama_context() {
@@ -27174,7 +27174,7 @@ index deaf6efd9..48b2c0c4f 100644
      // wait for any pending asynchronous copies into the output buffers before they are freed
      synchronize();
  
-@@ -1024,6 +1093,12 @@ llama_context::~llama_context() {
+@@ -1028,6 +1097,12 @@ llama_context::~llama_context() {
              if (size_exp == size_act) {
                  LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
                      __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
@@ -27187,7 +27187,7 @@ index deaf6efd9..48b2c0c4f 100644
              } else {
                  LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB, does not match expectation of %8.4f MiB\n",
                      __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
-@@ -1248,6 +1323,46 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+@@ -1252,6 +1327,46 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
      return (int) users.size();
  }
  
@@ -27234,7 +27234,7 @@ index deaf6efd9..48b2c0c4f 100644
  void llama_context::sched_new(const sched_params & params) {
      // reusing the scheduler avoids reallocating its buffers (incl. the compute buffers)
      if (sched && params.can_reuse(sched_params_cur)) {
-@@ -1255,7 +1370,6 @@ void llama_context::sched_new(const sched_params & params) {
+@@ -1259,7 +1374,6 @@ void llama_context::sched_new(const sched_params & params) {
                  __func__, params.max_nodes, sched_params_cur.max_nodes);
          return;
      }
@@ -27242,7 +27242,7 @@ index deaf6efd9..48b2c0c4f 100644
      sched.reset(ggml_backend_sched_new(
              backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
  
-@@ -1522,6 +1636,24 @@ void llama_context::sched_reserve() {
+@@ -1526,6 +1640,24 @@ void llama_context::sched_reserve() {
          }
      }
  
@@ -27267,7 +27267,7 @@ index deaf6efd9..48b2c0c4f 100644
      {
          const bool diff = n_nodes_pp != n_nodes_tg || n_splits_pp != n_splits_tg ||
                            n_inputs_pp != n_inputs_tg || n_input_tensors_pp != n_input_tensors_tg;
-@@ -2430,12 +2562,12 @@ bool llama_context::set_adapter_cvec(
+@@ -2434,12 +2566,12 @@ bool llama_context::set_adapter_cvec(
      return res;
  }
  
@@ -27286,7 +27286,7 @@ index deaf6efd9..48b2c0c4f 100644
  
  llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
      if (mctx && !mctx->apply()) {
-@@ -2466,6 +2598,38 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2470,6 +2602,38 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
      // settled on" -- self-calibrating, no history guess, and it fires on the FIRST narrow pass of a
      // short-prompt workload.  Without a slab the classic wide-pass condition is kept, because there
      // reclaiming the wide layout is exactly what used to abort.
@@ -27325,7 +27325,7 @@ index deaf6efd9..48b2c0c4f 100644
      bool drop_now = false;
      // The work region actually observed before the drop.  The reference must be at least this: the narrow
      // layout varies with the graph (the MTP decode/verify graph is wider than the `n_rs_batch` reserve the
-@@ -2525,13 +2689,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2529,13 +2693,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          // (`mctx`) spans this ubatch's streams, and `build_attn_mha`/`ggml_flash_attn_ext` require the
          // query and the cache to agree on the stream dim (`q->ne[3] == k->ne[3]`).  A hard-coded 1
          // against a multi-sequence batch took `q->ne[2]/n_stream` to zero and aborted (issue #48).
@@ -27342,7 +27342,7 @@ index deaf6efd9..48b2c0c4f 100644
                                narrow_sizes, kq_mask_packed_reachable()) != nullptr) {
                  size_t narrow_bytes = 0;
                  for (int i = 0; i < 16; i++) {
-@@ -2551,7 +2716,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2555,7 +2720,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                  }
              }
          }
@@ -27351,7 +27351,7 @@ index deaf6efd9..48b2c0c4f 100644
          if (!narrow_ok) {
              LLAMA_LOG_WARN("%s: failed to re-reserve the post-prefill compute layout; a later"
                      " growth may not fit next to the MoE expert cache arena\n", __func__);
-@@ -2667,7 +2832,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2671,7 +2836,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
  
@@ -27378,7 +27378,7 @@ index deaf6efd9..48b2c0c4f 100644
              LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              ret = GGML_STATUS_ALLOC_FAILED;
              return nullptr;
-@@ -2693,6 +2876,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -2697,6 +2880,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          return nullptr;
      }
  
@@ -27386,7 +27386,7 @@ index deaf6efd9..48b2c0c4f 100644
      ret = GGML_STATUS_SUCCESS;
  
      return res;
-@@ -3067,6 +3251,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -3071,6 +3255,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
  
      output_swaps.clear();
      embd_batch_idxs.clear();
@@ -27394,7 +27394,7 @@ index deaf6efd9..48b2c0c4f 100644
  
      // issue #238: a 2-D (M-RoPE) position can only come from a multimodal chunk, and the compute reserve
      // covers the packed kq mask for such a batch only when the caller declared it at context creation.
-@@ -3460,6 +3645,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+@@ -3464,6 +3649,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
          }
      } while (true);
  
@@ -27417,7 +27417,7 @@ index deaf6efd9..48b2c0c4f 100644
      if (layer_inp_dev && ev_layer_inp_written) {
          ggml_backend_event_record(ev_layer_inp_written.get(), layer_inp_backend);
      }
-@@ -3715,7 +3916,128 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
+@@ -3719,7 +3920,128 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
      return n_outputs_max;
  }
  
@@ -27546,7 +27546,7 @@ index deaf6efd9..48b2c0c4f 100644
      bool extracted = false;
      if (cparams.embeddings_layer_inp_dev) {
          return extracted;
-@@ -3820,7 +4142,8 @@ void llama_context::output_reorder() {
+@@ -3824,7 +4146,8 @@ void llama_context::output_reorder() {
                  }
              }
              for (auto & layer : embd_layer_inp) {
@@ -27556,7 +27556,7 @@ index deaf6efd9..48b2c0c4f 100644
                      for (size_t k = 0; k < n_embd; ++k) {
                          std::swap(layer.data[i*n_embd + k], layer.data[j*n_embd + k]);
                      }
-@@ -4002,10 +4325,34 @@ ggml_cgraph * llama_context::graph_reserve(
+@@ -4006,10 +4329,34 @@ ggml_cgraph * llama_context::graph_reserve(
          } else {
              ggml_backend_sched_split_graph(sched.get(), gf);
          }
@@ -27595,7 +27595,7 @@ index deaf6efd9..48b2c0c4f 100644
      }
  
      return gf;
-@@ -5385,6 +5732,26 @@ llama_context_params llama_context_default_params() {
+@@ -5389,6 +5736,26 @@ llama_context_params llama_context_default_params() {
      return result;
  }
  
@@ -27622,7 +27622,7 @@ index deaf6efd9..48b2c0c4f 100644
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
-@@ -5420,10 +5787,49 @@ llama_context * llama_init_from_model(
+@@ -5424,10 +5791,49 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }
@@ -27674,7 +27674,7 @@ index deaf6efd9..48b2c0c4f 100644
          return nullptr;
      }
  
-@@ -5708,6 +6114,26 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+@@ -5712,6 +6118,26 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
      return ctx->get_embeddings_nextn_ith(i);
  }
  

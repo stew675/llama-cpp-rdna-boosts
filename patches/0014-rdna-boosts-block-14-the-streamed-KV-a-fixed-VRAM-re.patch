@@ -1,4 +1,4 @@
-From 808bc046463c66ca72c3a03f84476cca2556b8f2 Mon Sep 17 00:00:00 2001
+From 83b48edbbd76f29e71de7f8adb593adabf5ed9ca Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 14/18] rdna-boosts: block 14: the streamed KV -- a fixed-VRAM
@@ -6454,10 +6454,10 @@ index 3ede86eca..7be0a9c87 100644
  
      struct llama_model_tensor_override {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 1e45ce44d..70fa60eec 100644
+index fe6c97795..261e15a9d 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -826,6 +826,14 @@ llama_context::llama_context(
+@@ -830,6 +830,14 @@ llama_context::llama_context(
      cparams.moe_cache_size      = params.moe_cache_size; // upstream MoE cache (dormant unless --moe-cache-mib)
      cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
      cparams.drop_compute_buffers = params.drop_compute_buffers;
@@ -6472,7 +6472,7 @@ index 1e45ce44d..70fa60eec 100644
  
      // resolved after flash attention, see resolve_fused_ops()
      {
-@@ -995,6 +1003,8 @@ llama_context::llama_context(
+@@ -999,6 +1007,8 @@ llama_context::llama_context(
              /*.ctx_type  =*/ cparams.ctx_type,
              /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
              /*.no_alloc  =*/ model.no_alloc(),
@@ -6481,7 +6481,7 @@ index 1e45ce44d..70fa60eec 100644
          };
          // the graph builders that choose between quantized-aware attention arms need the same
          // types the memory module was given (see qwen4exp_qsa_sparse)
-@@ -6506,6 +6516,9 @@ llama_context_params llama_context_default_params() {
+@@ -6510,6 +6520,9 @@ llama_context_params llama_context_default_params() {
          /*.sampler                     =*/ nullptr,
          /*.n_sampler                   =*/ 0,
          /*.ctx_other                   =*/ nullptr,
@@ -6491,7 +6491,7 @@ index 1e45ce44d..70fa60eec 100644
      };
  
      return result;
-@@ -7306,6 +7319,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+@@ -7310,6 +7323,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
      return ctx->memory_breakdown();
  }
  

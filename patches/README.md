@@ -1309,8 +1309,8 @@ almost all of them `template-instances/*.cu`.
   node landed.  The reserve/probe context carries `n_kv = kv->get_size()` -- the whole **padded** cache extent --
   and qwen4exp's QSA decode arm is dense only while `n_kv < qsa_dense_decode_until` (**32768** on gfx1151), so at
   `-c >= 32768` the probe built the SPARSE arm, contained no rows node, and still reported `enabled`
-  (`require_observed` was false).  No AMD arch has a kv_rows kernel (`ggml_cuda_get_best_fattn_kernel` returns
-  NONE), so every joint attention layer then ran on the CPU: `splits = 25` in the decode graph, plain decode
+  (`require_observed` was false).  No AMD arch had a kv_rows kernel at the time (`ggml_cuda_get_best_fattn_kernel`
+  returned NONE), so every joint attention layer then ran on the CPU: `splits = 25` in the decode graph, plain decode
   **32.5 -> 11.0 t/s** and MTP `draft-mtp n3` **62-65 -> 18.7 t/s** at 15.5K depth (prefill and text unchanged;
   the verify band takes the same dense arm, and the drafter's own unified context was in the same state).  The
   descriptor now sets `require_observed` and lists every field in struct order -- the initializers here are
@@ -1319,6 +1319,36 @@ almost all of them `template-instances/*.cu`.
   `scripts/gate-fused-probe-splits.sh` (6 arms incl. the MTP pair; `splits == 1`, the two decline mechanisms
   graded separately).  Knob: `LLAMA_KV_ROWS_DISABLE=1` is the A/B arm (upstream's).  `WORKLOG.md` 261117.007,
   `INVARIANTS.md` r308.
+
+  **Since r358 (GitHub issue #363) the rows form RUNS ON THE GPU on AMD.**  The kv_rows branch of
+  `ggml_cuda_get_best_fattn_kernel` offered the MMA kernel to NVIDIA Turing+ only, so on RDNA every joint
+  attention layer of a `--kv-unified` server fell back to the CPU backend -- silent, correct, and ~3x decode loss
+  (`INVARIANTS.md` r308 item 3).  It now offers it to `amd_mfma_available(cc) || amd_wmma_available(cc)` as well,
+  **gated on `gqa_opt_applies`** because every AMD instance of that kernel is compiled out unless the GQA-optimised
+  layout is chosen (`ncols2 >= 2`, `ncols >= 16`; the WMMA instances have no `ncols2 == 1` arm at all, so a launch
+  there would set `NO_DEVICE_CODE` and leave the output untouched).  Three holes had to be closed with it, each a
+  silent wrong-answer or an abort on a shape only reachable once AMD could be selected:
+  * **the batch-wide packed fully-masked-group bitmap assumed `mask->ne[0] == K->ne[1]`** (fattn-common.cuh).  The
+    rows form's mask is compacted to `n_kv_cols` = `kv_rows->ne[0]` while `K->ne[1]` is the padded cache extent
+    (`LLAMA_KV_N_PAD_PREFILL` widens it, and another slot's cells widen it too), so the assert fired and the word
+    count was for the wrong group count.  Both now follow `n_kv_cols` (a no-op without the rows form);
+  * **the native K/V loaders ignored the row list** (fattn-mma-f16.cuh): the q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl and
+    bf16 arms read `k_VKQ_0 + i` unless `use_sparse`, i.e. a quantized or bf16 KV cache would have attended the
+    wrong cells at the <= 8-row widths.  They now take `use_indices` and read through `indices` exactly like the
+    half2 loader (negative entry = padding, staged as row 0, killed by the -inf mask);
+  * **the RDNA4 band and its q8_0 fetch-ahead arm have no index path** (their `process_tile` calls pass a null
+    index list, and the fetch-ahead ring is addressed by row index), so `ggml_cuda_fattn_band_wmma_applies()` and
+    the fetch-ahead predicate now decline the rows form -- it falls through to the ordinary stream-k MMA path,
+    which is also what upstream runs with it on NVIDIA.
+  Measured on gfx1201 (3 GPUs `-sm layer`, Flash-Next GSQ-IQ3_XXS, bf16 KV, `--kv-unified -c 32768 -np 2`, 5246-token
+  prefill + 48 greedy tokens): every arm of `scripts/gate-fused-probe-splits.sh` reads `splits = 4` (the layout
+  bound) and text **`f6f0a8fd998b`** -- the sha r311 pinned for the same-regime arms, so the GPU rows path is
+  bit-identical to the validated dense form.  On 4B Q8_0 3 GPUs `-sm tensor` a slot's answer is unchanged by a
+  second slot holding a 5246-token context (T(alone) == T(foreign slot resident)), and the native and staged
+  read arms of a q8_0 and a bf16 cache read one text.  Gate: `scripts/gate-fused-probe-splits.sh` (updated: the
+  rows form must not be PLACED ON THE CPU and `splits` stays bounded -- `enabled` itself is now the correct
+  verdict, `KVROWS_EXPECT=enable|obs|place` pins the box) + `scripts/gate-prefill-logits.sh` (inert: 0.000000).
+  `WORKLOG.md` r358 entry, `INVARIANTS.md` r358.
 * **The other fused-op probes say HOW they verified (r311, `TODO` #345).**  r308's fix was one flag on one
   probe; the class is wider.  `llm_fused_op_probe` gained `query_supports_op`: when the probe graph does not
   CONTAIN the audited node, `resolve_fused_ops()` asks the acting DEVICE instead

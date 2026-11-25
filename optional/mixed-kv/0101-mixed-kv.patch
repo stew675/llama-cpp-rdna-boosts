@@ -1,4 +1,4 @@
-From 6c91c10404a3fd1d640c7ca37f5e55e1621f4859 Mon Sep 17 00:00:00 2001
+From eb5599b36bc741c677f6fd706c88e9cc83984b9c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 21 Nov 2026 18:16:14 -0600
 Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types (optional: NOT
@@ -22,7 +22,7 @@ Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types (optional: NOT
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_1.cu
 
 diff --git a/ggml/src/ggml-cuda/fattn-rdna.cuh b/ggml/src/ggml-cuda/fattn-rdna.cuh
-index 380f22ec8..bb43d0435 100644
+index 05a6771cb..165a1db7c 100644
 --- a/ggml/src/ggml-cuda/fattn-rdna.cuh
 +++ b/ggml/src/ggml-cuda/fattn-rdna.cuh
 @@ -265,6 +265,29 @@ static inline int ggml_cuda_fattn_tile_kv_native_type(const ggml_tensor * K, con
@@ -75,7 +75,7 @@ index 380f22ec8..bb43d0435 100644
  // Decode/verify band (n_q <= 8) on RDNA4: the whole GQA group is folded into one block
  // (ncols2 = 8) via the WMMA kernel instead of the tile kernel's ncols2 = 2, which fetches and
  // dequantizes every K/V element once per head pair (3x for GQA 6).  This is the default; the env var
-@@ -606,7 +637,8 @@ static inline bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_te
+@@ -613,7 +644,8 @@ static inline bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_te
      // is the default since the r6 flip; it is deliberately NOT banded while it is staged, where the
      // whole-cache conversion dominates (that staged case only appears under GGML_CUDA_FA_KV_NATIVE=0).
      const int  kv_native = ggml_cuda_fattn_kv_native_type(K);
@@ -409,10 +409,10 @@ index e0778c76b..fbc9277da 100644
  EXTERN_DECL_FATTN_TILE_CASES( 64,  64);
  EXTERN_DECL_FATTN_TILE_CASES( 72,  72);
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 227c79024..ffef4c0c0 100644
+index a22a4988c..a6a794cb8 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -943,7 +943,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -952,7 +952,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
              // into the neighbouring buffer).
              const ggml_type tile_type = ggml_cuda_fattn_tile_type(K, V, ggml_cuda_info().devices[device].cc);
              need_f16_K = K->type != tile_type;
@@ -485,10 +485,10 @@ index 64dcacf05..7b4bf9077 100755
      for type_v in TYPES_KV:
          with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 8518e09fe..1955de59a 100644
+index fceddd520..3b2f447c0 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -6618,9 +6618,28 @@ llama_context * llama_init_from_model(
+@@ -6622,9 +6622,28 @@ llama_context * llama_init_from_model(
      // split/flash-attention one - assumes type_k == type_v, so a mixed configuration is rejected
      // rather than accepted as a slow-but-valid one.  Both types default to f16, so only an explicit
      // --cache-type-k (or --cache-type-v) can trigger this.
