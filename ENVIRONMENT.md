@@ -758,6 +758,21 @@ live in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §27.
 
 ---
 
+## 28. The slab ring hole on a pool tier, and the residency map (block 10, r362)
+
+No end-user variable is added: a host-expert run whose loader tier is the **pool** (`--host-experts pool`, or an
+`-lme` budget that resolves to the per-expert pool) no longer gives the movable-boundary slab a whole-table H2D
+staging hole, because that tier gathers its routed tables at every prefill width and the hole therefore holds
+nothing.  Without the hole the slab's work boundary stops 8.5 GiB lower, 51 expert tables stay resident through a
+`-ub 8192` prefill instead of standing down, and on the shape of GitHub issue #368 that is +3.4 % prefill and
++2.2 % decode (the L2 revisit of the same conversation goes 728 -> 902 t/s because it no longer re-evicts).
+`GGML_CUDA_SLAB_RING_MIB` and `GGML_SCHED_DEVGATHER` still change it, and `MOE_EXPERT_CACHE_TABLES=1` prints which
+layers hold what.
+
+*The two knobs that change this, and the residency-map diagnostic, are in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §28.*
+
+---
+
 ## Maintaining this file
 
 The tables are derived from the code, so re-derive rather than trust them after a block change:

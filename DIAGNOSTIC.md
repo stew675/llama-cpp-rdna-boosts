@@ -696,6 +696,21 @@ Gate: `scripts/gate-fast-topk-penalties.sh`.
 
 ---
 
+## 28. Residency by layer, and the slab ring hole (block 10, r362)
+
+Two things a host-expert run needs to say out loud, both from GitHub issue #368.  The first is a diagnostic: the
+residency map is the one reading that tells two runs of the same config apart, because the exit census's `h`,
+`evictions` and `fills` are *totals* and two runs whose totals agree can still hold different layers.  The second
+is not a variable at all on the default path; it is recorded here because it is the arm any "is the ring hole
+worth its arena" comparison must use.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `MOE_EXPERT_CACHE_TABLES` | `0` (off) | **diagnostic** | At exit, one INFO line with the per-layer residency map (`L12 261/512`, `I` appended when a table of that layer is on the identity fast path) and one with this run's per-layer **slab-reclaim stand-downs** and **re-arms** (`L30x3 L31x3`).  The eviction and re-arm messages carry counts and bytes only, so a report that says "the same eviction sizes" can still hide a different *set*: read this first when comparing two runs of a host-expert shape, and change nothing until the two maps agree or the difference is explained.  Nothing is printed when the cache is off. |
+| `GGML_CUDA_SLAB_RING_MIB` | unset (auto) | tuning (pre-existing) | The whole-table H2D staging ring the slab reserves as a fixed hole above the narrow floor.  Since r362 it is **not reserved at all when the loader's host tier is the POOL** (`--host-experts pool`, or an `-lme` budget that resolves to the per-expert pool): that tier has no device-readable host master, so the default `GGML_SCHED_DEVGATHER` mode gathers a pool-backed table at every prefill width and the hole holds nothing for it.  An explicit value restores a hole of that size (the r361 behaviour is `GGML_CUDA_SLAB_RING_MIB=6144`), and an explicit `GGML_SCHED_DEVGATHER=0` also keeps it, because that arm really does stage.  Measured on the shape of issue #368: hole 6656 MiB -> work boundary 3264 -> 11776 MiB -> 8500 MiB / 51 tables stood down at every prefill, L1 prefill 1895 t/s / decode 34.18; without the hole, boundary 3328 MiB, no stand-down, 1958 / 34.94 (+3.4 % / +2.2 %) and the L2 revisit 728 -> 902 t/s. |
+
+---
+
 ## Maintaining this file
 
 The same recipe as [`ENVIRONMENT.md`](ENVIRONMENT.md) → *Maintaining this file* derives the names; this file is

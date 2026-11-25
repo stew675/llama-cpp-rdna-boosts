@@ -92,6 +92,23 @@
 > `scripts/gate-prefill-logits.sh` **0.000000 / 100.000 %**, coherence byte-identical, 18/18 rungs build.
 > Record: `WORKLOG.md` 261121.010, `INVARIANTS.md` r331, `TODO` #358 (the reconciliation check this exposed).
 >
+> **r362: the slab's whole-table H2D staging hole is NOT reserved on a POOL-backed host-expert tier -- it holds
+> nothing there, and its extent came out of the expert arena (GitHub issue #368), an amendment to block 10.**
+> `sched_input_gatherable`'s mode 1 (the default `GGML_SCHED_DEVGATHER`) gathers a pool-backed routed table at every
+> prefill width, so the 6656 MiB hole a `-ub 8192` reserve carves (`h2d_stage_region_bytes`, above the narrow floor)
+> is never read by anything: the wide prefill view can only be placed behind it, the work boundary moves 3264 ->
+> 11776 MiB, and **8500 MiB / 51 whole tables stand down at every prefill** plus a 54-table re-arm at the drop.
+> `slab_ring_region_bytes()` (ggml-cuda.cu) now returns 0 when the loader's tier is the pool
+> (`moe_cache_host_pool_requested()`, a new read-only query in block 09's cache) -- unless `GGML_CUDA_SLAB_RING_MIB`
+> names a size or `GGML_SCHED_DEVGATHER=0` asks for staging, both of which keep the hole.  Measured (1x R9700,
+> Flash-Next GSQ-RCO-IQ3_XXS, `-ncmoe 47 --host-experts pool -c 131072 -ub 8192`, 89199-token prompt): 1895 t/s
+> prefill / 34.18 t/s decode -> **1958 / 34.94**, the conversation's cache-hit revisit **728 -> 902 t/s**, no
+> stand-down and no re-arm in the run, text byte-identical (`98c4f67d6ed9`).  Gates: `gate-prefill-logits.sh`
+> **0.000000 / 100.000 %**, `gate-host-expert-text.sh --quick` 2/2 identical, `check-shlib-symbols.sh` 16/16,
+> no GPU faults.  Same block: `MOE_EXPERT_CACHE_TABLES=1` prints the per-layer residency map and this run's
+> per-layer stand-down / re-arm tally.  Record: `WORKLOG.md` 261125.008,
+> `benchmarks/2026-11-25-issue-368-pool-tier-ring-hole.md`, `DIAGNOSTIC.md` §28.
+>
 > **r326: the graph-replay width band is `GGML_CUDA_GRAPH_MAX_TOKENS` (default 16, was 8) -- a repeating 9..16-row verify or pre-fill ubatch is replayed (+3.5 % on a 4-slot server, +1.2 % at `llama-batched-bench -npl 16`), a moving width pays a capture per new width, and the FA staging arena is no longer grown from inside a capture (contributor PR #336, `@overdoingism`), an amendment to block 10.**
 >
 > **r321: a fused MoE launch's STAGED answer is a PLACEMENT, not a stand-down -- and it owns the broken-promise repair (GitHub issue #332), an amendment to block 10.**

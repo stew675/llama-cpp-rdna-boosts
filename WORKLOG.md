@@ -16,6 +16,54 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.008 (r362) -- the pool tier no longer pays the slab's ring hole out of the expert arena (GitHub issue #368), and a residency map that names which tables stand down
+
+**The report.**  GitHub issue #368 (`@DanoPTT`, 1 x R9700, Windows, ROCm 10.2, Flash-Next IQ3_XXS
+`-ncmoe 47 --host-experts pool -c 131072 -np 2 --kv-unified -b 8192 -ub 8192`, a 90k-token prompt): every fresh
+server lands in one of **two deterministic states**, good L1 prefill 2960-3000 / tg 52 against slow 1615-1620 /
+tg 30-32, two byte-stable but different texts, and `-ub 4096` never switches.  Startup, pool fill, arena size and
+eviction *sizes* are the same in both states; the slow one re-evicts once more at the L2 revisit.
+
+**Reproduced the shape, not the bimodality.**  Nine fresh starts at their flags read ONE state here (L1 1890-1900,
+tg 34.06-34.24, text `98c4f67d6ed9`), with their eviction pattern to within a few percent (6602 MiB / 40 tables
+then 8500 / 51, re-arm 42 then 54, against their 6811 / 41 and 8546 / 51).  Eleven one-variable arms (arena 0 / 512 /
+12000 / 26000 MiB, the gather off, staging off, serial, `GGML_CUDA_MMB=0`, slab off, headroom, `MOE_GATHER_NSPLIT`
+8/32, the PLE resident, `--host-experts pinned`/`-lme mirror`) all read the **same text**, so on this box the
+expert cache's residency is not a text input on this shape — their two texts need another carrier.
+
+**What did explain the cost of the state (the fix, block 10).**  Two delivery statements contradicted each other on
+a pool-backed tier: `sched_input_gatherable` mode 1 gathers a pool table at EVERY prefill width, yet
+`h2d_stage_region_bytes()` still carved a whole-table H2D ring hole — **6656 MiB at `-ub 8192`** (1800 at 4096, so
+4096 is exactly the width that never shows the state).  The hole sits above the narrow floor, so the wide prefill
+view can only be placed behind it: the work boundary moved 3264 -> 11776 MiB and `moe_cache_evict_slab_range` took
+**8500 MiB / 51 whole tables** at every prefill, plus their 54-table re-arm at the drop — residency the prefill then
+streams back from the host on every ubatch.  `slab_ring_region_bytes()` now returns 0 when the loader's tier is the
+pool (`moe_cache_host_pool_requested()`, a read-only query added to block 09's cache), still deferring to
+`GGML_CUDA_SLAB_RING_MIB` and to an explicit `GGML_SCHED_DEVGATHER=0`.
+
+**Measured, after.**  Four fresh visits, the same flags and a cold heat-map directory: L1 **1895 -> 1958.5 t/s**
+(+3.4 %), tg **34.18 -> 34.94** (+2.2 %), the cache-hit revisit **728 -> 902.5 t/s** (+24 %, it no longer re-evicts
+6778 MiB / 41 tables), S2 tg 46.1 -> 47.1, arena 20 397 MiB held through the whole run, `slab-reclaim stand-downs
+this run: none | re-arms: none`, text byte-identical (`98c4f67d6ed9`).
+
+**The instrument the issue asks for (question 3, new).**  `MOE_EXPERT_CACHE_TABLES=1` prints, at exit, the per-layer
+residency map (`L1..L48 261/512`, `I` for an identity table) and this run's per-layer slab-reclaim stand-down /
+re-arm tally (`L30x3 L31x3`).  The eviction and re-arm messages carry counts and bytes only, so two runs that agree
+on `h` and `evictions` can still hold different layers — which is the thing a "same eviction sizes" report cannot
+show.
+
+**Gates.**  `gate-prefill-logits.sh` **0.000000 / 100.000 %**, `gate-host-expert-text.sh --quick` 2/2 identical
+(and the flipped-library arm still moves, so the pin is live), `check-shlib-symbols.sh` 16/16, `check-gen-docs.sh`
+ok, `check-gpu-faults.sh` clean, `validate-set.sh` green with `0 unexplained` in the rung reconciliation (the two new
+env keys are additions).  Owned gap: the host-expert KLD point still has no base recorded on this box, so its `--kld`
+leg cannot run (the r361-vs-r362 text identity on this shape is the neutrality evidence instead).
+
+**The cut.**  `v18-919794500-r362` = `ca149fbe6` (fork re-cut tip), base `919794500`, tree
+`45beb90c0ea0126d454753f4276bd06541934ba2`; canonical re-cut tree matches, 18 official + 1 temporary = 19 default
+blocks; optional `0100` tree `0a189a09b`, `0101` tree `1a0ee3d93`, cumulative `95d40ba7d` (both still apply strictly
+on the new tree).  Record: `benchmarks/2026-11-25-issue-368-pool-tier-ring-hole.md`, `INVARIANTS.md` r362,
+`DIAGNOSTIC.md` §28, `ENVIRONMENT.md` §28.
+
 ## 261125.007 (r361, release cut) -- tagged, pushed, the fork branch refreshed to the re-cut tip, the images verified, issue #366 answered and closed
 
 **The cut.**  `v18-919794500-r361` = `41b54afa`, base `919794500`, tree

@@ -3523,3 +3523,32 @@ loses everywhere measurable, so the delivery's default went back to the dense fo
   gfx1201+gfx1100 pair, and byte-identical text against the full-vocabulary arm on 7 profiles including a 700-token
   run that crossed the cap.  Gates: `scripts/gate-fast-topk-penalties.sh` (`MANIFESTS.md` gate 45); knobs
   `DIAGNOSTIC.md` §27; rule `GREEDY-PURITY.md` §110; record `archive/work/fast-topk-penalties/`.
+
+* **(r362, block 10, GitHub issue #368) A POOL-BACKED HOST-EXPERT TIER GATHERS EVERY ROUTED TABLE AT EVERY WIDTH,
+  SO THE SLAB'S WHOLE-TABLE STAGING RING HOLDS NOTHING FOR IT — do not reserve its hole out of the expert arena.**
+  The delivery carries two independent statements that only contradict each other on a host-expert shape:
+  (1) `sched_input_gatherable`'s **mode 1** (`GGML_SCHED_DEVGATHER` unset, the default) says a POOL-backed routed
+  table is gathered at *every* prefill width, because that tier has no device-readable host master and whole-table
+  staging of it is the slow path by design (`wip/host-pool-speed` §18.2); (2) `h2d_stage_region_bytes()` sizes a
+  fixed, non-evictable H2D staging hole from the largest host-weight table and the ubatch — 6656 MiB at `-ub 8192`,
+  and it scales with the ubatch (`1800/n + ub/(1.7 n²)` MiB).  The hole sits *above* the narrow floor, so the wide
+  (prefill) compute view can only be placed behind it: the slab's work boundary moves from 3264 to 11776 MiB, the
+  arena hands `moe_cache_evict_slab_range` everything in that range, and **8500 MiB / 51 whole tables stand down at
+  every prefill** plus their 54-table re-arm at the drop — residency the prefill then re-reads from the host on
+  every ubatch.  Measured (1× R9700, Flash-Next GSQ-RCO-IQ3_XXS, `-ncmoe 47 --host-experts pool -c 131072 -ub 8192`,
+  an 89199-token prompt): 1895 t/s prefill / 34.18 t/s decode with the hole, 1958 / 34.94 without (+3.4 % / +2.2 %),
+  and the conversation's cache-hit revisit 728 -> 902 t/s because it no longer re-evicts 6778 MiB / 41 tables.
+  The hole is still reserved for a non-pool tier and for an explicit `GGML_SCHED_DEVGATHER=0`, where staging really
+  is the transport.  **A hole nothing reads is not free** — it is arena, and on a partial-arena tier it is exactly
+  the residency the prefill streams back from the host.  Knobs `DIAGNOSTIC.md` §28; record
+  `benchmarks/2026-11-25-issue-368-pool-tier-ring-hole.md`.
+* **(r362, measurement, GitHub issue #368) On this box the expert cache's RESIDENCY IS NOT A TEXT INPUT on a
+  pool-backed host-expert shape, and it is not the prefill's lever either.**  Nine fresh server starts at the
+  reporter's flags (`-c 131072 -np 2 --kv-unified -b 8192 -ub 8192`, 89199-token prompt) read ONE text
+  (`98c4f67d6ed9`) and ONE state: arena 20397 MiB of 40012.5 (51 % residency, `L1..L48 261/512`, no identity
+  table), pool `h=1.0000`, gather 1794 calls, and the same text with the arena at 0 / 512 / 12000 / 20397 / 26000
+  MiB, with the gather off (ring staging), with staging off (serial), with `GGML_CUDA_MMB=0`, with the slab off,
+  with the PLE resident, and with a pinned master.  So the reporter's two texts are **not** explained by which
+  experts the arena holds (§89's corrected doctrine reaches this shape), and the next things to compare on their
+  box are the BLAS state, the PLE's lazy reads and the *set* of tables standing down — which is why
+  `MOE_EXPERT_CACHE_TABLES=1` exists.  The one lever this box did show is the ring hole above.
