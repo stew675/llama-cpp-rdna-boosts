@@ -86,6 +86,13 @@ The frozen beta candidate (`beta/prefill-decode-arms/`, three patches) was re-ap
 applies strictly, producing tree `a8f070fb2`; it is not re-cut (it is frozen as a code reproduction, `AGENTS.md`) and
 its README's recorded tree predates this release.
 
+**Containers.**  The `radiance` watcher built and pushed the six images for `7.14.1` and `10.2`;
+`scripts/build-containers.sh --verify-only` on this tree reads all **23 tags** PRESENT, with every moving tag (`latest`,
+`rocm-<line>`, `server-rocm-<line>`, `full-`/`light-rocm-<line>`) carrying this release's digest -- issue #364's check
+doing exactly its job.  One wrinkle worth recording: the watcher logged a single `ERROR: git fetch --tags --force origin
+failed` (`cannot lock ref 'refs/remotes/origin/main'`) on the poll right after the push, then fetched cleanly on the next
+poll and built on attempt 1/3; the r358 entry's fix (failures are filed, not just logged) is what made that visible.
+
 **Docs.**  `DIAGNOSTIC.md` §8 (the repointed opt-in, its default and why), `INVARIANTS.md` **r359** (four facts: the
 derived-mask coupling, the seven-arm form table, the family-switch caveat for text, and "the default is pinned by the
 gate"), `patches/README.md` block 05, `MANIFESTS.md` gate 05, `AGENTS.md`'s gate table (do not re-enable it by default),
