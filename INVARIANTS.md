@@ -3293,7 +3293,8 @@ it removed an abort (r374-wip) -- so the per-shape rule above stands, now on the
    takes every batch) rather than tripping the conversion's contiguity assert.  Every split the delivery
    validates hands it a contiguous slab (measured), so the decline is for the class, not a live path.
 6. **The default path is untouched, measured three ways.**  Text: 4B `1c5d32ac537d` on 1 GPU and 3-GPU
-   `-sm tensor`, 35B-A3B `461ca8cd0e88` on 3-GPU tensor, both identical to r355.  Prefill logits: KLD
+   `-sm tensor`, 35B-A3B `461ca8cd0e88` on 3-GPU tensor, both identical to r355, and on gfx1151 the dense text is
+   `1c5d32ac537d` on both builds too.  Prefill logits: KLD
    **0.000000 / 100.000 %** against a base recorded from the r355 build on this ROCm line.  Rate: pp512 at parity
    over five interleaved rounds (spread ±190 t/s on both builds), tg128 +0.08 %, `npl 1,4,8` within 0.7 %.  A
    fusor added to block 10's dispatcher and a node reorder in `graph_optimize` both run for EVERY graph, so this

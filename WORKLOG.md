@@ -92,7 +92,9 @@ Qwen3.5-4B Q8_0 text `1c5d32ac537d` on 1 GPU and on 3-GPU `-sm tensor`, identica
 3-GPU tensor `461ca8cd0e88` identical (pinned `MOE_EXPERT_HEATMAP=load,ROCBLAS_USE_HIPBLASLT=0`); pp512 at parity
 over five interleaved rounds (r355 8262-8286, r356 8250-8287, arm spread ±190 t/s), tg128 105.08 → 105.16 t/s;
 `llama-batched-bench -npl 1,4,8` 6866/8053/8041 → 6683/8020/8019 pp and 103.1/345.0/531.8 → 103.4/345.3/528.3 tg
-(B=1 noise, ≤0.7 % elsewhere).
+(B=1 noise, ≤0.7 % elsewhere).  **gfx1151** (same models, 1 device, this arm finished after the tag as a docs-only
+follow-up): the dense 4B text is `1c5d32ac537d` on BOTH the r355 and the r356 build — the same hash gfx1201 reads —
+and the rate is at parity (pp512 3188.9 → 3179.1, tg128 44.14 → 44.12 t/s).
 
 ### 5. The gate ladder
 
