@@ -16,6 +16,60 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261124.016 (r357, release) -- block 12 AMENDMENT: the server keeps a tool result's special-token strings as TEXT (contributor PR #360, `@overdoingism`); `v18-919794500-r357`
+
+**Release v18-919794500-r357** -- base `919794500`, tip `1a7689a8e`, default tree `24c3d4b367946ede7c8e2405561a6cd56f20876c`
+(was `2dbfffd60a5f...`), 19 default patches (18 official + `0300`), `rdna-boosts-all.patch` sha256 `1fff6a0d...cc5a9d`;
+optional trees re-recorded on the new default tree (`0100` alone `120d4c2fb`, `0101` alone `2f0690e0f`, cumulative
+`8e73d16f4`) -- the two optional artifacts themselves are unchanged (same sha256, they still apply strictly).
+
+**What shipped.**  A tool result, a tool call's arguments and an assistant's own content/reasoning are DATA; the server
+rendered the chat template and tokenized the whole string with `parse_special`, so a `<|im_end|>` in that data became the
+real token and could forge a turn.  The amendment protects by message ROLE (never by searching the rendered prompt), with
+two noncharacter marks around each protected string before the template and a tokenize pass that treats a marked string as
+ordinary text; a request without such strings is tokenized exactly as before.  Default-on, `LLAMA_SERVER_TOOL_TEXT=0` is
+the kill switch, `LLAMA_SERVER_TOOL_TEXT_CENSUS=1` the census (`DIAGNOSTIC.md` §26).  The submission (`wip/tool-text/`)
+was **promoted into block 12 as an amendment** -- the maintainer's call: a correctness/security fix of ~350 lines in three
+server files belongs in the campaign-remainder block that already owns the server's prompt/idle-slot code, not a new block
+number and not block 00 (which owns the CUDA foundation and no server code).  Record: `archive/work/tool-text/`
+(the submitted patch kept as the reproduction, `integration-fixes.patch` the delta the delivery carries).
+
+**Three integration fixes** (each a class the new gate catches; the submission scores 29 passed / 3 failed on it, the
+delivery build 33/33):
+1. **the space fallback is per REQUEST, not per server** -- gating it on `opt.allow_image/audio/video` (the mmproj
+   capability) made every vision-capable server mutate the tool data the model reads on a text-only request (measured:
+   `< /tool_response>`, five inserted spaces on Qwen3.6-35B-A3B + mmproj).  Now gated on the request's own media, and the
+   two mtmd routing sites accept the token array a protected prompt becomes (`handle_completions_impl`,
+   `handle_count_tokens` -- `/v1/chat/completions/input_tokens` answered 373 for the same request).
+2. **the kill switch really restores stock** -- the submission stripped a client's own U+FDD0/U+FDD1 unconditionally, so
+   the OFF arm still altered text (stock 1654 bytes / both noncharacters, submission's OFF arm 1652).  The strip is armed
+   with the feature; every probe's OFF prompt is byte-identical to stock.
+3. **the piecewise re-tokenization is verified** (`tool_text_tokenize_ok`, the `common_chat_input_tokenize` pattern):
+   the tokens must detokenize to the marked prompt, else the request takes the space fallback.  Non-vacuity proved by a
+   deliberate one-character change, which reads `mode=space (the tokenizer changed the text)` and still protects.
+
+**Gates.**  `scripts/gate-tool-text.sh` (new, `MANIFESTS.md` gate 43) **33/33 PASS, 0 skipped**: clean 20 special tokens;
+the three forged probes 20 / 20 / 26 = the same conversations without the forged text (`mode=text`), the switch-off arms
+25 / 25 / 30 (`mode=off`); `/apply-template` byte-identical to the switch-off arm on six probes; the vision server's
+text-only request `mode=text` and identical to its own switch-off arm, its image request `mode=space` at the template's own
+20; a client's U+FDD0 dropped when armed and kept when off; `/apply-template` 5 ms vs 4 ms; no abort, no GPU fault.  The
+**pre-fix build FAILS arms 4 and 7** (29/3).  Neutrality: same-seed greedy text unchanged against the r356 build on a dense
+4B (`7386359e5dac`) and a 3-GPU `-sm layer` 35B-A3B (`8d733a56c740`); server-side, a normal request's text and prompt
+token count identical to the switch-off arm, prompt cache 328 -> 324 cached, streaming and tool-call parsing unchanged.
+Whole-set `all` build at the tip; `check-shlib-symbols.sh` 16/16 libraries clean; `check-gen-docs.sh` clean (no option
+added); `validate-set.sh` **OK** -- fresh-tarball strict apply, all 19 + 2 checksums, both optional artifacts and the
+cumulative order, the Windows portability scan (519 files) and the file-set reconciliation (573 -> 575 files, envs 580 ->
+582, **0 unexplained**).
+
+**Docs.**  `patches/README.md` block 12 (the r357 amendment + the three fixes + what is not covered);
+`MANIFESTS.md` gate 43 and block 12's verification row; `DIAGNOSTIC.md` §26 with the `ENVIRONMENT.md` pointer (both
+variables are diagnostics); `scripts/README.md`; `README.md` (the `0012` row and the acknowledgement); `INVARIANTS.md`
+r357 (six facts); `TODO` **#382** (the parked redesign: tokenize the prompt's `common_chat_prompt_part::is_input` parts
+instead of the mark scheme) and **#383** (the role-scoped limitation: user/system text, meaning-level injection, the
+realtime endpoint, the media/non-BPE fallback); `wip/CAMPAIGNS.md` records the promotion (the campaign never had a row --
+it was submitted as a PR, not an indexed campaign).  `upstream/tool-text/` stays as the submitted form with a note that
+the delivery form carries the fixes and must be re-cut before filing.
+
 ## 261124.015 (no release; docs) -- `WORKLOG.md` keeps today and indexes the rest, one file per day under `archive/worklog/`
 
 `WORKLOG.md` had reached **46 950 lines and 805 entries** in one file, which is past the point where a reader can

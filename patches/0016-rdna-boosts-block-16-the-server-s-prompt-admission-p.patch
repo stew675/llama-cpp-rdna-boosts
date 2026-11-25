@@ -1,4 +1,4 @@
-From fa2e4c24a280c0f288104e71f7c4dc56e653be6f Mon Sep 17 00:00:00 2001
+From 99e934f8a1e2a5e582f5a14ed3141912f7e47b9a Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Mon, 16 Nov 2026 23:43:27 -0600
 Subject: [PATCH 16/18] rdna-boosts: block 16: the server's prompt admission
@@ -290,7 +290,7 @@ index 3c89ff19d..f5b262254 100644
  | `--spec-draft-n-start N` | initial adaptive MTP draft depth: the first verify round of each generation starts here instead of the default cold start.  Clamped to [--spec-draft-n-min-adaptive, --spec-draft-n-max].  Use it to start deeper when the workload settles high (e.g. verbatim recall) or shallower for a short generation at a deep context, where a wide verify batch costs more.  Unset: three steps below the ceiling, bounded by the floor.<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_START) |
  | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index b14c0eb37..60d3feec3 100644
+index fde607ac3..0a030aa6f 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1165,6 +1165,81 @@ private:
@@ -433,7 +433,7 @@ index b14c0eb37..60d3feec3 100644
          // initialize slots
          for (int i = 0; i < params_base.n_parallel; i++) {
              slots.emplace_back();
-@@ -2131,6 +2243,119 @@ private:
+@@ -2144,6 +2256,119 @@ private:
          }
      }
  
@@ -553,7 +553,7 @@ index b14c0eb37..60d3feec3 100644
      // return true if at least one slot has been cleared
      // TODO: improve logic
      //       - smarter decision which slot to clear (LRU or longest prompt?)
-@@ -4287,6 +4512,101 @@ private:
+@@ -4300,6 +4525,101 @@ private:
          auto & alora_scale       = batch.alora_scale;
          auto & alora_disabled_id = batch.alora_disabled_id;
  
@@ -655,7 +655,7 @@ index b14c0eb37..60d3feec3 100644
          // next, batch any pending prompts without exceeding n_batch
          if (params_base.cont_batching || batch.size() == 0) {
              bool add_ok = true; // false means the batch is full, skip remaining slots
-@@ -4300,6 +4620,13 @@ private:
+@@ -4313,6 +4633,13 @@ private:
                      return;
                  }
  
@@ -669,7 +669,7 @@ index b14c0eb37..60d3feec3 100644
                  // check if we can batch this slot with the previous one
                  if (slot_batched && !slot_batched->can_batch_with(slot)) {
                      return;
-@@ -4759,8 +5086,12 @@ private:
+@@ -4772,8 +5099,12 @@ private:
  
                      const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
  
@@ -684,7 +684,7 @@ index b14c0eb37..60d3feec3 100644
                          // get next token to process
                          llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                          if (cur_tok == LLAMA_TOKEN_NULL) {
-@@ -4836,6 +5167,9 @@ private:
+@@ -4849,6 +5180,9 @@ private:
                      // the number of tokens added to the batch for the current slot
                      const auto n_tokens_cur = batch.size() - n_tokens_prev;
  
@@ -694,7 +694,7 @@ index b14c0eb37..60d3feec3 100644
                      const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
  
                      const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
-@@ -4900,6 +5234,10 @@ private:
+@@ -4913,6 +5247,10 @@ private:
                  }
              });
          }

@@ -658,6 +658,22 @@ None of these change the computed result on the default path.
 
 ---
 
+## 26. The server's tool-text protection (block 12, r357)
+
+A tool result, a tool call's arguments and an assistant's own text are DATA: the server used to tokenize the
+rendered prompt with `parse_special`, so a `<|im_end|>` in a tool result became the real token and forged a turn.
+The block keeps those strings as TEXT (two noncharacter marks around each before the template, then a
+tokenize pass that treats a marked string as ordinary text).  Both variables are read once, on first use, and
+both are diagnostics: the feature itself is on with nothing set.  Contract: `patches/README.md` (block 12, r357)
+and `INVARIANTS.md` r357.  Gate: `scripts/gate-tool-text.sh`.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `LLAMA_SERVER_TOOL_TEXT` | **`1` (on)** | **kill switch** | `0` restores the previous behaviour exactly: no marks are inserted and a client's own copy of them is no longer stripped, so the prompt is byte-identical to the r356 build's (measured).  The census still counts, so the OFF arm reports `mode=off` with the forged strings as real tokens — that is the arm any A/B must use. |
+| `LLAMA_SERVER_TOOL_TEXT_CENSUS` | `0` (off) | **diagnostic** | One INFO line per chat request: `tool_text: mode=none|text|off|space[(...)] strings= tool_results= tool_args= replies= prompt_tokens= special_tokens=`.  `mode=none` = nothing to protect, `text` = the marks path ran, `off` = the kill switch, `space[(reason)]` = the fallback (a request that carries media, a vocab that is not byte-level BPE, a template that rewrote a mark, or a tokenization that did not reproduce the prompt).  `special_tokens` is the prompt's count of CONTROL/UNKNOWN/USER_DEFINED tokens: with the protection on it must equal the same conversation's count without the forged text, and with it off it is higher — that is the mechanism check in the gate. |
+
+---
+
 ## Maintaining this file
 
 The same recipe as [`ENVIRONMENT.md`](ENVIRONMENT.md) → *Maintaining this file* derives the names; this file is

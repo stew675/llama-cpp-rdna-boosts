@@ -1,3 +1,80 @@
+# tool-text — a tool result's special-token strings stay TEXT (block 12 amendment, r357)
+
+Promoted to a **block-12 amendment** at `v18-919794500-r357` (contributor PR #360, `@overdoingism`; the campaign was
+submitted as `wip/tool-text/`).  The block reference is `patches/README.md` block 12 (the r357 amendment); the facts
+are `INVARIANTS.md` r357; the gate is `scripts/gate-tool-text.sh` (`MANIFESTS.md` gate 43); the knobs are
+`DIAGNOSTIC.md` §26; the narrative is `WORKLOG.md` 261124.016.
+
+**Block 12, not a block of its own.**  The change is ~350 lines in three `tools/server/` files, server-only and
+backend-neutral, and the maintainer's decision (2026-11-24) was that a correctness/security fix of that size belongs
+in the campaign-remainder block that already owns the server's prompt/idle-slot code — not in a block number of its
+own, and not in block 00 (which owns the band-uniformity / Meta / allocator / loader foundation and no server code).
+`tools/server/server-common.cpp` carries no other delivery code, so the amendment also makes that file block 12's.
+
+## What the integration changed in the submission (all three are in the block, not here)
+
+1. **The space fallback is per REQUEST, not per server.**  The submission gated it on
+   `opt.allow_image/audio/video` — the mmproj *capability* — so every vision-capable server took it for every request
+   that carried protected text, and **mutated the tool data the model reads** on a text-only request:
+   `< /tool_response>`, `< |im_end|>`, `< |im_start|>` (measured on Qwen3.6-35B-A3B + mmproj, 5 inserted spaces).  It
+   is now gated on the request's own media, and the two mtmd routing sites (`handle_completions_impl`,
+   `handle_count_tokens`) accept the token array a protected prompt becomes — a text-only request on a vision server
+   keeps the marks path and its tool data reaches the model byte-identical.
+2. **The kill switch really restores the previous behaviour.**  The submission stripped a client's copy of the marks
+   (U+FDD0 / U+FDD1) from every message unconditionally, so `LLAMA_SERVER_TOOL_TEXT=0` still altered text holding them
+   (measured: stock keeps 1654 bytes with both noncharacters, the submission's OFF arm 1652).  The strip is armed with
+   the feature; the OFF arm's prompt is now byte-identical to stock on all three probes.
+3. **The piecewise re-tokenization is VERIFIED, not assumed** (`tool_text_tokenize_ok`, the check
+   `common_chat_input_tokenize()` makes): the tokens must detokenize to the marked prompt, and a vocab whose
+   pre-tokenizer adds a prefix, normalizes a fragment or strips one (`metaspace_prepend_scheme "first"`, the SOPRANO /
+   NEMOTRON_3_5_EMBD / MMBERT pre-types, a `<mask>` LSTRIP) falls back to the space mode instead of moving the text
+   the model reads.  The submission re-derived `llama_vocab::tokenize`'s BOS/EOS and per-fragment behaviour by hand
+   with nothing checking it.
+
+## Measured here (gfx1201, on the delivery tree at r357)
+
+* **The mechanism** (`scripts/gate-tool-text.sh`, census `LLAMA_SERVER_TOOL_TEXT_CENSUS=1`): a clean tool round trip
+  reads `mode=none` and 20 special tokens; the forged user turn in a tool result, in an earlier call's arguments and
+  in an earlier assistant reply each read `mode=text` with **the same 20 / 26 special tokens as the same conversation
+  without the forged text**, and the same probes with `LLAMA_SERVER_TOOL_TEXT=0` read `mode=off` at **25 / 30** — the
+  forged strings are real tokens there.  Re-derived on Qwen3.8-27B: the submission's own table (21 / 26) is right.
+* **The text the model reads**: `/apply-template` on every probe is **byte-identical** to the switch-off arm, on
+  Qwen3.8-27B, on Gemma4-12B (a GEMMA4 pre-type vocab) and on the vision server.
+* **Neutrality**: a request with no protected string gives the same prompt token count and the same greedy text as the
+  switch-off arm; prompt cache reuse (328 → 324 cached), streaming and tool-call parsing all unchanged.
+* **Cost**: `/apply-template` 5 ms vs 4 ms with a 118-byte forged tool result (a request carrying protected text
+  renders the template twice).  Negligible against inference, and it is the only added work.
+* **The gate is not vacuous**: on the submitted (pre-fix) build it FAILS arm 4 (`mode=space` on a text-only request
+  and the mutated tool data) and arm 7 (`the switch-off arm dropped the client's U+FDD0`) — measured, 29 passed /
+  3 failed there against 33/33 on the delivery build.
+
+## Accepted limitations (also `TODO.md` #383)
+
+Out of scope **by design**, not by omission: user and system text (a client that puts tool output in a `user` message
+is unprotected — measured: a forged turn in a `user` message still returns `PWNED`), meaning-level injection (plain
+words inside the one real tool result are still obeyed), and USER_DEFINED strings in *assistant* text (a `<think>` or
+`<tool_response>` there can be a token the model really generated).  Not covered: the realtime endpoint
+(`server-realtime.cpp` builds its own chat session), a request that carries media (it keeps a string prompt for mtmd
+and takes the space fallback, so its tool data is broken with a space — now only when media is present), a non-BPE
+vocab (same fallback), and a single-character protected string (neither a mark nor a space can split it; no vocab in
+fleet has one — checked with `llama_vocab_get_attr`, Qwen3.8 0/33, Gemma4 0/24, a Llama-3 vocab 0/256).
+
+The cleaner design is parked in `TODO.md` #382: the renderer already carries
+`common_chat_prompt_part::is_input` ("from user input, special tokens inside must not be parsed") and nothing consumes
+it, so tokenizing the parts instead (with one tokenizer flag that skips USER_DEFINED matching too) would remove the
+marks, the second render and the space fallback, and would cover `user` / `system` as well.
+
+## The submitted patch (the reproduction)
+
+`0001-server-special-token-strings-in-tool-results-tool-ca.patch` (sha256 `c30f453d…f572fe`, cut against
+`v17-919794500-r353`, applied tree `13b9db143`) is the submission verbatim, kept as the reproduction of (1) and (2);
+`scripts/gate-tool-text.sh --build <a pre-fix binary>` is how to re-observe them, and `integration-fixes.patch`
+(sha256 `d77f6c55…39eb3`) is the delta the delivery carries on top of it.  The `upstream/tool-text/` form is the same
+commit cut against llama.cpp master `e6d624b9a` and has **not** been re-cut with the three fixes — re-cut it from the
+delivery form before filing it upstream.
+
+## The submitter's record (unchanged below)
+
 # wip/tool-text — special-token strings in tool results, tool-call arguments and assistant text stay text
 
 Written by Claude (AI).  One `git am` file made on `v17-919794500-r353` (tip `089f90067`, tree `27db9bfd4`); applied, the tree

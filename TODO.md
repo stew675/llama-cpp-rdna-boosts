@@ -97,10 +97,11 @@ delivery's host-expert tier, so it stays.
 | **381** | block 17's **gfx1100** arm was not run: `fingon` rebooted twice mid-build and then dropped off the network during the r356 session, so the cross-arch matrix is gfx1201 + gfx1151 only | validation / external (delivery) | **WAITING on `fingon`** -- when the box is back: pull `main`, apply the set in a worktree at `release.json.base`, build, then `./scripts/gate-tq.sh --build <dir> --tq2 ~/models/Llama3-8B-1.58/TQ2_0.gguf --tq1 ~/models/Llama3-8B-1.58/TQ1_0.gguf --dense <a 4B Q8_0> --dense-ref '' --device 0 --no-split --bench`.  gfx1100 has no RDNA4 int8-WMMA kernel, so `mma=0` there is by design (gfx1151 already covers that path: **305/305 and 84/84 exactly 0**); what gfx1100 adds is a second non-MMA arch on the neutrality and rate arms.  Note the two instrument traps the gfx1151 run found: the CPU-placement text arm is not an oracle, and `TQ_CENSUS` can print more than one line per device (both now handled by the gate); §381 |
 | **380** | block 17's `ggml/src/ggml-cuda/tq.cu` (689 lines of new CUDA) has **only ever been compiled by HIP/clang**: the contributor states it, the delivery's CI compiles nothing, and there is no NVIDIA device or CUDA toolkit on any box in this fleet — so the CUDA (nvcc) build of the ternary path, and its bit-identity there, are unverified | validation / external (delivery) | **WAITING on an NVIDIA box (or a CUDA toolkit)** -- compile `tq.cu` with nvcc (`-DGGML_CUDA=ON`, any recent CUDA), then `test-backend-ops -o MUL_MAT -p type_a=tq` and `-o GET_ROWS -p type=tq` with `LLAMA_TEST_OP_NMSE=1`: the `#pragma clang fp contract(off)` is clang-guarded and `TQ_FMUL`/`TQ_FADD` fall back to `__fmul_rn`/`__fadd_rn`, but nvcc's `-use_fast_math` flushes subnormals, so **all 305/84 values reading exactly 0 is the claim to test**, not the text.  A `MUL_MAT_ID` (TQ experts stay on the CPU backend by design) or a draft/MTP TQ arm would be the follow-up; §380 |
 | **379** | `ggml_cuda_try_fuse` still costs ~7 ms per `graph_compute` on the 27B (~890 calls) even with the GDN norm-gate fold switched OFF: *other* matchers count readers over the whole graph too, and every count is a full node walk | performance / host time (delivery) | **OPEN** -- take the reader counts ONCE per graph (a per-graph `count_uses` cache, or a single pass that fills every tensor's count) and let the matchers read it instead of walking. It is a matcher-design change, not a fold: it must keep every matcher's decision identical (the r355 instrument -- re-run the pre-change matcher at every accept site and compare -- is the cheap oracle), and it pays only where the node loop runs (`GGML_CUDA_DISABLE_GRAPHS=1`, prefill, verify, recapture). Left out of PR #361 for that reason; `archive/work/gdn-norm-gate-once/`, `INVARIANTS.md` r355 |
+| **382** | block 12's tool-text protection is a WORKAROUND for a missing piece: the renderer already carries `common_chat_prompt_part::is_input` ("from user input, special tokens inside must not be parsed") and nothing consumes it, so a tool result's special-token strings have to be marked and re-tokenized by hand | correctness / design (delivery) | **PARKED** -- the real fix is per-PART tokenization: one flag in `llama_vocab::tokenize`/`tokenizer_st_partition` meaning "no special-token matching at all" (today `parse_special=false` still matches USER_DEFINED ones), then tokenize `out_session.prompt().parts` with it on every `is_input` part.  That removes the marks, the second template render, the intactness heuristic and the space fallback, and covers `user`/`system` text too; take it at a re-base or when upstream offers a tokenizer-side switch -- `§382` |
 
 ## Handle numbering
 
-**New handles append after the highest issued so far, so the next free handle is `#382` (`#381` is block 17's owed gfx1100 arm, `#380` is block 17's unverified CUDA build, `#379` is the whole-graph reader-count cache the matchers still owe, `#378` the two-arm server's corruption under heavy load, `#377` the missing `gate-seqpar` prefill-logit base, `#376` the block-17 promotion-time fold, `#375` the cache-off page fault).  `#364`-`#372` and `#374` were issued for the block-17 follow-ups and **retracted (void) on 2026-11-23**; a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
+**New handles append after the highest issued so far, so the next free handle is `#384` (`#383` is the tool-text protection's role-scoped limitation, `#382` its parked redesign, `#381` is block 17's owed gfx1100 arm, `#380` is block 17's unverified CUDA build, `#379` is the whole-graph reader-count cache the matchers still owe, `#378` the two-arm server's corruption under heavy load, `#377` the missing `gate-seqpar` prefill-logit base, `#376` the block-17 promotion-time fold, `#375` the cache-off page fault).  `#364`-`#372` and `#374` were issued for the block-17 follow-ups and **retracted (void) on 2026-11-23**; a number is never reused.**  `#NN` is a permanent handle: a `WORKLOG.md` entry that cites `TODO #74` still means the same
 subject after that item has closed and left this file.  The recent ones, so the sequence is auditable:
 
 * **issued and retired the same day** (2026-11-16): `#337` — the attendance pool *does* engage on
@@ -358,6 +359,38 @@ The two-arm candidate is **not** blocked on this fix for testing (the fd work la
 on a 3-device tensor split and a big prefill).  It **is** a blocker for folding the pair into the delivery: a
 promotion that swallowed a lower block's bug would be the wrong shape.
 
+## 382. block 12's tool-text protection is a WORKAROUND — the renderer's `is_input` parts are the real lever
+
+**Status: PARKED** (r357, `ARCHIVE/work/tool-text/`, `INVARIANTS.md` r357, `MANIFESTS.md` gate 43).  The shipped block is
+correct and gated; this row is the *design* debt behind it, recorded so the next session does not re-derive it.
+
+The chat renderer already knows which span is data: `common/jinja` marks every interpolated value with `is_input`
+(`common/jinja/string.cpp`, propagated through `lower`/`replace`/… by `mark_input_based_on`, and documented in
+`common/chat.h` as *"from user input, special tokens inside must not be parsed"*).  `common_chat_prompt` carries it as
+`parts`, and **nothing consumes it for tokenization**: `oaicompat_chat_params_parse()` flattens the prompt with
+`prompt().str()` and `handle_completions_impl()` tokenizes that one string with `parse_special = true`.  That
+flattening is the defect; the block the delivery ships is a workaround for it (mark the strings with U+FDD0/U+FDD1
+before the template, then tokenize each marked string as ordinary text — see `patches/README.md` block 12).
+
+**The real fix is two small changes:**
+
+* a flag in `llama_vocab::tokenize` / `tokenizer_st_partition` meaning *no special-token matching at all*.  Today
+  `parse_special = false` skips only CONTROL / UNKNOWN and **still matches USER_DEFINED tokens** (Qwen's `<think>`,
+  `<tool_call>`, `<tool_response>`), which is why "just turn parse_special off" does not close the forgery
+  (`INVARIANTS.md` r357 item 1);
+* tokenize `out_session.prompt().parts` with that flag on every `is_input` part, ordinary parsing otherwise.
+
+**What that buys:** the marks, the second template render (the +1 ms per request `/apply-template` shows), the
+`tool_text_marks_intact()` heuristic and the whole space fallback disappear; a request carrying media and a non-BPE
+vocab stop needing a fallback at all; and `user` / `system` text is covered too, which the shipped block leaves
+forgeable **by design** (`#383`) — a forged turn in a `user` message still returns `PWNED` (measured).
+
+**Why it did not ship now:** it is a tokenizer-API change (a fourth `parse_special` state, or a new argument) touching
+`src/llama-vocab.cpp` and the one consumer, with a much wider blast radius than the block — every tokenization call
+site is in scope for review — and the maintainer's r357 call was to take the submission's shape into the delivery and
+park the redesign.  **Re-entry:** upstream offering a tokenizer-side "no special tokens" switch (then the block
+becomes a 20-line call-site change), or a session that is already touching `llama_vocab::tokenize`.
+
 ## Accepted limitations (deliberately not fixed — do not re-report)
 
 These are closed or accepted: no work is owed, and no row above tracks them (see *How this file is
@@ -535,3 +568,26 @@ oracle itself does not exist there.  Re-entry: a TQ MoE GGUF (then `MUL_MAT_ID` 
 `gate-tq.sh` oracle extended to the routed form), a TQ model with a draft head, or an ARM box whose
 `test-backend-ops` TQ run can be compared.  `scripts/gate-tq.sh` reports the first two as not covered rather than
 skipping them silently, and `patches/README.md` block 17 names all three.
+
+### #383 — the tool-text protection does not cover `user` / `system` text, meaning-level injection, or the realtime endpoint (r357)
+
+**Accepted limitation** (r357, contributor PR #360; block 12's r357 amendment).  The block protects **by message role**:
+`tool` / `function` content, an assistant's `tool_calls[].arguments`, and an assistant's own content/reasoning (the
+CONTROL / UNKNOWN strings only there).  User and system text is deliberately untouched, so a *client* that returns tool
+output in a `user` message — the text tool protocols, a late result, a sub-agent's summary, an environment dump — is
+unprotected: measured on the delivery build, a forged turn placed in a `user` message still returns `PWNED`
+(`archive/work/tool-text/README.md`).  Also not stopped: **meaning-level injection** (with the protection on, a forged
+"second tool result" becomes plain words inside the one real tool result and the model still follows them), and
+`server-realtime.cpp`, which builds its own chat session and never reaches `oaicompat_chat_params_parse()`.
+
+A **request that carries media** and a **non-BPE vocab** take the space fallback, which keeps the strings from becoming
+tokens by breaking them (`< |im_end|>` — the model reads a space the client did not send); that is a documented
+degradation, now scoped to requests that really carry media (`INVARIANTS.md` r357 item 4).  A single-character
+protected string is also unsplittable by either mechanism — no vocab in fleet has one (checked with
+`llama_vocab_get_attr`: Qwen3.8 0/33, Gemma4 0/24, a Llama-3 vocab 0/256).
+
+**Nothing is owed here**: the role-scoped rule is what the block claims, the gate asserts it, and the complete answer is
+the parked redesign (`#382`) — tokenizing the prompt's `is_input` parts — which covers `user`/`system` for free.  The
+re-entry for the *fallback* arms is a client-side escape on a media request, or a tokenizer-side switch; the re-entry for
+the realtime endpoint is that endpoint gaining a chat-template path of its own.  Record: `patches/README.md` block 12,
+`MANIFESTS.md` gate 43, `DIAGNOSTIC.md` §26, `archive/work/tool-text/`.

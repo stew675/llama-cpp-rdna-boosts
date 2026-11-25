@@ -5,6 +5,12 @@ Written by Claude (AI).  `UPSTREAM-PR-tool-text.patch` is cut against unadultera
 `wip/tool-text/` (the delivery form for `v17-919794500-r353`), which also cherry-picks onto this master without a conflict.
 Not part of any delivery block.
 
+> **The patch below is the SUBMITTED form and does not carry the three integration fixes the delivery's block 12
+> does** (the space fallback keyed on the request rather than the server capability, the mark strip armed with the
+> feature so the kill switch restores stock, and a detokenize-and-compare check on the piecewise re-tokenization).
+> See `archive/work/tool-text/README.md` for what each one is and `scripts/gate-tool-text.sh` for the arms that catch
+> them.  **Re-cut this form from the delivery's own change before filing it**, then re-run the Validation table.
+
 ## What it is
 
 The server renders the chat template and tokenizes the result as one string with `parse_special`.  Special-token strings

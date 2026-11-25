@@ -3308,3 +3308,46 @@ it removed an abort (r374-wip) -- so the per-shape rule above stands, now on the
    `defined(__clang__)`-guarded and `TQ_FMUL`/`TQ_FADD` fall back to `__fmul_rn`/`__fadd_rn`, and
    `-use_fast_math` flushes subnormals — so the claim to test on an NVIDIA box is the **NMSE column**, not the
    text, which will be coherent either way.
+
+## r357 — the server flattened what the renderer marks as INPUT, so a tool result's special-token strings became tokens (block 12 amendment, contributor PR #360)
+
+1. **`parse_special = false` does not stop a USER_DEFINED token, so "turn it off at the call site" is not a fix.**
+   `llama_vocab::impl::tokenizer_st_partition` skips only `CONTROL | UNKNOWN` when `parse_special` is false and
+   **still pre-tokenizes USER_DEFINED ones** (Qwen's `<think>`, `<tool_call>`, `<tool_response>`) — that is deliberate
+   (the HF regex-split behaviour).  A tool result's forgeable strings are therefore only closed by *preventing the
+   match*, never by disabling parsing: the shipped fix cuts each protected string after its first character and
+   tokenizes the pieces with `parse_special = false`.
+2. **The renderer already says which span is data and the server throws it away.**  `common/jinja` marks every
+   interpolated value `is_input` (`common/jinja/string.cpp`; propagated by `mark_input_based_on` through
+   `lower`/`replace`/`format`), `common_chat.h` documents it as *"from user input, special tokens inside must not be
+   parsed"*, and `common_chat_prompt` carries it as `parts` — **and no tokenizer call site reads it**:
+   `oaicompat_chat_params_parse()` flattens with `prompt().str()` and `handle_completions_impl()` tokenizes that one
+   string with `parse_special = true`.  That flattening is the defect; the mark scheme is the workaround (`TODO` #382).
+3. **A hand-rolled piecewise tokenization must be verified, not trusted.**  The fix re-derives
+   `llama_vocab::tokenize`'s BOS/EOS and per-fragment behaviour, and several pre-types change a fragment on the way in
+   (`metaspace_prepend_scheme "first"` prepends U+2581 to the *first* fragment of each call, so every piece would get
+   one; SOPRANO lower-cases and collapses whitespace; NEMOTRON_3_5_EMBD rewrites `[`+ZWNJ; MMBERT/GEMMA4 have their
+   own metaspace rules; `<mask>` carries LSTRIP).  `common/chat.cpp`'s `common_chat_input_tokenize()` is the house
+   pattern — tokenize, detokenize, compare, fall back — and the fix now does the same (`tool_text_tokenize_ok()`),
+   dropping to the space fallback on a mismatch.  Measured: the tokens detokenize to the prompt byte-for-byte on
+   Qwen3.8-27B, Gemma4-12B (GEMMA4 pre-type) and a Llama-3 vocab; a deliberate one-character change in the
+   re-tokenization reads `mode=space (the tokenizer changed the text)` and still protects.
+4. **A server-capability predicate is not a request predicate.**  Gating the space fallback on
+   `opt.allow_image/audio/video` (the mtmd *capability*) made **every vision-capable server** mutate the tool data the
+   model reads on a TEXT-ONLY request — measured on Qwen3.6-35B-A3B + mmproj: `22C and sunny.< /tool_response><
+   |im_end|>`, five inserted spaces.  It must key on the request's own media (`out_files.empty()`), which also means
+   the two mtmd routing sites (`handle_completions_impl` and `handle_count_tokens`) must accept the token array a
+   protected prompt becomes — `handle_completions_impl` picked `process_mtmd_prompt()` on `mctx != nullptr` alone and
+   required a string prompt; `/v1/chat/completions/input_tokens` then answered 373 tokens for the same request.
+5. **The forgery's *text* is not the signal; the prompt's special-token COUNT is.**  The same probe reads like a
+   normal answer on both arms (measured: with thinking disabled the OFF arm refused the injection with "I can't do
+   that." while the ON arm answered the weather question — behaviour is a model property, not a mechanism).
+   `LLAMA_SERVER_TOOL_TEXT_CENSUS=1` is the instrument: the clean conversation is 20, the protected probes are 20 (= the
+   same conversation without the forged text) and the unprotected arm is 25 (Qwen3.8-27B, `BOS`+turn boundaries plus
+   the forged `<|im_end|>`/`<|im_start|>`).  This is "throughput is not a correctness signal" in the security
+   direction, and it is why gate 43 exists (`scripts/gate-tool-text.sh`; the pre-fix build fails arms 4 and 7).
+6. **A protection marker a client can send must be stripped only while the protection is armed.**  Dropping
+   U+FDD0/U+FDD1 from every message unconditionally made `LLAMA_SERVER_TOOL_TEXT=0` *not* the previous behaviour
+   (stock keeps a 1654-byte prompt holding both noncharacters; the submission's OFF arm read 1652).  Arming the strip
+   with the feature makes the kill-switch arm byte-identical to stock on every probe, which is the only thing an A/B
+   can rest on.

@@ -1,0 +1,164 @@
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index fd33013e1..ac2c60fff 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -1610,11 +1610,9 @@ struct tool_text_count {
+     size_t replies = 0; // assistant messages whose text holds a control-token string
+ };
+ 
+-// drops any client copy of the marks from every message and tool, then treats the tool results and tool-call arguments
+-// (m: all protected strings) and the assistant text (mc: the control-token strings)
+-static tool_text_count tool_text_inputs(common_chat_templates_inputs & inputs, const tool_text_matcher & m,
+-                                        const tool_text_matcher & mc, const tool_text_mode mode) {
+-    tool_text_count c;
++// drops any client copy of the marks from every message and tool, so that a request cannot carry its own marks into the
++// region the template sees (called only while the protection is armed: the kill switch sends the request unchanged)
++static void tool_text_strip_inputs(common_chat_templates_inputs & inputs) {
+     for (auto & tool : inputs.tools) {
+         tool_text_strip(tool.name);
+         tool_text_strip(tool.description);
+@@ -1634,6 +1632,18 @@ static tool_text_count tool_text_inputs(common_chat_templates_inputs & inputs, c
+             tool_text_strip(tc.arguments);
+             tool_text_strip(tc.id);
+         }
++    }
++}
++
++// treats the tool results and tool-call arguments (m: all protected strings) and the assistant text (mc: the
++// control-token strings); strip drops a client's own copy of the marks first, so the count sees what the template sees
++static tool_text_count tool_text_inputs(common_chat_templates_inputs & inputs, const tool_text_matcher & m,
++                                        const tool_text_matcher & mc, const tool_text_mode mode, const bool strip) {
++    tool_text_count c;
++    if (strip) {
++        tool_text_strip_inputs(inputs);
++    }
++    for (auto & msg : inputs.messages) {
+         if (msg.role == "tool" || msg.role == "function") {
+             size_t k = tool_text_apply(msg.content, m, mode);
+             for (auto & part : msg.content_parts) {
+@@ -1711,6 +1721,22 @@ static void tool_text_tokenize_plain(const llama_vocab * vocab, const std::strin
+     out.insert(out.end(), t.begin(), t.end());
+ }
+ 
++// the marked prompt with the marks taken out: the text the piecewise tokenization below has to give back
++static std::string tool_text_unmark(const std::string & prompt) {
++    std::string out;
++    for (size_t i = 0; i < prompt.size();) {
++        if (prompt.compare(i, TOOL_TEXT_OPEN.size(), TOOL_TEXT_OPEN) == 0) {
++            const size_t b = i + TOOL_TEXT_OPEN.size();
++            const size_t e = prompt.find(TOOL_TEXT_CLOSE, b);
++            out.append(prompt, b, e - b);
++            i = e + TOOL_TEXT_CLOSE.size();
++            continue;
++        }
++        out += prompt[i++];
++    }
++    return out;
++}
++
+ // the marked prompt as common_tokenize(vocab, prompt, true, true) would tokenize it, except that each marked string is
+ // ordinary text (a byte-level BPE vocab: a piece adds no prefix, so the pieces decode to the same characters)
+ static llama_tokens tool_text_tokenize(const llama_vocab * vocab, const std::string & prompt, const tool_text_matcher & m) {
+@@ -1736,6 +1762,24 @@ static llama_tokens tool_text_tokenize(const llama_vocab * vocab, const std::str
+     return out;
+ }
+ 
++// whether the tokens give the prompt back as text.  tool_text_tokenize() re-derives llama_vocab::tokenize's BOS/EOS and
++// per-fragment behaviour, so a vocab whose pre-tokenizer adds a prefix, normalizes a fragment or strips one (a
++// metaspace_prepend_scheme "first", a SOPRANO / NEMOTRON_3_5_EMBD / MMBERT pre-type, a <mask> LSTRIP) can move the text
++// the model reads.  This is the check common_chat_input_tokenize() makes: on a mismatch the request keeps its strings
++// BROKEN (the space fallback) instead of taking a token array that does not decode to the prompt.
++static bool tool_text_tokenize_ok(const llama_vocab * vocab, const std::string & prompt, const llama_tokens & toks) {
++    size_t b = 0;
++    size_t e = toks.size();
++    if (llama_vocab_get_add_bos(vocab) && b < e && toks[b] == llama_vocab_bos(vocab)) {
++        ++b;
++    }
++    if (llama_vocab_get_add_eos(vocab) && b < e && toks[e - 1] == llama_vocab_eos(vocab)) {
++        --e;
++    }
++    const llama_tokens body(toks.begin() + b, toks.begin() + e);
++    return common_detokenize(vocab, body, true) == tool_text_unmark(prompt);
++}
++
+ // used by /chat/completions endpoint
+ json oaicompat_chat_params_parse(
+     const llama_vocab * vocab,
+@@ -1913,17 +1957,18 @@ json oaicompat_chat_params_parse(
+     static const bool tool_text_census = [] { const char * e = getenv("LLAMA_SERVER_TOOL_TEXT_CENSUS"); return e != nullptr && atoi(e) != 0; }();
+     const tool_text_matcher tt_match(opt.tool_text_protected);
+     const tool_text_matcher tt_control(opt.tool_text_control);
+-    const tool_text_count   tt_count = tool_text_inputs(inputs, tt_match, tt_control, TOOL_TEXT_COUNT);
+-    // the marks reach the tokenizer only with a text prompt and a byte-level BPE vocab (no prefix on a piece)
+-    const bool tt_marks = vocab != nullptr && llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_BPE &&
+-                          !opt.allow_image && !opt.allow_audio && !opt.allow_video;
++    const tool_text_count   tt_count = tool_text_inputs(inputs, tt_match, tt_control, TOOL_TEXT_COUNT, tool_text_on);
++    // the marks reach the tokenizer only with a byte-level BPE vocab (a piece adds no prefix) and a TEXT prompt: a request
++    // that carries media keeps its prompt a string for mtmd, so only that request takes the space fallback.  A
++    // vision-capable server reading a text-only request is not a multimodal prompt and must not have its tool data broken.
++    const bool tt_marks = vocab != nullptr && llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_BPE && out_files.empty();
+     const char * tt_mode = tt_count.strings == 0 ? "none" : !tool_text_on ? "off" : tt_marks ? "text" : "space";
+     common_chat_templates_inputs inputs_plain;
+     if (tt_count.strings > 0 && tool_text_on) {
+         if (tt_marks) {
+             inputs_plain = inputs; // for the fallback
+         }
+-        tool_text_inputs(inputs, tt_match, tt_control, tt_marks ? TOOL_TEXT_MARK : TOOL_TEXT_SPACE);
++        tool_text_inputs(inputs, tt_match, tt_control, tt_marks ? TOOL_TEXT_MARK : TOOL_TEXT_SPACE, true);
+     }
+ 
+     // Apply chat template to the list of messages
+@@ -1934,14 +1979,23 @@ json oaicompat_chat_params_parse(
+     std::string prompt = out_session.prompt().str();
+     if (tt_count.strings > 0 && tool_text_on && tt_marks) {
+         // the same request with the strings broken: the template's own special tokens, and the fallback
+-        tool_text_inputs(inputs_plain, tt_match, tt_control, TOOL_TEXT_SPACE);
++        tool_text_inputs(inputs_plain, tt_match, tt_control, TOOL_TEXT_SPACE, false);
+         common_chat_session session_space(opt.tmpls.get(), vocab, inputs_plain, session_params);
+         const std::string   prompt_space = session_space.prompt().str();
+-        if (tool_text_marks_intact(prompt, tt_match, prompt_space)) {
+-            llama_params["prompt"] = tool_text_tokenize(vocab, prompt, tt_match);
+-        } else {
++        llama_tokens        tt_toks;
++        if (!tool_text_marks_intact(prompt, tt_match, prompt_space)) {
+             // the template rewrote a mark (e.g. a tojson that escapes it): keep the strings broken instead
+-            tt_mode     = "space (the template changed the marks)";
++            tt_mode = "space (the template changed the marks)";
++        } else {
++            tt_toks = tool_text_tokenize(vocab, prompt, tt_match);
++            if (!tool_text_tokenize_ok(vocab, prompt, tt_toks)) {
++                tt_toks.clear();
++                tt_mode = "space (the tokenizer changed the text)";
++            }
++        }
++        if (!tt_toks.empty()) {
++            llama_params["prompt"] = std::move(tt_toks);
++        } else {
+             out_session = std::move(session_space);
+             prompt      = prompt_space;
+             llama_params["prompt"] = prompt;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a7ffe9cf1..0a030aa6f 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -6025,8 +6025,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+         // process prompt
+         std::vector<server_tokens> inputs;
+ 
+-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
++        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr && prompt.is_string()) {
+             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
++            // A chat prompt can also arrive as tokens (the tool-text protection of oaicompat_chat_params_parse): it carries
++            // no media, so it takes the generic path below instead of the mtmd one.
+             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
+         } else {
+             // Everything else, including multimodal completions.
+@@ -7967,7 +7969,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const s
+ 
+     // TODO @ngxson : refactor this code block, move this to server-common and reuse it in other places
+     size_t n_tokens;
+-    if (ctx_server.mctx != nullptr) {
++    if (ctx_server.mctx != nullptr && !json_is_array_of_numbers(prompt)) {
+         if (!prompt.is_string()) {
+             throw std::runtime_error("for mtmd, input prompt must be a string.");
+         }

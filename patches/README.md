@@ -4318,6 +4318,51 @@ cannot tell the two arms apart).  Record: `archive/work/qsa-topk-regular/`.
 
 ## Block 12 — campaign remainder
 
+> **r357 amendment (contributor PR #360, `@overdoingism`): the server keeps a tool result's special-token strings as
+> TEXT.**  A tool result (role `tool` / `function`), the arguments of an assistant's tool call and an assistant's own
+> content/reasoning are DATA — text that came from a file, a web page, a database row, or that the model copied out of
+> one.  The server rendered the chat template and tokenized the whole string with `parse_special`, so a `<|im_end|>` in
+> that data became the real token and could forge a turn, a tool call or a tool result.  `parse_special = false` would
+> not close it: `llama_vocab`'s `tokenizer_st_partition` still matches USER_DEFINED tokens (`<think>`, `<tool_call>`,
+> `<tool_response>`) when it is false.  The amendment lists the protected strings once at model load (every CONTROL /
+> UNKNOWN token's text, plus the USER_DEFINED ones the chat template itself uses — 33 for Qwen3.8, 256 for a Llama-3
+> vocab, 24 for Gemma4), wraps each occurrence in two noncharacter marks (U+FDD0 / U+FDD1) **before** the template is
+> applied — chosen by message ROLE, never by searching the rendered prompt, so a forged closing tag cannot end the
+> protected region — and then tokenizes the prompt as before EXCEPT that each marked string is ordinary text, cut after
+> its first character so no piece can hold a whole one.  Assistant content and reasoning take the CONTROL / UNKNOWN
+> strings only (a turn boundary; `--special` empties that list), and user / system text is not touched.  A request
+> without such strings is tokenized exactly as before (same text, same prompt token count, measured), and the strings
+> come from the vocab and the template at load, so nothing is set per model.
+>
+> **Three integration fixes against the submission**, each a class the gate now catches (`scripts/gate-tool-text.sh`,
+> `MANIFESTS.md` gate 43; the record is `archive/work/tool-text/`, and the submitted patch is kept there as the
+> reproduction — on it the gate reads 29 passed / 3 failed):
+>
+> 1. **the space fallback is per REQUEST, not per server** — it was gated on `opt.allow_image/audio/video`, the mmproj
+>    *capability*, so every vision-capable server mutated the tool data the model reads on a TEXT-ONLY request
+>    (`< /tool_response>`, five inserted spaces, measured on Qwen3.6-35B-A3B + mmproj).  It is now gated on the
+>    request's own media, and the two mtmd routing sites (`handle_completions_impl`, `handle_count_tokens`) accept the
+>    token array a protected prompt becomes; a text-only request on a vision server keeps the marks path and its tool
+>    data reaches the model byte-identical.
+> 2. **the kill switch restores the previous behaviour** — the submission stripped a client's own copy of the marks
+>    unconditionally, so `LLAMA_SERVER_TOOL_TEXT=0` still altered text holding U+FDD0/U+FDD1 (stock 1654 bytes, the
+>    submission's OFF arm 1652).  The strip is armed with the feature; the OFF arm's prompt is byte-identical to stock
+>    on every probe.
+> 3. **the piecewise re-tokenization is verified, not assumed** — `tool_text_tokenize_ok()`, the check
+>    `common_chat_input_tokenize()` makes: the tokens must detokenize to the marked prompt, and a vocab whose
+>    pre-tokenizer adds a prefix or normalizes a fragment (`metaspace_prepend_scheme "first"`, the SOPRANO /
+>    NEMOTRON_3_5_EMBD / MMBERT pre-types, a `<mask>` LSTRIP) falls back to the space mode instead of moving the text.
+>
+> **Not covered, by design** (`TODO` #383): user and system text (a client that returns tool output in a `user`
+> message is unprotected — measured: a forged turn there still returns `PWNED`), meaning-level injection, USER_DEFINED
+> strings in *assistant* text (a `<think>` there can be a token the model really generated), the realtime endpoint, a
+> request that carries media and a non-BPE vocab (the space fallback, which breaks the strings with a space).  Knobs:
+> `DIAGNOSTIC.md` §26 — `LLAMA_SERVER_TOOL_TEXT` (kill switch, default on) and `LLAMA_SERVER_TOOL_TEXT_CENSUS` (one
+> line per request).  The cleaner design — tokenize the prompt's `common_chat_prompt_part::is_input` parts instead,
+> with one tokenizer flag that skips USER_DEFINED matching too — is parked in `TODO` #382.  Server code only: no ggml,
+> kernel or backend file is touched, so every backend runs it.  It is a correctness/security change, **not** a
+> performance claim.
+
 > **r301: THE ADMISSION POLICY IS NO LONGER IN THIS BLOCK — it is block 16** (`TODO` #339; the maintainer
 > deferred the structure call to the r301 session, which chose a new official `0016` over a `03xx` because the
 > policy is settled and gated).  The note below is kept as the r300 record of **why** the policy exists; the code

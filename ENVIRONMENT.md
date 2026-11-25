@@ -731,6 +731,18 @@ is `patches/README.md` (block 17) and `GREEDY-PURITY.md` §109.  Gate `scripts/g
 
 ---
 
+## 26. The server's tool-text protection (block 12, r357)
+
+A tool result, a tool call's arguments or an assistant's text can carry a special-token string (`<|im_end|>`,
+`</tool_call>`); the server keeps it as TEXT instead of letting it become the real token in the rendered
+prompt.  The feature is **on with nothing set**, and it adds **no end-user variable**: both of its variables are
+diagnostics — a kill switch and a census line — so they live in `DIAGNOSTIC.md` §26.  Nothing is configured per
+model: the strings come from the vocab and the chat template at load.
+
+*The kill switch and the census for this section are in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §26.*
+
+---
+
 ## Maintaining this file
 
 The tables are derived from the code, so re-derive rather than trust them after a block change:

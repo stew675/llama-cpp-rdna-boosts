@@ -1,5 +1,16 @@
 # Open WIP campaigns (index)
 
+> **Promoted (r357, 2026-11-24):** `tool-text` became a **block-12 amendment** (`LLAMA_SERVER_TOOL_TEXT` kill switch,
+> default-on; the server keeps a tool result's, a tool call's arguments' and an assistant text's special-token
+> strings as TEXT).  It was submitted as `wip/tool-text/` by contributor PR #360 (`@overdoingism`) and never had a row
+> in this index; its record moved to [`../archive/work/tool-text/`](../archive/work/tool-text/README.md) with the
+> three integration fixes named there (the space fallback keyed on the request's media rather than the server's mmproj
+> capability, the mark strip armed with the feature so the kill switch restores stock, and a detokenize-and-compare
+> check on the piecewise re-tokenization), the submitted patch kept as the reproduction, and the measurements.
+> Gate: `scripts/gate-tool-text.sh` (`MANIFESTS.md` gate 43); knobs `DIAGNOSTIC.md` §26; the parked redesign (tokenize
+> the prompt's `is_input` parts instead of the mark scheme) is `TODO.md` #383.  It is not an open campaign and it is
+> not kept here as a stub.
+>
 > **Promoted (r356, 2026-11-24):** `tq-hip` became **official block 17** (`GGML_CUDA_TQ` kill switch, the ternary
 > types on the GPU, default-on).  Its record moved to [`../archive/work/tq-hip/`](../archive/work/tq-hip/README.md)
 > with the three integration changes named there (the unfused accumulation that restores the bit-identity the patch
