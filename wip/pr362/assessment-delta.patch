@@ -1,0 +1,131 @@
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index 280ebf762..656a0db34 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -1405,10 +1405,17 @@ static __global__ void flash_attn_tile(
+     constexpr bool kv_is_native  = kv_native_self != FATTN_KV_NATIVE_NONE;
+ 
+     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+-    const bool fold_gqa = kv_is_native && ncols2 > gqa_ratio;
+ 
+-    // A padded GQA launch uses ceil(gqa_ratio/ncols2) groups per KV head. In the initial
+-    // GQA-6 experiment ncols1 == 1, ncols2 == 8 and ncols2_eff == 6, so columns 6/7 are padded.
++    // The padded fold is ONE instantiation: the launcher's 8-column GQA-6 pin (Q8_0 native K/V).
++    // The tile launcher only ever picks ncols2 as a DIVISOR of gqa_ratio, so `ncols2 > gqa_ratio` is
++    // reachable through that pin alone -- but the mapping below also assumes a single query column
++    // per block (ncols1_eff = ncols/ncols2_eff == 1), so name the geometry instead of relying on it.
++    constexpr bool fold_geometry = ncols1 == 1 && ncols2 == 8 && kv_native_self == FATTN_KV_NATIVE_Q8_0;
++    const bool fold_gqa = fold_geometry && ncols2 > gqa_ratio;
++
++    // A padded GQA launch uses ceil(gqa_ratio/ncols2) groups per KV head. The GQA-6 pin gives
++    // ncols1 == 1, ncols2 == 8, ncols2_eff == 6, so columns 6/7 are padded and the whole KV head is
++    // traversed once (the r359 selection reads it three times, two heads at a time).
+     int sequence, head0, ncols2_eff, ncols1_eff, ncols_valid;
+     if (fold_gqa) {
+         const int iter_z_gqa = (gqa_ratio + ncols2 - 1) / ncols2;
+@@ -1416,7 +1423,7 @@ static __global__ void flash_attn_tile(
+         const int z_KV   = blockIdx.z / iter_z_gqa - sequence*ne12;
+         const int zt_gqa = blockIdx.z % iter_z_gqa;
+         ncols2_eff  = ncols2 > gqa_ratio ? gqa_ratio : ncols2;
+-        ncols1_eff  = ncols / ncols2_eff;
++        ncols1_eff  = ncols / ncols2_eff; // == 1 for the pin (dims: 8 padded columns, gqa_ratio 6)
+         ncols_valid = ncols1_eff * ncols2_eff;
+         head0       = z_KV*gqa_ratio + zt_gqa*ncols2;
+     } else {
+@@ -1993,18 +2000,36 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+     GGML_ABORT("fatal error");
+ }
+ 
+-// Experimental padded GQA-6 fold for the RDNA3 native-Q8_0 decode/verify band.
+-// Enabled by default so the same binary supports fold-on/fold-off A/B runs; set to 0 to
+-// retain r284's original ncols2 = 2 path. The launcher pins ncols1 = 1 for ncols2 = 8,
+-// which also keeps one reduction configuration for every query width from 1 through 8.
++// Padded GQA-6 fold for the RDNA3_0 native-Q8_0 decode/verify band -- OPT-IN, default OFF.
++// It replaces the tile launcher's three KV-head traversals per query row (ncols2 = 2 for a ratio of 6)
++// with one padded eight-column block (ncols1 = 1, ncols2 = 8; columns 6/7 carry zero Q and are never
++// stored).  It is NOT a padded-column bookkeeping change only: the pin moves cols_per_block, so
++// ntiles_z_gqa 3 -> 1 and the kernel's occupancy (max_blocks_per_sm 18 -> 6), and the launcher's split
++// search therefore picks a different parallel_blocks P (measured on gfx1100 at a 32K cache: 18 -> 6).
++// Block b owns KV iterations b, b+P, ... and the combine sums the P partials in block order, so P IS the
++// summation order -- greedy text moves at near-ties (GREEDY-PURITY.md 99, 104; the point reads mean KLD
++// 0.000001 / same-top-p 100.000 % at the decode width, so it is rounding-level, not approximate).
++// That is why the default is the r359 path -- GGML_HIP_FA_TILE_GQA6_FOLD=1 is the opt-in -- and why the
++// value is read once per process.
+ static inline bool ggml_cuda_fattn_tile_gqa6_fold_enabled() {
+     static const bool enabled = [] {
+         const char * env = getenv("GGML_HIP_FA_TILE_GQA6_FOLD");
+-        return env == nullptr || atoi(env) != 0;
++        return env != nullptr && atoi(env) != 0;
+     }();
+     return enabled;
+ }
+ 
++// One line at -lv 4 that proves the opt-in arm really launched (a numerics-changing opt-in whose arm
++// cannot be observed is not reviewable).
++static inline void ggml_cuda_fattn_tile_gqa6_fold_census(const int cc, const int gqa_ratio, const int n_q) {
++    static bool logged = false;
++    if (!logged) {
++        logged = true;
++        GGML_LOG_INFO("%s: padded GQA-6 tile fold ON (cc 0x%x, gqa_ratio %d, n_q %d, ncols1 1 / ncols2 8)\n",
++            __func__, cc, gqa_ratio, n_q);
++    }
++}
++
+ template <int DKQ, int DV, bool use_logit_softcap, ggml_type type_KV>
+ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * KQV  = dst;
+@@ -2037,10 +2062,13 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+     // into block 05), so RDNA2 takes the same ncols2 the rest of the archs do.
+ 
+     if constexpr (DKQ == 256 && DV == 256 && type_KV == GGML_TYPE_Q8_0) {
+-        const bool rdna3_target = device_cc == GGML_CUDA_CC_OFFSET_AMD + 0x1101 ||
+-                                  device_cc == GGML_CUDA_CC_OFFSET_AMD + 0x1102;
++        // RDNA3_0 (gfx1100/1101/1102/1103): the band kernel is RDNA4-only, so this is the only GQA-6
++        // fold those parts can reach.  RDNA3_5 and RDNA4 are deliberately not covered here -- the
++        // former is unmeasured, the latter already folds ratio 6 at head 256 in the band.
++        const bool rdna3_target = GGML_CUDA_CC_IS_RDNA3_0(device_cc);
+         if (rdna3_target && ggml_cuda_fattn_tile_gqa6_fold_enabled() && use_gqa_opt &&
+                 Q->ne[1] <= 8 && gqa_ratio == 6) {
++            ggml_cuda_fattn_tile_gqa6_fold_census(device_cc, gqa_ratio, Q->ne[1]);
+             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap, type_KV>(ctx, dst);
+             return;
+         }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8bab1a9d7..bcacbd6b6 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11549,6 +11549,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             }
+         }
+     }
++    // the 256-dim GQA-6 class: the tile kernel's padded fold (ggml_cuda_fattn_tile_gqa6_fold_enabled) pins
++    // ncols1 1 / ncols2 8 for a ratio of 6 at head 256 on RDNA3_0, so the geometry needs its own oracle --
++    // the prefill-shaped and band blocks above only reach ratios 4 and 12 at this head size.  Widths 9..16
++    // are the control: the fold is n_q <= 8, so those rows must read the r359 selection.
++    for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
++        for (int64_t nh : { 8, 4 }) {
++            for (int kv : { 512, 1024, 4096 }) {
++                for (int nb : { 1, 2, 4, 5, 8, 9, 16 }) {
++                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
++                                                                    type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, false, false, kv == 4096));
++                }
++            }
++            // a deep cache at the decode and verify widths: the fold's whole premise is the three KV-head
++            // traversals per query row, so the case that measures it is the long-KV one
++            for (int nb : { 1, 4, 8 }) {
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32,
++                                                                type_KV, type_KV));
++            }
++            // the production mask form: a dense qwen35 model takes the V3 derived mask (no mask tensor), and the
++            // fold rewrites the row index it derives from (jc/ncols2_eff), so the derived arm needs its own case
++            for (int kv : { 512, 4096 }) {
++                for (int nb : { 1, 8 }) {
++                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
++                                                                    type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, true));
++                }
++            }
++        }
++    }
+     // the band itself: a 32768-cell cache is past the auto gate's crossover for every ratio in the class, and bf16
+     // is the band's third native K/V type (`GGML_HIP_FA_BAND_WMMA_H128=0` runs these through the tile kernel)
+     for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
