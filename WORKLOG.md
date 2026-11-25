@@ -16,6 +16,37 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.009 (r362, release cut) -- tagged, pushed, the fork branch refreshed to the re-cut tip, the images building off-host, issue #368 answered with the instrument
+
+**The cut.**  `v18-919794500-r362` = fork re-cut tip `ca149fbe6`, base `919794500`, tree
+`45beb90c0ea0126d454753f4276bd06541934ba2`, 18 official + 1 temporary = 19 default blocks, 2 optional (`0100` tree
+`0a189a09b`, `0101` tree `1a0ee3d93`, cumulative `95d40ba7d`; both still apply STRICTLY on the new default tree).
+`scripts/validate-set.sh` green on the committed set, the rung reconciliation at `0 unexplained` with the two new
+env keys counted as additions, `check-shlib-symbols.sh` 16/16, `check-gen-docs.sh` ok, `check-gpu-faults.sh` clean,
+`gate-prefill-logits.sh` **0.000000 / 100.000 %**, `gate-host-expert-text.sh --quick` 2/2 identical.  The GitHub
+Release carries its 4 assets.
+
+**The fork.**  `scripts/fork-refresh.sh --build --gates --push` re-cut the branch deterministically, asserted the
+tree, built it, ran its gates and pushed:
+`gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` reads **`ca149fbe6c6c4e7321a55b44211c34c107db965e`**,
+which is what `release.json.tip` records.
+
+**The images.**  The worker (`radiance`) picked the tag up on its 17:10 poll (`new release v18-919794500-r362 (last
+built: v18-919794500-r361); building (attempt 1/3)`) and is building both ROCm lines off-host.  Still open by
+policy: `scripts/build-containers.sh --verify-only` must read all 23 tags resolving and every moving tag carrying
+this release before the release is finished (issue #364); at the time of writing it reads 15/23 with the versioned
+r362 tags missing, which is the correct reading for a tag the worker has just started on.
+
+**The issue.**  GitHub issue #368 answered (a comment, not a close): the geometry and the eviction pattern
+reproduce here but the bimodality does not (nine fresh starts, one state, one text), so the fix is the ring hole and
+the remaining ask is two `MOE_EXPERT_CACHE_TABLES=1` residency maps from the reporter's good and slow visits.  The
+issue stays open deliberately: we cannot claim to have fixed a flip we never reproduced.
+
+**One correction to record.**  A suspected PCIe bifurcation on this box is NOT what the numbers show: GPU0 is
+`0000:03:00.0` at `current_link_width` **16** (the x8 links here are `01:00.0`/`07:00.0`, neither of which is a
+R9700 in the HIP device order), so the r362 measurements above are x16 numbers.  The shape is re-measured on
+`radix` (single R9700, x16, 93 GiB) as the independent platform.
+
 ## 261125.008 (r362) -- the pool tier no longer pays the slab's ring hole out of the expert arena (GitHub issue #368), and a residency map that names which tables stand down
 
 **The report.**  GitHub issue #368 (`@DanoPTT`, 1 x R9700, Windows, ROCm 10.2, Flash-Next IQ3_XXS
