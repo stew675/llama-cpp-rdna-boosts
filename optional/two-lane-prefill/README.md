@@ -1,6 +1,11 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Optional block `0100`; verified on `r353`** (against the r353
+**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r356` and verified on `r353`.**
+r356 (18 official blocks `0000`-`0017` + temporary `0300`, default tree `2dbfffd60a5f7490a90498967d83ccbe8cb569e8`):
+applies strictly, sha256 `f706e2c353fd17b2c9767a2843389a2239a2e9fe1a0fd632a10bda8238194145` (the sha moved with
+the exported commit id; the diff is unchanged -- block 17 owns no file this artifact touches), trees
+`79a1fc9ef5275befcd254a3444d111536d9c4914` alone and `2f7f97dc919539992107a4926c8771974e9494c2` cumulative.
+The port verification and the numbers of record are the r353 run below, against the r353
 default delivery tree `27db9bfd4ef7f41c7df60f704410de28863beac3` = official blocks `0000`-`0016` plus the
 temporary `0300`; the r320 cut and its port verification are kept below; the r319 cut is at the bottom of the list, against the r319 default delivery tree
 `9f53a85322eb8c0327c350fca89fe5af76a30806`; the r318 cut is at the bottom of the list, against the r318 default delivery tree

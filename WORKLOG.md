@@ -117,8 +117,9 @@ over five interleaved rounds (r355 8262-8286, r356 8250-8287, arm spread ±190 t
   can reach it and no TQ model with an MTP head exists here: the arm would be vacuous by this repo's own rule
   (an arm that cannot reach the changed code measures nothing), and the honest instruments for "the default path
   did not move" are the neutrality text/rate arms, the `npl 1,4,8` row and the 0.000000 KLD point above.  The
-  **gfx1100 arm is owed**: `fingon` rebooted twice mid-build and then dropped off the network during this
-  session, so the gfx1100 row is not in this record (`TODO` #380 covers the CUDA build, not this).
+  **gfx1100 arm is owed** (`TODO` #381): `fingon` rebooted twice mid-build and then dropped off the network during
+  this session, so the gfx1100 row is not in this record.  gfx1100 has no RDNA4 WMMA kernel, so it takes exactly the
+  path gfx1151 already validated — but that is a reason to expect it to pass, not a substitute for running it.
 
 ### 6. What it leaves open
 
