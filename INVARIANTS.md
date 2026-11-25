@@ -3223,3 +3223,36 @@ it removed an abort (r374-wip) -- so the per-shape rule above stands, now on the
    memory generation, so a capture that baked a freed arena address is invalidated instead of replayed.  A
    *replay already dispatched* is the residual hazard, which is why the fence is the step boundary and not the
    barrier.
+
+## r355 (2026-11-24, `WORKLOG.md` 261124.011) — a fusion matcher can pay its whole-graph reader counts TWICE per layer, and on a graphs-off harness that is a decode tax (block 10, contributor PR #361)
+
+1. **The defect was the r353 fold's own, and it only showed on one configuration.**  `ggml_cuda_gdn_norm_gate_match()`
+   ends with three whole-graph reader counts — `ggml_cuda_count_uses()` for the `RMS_NORM` and for its `MUL`, and the
+   gate `MUL`'s inside `ggml_cuda_find_mul_q8_1_matmul()` — and after r353's SILU widening it ran on Qwen3.x, i.e. on
+   the delivery's own GDN families.  It ran **twice per GDN layer** (the skip at the norm, the gate node), the gate
+   then counted its `MUL` a third time: **seven graph walks per layer** against one for the unfused gate.  Measured on
+   the 10.2 build, 27B tg128, `GGML_CUDA_GCDBG=1`: `try_fuse` **1 323.3 ms** over 258 `graph_compute` =
+   **5.13 ms per call**.
+2. **Where the cost is paid decides whether you can see it.**  A captured, replayed graph pays **nothing** (the node
+   loop is not run), so with the default graphs on the fold costs a flat 0.00 t/s: 32.15 / 32.18 t/s and `pp512`
+   1447/1450 in both arms.  With `GGML_CUDA_DISABLE_GRAPHS=1` it is **31.13 -> 31.77 t/s (+2.1 %)** once the walks are
+   gone (`fuse` 752.4 ms, 2.91 ms per call).  That is the class issue #359 reported as −1.8 %: **the reporter's server
+   harness sets `GGML_CUDA_DISABLE_GRAPHS=1`**, so a "host-only, bit-identical, invisible" change was a real regression
+   on a documented configuration.  Rule: a host-time claim is per *serving mode* — replayed, direct and recaptured are
+   three different products, and a graphs-off arm is the only one that prices the matcher.
+3. **A matcher may not re-decide at a later node what an earlier node already decided, unless the invariant is stated
+   and tripwired.**  The skip records the gate index (`gdn_norm_gate_at`) and the gate node trusts it.  That is sound
+   only because the skip's own match proved the pending norm has **exactly one reader** (the gate's `MUL`), so no other
+   node in the graph can produce that decision; the dispatcher's existing `i < gate_at` guard keeps every other fusion
+   out of the window, so the graph cannot move underneath it.  Both conditions must be written down — the assert that
+   encodes them (`direct || nodes[s+2]` is the `RESHAPE` over the gate `MUL`) is the tripwire, and it has to run
+   **before** the pending state is cleared, or a broken invariant silently fuses the wrong matmul.
+4. **A peek past a node is a read, and the reshape branch is the live one.**  The submitted form derived the fused
+   matmul as `nodes[s + 2]->op == MUL_MAT ? nodes[s + 2] : nodes[s + 3]` — no bound on `s + 3`, assert after the read.
+   On every shape measured the gate `MUL` is followed by a no-op `RESHAPE` then the matmul (**7 354 of 7 354**
+   decisions took that branch, `direct=0`), so the unguarded read is the taken path.  Bound it.
+5. **The decision was verified by re-running the OLD matcher, not by arguing.**  An instrumented arm called the
+   pre-change `ggml_cuda_gdn_norm_gate_match()` at every gate node and compared `r`, the norm tensor and the matmul:
+   **7 354 decisions, 0 mismatches** across qwen35 dense (1 GPU and 3-GPU `-sm tensor`, graphs on and off), qwen35moe
+   and qwen4exp/Flash-Next.  For a "the same decision, cheaper" change this is cheaper than a KLD ladder and stronger
+   than text alone, and it is how the SIGMOID arm (which no gate here can build at full size) gets covered.

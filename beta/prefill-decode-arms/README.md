@@ -30,7 +30,7 @@ tested (its sha256 is unchanged through this split).
 | sha256 | `fd50d736e4ee959175d5f99f98afd3a8c0f9c219e47ad0c2da4f301d31030963` |
 | size | 4 files, **+97/−4** |
 | cut against | `release.json` base `919794500`, tree **`27db9bfd4ef7f41c7df60f704410de28863beac3`** |
-| **applied tree** | **`c0c261e45cd63fcb5d34cb34e4753d0a22603132`** (release tree + all three patches; verified below) |
+| **applied tree** | **`dc9c657e6e9d0cd3af485153e69a7cbfaf5ef941`** (release tree + all three patches; verified below) |
 | options | `--prefill-decode-arms` / `--no-prefill-decode-arms` (`LLAMA_ARG_PREFILL_DECODE_ARMS`), `--prefill-decode-arms-mode off\|on\|auto` (`LLAMA_ARG_PREFILL_DECODE_ARMS_MODE`) — **both default OFF** |
 | campaign record | `wip/prefill-decode-arms-v2/` (`DESIGN.md`, `RUNS.md`, `HANDOVER.md`, `gates/`, `baseline/`) |
 
@@ -40,16 +40,16 @@ tested (its sha256 is unchanged through this split).
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 919794500
 bash <delivery>/scripts/apply-all.sh --include-beta .
-#   18 delivery blocks (tip 089f90067, tree 27db9bfd4...), then 2 beta candidate patches:
+#   18 delivery blocks (tip 13df5e2c7, tree 4244d077e...), then 2 beta candidate patches:
 #     prefill-decode-arms.patch     (block 17, the two-arm server)
 #     state-split-2d-read.patch     (STEP 15, the 2-D read fix  -- delivery-level, dropped at promotion)
 #     two-arm-drop-boundary.patch   (STEP 16, the drop fence      -- delivery-level, dropped at promotion)
-#   applied tree: c0c261e45cd63fcb5d34cb34e4753d0a22603132
+#   applied tree: dc9c657e6e9d0cd3af485153e69a7cbfaf5ef941
 ```
 
-**Verified three ways on this box**, all reading tree **`29c9644350…`**: the tester path
+**Verified three ways on this box**, all reading tree **`dc9c657e6…`**: the tester path
 (`apply-all.sh --include-beta .` from `919794500`, which prints two applied patches and the tree); a `git am` of
-both files in filename order on a checkout already at `089f90067`; and the squashed tree the two patches were cut
+both files in filename order on a checkout already at `13df5e2c7`; and the squashed tree the two patches were cut
 from.  Patch 1 was cut from a canonical chain (`apply-all.sh` at `919794500`, then the campaign's `steps/` to
 STEP 14), patch 2 from one more `steps/` replay to STEP 15, with the generated docs regenerated — and the replayed
 trees equal the campaign's own trees exactly.

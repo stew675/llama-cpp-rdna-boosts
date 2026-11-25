@@ -27,11 +27,11 @@ git checkout 919794500
 bash "$DELIVERY/scripts/apply-all.sh" --include-beta .
 ```
 
-It must print `Applied tip: 089f90067 (...)`, then apply `beta/prefill-decode-arms/prefill-decode-arms.patch`, then:
+It must print `Applied tip: 13df5e2c7 (...)`, then apply `beta/prefill-decode-arms/prefill-decode-arms.patch`, then:
 
 ```
       release.json tree: 27db9bfd4ef7f41c7df60f704410de28863beac3
-      applied tree:      c0c261e45cd63fcb5d34cb34e4753d0a22603132   (THREE beta patches: block 17 + STEP 15 + STEP 16)
+      applied tree:      dc9c657e6e9d0cd3af485153e69a7cbfaf5ef941   (THREE beta patches: block 17 + STEP 15 + STEP 16)
 ```
 
 **If the applied tree is different, stop and report it** — do not proceed (the patch was cut against exactly that

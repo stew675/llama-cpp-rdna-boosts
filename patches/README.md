@@ -3363,6 +3363,23 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
   +1.1 / +0.1 / +0.05 %).  Gate: `scripts/gate-gdn-norm-gate.sh`; knobs: `ENVIRONMENT.md` §7.1.
   The `xn->ne[3] != 1` shape guard is unchanged, so a multi-sequence ubatch still never matches this fold
   (the r108 / `GREEDY-PURITY.md` §49 class); `tests/test-fusion-gate-beta-multiseq` re-run 77/77 after the change.
+* **The fold's gate node takes the skip's decision** (r355, contributor PR #361).  Widening the matcher at r353
+  made it run on Qwen3.x too, and it ends with three whole-graph reader counts (`ggml_cuda_count_uses` for the
+  `RMS_NORM`, for its `MUL`, and the gate `MUL`'s inside `ggml_cuda_find_mul_q8_1_matmul`) — and it ran **twice
+  per GDN layer**, at the norm (the skip) and again at the gate, which then counted the gate `MUL` once more:
+  **seven graph walks per GDN layer** wherever the node loop runs, against one for the unfused gate.  The gate
+  node now takes the skip's decision (`gdn_norm_gate_at`; the pending norm has exactly one reader, the gate's
+  `MUL`, so no other node can match it) and the three counts are one walk (`ggml_cuda_count_uses3`, with an
+  already-counted value passed to `ggml_cuda_find_mul_q8_1_matmul` through a defaulted parameter).  Bit-identical
+  — same kernels, launch for launch: census unchanged (`silu=96`/`528` on the 27B, OFF `declined=528`; 35B-A3B
+  `60`/`300`), text identical on 1 GPU (graphs on and off), 3-GPU `-sm tensor` (both), 35B-A3B and a two-slot
+  `--kv-unified` server, prefill-logit `--ab` at `--ub 1`/`--ub 4` −0.000000 / 100.000 %, and a re-run of the
+  PRE-change matcher at every gate node (7 354 decisions, 0 mismatches, qwen35 / qwen35moe / qwen4exp).
+  Worth **+2.1 %** graphs-off tg128 on the 27B (`fuse` 5.13 -> 2.91 ms per `graph_compute`, 1323 -> 752 ms over
+  the same 234 158 calls); **flat with graphs on**, which is the default, because a replayed graph pays no host
+  time — this is the cost #359's reporter measured as −1.8 % in a graphs-off harness, and the r353 fold's own
+  defect, not a new feature.  Gate: `scripts/gate-gdn-norm-gate.sh` (+ `gate-lora-fusion.sh`, whose counted
+  reader is the one this shortcut relies on); record: `archive/work/gdn-norm-gate-once/`.
 * **Async graph-input ring**: batched uploads + lazy done event (PR #182), and the r90 fix that snapshots
   the source through the pinned ring — the scheduler uses `set_tensor_async` for a *CPU split's* output,
   which the next ubatch rewrites, so a direct copy from the caller's live pointer could read the next

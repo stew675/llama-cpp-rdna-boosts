@@ -1,4 +1,4 @@
-From 712e094c64de95b6df308b726f9ed7cd7368ed31 Mon Sep 17 00:00:00 2001
+From 704e76f3a054ea5c7b4202cb1a1de109719c5ea0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/17] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -188,7 +188,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |  283 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |   27 +
  ggml/src/ggml-cuda/ggml-cuda-slab.cu          | 1867 +++++
- ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 3504 +++++++++
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 3542 +++++++++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cuh     |   43 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   60 +
  ggml/src/ggml-cuda/ggml-cuda.cu               | 6408 ++++++-----------
@@ -239,7 +239,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  tests/test-fusion-gate-beta-multiseq.cpp      |  321 +
  tests/test-logits-width-probe.cpp             |  234 +-
  tools/server/server-context.cpp               |   30 +-
- 87 files changed, 18039 insertions(+), 5671 deletions(-)
+ 87 files changed, 18077 insertions(+), 5671 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -7925,10 +7925,10 @@ index 000000000..5b72804a3
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
 new file mode 100644
-index 000000000..d581c99a1
+index 000000000..20e7052d2
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
-@@ -0,0 +1,3504 @@
+@@ -0,0 +1,3542 @@
 +// CUDA graph fusion dispatcher: the delivery's matchers and the one-line-per-concern try-fuse
 +// arms.  Split out of ggml-cuda.cu so an upstream change to the shared graph/evaluate path
 +// collides with the single ggml_cuda_try_fuse() call, not with every arm body.
@@ -8184,8 +8184,9 @@ index 000000000..d581c99a1
 +
 +// If the MUL output feeds a single mmvq matmul (directly or via a no-op
 +// reshape at the next node), return that matmul; otherwise return nullptr.
++// uses_known >= 0: ggml_cuda_count_uses(cgraph, mul), already counted by the caller.
 +static const ggml_tensor * ggml_cuda_find_mul_q8_1_matmul(const ggml_cgraph * cgraph,
-+                                                          int mul_idx, const ggml_tensor * mul) {
++                                                          int mul_idx, const ggml_tensor * mul, int uses_known = -1) {
 +    const int n = cgraph->n_nodes;
 +    const ggml_tensor * n1 = (mul_idx + 1 < n) ? cgraph->nodes[mul_idx + 1] : nullptr;
 +    if (n1 == nullptr) {
@@ -8209,7 +8210,7 @@ index 000000000..d581c99a1
 +    // A LoRA-free graph reads exactly `want` (it did before this check: the reshape counts directly and the matmul
 +    // through it), so the fusion still fires there.
 +    const int want = n1 == mm ? 1 : 2;
-+    const int uses = ggml_cuda_count_uses(cgraph, mul);
++    const int uses = uses_known >= 0 ? uses_known : ggml_cuda_count_uses(cgraph, mul);
 +    if (uses != want) {
 +        mul_q8_1_trace_decline(mul, uses, want);
 +        return nullptr;
@@ -9808,6 +9809,26 @@ index 000000000..d581c99a1
 +    return uses;
 +}
 +
++// ggml_cuda_count_uses for three tensors in one walk of the graph: uses[k] is what ggml_cuda_count_uses(cgraph, t[k])
++// returns.  Each walk visits every source of every node, so a matcher that needs several counts pays once.
++static void ggml_cuda_count_uses3(const ggml_cgraph * cgraph, const ggml_tensor * const t[3], int uses[3]) {
++    uses[0] = uses[1] = uses[2] = 0;
++    for (int j = 0; j < cgraph->n_nodes; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        for (int s = 0; s < GGML_MAX_SRC; ++s) {
++            const ggml_tensor * src = n->src[s];
++            if (src == nullptr) {
++                continue;
++            }
++            for (int k = 0; k < 3; ++k) {
++                if (src == t[k] || src->view_src == t[k]) {
++                    uses[k]++;
++                }
++            }
++        }
++    }
++}
++
 +// CONT(view) -> UNARY -> MUL -> decode matmul (the qwen4exp attention output gate: the gate half of each Q head):
 +// the gate -> Q8_1 kernel reads the row-strided view itself, so the CONT launches nothing.  The CONT is an exact
 +// copy, so the result is bit-identical.  GGML_CUDA_FUSE_CONT_GATE_Q8_1=0: off.  Returns the extra nodes consumed.
@@ -9893,8 +9914,7 @@ index 000000000..d581c99a1
 +            nm->type != GGML_TYPE_F32 || !w || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != 128 ||
 +            ggml_nelements(w) != 128 || !xn || xn->type != GGML_TYPE_F32 || xn->ne[0] != 128 || xn->nb[0] != sizeof(float) ||
 +            xn->ne[3] != 1 || !ggml_are_same_shape(rn, nm) || !ggml_are_same_shape(nm, z) || !ggml_is_contiguous(nm) ||
-+            !ggml_is_contiguous(z) || ggml_nelements(mul) % 256 != 0 || ggml_nelements(mul) != ggml_nelements(z) ||
-+            ggml_cuda_count_uses(cgraph, rn) != 1 || ggml_cuda_count_uses(cgraph, nm) != 1) {
++            !ggml_is_contiguous(z) || ggml_nelements(mul) % 256 != 0 || ggml_nelements(mul) != ggml_nelements(z)) {
 +        return -1;
 +    }
 +    // nothing between the norm and the gate writes over its input or weight
@@ -9911,7 +9931,15 @@ index 000000000..d581c99a1
 +            return -1;
 +        }
 +    }
-+    if (ggml_cuda_find_mul_q8_1_matmul(cgraph, s + 1, mul) == nullptr) {
++    // The norm, its MUL and the gate MUL each need a reader count over the whole graph: one walk for the three
++    // (the counts and the decision are the same as three separate ggml_cuda_count_uses calls).
++    const ggml_tensor * const counted[3] = { rn, nm, mul };
++    int uses[3];
++    ggml_cuda_count_uses3(cgraph, counted, uses);
++    if (uses[0] != 1 || uses[1] != 1) {
++        return -1;
++    }
++    if (ggml_cuda_find_mul_q8_1_matmul(cgraph, s + 1, mul, uses[2]) == nullptr) {
 +        return -1;
 +    }
 +    return m - 1;
@@ -9939,21 +9967,31 @@ index 000000000..d581c99a1
 +}
 +
 +// At the gate: the skipped norm computed by the gate -> Q8_1 kernel.  Returns the extra nodes consumed.
++// The skip already matched this gate to the pending norm on this graph (ggml_cuda_gdn_norm_gate_skip records the gate
++// node), so the decision is taken from there instead of being matched again: the match walks the whole graph for its
++// reader counts, and repeating it at every gate cost a decode step one graph walk per GDN layer per count whenever the
++// node loop runs (no graph replay).  It is the same decision -- the pending norm has one reader, the gate's MUL, so
++// no other node can match it -- and the same kernel, norm (the MUL's RMS_NORM source) and matmul.
 +static int ggml_cuda_gdn_norm_gate_try_fuse(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int s) {
 +    const ggml_tensor * un = cgraph->nodes[s];
-+    if (cuda_ctx->gdn_norm_pending == nullptr || un->op != GGML_OP_UNARY) {
++    if (cuda_ctx->gdn_norm_pending == nullptr || un->op != GGML_OP_UNARY || s != cuda_ctx->gdn_norm_gate_at) {
 +        return 0;
 +    }
-+    const int r = ggml_cuda_gdn_norm_gate_match(cgraph, s, ggml_cuda_gdn_norm_gate_silu_on());
-+    if (r < 0 || cgraph->nodes[r + 1] != cuda_ctx->gdn_norm_pending) {
-+        return 0;
-+    }
++    const ggml_tensor * rn  = cuda_ctx->gdn_norm_pending->src[0];
++    ggml_tensor *       mul = cgraph->nodes[s + 1];
++    // The matmul the skip's match accepted (ggml_cuda_find_mul_q8_1_matmul): the next node, or the one after the
++    // MUL's no-op reshape.  Derived and asserted BEFORE the pending state is cleared, and bounds-checked: the peek
++    // must never read past the graph, and a mismatch must trip the assert rather than fuse a wrong matmul.
++    const int  n      = cgraph->n_nodes;
++    const bool direct = s + 2 < n && cgraph->nodes[s + 2]->op == GGML_OP_MUL_MAT;
++    const ggml_tensor * mm = direct ? cgraph->nodes[s + 2] : (s + 3 < n ? cgraph->nodes[s + 3] : nullptr);
++    GGML_ASSERT(mm != nullptr && mm->op == GGML_OP_MUL_MAT && rn->op == GGML_OP_RMS_NORM &&
++                (direct || (s + 2 < n && cgraph->nodes[s + 2]->op == GGML_OP_RESHAPE &&
++                            cgraph->nodes[s + 2]->src[0] == mul)));
 +    cuda_ctx->gdn_norm_pending = nullptr;
 +    cuda_ctx->gdn_norm_gate_at = -1;
 +    cuda_ctx->gdn_norm_gate_census[ggml_get_unary_op(un) == GGML_UNARY_OP_SILU ? 1 : 0]++;
-+    ggml_tensor * mul = cgraph->nodes[s + 1];
-+    const ggml_tensor * mm = ggml_cuda_find_mul_q8_1_matmul(cgraph, s + 1, mul);
-+    ggml_cuda_op_unary_mul_q8_1(*cuda_ctx, cgraph->nodes[s], mul, mm, nullptr, cgraph->nodes[r]);
++    ggml_cuda_op_unary_mul_q8_1(*cuda_ctx, cgraph->nodes[s], mul, mm, nullptr, rn);
 +    return cgraph->nodes[s + 2] == mm ? 1 : 2;
 +}
 +

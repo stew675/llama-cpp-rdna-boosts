@@ -41,8 +41,9 @@ move happens with a "refuted" status.  A finished candidate leaves `beta/`; no s
   artifact in its entirety** (the maintainer's decision of 2026-11-24 — the old design's second context that
   *viewed* and *co-owned* the first's memory, and the recurrent state copied between two modules, are gone at
   the root); on promotion it is **delivery block 17 as ONE self-contained patch**, a modification to the
-  lower-numbered blocks.  Applied on the r353 default tree (`27db9bfd4`) it produces tree
-  **`29c9644350`**.  Files: [`prefill-decode-arms/README.md`](prefill-decode-arms/README.md) (what it is, the
+  lower-numbered blocks.  Applied on the **r355** default tree (`4244d077e`) it produces tree
+  **`dc9c657e60`** (no re-cut was needed: the patch files are unchanged, and every produced tree moved with
+  the default tree).  Files: [`prefill-decode-arms/README.md`](prefill-decode-arms/README.md) (what it is, the
   measured numbers, the residuals, the shapes it refuses),
   [`prefill-decode-arms/BETA-TESTING.md`](prefill-decode-arms/BETA-TESTING.md) (the apply, build and arm ladder)
   and [`prefill-decode-arms/prefill-decode-arms.patch`](prefill-decode-arms/prefill-decode-arms.patch)

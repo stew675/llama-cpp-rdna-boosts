@@ -1,3 +1,105 @@
+## 261124.011 (release `v17-919794500-r355`, contributed PR #361 promoted into block 10) -- the GDN norm-gate fold matches once per GDN layer: +2.1 % graphs-off decode, the default path flat, bit-identically
+
+`v17-919794500-r355`: contributor PR #361 (`overdoingism`, submitted as `wip/gdn-norm-gate-once/`) short-circuits
+block 10's **GDN output-norm fold**, which r353's SILU widening (PR #357) had made run on the delivery's own GDN
+families.  The matcher ends with three whole-graph reader counts and ran **twice per GDN layer** — at the norm (the
+skip) and at the gate, which then counted its `MUL` once more: **seven graph walks per layer** against one for the
+unfused gate, on every `graph_compute` that runs the node loop.  The gate node now takes the skip's decision and the
+three counts are **one** walk.  **Fold-in, not a new block**: block 10 owns this fold and introduced the cost, so the
+maintainer's decision (this session) is an amendment to block 10, default-on, precedence r353/#357.
+`n_blocks` 17 / `n_default` 18, base `919794500`, **tip `13df5e2c7` / tree `4244d077e`**.
+
+### 1. What it is, and what it is not
+
+* **It is r353's own defect, not a new feature.**  r353 shipped the SILU widening as "+0.15-0.5 % decode" and that
+  holds with graphs on — but the fold also *cost* **2.1 %** of decode wherever the node loop runs untraced, i.e. with
+  **`GGML_CUDA_DISABLE_GRAPHS=1`**, a documented configuration (issue #359's reporter runs it).  After this change the
+  fold is non-regressive in both serving modes, which is what the default-on policy asks for.
+* **The submitted text's one wrong claim, corrected here.**  The PR body said the change "does not explain #359"; the
+  reporter then found their harness sets `GGML_CUDA_DISABLE_GRAPHS=1`, and r353 + this change reads **+0.4 %** against
+  r345 where r353 alone read **−1.8 %**.  The shipped commit message does not carry the superseded sentence (block
+  10's commit was amended, so its text is ours), and the attribution is recorded in `INVARIANTS.md` r355 item 2.
+* **No switch of its own** (host-side, bit-identical, same kernels launch for launch); `GGML_CUDA_FUSE_GDN_NORM_GATE_SILU`
+  and `GGML_CUDA_FUSE_GDN_NORM_GATE_CENSUS` behave exactly as they did, and no CLI option changed (`check-gen-docs` ok).
+
+### 2. The reviewer's two amendments to the submitted form (both made before the cut)
+
+* **Bounds-checked, and derived before the state is cleared.**  The submitted
+  `nodes[s + 2]->op == MUL_MAT ? nodes[s + 2] : nodes[s + 3]` read `nodes[s + 3]` unbounded and asserted *after* the
+  read; the reshape branch is the live one (**7 354 of 7 354** decisions), not a theoretical path.  `s + 2 < n` /
+  `s + 3 < n` now guard it, and the assert — extended to the relation it relies on (`direct || nodes[s + 2]` is the
+  `RESHAPE` over the gate `MUL`) — runs **before** `gdn_norm_pending` / `gdn_norm_gate_at` are cleared, so a broken
+  invariant trips a tripwire instead of fusing a wrong matmul.
+* **The decision was verified by re-running the OLD matcher, not by argument.**  A temporary instrumented arm called
+  the pre-change `ggml_cuda_gdn_norm_gate_match()` at every gate node and compared the norm, the matmul and the accept:
+  **7 354 decisions, 0 mismatches** across qwen35 dense (1 GPU and 3-GPU `-sm tensor`, graphs on and off), qwen35moe
+  and **qwen4exp/Flash-Next** — the SIGMOID arm the contributor could not test, and one no gate here can build whole.
+
+### 3. Gates that ran on the final build (`13df5e2c7`, ROCm **10.2**, one GPU job at a time)
+
+| gate | result |
+|---|---|
+| `scripts/gate-gdn-norm-gate.sh --kld` (MANIFESTS 41) | **PASS**: census 27B `fused sigmoid=0 silu=96` at `-ub 1` / `528` at `-ub 8`, OFF `declined silu=528`; 35B-A3B `60` / `300` / `300`; text 27B `b9f729ecc723`, 35B-A3B `22bfcf93c0ab`, identical ON/OFF at `-ub 2/4/8/512` **and identical to the r354 build**; `--kld` arms **−0.000000 / 100.000 %** at `--ub 1` and `--ub 4`; GPU faults clean |
+| `gate-prefill-logits.sh` (canonical point, recorded 10.2 base) | **PASS** 0.000000 / 100.000 % |
+| `gate-lora-fusion.sh` (the counted reader this shortcut relies on) | **PASS**: A `faad90258a16`, B `fe967e92321a`, C moves the text, D `declines: LoRA=2 no-LoRA=0`, E prefill `942ef687096b` |
+| text, 1 GPU, **graphs off** and graphs on | `b9f729ecc723` in all four arms (r354 == r355) |
+| text, 3-GPU `-sm tensor -mg 0`, graphs off and on | `b9f729ecc723` in all four arms |
+| text, 35B-A3B 1 GPU | `22bfcf93c0ab` (both builds) |
+| two-slot `--kv-unified` server, two concurrent greedy completions | `02f198e3371b` / `046a29552cce`, identical on both builds |
+| **MTP four-axis protocol** (`-n 3000`, 27B UD-Q4_K_XL, 1 GPU `-sm layer`, bf16 KV, adaptive ceiling 7) | `none` == `draft-mtp-adaptive` byte-identical on all four axes, and **every text identical to the r352/r353 record**: R `11777 988e30dfb6cc` (acc 0.53656 — the recorded cell exactly, 30.9 -> 54.2 t/s), K `2174 a87c4318b649` (0.99286, 31.1 -> 102.9), P `6789 4172642d7dc2` (0.66284, 30.5 -> 73.0), C `13219 930756b488ff` (0.68981, 30.9 -> 83.1).  **Read the acceptance column as this build's, not as a reproduction**: R matches the recorded r353 cell exactly (0.53656), K is 0.00086 off (0.99286 vs 0.99200) and P/C read lower here (0.66284 / 0.68981 against 0.80437 / 0.86819) on **byte-identical text** -- so it is the drafter's policy cell, not the verify numerics this gate exists to watch (a collapse reads 0.000), and the purity/purity-by-hash claims above are unaffected.  The arm is deterministic (P re-run reads 0.66284 again) and the flags are the protocol's (`--spec-type draft-mtp-adaptive --spec-draft-n-max 7`); whichever drafter knob the earlier cell used is not recorded, so it is not claimed as reproduced |
+| `llama-batched-bench -npl 1,4,8` (35B-A3B Q8_0, 3 GPU tensor, 2 interleaved rounds) | TG **474.78 / 1200.21 / 1670.95 -> 475.76 / 1204.34 / 1673.52** t/s (+0.2 / +0.3 / +0.2 %, noise); pp512 flat |
+| `tests/test-fusion-gate-beta-multiseq` | 77/77, 0 failed |
+| `scripts/check-shlib-symbols.sh` | 16/16 libraries resolve |
+| `scripts/check-gen-docs.sh` (on the release tree) | ok |
+| `scripts/check-windows-portability.sh`, header closure, file-set reconciliation | via `validate-set.sh`: 515 files, 530 files, blocks 20 -> 20 / files 571 -> 571 / defines 172 -> 172 / envs 577 -> 577 / options 14 -> 14, **0 unexplained** |
+| whole-set build (`all`, ROCm 10.2) | OK |
+| `scripts/validate-set.sh` | **GREEN** (18/18 strict, tree `4244d077e`, both optionals alone `44a2de757` / `1018f175b` + cumulative `cdeae8f29`) |
+| `scripts/check-gpu-faults.sh --since` (this session's window) | clean (the box's earlier page faults are 06:58-12:24, the `prefill-decode-arms` v2 campaign's) |
+
+**Performance, measured on the two arms this change is about** (`GGML_CUDA_GCDBG=1`, 27B tg128, graphs off):
+`fuse` **1323.3 -> 752.4 ms** over the same 234 158 `try_fuse` calls (258 `graph_compute`) = **5.13 -> 2.91 ms**, and
+decode **31.13 -> 31.77 t/s (+2.1 %)**.  With graphs on (the default) decode is 32.15 / 32.18 t/s and `pp512`
+1447 / 1450 — flat, because a replayed graph runs no node loop.  The contributor's Windows arm reads the same shape
+(26.9 -> 28.2 t/s) at a slower CPU's per-call cost.
+
+Not run, and why: `gate-spec-purity.sh` (the change touches no FA tile launcher, KV extent or speculator, and the
+four-axis protocol is the arm that dimensions the verify batch); RDNA3 / NVIDIA / Windows (no runner here — the
+contributor's own gap, and the change is host code with no backend predicate); the contributor's HIP-10.2-runtime
+hybrid (this box runs the 10.2 compiler **and** runtime).
+
+### 4. Mechanics of the cut (a block amendment, and what it moved)
+
+* block 10's commit was amended on the canonical chain (base `919794500`, `scratch` in `~/llama-scratch`); blocks 11-16
+  and `0300` were replayed onto it unchanged, and the only content movement outside block 10 is the **hunk line
+  offsets** in blocks 11 and 12, which also touch `ggml-cuda-try-fuse.cu`.
+* `.tip` is **`13df5e2c7`** — the value a fresh `apply-all.sh` prints on a clean checkout at `919794500` (verified on a
+  local clone; the amended *working* chain tip `5a7f5770c` has the same tree and is not recorded, per the `.tip` rule).
+* the two **optional** artifacts needed no re-cut (their files are untouched, sha256 unchanged) but their **produced
+  trees moved with the default tree**: `0100` -> `44a2de757`, `0101` -> `1018f175b`, cumulative `cdeae8f29`; both
+  re-verified strictly by `validate-set.sh` check 8.  `beta/prefill-decode-arms/` still applies strictly
+  (default tree + beta -> `dc9c657e6`).
+* the campaign's record is `archive/work/gdn-norm-gate-once/` (the contributor's description, the reviewer's
+  amendments, this box's verification) and `TODO` **#379** records the larger idea the PR left out (reader counts once
+  per graph, for the *other* matchers).
+
+### 5. Release completed
+
+`v17-919794500-r355` is committed and pushed to `git@github.com:stew675/llama-cpp-rdna-boosts.git` (`main` + the
+annotated tag), and the personal fork's `rdna-boosts` branch was re-cut and force-pushed by
+`scripts/fork-refresh.sh --build --gates --push --yes`: **`089f90067...13df5e2c7`**, applied tree `4244d077e` ==
+`release.json.tree`, 18 default commits, base `919794500`.  `gh api repos/stew675/llama.cpp/branches/rdna-boosts
+--jq .commit.sha` reads `13df5e2c7f85c5ea3b0ead31d746204e2451bc68` (the freshness read; the branch's newest commit
+stays dated 2026-10-25 by design — the committer date is stamped from the author date).  `fork-refresh --gates`
+re-ran the shared-library check (16/16), the coherence arm (Qwen3.5-4B Q8_0, 3-GPU `-sm tensor`, `111 7e6229b260f6`
+— identical to the r354 binary) and the canonical prefill-logit point (0.000000 / 100.000 % against the recorded
+10.2 base).  The release container images are the off-host worker's job (`scripts/container-watch.sh` on
+`radiance`, `--rocm "7.14.1 10.2" --push --prune`); nothing was built here.
+
+Issue **#359** is closed by this release: its report is exactly the host cost this block amendment removes
+(the reporter's harness sets `GGML_CUDA_DISABLE_GRAPHS=1`, and r353 + this change reads +0.4 % against r345 where
+r353 alone read −1.8 %).  The contributor's PR #361 is recorded there as promoted, with the two reviewer
+amendments and the corrected #359 attribution.
+
 ## 261124.010 (release `v17-919794500-r354`) -- the `prefill-decode-arms` v2 campaign lands on `main` as a BETA artifact: same delivery bytes, a three-patch candidate, and a known open corruption
 
 Merge of the campaign branch (`prefill-decode-arms-v2`, 40 commits) into `main` as a `--no-ff` landing commit.  **No
