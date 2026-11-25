@@ -28,15 +28,20 @@
 #            `-o GET_ROWS -p type=tq` 16/16, and with LLAMA_TEST_OP_NMSE=1 **every** reported error is exactly 0
 #            (305 MUL_MAT values, 84 GET_ROWS values here).  A failure is diagnosed: when every k=256 case is 0
 #            and every k>256 case is nonzero, the accumulation has been fused again (`fmaf` in tq.cu).
-#   HARD  2. the text: the default, `GGML_CUDA_TQ_FUSE=0` (the decode fusions and the graph_optimize reorder
-#            off) and `GGML_CUDA_TQ=0` (the CPU backend runs the matmuls, i.e. the pre-block behaviour) must read
-#            ONE text on TQ2_0 and on TQ1_0, at a shallow and at a 200-token generation, on 1 GPU.  `TQ=0` is the
-#            arm that proves the GPU result is the CPU's, so it is not optional THERE.  On the multi-device split
-#            only the fusion pair is compared: `-ngl 99` still uploads the split weights to the devices, so the
-#            CPU-backend arm is a per-op host round-trip of the weight slab rather than "the pre-block
-#            behaviour" -- and on r355, where every TQ matmul took exactly that path, the arm does not even
-#            reach a token: `ggml-backend-meta.cpp:1460: GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]))`
-#            aborts (measured, r356).  Gating it would gate a pre-existing pathology this block REMOVES.
+#   HARD  2. the text: the default and `GGML_CUDA_TQ_FUSE=0` (the decode fusions and the graph_optimize reorder
+#            off) must read ONE text on TQ2_0 and on TQ1_0, at a shallow and at a 200-token generation, and on the
+#            multi-device split.  Those two arms have the SAME op placement, so a difference is a fusion that is
+#            not the separate ops.  The `GGML_CUDA_TQ=0` (CPU-backend) arm is run and REPORTED, not gated: it is a
+#            different placement, not a reference -- moving the TQ matmuls to the CPU drags the neighbouring ops
+#            there too, so a hash comparison across the two is not an oracle (`GREEDY-PURITY.md` §38/§82), and
+#            the bit-identity claim is arm 1's NMSE column (exactly 0).  Measured r356: gfx1201 agreed at 64 AND
+#            200 tokens, gfx1151 agreed at 64 and flipped one token by 200 with the NMSE still 0/305 -- the
+#            divergence is in a non-TQ op the placement moved, which is exactly why it cannot be the gate.
+#            On the multi-device split the CPU arm is not run at all: `-ngl 99` still uploads the split weights to
+#            the devices, so it is a per-op host round-trip of the weight slab rather than "the pre-block
+#            behaviour", and on r355 -- where every TQ matmul took exactly that path -- it does not even reach a
+#            token: `ggml-backend-meta.cpp:1460: GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]))` aborts
+#            (measured, r356).  Gating it would gate a pre-existing pathology this block REMOVES.
 #   HARD  3. the mechanism / non-vacuity (`GGML_CUDA_TQ_CENSUS=1`, one line per device at teardown):
 #              default arm   : small>0, vec>0, vec_fused>0 (the decode fusions fired) and, on RDNA4, mma>0 (the
 #                              int8-WMMA prefill kernel) -- a census of 0s means the block is not running;
@@ -219,6 +224,7 @@ text_run() {  # text_run TAG MODEL EXTRA_PROMPT_ARGS... ENV...
         env ${TEXT_ENV[@]+"${TEXT_ENV[@]}"} "$LLAMA_CLI" -m "$model" -ngl 99 ${TEXT_SPLIT:+-sm $TEXT_SPLIT} \
         "${TEXT_PROMPT_ARGS[@]}" --seed 42 --temp 0 --no-display-prompt --single-turn > "$log" 2>&1
     if [ $? -ne 0 ]; then echo "FAILED"; return; fi
+    python3 "$REPO_DIR/scripts/extract-generated.py" "$log" --text 2>/dev/null > "${log%.log}.txt"
     python3 "$REPO_DIR/scripts/extract-generated.py" "$log" 2>/dev/null
 }
 sha_of() { echo "$1" | sed -n 's/.*sha=\([0-9a-f]*\).*/\1/p'; }
@@ -234,6 +240,37 @@ text_arm() {  # text_arm MODEL LABEL [no-cpu]  (runs the env arms on the current
     fi
     if [ "$g" = FAILED ] || [ "$f" = FAILED ] || [ "$c" = FAILED ]; then
         fail "$label: an arm did not complete"; return
+    fi
+    if [ "$with_cpu" = cpu ]; then
+        # HARD: default == fuse-off.  The two arms have the SAME op placement (only the fusion differs), so a
+        # text difference is a fusion that is not the separate ops, which is the claim.
+        local sg2 sf2
+        sg2="$(sha_of "$g")"; sf2="$(sha_of "$f")"
+        if [ -n "$sg2" ] && [ "$sg2" = "$sf2" ]; then
+            pass "$label: the default and GGML_CUDA_TQ_FUSE=0 arms read one text (sha $sg2)"
+        else
+            fail "$label: default ($sg2) != GGML_CUDA_TQ_FUSE=0 ($sf2) -- a fused result is not the separate ops'"
+        fi
+        # INFO: the CPU-backend arm is a DIFFERENT PLACEMENT, not a reference: GGML_CUDA_TQ=0 drags the whole
+        # attention/FFN block's neighbours onto the CPU backend too, so the two arms are not one configuration and
+        # a hash comparison across them is not an oracle (GREEDY-PURITY.md §38/§82).  The bit-identity claim is
+        # arm 1's NMSE column, which reads exactly 0; this arm is reported for the record.  Measured r356: gfx1201
+        # agreed at 64 and 200 tokens, gfx1151 agreed at 64 and flipped one token by 200 (with NMSE still 0/305
+        # there) -- which is what a non-oracle looks like.
+        note "$label: CPU-backend arm (different placement, INFO not an oracle): ${c:-<none>}"
+        if [ -s "$KEEPOUT/text-${label//\//-}-G.txt" ] && [ -s "$KEEPOUT/text-${label//\//-}-C.txt" ]; then
+            note "$label: shared prefix with the CPU arm: $(python3 - "$KEEPOUT/text-${label//\//-}-G.txt" "$KEEPOUT/text-${label//\//-}-C.txt" <<'PY'
+import sys
+a = open(sys.argv[1], errors="replace").read(); b = open(sys.argv[2], errors="replace").read()
+n = 0
+for x, y in zip(a, b):
+    if x != y: break
+    n += 1
+print("%d of %d/%d chars" % (n, len(a), len(b)))
+PY
+)"
+        fi
+        return
     fi
     if [ "$with_cpu" != cpu ]; then
         # A MULTI-DEVICE split is not a CPU-backend configuration: `-ngl 99` still uploads the split weights to
@@ -293,7 +330,7 @@ fi
 # ---------------------------------------------------------------------------
 # 3. the mechanism: census on the default arm, all-zero on the kill switch
 # ---------------------------------------------------------------------------
-census_run() {  # census_run TAG MODEL  -> prints the census lines (one per device)
+census_run() {  # census_run TAG MODEL  -> one SUMMED census line per device
     local tag="$1" model="$2"
     local log="$KEEPOUT/census-$tag.log"
     # the prompt file is ~350 tokens, i.e. a PREFILL wider than TQ_SMALL_MAX (16), which is what makes the
@@ -302,7 +339,25 @@ census_run() {  # census_run TAG MODEL  -> prints the census lines (one per devi
         env ${CENSUS_ENV[@]+"${CENSUS_ENV[@]}"} GGML_CUDA_TQ_CENSUS=1 "$LLAMA_CLI" -m "$model" -ngl 99 \
         -f "$PROMPT" -n 8 --seed 42 --temp 0 --no-display-prompt --single-turn -lv 4 > "$log" 2>&1
     if [ $? -ne 0 ]; then echo "FAILED"; return; fi
-    grep 'TQ_CENSUS' "$log"
+    # SUMMED over every line: llama-cli can create and destroy more than one CUDA context, and the first line is
+    # not always the one that did the work (measured on gfx1151: two lines, the first all-zero).
+    python3 - "$log" <<'PY'
+import re, sys
+tot = {}
+for l in open(sys.argv[1], errors="replace"):
+    m = re.search(r"TQ_CENSUS dev=(\d+) mul_mat small=(\d+) mma=(\d+) get_rows=(\d+) vec=(\d+) vec_fused=(\d+)", l)
+    if not m:
+        continue
+    dev = int(m.group(1))
+    v = [int(x) for x in m.groups()[1:]]
+    if dev not in tot:
+        tot[dev] = v
+    else:
+        tot[dev] = [a + b for a, b in zip(tot[dev], v)]
+for dev in sorted(tot):
+    s, mma, gr, vec, vf = tot[dev]
+    print("TQ_CENSUS dev=%d mul_mat small=%d mma=%d get_rows=%d vec=%d vec_fused=%d" % (dev, s, mma, gr, vec, vf))
+PY
 }
 
 echo "--> arm 3: the census (the block ran; the kill switch is not vacuous)"
