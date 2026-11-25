@@ -16,6 +16,79 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.004 (r360) -- `--fit` charged 1024 MiB of FA staging reserve on a q8_0 K/V cache the kernels read natively, and on a 12 GiB card that was eight layers of offload (GitHub issue #367, RDNA2)
+
+**The report.**  `@pkrasicki` runs an RX 6700 XT (`gfx1031`, 12 GiB) on a DDR3 platform and measured the r354/r355 tree
+(`91a8150`) **slower than upstream**, not faster, on two shapes: a Gemma-4 26A4B MoE with `-cmoe --moe-cache-mib 7000
+-lm none --spec-type draft-mtp` (**0.5 t/s prompt / 14.4 t/s tg** against upstream's 15.8 / 52.5) and a Qwen3.8 27B
+IQ3_S with `-sm tensor -mg 0 -c 16384 -fa on -ctk q8_0 -ctv q8_0` (**19.0 / 4.0** against 40.7 / 15.5).  No RDNA2
+device is in the fleet, and a 4x decode loss is not a tuning difference, so this was reproduced by MEASUREMENT on the
+shapes this box can reach rather than by inspection.
+
+**Root cause: `--fit`, not a kernel.**  `llama_context::memory_breakdown()`'s no_alloc (`--fit`) path charges a
+per-device compute reserve for the FA **prefill staging arena** (a raw device allocation outside the compute-graph
+reserve), and `ggml_backend_cuda_fattn_stage_bound()` answered with a FLAT `2 * GGML_CUDA_FA_STAGE_MAX_MB` = **1024
+MiB** for every device except RDNA3_5, gated only on `-fa` plus a non-F16 K cache.  That covers the delivery's own
+default `-ctk q8_0 -ctv q8_0`, where `ggml_cuda_fattn_tile_type()` resolves the pair **natively** (the launcher's
+`need_f16_K/V` are false) and the arena never grows at all: the reserve bought nothing and the fit paid for it in
+layers.  Measured with `llama-fit-params` on a 27B UD-IQ3_S at `-c 16384 -fa on -ctk q8_0 -ctv q8_0`, an ~11 GiB
+budget derived from the card's free VRAM:
+
+| arm | model | context | compute | `-ngl` |
+|---|---|---|---|---|
+| r359, f16 KV (control) | 10616 | 1173 | **515** | 59 |
+| r359, q8_0/q8_0 | 10616 | 697 | **1539** | **55** |
+| r360, q8_0/q8_0 (native) | 10616 | 697 | **515** | **62** |
+| r360, `GGML_CUDA_FA_KV_NATIVE=0` (staged) | 10616 | 697 | 1539 | 55 |
+| r360, staged + `GGML_CUDA_FA_STAGE_MAX_MB=0` | 10616 | 697 | 4675 | 34 |
+| same-tree **upstream** build, q8_0/q8_0 | 10616 | 697 | 541 | 59 |
+
+So the delivery offloaded **4 fewer layers than its own base** on the same flags and 8 fewer with the GSQ cut, and on
+a card whose model barely fits that is exactly the reported shape: the layers left on the host are streamed per token
+(11.28 GiB / 62 layers ≈ 186 MiB each), so ~750 MiB/token over DDR3 lands at 4 t/s while upstream's 59/62 reads 15.5.
+The fit's reserve is an ESTIMATE of an allocation the compute buffer does not contain -- a live run at `-c 16384
+-ub 512` prints a **118.89 MiB** compute buffer, and it grows linearly at 0.232 MiB per ubatch token (237.72 at
+`-ub 1024`, 475.37 at `-ub 2048`).
+
+**The fix (blocks 09 + 10).**  The bound now takes the context's K/V types and returns 0 for a pair the launcher does
+not convert, using the launcher's OWN predicate: `ggml_cuda_fattn_kv_pair_native_host(cc, type_k, type_v)` is
+`ggml_cuda_fattn_tile_type` applied to a probe tensor, i.e. literally the `need_f16_K/V` test in
+`ggml_cuda_flash_attn_ext_get_f16_extra_data`.  A policy switch (`GGML_CUDA_FA_KV_NATIVE=0`), a mixed pair, bf16
+without bf16 MMA, or `GGML_CUDA_FA_STAGE_MAX_MB=0` all keep the reserve exactly as before, and the RDNA3_5 special
+case is left alone.  Nothing about a kernel selection, a launch or a numerics path changed: this is a number the fit
+subtracts from a budget.
+
+**Two things checked because they are the obvious wrong turns.**  (1) *Is the reserve needed for a deep prefill?*  A
+16K-context q8_0 KV prefill (1315 tokens) reads `990793afb918` on both the r359 and the r360 build, and the same
+text on a `GGML_CUDA_FA_STAGE_MAX_MB=1` arm where the arena can never be charged for anything.  (2) *Is this
+RDNA2-only?*  It is not: the accounting is in `llama-context`, and `gfx1036` (a real RDNA2 device on this box) reads
+495 MiB of compute for BOTH its f16 and its q8_0 arm and 1519 for the staged arm, i.e. the same native answer as
+gfx1201 -- the old "only RDNA3_5 reads natively" special case was a leftover from when the native q8_0 arm was
+gfx1151-only, which under-charged nobody and over-charged everyone else.
+
+**Gates.**  New `scripts/gate-fit-staging.sh` (`MANIFESTS.md` gate 44, four `llama-fit-params` arms, no compute,
+~10 s) -- **NEGATIVE-TESTED**: on the same r359 build it FAILS A1 (+1024 MiB), A2 (`-ngl 55` < 59) and B1 (0 MiB over
+the native arm), and passes 6/6 on r360.  `gate-prefill-logits.sh` **0.000000 / 100.000 %** (no GPU faults).
+Byte-identical greedy text against the r359 build on 1 GPU (`1c5d32ac537d`), 3-GPU `-sm tensor` (`1c5d32ac537d`) and
+the 16K q8_0 prefill (`990793afb918`); a real q8_0-KV FA run on the RDNA2 `gfx1036` iGPU generates (`f33aec64cbab`,
+14.0/3.2 t/s on 2 CUs).  `validate-set.sh` green (19 default + 2 optional, applied tree `4674dd9f2e…`), the optional
+`0100`/`0101` re-cut onto the r360 tree (`831bc116a…` / `f455c3121…`, cumulative `8bd172df5…`; 0101 needed one
+textual conflict resolved because block 10 owns `fattn-rdna.cuh`), the file-set reconciliation reads 0 unexplained.
+
+**What the report's FIRST shape still needs, and what it is not.**  Test 1's command is not comparable across the two
+builds: `-cmoe`, `--moe-cache-mib`, `-lm` and `-sm relaxed-tensor` do not exist upstream, so the upstream arm could not
+have run it -- its `-ngl 99` on a 16 GiB model in 12 GiB means something else entirely (page-cache-resident experts
+computed on the CPU, which is exactly what the delivery's `--moe-cache-mib 7000` replaces with a 7 GiB device cache
+and a pinned host master).  That arm is a *placement* question on a DDR3 box with no RDNA2 device here to measure it
+on, so it is not "fixed" by this entry: the reporter is asked for the exact upstream command, and `TODO` #361's
+V620 validation still covers the RDNA2-only block-05/08/10 items.
+
+**Where the RDNA2 story goes from here.**  The two block-05/08/10 items r334 folded in remain externally
+validated only (`TODO` #361, waiting on `@jstamagal`'s V620), and this fix is orthogonal to them: it removes a
+placement loss the fit was causing, not a kernel regression.  It also means the r360 tree is the first one where an
+RDNA2 owner can see the delivery's own `-ctk q8_0` default without paying a 1 GiB fit reserve for it.
+
+
 ## 261125.003 (no release; record correction) -- the r359 entry's Flash-Next tg numbers were 32-token cold-start numbers: at 2000 tokens the model reads 39.24 t/s and the rows form's LOSS is bigger, not smaller
 
 **Why this exists.**  The r359 measurements above used a 32-token greedy tail on a fresh `--no-warmup` server.  That is

@@ -3459,3 +3459,37 @@ loses everywhere measurable, so the delivery's default went back to the dense fo
    now asks for it explicitly.  Measured (gfx1201, 3 GPUs `-sm layer`, Flash-Next GSQ-IQ3_XXS, bf16 KV,
    `-c 32768 -np 2`, 5246-token prefill + 48 greedy tokens): 7 arms, `default` + `rows-off` identical, every graph
    `splits = 4`, no CPU placement, no GPU fault.
+
+
+* **A `--fit` reserve that is charged for a code path the context cannot reach is not conservative, it is a LAYER
+  COUNT (r360, blocks 09+10, GitHub issue #367).**  The FA prefill staging arena is a raw device allocation outside
+  the compute-graph reserve, so `llama_context::memory_breakdown()`'s no_alloc (`--fit`) path charges a per-device
+  compute reserve for it.  Until r360 that reserve was a FLAT `2 * GGML_CUDA_FA_STAGE_MAX_MB` (1024 MiB at the
+  512 MiB default) for **every** device except RDNA3_5, gated only on `-fa` + a non-F16 K cache -- i.e. it was
+  charged on the delivery's own default `-ctk q8_0 -ctv q8_0`, where the kernels read the cache **natively**
+  (`ggml_cuda_fattn_tile_type` returns q8_0, so the launcher's `need_f16_K/V` are false) and the arena never grows
+  at all.  Four facts worth keeping:
+  (1) **The symptom is invisible on a roomy card and is the whole story on a tight one.**  `--fit` spends the
+  reserve on nothing, so it offloads fewer layers: at an ~11 GiB `--fit-target`-derived budget a 27B UD-IQ3_S
+  projects 1539 MiB of compute and `-ngl 55` against 515 MiB and `-ngl 62` without it (a same-tree upstream build
+  at the same base: 541 MiB / `-ngl 59`), and on the reporter's 12 GiB gfx1031 that layer difference is 4.0 t/s
+  against upstream's 15.5.  **A fit-accounting change is a placement change, so it needs a placement arm, not a
+  text arm** (the text is identical either way -- the accounting moves no byte).
+  (2) **The reserve must ask the LAUNCHER's predicate, not the arch.**  r360's bound calls
+  `ggml_cuda_fattn_kv_pair_native_host`, which is `ggml_cuda_fattn_tile_type` on a probe tensor -- literally the
+  `need_f16_K` test of `ggml_cuda_flash_attn_ext_get_f16_extra_data` -- so a policy switch
+  (`GGML_CUDA_FA_KV_NATIVE=0`) turns the conversion and the reserve on together and the pair cannot drift the way
+  the scratch sizing did before TODO 71.  A future KV type, a new staging arm or a change to
+  `ggml_cuda_fattn_tile_type` owes an arm in `scripts/gate-fit-staging.sh`.
+  (3) **The answer is the same on RDNA2.**  gfx1036 (a real RDNA2 device on this box) reads a q8_0 pair natively too:
+  its fit projects 495 MiB for both the f16 and the q8_0 arm and 1519 MiB for the `GGML_CUDA_FA_KV_NATIVE=0` arm.
+  So the "RDNA3_5 is the only arch that reads natively" special case was a leftover from when the native q8_0 arm
+  was RDNA3_5-only, and it under-charged nobody else while over-charging everyone.
+  (4) **What still costs a reserve, and how much risk the change carries.**  A pair that really stages (a mixed
+  K/V pair, bf16 where bf16 MMA is absent, `GGML_CUDA_FA_KV_NATIVE=0`, `GGML_CUDA_FA_STAGE_MAX_MB=0`) still
+  reserves the same way.  The accounting is an ESTIMATE of an allocation the compute buffer does not contain (a
+  live run's compute buffer reads 118.89 MiB at `-c 16384`/`-ub 512` on the 27B), so a native pair now fits up to
+  ~1 GiB tighter than before -- covered by the default `--fit-target` margin of 1024 MiB per device, and a too-thin
+  user target is what the reserve used to hide.  Gates: `scripts/gate-fit-staging.sh` (with the r359 build as its
+  negative control), `gate-prefill-logits.sh` 0.000000 / 100.000 %, byte-identical greedy text on 1 GPU, 3-GPU
+  `-sm tensor` and a 16K-context q8_0 prefill.  Record: `WORKLOG.md` 261125.004, `MANIFESTS.md` gate 44.

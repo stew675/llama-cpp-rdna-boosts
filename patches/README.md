@@ -1,5 +1,24 @@
 # The delivery patches — what each block is and what it does
 
+> **r360: `--fit` stops reserving the FA staging arena for a K/V pair the kernels never stage (GitHub issue #367), an
+> amendment to blocks 09 and 10.**  The arena is a raw device allocation outside the compute-graph reserve, so
+> `llama_context::memory_breakdown()`'s no_alloc (`--fit`) path charges a compute reserve for it, and the backend's
+> bound was a FLAT `2 * GGML_CUDA_FA_STAGE_MAX_MB` (1024 MiB at the 512 MiB default) for every device except
+> RDNA3_5 — gated only on `-fa` plus a non-F16 K cache.  That included the delivery's own default
+> `-ctk q8_0 -ctv q8_0`, where `ggml_cuda_fattn_tile_type` resolves the q8_0 pair natively, the launcher's
+> `need_f16_K/V` are false and the arena never grows: the reserve bought nothing and `--fit` paid for it in LAYERS
+> (at an ~11 GiB budget a 27B UD-IQ3_S read 1539 MiB of compute and `-ngl 55` against 515 MiB and `-ngl 62`, a
+> same-tree upstream build read 541 MiB / 59 — on the reporter's 12 GiB gfx1031 that is 4.0 t/s against 15.5).
+> The bound now takes the context's K/V types and answers with the launcher's own predicate
+> (`ggml_cuda_fattn_kv_pair_native_host` = `ggml_cuda_fattn_tile_type` on a probe tensor, both in block 10's
+> `fattn-rdna.cuh`), so a policy switch (`GGML_CUDA_FA_KV_NATIVE=0`) turns the conversion and the reserve on
+> together and they cannot drift; a pair that really stages (mixed, bf16 without bf16 MMA, the staged arm, an
+> unbounded cap) reserves exactly as before.  Blocks: the CUDA side is block 10 (`fattn-rdna.cuh`,
+> `ggml-cuda-moe-cache-hooks.{cu,cuh}`), the `--fit` accounting is block 09 (`src/llama-context.cpp`).  Gates:
+> `scripts/gate-fit-staging.sh` (new, `MANIFESTS.md` gate 44; the r359 build FAILS its A1/A2/B1 arms),
+> `gate-prefill-logits.sh` 0.000000 / 100.000 %, byte-identical greedy text on 1 GPU, 3-GPU `-sm tensor` and a
+> 16K-context q8_0 prefill, `validate-set.sh` green, the optional `0100`/`0101` re-cut onto the new tree.
+
 > **r356: a new official block 17 — TQ1_0 / TQ2_0 (ternary) weights on the GPU (contributor PR #358, `@overdoingism`).**
 > A ternary model (`BitNet` b1.58 and its conversions) had no CUDA/HIP path at all: `supports_op` refused the two
 > types, the weights stayed in host memory and the CPU backend ran every matmul, so `-ngl 99` decoded a TQ model at

@@ -1114,6 +1114,31 @@ in CI.  The model-level gates are manual:
     fallback predicate, the mtmd routing in `handle_completions_impl` / `handle_count_tokens`, or the chat-parse
     path in `server-common.cpp`.
 
+44. **`--fit` must not reserve a staging arena the kernels never fill** (r360, blocks 09+10, GitHub issue #367)
+    -- `scripts/gate-fit-staging.sh`.  The FA prefill staging arena is a raw device allocation outside the
+    compute-graph reserve, so `llama_get_memory_breakdown()`'s no_alloc (`--fit`) path charges a per-device
+    compute reserve for it.  That reserve used to be a FLAT `2 * GGML_CUDA_FA_STAGE_MAX_MB` (1024 MiB at the
+    512 MiB default) for every device except RDNA3_5, i.e. for **every** `-fa on` context with a quantized K
+    cache -- including the delivery default `-ctk q8_0 -ctv q8_0`, where the kernels read the cache natively
+    and the arena never grows.  The cost is not visible on a roomy card and is not a rate on a tight one: at an
+    ~11 GiB budget a 27B UD-IQ3_S reads a compute tier of 1539 MiB and `-ngl 55` with the flat reserve,
+    515 MiB and `-ngl 62` without it (r359: 1539 / `-ngl 52` on the GSQ cut), against a same-tree upstream
+    build's 541 MiB / `-ngl 59` -- which on the reporter's 12 GiB gfx1031 is 4.0 t/s against upstream's 15.5.
+    The bound now asks the launcher's OWN predicate (`ggml_cuda_fattn_kv_pair_native_host`, i.e.
+    `ggml_cuda_fattn_tile_type` on a probe tensor -- the `need_f16_K/V` test of
+    `ggml_cuda_flash_attn_ext_get_f16_extra_data`), so the reserve and the launcher cannot drift (TODO 71).
+    The gate is `llama-fit-params` only (no compute, ~10 s), four arms: **A** a native q8_0 pair must project
+    within 8 MiB of an f16-KV control and must never offload FEWER layers than that control (a q8_0 cache is
+    the smaller one); **B** `GGML_CUDA_FA_KV_NATIVE=0` -- the arm that really converts -- must still reserve
+    >= 900 MiB over A and must lose layers, which is the non-vacuity proof (an unconditional 0 passes A);
+    **C** `GGML_CUDA_FA_STAGE_MAX_MB=0` on the staged arm must raise the reserve to the whole-F16-KV estimate,
+    so the accounting still follows the cap; **D** a live `llama-cli` run's own compute buffer must stay below
+    the fit's projection (the reserve is an estimate of an allocation the compute buffer does not contain, so
+    a run that already spent it would mean a double count).  NEGATIVE-TESTED: on the r359 build the same
+    script FAILS A1 (+1024 MiB), A2 (`-ngl 55` < 59) and B1 (0 MiB over the native arm).  Required for any
+    change to the staging arena, to `ggml_cuda_fattn_tile_type` / a `_kv_*_supported` predicate, to
+    `GGML_CUDA_FA_STAGE_MAX_MB`, or to `llama_context::memory_breakdown()`'s reserve accounting.
+
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 
 ## Verification per block
@@ -1123,6 +1148,7 @@ on the tip.
 
 | block | verify | expected |
 |---|---|---|
+| 09/10 | **(r360, issue #367) the `--fit` staging-arena reserve follows the launcher's predicate**: `scripts/gate-fit-staging.sh` on a q8_0-capable model (arms A-D: a native pair charges nothing and keeps the f16 control's layers, the `GGML_CUDA_FA_KV_NATIVE=0` arm still charges >= 900 MiB and loses layers, an unbounded cap charges the whole-F16-KV estimate, and a live run's compute buffer stays below the projection), plus the same-seed greedy text against the previous build on 1 GPU and a 3-GPU `-sm tensor`, and `gate-prefill-logits.sh` | gate **PASS** (control 515 MiB / `-ngl 59`, native 515 / 62, staged 1539 / 55, staged+unbounded 4675 / 34, live run 118.89 MiB); the r359 build **FAILS** A1/A2/B1 (+1024 MiB, `-ngl 55`); text identical (`1c5d32ac537d` 1 GPU and 3-GPU tensor, `990793afb918` at a 16K-context q8_0 prefill); KLD 0.000000 / 100.000 % |
 | 05 | **(r319, issue #330) the decode/verify KV split is a run constant**: `scripts/gate-spec-purity.sh` (`plain == draft-mtp` on q8_0 and bf16 at 3-device `-sm tensor`, the non-vacuity draft-rate check, `--control` on `GGML_CUDA_FA_SPLIT_CONST=0` must diverge, and the width probe's flat + 256-cell-boundary arms for both KV types); the four-axis MTP protocol on 1 GPU and on 3 GPU `-sm tensor` on BOTH cache types; the same-seed text of the arms the change cannot reach (4B 1 GPU, 27B 2 GPU tensor, 27B 3 GPU `-sm layer`) against the previous build; `llama-bench tg128` at d0..131k and `pp512` (flat); `test-backend-ops -o FLASH_ATTN_EXT`; `gate-prefill-logits.sh` | gate **PASS** (A `c1f9d0b3f5b6`, B `2fbc183348a8`, plain == draft; control diverges; probe flat + boundary maxdiff **0** for q8_0 AND bf16 where the pre-fix boundary arm reads 0.232868 / 0.196008); four-axis plain == draft on all four at `-n 3000` 1 GPU (acceptance 0.53656 / 0.80437 / 0.86819 / 0.99200) and all four at `-n 1000` on both caches 3 GPU tensor (0.57755 / 0.81776 / 0.86555 / 0.99200); unchanged `be6407e421c8` / `b1c84ba23a2c` / `f59aa0be6536`; tg128 46.6 / 45.6 / 42.3 / 39.3 / 36.8 / 34.6 at d0/8k/32k/65k/98k/131k both arms; 7381/7381; KLD 0.000000 / 100.000 % canonical and 0.000000 / 99.990 % 3-device tensor -- `WORKLOG.md` 261119.003 |
 | 10 | **(r319, issue #330) the width probe must straddle a 256-cell padding boundary**: `test-logits-width-probe MODEL prompts/prose-rdna-boosts.txt 4096 512` on `KV=q8_0` and `KV=bf16` at `SPLIT=tensor` (the flat arm plus the new boundary arm at `P=4348`), with the pre-fix arm as the control (`GGML_CUDA_FA_SPLIT_CONST=0` must FAIL the boundary arm) | flat PASS in both arms (maxdiff 0); boundary **PASS maxdiff 0** post-fix and **FAIL 0.232868 (q8_0) / 0.196008 (bf16)** pre-fix -- `benchmarks/2026-11-19-fa-split-boundary-purity.md` |
 | 00 | `test-backend-ops -o FLASH_ATTN_EXT`; `test-logits-width-probe` W=1..8 | pass; one hash across the band |

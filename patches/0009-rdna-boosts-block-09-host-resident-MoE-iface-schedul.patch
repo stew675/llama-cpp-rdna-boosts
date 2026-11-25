@@ -1,4 +1,4 @@
-From becf02ec8a91ae6735b8e20169d231af09c661c4 Mon Sep 17 00:00:00 2001
+From 571dd436a2f78724e0f2576cf6e7be5f63ad7d94 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/18] rdna-boosts: block 09: host-resident MoE (iface,
@@ -128,7 +128,7 @@ refused, 3-device arm untouched).  Measured: benchmarks/2026-11-21-ffn-even-spli
  ggml/src/ggml-zendnn/ggml-zendnn.cpp          |    7 +
  ggml/src/ggml.c                               |    2 +
  include/llama.h                               |   77 +
- src/llama-context.cpp                         |  462 +-
+ src/llama-context.cpp                         |  470 +-
  src/llama-context.h                           |   35 +-
  src/llama-cparams.h                           |   11 +
  src/llama-ext.h                               |   11 +
@@ -144,7 +144,7 @@ refused, 3-device arm untouched).  Measured: benchmarks/2026-11-21-ffn-even-spli
  tests/test-backend-tensor.cpp                 |    3 +
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 70 files changed, 18543 insertions(+), 547 deletions(-)
+ 70 files changed, 18551 insertions(+), 547 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -19667,7 +19667,7 @@ index 58c10f43b..f2f880c34 100644
  
      LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 2fcc372a3..4d622d1e5 100644
+index 2fcc372a3..5f8e57ff9 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -753,8 +753,9 @@ llama_context::llama_context(
@@ -20158,7 +20158,7 @@ index 2fcc372a3..4d622d1e5 100644
  }
  
  llm_graph_cb llama_context::graph_get_cb() const {
-@@ -4822,6 +5041,52 @@ void llama_context::perf_reset() {
+@@ -4822,6 +5041,59 @@ void llama_context::perf_reset() {
      // note: the reallocation counters are not reset - they track the lifetime totals for this context
  }
  
@@ -20168,7 +20168,14 @@ index 2fcc372a3..4d622d1e5 100644
 +// worst case the runtime can request for this context, so the fit cannot under-provision a deep
 +// prefill.  The provider is the CUDA backend (the only backend with this arena); every other
 +// backend returns 0.  `f16_kv_bytes` is the F16 attention-KV size the context could stage.
-+static size_t llama_fattn_stage_accounting(ggml_backend_t backend, bool reserve, size_t f16_kv_bytes) {
++//
++// The cache's K/V types are an argument because a pair the kernels read natively is never staged, so
++// the reserve is 0 for it: the backend answers with the launcher's own predicate (issue #367 -- the
++// flat reserve this used to charge on every quantized K cache cost a memory-tight 12 GiB card eight
++// layers of offload and ~4x its decode rate, on the default `-ctk q8_0 -ctv q8_0` where nothing is
++// converted at all).
++static size_t llama_fattn_stage_accounting(ggml_backend_t backend, bool reserve, size_t f16_kv_bytes,
++                                           ggml_type type_k, ggml_type type_v) {
 +    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
 +    if (reg == nullptr) {
 +        return 0;
@@ -20177,11 +20184,11 @@ index 2fcc372a3..4d622d1e5 100644
 +        auto used_fn = (size_t (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fattn_stage_used");
 +        return used_fn != nullptr ? used_fn(backend) : 0;
 +    }
-+    auto bound_fn = (size_t (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fattn_stage_bound");
++    auto bound_fn = (size_t (*)(ggml_backend_t, int, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fattn_stage_bound");
 +    if (bound_fn == nullptr) {
 +        return 0;
 +    }
-+    const size_t bound = bound_fn(backend);
++    const size_t bound = bound_fn(backend, (int) type_k, (int) type_v);
 +    if (bound == 0) {
 +        return 0;                   // this device never prefill-stages
 +    }
@@ -20211,7 +20218,7 @@ index 2fcc372a3..4d622d1e5 100644
  llama_memory_breakdown llama_context::memory_breakdown() const {
      std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
      for (const auto & [buft, size] : model.memory_breakdown()) {
-@@ -4832,22 +5097,38 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
+@@ -4832,22 +5104,39 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
              ret[buft].context += size;
          }
      }
@@ -20219,7 +20226,8 @@ index 2fcc372a3..4d622d1e5 100644
 +    // the fit's arena reserve; the cap is the hard bound).  Only the types the launcher stages
 +    // (anything a native-capable arm can read) are counted.
 +    const bool fa_stages =
-+            cparams.flash_attn && cparams.type_k != GGML_TYPE_F16 && cparams.type_k != GGML_TYPE_F32;
++            cparams.flash_attn && ((cparams.type_k != GGML_TYPE_F16 && cparams.type_k != GGML_TYPE_F32) ||
++                                   (cparams.type_v != GGML_TYPE_F16 && cparams.type_v != GGML_TYPE_F32));
 +    size_t f16_kv_bytes = 0;
 +    if (model.no_alloc() && fa_stages) {
 +        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
@@ -20239,7 +20247,7 @@ index 2fcc372a3..4d622d1e5 100644
              ggml_backend_t             backend = backends[i].get();
              ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
 -            ret[buft].compute += backend_buf_exp_size[i];
-+            ret[buft].compute += backend_buf_exp_size[i] + llama_fattn_stage_accounting(backend, true, f16_kv_bytes)
++            ret[buft].compute += backend_buf_exp_size[i] + llama_fattn_stage_accounting(backend, true, f16_kv_bytes, cparams.type_k, cparams.type_v)
 +                               + llama_h2d_stage_accounting(backend, true, max_host_table);
          }
      } else {
@@ -20247,12 +20255,12 @@ index 2fcc372a3..4d622d1e5 100644
              ggml_backend_t             backend = backend_ptr.get();
              ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
 -            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
-+            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend) + llama_fattn_stage_accounting(backend, false, 0)
++            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend) + llama_fattn_stage_accounting(backend, false, 0, cparams.type_k, cparams.type_v)
 +                               + llama_h2d_stage_accounting(backend, false, 0);
          }
      }
      return ret;
-@@ -4997,12 +5278,15 @@ void llama_context::opt_epoch_iter(
+@@ -4997,12 +5286,15 @@ void llama_context::opt_epoch_iter(
                  break;
              }
  
@@ -20269,7 +20277,7 @@ index 2fcc372a3..4d622d1e5 100644
              res->reset();
  
              auto * gf = model.build_graph(gparams);
-@@ -5033,7 +5317,6 @@ void llama_context::opt_epoch_iter(
+@@ -5033,7 +5325,6 @@ void llama_context::opt_epoch_iter(
                      ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                  }
              }
@@ -20277,7 +20285,7 @@ index 2fcc372a3..4d622d1e5 100644
              ggml_opt_eval(opt_ctx, result);
              if (callback) {
                  callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
-@@ -5133,6 +5416,7 @@ llama_context_params llama_context_default_params() {
+@@ -5133,6 +5424,7 @@ llama_context_params llama_context_default_params() {
          /*.op_offload                  =*/ true,
          /*.swa_full                    =*/ true,
          /*.kv_unified                  =*/ false,

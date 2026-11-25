@@ -1,4 +1,4 @@
-From 4444b6fe2c5fb1cdb4ffd5e7285d56089bda4130 Mon Sep 17 00:00:00 2001
+From 2494a5c2eab54b39b65380f188bab03a7cb74b6c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/18] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -168,6 +168,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  ggml/src/ggml-cuda/dsv4-hc.cu                 |   93 +-
  ggml/src/ggml-cuda/fattn-common.cuh           |  708 +-
  ggml/src/ggml-cuda/fattn-mma-f16.cuh          |   84 +-
+ ggml/src/ggml-cuda/fattn-rdna.cuh             |   29 +
  ggml/src/ggml-cuda/fattn-tile.cuh             |    5 +-
  ggml/src/ggml-cuda/fattn-vec.cuh              |    4 +-
  ggml/src/ggml-cuda/fattn.cu                   |  115 +-
@@ -185,7 +186,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  ggml/src/ggml-cuda/gdn-conv.cuh               |   13 +-
  ggml/src/ggml-cuda/ggml-cuda-arena.cu         |   70 +
  ggml/src/ggml-cuda/ggml-cuda-arena.cuh        |   15 +
- .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |  283 +
+ .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |  295 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |   27 +
  ggml/src/ggml-cuda/ggml-cuda-slab.cu          | 1867 +++++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 3542 +++++++++
@@ -239,7 +240,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  tests/test-fusion-gate-beta-multiseq.cpp      |  321 +
  tests/test-logits-width-probe.cpp             |  234 +-
  tools/server/server-context.cpp               |   30 +-
- 87 files changed, 18077 insertions(+), 5671 deletions(-)
+ 88 files changed, 18118 insertions(+), 5671 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -3625,6 +3626,46 @@ index 2e716c67f..ab842fe07 100644
  }
  
  
+diff --git a/ggml/src/ggml-cuda/fattn-rdna.cuh b/ggml/src/ggml-cuda/fattn-rdna.cuh
+index 05a6771cb..831a964fa 100644
+--- a/ggml/src/ggml-cuda/fattn-rdna.cuh
++++ b/ggml/src/ggml-cuda/fattn-rdna.cuh
+@@ -311,6 +311,35 @@ static inline ggml_type ggml_cuda_fattn_tile_type(const ggml_tensor * K, const g
+                                                  : ggml_cuda_fattn_native_ggml_type(tile_native);
+ }
+ 
++// Host-side answer to "does the family this device picks read a K/V cache of these two types WITHOUT
++// the F16 staging copy?".  The prefill staging arena only ever holds the conversion a launch asked
++// for, so a pair the kernels read natively never grows it -- and `--fit` must not reserve for it.  A
++// flat reserve charged for every quantized K cache cost a memory-tight 12 GiB gfx1031 eight layers of
++// offload and ~4x its decode (issue #367: 4.0 t/s against upstream's 15.5), on the delivery default
++// `-ctk q8_0 -ctv q8_0` where no conversion happens at all.
++//
++// The answer is the launcher's OWN predicate (`ggml_cuda_fattn_tile_type`, i.e. the `need_f16_K/V`
++// test of ggml_cuda_flash_attn_ext_get_f16_extra_data) applied to a probe tensor, so the reserve and
++// the launcher cannot drift the way they did before TODO 71 -- a policy switch such as
++// `GGML_CUDA_FA_KV_NATIVE=0` turns both on together.  A pair the tile family reads natively is native
++// for the MMA family too (it types each operand from the same per-type predicates and stages strictly
++// less), so one test answers for both.  The per-tensor layout tests are KV-cache invariants
++// (block-contiguous rows, a head width that is a multiple of the staged chunk), so the probe carries
++// the smallest row the loaders accept.
++static inline bool ggml_cuda_fattn_kv_pair_native_host(int cc, ggml_type type_k, ggml_type type_v) {
++    ggml_tensor k = {};
++    k.type  = type_k;
++    k.ne[0] = GGML_CUDA_FA_Q8_CHUNK;
++    k.nb[0] = ggml_type_size(type_k);
++    ggml_tensor v = k;
++    v.type  = type_v;
++    v.nb[0] = ggml_type_size(type_v);
++    // F16/F32 and the bf16 arm reach the kernel's own T_KV; a quantized pair reaches a native dequant
++    // arm only when both operands name the SAME type (the tile kernel has one K/V type parameter).
++    const ggml_type tile = ggml_cuda_fattn_tile_type(&k, &v, cc);
++    return tile == type_k && tile == type_v;
++}
++
+ // Decode/verify band (n_q <= 8) on RDNA4: the whole GQA group is folded into one block
+ // (ncols2 = 8) via the WMMA kernel instead of the tile kernel's ncols2 = 2, which fetches and
+ // dequantizes every K/V element once per head pair (3x for GQA 6).  This is the default; the env var
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
 index ce0f4a622..e0778c76b 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cuh
@@ -5729,15 +5770,19 @@ index 000000000..07f58164d
 +int ggml_backend_cuda_buffer_type_device(ggml_backend_buffer_type_t buft);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
 new file mode 100644
-index 000000000..abb2ef041
+index 000000000..14dbc00f0
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,295 @@
 +// MoE expert-cache callbacks + op-offload staging hooks (block 06/09) and the FA/H2D staging
 +// accounting.  Split out of ggml-cuda.cu (an upstream hub).
 +
 +#include "ggml-cuda-moe-cache-hooks.cuh"
 +#include "common.cuh"
++// fattn-rdna.cuh requires FATTN_KQ_STRIDE (defined at the top of fattn-common.cuh) in front of it.
++// Pulled in for ggml_cuda_fattn_kv_pair_native_host, the --fit staging-arena bound's predicate.
++#include "fattn-common.cuh"
++#include "fattn-rdna.cuh"
 +#include "ggml-backend-impl.h"
 +#include "ggml-cuda-vmm.h"
 +#include "moe-expert-cache.h"
@@ -5971,7 +6016,12 @@ index 000000000..abb2ef041
 +// worst-case per-launch staging request for the device: 0 when this device never prefill-stages
 +// (RDNA3_5 reads natively), SIZE_MAX when the cap is unbounded (the caller supplies an estimate),
 +// otherwise 2*cap because K and V are capped independently.  `used` is what the arena has grown to.
-+size_t ggml_backend_cuda_fattn_stage_bound(ggml_backend_t backend) {
++//
++// The K/V types the context will actually cache are an argument because a pair the kernels read
++// natively is never staged, so its bound is 0 (issue #367: the flat reserve this used to return for
++// every quantized K cache cost a 12 GiB card eight layers of offload).  The predicate is the
++// launcher's own (ggml_cuda_fattn_kv_pair_native_host), so the reserve cannot disagree with it.
++size_t ggml_backend_cuda_fattn_stage_bound(ggml_backend_t backend, int type_k, int type_v) {
 +    const ggml_backend_cuda_context * ctx = (const ggml_backend_cuda_context *) backend->context;
 +    if (ctx == nullptr) {
 +        return 0;
@@ -5979,6 +6029,9 @@ index 000000000..abb2ef041
 +    const int cc = ggml_cuda_info().devices[ctx->device].cc;
 +    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
 +        return 0;
++    }
++    if (ggml_cuda_fattn_kv_pair_native_host(cc, (ggml_type) type_k, (ggml_type) type_v)) {
++        return 0;   // nothing is ever converted, so the arena stays empty
 +    }
 +    const size_t cap = ggml_cuda_fattn_stage_max_bytes();
 +    if (cap == 0) {
@@ -6019,7 +6072,7 @@ index 000000000..abb2ef041
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
 new file mode 100644
-index 000000000..310a748ca
+index 000000000..3bf0b0906
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
 @@ -0,0 +1,27 @@
@@ -6046,7 +6099,7 @@ index 000000000..310a748ca
 +int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend);
 +bool   ggml_backend_cuda_moe_cache_gather(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, size_t slice_off, int split_axis);
 +bool   ggml_backend_cuda_moe_cache_remap(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, bool check_only);
-+size_t ggml_backend_cuda_fattn_stage_bound(ggml_backend_t backend);
++size_t ggml_backend_cuda_fattn_stage_bound(ggml_backend_t backend, int type_k, int type_v);
 +size_t ggml_backend_cuda_fattn_stage_used(ggml_backend_t backend);
 +size_t ggml_backend_cuda_h2d_stage_used(ggml_backend_t backend);
 +size_t ggml_backend_cuda_h2d_stage_bound(ggml_backend_t backend, size_t max_table);
@@ -27055,7 +27108,7 @@ index 289a9d936..89c303d8d 100644
              }
              view_src = view_src->view_src;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 4d622d1e5..bf5b44a00 100644
+index 5f8e57ff9..8f099b20f 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,7 @@
@@ -27595,7 +27648,7 @@ index 4d622d1e5..bf5b44a00 100644
      }
  
      return gf;
-@@ -5426,6 +5773,26 @@ llama_context_params llama_context_default_params() {
+@@ -5434,6 +5781,26 @@ llama_context_params llama_context_default_params() {
      return result;
  }
  
@@ -27622,7 +27675,7 @@ index 4d622d1e5..bf5b44a00 100644
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
-@@ -5461,10 +5828,49 @@ llama_context * llama_init_from_model(
+@@ -5469,10 +5836,49 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }
@@ -27674,7 +27727,7 @@ index 4d622d1e5..bf5b44a00 100644
          return nullptr;
      }
  
-@@ -5749,6 +6155,26 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+@@ -5757,6 +6163,26 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
      return ctx->get_embeddings_nextn_ith(i);
  }
  
