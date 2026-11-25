@@ -246,6 +246,13 @@ packaging stays in CI:
   `flock` (`$HOME/.cache/rdna-containers/.lock`) so cron skips, then write the
   tag into `$HOME/.cache/rdna-containers/last-built` so the watcher does not
   rebuild the unlabelled images (r222 did exactly this).
+- **a release is only finished when the images RESOLVE** — a push's exit status is not proof.
+  `scripts/build-containers.sh --verify-only` asks the registry about every tag the release owes and
+  fails on a missing tag **or** on a moving tag (`latest`, `rocm-<line>`, `server-rocm-<line>`, …) that
+  still carries the *previous* release's digest.  Run it from anywhere after the worker reports
+  `pushed` (anonymous read works, the package is public): it needs only `skopeo`, or `curl` + `jq` for
+  ghcr.io.  `--push` runs the same check itself and now FAILS the push step if a tag does not resolve,
+  so the watcher's failure signal fires instead of a silent no-op.
 - `docker-ghcr.yml` no longer runs automatically (no tag or schedule trigger);
   it is a manual `workflow_dispatch` fallback.
 
@@ -290,6 +297,9 @@ To cut a release after a re-base or a block amendment:
 # freeze it: annotated tag on the commit that carries this release.json
 git tag -a v<blocks>-<base-sha>-r<N> -m "rdna-boosts v<blocks>-<base-sha>-r<N>"
 git push origin main v<blocks>-<base-sha>-r<N>
+
+# after the worker reports the tag pushed (~10 min + the build), PROVE it landed:
+./scripts/build-containers.sh --verify-only    # 0 = every tag resolves and latest carries this release
 ```
 
 **Release naming.**  One tag per release, `v<blocks>-<base-sha>-r<N>` (e.g. `v15-6050b467c-r138`), where `N` is
@@ -334,7 +344,10 @@ gh auth refresh -h github.com -s write:packages            # once; podman needs 
 gh auth token | podman login ghcr.io -u stew675 --password-stdin
 
 ./scripts/build-containers.sh --prepare-only               # reconstruct + verify the release tree
+./scripts/build-containers.sh --list-tags                  # what this release owes (source of truth)
 ./scripts/build-containers.sh --rocm "7.14.1 10.2" --push # build + push the release images
+./scripts/build-containers.sh --verify-only                # prove every tag RESOLVES, and that the
+                                                           # moving tags carry this release (exit 1 if not)
 
 # fast smoke: one ROCm line, one GPU arch, one target, no push
 ./scripts/build-containers.sh --rocm 10.2 --arch gfx1201 --targets server
@@ -462,7 +475,12 @@ pin the block count, so a `v12-*` -> `v13-*` rename cannot make it go quiet (it 
 (not a version sort: the base SHA is in the tag name, so a re-base to a lower-sorting
 base would otherwise be missed), and if it differs from
 `~/.cache/rdna-containers/last-built`, checks it out and runs that tag's
-`scripts/build-containers.sh --rocm "7.14.1 10.2" --push --prune`.  `--prune`
+`scripts/build-containers.sh --push --prune`.  **It does not pass `--rocm`**: the ROCm line set is a property
+of the release, so it comes from the tag's own script (set `ROCM_LINES=...` in the environment only to
+override it deliberately).  That is not pedantry — the r366-lineage worker kept a 2026-11-06 copy of the
+watcher that hardcoded `--rocm "7.14.1 10.1"`, the delivery retired 10.1 on 2026-11-23 and made
+`build-containers.sh` refuse it, and **every release from r354 to r358 died 4 s in without publishing an
+image** (GitHub issue #364).  `--prune`
 removes the images just built plus dangling layers after a successful push, so the
 worker's disk stays bounded; the ROCm base images (~20 GB each) and the ccache
 store (bounded at `CCACHE_MAXSIZE=20G`) are deliberately kept.  A `flock` serialises
@@ -482,7 +500,14 @@ builds a stale tree *and* runs a stale script.  Refresh them when you touch the 
 git -C ~/llama-cpp-rdna-boosts fetch origin && git -C ~/llama-cpp-rdna-boosts checkout main \
   && git -C ~/llama-cpp-rdna-boosts reset --hard origin/main
 git -C ~/llama.cpp fetch origin rdna-boosts      # so build-containers.sh can borrow the tip's worktree
+# and the watcher itself, which is a COPY in ~/bin: refresh it from the checkout too
+install -m 0755 ~/llama-cpp-rdna-boosts/scripts/container-watch.sh ~/bin/rdna-container-watch.sh
 ```
+
+That last line is not optional bookkeeping: `~/bin/rdna-container-watch.sh` is an installed **copy**, so a
+change to `scripts/container-watch.sh` reaches the worker only when it is re-installed.  The r354-r358 outage
+was exactly this staleness (a 2026-11-06 copy that pinned the retired ROCm 10.1, GitHub issue #364); the
+watcher no longer defaults the line set, so the class is gone, but re-install it whenever the script moves.
 
 (`git branch --show-current` is empty on a detached checkout, so "the worker is on `main`" is not something to
 assume — check it.)
@@ -503,6 +528,17 @@ assume — check it.)
 * **Build logs are bounded.**  `KEEP_LOGS` (default **10**, one log is ~8 MB) prunes
   `build-*.log` after a successful build, so `~/.cache/rdna-containers` does not grow
   without bound (it had reached 67 logs / 768 MB).
+* **A failure is FILED, not just logged (r364-lineage, 2026-11-25).**  Everything above was correct and the
+  release images still went missing for five releases, because the only trace was the worker's own
+  `watch.log`: cron repeated `ERROR: … has failed 3 times; not retrying` every ten minutes for a day and a
+  **reporter** found it.  The watcher now opens ONE GitHub issue per tag
+  (`Release container images not published: <tag>`) on the first failure, comments only on a **state
+  change** (a retry that fails again is not news; the walk from attempt 1 to `MAX_ATTEMPTS` plus the park
+  is 4 notifications, then silence), and comments + **closes** it on the next successful build.  The body
+  carries the host, the attempt count, the log path and the tail of the log, so the issue is diagnosable
+  without shell access to the worker.  `NOTIFY=0` (log only) and `NOTIFY_REPO=<owner/repo>` (default:
+  derived from `gh repo view` in the checkout) are the knobs; a missing `gh` or a failed API call is a
+  `WARNING`, never a build failure.
 To build a release immediately instead of waiting for cron:
 
 ```bash

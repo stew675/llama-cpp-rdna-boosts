@@ -23,7 +23,9 @@
 #   RDNA_REPO     delivery repo checkout      (default $HOME/llama-cpp-rdna-boosts)
 #   LLAMA_DIR     llama.cpp checkout          (default $HOME/llama.cpp; passed as LLAMA_CPP_DIR)
 #   STATE_DIR     state + logs                (default $HOME/.cache/rdna-containers)
-#   ROCM_LINES    ROCm release lines          (default "7.14.1 10.2")
+#   ROCM_LINES    ROCm release lines to OVERRIDE the tag's own default with.  Leave it unset:
+#                 the line list is a property of the release, so it comes from the tag's
+#                 scripts/build-containers.sh (see the note at the assignment below).
 #   BUILD_EXTRA   extra args for build-containers.sh (e.g. "--no-cleanup")
 #   FORCE_TAG     build this tag even if it equals the last-built marker
 #   MAX_ATTEMPTS  failed attempts before this tag stops being retried automatically
@@ -31,6 +33,14 @@
 #                 cron is every 10 min and one build is 10-40 min, so an unfixed
 #                 failure pins the box indefinitely.
 #   KEEP_LOGS     build logs to keep in STATE_DIR (default 10; one is ~8 MB)
+#   NOTIFY        file/update a GitHub issue when a tag fails or parks (default 1; 0 = log only)
+#   NOTIFY_REPO   repo to file it in (default: this checkout's `origin`, via gh).  The issue closes
+#                 itself on the next successful build of the same tag.
+#
+# THE FAILURE SIGNAL (GitHub issue #364): a failed tag used to be visible only in this script's own
+# watch.log.  From r354 to r358 every build died in 4 s, cron wrote "has failed 3 times; not retrying"
+# every 10 minutes for a day, and nobody saw it -- a reporter did.  A failure, a park and a recovery are
+# now all filed as an issue, exactly once per state change (no 10-minute comment storm).
 #
 # Exit: 0 = nothing to do, a build succeeded, or this tag already failed MAX_ATTEMPTS
 #            times (reported in the log); 1 = a build/push failed and may be retried.
@@ -54,8 +64,20 @@ fi
 RDNA_REPO="${RDNA_REPO:-$HOME/llama-cpp-rdna-boosts}"
 LLAMA_DIR="${LLAMA_DIR:-$HOME/llama.cpp}"
 STATE_DIR="${STATE_DIR:-$HOME/.cache/rdna-containers}"
-ROCM_LINES="${ROCM_LINES:-7.14.1 10.2}"
+# The ROCm line set is NOT defaulted here, and it is passed through only when the operator sets it.
+# `build-containers.sh` in the checked-out TAG owns the default, so a worker whose copy of THIS file is
+# stale can no longer pin a retired line: on 2026-11-23 (r359-wip) the delivery dropped ROCm 10.1 and
+# made build-containers.sh REFUSE it, while the radiance worker still ran a copy from 2026-11-07 that
+# hardcoded "7.14.1 10.1" and always passed `--rocm` explicitly.  Every release from r354 to r358 died
+# ~4 s in with `unsupported ROCm release line: 10.1` and never published an image; nobody saw it because
+# the only trace was this script's own watch.log (GitHub issue #364, found by a reporter).  Never
+# re-introduce a line list default here -- the tag is the source of truth.
+ROCM_ARGS=()
+if [ -n "${ROCM_LINES:-}" ]; then
+    ROCM_ARGS=(--rocm "$ROCM_LINES")
+fi
 BUILD_EXTRA="${BUILD_EXTRA:-}"
+NOTIFY="${NOTIFY:-1}"
 FORCE_TAG="${FORCE_TAG:-}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 KEEP_LOGS="${KEEP_LOGS:-10}"
@@ -109,9 +131,114 @@ fi
 # A tag that keeps failing is not retried forever (see MAX_ATTEMPTS).  The counter is per
 # tag, so a new release is always attempted; clearing the file (or FORCE_TAG) revives it.
 FAILED_FILE="$STATE_DIR/failed-$tag"
+LOG="$STATE_DIR/build-$tag.log"
 attempt=$(( $(cat "$FAILED_FILE" 2>/dev/null || echo 0) + 1 ))
+
+# ---- the failure signal (GitHub issue #364) -------------------------------------------------------
+# One issue per tag, titled "Release container images not published: <tag>", created on the first failure,
+# commented only on a STATE CHANGE (a retry attempt that fails again is not news; a 10-minute comment storm
+# from cron is worse than silence), and commented + closed on the next successful build.  Every gh call is
+# bounded and non-fatal: a missing/expired token must never turn a build outcome into a script failure.
+issue_title() { echo "Release container images not published: $tag"; }
+
+notify_repo() {
+    [ -n "${NOTIFY_REPO:-}" ] && { echo "$NOTIFY_REPO"; return 0; }
+    timeout 60 gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true
+}
+
+open_issue() { # $1=repo $2=title -> number, or empty
+    timeout 90 gh issue list -R "$1" --state open --search "in:title \"$2\"" \
+        --json number,title --jq ".[] | select(.title == \"$2\") | .number" 2>/dev/null | sed -n '1p' || true
+}
+
+signal() { # $1=state (failed|parked|recovered)  $2=one-line detail
+    [ "$NOTIFY" = 1 ] || return 0
+    local state="$1" detail="$2" repo title num seen mark body
+    if ! command -v gh >/dev/null 2>&1; then
+        log "WARNING: gh not installed; '$state' is recorded only in this log"
+        return 0
+    fi
+    repo="$(notify_repo)"
+    if [ -z "$repo" ]; then
+        log "WARNING: cannot resolve the GitHub repo; '$state' is recorded only in this log (NOTIFY_REPO=... to pin it)"
+        return 0
+    fi
+    title="$(issue_title)"
+    num="$(open_issue "$repo" "$title")"
+    case "$num" in ''|*[!0-9]*) num="" ;; esac          # never hand a URL/message to `gh issue comment`
+
+    if [ "$state" = "recovered" ]; then
+        if [ -n "$num" ]; then
+            body="Recovered: **$tag** is published.
+
+$detail
+
+\`$0\` on \`$(hostname)\` cleared the failure marker; this issue closes itself."
+            timeout 90 gh issue comment -R "$repo" "$num" --body "$body" >/dev/null 2>&1 \
+                && timeout 90 gh issue close -R "$repo" "$num" --reason completed >/dev/null 2>&1 \
+                && log "closed issue #$num ($title)" || log "WARNING: could not close issue #$num"
+        fi
+        rm -f "$STATE_DIR/notify-$tag"
+        return 0
+    fi
+
+    # Suppress a repeat of the same state at the same attempt (cron runs every 10 minutes).
+    mark="$state/attempt-$attempt"
+    seen="$(cat "$STATE_DIR/notify-$tag" 2>/dev/null || true)"
+    body="The release container images for **$tag** have NOT been published.
+
+| | |
+|---|---|
+| state | \`$state\` |
+| tag | \`$tag\` |
+| host | \`$(hostname)\` |
+| attempt | $attempt/$MAX_ATTEMPTS |
+| detail | $detail |
+| build log | \`$LOG\` |
+
+"
+    if [ "$state" = "parked" ]; then
+        body+="This tag will **not be retried automatically** (\`MAX_ATTEMPTS=$MAX_ATTEMPTS\`).  Fix the cause, then:
+
+\`\`\`bash
+rm -f \"$FAILED_FILE\"
+FORCE_TAG=$tag $0
+\`\`\`
+"
+    else
+        body+="It will be retried by cron (every 10 minutes, up to $MAX_ATTEMPTS attempts).  The last lines of the build log:
+
+\`\`\`
+$(tail -40 "$LOG" 2>/dev/null || echo '<no log>')
+\`\`\`
+"
+    fi
+    body+="
+This issue is the container-build failure signal (GitHub issue #364); it closes itself when the tag publishes."
+
+    if [ -z "$num" ]; then
+        if num="$(printf '%s' "$body" | timeout 120 gh issue create -R "$repo" --title "$title" --body-file - 2>/dev/null | sed -n 's|.*/issues/\([0-9]*\).*|\1|p' | sed -n '1p')"; then
+            case "$num" in
+                ''|*[!0-9]*) log "WARNING: gh issue create returned no issue number (the issue may still have been filed)"; num="" ;;
+                *)           log "filed issue #$num ($title)" ;;
+            esac
+        else
+            log "WARNING: could not file the failure issue ($title)"
+        fi
+    elif [ "$seen" != "$mark" ]; then
+        printf '%s' "$body" | timeout 120 gh issue comment -R "$repo" "$num" --body-file - >/dev/null 2>&1 \
+            && log "commented on issue #$num ($state, attempt $attempt)" \
+            || log "WARNING: could not comment on issue #$num"
+    fi
+    echo "$mark" > "$STATE_DIR/notify-$tag"
+    return 0
+}
+
 if [ -f "$FAILED_FILE" ] && [ "$attempt" -gt "$MAX_ATTEMPTS" ]; then
-    log "ERROR: $tag has failed $((attempt - 1)) times; not retrying (fix it, then remove $FAILED_FILE)"
+    if [ "$(cat "$STATE_DIR/notify-$tag" 2>/dev/null || true)" != "parked/attempt-$attempt" ]; then
+        log "ERROR: $tag has failed $((attempt - 1)) times; not retrying (fix it, then remove $FAILED_FILE)"
+        signal parked "failed $((attempt - 1)) times; automatic retries are exhausted"
+    fi
     exit 0
 fi
 
@@ -122,6 +249,7 @@ log "new release $tag (last built: ${built:-none}); building (attempt $attempt/$
 fail() {
     echo "$attempt" > "$FAILED_FILE"
     log "ERROR: $* (attempt $attempt/$MAX_ATTEMPTS); not built"
+    signal failed "$*"
     exit 1
 }
 
@@ -133,7 +261,6 @@ want_rev="$(git rev-parse --verify -q "${tag}^{commit}")"
 have_rev="$(git rev-parse --verify -q HEAD)"
 [ "$want_rev" = "$have_rev" ] || fail "$tag resolves to $want_rev but HEAD is $have_rev"
 
-LOG="$STATE_DIR/build-$tag.log"
 # LLAMA_DIR is forwarded so build-containers.sh can borrow the canonical tip when
 # present; otherwise it reconstructs the tree from the base tarball + the patches.
 # --prune keeps the local disk bounded: after a successful push it removes the
@@ -143,12 +270,21 @@ LOG="$STATE_DIR/build-$tag.log"
 # broken image is left for inspection.
 # --force: `--src` is a DISPOSABLE materialized tree, so a stale one (a previous
 # release's tree) must never silently block a new release's build -- recreate it.
-if LLAMA_CPP_DIR="$LLAMA_DIR" ./scripts/build-containers.sh --rocm "$ROCM_LINES" --push --prune --force $BUILD_EXTRA >"$LOG" 2>&1; then
+if LLAMA_CPP_DIR="$LLAMA_DIR" ./scripts/build-containers.sh "${ROCM_ARGS[@]}" --push --prune --force $BUILD_EXTRA >"$LOG" 2>&1; then
     echo "$tag" > "$STATE_DIR/last-built"
     rm -f "$FAILED_FILE"
     # Keep the log directory bounded (one build log is ~8 MB).
     ls -1t "$STATE_DIR"/build-*.log 2>/dev/null | tail -n +$((KEEP_LOGS + 1)) | xargs -r rm -f
     log "$tag pushed (log: $LOG)"
+    # A previous failure for this tag is closed here.  A tag that was never failed has no issue, so nothing is
+    # filed on the ordinary path.  The evidence quoted is the END of the build log, which is where the pushing
+    # script's own `--verify-only` summary lands ("OK: all N tags for <release> resolve ...") -- the watcher does
+    # not re-implement that check, it carries the tag's own verdict.
+    signal recovered "Last lines of the build log:
+
+\`\`\`
+$(tail -10 "$LOG" 2>/dev/null || echo '<no log>')
+\`\`\`"
 else
     tail -20 "$LOG" >&2 || true
     fail "$tag build/push failed (log: $LOG)"

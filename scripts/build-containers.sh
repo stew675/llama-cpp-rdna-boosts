@@ -39,6 +39,13 @@
 #                      release cycle, so the previous base survives as a
 #                      rollback)
 #   --prepare-only     prepare + verify the source tree, then exit
+#   --list-tags        print the registry tags this configuration would build/push, then exit
+#                      (no source prep, no build; the single source of truth for tag names)
+#   --verify-only      check that every expected tag for the current release RESOLVES in the
+#                      registry, then exit 0 (all present) / 1 (missing or unverifiable).  No
+#                      source prep, no build.  This is what makes "the images were published"
+#                      checkable after the fact instead of inferred from a push's exit status
+#                      (GitHub issue #364)
 #   --force            recreate --src if it is not the release tree
 #   --no-cache         pass --no-cache to the container engine
 #   -h, --help         this help
@@ -47,6 +54,7 @@
 #   gh auth refresh -h github.com -s write:packages   # once
 #   gh auth token | podman login ghcr.io -u stew675 --password-stdin
 #   ./scripts/build-containers.sh --rocm "7.14.1 10.2" --push
+#   ./scripts/build-containers.sh --verify-only       # after the worker finishes: prove it landed
 #
 # Fast smoke (no push):
 #   ./scripts/build-containers.sh --rocm 10.2 --arch gfx1201 --targets server
@@ -69,6 +77,8 @@ PRUNE=0
 CLEANUP=1        # GHCR retention runs on --push; --no-cleanup disables it
 KEEP_DAYS=7
 PREPARE_ONLY=0
+LIST_TAGS=0
+VERIFY_ONLY=0
 FORCE=0
 NO_CACHE=""
 
@@ -89,6 +99,8 @@ while [ $# -gt 0 ]; do
         --no-cleanup)   CLEANUP=0; shift ;;
         --keep-days)    KEEP_DAYS="$2"; shift 2 ;;
         --prepare-only) PREPARE_ONLY=1; shift ;;
+        --list-tags)    LIST_TAGS=1; shift ;;
+        --verify-only)  VERIFY_ONLY=1; shift ;;
         --force)        FORCE=1; shift ;;
         --no-cache)     NO_CACHE="--no-cache"; shift ;;
         -h|--help)      usage; exit 0 ;;
@@ -99,6 +111,9 @@ done
 if [ "$PRUNE" -eq 1 ] && [ "$PUSH" -ne 1 ]; then
     die "--prune requires --push (refusing to delete images that were not published)"
 fi
+if [ "$VERIFY_ONLY" -eq 1 ] && { [ "$PUSH" -eq 1 ] || [ "$LIST_TAGS" -eq 1 ]; }; then
+    die "--verify-only does not build, push or list; run it on its own"
+fi
 case "$KEEP_DAYS" in ''|*[!0-9]*) die "--keep-days must be a non-negative integer (got: $KEEP_DAYS)" ;; esac
 
 command -v jq >/dev/null || die "jq is required"
@@ -106,12 +121,14 @@ command -v jq >/dev/null || die "jq is required"
 [ -f "$DOCKERFILE" ] || die "$DOCKERFILE not found"
 [ -f "$DOCKERIGNORE" ] || die "$DOCKERIGNORE not found"
 
+# An engine is only needed to BUILD; `--list-tags` and `--verify-only` read the manifest and the registry only,
+# so they must work on a box without podman/docker (a CI check, a laptop with skopeo).
 if command -v podman >/dev/null; then
     ENGINE=podman
 elif command -v docker >/dev/null; then
     ENGINE=docker
 else
-    die "neither podman nor docker is installed"
+    ENGINE=""
 fi
 
 base="$(jq -r .base "$MANIFEST")"
@@ -131,7 +148,7 @@ done
 # tip) instead of only the fork point, so `docker inspect` answers the question.  The fork-point tags stay for
 # compatibility and are what the GHCR retention keep-rule matches.
 echo "==> release ${release} (fork point ${base} -> tip ${tip}, ${n_blocks} official + 0300 temporary = ${n_default} default patches, tree ${tree})"
-echo "==> engine=${ENGINE}  image=${IMAGE}  src=${SRC}"
+echo "==> engine=${ENGINE:-<none: list-tags/verify-only do not build>}  image=${IMAGE}  src=${SRC}"
 
 remove_src() {
     if [ -e "$SRC/.git" ] && [ -d "$LLAMA_DIR/.git" ]; then
@@ -194,24 +211,6 @@ validate_rocm() {
     done
 }
 
-prepare_src
-cp -f "$DOCKERIGNORE" "$SRC/.dockerignore"
-echo "==> wrote build-context .dockerignore"
-
-if [ "$PREPARE_ONLY" -eq 1 ]; then
-    echo "==> prepare-only: $SRC is ready (tree $tree)"
-    exit 0
-fi
-
-validate_rocm
-
-avail_kb="$(df -Pk "$SRC" | awk 'NR==2 {print $4}')"
-if [ "${avail_kb:-0}" -lt 60000000 ]; then
-    echo "WARNING: only $((avail_kb/1024/1024)) GiB free on the source filesystem; the two full lines plus build layers can need ~80-120 GiB" >&2
-fi
-
-BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
 tags_for() { # $1=target  $2=rocm-line
     case "$1" in
         full)   echo "$IMAGE:full-rocm-$2 $IMAGE:full-rocm-$2-$base $IMAGE:full-rocm-$2-$release" ;;
@@ -223,6 +222,147 @@ tags_for() { # $1=target  $2=rocm-line
         *) die "unknown target: $1" ;;
     esac
 }
+
+# every tag this configuration builds and pushes, one per line
+all_tags() {
+    local v t tag
+    for v in $ROCM_LINES; do
+        for t in $TARGETS; do
+            for tag in $(tags_for "$t" "$v"); do echo "$tag"; done
+        done
+    done
+}
+
+# Does the image REF resolve in the registry?  Prints `PRESENT <digest>` / `ABSENT` / `UNKNOWN` and returns
+# 0 / 1 / 2.  REF is a FULL reference (`registry/repo:tag`, what `tags_for` emits).
+#
+# Why this exists (GitHub issue #364): the r358 release images never appeared, and the only evidence was a
+# reporter's `manifest unknown` a day later -- because the build loop treated a push's exit status as proof of
+# publication.  A push can succeed into a registry view nobody reads, a tag can be missing after a partial run,
+# and a stale worker can fail before it pushes anything at all.  So ask the REGISTRY, per tag.
+#
+# ABSENT is only reported on a definite "there is no such manifest" (a 404-equivalent from the registry API) --
+# an unreachable registry, an auth failure or a timeout reads UNKNOWN, never PASS (this repo's tooling rule: say
+# UNKNOWN rather than guess).  `skopeo inspect` is used when available because it is registry-agnostic and reads
+# the same credential files the push used; otherwise ghcr.io is probed directly over its v2 API with an anonymous
+# pull token (the package is public), which needs only curl + jq.  The digest is carried because a MOVING tag
+# (`latest`, `rocm-10.2`, `server-rocm-7.14.1`) that exists but still points at the PREVIOUS release is the
+# other half of the issue #364 report, and only a digest comparison sees it.
+registry_probe() { # $1=full image reference (registry/repo:tag)
+    local ref="$1" out code token digest
+    if command -v skopeo >/dev/null 2>&1; then
+        if out="$(timeout 120 skopeo inspect --no-tags --retry-times 3 "docker://$ref" 2>&1)"; then
+            digest="$(printf '%s' "$out" | jq -r '.Digest // empty' 2>/dev/null || true)"
+            echo "PRESENT ${digest:--}"; return 0
+        fi
+        case "$out" in
+            *"manifest unknown"*|*"name unknown"*|*"not found"*) echo ABSENT; return 1 ;;
+            *) echo UNKNOWN; return 2 ;;
+        esac
+    fi
+    case "$ref" in
+        ghcr.io/*)
+            # the token scope is per REPOSITORY (`owner/repo`), never per tag: `ref` carries the tag, so strip it
+            local path="${ref#ghcr.io/}"
+            path="${path%%:*}"
+            token="$(timeout 60 curl -fsSL \
+                "https://ghcr.io/token?scope=repository:${path}:pull&service=ghcr.io" 2>/dev/null \
+                | jq -r '.token // empty' 2>/dev/null || true)"
+            [ -n "$token" ] || { echo UNKNOWN; return 2; }
+            code="$(timeout 90 curl -s -o /dev/null -D - -w '%{http_code}' \
+                -H "Authorization: Bearer $token" \
+                -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+                "https://ghcr.io/v2/${path}/manifests/${ref##*:}" 2>/dev/null || true)"
+            digest="$(printf '%s' "$code" | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | tr -d '\r' | sed -n '1p')"
+            code="$(printf '%s' "$code" | tail -1)"
+            case "$code" in
+                200) echo "PRESENT ${digest:--}"; return 0 ;;
+                404) echo ABSENT; return 1 ;;
+                *)   echo UNKNOWN; return 2 ;;
+            esac ;;
+    esac
+    echo UNKNOWN; return 2
+}
+
+short_digest() { local d="${1#sha256:}"; echo "sha256:${d:0:12}"; }
+
+# Assert every tag THIS release owes is present AND that each moving tag resolves to this release's image.
+# Returns 1 on any MISSING / STALE (defect) or UNKNOWN (unverifiable -- a check must not pass on ignorance).
+verify_published() {
+    local tag state kind digest missing=0 unknown=0 stale=0 total=0
+    local -A digests=()
+    echo "==> verifying the ${release} tags resolve in the registry ($IMAGE)"
+    for tag in $(all_tags); do
+        total=$((total + 1))
+        state="$(registry_probe "$tag" || true)"
+        kind="${state%% *}"
+        case "$kind" in
+            PRESENT) digest="${state#PRESENT }"; digests["$tag"]="$digest"
+                     echo "    PRESENT  $tag  $(short_digest "$digest")" ;;
+            ABSENT)  echo "    MISSING  $tag  (manifest unknown)"; missing=$((missing + 1)) ;;
+            *)       echo "    UNKNOWN  $tag  (registry unreachable, auth refused or probe timed out)"; unknown=$((unknown + 1)) ;;
+        esac
+    done
+
+    # A moving tag that exists but still points at the PREVIOUS release is the symptom the reporter also named
+    # (`latest` and `server-rocm-7.14.1` still reported r353).  Every `X-<release>` tag must share its digest
+    # with the moving `X`; `latest` must be the 10.2 server image of this release.
+    for tag in "${!digests[@]}"; do
+        case "$tag" in
+            *-"$release") kind="${tag%-"$release"}"
+                if [ -n "${digests[$kind]:-}" ] && [ "${digests[$kind]}" != "${digests[$tag]}" ] \
+                   && [ "${digests[$kind]}" != "-" ] && [ "${digests[$tag]}" != "-" ]; then
+                    echo "    STALE    $kind  ($(short_digest "${digests[$kind]}") != ${release} $(short_digest "${digests[$tag]}"))"
+                    stale=$((stale + 1))
+                fi ;;
+        esac
+    done
+    local lt="$IMAGE:latest" ref="$IMAGE:server-rocm-10.2-$release"
+    if [ -n "${digests[$lt]:-}" ] && [ -n "${digests[$ref]:-}" ] \
+       && [ "${digests[$lt]}" != "${digests[$ref]}" ] \
+       && [ "${digests[$lt]}" != "-" ] && [ "${digests[$ref]}" != "-" ]; then
+        echo "    STALE    latest  ($(short_digest "${digests[$lt]}") != server-rocm-10.2-${release} $(short_digest "${digests[$ref]}"))"
+        stale=$((stale + 1))
+    fi
+
+    if [ "$missing" -gt 0 ] || [ "$unknown" -gt 0 ] || [ "$stale" -gt 0 ]; then
+        echo "==> FAILED: $missing missing, $stale stale, $unknown unverifiable, $((total - missing - unknown))/$total present (release ${release})" >&2
+        return 1
+    fi
+    echo "==> OK: all $total tags for ${release} resolve and every moving tag carries this release"
+}
+
+# The line set is refused BEFORE any source prep: a retired line must fail in a second with the reason
+# (issue #364 -- that message existed, but only after minutes of prep, and only in a worker's own log).
+validate_rocm
+
+if [ "$LIST_TAGS" -eq 1 ]; then
+    all_tags
+    exit 0
+fi
+
+if [ "$VERIFY_ONLY" -eq 1 ]; then
+    verify_published || exit 1
+    exit 0
+fi
+
+[ -n "$ENGINE" ] || die "neither podman nor docker is installed (needed to build; --list-tags/--verify-only do not)"
+
+prepare_src
+cp -f "$DOCKERIGNORE" "$SRC/.dockerignore"
+echo "==> wrote build-context .dockerignore"
+
+if [ "$PREPARE_ONLY" -eq 1 ]; then
+    echo "==> prepare-only: $SRC is ready (tree $tree)"
+    exit 0
+fi
+
+avail_kb="$(df -Pk "$SRC" | awk 'NR==2 {print $4}')"
+if [ "${avail_kb:-0}" -lt 60000000 ]; then
+    echo "WARNING: only $((avail_kb/1024/1024)) GiB free on the source filesystem; the two full lines plus build layers can need ~80-120 GiB" >&2
+fi
+
+BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 for v in $ROCM_LINES; do
     rocm_version="$(rocm_full "$v")"
@@ -263,15 +403,18 @@ done
 
 echo
 if [ "$PUSH" -eq 1 ]; then
+    # A push's exit status is NOT proof of publication (issue #364: the r358 images never existed while the
+    # build exits before them looked fine).  Ask the registry about every tag this release owes, on the box
+    # that pushed them, BEFORE the local prune and the registry retention run -- so a missing tag fails the
+    # build/push step loudly (the worker's watcher then files the failure issue) instead of turning up in a
+    # user report a day later.
+    echo "==> verifying every pushed tag resolves in the registry (a push that returns 0 is not proof)"
+    verify_published || die "one or more expected tags do not resolve in the registry -- the images are NOT fully published.  Re-check with: scripts/build-containers.sh --verify-only"
     echo "==> pushed:"
 else
     echo "==> built (not pushed; pass --push to publish):"
 fi
-for v in $ROCM_LINES; do
-    for t in $TARGETS; do
-        for tag in $(tags_for "$t" "$v"); do echo "    $tag"; done
-    done
-done
+all_tags | sed 's/^/    /'
 
 # Optional local cleanup: drop the images we just built and any dangling build
 # layers, but keep the (expensive) base images and the ccache store so the next

@@ -157,10 +157,14 @@ still open, stop before the release cut, the commit and the tag.
   the branch page's "updated <time>", which is the ref push.  Do not "fix" it by dating the commits or
   by pushing `master` — the dated commits ARE the reproducibility contract.  If in doubt: **compare trees, never SHAs**; a matching tree plus a `rdna-boosts` branch
   whose tip is `.tip` is the whole contract.
-- **Every release MUST also publish the ROCm container images.**  They are built and pushed
-  **off-host** by the worker watcher (`scripts/container-watch.sh` on `radiance`), which polls for the
-  new release tag and runs `scripts/build-containers.sh --rocm "7.14.1 10.2" --push --prune`; see
-  `CONTAINERS.md` → "Offload the image build to a worker".  **Do not run the full container image build
+- **Every release MUST also publish the ROCm container images — and verify they RESOLVE.**  They are
+  built and pushed **off-host** by the worker watcher (`scripts/container-watch.sh` on `radiance`), which
+  polls for the new release tag and runs that tag's `scripts/build-containers.sh --push --prune` (the ROCm
+  line set comes from the tag, never from the worker's copy of the watcher); see `CONTAINERS.md` →
+  "Offload the image build to a worker".  A push's exit status is **not** proof: after the worker reports
+  the tag pushed, run `scripts/build-containers.sh --verify-only` (a missing tag, or a moving tag that
+  still carries the previous release, exits 1 — GitHub issue #364, where r354-r358 published nothing and
+  only the worker's own log knew).  **Do not run the full container image build
   (all targets, both ROCm lines) on the primary box during a release**: it pins all cores for tens of
   minutes and contaminates any benchmark running beside it.  Nothing here changes the normal local
   **source** build for testing and development (`~/bin/build-llama-rocm`, Common tasks → "Build the
