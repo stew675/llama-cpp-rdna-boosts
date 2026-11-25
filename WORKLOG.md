@@ -16,6 +16,31 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.007 (r361, release cut) -- tagged, pushed, the fork branch refreshed to the re-cut tip, the images verified, issue #366 answered and closed
+
+**The cut.**  `v18-919794500-r361` = `41b54afa`, base `919794500`, tree
+`8962b7a40ea7e509a60d763b96a2ceeb0902521a`, 18 official + 1 temporary = 19 default blocks, 2 optional (`0100` tree
+`35ab35cf5`, `0101` tree `30a57b9a2`, cumulative `ae4981eac`; both re-applied STRICTLY on the new default tree, so
+only their recorded trees were re-derived, not the patches).  `scripts/validate-set.sh` green on the committed set,
+the rung reconciliation at `0 unexplained` with the two new variables counted as additions, tier-1 CI green on both
+`main` and the tag, and the GitHub Release carries its 4 assets.
+
+**The fork.**  `scripts/fork-refresh.sh --build --gates --push` re-cut the branch deterministically (two re-cuts read
+the same tip), asserted tree `8962b7a40e…`, built it, ran `check-shlib-symbols.sh` (**16/16**), the coherence gate and
+`gate-prefill-logits.sh` (**0.000000 / 100.000 %**, no GPU faults), and pushed:
+`gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` reads **`c7a4f0b6c`**, which is what
+`release.json.tip` records.  The patches were re-exported FROM that re-cut chain, so their `From` lines name the
+commits the fork carries.
+
+**The images.**  The worker (`radiance`) picked up the tag and published both ROCm lines off-host;
+`scripts/build-containers.sh --verify-only` reads **all 23 tags resolve and every moving tag carries this release**
+(the check that issue #364 exists for: a push's exit status is not evidence).
+
+**The issue.**  GitHub issue #366 answered with the reproduction, the mechanism, the exactness evidence and the two
+caveats (a >256-token penalty window still falls back; an adaptive speculator cannot be gated for text), and closed as
+completed, asking the reporter to re-run their mixed gfx1100 + gfx1201 pair with `presence_penalty 1.5` if they get a
+chance.
+
 ## 261125.006 (r361) -- a penalty no longer costs decode: the exact top-k fast path reproduces the penalties sampler (issue #366)
 
 **The report.**  GitHub issue #366 (`@mjohanning99`): a presence penalty of `0.15` cost **5.7 %** of MTP decode on
