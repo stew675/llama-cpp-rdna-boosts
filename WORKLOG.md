@@ -1,3 +1,40 @@
+## 261124.014 (no release; docs) -- the variable catalogue split in two: `ENVIRONMENT.md` for the knobs, `DIAGNOSTIC.md` for the switches
+
+The catalogue was still 1 020 lines and ~440 rows after the 261124.013 cleanup, which is too much for the one
+job it has: telling a consumer which variable to set.  The audience is really two: an operator choosing a
+feature or a value, and a maintainer turning a default-on feature off, proving an arm ran or bisecting a
+regression.  Split on that line.
+
+* **`ENVIRONMENT.md`** (751 lines, 203 table rows) -- the **opt-in** features, the **tuning** values, the
+  **options** (with their env spellings) and the one **numerics selector**.
+* **`DIAGNOSTIC.md`** (667 lines, 282 rows) -- every **kill-switch**, **A/B and bisection arm**, **test-only**
+  hook and **diagnostic**: the things that exist to disable or to observe.  Nothing there is needed to run the
+  delivery and nothing there is a supported configuration.
+
+**The split is mechanical, not curated**: a row goes to `DIAGNOSTIC.md` when its class cell *starts* with
+kill / diagnostic / A/B / test / retired / safety / opt-out, else it stays.  Five class cells were corrected
+first, because their leading word named the opposite of the headline purpose (`MOE_HOST_POOL_RAM_PCT` and
+`LLAMA_KV_SPILL_RAM_PCT` are ceilings with a `0` that disables them; `LLAMA_STATE_PIPE_GROUPS` is a group
+count; `MOE_HOST_POOL_RANK` is a mode selector; `LLAMA_SERVER_PREFILL_DUTY` is a burst length).  Two rows moved
+the other way on the same principle: the `FA`/`KV`/`RS` internal-probe group went to `DIAGNOSTIC.md`, and
+`GGML_CUDA_AR_KER_EVENTS` stayed with the diagnostics it restores.
+
+**Section numbers are unchanged in both files** -- they are a contract (`ENVIRONMENT.md` §7.4 and friends appear
+in 30+ places).  Each file therefore carries the full skeleton: a section with nothing for that file keeps its
+heading and one pointer line naming the other file's section, so `§20` reads sensibly whichever door you came
+through.  `§17.0`/`§17.1`/`§17.2` gained a real **class** column (they had none, which is how the pool's debug
+rows ended up indistinguishable from the pool's own knob); `§13` retired names, `§14` build-time flags, `§12`
+runtime variables and `§4.1` tags stay here, since they are option-name references rather than switches.
+
+**No code change, no release, no gate.**  `release.json`, `patches/` and `scripts/` are untouched except one
+stale comment in `scripts/gate-kv-residency.sh` ("see `ENVIRONMENT.md` block 15", now the correct
+`DIAGNOSTIC.md` 17.1).  Cross-references that named a section whose rows are now all in `DIAGNOSTIC.md` were
+repointed: `AGENTS.md` (rule 9, the layout table, the docs-one-job paragraph, block 17's knobs),
+`README.md` (5 places), `MANIFESTS.md` (gate 00), `patches/README.md` (7), `INVARIANTS.md` (2),
+`GREEDY-PURITY.md` (2), `TODO.md` (1) and two `benchmarks/` records that cite the §1.2 r40 rule.  `AGENTS.md`
+rule 9 now names both files, and "a new section is added to both", so the next variable cannot land in the
+wrong half by omission.
+
 ## 261124.013 (no release; docs) -- `ENVIRONMENT.md` is a catalogue again, not a campaign diary
 
 `ENVIRONMENT.md` had grown to 1 923 lines, of which the overwhelming majority was **not** a variable

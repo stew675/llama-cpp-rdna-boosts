@@ -366,8 +366,10 @@ the two `SLAB_INIT`/`re-arm` WARNs.
 
 - [QFN Memory Usage](QFN-Memory-Usage) — the 24 GiB `gfx1100` record this page is a companion to
 - [`ENVIRONMENT.md`](https://github.com/stew675/llama-cpp-rdna-boosts/blob/main/ENVIRONMENT.md) —
-  `GGML_CUDA_SLAB_HEADROOM_MIB`, `MOE_EXPERT_CACHE_MIB`, §1's "why the cards sit near-full" and the
-  r214 narrow-2 note, §17.1 (the attendance pool)
+  `GGML_CUDA_SLAB_HEADROOM_MIB`, `MOE_EXPERT_CACHE_MIB`, §1.3 (the slab, its headroom and the draft's
+  narrow-2 region), §17.1 (the attendance pool)
+- [`DIAGNOSTIC.md`](https://github.com/stew675/llama-cpp-rdna-boosts/blob/main/DIAGNOSTIC.md) — the
+  kill-switches behind those knobs (same section numbers)
 - [`patches/README.md`](https://github.com/stew675/llama-cpp-rdna-boosts/blob/main/patches/README.md)
   — block 14 (streamed KV / attendance pool) and block 15 (`-lme` host-expert tiers)
 - [`INVARIANTS.md`](https://github.com/stew675/llama-cpp-rdna-boosts/blob/main/INVARIANTS.md) —

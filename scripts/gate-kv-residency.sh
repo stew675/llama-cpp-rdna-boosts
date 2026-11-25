@@ -30,7 +30,7 @@
 #   check of the VMM hazard):
 #     wselftest     default arm -- must print the PASS verdict
 #     wselftest0    `LLAMA_KV_REGION_QUARANTINE=0` -- must print the FAIL verdict, or the oracle is vacuous
-#   (Both need `llama-cli -v`: the PASS verdict is a WARN line -- see `ENVIRONMENT.md` block 15.)
+#   (Both need `llama-cli -v`: the PASS verdict is a WARN line -- see `DIAGNOSTIC.md` 17.1.)
 #   Window (4B Q8_0, 1 GPU, `-c 16384` f16 KV, a 5 246-token prompt, so the run depth is ~5 300):
 #     wref          no knob: the plain device KV (the reference text)
 #     wres          W=8192, ABOVE the run depth: nothing spills, so no mapping may ever flip to host

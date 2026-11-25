@@ -3244,7 +3244,7 @@ two-slot unified server answered `209 5cc901c01994` / `316 6f84cc5be35a` in both
 (27B, d8192) and **+0.9 %** (35B-A3B, d8192), depth 0 within the run-to-run spread, `llama-batched-bench
 -npl 1,4,8` +1.1 / +0.1 / +0.05 %, pp512 flat.
 
-**Record.**  This entry; `scripts/gate-gdn-norm-gate.sh`; `patches/README.md` block 10; `ENVIRONMENT.md` §7.1;
+**Record.**  This entry; `scripts/gate-gdn-norm-gate.sh`; `patches/README.md` block 10; `DIAGNOSTIC.md` §7.1;
 `MANIFESTS.md` gate 41; `INVARIANTS.md` r353; `WORKLOG.md` 261123.004; §60 rule 2 (the fused-norm reduction
 contract this inherits) and §49 (the multi-sequence fusion class the `ne[3]` guard keeps it out of).
 
@@ -3283,5 +3283,5 @@ inaccuracy, it is the one property the block exists to provide, silently absent.
 every fusion this repo adds is an invitation to take one rounding out of a chain that a CPU oracle had as two.
 
 **Record.**  This entry; `scripts/gate-tq.sh` (arm 1, with the `k=256`-vs-`k>256` diagnosis); `patches/README.md`
-block 17; `ENVIRONMENT.md` §25; `MANIFESTS.md` gate 42; `INVARIANTS.md` r356; `WORKLOG.md` 261124.012;
+block 17; `DIAGNOSTIC.md` §25; `MANIFESTS.md` gate 42; `INVARIANTS.md` r356; `WORKLOG.md` 261124.012;
 `archive/work/tq-hip/` (the campaign record and the submitted patch's own claim).

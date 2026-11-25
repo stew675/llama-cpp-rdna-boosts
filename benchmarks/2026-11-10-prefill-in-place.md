@@ -9,7 +9,7 @@ D2D-ing it into the split input — once per table per prefill ubatch.
 
 ## Why this is not the r40 mechanism coming back
 
-`ENVIRONMENT.md` §1.2's r40 note and `TODO` #273 both warn against an "in-place/remap prefill read". That
+`DIAGNOSTIC.md` §1.2's r40 note and `TODO` #273 both warn against an "in-place/remap prefill read". That
 removed machinery was a **device-side policy**: it decided per expert (resident vs complement) and read
 the resident half in place while fetching the complement, with a device map, deferred promotion and
 device mirrors. It was slower than staging, and the archive refutes it.

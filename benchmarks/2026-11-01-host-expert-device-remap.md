@@ -17,7 +17,7 @@ Two changes, each with its own kill switch:
 
 It removes a device synchronize per routed op (the eager path pays `ggml_backend_synchronize(input_backend)`
 plus the ids readback's own sync) while keeping every expert read on the same bytes, and it is deliberately
-much narrower than the device-*policy* family removed in r40 (`ENVIRONMENT.md` §1.2 records the difference:
+much narrower than the device-*policy* family removed in r40 (`DIAGNOSTIC.md` §1.2 records the difference:
 host policy, one small map kernel, no device mirrors, no KSLOT, no promotion, no prefill path, and it
 declines under `-sm tensor`).
 

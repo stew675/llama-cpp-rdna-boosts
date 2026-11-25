@@ -7,8 +7,9 @@ k-quant decode paths, a hybrid all-reduce, qwen4exp (Qwen3.8-Flash-Next)
 support, and an attention-memory campaign that frees several GiB of VRAM.
 
 **Everything this delivery adds is default-on — you should not need to set any environment variable.**
-[`ENVIRONMENT.md`](ENVIRONMENT.md) documents every variable the set adds or repoints: its default, and
-whether it is a kill-switch (default-on, set to disable), an opt-in, a tuning value, or a diagnostic.
+[`ENVIRONMENT.md`](ENVIRONMENT.md) documents every end-user variable the set adds or repoints — the opt-ins,
+the tuning values and the options, with their defaults — and [`DIAGNOSTIC.md`](DIAGNOSTIC.md) holds the
+kill-switches, A/B arms and diagnostics, which you only reach for when something is wrong or you are bisecting.
 
 It ships as **19 default patches** for a clean llama.cpp checkout at the fork point **`919794500`**
 (upstream master, the 2026-11-20 re-base): the **18 official supported blocks `0000`-`0017`** plus the **temporary block
@@ -43,7 +44,8 @@ bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 18 default bl
 - One-line summary of each block: [The blocks](#the-blocks)
 - What each block contains, its knobs and its purity notes: [`patches/README.md`](patches/README.md)
 - The folded `mmb`/QSA campaign: [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery)
-- Every environment variable, with its default and class: [`ENVIRONMENT.md`](ENVIRONMENT.md)
+- Every environment variable, with its default and class: [`ENVIRONMENT.md`](ENVIRONMENT.md) (the knobs)
+  and [`DIAGNOSTIC.md`](DIAGNOSTIC.md) (the switches, A/B arms and diagnostics)
 - **Running a model bigger than your VRAM on one card** (`-ncmoe` + the MoE expert cache, with the
   measured config tables and the measurement method): [`COMMUNITY-CONFIG.md`](COMMUNITY-CONFIG.md)
 - What changed recently: [`WORKLOG.md`](WORKLOG.md)
@@ -140,7 +142,8 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── GREEDY-PURITY.md       # purity rulebook: invariants + one summary entry per finding (read before shipping)
 │                          #   narratives/evidence: WORKLOG.md + benchmarks/ (and pre-r100: archive/docs/GREEDY-PURITY-FINDINGS.md)
 ├── WORKLOG.md             # dated delivery records (newest first; the only release history)
-├── ENVIRONMENT.md         # every env var the set adds or repoints, with its default and class
+├── ENVIRONMENT.md         # the end-user env vars (opt-in/tuning/options), with default and class
+├── DIAGNOSTIC.md          # the kill-switches, A/B arms, test hooks and diagnostics
 ├── CONTAINERS.md          # the ROCm container images + the off-host build watcher
 ├── COMMUNITY-CONFIG.md    # running a model bigger than VRAM (`-ncmoe` + the expert cache)
 ├── rdna-boosts-all.patch  # convenience: the entire 19-patch default net as ONE patch
@@ -203,7 +206,8 @@ RAM is refused at load with the fix instead of being left to swap.  Measured: **
 box**, +15.6 % decode from the direct fill, +13.7 % warm / +56-67 % on a >RAM model from the RDNA3_5 transport start
 arm, +63-67 % prefill from streaming only what is not resident — with the logits unmoved (KLD -0.000000).  The tier
 is **inert on a discrete GPU, measured** (zero census lines with its envs forced on; `gate-host-pool.sh` 42/42).
-`ENVIRONMENT.md` §20 is the knob list, `patches/README.md` → Block 15 the detail, and
+`ENVIRONMENT.md` §20 (tuning) and `DIAGNOSTIC.md` §20 (the tier's kill switches) are the knob lists,
+`patches/README.md` → Block 15 the detail, and
 `archive/work/apu-expert-gtt/` the campaign record.
 
 **r307 fixed issue #327 — the host-expert cache's take-over promise was scoped by buffer address, not by pass.**
@@ -226,7 +230,7 @@ step, including one with nothing decoding, where it bounds nothing -- on the fie
 3036 t/s** for the same 65536 tokens.  A step with no slot generating now takes the whole `-b` window (shared
 max-min fairly, so the number of concurrent prompts is irrelevant); `LLAMA_SERVER_PREFILL_CHUNK` is the option's
 deprecated alias.  Gates: `scripts/gate-prefill-fairness.sh` and `scripts/gate-prefill-duty.sh`;
-`ENVIRONMENT.md` §22.
+`ENVIRONMENT.md` §22 (the tuning half) and `DIAGNOSTIC.md` §22 (the on/off half).
 
 **r287 added block 17 — mixed K/V cache types (PR #312); r288 made it optional block `0101`.**  The
 delivery refused every `type_k != type_v` pair since 2026-09-11 because a mixed pair could not take the
@@ -260,7 +264,7 @@ artifact and review: `archive/work/mixed-kv/`.
 | `0013` | **MTP draft vocabulary subset** (`--spec-draft-mtp-vocab N`, **opt-in**, default off) | the MTP draft scores only the LM-head rows for token ids < N (+ control/user ids) and scatters them into a full-vocab row of `-inf` — the target's verification is untouched, so the draft can only lose proposals; the `ggml-backend-meta` row-range read that makes it work under `-sm tensor` (r107) |
 | `0014` | **streamed KV** (**all three placements opt-in, default OFF since r247**: `--kv-window` / `--kv-attendance-pool` window and pool, and `--spec-draft-kv-window`, the MTP draft ring — see `ENVIRONMENT.md` §17 for why the draft ring's old default was a decode regression) | the KV's VRAM cost becomes a resident **window** of the newest `W` cells instead of `-c` cells: one VA reservation holds the cache, the window is VRAM and everything older is pinned system RAM, so a context that OOMed now runs (27B Q8_0 `-c 262144` = 128 MiB VRAM + 8576 MiB pinned host) and the VRAM the KV does not need *yet* goes to the expert-cache arena (+2.2…+2.9 GiB at `-c 262144`, `-n 2000`). A spilled KV is numerically transparent (prefill-logit KLD −0.000000 / 100.000 % on a spilling arm); unset = byte-identical to a build without it, including the OOM (r178, promoted from `archive/work/kv-residency`)  **The same block also carries the attendance pool** (r190, Goal B: `--kv-attendance-pool on\|off`, whose size is derived from the model since r247 — the KV's authoritative copy in a pinned host mirror plus a compact device pool of indexer-block pages the sparse decode resolves through, 204 MiB instead of 1.6-2.4 GiB of resident KV at 103k-180k, `--fit`-visible) and the streaming arm policy (a streamed cache takes the sparse decode arm, +34 %/+47 % on a spilled KV).  Both placements are **opt-in and default off**  + r204: the same **window across a `-sm tensor` split** (`TODO` #124): one VMM region per child device of the Meta wrapper, the grow fanned out to every child, `--fit` sizing it against the split's per-device budget (a MIRRORED dsv4/HRM cache still declines it); + r222: the provider binds the device at every driver-reaching entry point and a buffer type answers capability without touching the driver, so a **plain** 2-GPU `-sm tensor` run does no VMM driver call at all (issue #275: the construction-time probe ran cross-context, which crashed the first kernel launch on Windows); + r248: the MTP draft ring is a **true** ring, so a batch the position window cannot place (an M-RoPE image chunk) evicts the drafter's oldest cells instead of failing the request, and a drafter failure can no longer return a 500 (issue #297) |
 | `0015` | **the UMA GTT expert store** (an APU's MoE expert set in one registered region; `-lme` sizes it and is the streaming opt-in) | new in r263: the arena tier per `-lme`, the MTP head pinned outside that budget, the direct fill, the RDNA3_5 transport start arm, and prefill streaming.  Inert on a discrete GPU (measured) |
-| `0017` | **TQ1_0 / TQ2_0 (ternary) weights on the GPU** (**default-on**, `GGML_CUDA_TQ=0` refuses the types again) | a ternary model (`BitNet` b1.58 and its conversions) had no GPU path at all — `supports_op` refused the two types, so with `-ngl 99` the weights stayed in host memory and the CPU backend ran every matmul (~11 t/s decode on three R9700s).  This adds `MUL_MAT` (not `MUL_MAT_ID`), `GET_ROWS` and the fp16/fp32/bf16 dequantise rows, **bit-identical to the CPU backend's x86 AVX2 path** (the eight-lane integer dot, the Q8_K quantisation and `hsum_float_8`'s order, with an UNFUSED mul+add per block because ggml-cpu's is not contracted) — `test-backend-ops` with `LLAMA_TEST_OP_NMSE=1` reads exactly 0 on all 305 `MUL_MAT` and 84 `GET_ROWS` values.  Decode takes a vec kernel that quantises src1 in shared memory and can fuse Q/K/V, gate+up+SWIGLU or matmul+residual-ADD (`GGML_CUDA_TQ_FUSE=0` turns all of it off); prefill takes an int8-WMMA kernel on RDNA4 and a small-batch `dp4a` kernel elsewhere.  Measured (one R9700): TQ2_0 pp512 **4177 vs 258** and tg128 **181.5 vs 21.8** against the CPU-backend arm; TQ1_0 **3693 vs 99.5** / **198.2 vs 16.1**; every non-TQ model untouched (text and rate measured).  Contributor PR #358; gate `scripts/gate-tq.sh`; knobs `ENVIRONMENT.md` §25 |
+| `0017` | **TQ1_0 / TQ2_0 (ternary) weights on the GPU** (**default-on**, `GGML_CUDA_TQ=0` refuses the types again) | a ternary model (`BitNet` b1.58 and its conversions) had no GPU path at all — `supports_op` refused the two types, so with `-ngl 99` the weights stayed in host memory and the CPU backend ran every matmul (~11 t/s decode on three R9700s).  This adds `MUL_MAT` (not `MUL_MAT_ID`), `GET_ROWS` and the fp16/fp32/bf16 dequantise rows, **bit-identical to the CPU backend's x86 AVX2 path** (the eight-lane integer dot, the Q8_K quantisation and `hsum_float_8`'s order, with an UNFUSED mul+add per block because ggml-cpu's is not contracted) — `test-backend-ops` with `LLAMA_TEST_OP_NMSE=1` reads exactly 0 on all 305 `MUL_MAT` and 84 `GET_ROWS` values.  Decode takes a vec kernel that quantises src1 in shared memory and can fuse Q/K/V, gate+up+SWIGLU or matmul+residual-ADD (`GGML_CUDA_TQ_FUSE=0` turns all of it off); prefill takes an int8-WMMA kernel on RDNA4 and a small-batch `dp4a` kernel elsewhere.  Measured (one R9700): TQ2_0 pp512 **4177 vs 258** and tg128 **181.5 vs 21.8** against the CPU-backend arm; TQ1_0 **3693 vs 99.5** / **198.2 vs 16.1**; every non-TQ model untouched (text and rate measured).  Contributor PR #358; gate `scripts/gate-tq.sh`; knobs `DIAGNOSTIC.md` §25 |
 | `0300` | **`-sm relaxed-tensor`** (**TEMPORARY**, `flint`/`mellum`/`mistral4` only) | tensor split that also admits a replicated tensor whose values differ per GPU (the MoE amax row max, which no device can complete). Exact on RDNA/HIP, zero VRAM, and **not a supported feature**: it relaxes upstream #31081 and is expected to be dropped when upstream fixes the amax under a tensor split. Delete this patch to get back to the r136 tree |
 
 Phase-2 additionally moved each concern into a self-contained file: the `ggml_cuda_try_fuse` arms, the
@@ -428,7 +432,7 @@ moe_cache_init: HIP runtime 7.16.26385 from C:\path\to\llama-server\amdhip64_7.d
 If it instead names `C:\Windows\System32`, the delivery logs a WARN with this remedy.  A box that cannot
 switch runtimes can still run the host-expert path with **`MOE_HOST_POOL_PIN=0`**: the pinned tier stays closed
 (no pool, no bounce/span ring) and every fill takes the pageable model mapping -- correct and slower, but it
-avoids the tier that the driver runtime cannot grow.  See `ENVIRONMENT.md` for both variables.
+avoids the tier that the driver runtime cannot grow.  Both variables: `DIAGNOSTIC.md` §1.2.1.
 
 ### Manual equivalent
 
@@ -541,7 +545,7 @@ code/prose-neutral with the same recall win.  The small reasoning cost is the pr
 >   `--spec-ngram-mod-n-min` (default 48) silently disables `ngram-mod` rather than shortening it.
 >
 > Mechanism and measurements: [`GREEDY-PURITY.md`](GREEDY-PURITY.md) §50,
-> [`ENVIRONMENT.md`](ENVIRONMENT.md) §3, and
+> [`ENVIRONMENT.md`](ENVIRONMENT.md) §3 and [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §3, and
 > [`archive/work/ngram-mod-host-experts/EVIDENCE-2026-10-24.md`](archive/work/ngram-mod-host-experts/EVIDENCE-2026-10-24.md).
 
 Guidance:
@@ -700,7 +704,8 @@ router, the shared-expert gate) fell back to rocBLAS's Tensile kernels.  Block 0
 hipBLASLt-enabled arm's 2027 t/s, with decode flat.  Nothing changes with hipBLASLt enabled (0 launches,
 prefill logits bit-identical), so a default run is unaffected; the delivery still never pins the variable
 itself.  If you pin for an unrelated reason on 10.2 (a hipBLASLt OOM at a tight slab headroom, say) you keep
-the speed as well.  Knobs: [`ENVIRONMENT.md`](ENVIRONMENT.md) §10.2.
+the speed as well.  Knobs: [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §10.2 (the switch), `ENVIRONMENT.md` §10.2 (the
+two tuning values).
 
 **Measured on both lines (r340, `TODO` #362) — and the delivery barely reaches hipBLASLt at all.**  The
 mapping above is now backed by an arm rather than by the upstream commit message, and it is backed on the

@@ -1264,7 +1264,7 @@ Record: `WORKLOG.md` 261119.006, `GREEDY-PURITY.md` §98, `patches/README.md` bl
    asserted: a decline is the protection firing, so requiring zero would punish it.
 
 Record: `WORKLOG.md` 261119.007, `benchmarks/2026-11-19-glu-inplace.md`, `patches/README.md` block 00,
-`MANIFESTS.md` gate 00/37, `ENVIRONMENT.md` §1.1b, `scripts/gate-glu-inplace.sh`, PR #334.
+`MANIFESTS.md` gate 00/37, `DIAGNOSTIC.md` §1.1b, `scripts/gate-glu-inplace.sh`, PR #334.
 
 ## r324 (2026-11-19, `WORKLOG.md` 261119.008) — the MoE weighted reduction is computed without fma contraction, and its fold outranks the MUL-only fold (contributor PR #335)
 
@@ -1556,7 +1556,7 @@ Record: `WORKLOG.md` 261121.007, `archive/work/r328-followups/` (§3 rows and `l
   tree must be `#define`d in `common.cuh`, and the grep must include `*.inc` (`.cu`/`.cuh`/`.h` alone misses a
   body file).  Audited clean at r331 apart from this one site, which now says `GGML_CUDA_CC_GB10`.  The same
   re-base pass also lost `ggml_cuda_should_fuse_rope_set_rows()`'s `GGML_CUDA_DISABLE_ROPE_SET_ROWS` kill switch
-  (restored; a bisect knob only, `ENVIRONMENT.md` §7.3).  Record: `WORKLOG.md` 261121.010.
+  (restored; a bisect knob only, `DIAGNOSTIC.md` §7.3).  Record: `WORKLOG.md` 261121.010.
 
 
 * **Per-block independent buildability is NOT a delivery property (r332, maintainer's decision 2026-11-21).**  The

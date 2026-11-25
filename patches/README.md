@@ -308,7 +308,7 @@
 > reorder-only Flash-Next IQ4_NL arm (`df389355f5e8`) unchanged given that its projection type takes neither epilogue.
 > Worth **+1.9 %** tg128 (Qwen3.6-35B-A3B UD-Q4_K_M, F32 arm) and **+1.0 %** (LMStudio Q4_K_M, Q4_K arm), MTP
 > +1.0/+0.8 %, `llama-batched-bench -npl 1,4,8` TG +2.1/+1.3/+0.9 % and +0.9/+2.8/+1.8 % with pp512 and the
-> Q8_0-alpha 27B control flat.  Record: `WORKLOG.md` 261117.003, `INVARIANTS.md` r304, `ENVIRONMENT.md` §7.1,
+> Q8_0-alpha 27B control flat.  Record: `WORKLOG.md` 261117.003, `INVARIANTS.md` r304, `DIAGNOSTIC.md` §7.1,
 > `MANIFESTS.md` (block 10 row).
 
 > **r299: a mid-run pinned-tier latch's MIXTURE is gated on the LOGITS (`TODO` #282 retired).**  Block **12** (the
@@ -773,7 +773,7 @@ split, tree-identical.
 > is negative-tested against the switch).  `scripts/gate-fusion-alias-copy.sh` now pins `GGML_GLU_INPLACE=0`
 > for its two trace arms, because the fused window's output can no longer land on the dead host-expert
 > scheduler copy — the protection is still needed wherever the rule does not apply, and the pinned arm proves
-> it still declines.  Record: `benchmarks/2026-11-19-glu-inplace.md`, `ENVIRONMENT.md` §1.1b.
+> it still declines.  Record: `benchmarks/2026-11-19-glu-inplace.md`, `DIAGNOSTIC.md` §1.1b.
 
 > **r275 amendment (issue #306 cleanup):** the `-Wshadow` arm is now scoped on clang.  Plain clang `-Wshadow` also
 > reports upstream's "local/parameter named after the field" idiom (102 sites, deliberately not renamed -- TODO #101),
@@ -1669,7 +1669,7 @@ judgement.
 keeps the rocBLAS call.  BF16/f16 prefill (Flash-Next) is untouched, so hipBLASLt keeps its large advantage
 there (and its per-start lottery — the BF16 counterpart is not claimed).  A **full-F32 model's FFN GEMMs
 (`m` ≫ 256) stay on rocBLAS**: the kernel would need a different tile to be competitive at wide `m`, and no
-such model is validated.  Default-on for RDNA4 **and RDNA3_5**, opt-in on RDNA3 (`ENVIRONMENT.md` §10.1; RDNA3
+such model is validated.  Default-on for RDNA4 **and RDNA3_5**, opt-in on RDNA3 (`DIAGNOSTIC.md` §10.1; RDNA3
 measured −1.3…−2.2 % at `pp2048` on gfx1100, so the lever there would be a per-arch tile, not the gate).
 
 **Contents.**  The `mmb` kernel family and its dispatch (`ggml-cuda.cu`); a per-quant type list
@@ -2304,7 +2304,7 @@ COUNT, so a slot-count change without a rebuild would read past the master.  `de
 `ggml_cuda_graph_mem_freed` (the map and lag buffers are kernel arguments of a captured graph).  The lag
 buffer is guarded by a system-scope atomic flag (one block per job) or a per-table event (wider batches),
 and the `dr_lag_n` counter is zeroed whenever the buffers are freed, so a stale lag can only perturb the
-*policy*, never a read address.  `ENVIRONMENT.md` §1.2 carries the r40 "removed, do not reintroduce" note
+*policy*, never a read address.  `DIAGNOSTIC.md` §1.2 carries the r40 "removed, do not reintroduce" note
 for the old device-*policy* family and why this is not it.
 
 **`--host-experts pool` reads a pool-resident miss in place (r203, same fold).**  A pool-backed table has a
@@ -2863,7 +2863,7 @@ next item) and the census to expect is `direct` ~= 0 with `properties_changed` i
 > 0 — the early weight-load prefetch block was compiled out on GB10 with no warning (inert on HIP; found by
 > `@briansp2020` reviewing the re-base).  `ggml_cuda_should_fuse_rope_set_rows()` also had its documented
 > `GGML_CUDA_DISABLE_ROPE_SET_ROWS` bisect switch removed by a conflict resolution; it is back, so
-> `ENVIRONMENT.md` §7.3 names a switch that exists again.  No default and no token moved (the switch is unset by
+> `DIAGNOSTIC.md` §7.3 names a switch that exists again.  No default and no token moved (the switch is unset by
 > default, and the GB10 arm is NVIDIA-only).  Record: `WORKLOG.md` 261121.010.
 >
 > **r329 amendment (housekeeping, no behaviour change): `tests/test-logits-width-probe.cpp` moved off the
@@ -3379,7 +3379,7 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
   (`GGML_CUDA_FUSE_GDN_NORM_GATE_CENSUS=1`) proves the arm is not vacuous: `fused silu=240` against
   `fused sigmoid=0` at default, `declined silu=240` with `GGML_CUDA_FUSE_GDN_NORM_GATE_SILU=0`.  Worth **+0.5 %**
   tg128 at depth 8192 on the 27B and **+0.9 %** on 35B-A3B (nothing at depth 0 beyond noise; `-npl 1,4,8`
-  +1.1 / +0.1 / +0.05 %).  Gate: `scripts/gate-gdn-norm-gate.sh`; knobs: `ENVIRONMENT.md` §7.1.
+  +1.1 / +0.1 / +0.05 %).  Gate: `scripts/gate-gdn-norm-gate.sh`; knobs: `DIAGNOSTIC.md` §7.1.
   The `xn->ne[3] != 1` shape guard is unchanged, so a multi-sequence ubatch still never matches this fold
   (the r108 / `GREEDY-PURITY.md` §49 class); `tests/test-fusion-gate-beta-multiseq` re-run 77/77 after the change.
 * **The fold's gate node takes the skip's decision** (r355, contributor PR #361).  Widening the matcher at r353
@@ -6396,7 +6396,7 @@ with TQ1_0 converted to TQ2_0 first (the same trits, the same `d`); every other 
 contiguous, stays on the small-batch kernel, which takes any batch.  `GET_ROWS` dequantises 4 values a thread through
 the shared dequantise helpers, so the same code serves f16/f32/bf16.
 
-**Knobs** (`ENVIRONMENT.md` §25): `GGML_CUDA_TQ=0` is the kill switch — the types are refused again and the pre-block
+**Knobs** (`DIAGNOSTIC.md` §25): `GGML_CUDA_TQ=0` is the kill switch — the types are refused again and the pre-block
 behaviour returns (the CPU backend runs them); `GGML_CUDA_TQ_FUSE=0` takes the decode fusions and the `graph_optimize`
 reorder away; `GGML_CUDA_TQ_CENSUS=1` prints, once per device at teardown,
 `TQ_CENSUS dev= mul_mat small= mma= get_rows= vec= vec_fused=`.

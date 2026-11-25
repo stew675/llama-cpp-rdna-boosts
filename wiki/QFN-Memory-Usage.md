@@ -300,6 +300,8 @@ multiply each tensor's element count by its type's bytes-per-block; `general.arc
   plus `-lme auto` resolves into)
 - [`ENVIRONMENT.md`](https://github.com/stew675/llama-cpp-rdna-boosts/blob/main/ENVIRONMENT.md)
   — `GGML_CUDA_SLAB_HEADROOM_MIB`, `MOE_EXPERT_CACHE_MIB`, `LLAMA_PLE_*`, `MOE_HOST_POOL_RAM_PCT`
+- [`DIAGNOSTIC.md`](https://github.com/stew675/llama-cpp-rdna-boosts/blob/main/DIAGNOSTIC.md)
+  — the kill-switches and diagnostics behind them (same section numbers)
 - [`wip/slab-draft-aux-reserve/`](https://github.com/stew675/llama-cpp-rdna-boosts/blob/main/wip/slab-draft-aux-reserve/README.md)
   — the open campaign this page's MTP/arena numbers came out of, and the **2.4 GiB draft-reserve
   accounting error** it found (the slab's `aux` reserve is written by the *last* preflight, so a
