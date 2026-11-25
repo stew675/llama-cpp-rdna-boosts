@@ -1,3 +1,143 @@
+## 261124.012 (release `v18-919794500-r356`, contributed PR #358 promoted as **block 17**) -- TQ1_0 / TQ2_0 (ternary) weights on the GPU: bit-identical to the CPU's AVX2 path, 8-37x over the CPU fallback, and the claim that did not reproduce until the accumulation was unfused
+
+`v18-919794500-r356`: contributor PR #358 (`@overdoingism`, submitted as `wip/tq-hip/`) gives `ggml-cuda` a
+`MUL_MAT` (not `MUL_MAT_ID`), a `GET_ROWS` and the fp16/fp32/bf16 dequantise rows for the two **ternary** weight
+types, so a BitNet-style model runs on the GPU instead of leaving every matmul on the CPU backend.  Before this,
+`supports_op` refused the types: with `-ngl 99` a TQ model decoded at ~11 t/s on a box with three R9700s, and on a
+`-sm tensor` split it did not run at all.  The maintainer's decision (this session) is a **new official block 17**,
+default-on.  The ordinal is positional and was the two-arm server's until r352 (that server stays in
+`beta/prefill-decode-arms/`); `n_blocks` 18 / `n_default` 19, base `919794500`, **tip `1aa098d85` / tree
+`2dbfffd60`**, optional artifacts `0100`/`0101` re-cut and verified against the new default tree.
+
+### 1. What it is, and what it is not
+
+* **It is a new capability, not a tuning change.**  Nothing in the delivery's own model set is ternary, so the
+  block is inert for every configuration the existing gates exercise — which is why its ledger is one new gate
+  (`scripts/gate-tq.sh`, MANIFESTS gate 42) plus a *neutrality* arm rather than a KLD ladder on the models here.
+* **The block's claim is bit-identity to the CPU backend's x86 AVX2 path**, and that is the design: a 2-bit weight
+  times a Q8_K activation has no dynamic range to spare, so the kernels reproduce `ggml_vec_dot_tq{1,2}_0_q8_K`
+  exactly — the Q8_K quantisation with its `+12582912.f` rounding trick, the eight 32-bit lanes (lane L takes the
+  values whose index mod 32 is `4L..4L+3`, minus the Q8_K `bsums` of values `32L..32L+31`), the per-lane
+  accumulation over blocks, and `hsum_float_8`'s summation order.
+* **Two decode fusions + a node reorder, one switch.**  With `GGML_CUDA_TQ_FUSE` (on unless `0`) one launch takes
+  Q/K/V, or gate+up+SWIGLU, or a matmul + its residual ADD; and `graph_optimize` moves the V/K projections directly
+  behind Q so the three are adjacent.  Every fused result is the separate ops' result bit for bit (measured: the
+  default and `FUSE=0` arms read one text at 64 and 200 tokens on gfx1201 and on gfx1151, below).
+* **Three knobs, one kill switch** (`ENVIRONMENT.md` §25): `GGML_CUDA_TQ=0` refuses the types again,
+  `GGML_CUDA_TQ_FUSE=0` takes the fusions and the reorder away, `GGML_CUDA_TQ_CENSUS=1` prints a per-device
+  launch census at teardown.
+* **Nothing outside `ggml/src/ggml-cuda/` is touched**, so every other backend keeps refusing the two types; the
+  CUDA/nvcc build is the one thing nobody has compiled (`TODO` #380).
+
+### 2. The claim that did not reproduce, and the three-line fix (`GREEDY-PURITY.md` §109)
+
+The submission stated that `test-backend-ops … LLAMA_TEST_OP_NMSE=1` reported "every error exactly 0".  On this
+repo's build it did not: **25 of 61** `MUL_MAT` cases read NMSE ≈ 1e-14, and the split was diagnostic — **every**
+`k=256` case (one Q8_K block) was exactly 0 and **every** `k>256` case was not.  The cause is the *premise*, not
+the arithmetic: the patch comment says the CPU accumulates each block "with one fma", but a Release clang build of
+`ggml-cpu` emits `vmulps` + `vaddps` for `_mm256_add_ps(_mm256_mul_ps(..), sumf)` and **no `vfmadd`** in either
+`ggml_vec_dot_tq*_0_q8_K` (disassembled on the delivery's own build).  The kernels now accumulate with the file's
+own `TQ_FMUL`/`TQ_FADD` (three sites: small-batch, vec, int8-WMMA), and **all 305 `MUL_MAT` and all 84 `GET_ROWS`
+values read exactly 0** — at no cost (TQ2_0 tg128 181.5 → 180.7 t/s, TQ1_0 198.2 → 197.7 on the same box, noise).
+`GET_ROWS` was already exact: it dequantises, it does not reduce.
+
+This is the entry's rule: **an "identical to the CPU" kernel matches the CPU's rounding, not the CPU's source**,
+and the class is invisible to every text/hash arm (a 1e-14 logit shift cannot flip a near-tie) — only the op
+oracle's NMSE column sees it, and only at a multi-block length.
+
+### 3. The reviewer's two other adjustments (both in the block, not in the wip record)
+
+* **A strided TQ1_0 weight DECLINES the MMA path instead of asserting.**  The int8-WMMA path converts the weight
+  to TQ2_0 flat (one kernel over the whole tensor), so it needs a contiguous `src0`; the submission asserted that
+  and would have aborted where the honest answer is the small-batch kernel, which takes every batch.  Measured
+  reachable-but-inert in every split the delivery validates (a tensor-split slab is contiguous), so it is a
+  decline added for the class, not a bug fixed in anger.
+* **The claims are restated** to what reproduces here: the commit message, `patches/README.md` block 17 and the
+  archive record carry the measured arms, the arch matrix and what is not covered, instead of the submitted
+  "every batch size, every error exactly 0".
+
+### 4. Measured
+
+**gfx1201** (one R9700, ROCm 10.2, `llama-bench -fa 1 -p 512 -n 128 -r 3`, mean t/s), against
+`GGML_CUDA_TQ=0` (the CPU backend, i.e. r355's behaviour): Llama3-8B-1.58 TQ2_0 pp512 **4048.8 vs 255.7**, tg128
+**181.6 vs 21.6**; TQ1_0 pp512 **3589.7 vs 99.4**, tg128 **198.6 vs 15.8**.  Op oracle: 61/61 `MUL_MAT` and 16/16
+`GET_ROWS` cases, **305/305 and 84/84 values exactly 0**.  Census (1 GPU, ~350-token prefill, `-n 8`):
+`small=442 mma=2210 vec=262 vec_fused=324`; `FUSE=0` → `vec=457 vec_fused=0`; `TQ=0` → all five counters 0.  Text:
+the default and `FUSE=0` arms read one text on both models at 64 tokens (`e5a9bb20d861`) and at 200
+(`63d079923c92`), on 1 GPU, on 3-GPU `-sm layer` and on 3-GPU `-sm tensor`; the CPU-placement arm reads the same
+text and shares all 539 characters.  **A TQ model on a 3-GPU tensor split also stops aborting**: on r355 it dies
+at `ggml-backend-meta.cpp:1460: GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]))` (measured), because every
+TQ matmul was placed on the CPU and split the Meta state; with the block the split runs and the census is live on
+all three devices.
+
+**gfx1151** (Strix Halo APU, ROCm 10.2, and this box builds with `GGML_HIP_NO_VMM` — gate 40's *other*
+configuration, compiled and run): op oracle **305/305 and 84/84 exactly 0**, so the bit-identity holds on the
+"no MMA path, the small-batch kernel takes every batch" code too; the default and `FUSE=0` arms read one text at
+64 (`e5a9bb20d861`) and at 200 (`c07a4b147258`) on both TQ models; the census shows `mma=0` by design (no RDNA4
+WMMA kernel) with the small-batch and vec kernels live; rate pp512 **633.8 vs 187.9**, tg128 **84.3 vs 20.9**
+against the CPU placement (3.4x / 4.0x — the APU's memory bandwidth caps the absolute number, as expected).
+
+**The one instrument that lied, and is now documented** (`gate-tq.sh`'s header): on gfx1151 the `GGML_CUDA_TQ=0`
+arm's 200-token text differs from the GPU arm's (326 vs 538 chars) *while the op oracle is exactly 0/305 there* —
+the two arms share a prefix and then settle into different repetition basins.  That arm is a different **op
+placement** (moving the TQ matmuls to the CPU drags their neighbours there too), not a reference: this model is a
+degenerate 1.58-bit Llama3 that loops, so *any* 1-ULP difference elsewhere flips which loop it enters
+(`GREEDY-PURITY.md` §38/§82: a text hash across placements is not an oracle).  The gate now gates
+`default == FUSE=0` (same placement) as HARD and reports the CPU arm with its shared prefix as INFO.  This is the
+kind of thing the cross-arch run exists to find: the same three-arm comparison *passed* on gfx1201 and would have
+been recorded as a purity property it never was.
+
+**Default-path neutrality** (the block adds a fusor and a `graph_optimize` pass that run for every graph):
+Qwen3.5-4B Q8_0 text `1c5d32ac537d` on 1 GPU and on 3-GPU `-sm tensor`, identical to the r355 build; 35B-A3B Q8_0
+3-GPU tensor `461ca8cd0e88` identical (pinned `MOE_EXPERT_HEATMAP=load,ROCBLAS_USE_HIPBLASLT=0`); pp512 at parity
+over five interleaved rounds (r355 8262-8286, r356 8250-8287, arm spread ±190 t/s), tg128 105.08 → 105.16 t/s;
+`llama-batched-bench -npl 1,4,8` 6866/8053/8041 → 6683/8020/8019 pp and 103.1/345.0/531.8 → 103.4/345.3/528.3 tg
+(B=1 noise, ≤0.7 % elsewhere).
+
+### 5. The gate ladder
+
+* `scripts/gate-tq.sh` (**MANIFESTS gate 42**) **PASS 18/18** on gfx1201, and 18/18 on gfx1151 after the two
+  instrument fixes above (its first gfx1151 run reported 4 failures, all instrument artefacts: log names with a
+  `/`, the CPU arm being gated as if it were a reference, and a per-device census that took the *first* of two
+  context lines).  `--self-test` (a pre-fix binary must fail arm 1) is the negative control.
+* `scripts/gate-prefill-logits.sh`: base recorded from the **r355** build on this ROCm line, r356 compared against
+  it — **mean KLD 0.000000 / same-top-p 100.000 %**.  The default path did not move, which is the release's
+  prefill contract.
+* `scripts/gate-lora-fusion.sh` **PASS** (block 17 adds a fusor to block 10's dispatcher, so the reader-count
+  contract is owed): the LoRA delta survives the fused chain, the adapter moves the text, the declines fire, the
+  `-ub 512` prefill arm is byte-identical, GPU faults clean.
+* `scripts/validate-set.sh` **GREEN**: 19/19 strict apply from a fresh tarball, tree `2dbfffd60`, both optional
+  artifacts re-cut to the new default tree and applied strictly (alone and cumulative), the Windows portability
+  lint clean, and the file-set reconciliation **0 unexplained** (18 blocks → 19, +13 defines, +3 env vars,
+  +0 options — the three TQ switches).
+* `scripts/check-gen-docs.sh` ok (no CLI option added), `scripts/check-shlib-symbols.sh` **16/16** on the whole
+  `all` build, `scripts/check-gpu-faults.sh` clean over the gate's and the KLD gate's windows, and the
+  `GGML_HIP_NO_VMM` configuration built and passed its own op oracle on gfx1151 (gate 40's second build).
+* **Not run, and why**: the adaptive-MTP four-axis protocol.  The fusor keys on `src0->type`, so no non-TQ graph
+  can reach it and no TQ model with an MTP head exists here: the arm would be vacuous by this repo's own rule
+  (an arm that cannot reach the changed code measures nothing), and the honest instruments for "the default path
+  did not move" are the neutrality text/rate arms, the `npl 1,4,8` row and the 0.000000 KLD point above.  The
+  **gfx1100 arm is owed**: `fingon` rebooted twice mid-build and then dropped off the network during this
+  session, so the gfx1100 row is not in this record (`TODO` #380 covers the CUDA build, not this).
+
+### 6. What it leaves open
+
+`TODO` **#380** — the CUDA (nvcc) build of `tq.cu` is unverified (no NVIDIA device or toolkit in this fleet, and
+CI compiles nothing), and it is the one part of "other backends uninjured" that is in scope.  Accepted
+limitations (recorded in `TODO.md` and in `patches/README.md` block 17): `MUL_MAT_ID` (a TQ MoE keeps its experts
+on the CPU backend), draft/MTP decoding with a TQ model, and a non-x86 CPU reference (the AVX2 path *is* the
+oracle).  The TQ1_0 prefill converts the weight it is about to read, which holds one extra TQ2_0 copy per distinct
+layer size in the pool (~16 MB on an 8B model) — measured inert at the rates above.
+
+### 7. Release facts
+
+`release.json`: `v18-919794500-r356`, `n_blocks` 18, `n_temporary` 1, `n_default` 19, `n_optional` 2, tip
+`1aa098d85` / tree `2dbfffd60` (a re-cut in a second checkout reproduces the tip — verified), optional trees
+`0100` `79a1fc9ef` / `0101` `669b40949` / cumulative `2f7f97dc9`.  The campaign record moved to
+`archive/work/tq-hip/` (with the submitted pre-fix patch kept as the reproduction for §2) and the `wip/` entry is
+deleted, per the promotion rule.  The PR gets a review naming the fix, the two instrument findings and the
+gfx1100 gap.
+
 ## 261124.011 (release `v17-919794500-r355`, contributed PR #361 promoted into block 10) -- the GDN norm-gate fold matches once per GDN layer: +2.1 % graphs-off decode, the default path flat, bit-identically
 
 `v17-919794500-r355`: contributor PR #361 (`overdoingism`, submitted as `wip/gdn-norm-gate-once/`) short-circuits

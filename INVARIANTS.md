@@ -3256,3 +3256,54 @@ it removed an abort (r374-wip) -- so the per-shape rule above stands, now on the
    **7 354 decisions, 0 mismatches** across qwen35 dense (1 GPU and 3-GPU `-sm tensor`, graphs on and off), qwen35moe
    and qwen4exp/Flash-Next.  For a "the same decision, cheaper" change this is cheaper than a KLD ladder and stronger
    than text alone, and it is how the SIGMOID arm (which no gate here can build at full size) gets covered.
+
+## r356 — TQ1_0 / TQ2_0 on the GPU: the bit-identity to the CPU is a property of the ACCUMULATION, and the arm that was supposed to prove it was a placement (block 17, contributor PR #358)
+
+1. **A "bit-identical to the CPU" kernel must reproduce the CPU's arithmetic AS COMPILED, and that is not the
+   arithmetic in the CPU's source.**  `ggml_vec_dot_tq{1,2}_0_q8_K` writes
+   `sumf = _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(sumi0), d), sumf)`; a Release clang/GCC build of
+   `ggml-cpu` emits `vmulps` + `vaddps` and **no `vfmadd`** for it (disassembled on this build, `-march=native`).
+   So the GPU's per-Q8_K-block accumulation must be an **unfused mul and add** (`TQ_FADD(TQ_FMUL(dot, y.d*x.d),
+   acc)`).  The submitted patch used `fmaf`, and its claim ("`LLAMA_TEST_OP_NMSE=1` … every error exactly 0") did
+   not reproduce: **25 of 61** `MUL_MAT` cases read ≈1e-14.  After the fix **305/305 `MUL_MAT` and 84/84
+   `GET_ROWS` values read exactly 0**, on gfx1201 and on gfx1151 alike, and the fix costs no rate (TQ2_0 tg128
+   181.5 → 180.7, TQ1_0 198.2 → 197.7 t/s).  `GET_ROWS` needed nothing: it dequantises, it does not reduce.
+2. **The failure has a diagnostic SHAPE, and the shape is the whole test.**  With a fused accumulation every
+   `k=256` case (one block, one addition onto a zero accumulator) is exactly 0 and **every** `k>256` case is not.
+   A bit-identity arm therefore has to include a multi-block length — a single-block arm passes a fused kernel —
+   and `scripts/gate-tq.sh` prints this `k=256`-vs-`k>256` split before it fails (`GREEDY-PURITY.md` §109).
+3. **`GGML_CUDA_TQ=0` is a PLACEMENT, not a reference, and a text hash across the two placements is not an
+   oracle.**  Moving the TQ matmuls to the CPU backend changes nothing about the TQ dot product — the op oracle
+   reads exactly 0 in both `-sm layer`/`-sm tensor` splits and on both boxes — but it also moves that block's
+   neighbouring ops onto the CPU, so the two arms are different configurations (the §38/§82 class).  Measured: on
+   gfx1201 the default, `GGML_CUDA_TQ_FUSE=0` and `GGML_CUDA_TQ=0` arms read one text at 64 and at 200 tokens
+   (all 539 characters shared); on **gfx1151** the first two agree at both lengths and the CPU arm shares a prefix
+   and then settles into a different repetition basin on this degenerate 1.58-bit model (326 vs 538 characters) —
+   with the NMSE still 0/305 **there**.  The gate's HARD text arm is `default == TQ_FUSE=0` (same placement) and
+   the CPU arm is reported with its shared prefix.  A release that quoted the three-arm agreement as a purity
+   property would have quoted gfx1201's luck.
+4. **The block also removes an abort it was not written for.**  On r355 a TQ model on a 3-GPU `-sm tensor` split
+   dies at `ggml-backend-meta.cpp:1460: GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]))`, because every TQ
+   matmul was placed on the CPU and the Meta split states diverged; with the block the split runs and the census
+   is live on each of the three devices (`small=442 mma=221 vec=262 vec_fused=195` per device on a 10.1 build;
+   `mma=2210` on the 1-device wide-prefill arm).  The kill-switch configuration on a split is still that abort/a
+   hang and is not a supported configuration, which is why the gate does not run it there.
+5. **The int8-WMMA prefill path needs a contiguous weight and must DECLINE, not assert.**  It converts TQ1_0 to
+   TQ2_0 with one kernel over the whole tensor, so a strided `TQ1_0` `src0` keeps the small-batch kernel (which
+   takes every batch) rather than tripping the conversion's contiguity assert.  Every split the delivery
+   validates hands it a contiguous slab (measured), so the decline is for the class, not a live path.
+6. **The default path is untouched, measured three ways.**  Text: 4B `1c5d32ac537d` on 1 GPU and 3-GPU
+   `-sm tensor`, 35B-A3B `461ca8cd0e88` on 3-GPU tensor, both identical to r355.  Prefill logits: KLD
+   **0.000000 / 100.000 %** against a base recorded from the r355 build on this ROCm line.  Rate: pp512 at parity
+   over five interleaved rounds (spread ±190 t/s on both builds), tg128 +0.08 %, `npl 1,4,8` within 0.7 %.  A
+   fusor added to block 10's dispatcher and a node reorder in `graph_optimize` both run for EVERY graph, so this
+   neutrality is the evidence that they are inert.
+7. **An arch with no MMA kernel is not a smaller version of the same test.**  gfx1151 (RDNA3.5, and the box builds
+   `GGML_HIP_NO_VMM` — gate 40's other configuration) takes the small-batch kernel for every batch and still reads
+   **305/305 exactly 0**, so the two kernel families are separately exact against the same CPU oracle; its `mma`
+   counter is 0 by construction and must not be read as a failure.  Rate there is 3.4x/4.0x over the CPU
+   placement (633.8 vs 187.9 pp512, 84.3 vs 20.9 tg128) — the APU's bandwidth, not the kernel.
+8. **The CUDA (nvcc) build of `tq.cu` has never been compiled** (`TODO` #380).  The clang-only pragma is
+   `defined(__clang__)`-guarded and `TQ_FMUL`/`TQ_FADD` fall back to `__fmul_rn`/`__fadd_rn`, and
+   `-use_fast_math` flushes subnormals — so the claim to test on an NVIDIA box is the **NMSE column**, not the
+   text, which will be coherent either way.
