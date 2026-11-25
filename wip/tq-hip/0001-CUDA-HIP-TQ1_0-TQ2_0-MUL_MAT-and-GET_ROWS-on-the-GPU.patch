@@ -1,0 +1,1195 @@
+From 363791a91045f1362615de291ccbf458e5633234 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:37:36 +0800
+Subject: [PATCH] CUDA/HIP: TQ1_0 / TQ2_0 MUL_MAT and GET_ROWS on the GPU,
+ bit-identical to the CPU backend (GGML_CUDA_TQ, on unless 0)
+
+Ternary weights (TQ1_0 / TQ2_0) had no GPU path: supports_op refused them, so the weights stayed in host memory and the
+CPU backend ran every matmul over them.  This adds MUL_MAT (not MUL_MAT_ID), GET_ROWS and the to_fp16 / fp32 / bf16
+conversions.
+
+- The MUL_MAT result is bit-identical to the CPU backend's x86 AVX2 path, for every batch size: src1 is quantized to Q8_K
+  as quantize_row_q8_K_ref does, each 256-value block's integer dot is split into the CPU's eight 32-bit lanes, each lane
+  is accumulated over the blocks with one fma by y.d*x.d, and the lanes are summed in hsum_float_8's order (tq.cuh).
+- Decode (one src1 column): a vec kernel that quantizes src1 into shared memory itself.  With GGML_CUDA_TQ_FUSE (on unless
+  0) it also takes the Q, K and V projections in one launch, gate + up + SWIGLU, and a matmul + its residual ADD; and
+  graph_optimize moves the V / K projections behind the Q projection so that the three are adjacent.  Every fused result
+  is that of the separate ops on this backend, bit for bit.
+- 2..16 columns: a small-batch kernel (dp4a).  Larger batches on RDNA4: int8 WMMA, one K = 32 MMA per block and lane
+  (TQ1_0 is converted to TQ2_0 first); elsewhere the small-batch kernel takes every batch.
+- GGML_CUDA_TQ=0 refuses the types again (the previous behaviour); GGML_CUDA_TQ_CENSUS=1 logs the launches per path when
+  the context is freed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh            |  27 +
+ ggml/src/ggml-cuda/convert.cu            |  38 ++
+ ggml/src/ggml-cuda/dequantize.cuh        |  28 +
+ ggml/src/ggml-cuda/getrows.cu            |  12 +
+ ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu |  84 +++
+ ggml/src/ggml-cuda/ggml-cuda.cu          |  64 +++
+ ggml/src/ggml-cuda/mmvq.cu               |   4 +-
+ ggml/src/ggml-cuda/tq.cu                 | 689 +++++++++++++++++++++++
+ ggml/src/ggml-cuda/tq.cuh                |  22 +
+ 9 files changed, 966 insertions(+), 2 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/tq.cu
+ create mode 100644 ggml/src/ggml-cuda/tq.cuh
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index f7d49b8dc..7400abbe2 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1466,6 +1466,28 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ4_NL> {
+     static constexpr int bs = sizeof(block_iq4_nl);
+ };
+ 
++// TQ1_0 (ggml-quants.c dequantize_row_tq1_0): the trit 0..2 of value e (0..255) of a block, the stored value being trit - 1.
++// qs[0..31] hold values 0..159 (digit e/32 of byte e%32), qs[32..47] values 160..239 (digit (e-160)/16 of byte
++// 32 + (e-160)%16), qh[0..3] values 240..255 (digit (e-240)/4 of byte (e-240)%4); digit n of byte b is
++// ((uint8_t) (b*3^n) * 3) >> 8.
++static __device__ __forceinline__ int ggml_cuda_tq1_0_trit(const block_tq1_0 * x, const int e) {
++    int b;
++    int n;
++    if (e < 160) {
++        b = x->qs[e % 32];
++        n = e / 32;
++    } else if (e < 240) {
++        b = x->qs[32 + (e - 160) % 16];
++        n = (e - 160) / 16;
++    } else {
++        b = x->qh[(e - 240) % 4];
++        n = (e - 240) / 4;
++    }
++    const int     p = n == 0 ? 1 : n == 1 ? 3 : n == 2 ? 9 : n == 3 ? 27 : 81;
++    const uint8_t q = (uint8_t) (b * p);
++    return ((uint16_t) q * 3) >> 8;
++}
++
+ template<>
+ struct ggml_cuda_type_traits<GGML_TYPE_IQ4_XS> {
+     static constexpr int qk = QK_K;
+@@ -1949,6 +1971,11 @@ struct ggml_backend_cuda_context {
+     // GGML_CUDA_FUSE_GDN_NORM_GATE_SILU=0 declined.  All three are counted AT THE GATE NODE, i.e. where the host walks
+     // the graph, so a replayed graph adds nothing.
+     uint64_t            gdn_norm_gate_census[3] = {};
++    // census (GGML_CUDA_TQ_CENSUS=1, logged when the context is freed): TQ1_0 / TQ2_0 weights, [0] MUL_MAT through the
++    // small-batch kernel, [1] MUL_MAT through the MMA kernel, [2] GET_ROWS, [3] decode launches of the vec kernel, [4] the
++    // nodes they took on top of the first matmul (fused matmuls and ADDs; GGML_CUDA_TQ_FUSE=0: none).  Host-side calls: a replayed graph
++    // adds nothing.
++    uint64_t            tq_census[5] = {};
+     const ggml_tensor * glu_q8_1_mm   = nullptr;
+     std::vector<q8_1_cache_entry> q8_1_cache;
+     size_t q8_1_arena_pos = 0;
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index eaaadd427..e63153b15 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -138,6 +138,20 @@ static __global__ void dequantize_block_q4_1(const void * __restrict__ vx, dst_t
+ 
+ //================================== k-quants
+ 
++template<typename dst_t>
++static __global__ void dequantize_block_tq1_0(const void * __restrict__ vx, dst_t * __restrict__ yy) {
++    const int64_t i = blockIdx.x;
++
++    dequantize_tq1_0(vx, i, yy + i*QK_K, threadIdx.x);
++}
++
++template<typename dst_t>
++static __global__ void dequantize_block_tq2_0(const void * __restrict__ vx, dst_t * __restrict__ yy) {
++    const int64_t i = blockIdx.x;
++
++    dequantize_tq2_0(vx, i, yy + i*QK_K, threadIdx.x);
++}
++
+ template<typename dst_t>
+ static __global__ void dequantize_block_q2_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+     const int64_t i = blockIdx.x;
+@@ -275,6 +289,18 @@ static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half *
+     }
+ }
+ 
++template<typename dst_t>
++static void dequantize_row_tq1_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
++    const int nb = k / QK_K;
++    dequantize_block_tq1_0<<<nb, 64, 0, stream>>>(vx, y);
++}
++
++template<typename dst_t>
++static void dequantize_row_tq2_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
++    const int nb = k / QK_K;
++    dequantize_block_tq2_0<<<nb, 64, 0, stream>>>(vx, y);
++}
++
+ template<typename dst_t>
+ static void dequantize_row_q2_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+     const int nb = k / QK_K;
+@@ -509,6 +535,10 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
+             return dequantize_block_cont_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+         case GGML_TYPE_Q8_0:
+             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
++        case GGML_TYPE_TQ1_0:
++            return dequantize_row_tq1_0_cuda;
++        case GGML_TYPE_TQ2_0:
++            return dequantize_row_tq2_0_cuda;
+         case GGML_TYPE_Q2_K:
+             return dequantize_row_q2_K_cuda;
+         case GGML_TYPE_Q3_K:
+@@ -571,6 +601,10 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
+                 return dequantize_block_q8_0_f16_cuda;
+             }
+             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
++        case GGML_TYPE_TQ1_0:
++            return dequantize_row_tq1_0_cuda;
++        case GGML_TYPE_TQ2_0:
++            return dequantize_row_tq2_0_cuda;
+         case GGML_TYPE_Q2_K:
+             return dequantize_row_q2_K_cuda;
+         case GGML_TYPE_Q3_K:
+@@ -630,6 +664,10 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
+             return dequantize_block_cont_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+         case GGML_TYPE_Q8_0:
+             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
++        case GGML_TYPE_TQ1_0:
++            return dequantize_row_tq1_0_cuda;
++        case GGML_TYPE_TQ2_0:
++            return dequantize_row_tq2_0_cuda;
+         case GGML_TYPE_Q2_K:
+             return dequantize_row_q2_K_cuda;
+         case GGML_TYPE_Q3_K:
+diff --git a/ggml/src/ggml-cuda/dequantize.cuh b/ggml/src/ggml-cuda/dequantize.cuh
+index a8cf54eb5..bb245e930 100644
+--- a/ggml/src/ggml-cuda/dequantize.cuh
++++ b/ggml/src/ggml-cuda/dequantize.cuh
+@@ -448,6 +448,34 @@ static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const
+     }
+ }
+ 
++// TQ1_0 / TQ2_0 (ternary): 64 threads per block, 4 values each; value = (trit - 1) * d as in ggml-quants.c
++template<typename dst_t>
++static __device__ __forceinline__ void dequantize_tq1_0(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
++    const block_tq1_0 * x = (const block_tq1_0 *) vx + ib;
++
++    const float d = __half2float(x->d);
++#pragma unroll
++    for (int k = 0; k < 4; ++k) {
++        const int e = tid + 64*k;
++        yy[e] = ggml_cuda_cast<dst_t>((float) (ggml_cuda_tq1_0_trit(x, e) - 1) * d);
++    }
++}
++
++template<typename dst_t>
++static __device__ __forceinline__ void dequantize_tq2_0(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
++    const block_tq2_0 * x = (const block_tq2_0 *) vx + ib;
++
++    // value 128*h + 32*l + m is bits 2l..2l+1 of qs[32*h + m]; thread tid takes byte tid
++    const int     h = tid / 32;
++    const int     m = tid % 32;
++    const uint8_t q = x->qs[tid];
++    const float   d = __half2float(x->d);
++#pragma unroll
++    for (int l = 0; l < 4; ++l) {
++        yy[128*h + 32*l + m] = ggml_cuda_cast<dst_t>((float) (((q >> (2*l)) & 3) - 1) * d);
++    }
++}
++
+ template<typename dst_t>
+ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+ 
+diff --git a/ggml/src/ggml-cuda/getrows.cu b/ggml/src/ggml-cuda/getrows.cu
+index 16421bb49..0bf2444ce 100644
+--- a/ggml/src/ggml-cuda/getrows.cu
++++ b/ggml/src/ggml-cuda/getrows.cu
+@@ -369,6 +369,14 @@ static void ggml_cuda_get_rows_switch_src0_type(
+             get_rows_cuda_q<QK8_0, QR8_0, dequantize_q8_0>(src0_d, src1_d, dst_d,
+                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+             break;
++        case GGML_TYPE_TQ1_0:
++            get_rows_cuda_kq<64, dst_t, dequantize_tq1_0<dst_t>>(src0_d, src1_d, dst_d,
++                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            break;
++        case GGML_TYPE_TQ2_0:
++            get_rows_cuda_kq<64, dst_t, dequantize_tq2_0<dst_t>>(src0_d, src1_d, dst_d,
++                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            break;
+         case GGML_TYPE_Q2_K:
+             get_rows_cuda_kq<64, dst_t, dequantize_q2_K<dst_t>>(src0_d, src1_d, dst_d,
+                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+@@ -474,6 +482,10 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+ 
++    if (src0->type == GGML_TYPE_TQ1_0 || src0->type == GGML_TYPE_TQ2_0) {
++        ctx.tq_census[2]++;
++    }
++
+     cudaStream_t stream = ctx.stream();
+ 
+     GGML_TENSOR_BINARY_OP_LOCALS
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 7caad189c..737aacc7b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -68,6 +68,7 @@
+ #include "ggml-cuda/sumrows.cuh"
+ #include "ggml-cuda/top-k.cuh"
+ #include "ggml-cuda/mean.cuh"
++#include "ggml-cuda/tq.cuh"
+ #include "ggml-cuda/tsembd.cuh"
+ #include "ggml-cuda/topk-moe.cuh"
+ #include "ggml-cuda/unary.cuh"
+@@ -2188,6 +2189,84 @@ static const ggml_tensor * ggml_cuda_get_mul_mat_id_scale(const ggml_tensor * re
+     return scale;
+ }
+ 
++// TQ1_0 / TQ2_0 weights, one src1 column (tq.cu's vec kernel): gate + up + SWIGLU as one launch that writes the GLU,
++// a matmul and the ADD of its result (the residual) as one launch that writes the ADD, or two or three matmuls over the
++// same src1 (e.g. the K and V projections) as one launch.  Every row keeps its own
++// unchanged dot product, and the GLU is computed as the GLU kernel does, so the results are those of the separate ops.
++// Returns the index offset of the last fused node.  GGML_CUDA_TQ_FUSE=0: off.
++static int ggml_cuda_tq_try_fuse(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i) {
++    static const bool on = [] { const char * e = getenv("GGML_CUDA_TQ_FUSE"); return e == nullptr || atoi(e) != 0; }();
++    const ggml_tensor * node = cgraph->nodes[i];
++    if (!on || node->op != GGML_OP_MUL_MAT || !ggml_cuda_mul_mat_tq_vec_ok(node)) {
++        return 0;
++    }
++    const auto same = [&](const ggml_tensor * t) {
++        return t->op == GGML_OP_MUL_MAT && (t->flags & GGML_TENSOR_FLAG_COMPUTE) && t->src[1] == node->src[1] &&
++               t->src[0]->type == node->src[0]->type && t->src[0]->ne[0] == node->src[0]->ne[0] &&
++               ggml_cuda_mul_mat_tq_vec_ok(t) && ggml_is_matrix(t->src[0]) && ggml_is_vector(t) && ggml_is_contiguous(t);
++    };
++    if (!same(node)) {
++        return 0;
++    }
++    if (i + 2 < cgraph->n_nodes) {
++        const ggml_tensor * mm1 = cgraph->nodes[i + 1];
++        ggml_tensor       * glu = cgraph->nodes[i + 2];
++        const ggml_op ops[3]    = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
++        const int     out[1]    = { i + 2 };
++        if (glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && !ggml_get_op_params_i32(glu, 1) &&
++                glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && same(mm1) &&
++                ((glu->src[0] == node && glu->src[1] == mm1) || (glu->src[0] == mm1 && glu->src[1] == node)) &&
++                ggml_are_same_shape(node->src[0], mm1->src[0]) && ggml_are_same_shape(glu, node) &&
++                ggml_can_fuse_subgraph(cgraph, i, 3, ops, out, 1) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out, 1)) {
++            const ggml_tensor * mm[2] = { glu->src[0], glu->src[1] }; // gate, up
++            ggml_cuda_mul_mat_tq_vec(*ctx, mm, 2, glu, nullptr);
++            return 2;
++        }
++    }
++
++    // matmul + ADD (the residual): the sum is written by the matmul's threads, element by element, so the ADD may write in
++    // place over its other operand, but not over the matmul's src1, which other thread blocks may still be reading
++    if (i + 1 < cgraph->n_nodes) {
++        ggml_tensor   * add    = cgraph->nodes[i + 1];
++        const ggml_op   ops[2] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
++        const int       out[1] = { i + 1 };
++        const ggml_tensor * res = add->src[0] == node ? add->src[1] : add->src[0];
++        const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++            const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a), b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
++            return a0 < b1 && b0 < a1;
++        };
++        if (add->op == GGML_OP_ADD && (add->src[0] == node || add->src[1] == node) && res != node &&
++                add->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32 && ggml_are_same_shape(add, node) &&
++                ggml_are_same_shape(res, add) && ggml_is_contiguous(add) && ggml_is_contiguous(res) &&
++                ggml_can_fuse_subgraph(cgraph, i, 2, ops, out, 1) && !overlap(add, node->src[1]) && !overlap(res, node->src[1]) &&
++                (!overlap(add, res) || add->data == res->data)) {
++            const ggml_tensor * mm[1] = { node };
++            ggml_cuda_mul_mat_tq_vec(*ctx, mm, 1, nullptr, add);
++            return 1;
++        }
++    }
++
++    const ggml_tensor * mm[3] = { node, nullptr, nullptr };
++    int n    = 1;
++    int last = i;
++    for (int j = i + 1; j < std::min(cgraph->n_nodes, i + 8) && n < 3; ++j) {
++        const ggml_tensor * t = cgraph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(t)) {
++            continue;
++        }
++        if (!same(t)) {
++            break;
++        }
++        mm[n++] = t;
++        last    = j;
++    }
++    if (n < 2) {
++        return 0;
++    }
++    ggml_cuda_mul_mat_tq_vec(*ctx, mm, n, nullptr, nullptr);
++    return last - i;
++}
++
+ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     if (ggml_cuda_fusion_disabled()) {
+@@ -2981,6 +3060,11 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+         return fused_node_count - 1;
+     }
+ 
++    // TQ1_0 / TQ2_0 decode (tq.cu): gate + up + SWIGLU, or two or three matmuls over the same src1, in one launch
++    if (const int n_tq = ggml_cuda_tq_try_fuse(cuda_ctx, cgraph, i)) {
++        return n_tq;
++    }
++
+     // Dual-output mmvq fusion (owned by mmvq.cu).  The row concat runs first (the submitter's order, measured identical to
+     // the reverse on gfx1100/gfx1201 -- see the block-15 notes in patches/README.md): it appends the rows of two more
+     // same-src1 matmuls to the largest weight's launch, while the dual-output keeps the equal-height pair it owns.
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a8241b6c9..18362ec5b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -47,6 +47,7 @@
+ #include "ggml-cuda/mmq-few.cuh"
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
++#include "ggml-cuda/tq.cuh"
+ #include "ggml-cuda/mmvq-wmma.cuh"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
+ #include "ggml-cuda/mmf32.cuh"
+@@ -1742,6 +1743,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+                           (unsigned long long) gdn_norm_gate_census[1], (unsigned long long) gdn_norm_gate_census[2]);
+         }
+     }
++    {
++        static const bool census = [] { const char * e = getenv("GGML_CUDA_TQ_CENSUS"); return e != nullptr && atoi(e) != 0; }();
++        if (census) {
++            GGML_LOG_WARN("TQ_CENSUS dev=%d mul_mat small=%llu mma=%llu get_rows=%llu vec=%llu vec_fused=%llu\n", device,
++                          (unsigned long long) tq_census[0], (unsigned long long) tq_census[1], (unsigned long long) tq_census[2],
++                          (unsigned long long) tq_census[3], (unsigned long long) tq_census[4]);
++        }
++    }
+     h2d_stage_free();
+ 
+     for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
+@@ -7446,6 +7455,11 @@ bool ggml_cuda_mul_mat_takes_mmq(ggml_backend_cuda_context & ctx, const ggml_ten
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
++    if (src0->type == GGML_TYPE_TQ1_0 || src0->type == GGML_TYPE_TQ2_0) {
++        ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);   // supports_op admits only what it takes (tq.cuh)
++        return;
++    }
++
+     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
+         return;
+     }
+@@ -10324,6 +10338,42 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+             i = j + 2;
+         }
+ 
++        // TQ1_0 / TQ2_0, 1-token graphs, attention without a Q norm (Llama, BitNet): the model graph runs the Q projection and
++        // its RESHAPE + ROPE before the V and K projections over the same input, so the decode fusion
++        // (ggml_cuda_tq_try_fuse) could take only V and K.  Move the V / K projections (MUL_MAT + the RESHAPE / VIEW of
++        // them, which read none of the Q nodes) directly behind the Q projection: the same nodes, one stream, so the
++        // results are bit-identical.  Structural only.  GGML_CUDA_TQ_FUSE=0: off.
++        static const bool tq_fuse = [] { const char * e = getenv("GGML_CUDA_TQ_FUSE"); return e == nullptr || atoi(e) != 0; }();
++        for (int i = 0; tq_fuse && i + 3 < cgraph->n_nodes; ++i) {
++            ggml_tensor ** n = cgraph->nodes;
++            const auto is_tq_mm = [&](const ggml_tensor * t) {
++                return t->op == GGML_OP_MUL_MAT && t->ne[1] == 1 && t->src[1] == n[i]->src[1] &&
++                       (t->src[0]->type == GGML_TYPE_TQ1_0 || t->src[0]->type == GGML_TYPE_TQ2_0);
++            };
++            if (!is_tq_mm(n[i]) || n[i + 1]->op != GGML_OP_RESHAPE || n[i + 1]->src[0] != n[i] ||
++                    n[i + 2]->op != GGML_OP_ROPE || n[i + 2]->src[0] != n[i + 1]) {
++                continue;
++            }
++            int j   = i + 3;
++            int nmm = 0;
++            for (; j < std::min(cgraph->n_nodes, i + 11); ++j) {
++                const ggml_tensor * t = n[j];
++                bool view_of_moved = false;
++                for (int k = i + 3; k < j && !view_of_moved; ++k) {
++                    view_of_moved = (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->src[0] == n[k] && n[k]->op == GGML_OP_MUL_MAT;
++                }
++                if (is_tq_mm(t)) {
++                    ++nmm;
++                } else if (!view_of_moved) {
++                    break;
++                }
++            }
++            if (nmm > 0) {
++                std::rotate(n + i + 1, n + i + 3, n + j);
++                i = j - 1;
++            }
++        }
++
+         // Small projections and a larger one over the same input (Qwen3.5/3.6 GDN: ssm_beta and ssm_alpha, 32 rows, then
+         // the attn_gate z projection a few nodes later): from the first MUL_MAT of <= 256 rows, gather the later MUL_MATs
+         // with the same activation, weight type and K (any number of small ones, one larger one) directly after it, so
+@@ -11160,6 +11210,13 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
+ }
+ 
+ // TODO: move these functions here
++// TQ1_0 / TQ2_0 (ternary) weights on the GPU: MUL_MAT (tq.cu, bit-identical to the CPU backend's x86 AVX2 path) and
++// GET_ROWS.  GGML_CUDA_TQ=0: not supported, so the weights stay in host memory and the CPU backend runs them, as before.
++static bool ggml_cuda_tq_on() {
++    static const bool on = [] { const char * e = getenv("GGML_CUDA_TQ"); return e == nullptr || atoi(e) != 0; }();
++    return on;
++}
++
+ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+ 
+@@ -11233,6 +11290,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
+                     return false; // TODO this could in principle be implemented though currently there is no use case.
+                 }
++                if (a->type == GGML_TYPE_TQ1_0 || a->type == GGML_TYPE_TQ2_0) {
++                    // MUL_MAT only: MUL_MAT_ID has no TQ path, its experts stay with the CPU backend
++                    return ggml_cuda_tq_on() && op->op == GGML_OP_MUL_MAT && ggml_cuda_mul_mat_tq_supported(a, b, op);
++                }
+                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 && !ggml_cuda_op_mul_mat_use_fwht(op)) {
+                     return false;
+                 }
+@@ -11299,6 +11360,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+         case GGML_OP_GET_ROWS:
+             {
++                if (op->src[0]->type == GGML_TYPE_TQ1_0 || op->src[0]->type == GGML_TYPE_TQ2_0) {
++                    return ggml_cuda_tq_on();
++                }
+                 switch (op->src[0]->type) {
+                     case GGML_TYPE_F16:
+                     case GGML_TYPE_F32:
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index a1777cb08..07ffe5555 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -332,8 +332,8 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+ }
+ 
+ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+-    if (!ggml_is_quantized(type)) {
+-        return false;
++    if (!ggml_is_quantized(type) || type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0) {
++        return false; // TQ1_0 / TQ2_0: tq.cu
+     }
+     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
+     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
+diff --git a/ggml/src/ggml-cuda/tq.cu b/ggml/src/ggml-cuda/tq.cu
+new file mode 100644
+index 000000000..69be217b3
+--- /dev/null
++++ b/ggml/src/ggml-cuda/tq.cu
+@@ -0,0 +1,689 @@
++#include "tq.cuh"
++#include "mma.cuh"
++#include "unary.cuh"
++#include "vecdotq.cuh"
++
++// See tq.cuh.  The CPU reference: ggml-quants.c quantize_row_q8_K_ref (plain SSE2 build: mul, then add, no fma) and
++// ggml-cpu/arch/x86/quants.c ggml_vec_dot_tq{1,2}_0_q8_K (AVX2: per block, 16-bit lanes k from byte pairs 2k, 2k+1 of
++// every 32-value vector, minus bsums[k], then pairs of them as eight 32-bit lanes; sumf = fma(lane, y.d*x.d, sumf);
++// hsum_float_8 at the end).  Lane L of a block holds the values whose index mod 32 is 4L..4L+3, minus the sum of the
++// Q8_K values 32L..32L+31.
++
++// Products and sums that must not become an fma.  clang (HIP): plain operators in a scope with fp contract(off) -- HIP's
++// __fmul_rn / __fadd_rn are inline header functions whose operators keep their own contractable flags and would still be
++// fused after inlining.  nvcc: __fmul_rn / __fadd_rn, which it never contracts.
++#if defined(__clang__)
++#define TQ_FMUL(a, b) ((a)*(b))
++#define TQ_FADD(a, b) ((a)+(b))
++#else
++#define TQ_FMUL(a, b) __fmul_rn(a, b)
++#define TQ_FADD(a, b) __fadd_rn(a, b)
++#endif // defined(__clang__)
++
++#define TQ_LANES       8          // the CPU's 32-bit lanes per block
++#define TQ_SMALL_NCOLS 8          // small-batch kernel: src1 columns per thread
++#define TQ_SMALL_MAX   16         // batches up to this many columns take the small-batch kernel, larger ones the MMA kernel
++#define TQ_VEC_THREADS 512        // vec kernel (decode): threads per block; every block quantizes src1 once
++#define TQ_VEC_BPSM    2          // vec kernel: thread blocks per SM at most (they take turns on the row groups)
++#define TQ_VEC_SMEM    (48*1024)  // vec kernel: the largest quantized src1 it keeps in shared memory
++#define TQ_VEC_MAX     3          // vec kernel: weight matrices per launch
++#define TQ_MMA_WARPS   4          // MMA kernel: warps per thread block, 16 weight rows each
++#define TQ_MMA_BM      (16*TQ_MMA_WARPS) // MMA kernel: weight rows per thread block
++#define TQ_MMA_BN      16         // MMA kernel: src1 columns per thread block
++
++// Weight blocks the small-batch and vec kernels load ahead: more only crowds the caches (TQ1_0 has more decoding to cover).
++template <ggml_type type> static constexpr __device__ int tq_unroll() { return type == GGML_TYPE_TQ1_0 ? 2 : 1; }
++
++// src1 as quantize_row_q8_K_ref quantizes it, stored lane-major: q[32L + 4k + r] is value 32k + 4L + r, bsum[L] the sum of
++// values 32L..32L+31 (bsums[2L] + bsums[2L + 1]).
++struct block_q8_tq {
++    int8_t q[QK_K];
++    int    bsum[TQ_LANES];
++    float  d;
++    int    pad[3];
++};
++static_assert(sizeof(block_q8_tq) == 304, "block_q8_tq: 16-byte multiple");
++
++// Q8_K exactly as quantize_row_q8_K_ref, by one warp: 256 values from xb (thread t holds values 8t..8t+7) into yb.
++static __device__ __forceinline__ void tq_quantize_warp(const float * __restrict__ xb, block_q8_tq * __restrict__ yb, const int t) {
++#if defined(__clang__)
++#pragma clang fp contract(off) // see TQ_FMUL
++#endif // defined(__clang__)
++    static_assert(WARP_SIZE == 32, "8 values a thread");
++    float v[8];
++#pragma unroll
++    for (int k = 0; k < 8; ++k) {
++        v[k] = xb[8*t + k];
++    }
++    // the largest magnitude; 0 when every value is zero or NaN, as the CPU's scan from 0 with a strict '>'
++    float amax = 0.0f;
++#pragma unroll
++    for (int k = 0; k < 8; ++k) {
++        amax = fmaxf(amax, fabsf(v[k]));
++    }
++#pragma unroll
++    for (int off = 16; off > 0; off >>= 1) {
++        amax = fmaxf(amax, __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, amax, off, WARP_SIZE));
++    }
++    // the value at its first position (the CPU keeps the first one): the lowest thread with a match, its lowest k
++    float vk  = 0.0f;
++    bool  hit = false;
++#pragma unroll
++    for (int k = 7; k >= 0; --k) {
++        if (fabsf(v[k]) == amax) {
++            vk  = v[k];
++            hit = true;
++        }
++    }
++    const int   src  = __ffsll((long long) __ballot_sync(GGML_CUDA_FULL_THREAD_MASK, hit)) - 1;
++    const float vmax = __shfl_sync(GGML_CUDA_FULL_THREAD_MASK, vk, src, WARP_SIZE);
++
++    // values 8t..8t+3 and 8t+4..8t+7 are 4 consecutive bytes each of the lane-major order
++    int * yq = (int *) yb->q;
++    if (amax == 0.0f) {
++        yq[8*(2*(t % 4) + 0) + t/4] = 0;
++        yq[8*(2*(t % 4) + 1) + t/4] = 0;
++        if (t < TQ_LANES) {
++            yb->bsum[t] = 0;
++        }
++        if (t == 0) {
++            yb->d = 0.0f;
++        }
++        return;
++    }
++
++    const float iscale = __fdiv_rn(-127.0f, vmax);
++    int sum   = 0;
++    int pk[2] = {0, 0};
++#pragma unroll
++    for (int k = 0; k < 8; ++k) {
++        // nearest_int(iscale*x): the float add of 1.5*2^23 rounds to an integer in the mantissa
++        const float val = TQ_FADD(TQ_FMUL(iscale, v[k]), 12582912.0f);
++        const int   q   = min(127, (__float_as_int(val) & 0x007fffff) - 0x00400000);
++        pk[k/4] |= (q & 0xFF) << (8*(k % 4));
++        sum += q;
++    }
++    yq[8*(2*(t % 4) + 0) + t/4] = pk[0];
++    yq[8*(2*(t % 4) + 1) + t/4] = pk[1];
++    // bsum[L]: values 32L..32L+31, held by threads 4L..4L+3
++    sum += __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, sum, 1, WARP_SIZE);
++    sum += __shfl_xor_sync(GGML_CUDA_FULL_THREAD_MASK, sum, 2, WARP_SIZE);
++    if (t % 4 == 0) {
++        yb->bsum[t/4] = sum;
++    }
++    if (t == 0) {
++        yb->d = __fdiv_rn(1.0f, iscale);
++    }
++}
++
++// src1 to block_q8_tq: one warp per 256 values.
++static __global__ void quantize_q8_tq(
++        const float * __restrict__ x, block_q8_tq * __restrict__ y, const int nb,
++        const int64_t s11, const int64_t s12, const int64_t s13, const int64_t ne11, const int64_t ne12) {
++    const int     ib  = blockIdx.x*blockDim.y + threadIdx.y;
++    const int64_t i11 = blockIdx.y;
++    const int64_t i12 = blockIdx.z % ne12;
++    const int64_t i13 = blockIdx.z / ne12;
++    if (ib >= nb) {
++        return;
++    }
++    tq_quantize_warp(x + i13*s13 + i12*s12 + i11*s11 + (int64_t) ib*QK_K, y + ((int64_t) blockIdx.z*ne11 + i11)*nb + ib, threadIdx.x);
++}
++
++template <ggml_type type> struct tq_block;
++template <> struct tq_block<GGML_TYPE_TQ1_0> { typedef block_tq1_0 t; };
++template <> struct tq_block<GGML_TYPE_TQ2_0> { typedef block_tq2_0 t; };
++
++// The bytes of lane L of one weight block, loaded ahead of their decoding.
++template <ggml_type type> struct tq_raw;
++template <> struct tq_raw<GGML_TYPE_TQ2_0> { int w0; int w1; float d; };       // qs[4L..], qs[32 + 4L..]
++template <> struct tq_raw<GGML_TYPE_TQ1_0> { int a; int b; int h; float d; };  // qs[4L..], qs[32 + 4L%16..], qh
++
++static __device__ __forceinline__ tq_raw<GGML_TYPE_TQ2_0> tq_load(const block_tq2_0 * xb, const int L) {
++    return { get_int_b2(xb->qs, L), get_int_b2(xb->qs + 32, L), __half2float(xb->d) };
++}
++
++static __device__ __forceinline__ tq_raw<GGML_TYPE_TQ1_0> tq_load(const block_tq1_0 * xb, const int L) {
++    return { get_int_b2(xb->qs, L), get_int_b2(xb->qs + 32, L % 4), get_int_b2(xb->qh, 0), __half2float(xb->d) };
++}
++
++template <ggml_type type>
++static __device__ __forceinline__ tq_raw<type> tq_load_block(const char * __restrict__ xr, const int ib, const int L) {
++    if constexpr (type == GGML_TYPE_TQ2_0) {
++        return tq_load((const block_tq2_0 *) xr + ib, L);
++    } else {
++        return tq_load((const block_tq1_0 *) xr + ib, L);
++    }
++}
++
++// digit n (0..4) of each byte of w, as ggml-quants.c: ((uint8_t) (b*3^n) * 3) >> 8, packed back into bytes; p = 3^n.  The
++// even and the odd bytes go through in two 16-bit fields at once: b*3^n < 2^15, so neither field carries into the other.
++static __device__ __forceinline__ int tq1_0_digits4(const int w, const uint32_t p) {
++    const uint32_t xe = (((uint32_t) w        & 0x00FF00FFu)*p & 0x00FF00FFu)*3;
++    const uint32_t xo = ((((uint32_t) w >> 8) & 0x00FF00FFu)*p & 0x00FF00FFu)*3;
++    return (int) (((xe >> 8) & 0x00030003u) | (xo & 0x03000300u));
++}
++
++// The trits 0..2 of lane L: t[k] packs values 32k + 4L + 0..3 (k = 0..7).
++static __device__ __forceinline__ void tq_decode(const tq_raw<GGML_TYPE_TQ2_0> & raw, const int L, int * t) {
++    GGML_UNUSED(L);
++    // value 128h + 32l + m is bits 2l..2l+1 of qs[32h + m]
++#pragma unroll
++    for (int l = 0; l < 4; ++l) {
++        t[l]     = (raw.w0 >> (2*l)) & 0x03030303;
++        t[4 + l] = (raw.w1 >> (2*l)) & 0x03030303;
++    }
++}
++
++static __device__ __forceinline__ void tq_decode(const tq_raw<GGML_TYPE_TQ1_0> & raw, const int L, int * t) {
++    // values 0..159: digit e/32 of qs[e%32]; 160..239: digit (e-160)/16 of qs[32 + (e-160)%16]; 240..255: digit (e-240)/4
++    // of qh[(e-240)%4].  Digits 0..4 of qs[4L..]: x <- x*3 mod 256 steps b*3^n, and (x*3) >> 8 is digit n (16-bit fields
++    // as in tq1_0_digits4).
++    uint32_t xe = (uint32_t) raw.a        & 0x00FF00FFu;
++    uint32_t xo = ((uint32_t) raw.a >> 8) & 0x00FF00FFu;
++#pragma unroll
++    for (int k = 0; k < 5; ++k) {
++        const uint32_t ye = xe*3;
++        const uint32_t yo = xo*3;
++        t[k] = (int) (((ye >> 8) & 0x00030003u) | (yo & 0x03000300u));
++        xe = ye & 0x00FF00FFu;
++        xo = yo & 0x00FF00FFu;
++    }
++    // lanes 0..3: digits 0, 2, 4 of qs[32 + 4L..]; lanes 4..7: digits 1, 3 of qs[32 + 4(L-4)..] and digit L-4 of qh
++    const bool lo = L < 4;
++    t[5] = tq1_0_digits4(raw.b, lo ? 1 : 3);
++    t[6] = tq1_0_digits4(raw.b, lo ? 9 : 27);
++    t[7] = tq1_0_digits4(lo ? raw.b : raw.h, lo ? 81 : (0x1B090301u >> (8*(L & 3))) & 0xFF);
++}
++
++// The integer dot of one block and CPU lane L with the Q8 values of that lane, minus the lane's Q8 sum.
++static __device__ __forceinline__ int tq_lane_dot(const int * t, const int4 ya, const int4 yc, const int bsum) {
++    int s = -bsum;
++    s = ggml_cuda_dp4a(t[0], ya.x, s);
++    s = ggml_cuda_dp4a(t[1], ya.y, s);
++    s = ggml_cuda_dp4a(t[2], ya.z, s);
++    s = ggml_cuda_dp4a(t[3], ya.w, s);
++    s = ggml_cuda_dp4a(t[4], yc.x, s);
++    s = ggml_cuda_dp4a(t[5], yc.y, s);
++    s = ggml_cuda_dp4a(t[6], yc.z, s);
++    s = ggml_cuda_dp4a(t[7], yc.w, s);
++    return s;
++}
++
++// hsum_float_8 over the TQ_LANES threads of a row: ((l4 + l0) + (l6 + l2)) + ((l5 + l1) + (l7 + l3))
++static __device__ __forceinline__ float tq_lane_hsum(float v) {
++    v += ggml_cuda_shfl_xor(v, 4, TQ_LANES);
++    v += ggml_cuda_shfl_xor(v, 2, TQ_LANES);
++    v += ggml_cuda_shfl_xor(v, 1, TQ_LANES);
++    return v;
++}
++
++// Small batches: TQ_LANES threads per weight row (one per CPU lane), up to TQ_SMALL_NCOLS src1 columns per thread.
++template <ggml_type type>
++static __global__ void mul_mat_tq_small(
++        const char * __restrict__ vx, const block_q8_tq * __restrict__ y, float * __restrict__ dst,
++        const int nrows, const int nb, const int ncols, const int64_t s01, const int64_t s02, const int64_t s03,
++        const int64_t ne12, const int r2, const int r3, const int64_t s1, const int64_t s2, const int64_t s3) {
++#if defined(__clang__)
++#pragma clang fp contract(off) // see TQ_FMUL
++#endif // defined(__clang__)
++    constexpr int U   = tq_unroll<type>();
++    const int     L   = threadIdx.x % TQ_LANES;
++    const int     row = blockIdx.x*(blockDim.x/TQ_LANES) + threadIdx.x/TQ_LANES;
++    const int     c0  = blockIdx.y*TQ_SMALL_NCOLS;
++    const int     nc  = min(TQ_SMALL_NCOLS, ncols - c0);
++    const int64_t i12 = blockIdx.z % ne12;
++    const int64_t i13 = blockIdx.z / ne12;
++    if (row >= nrows) {
++        return;
++    }
++
++    const block_q8_tq * yz = y + ((int64_t) blockIdx.z*ncols + c0)*nb;
++    const char        * xr = vx + (i13/r3)*s03 + (i12/r2)*s02 + (int64_t) row*s01;
++    float acc[TQ_SMALL_NCOLS] = {0.0f};
++    for (int ib0 = 0; ib0 < nb; ib0 += U) {
++        tq_raw<type> raw[U];
++#pragma unroll
++        for (int u = 0; u < U; ++u) {
++            if (ib0 + u < nb) {
++                raw[u] = tq_load_block<type>(xr, ib0 + u, L);
++            }
++        }
++#pragma unroll
++        for (int u = 0; u < U; ++u) {
++            if (ib0 + u >= nb) {
++                break;
++            }
++            int t[8];
++            tq_decode(raw[u], L, t);
++#pragma unroll
++            for (int c = 0; c < TQ_SMALL_NCOLS; ++c) {
++                if (c < nc) {
++                    const block_q8_tq * yb = yz + (int64_t) c*nb + ib0 + u;
++                    const int4 ya = ((const int4 *) (yb->q + 32*L))[0];
++                    const int4 yc = ((const int4 *) (yb->q + 32*L))[1];
++                    acc[c] = fmaf((float) tq_lane_dot(t, ya, yc, yb->bsum[L]), TQ_FMUL(yb->d, raw[u].d), acc[c]);
++                }
++            }
++        }
++    }
++
++#pragma unroll
++    for (int c = 0; c < TQ_SMALL_NCOLS; ++c) {
++        const float v = tq_lane_hsum(acc[c]);
++        if (L == 0 && c < nc) {
++            dst[i13*s3 + i12*s2 + (int64_t) (c0 + c)*s1 + row] = v;
++        }
++    }
++}
++
++// Decode (one src1 column): up to TQ_VEC_MAX weight matrices over the same src1 in one launch, their rows one after
++// another (row_end: the running row counts); or with glu the gate (0) and up (1) rows of an SWIGLU, written as
++// up*silu(gate); or (n == 1) the result plus add's element (a residual ADD).  Every thread block quantizes src1 into
++// shared memory first, which saves a quantize launch, then takes groups of blockDim.x/TQ_LANES rows, gridDim.x apart.
++// Every row's dot product is the small kernel's.
++struct tq_vec_args {
++    const char  * x[TQ_VEC_MAX];
++    float       * dst[TQ_VEC_MAX];
++    int64_t       s01[TQ_VEC_MAX];
++    int           row_end[TQ_VEC_MAX];
++    int           n;
++    const float * add; // or nullptr
++};
++
++template <ggml_type type, bool glu>
++static __global__ void mul_mat_tq_vec(
++        const tq_vec_args a, const float * __restrict__ x1, const int nb, const int64_t s02, const int64_t s03,
++        const int64_t ne12, const int r2, const int r3, const int64_t s12_1, const int64_t s13_1, const int64_t s2,
++        const int64_t s3) {
++#if defined(__clang__)
++#pragma clang fp contract(off) // see TQ_FMUL
++#endif // defined(__clang__)
++    constexpr int U   = tq_unroll<type>();
++    constexpr int R   = glu ? 2 : 1; // weight rows a thread: gate and up
++    const int     L   = threadIdx.x % TQ_LANES;
++    const int     rpb = blockDim.x/TQ_LANES;
++    const int64_t i12 = blockIdx.z % ne12;
++    const int64_t i13 = blockIdx.z / ne12;
++
++    extern __shared__ int4 tq_smem[];
++    block_q8_tq * ys = (block_q8_tq *) tq_smem;
++    {
++        const float * xc = x1 + i13*s13_1 + i12*s12_1;
++        for (int qb = threadIdx.x/WARP_SIZE; qb < nb; qb += blockDim.x/WARP_SIZE) {
++            tq_quantize_warp(xc + (int64_t) qb*QK_K, ys + qb, threadIdx.x % WARP_SIZE);
++        }
++    }
++    __syncthreads();
++
++    const int64_t woff  = (i13/r3)*s03 + (i12/r2)*s02;
++    const int     total = glu ? a.row_end[0] : a.row_end[a.n - 1];
++    for (int row = blockIdx.x*rpb + threadIdx.x/TQ_LANES; row < total; row += gridDim.x*rpb) {
++        const char * xr[R];
++        float      * d;
++        int          lr;
++        if constexpr (glu) {
++            lr    = row;
++            xr[0] = a.x[0] + woff + (int64_t) lr*a.s01[0];
++            xr[1] = a.x[1] + woff + (int64_t) lr*a.s01[1];
++            d     = a.dst[0];
++        } else {
++            const int m = row < a.row_end[0] ? 0 : row < a.row_end[1] ? 1 : 2;
++            lr    = row - (m == 0 ? 0 : a.row_end[m - 1]);
++            xr[0] = (m == 0 ? a.x[0] : m == 1 ? a.x[1] : a.x[2]) + woff + (int64_t) lr*(m == 0 ? a.s01[0] : m == 1 ? a.s01[1] : a.s01[2]);
++            d     = m == 0 ? a.dst[0] : m == 1 ? a.dst[1] : a.dst[2];
++        }
++
++        float acc[R] = {0.0f};
++        for (int ib0 = 0; ib0 < nb; ib0 += U) {
++            tq_raw<type> raw[R][U];
++#pragma unroll
++            for (int u = 0; u < U; ++u) {
++#pragma unroll
++                for (int r = 0; r < R; ++r) {
++                    if (ib0 + u < nb) {
++                        raw[r][u] = tq_load_block<type>(xr[r], ib0 + u, L);
++                    }
++                }
++            }
++#pragma unroll
++            for (int u = 0; u < U; ++u) {
++                if (ib0 + u >= nb) {
++                    break;
++                }
++                const block_q8_tq * yb = ys + ib0 + u;
++                const int4  ya = ((const int4 *) (yb->q + 32*L))[0];
++                const int4  yc = ((const int4 *) (yb->q + 32*L))[1];
++                const int   bs = yb->bsum[L];
++                const float yd = yb->d;
++#pragma unroll
++                for (int r = 0; r < R; ++r) {
++                    int t[8];
++                    tq_decode(raw[r][u], L, t);
++                    acc[r] = fmaf((float) tq_lane_dot(t, ya, yc, bs), TQ_FMUL(yd, raw[r][u].d), acc[r]);
++                }
++            }
++        }
++
++        float v = tq_lane_hsum(acc[0]);
++        if constexpr (glu) {
++            // as the GLU kernel computes it (the product is the same either way round)
++            v = ggml_cuda_op_glu_single(GGML_GLU_OP_SWIGLU, v, tq_lane_hsum(acc[1]), 0.0f);
++        } else if (a.add != nullptr) {
++            v += a.add[lr]; // as the ADD kernel computes it (one rounding, either order)
++        }
++        if (L == 0) {
++            d[i13*s3 + i12*s2 + lr] = v;
++        }
++    }
++}
++
++// The weight bytes one thread of the MMA kernel needs per block: its row (lane % 16), its half h (lane / 16) of the
++// lane-major 8 ints t[0..7] of every CPU lane L, i.e. t[4h..4h + 3].
++template <ggml_type type> struct tq_a_raw;
++template <> struct tq_a_raw<GGML_TYPE_TQ2_0> { int w[8]; float d; };                 // w[L] = qs[32h + 4L..]
++
++static __device__ __forceinline__ void tq_a_load(const block_tq2_0 * xb, const int h, tq_a_raw<GGML_TYPE_TQ2_0> & r) {
++#pragma unroll
++    for (int L = 0; L < TQ_LANES; ++L) {
++        r.w[L] = get_int_b2(xb->qs + 32*h, L);
++    }
++    r.d = __half2float(xb->d);
++}
++
++// t[4h + l], l = 0..3, of lane L (see tq_decode)
++static __device__ __forceinline__ void tq_a_tile(const tq_a_raw<GGML_TYPE_TQ2_0> & r, const int h, const int L, int * x) {
++    GGML_UNUSED(h);
++#pragma unroll
++    for (int l = 0; l < 4; ++l) {
++        x[l] = (r.w[L] >> (2*l)) & 0x03030303;
++    }
++}
++
++// Larger batches (RDNA4 WMMA): one int8 MMA (K = 32) per block, CPU lane and 16x16 output tile gives exactly that lane's
++// integer dot, the accumulator starting at minus the lane's Q8_K sum; the float part is the small kernel's, element by
++// element.  Every warp works on its own 16 weight rows and 16 src1 columns straight from global memory into the WMMA
++// registers (no shared memory, no barrier): thread i + 16h holds weight row i and src1 column i, half h of each lane's
++// 32 values (16x8 int tiles, I-major on WMMA128), and output rows 8h..8h + 7 of column i (the J-major result tile).  The
++// next block's data is loaded while the current one is computed.  TQ2_0 only: TQ1_0 is converted to it first.
++template <ggml_type type>
++static __global__ void __launch_bounds__(TQ_MMA_WARPS*WARP_SIZE, 1) mul_mat_tq_mma(
++        const char * __restrict__ vx, const block_q8_tq * __restrict__ y, float * __restrict__ dst,
++        const int nrows, const int nb, const int ncols, const int64_t s01, const int64_t s02, const int64_t s03,
++        const int64_t ne12, const int r2, const int r3, const int64_t s1, const int64_t s2, const int64_t s3) {
++#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
++#if defined(__clang__)
++#pragma clang fp contract(off) // see TQ_FMUL
++#endif // defined(__clang__)
++    static_assert(type == GGML_TYPE_TQ2_0, "TQ1_0 is converted to TQ2_0 first");
++    using namespace ggml_cuda_mma;
++    typedef tile<16,  8, int, DATA_LAYOUT_I_MAJOR> tile_ab;
++    typedef tile<16, 16, int, DATA_LAYOUT_J_MAJOR> tile_d;
++    static_assert(tile_ab::ne == 4 && tile_d::ne == 8, "WMMA128 tiles");
++
++    const int     i    = threadIdx.x % 16;
++    const int     h    = threadIdx.x / 16;
++    const int     c0   = blockIdx.x*16;
++    const int     wr0  = blockIdx.y*TQ_MMA_BM + threadIdx.y*16;
++    const int64_t i12  = blockIdx.z % ne12;
++    const int64_t i13  = blockIdx.z / ne12;
++    const bool    a_ok = wr0 + i < nrows;
++    const bool    b_ok = c0 + i < ncols;
++
++    const char        * xr = vx + (i13/r3)*s03 + (i12/r2)*s02 + (int64_t) (wr0 + i)*s01;
++    const block_q8_tq * yc = y + (int64_t) blockIdx.z*ncols*nb + (int64_t) (c0 + i)*nb;
++
++    // the next block, in registers
++    tq_a_raw<type> an = {};
++    int4  bn[TQ_LANES];
++    int4  sn0 = make_int4(0, 0, 0, 0);
++    int4  sn1 = make_int4(0, 0, 0, 0);
++    float yn  = 0.0f;
++#pragma unroll
++    for (int L = 0; L < TQ_LANES; ++L) {
++        bn[L] = make_int4(0, 0, 0, 0);
++    }
++#define TQ_MMA_LOAD(ib_)                                                                                     \
++    {                                                                                                        \
++        if (a_ok) {                                                                                          \
++            tq_a_load((const typename tq_block<type>::t *) xr + (ib_), h, an);                               \
++        }                                                                                                    \
++        if (b_ok) {                                                                                          \
++            const block_q8_tq * yb = yc + (ib_);                                                             \
++            _Pragma("unroll")                                                                                \
++            for (int L = 0; L < TQ_LANES; ++L) {                                                             \
++                bn[L] = *(const int4 *) (yb->q + 32*L + 16*h);                                               \
++            }                                                                                                \
++            sn0 = *(const int4 *) (yb->bsum + 0);                                                            \
++            sn1 = *(const int4 *) (yb->bsum + 4);                                                            \
++            yn  = yb->d;                                                                                     \
++        }                                                                                                    \
++    }
++
++    float acc[TQ_LANES][tile_d::ne];
++#pragma unroll
++    for (int L = 0; L < TQ_LANES; ++L) {
++#pragma unroll
++        for (int l = 0; l < tile_d::ne; ++l) {
++            acc[L][l] = 0.0f;
++        }
++    }
++
++    TQ_MMA_LOAD(0);
++    for (int ib = 0; ib < nb; ++ib) {
++        const tq_a_raw<type> ac = an;
++        int4 bc[TQ_LANES];
++#pragma unroll
++        for (int L = 0; L < TQ_LANES; ++L) {
++            bc[L] = bn[L];
++        }
++        const int   bs[TQ_LANES] = { sn0.x, sn0.y, sn0.z, sn0.w, sn1.x, sn1.y, sn1.z, sn1.w };
++        const float yd = yn;
++        if (ib + 1 < nb) {
++            TQ_MMA_LOAD(ib + 1); // in flight while this block is computed
++        }
++
++        // dd = y.d*x.d for output rows 8h + l (weight row 8h + l is held by thread 8h + l) of column i
++        const float dx = a_ok ? ac.d : 0.0f;
++        float dd[tile_d::ne];
++#pragma unroll
++        for (int l = 0; l < tile_d::ne; ++l) {
++            dd[l] = TQ_FMUL(yd, __shfl_sync(GGML_CUDA_FULL_THREAD_MASK, dx, 8*h + l, WARP_SIZE));
++        }
++#pragma unroll
++        for (int L = 0; L < TQ_LANES; ++L) {
++            tile_ab A;
++            tile_ab B;
++            int x[4] = {0, 0, 0, 0};
++            if (a_ok) {
++                tq_a_tile(ac, h, L, x);
++            }
++            A.x[0] = x[0]; A.x[1] = x[1]; A.x[2] = x[2]; A.x[3] = x[3];
++            B.x[0] = bc[L].x; B.x[1] = bc[L].y; B.x[2] = bc[L].z; B.x[3] = bc[L].w;
++            tile_d D;
++#pragma unroll
++            for (int l = 0; l < tile_d::ne; ++l) {
++                D.x[l] = -bs[L];
++            }
++            mma(D, A, B);
++#pragma unroll
++            for (int l = 0; l < tile_d::ne; ++l) {
++                acc[L][l] = fmaf((float) D.x[l], dd[l], acc[L][l]);
++            }
++        }
++    }
++
++#pragma unroll
++    for (int l = 0; l < tile_d::ne; ++l) {
++        const int row = wr0 + 8*h + l;
++        const int col = c0 + i;
++        // hsum_float_8: ((l4 + l0) + (l6 + l2)) + ((l5 + l1) + (l7 + l3))
++        const float v = ((acc[4][l] + acc[0][l]) + (acc[6][l] + acc[2][l])) + ((acc[5][l] + acc[1][l]) + (acc[7][l] + acc[3][l]));
++        if (row < nrows && col < ncols) {
++            dst[i13*s3 + i12*s2 + (int64_t) col*s1 + row] = v;
++        }
++    }
++#undef TQ_MMA_LOAD
++#else
++    GGML_UNUSED_VARS(vx, y, dst, nrows, nb, ncols, s01, s02, s03, ne12, r2, r3, s1, s2, s3);
++    NO_DEVICE_CODE;
++#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
++}
++
++// TQ1_0 -> TQ2_0, value for value (the same trits, the same d), so the MMA kernel reads two bits a value instead of decoding
++// base 3 once per column tile.  One thread per output byte: value 128h + 32l + m goes to bits 2l..2l+1 of qs[32h + m].
++static __global__ void convert_tq1_0_tq2_0(const block_tq1_0 * __restrict__ x, block_tq2_0 * __restrict__ y, const int64_t nblocks) {
++    const int64_t ib = blockIdx.x*(int64_t) (blockDim.x/64) + threadIdx.x/64;
++    const int     b  = threadIdx.x % 64;
++    if (ib >= nblocks) {
++        return;
++    }
++    const int h = b / 32;
++    const int m = b % 32;
++    int q = 0;
++#pragma unroll
++    for (int l = 0; l < 4; ++l) {
++        q |= ggml_cuda_tq1_0_trit(x + ib, 128*h + 32*l + m) << (2*l);
++    }
++    y[ib].qs[b] = q;
++    if (b == 0) {
++        y[ib].d = x[ib].d;
++    }
++}
++
++bool ggml_cuda_mul_mat_tq_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    if (src0->type != GGML_TYPE_TQ1_0 && src0->type != GGML_TYPE_TQ2_0) {
++        return false;
++    }
++    return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++        src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) &&
++        src0->ne[0] % QK_K == 0 && src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0 &&
++        src1->ne[1] <= 65535;
++}
++
++template <ggml_type type>
++static void ggml_cuda_mul_mat_tq_launch(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++        const block_q8_tq * y, const int nb) {
++    GGML_TENSOR_BINARY_OP_LOCALS;
++    cudaStream_t stream = ctx.stream();
++
++    const int  cc  = ggml_cuda_info().devices[ctx.device].cc;
++    const bool mma = ne11 > TQ_SMALL_MAX && GGML_CUDA_CC_IS_RDNA4(cc); // elsewhere the small-batch kernel takes every batch
++    const int  r2  = ne12/ne02;
++    const int  r3  = ne13/ne03;
++    ctx.tq_census[mma ? 1 : 0]++;
++    if (mma) {
++        const dim3 grid((ne11 + TQ_MMA_BN - 1)/TQ_MMA_BN, (ne01 + TQ_MMA_BM - 1)/TQ_MMA_BM, ne12*ne13);
++        const dim3 block(WARP_SIZE, TQ_MMA_WARPS, 1);
++        if constexpr (type == GGML_TYPE_TQ1_0) {
++            // the same values as TQ2_0, contiguous over all of src0's matrices (rows of nb02 / nb03 strides kept)
++            GGML_ASSERT(ggml_is_contiguous(src0));
++            const int64_t nblocks = ggml_nelements(src0)/QK_K;
++            ggml_cuda_pool_alloc<block_tq2_0> x2(ctx.pool(), nblocks);
++            convert_tq1_0_tq2_0<<<(nblocks + 3)/4, 256, 0, stream>>>((const block_tq1_0 *) src0->data, x2.get(), nblocks);
++            CUDA_CHECK(cudaGetLastError());
++            const int64_t s01_2 = nb*sizeof(block_tq2_0);
++            mul_mat_tq_mma<GGML_TYPE_TQ2_0><<<grid, block, 0, stream>>>((const char *) x2.get(), y, (float *) dst->data,
++                ne01, nb, ne11, s01_2, s01_2*ne01, s01_2*ne01*ne02, ne12, r2, r3, nb1/sizeof(float), nb2/sizeof(float), nb3/sizeof(float));
++        } else {
++            mul_mat_tq_mma<type><<<grid, block, 0, stream>>>((const char *) src0->data, y, (float *) dst->data,
++                ne01, nb, ne11, nb01, nb02, nb03, ne12, r2, r3, nb1/sizeof(float), nb2/sizeof(float), nb3/sizeof(float));
++        }
++    } else {
++        const int  rows_per_block = 256/TQ_LANES;
++        const dim3 grid((ne01 + rows_per_block - 1)/rows_per_block, (ne11 + TQ_SMALL_NCOLS - 1)/TQ_SMALL_NCOLS, ne12*ne13);
++        mul_mat_tq_small<type><<<grid, 256, 0, stream>>>((const char *) src0->data, y, (float *) dst->data,
++            ne01, nb, ne11, nb01, nb02, nb03, ne12, r2, r3, nb1/sizeof(float), nb2/sizeof(float), nb3/sizeof(float));
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++bool ggml_cuda_mul_mat_tq_vec_ok(const ggml_tensor * mm) {
++    const ggml_tensor * src0 = mm->src[0];
++    const ggml_tensor * src1 = mm->src[1];
++    return mm->op == GGML_OP_MUL_MAT && ggml_cuda_mul_mat_tq_supported(src0, src1, mm) && src1->ne[1] == 1 &&
++        (size_t) (src0->ne[0]/QK_K)*sizeof(block_q8_tq) <= TQ_VEC_SMEM;
++}
++
++template <ggml_type type, bool glu>
++static void ggml_cuda_mul_mat_tq_vec_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * const * mm, const int n,
++        const tq_vec_args & a) {
++    const ggml_tensor * src0 = mm[0]->src[0];
++    const ggml_tensor * src1 = mm[0]->src[1];
++    const ggml_tensor * dst  = mm[0];
++    const int nb   = src0->ne[0]/QK_K;
++    const int rows = glu ? a.row_end[0] : a.row_end[n - 1];
++    // the thread blocks take turns on the row groups, so that fewer of them quantize src1
++    const int  rows_f = TQ_VEC_THREADS/TQ_LANES;
++    const int  nsm    = ggml_cuda_info().devices[ctx.device].nsm;
++    const dim3 grid(std::min((rows + rows_f - 1)/rows_f, TQ_VEC_BPSM*nsm), 1, src1->ne[2]*src1->ne[3]);
++    mul_mat_tq_vec<type, glu><<<grid, TQ_VEC_THREADS, nb*sizeof(block_q8_tq), ctx.stream()>>>(a,
++        (const float *) src1->data, nb, src0->nb[2], src0->nb[3], src1->ne[2], src1->ne[2]/src0->ne[2], src1->ne[3]/src0->ne[3],
++        src1->nb[2]/sizeof(float), src1->nb[3]/sizeof(float), dst->nb[2]/sizeof(float), dst->nb[3]/sizeof(float));
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void ggml_cuda_mul_mat_tq_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * const * mm, const int n, ggml_tensor * glu,
++        ggml_tensor * add) {
++    GGML_ASSERT(n >= 1 && n <= TQ_VEC_MAX && (glu == nullptr || n == 2) && (add == nullptr || (n == 1 && glu == nullptr)));
++    tq_vec_args a = {};
++    a.n = n;
++    if (add != nullptr) {
++        const ggml_tensor * res = add->src[0] == mm[0] ? add->src[1] : add->src[0];
++        GGML_ASSERT(ggml_is_vector(mm[0]) && ggml_are_same_shape(add, mm[0]) && ggml_are_same_shape(res, add) &&
++                    ggml_is_contiguous(add) && ggml_is_contiguous(res) && res->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32);
++        a.add = (const float *) res->data;
++    }
++    for (int k = 0; k < n; ++k) {
++        GGML_ASSERT(ggml_cuda_mul_mat_tq_vec_ok(mm[k]) && mm[k]->src[0]->type == mm[0]->src[0]->type &&
++                    mm[k]->src[1] == mm[0]->src[1] && (n == 1 || (ggml_is_matrix(mm[k]->src[0]) && ggml_is_vector(mm[k]))));
++        a.x[k]       = (const char *) mm[k]->src[0]->data;
++        a.dst[k]     = (float *) (glu ? glu : add ? add : mm[k])->data;
++        a.s01[k]     = mm[k]->src[0]->nb[1];
++        a.row_end[k] = (k == 0 ? 0 : a.row_end[k - 1]) + (int) mm[k]->src[0]->ne[1];
++    }
++    ctx.tq_census[3]++;
++    ctx.tq_census[4] += n - 1 + (add != nullptr);
++    const bool tq1 = mm[0]->src[0]->type == GGML_TYPE_TQ1_0;
++    if (glu != nullptr) {
++        GGML_ASSERT(mm[0]->src[0]->ne[1] == mm[1]->src[0]->ne[1] && ggml_is_contiguous(glu) && glu->ne[0] == mm[0]->ne[0]);
++        tq1 ? ggml_cuda_mul_mat_tq_vec_launch<GGML_TYPE_TQ1_0, true>(ctx, mm, n, a)
++            : ggml_cuda_mul_mat_tq_vec_launch<GGML_TYPE_TQ2_0, true>(ctx, mm, n, a);
++    } else {
++        tq1 ? ggml_cuda_mul_mat_tq_vec_launch<GGML_TYPE_TQ1_0, false>(ctx, mm, n, a)
++            : ggml_cuda_mul_mat_tq_vec_launch<GGML_TYPE_TQ2_0, false>(ctx, mm, n, a);
++    }
++}
++
++void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    GGML_TENSOR_BINARY_OP_LOCALS;
++    GGML_ASSERT(ggml_cuda_mul_mat_tq_supported(src0, src1, dst));
++
++    cudaStream_t stream = ctx.stream();
++
++    const int     nb      = ne00 / QK_K;
++    const int64_t nrows_y = ne11*ne12*ne13;
++
++    // one src1 column (decode): the vec kernel quantizes it itself, into shared memory
++    if (ggml_cuda_mul_mat_tq_vec_ok(dst)) {
++        const ggml_tensor * mm = dst;
++        ggml_cuda_mul_mat_tq_vec(ctx, &mm, 1, nullptr, nullptr);
++        return;
++    }
++
++    ggml_cuda_pool_alloc<block_q8_tq> y_q8(ctx.pool(), nrows_y*nb);
++    {
++        const int  wpb = 4; // Q8_K blocks (warps) per thread block
++        const dim3 grid((nb + wpb - 1)/wpb, ne11, ne12*ne13);
++        quantize_q8_tq<<<grid, dim3(WARP_SIZE, wpb, 1), 0, stream>>>((const float *) src1->data, y_q8.get(), nb,
++            nb11/sizeof(float), nb12/sizeof(float), nb13/sizeof(float), ne11, ne12);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    if (src0->type == GGML_TYPE_TQ1_0) {
++        ggml_cuda_mul_mat_tq_launch<GGML_TYPE_TQ1_0>(ctx, src0, src1, dst, y_q8.get(), nb);
++    } else {
++        ggml_cuda_mul_mat_tq_launch<GGML_TYPE_TQ2_0>(ctx, src0, src1, dst, y_q8.get(), nb);
++    }
++}
+diff --git a/ggml/src/ggml-cuda/tq.cuh b/ggml/src/ggml-cuda/tq.cuh
+new file mode 100644
+index 000000000..acb4ab7d4
+--- /dev/null
++++ b/ggml/src/ggml-cuda/tq.cuh
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include "common.cuh"
++
++// TQ1_0 / TQ2_0 (ternary) MUL_MAT.  The result is bit-identical to the CPU backend's x86 AVX2 path
++// (ggml_vec_dot_tq{1,2}_0_q8_K as built with FMA, after quantize_row_q8_K_ref), for every batch size:
++//   - src1 is quantized to Q8_K exactly as quantize_row_q8_K_ref does (no contraction: mul, then add of the rounding constant);
++//   - per 256-value block, the integer dot is split into the CPU's eight 32-bit lanes (lane L takes the values whose index
++//     mod 32 is 4L..4L+3, minus the Q8_K bsums of values 32L..32L+31), each lane accumulated over the blocks with one fma
++//     by (y.d * x.d), and the eight lanes summed in hsum_float_8's order.
++bool ggml_cuda_mul_mat_tq_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
++
++void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
++
++// Decode (one src1 column): whether mm can take the vec kernel, and the vec kernel for n = 1..3 such matmuls over the
++// same src1 in one launch (the rows of each unchanged); or with glu (n = 2: gate, up) the SWIGLU of the two, written to
++// glu; or with add (n = 1) the ADD of the result and add's other operand, written to add.  The fused results are those
++// of the separate ops on this backend, bit for bit.
++bool ggml_cuda_mul_mat_tq_vec_ok(const ggml_tensor * mm);
++
++void ggml_cuda_mul_mat_tq_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * const * mm, int n, ggml_tensor * glu,
++                              ggml_tensor * add);
+-- 
+2.43.0
+
