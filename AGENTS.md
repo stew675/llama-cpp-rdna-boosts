@@ -541,6 +541,14 @@ append; and keep the `(rNN)`/PR tag so a reader can find the narrative). A *poli
 record* goes to `WORKLOG.md` or `benchmarks/`.  If `AGENTS.md` grows a section that is really a reference
 table or a findings list, move it out — that is how this file ended up needing a cleanup.
 
+**Revisions (`(rNN)` / the tag's `-rNN` suffix) are ONE delivery track: `previous release revision + 1`.**
+The `rNN-wip` numbers that a `wip/` campaign issues are a **parallel** track and never consume a delivery
+revision — `r354` and `r355` coexist as `r354`/`r354-wip` and `r355`/`r355-wip`, and the r354 release took
+`354` while `r385-wip` already existed in the same commit.  So take the next revision from the **release
+tags** (`git tag --list 'v*-r*' | sort -V | tail -1`), never from a flat max over every `rNN` in the docs:
+that reads a campaign's 30-odd `-wip` numbers as delivery revisions (the r355 cut was first numbered
+`r386` that way on 2026-11-24 and corrected within the hour).
+
 **WORKLOG dated headers use `YYMMDD.VVV`** (e.g. `## 261011.005 (r47) -- ...`).  `YYMMDD` is the
 real local calendar date and `VVV` is a per-date, monotonically increasing 3-digit sequence number in
 file order (the topmost/newest entry of a date carries the highest number).  The date is only a

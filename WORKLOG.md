@@ -82,7 +82,17 @@ hybrid (this box runs the 10.2 compiler **and** runtime).
   amendments, this box's verification) and `TODO` **#379** records the larger idea the PR left out (reader counts once
   per graph, for the *other* matchers).
 
-### 5. Release completed
+### 5. The revision number (corrected within the hour)
+
+The cut was first numbered **r386** and corrected to **r355**: the revision is the DELIVERY track's next number
+(r354 + 1), and the `rNN-wip` numbers the `prefill-decode-arms` v2 campaign issued (`r353-wip`..`r385-wip`) are a
+parallel track that never consumes a delivery revision — the r354 release itself took `354` while `r385-wip` sat in
+the same commit.  Nothing but the label moved: the tree (`4244d077e`), the tip (`13df5e2c7`), every patch sha256
+and every gate result are unchanged, the mis-numbered tag/release was deleted before the container watcher polled
+(GHCR never carried an `r386` image), and `AGENTS.md` now states the rule and the read that gets it right
+(`git tag --list 'v*-r*' | sort -V | tail -1`, never a flat max over `rNN` in the docs).
+
+### 6. Release completed
 
 `v17-919794500-r355` is committed and pushed to `git@github.com:stew675/llama-cpp-rdna-boosts.git` (`main` + the
 annotated tag), and the personal fork's `rdna-boosts` branch was re-cut and force-pushed by
