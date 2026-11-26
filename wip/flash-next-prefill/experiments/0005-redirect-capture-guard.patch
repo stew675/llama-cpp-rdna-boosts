@@ -1,0 +1,54 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index dd3149e8a..5b91c2cde 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2807,6 +2807,15 @@ static ggml_backend_event_t sched_stage_ev(ggml_backend_sched_t sched, int backe
+     return *pev;
+ }
+ 
++// wip/flash-next-prefill: the capture-safety limit for a REDIRECTED split (see `sched_stage_redirect`).
++// A redirected split's input buffer IS the ring slot, and a captured CUDA graph bakes that pointer in, so the
++// redirect is only legal above the graph-capture limit -- `GGML_CUDA_GRAPH_MAX_TOKENS`, 16 rows.  The staging
++// WIDTH FLOOR (>= 64 tokens, see `sched_stage_min_tokens`, floored "above the widest verify batch (16)") is
++// what makes that true in practice, but `GGML_SCHED_STAGE_MIN_TOKENS` can override the floor, so the width a
++// split actually got is re-checked at the redirect and a narrow split DECLINES to the copy path rather than
++// trusting the gate.  Kept at 16 to match the CUDA backend's capture limit; the scheduler's own floor is 64.
++static constexpr int64_t SCHED_STAGE_CAPTURE_SAFE_TOKENS = 16;
++
+ // wip/flash-next-prefill (the ping-pong the slab/arena work was asked for): a staged host weight is consumed
+ // IN THE RING SLOT instead of being copied into the graph-allocated split input first.  That is the retired
+ // r250 "redirect" form, and it is safe HERE for a reason r250 did not have: such a split is a multi-token
+@@ -3311,8 +3320,31 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+                     // consume the ring slot in place: no copy into the graph-allocated input.  The slot is freed
+                     // by `ggml_backend_sched_compute_splits` AFTER this split's compute is enqueued, so it stays
+                     // valid for exactly as long as the consumer needs it (the ping-pong's other half).
+-                    input_cpy->data = buf;
+-                    return;
++                    //
++                    // CAPTURE SAFETY, checked rather than asserted: a captured graph bakes `input_cpy->data` in,
++                    // so this is only legal above the graph-capture limit.  The staging width floor guarantees
++                    // it unless `GGML_SCHED_STAGE_MIN_TOKENS` lowered the floor, so the width this split really
++                    // got decides -- and a narrow split falls through to the copy below (correct, just slower).
++                    const int64_t toks = sched_stage_batch_tokens(split);
++                    if (toks > SCHED_STAGE_CAPTURE_SAFE_TOKENS) {
++                        static bool logged_redirect = false;
++                        if (!logged_redirect) {
++                            logged_redirect = true;
++                            GGML_LOG_INFO("%s: stage redirect: the ring slot IS the split input, "
++                                          "batch_tokens=%lld (> the graph-capture limit %lld)\n",
++                                          __func__, (long long) toks, (long long) SCHED_STAGE_CAPTURE_SAFE_TOKENS);
++                        }
++                        input_cpy->data = buf;
++                        return;
++                    }
++                    static bool logged_declined = false;
++                    if (!logged_declined) {
++                        logged_declined = true;
++                        GGML_LOG_WARN("%s: stage redirect DECLINED: batch_tokens=%lld is at or below the "
++                                      "graph-capture limit (%lld), so the slot is copied into the split input "
++                                      "instead (a captured graph would bake the slot pointer in)\n",
++                                      __func__, (long long) toks, (long long) SCHED_STAGE_CAPTURE_SAFE_TOKENS);
++                    }
+                 }
+                 // copy the slot into the real split input, then free it
+                 ggml_backend_event_t free_ev = sched_stage_ev(sched, b, slot, false);

@@ -277,6 +277,13 @@ at ub 4096, so §2.2's 0.9 s is the host-expert path only), the H2D calibration 
 
 ## 10. Session 2 (2026-11-26, second session) — the ring is not a ring, and the fill engine is the transport
 
+> **SESSION 3 REPLACED ITS SINGLE-RUN NUMBERS WITH AN INTERLEAVED MATRIX AND ADDED THE CORRECTNESS BLOCK — read
+> [`RESULTS-session3.md`](RESULTS-session3.md) for the current numbers.** The engine finding below holds (the
+> kernel fill is the slow engine, +24.6 % for a copy-engine fill, ranges disjoint); the redirect's "+6 %" does
+> **not** — at 5 samples per arm it is +2-4 %, inside the staged path's own 5-9 % spread — and the gather is
+> **not** retirable (it is also the decode-width path). Session 3 also adds a 122B-A10B arm with no PLE
+> (**+39.7 % prefill**, text identical) and the cross-geometry results (a tensor split loses 12 %).
+
 **Nothing here is in `patches/`.** Three experiment patches are in [`experiments/`](experiments/) and were
 measured on a build carrying them (`~/llama.cpp` uncommitted; `release.json` untouched, so `validate-set.sh`
 is unaffected). All numbers are GPU0 (Gen5 x8) unless the row says `radix` (Gen5 x16), `-ub 8192`, Dano's
