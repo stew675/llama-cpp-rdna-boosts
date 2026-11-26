@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 26 Nov 2026 14:55:12 +0000
+Subject: [PATCH] server: KV full stop -- with a unified KV cache, end a reply
+ that no longer fits with a length stop instead of failing the decode
+ (LLAMA_SERVER_KV_FULL_STOP=0: off)
+
+KV admission reserves room for each admitted reply, but a reply that outgrows
+its reserve can still fill the cache. The decode retry loop then halves the
+batch below the MTP verify width, and the generating request fails with
+HTTP 500 ("speculative batch index N is not inside the current sub-batch").
+
+Before each step, the generating slots' next tokens (1 + the draft) must fit
+in the free cells. Idle slots are cleared first (saved to the prompt cache);
+if that is not enough, the slot that has generated the most ends with a
+length stop (finish_reason "length"; every token it produced was already
+sent). The step's prompt tokens are then bounded by a separate fill limit
+(the decode tokens plus the cells left, counting idle slots' cells as room),
+so the batch always fits and is never split. A prompt still prefilling keeps
+the cells it already holds; when the cache is full, a reply is ended.
+
+Off while an n_cmpl parent or child is processing (they share prefix cells,
+which the per-slot count would double). Inert while the cache has room.
+---
+ tools/server/server-context.cpp | 99 +++++++++++++++++++++++++++++++--
+ 1 file changed, 95 insertions(+), 4 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 196e0bfffe..f75f903bfa 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1271,6 +1271,22 @@ private:
+         return e == nullptr ? -1 : std::max(0, atoi(e));
+     }();
+ 
++    // LLAMA_SERVER_KV_FULL_STOP (on unless 0): with a unified KV cache, a reply that outgrows its admission reserve
++    // no longer fails the decode.  Before a step, the generating slots' next tokens (1 + the draft) must fit in the
++    // free cells: idle slots are cleared first, and if that is not enough the slot that has generated the most ends
++    // with a length stop (finish_reason "length"; every token it produced was already sent).  The step's prompt
++    // tokens are capped to the cells left after that (idle slots' cells count as room: the decode retry clears
++    // them), so the batch always fits and is never split below the MTP verify width.  Without it the generating
++    // request got HTTP 500 when the cache filled ("speculative batch index N is not inside the current sub-batch",
++    // FINDINGS 1135).  A prompt still prefilling keeps the cells it holds: when its next chunk leaves no room
++    // for the decode tokens, the next step ends a reply.  Off while an n_cmpl parent or child is processing.
++    const bool kv_full_stop = [] {
++        const char * e = getenv("LLAMA_SERVER_KV_FULL_STOP");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    // cells left for this step's prompt tokens after the generating slots (-1: no cap)
++    int64_t kv_free_step = -1;
++
+     // LLAMA_SERVER_LAZY_IDLE_SLOTS (on unless 0): with a unified KV cache, an idle slot keeps its context when a new task
+     // starts and is saved to the prompt cache and cleared only once the KV cache runs out of room, so conversations that
+     // take turns on their own slots do not copy their whole state to host memory and back on every switch
+@@ -4409,6 +4425,71 @@ private:
+         });
+     }
+ 
++    // LLAMA_SERVER_KV_FULL_STOP: make room in the unified KV cache for this step's decode tokens; sets kv_free_step.
++    // Cells held = every slot's prompt tokens.  An n_cmpl parent and its children share their prefix cells
++    // (seq_cp), which this sum would count once per slot, so the check stays off while one is processing.
++    void kv_full_check() {
++        kv_free_step = -1;
++        if (!kv_full_stop || !params_base.kv_unified) {
++            return;
++        }
++        for (const auto & slot : slots) {
++            if (slot.is_processing() && slot.task != nullptr && (slot.task->is_parent() || slot.task->is_child())) {
++                return;
++            }
++        }
++        const int64_t n_ctx_total = llama_n_ctx(ctx_tgt);
++        const int64_t n_spec      = spec ? common_speculative_n_max(spec.get()) : 0;
++        auto is_gen = [](const server_slot & slot) {
++            return slot.state == SLOT_STATE_GENERATING && slot.task != nullptr &&
++                   slot.task->type != SERVER_TASK_TYPE_TTS && slot.task->type != SERVER_TASK_TYPE_REALTIME;
++        };
++        for (;;) {
++            int64_t n_held = 0;
++            int64_t n_idle = 0; // held by idle slots: the decode retry clears them on demand, as before
++            int64_t n_need = 0;
++            for (const auto & slot : slots) {
++                n_held += slot.prompt.n_tokens();
++                if (!slot.is_processing()) {
++                    n_idle += slot.prompt.n_tokens();
++                }
++                if (is_gen(slot)) {
++                    n_need += 1 + (slot.can_speculate() ? n_spec : 0);
++                }
++            }
++            const int64_t n_free = n_ctx_total - n_held;
++            if (n_need == 0) {
++                return; // nothing decoding: the prompt-only path is unchanged
++            }
++            if (n_need <= n_free) {
++                // the step's prompt tokens may also use what idle slots hold (a full batch makes the decode retry
++                // clear them), so the cap only binds when the room is not there at all
++                kv_free_step = n_free + n_idle - n_need;
++                return;
++            }
++            if (try_clear_idle_slots()) {
++                continue;
++            }
++            server_slot * victim = nullptr;
++            for (auto & slot : slots) {
++                if (is_gen(slot) && (victim == nullptr || slot.stats.n_gen > victim->stats.n_gen)) {
++                    victim = &slot;
++                }
++            }
++            if (victim == nullptr) {
++                return;
++            }
++            SLT_WRN(*victim, "KV cache full (%" PRId64 " of %" PRId64 " cells held, %" PRId64 " needed this step): ending the reply with a length stop after %d generated tokens\n",
++                    n_held, n_ctx_total, n_need, (int) victim->stats.n_gen);
++            victim->truncated      = true;
++            victim->stop           = STOP_TYPE_LIMIT;
++            victim->has_next_token = false;
++            victim->print_timings();
++            send_final_response(*victim);
++            victim->release();
++        }
++    }
++
+     void pre_decode() {
+         // apply context-shift if needed
+         // TODO: simplify and improve
+@@ -4478,6 +4559,8 @@ private:
+             }
+         });
+ 
++        kv_full_check();
++
+         // start populating the batch for this iteration
+         batch.clear();
+ 
+@@ -4650,6 +4733,14 @@ private:
+         // after four in a row.  So an idle server (or a prompt arriving with nothing decoding) is prefilled
+         // immediately and neither counter advances -- which is also what calibrates `prefill_step_us`.
+         const size_t n_batch_decode = batch.size(); // the decode tokens are already in; prompt tokens are not
++
++        // LLAMA_SERVER_KV_FULL_STOP: this step's prompt tokens only take the cells left after the decode tokens.  A
++        // separate fill limit, so it bounds the step's total whatever the per-slot shares are (the fair share floors
++        // each prompt at one token), and n_batch keeps its meaning for the size checks that reject a request.
++        int32_t n_batch_fill = n_batch;
++        if (kv_free_step >= 0 && batch.size() > 0) {
++            n_batch_fill = (int32_t) std::min<int64_t>(n_batch, (int64_t) batch.size() + kv_free_step);
++        }
+         const int64_t t_step_now = ggml_time_us();
+         const int64_t step_us    = prefill_step_start > 0 ? t_step_now - prefill_step_start : 0;
+         if (prefill_step_prev) {
+@@ -4733,7 +4824,7 @@ private:
+             bool add_ok = true; // false means the batch is full, skip remaining slots
+ 
+             iterate(slots, [&](server_slot & slot) {
+-                if (!add_ok || batch.size() >= n_batch) {
++                if (!add_ok || batch.size() >= n_batch_fill) {
+                     return; // batch is full, skip remaining slots
+                 }
+ 
+@@ -5087,7 +5178,7 @@ private:
+ 
+                     if (!slot.can_split()) {
+                         // cannot fit the prompt in the current batch - will try next iter
+-                        if (batch.size() + slot.task->n_tokens() > n_batch) {
++                        if (batch.size() + slot.task->n_tokens() > n_batch_fill) {
+                             return;
+                         }
+                     }
+@@ -5211,7 +5302,7 @@ private:
+                     const int32_t n_prompt_start  = (int32_t) slot.prompt.n_tokens();
+                     const int32_t n_prompt_budget = prompt_budget[slot.id];
+ 
+-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch &&
++                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_fill &&
+                            (int32_t) slot.prompt.n_tokens() - n_prompt_start < n_prompt_budget) {
+                         // get next token to process
+                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
+@@ -5225,7 +5316,7 @@ private:
+                         }
+ 
+                         // the outputs of a decision are read from one batch, do not split them
+-                        if (slot.prompt.n_tokens() == n_decision_first && batch.size() + slot.task->n_tokens() - n_decision_first > n_batch) {
++                        if (slot.prompt.n_tokens() == n_decision_first && batch.size() + slot.task->n_tokens() - n_decision_first > n_batch_fill) {
+                             break;
+                         }
+ 
+-- 
+2.53.0
+
