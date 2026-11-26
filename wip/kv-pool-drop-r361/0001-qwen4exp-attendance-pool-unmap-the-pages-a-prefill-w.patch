@@ -1,0 +1,255 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Wed, 25 Nov 2026 22:09:16 +0000
+Subject: [PATCH] qwen4exp attendance pool: unmap the pages a prefill writes
+ (ggml_kv_pool_drop), so resident pool copies never go stale
+
+---
+ ggml/include/ggml.h             | 10 ++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu |  6 ++++
+ ggml/src/ggml-cuda/kv-pool.cu   | 57 +++++++++++++++++++++++++++++++--
+ ggml/src/ggml.c                 | 21 ++++++++++++
+ src/llama-kv-cache.cpp          | 19 +++++++++++
+ src/llama-kv-cache.h            |  5 +++
+ src/models/qwen4exp.cpp         | 12 +++++++
+ 7 files changed, 128 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 5dd92aba7b..5a14e52737 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2411,6 +2411,16 @@ extern "C" {
+             struct ggml_tensor  * wids,
+             struct ggml_tensor  * use);
+ 
++    // ours: the attendance pool's DROP form (same op, op param 1 = 1).  A batch that writes the KV mirror
++    // without resolving through the pool (a prefill chunk, a dense-arm batch) leaves any resident copy of the
++    // pages it wrote stale; this unmaps them (tbl[cell / page_cells] = -1), so the next resolve claims them
++    // again and fills them from the mirror.  `wids` is the I64/I32 cell list the batch wrote.
++    GGML_API struct ggml_tensor * ggml_kv_pool_drop(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * wids,
++            struct ggml_tensor  * tbl,
++            int                   page_cells);
++
+     // the page size in cells (one QSA indexer block); stored in the op params
+     GGML_API void ggml_kv_pool_set_page(
+             struct ggml_tensor * a,
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 18362ec5b0..1661f609c9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -11729,6 +11729,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_FLASH_ATTN_QSA:
+             return ggml_cuda_flash_attn_qsa_supported(dev_ctx->device, op);
+         case GGML_OP_KV_POOL:
++            if (ggml_get_op_params_i32(op, 1) == 1) {
++                // ours: the drop form (ggml_kv_pool_drop)
++                return op->type == GGML_TYPE_I32 && op->src[0] != nullptr &&
++                    (op->src[0]->type == GGML_TYPE_I64 || op->src[0]->type == GGML_TYPE_I32) &&
++                    op->src[1] != nullptr && op->src[1]->type == GGML_TYPE_I32;
++            }
+             // the page-table resolve: I32 ids -> I32 pool positions, plus the mirror->pool fills
+             return op->type == GGML_TYPE_I32 && op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_I32 &&
+                 op->src[1] != nullptr && op->src[1]->type == GGML_TYPE_I32 &&
+diff --git a/ggml/src/ggml-cuda/kv-pool.cu b/ggml/src/ggml-cuda/kv-pool.cu
+index d5265eba61..d63497e48e 100644
+--- a/ggml/src/ggml-cuda/kv-pool.cu
++++ b/ggml/src/ggml-cuda/kv-pool.cu
+@@ -18,8 +18,12 @@
+ //       hold the previous cell's bytes -- `wids`),
+ //     * a page that is read but not resident is claimed and filled from the mirror BEFORE the
+ //       attention runs (this op is ordered before it on the same stream).
+-//   A page therefore never needs to be invalidated -- not after a rejected draft, not on a resume,
+-//   not on `seq_rm`/`seq_cp`.  The pool can only change WHERE the bytes are, never WHICH.
++//   That covers every batch that RESOLVES (the decode band).  A batch that writes the mirror without a
++//   resolve -- a prefill chunk, e.g. the next request's prompt over cells a previous request left
++//   resident, or a dense-arm batch -- unmaps the blocks it wrote instead (the drop form below,
++//   `ggml_kv_pool_drop`), so the next resolve claims and fills them again.  With that, a page needs no
++//   other invalidation -- not after a rejected draft, not on a resume, not on `seq_rm`/`seq_cp`.  The pool
++//   can only change WHERE the bytes are, never WHICH.
+ //
+ // THE PHASES, and why they are separate kernels
+ //   1 MARK   every page this launch's selection already holds resident (`use[slot] = epoch`) and list the
+@@ -267,7 +271,56 @@ static __global__ void kv_pool_verify_kernel(
+     }
+ }
+ 
++// ours: the drop form (ggml_kv_pool_drop).  The writer rule above re-fills a resident page only when the batch
++// that wrote it also RESOLVES (decode band).  A prefill chunk writes the mirror without a resolve -- e.g. the next
++// request's prompt over cells a previous request left resident -- and the pool kept the old bytes (VERIFY: millions
++// of mismatches, empty or wrong text; FINDINGS 1125/1126).  Unmapping the written blocks makes the next resolve
++// claim and fill them from the mirror.  The slot's inverse entry may keep naming the block: a later claim of that
++// slot only clears tbl[prev] when it still points at the slot (atomicCAS), so a stale inverse is harmless.
++template <typename T>
++static __global__ void kv_pool_drop_kernel(const T * __restrict__ wids, const int n_wids, int * __restrict__ tbl,
++        const int page_cells, const int n_blocks) {
++    const int i = blockIdx.x*blockDim.x + threadIdx.x;
++    if (i >= n_wids) {
++        return;
++    }
++    const int64_t c = (int64_t) wids[i];
++    if (c < 0) {
++        return;
++    }
++    const int64_t b = c / page_cells;
++    if (b < n_blocks) {
++        tbl[b] = -1;
++    }
++}
++
++static void ggml_cuda_kv_pool_drop(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * wids = dst->src[0];
++    const ggml_tensor * tbl  = dst->src[1];
++    GGML_ASSERT(ggml_is_contiguous(wids) && tbl->type == GGML_TYPE_I32);
++    const int page_cells = ggml_get_op_params_i32(dst, 0);
++    GGML_ASSERT(page_cells > 0);
++    const int n_wids   = (int) ggml_nelements(wids);
++    const int n_blocks = (int) tbl->ne[0];
++    if (n_wids == 0) {
++        return;
++    }
++    cudaStream_t stream = ctx.stream();
++    const int nthread = 256;
++    const int nblock  = (n_wids + nthread - 1)/nthread;
++    if (wids->type == GGML_TYPE_I64) {
++        kv_pool_drop_kernel<<<nblock, nthread, 0, stream>>>((const int64_t *) wids->data, n_wids, (int *) tbl->data, page_cells, n_blocks);
++    } else {
++        kv_pool_drop_kernel<<<nblock, nthread, 0, stream>>>((const int *) wids->data, n_wids, (int *) tbl->data, page_cells, n_blocks);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ void ggml_cuda_kv_pool(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (ggml_get_op_params_i32(dst, 1) == 1) {
++        ggml_cuda_kv_pool_drop(ctx, dst);
++        return;
++    }
+     const ggml_tensor * ids      = dst->src[0];
+     const ggml_tensor * tbl      = dst->src[1];
+     const ggml_tensor * inv      = dst->src[2];
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index bcff734f47..afbd42b23f 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5809,6 +5809,27 @@ struct ggml_tensor * ggml_kv_pool(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_kv_pool_drop(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * wids,
++        struct ggml_tensor  * tbl,
++        int                   page_cells) {
++    GGML_ASSERT(wids->type == GGML_TYPE_I64 || wids->type == GGML_TYPE_I32);
++    GGML_ASSERT(tbl->type == GGML_TYPE_I32 && tbl->ne[0] > 0);
++    GGML_ASSERT(page_cells > 0);
++
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
++
++    ggml_set_op_params_i32(result, 0, page_cells);
++    ggml_set_op_params_i32(result, 1, 1);           // the drop form
++
++    result->op     = GGML_OP_KV_POOL;
++    result->src[0] = wids;
++    result->src[1] = tbl;
++
++    return result;
++}
++
+ void ggml_kv_pool_set_page(
+         struct ggml_tensor * a,
+         int                   page_cells) {
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 8c3e894199..f37767617d 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2769,6 +2769,21 @@ ggml_tensor * llama_kv_cache::build_kv_pool_resolve(ggml_context * ctx, ggml_ten
+     return res;
+ }
+ 
++ggml_tensor * llama_kv_cache::build_kv_pool_drop(ggml_context * ctx, ggml_tensor * wids, int32_t il) const {
++    // LLAMA_KV_POOL_DROP=0: the pre-fix behaviour (stale pages after a prefill over resident cells), for A/B only
++    static const bool on = [] { const char * e = getenv("LLAMA_KV_POOL_DROP"); return e == nullptr || atoi(e) != 0; }();
++    if (!on || kv_pool_page == 0 || wids == nullptr) {
++        return nullptr;
++    }
++    const int32_t ikv = map_layer_ids.at(il);
++    GGML_ASSERT(ikv >= 0 && (size_t) ikv < pool_layers.size());
++    const kv_pool_layer & pl = pool_layers[ikv];
++    if (pl.tbl == nullptr) {
++        return nullptr;
++    }
++    return ggml_kv_pool_drop(ctx, wids, pl.tbl, (int) kv_pool_page);
++}
++
+ bool llama_kv_cache_context::has_kv_pool() const {
+     return kv->has_kv_pool();
+ }
+@@ -2789,6 +2804,10 @@ bool llama_kv_cache_context::kv_pool_serves(uint32_t n_rows) const {
+     return kv->kv_pool_serves(n_rows);
+ }
+ 
++ggml_tensor * llama_kv_cache_context::build_kv_pool_drop(ggml_context * ctx, ggml_tensor * wids, int32_t il) const {
++    return kv->build_kv_pool_drop(ctx, wids, il);
++}
++
+ uint32_t llama_kv_cache::get_size() const {
+     const auto & cells = v_cells[seq_to_stream[0]];
+ 
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 800d8023c2..754078e57e 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -229,6 +229,8 @@ public:
+     ggml_tensor * get_v_pool(ggml_context * ctx, int32_t il) const;
+     // the page-table resolve for one layer's selection: dst = the selected cells' POOL positions
+     ggml_tensor * build_kv_pool_resolve(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * wids, int32_t il) const;
++    // ours: unmap the pool pages of the cells a non-resolving batch wrote (see llama_kv_cache_context)
++    ggml_tensor * build_kv_pool_drop(ggml_context * ctx, ggml_tensor * wids, int32_t il) const;
+ 
+     bool get_has_shift() const;
+ 
+@@ -595,6 +597,9 @@ public:
+     // WROTE (the pages holding them are re-filled from the mirror), or nullptr.
+     ggml_tensor * build_kv_pool_resolve(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * wids, int32_t il) const;
+     bool kv_pool_serves(uint32_t n_rows) const;
++    // ours: unmap the pool pages of the cells `wids` (a batch that did not resolve through the pool) wrote; nullptr
++    // when there is nothing to do (no pool, LLAMA_KV_POOL_DROP=0)
++    ggml_tensor * build_kv_pool_drop(ggml_context * ctx, ggml_tensor * wids, int32_t il) const;
+ 
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 59feb35224..622da94da0 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -2610,6 +2610,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+             ggml_build_forward_expand(gf, top_k_kv);
+         }
+     }
++    // ours: a batch that wrote the mirror without the resolve unmaps the pages it wrote (ggml_kv_pool_drop)
++    if (top_k_kv == nullptr && mctx_cur->has_kv_pool()) {
++        if (ggml_tensor * drop = mctx_cur->build_kv_pool_drop(ctx0, inp->get_k_idxs(), il)) {
++            ggml_build_forward_expand(gf, drop);
++        }
++    }
+ 
+     ggml_tensor * q = q_cur;
+     ggml_tensor * k = top_k_kv != nullptr ? mctx_cur->get_k_pool(ctx0, il) : mctx_cur->get_k(ctx0, il);
+@@ -2877,6 +2883,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+         cur = build_attn(inp,
+                     nullptr, nullptr, nullptr,
+                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
++        // ours: the dense arm wrote the mirror without the pool's resolve (see build_attn_qsa)
++        if (inp->mctx->has_kv_pool()) {
++            if (ggml_tensor * drop = inp->mctx->build_kv_pool_drop(ctx0, inp->get_k_idxs(), il)) {
++                ggml_build_forward_expand(gf, drop);
++            }
++        }
+     }
+     cb(cur, "attn_pregate", il);
+ 
+-- 
+2.53.0
+

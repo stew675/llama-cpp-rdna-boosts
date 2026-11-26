@@ -1,0 +1,68 @@
+# repro-r361.log: stock r361 (tag stew-r361 0602cbb722) vs r361 + 0001 (kvpdrop-r361 1d0d7fea57), both built in rocm/dev-ubuntu-24.04:10.2.0-full
+# model: Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS (2 shards), 2x R9700, ROCR/HIP_VISIBLE_DEVICES=0,1
+# llama-server -m MODEL -c 65536 -sm layer --kv-attendance-pool on -ngl 99 -ctk q8_0 -ctv q8_0 -cram 2048 -ub 2048 -b 2048 --reasoning-effort low --temp 0.7 --top-k 20 --top-p 0.95 --min-p 0 --port 8099   (no MTP)
+# env: LLAMA_KV_POOL_VERIFY=1 LLAMA_KV_POOL_STATS=<file>; arm R: LLAMA_QSA_DENSE_DECODE_UNTIL=0 (no pool); arm F0: LLAMA_KV_POOL_DROP=0
+# requests: poolreq.py 8099 390 32, then poolreq.py 8099 90 32 (/completion, greedy, cache_prompt false; script at the end)
+
+## pair 1 (harness env also sets LLAMA_KQ_MASK_DERIVED=0 GGML_SCHED_SYNC_GRAPH_INPUTS=1 LLAMA_MTP_SPARSE=0 LLAMA_MTP_DRAFT_OP_OFFLOAD=0)
+=== S 2:30 PM /pwd/w1100/r361/build102/bin 
+   llama_kv_cache: ATTENDANCE POOL ENABLED for the attention KV: a 204.4 MiB device pool of 4104 pages x 4 cells per layer (--kv-attendance-pool, sized b
+   n=390: prompt 18140 tok, gen 32 @ 53.0 t/s, sha 8f4998e050cd |   <think> The user wants me to summarize 390 entries of maintenance records in three sente
+   n=90: prompt 4123 tok, gen 32 @ 55.4 t/s, sha 4af498db50ab |   <think> The user wants me to summarize 91 entries (Entry 0 through Entry 90) in three se
+   KVPOOL_BAD lines 16; first: KVPOOL_BAD n=0 K cell=2060 blk=515 slot=203 word=256 mirror=541344e2 pool=531343e1 i=1224
+   stats ~llama_kv_cache: KV pool: 4104 pages x 4 cells/layer, 12 layers, 2 counter blocks, claims 32251, misses 28494, ids 1722840, hits 1541566 (89.48 %), dirty re-fills 614, resolves 768, bad 227074287
+   faults 0
+=== F 2:31 PM /pwd/w1100/kvs361/build102/bin 
+   llama_kv_cache: ATTENDANCE POOL ENABLED for the attention KV: a 204.4 MiB device pool of 4104 pages x 4 cells per layer (--kv-attendance-pool, sized b
+   n=390: prompt 18140 tok, gen 32 @ 53.0 t/s, sha 8f4998e050cd |   <think> The user wants me to summarize 390 entries of maintenance records in three sente
+   n=90: prompt 4123 tok, gen 32 @ 55.4 t/s, sha 5c4eb5da3364 |   <think> The user wants me to summarize 90 entries of maintenance records in three senten
+   KVPOOL_BAD lines 0; first: 
+   stats ~llama_kv_cache: KV pool: 4104 pages x 4 cells/layer, 12 layers, 2 counter blocks, claims 40699, misses 36106, ids 1722840, hits 1452873 (84.33 %), dirty re-fills 600, resolves 768, bad 0
+   faults 0
+=== F0 2:31 PM /pwd/w1100/kvs361/build102/bin -e LLAMA_KV_POOL_DROP=0
+   llama_kv_cache: ATTENDANCE POOL ENABLED for the attention KV: a 204.4 MiB device pool of 4104 pages x 4 cells per layer (--kv-attendance-pool, sized b
+   n=390: prompt 18140 tok, gen 32 @ 53.1 t/s, sha 8f4998e050cd |   <think> The user wants me to summarize 390 entries of maintenance records in three sente
+   n=90: prompt 4123 tok, gen 32 @ 55.3 t/s, sha 4af498db50ab |   <think> The user wants me to summarize 91 entries (Entry 0 through Entry 90) in three se
+   KVPOOL_BAD lines 16; first: KVPOOL_BAD n=0 K cell=2061 blk=515 slot=506 word=256 mirror=541344e2 pool=531343e1 i=1225
+   stats ~llama_kv_cache: KV pool: 4104 pages x 4 cells/layer, 12 layers, 2 counter blocks, claims 32384, misses 28618, ids 1722840, hits 1541304 (89.46 %), dirty re-fills 615, resolves 768, bad 227979668
+   faults 0
+### psr DONE 2:32 PM
+=== R 2:32 PM /pwd/w1100/r361/build102/bin -e LLAMA_QSA_DENSE_DECODE_UNTIL=0
+   n=390: prompt 18140 tok, gen 32 @ 59.1 t/s, sha 8f4998e050cd |   <think> The user wants me to summarize 390 entries of maintenance records in three sente
+   n=90: prompt 4123 tok, gen 32 @ 61.4 t/s, sha 5c4eb5da3364 |   <think> The user wants me to summarize 90 entries of maintenance records in three senten
+   KVPOOL_BAD lines 0; first: 
+   faults 0
+### psr DONE 2:32 PM
+
+## pair 2 (without those four)
+=== S 2:33 PM /pwd/w1100/r361/build102/bin 
+   llama_kv_cache: ATTENDANCE POOL ENABLED for the attention KV: a 204.4 MiB device pool of 4104 pages x 4 cells per layer (--kv-attendance-pool, sized b
+   n=390: prompt 18140 tok, gen 32 @ 53.1 t/s, sha 8f4998e050cd |   <think> The user wants me to summarize 390 entries of maintenance records in three sente
+   n=90: prompt 4123 tok, gen 32 @ 55.5 t/s, sha 4af498db50ab |   <think> The user wants me to summarize 91 entries (Entry 0 through Entry 90) in three se
+   KVPOOL_BAD lines 16; first: KVPOOL_BAD n=0 K cell=2062 blk=515 slot=390 word=448 mirror=6011e21f pool=6111e21f i=1226
+   stats ~llama_kv_cache: KV pool: 4104 pages x 4 cells/layer, 12 layers, 2 counter blocks, claims 33075, misses 28941, ids 1722840, hits 1539787 (89.37 %), dirty re-fills 616, resolves 768, bad 225752352
+   faults 0
+=== F 2:34 PM /pwd/w1100/kvs361/build102/bin 
+   llama_kv_cache: ATTENDANCE POOL ENABLED for the attention KV: a 204.4 MiB device pool of 4104 pages x 4 cells per layer (--kv-attendance-pool, sized b
+   n=390: prompt 18140 tok, gen 32 @ 52.9 t/s, sha 8f4998e050cd |   <think> The user wants me to summarize 390 entries of maintenance records in three sente
+   n=90: prompt 4123 tok, gen 32 @ 55.3 t/s, sha 5c4eb5da3364 |   <think> The user wants me to summarize 90 entries of maintenance records in three senten
+   KVPOOL_BAD lines 0; first: 
+   stats ~llama_kv_cache: KV pool: 4104 pages x 4 cells/layer, 12 layers, 2 counter blocks, claims 41268, misses 36200, ids 1722840, hits 1452515 (84.31 %), dirty re-fills 596, resolves 768, bad 0
+   faults 0
+### psr DONE 2:34 PM
+
+## poolreq.py
+#!/usr/bin/env python3
+# poolreq.py PORT NREC NGEN: one fresh greedy request over NREC depth2-style entries (~46 tok each), prints tokens, sha, head.
+import hashlib, json, random, sys, urllib.request
+port, n, ngen = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]); R = random.Random(20261106)
+A = "pump valve filter gauge sensor relay bearing rotor stator flange gasket impeller coupling manifold actuator solenoid regulator thermostat compressor condenser".split()
+B = "inspected replaced calibrated cleaned tightened lubricated tested rebuilt adjusted logged flagged measured".split()
+C = "north south east west upper lower inner outer primary secondary spare auxiliary".split()
+body = " ".join("Entry %d: the %s %s at station %d was %s by crew %d on day %d, reading %.2f, cost %d." % (i, R.choice(C), R.choice(A), R.randrange(9000), R.choice(B), R.randrange(97), R.randrange(365), R.random()*500, R.randrange(100000)) for i in range(n))
+req = urllib.request.Request("http://127.0.0.1:%s/completion" % port, data=json.dumps({"prompt": body + "\nSummarize the entries above in three sentences.", "n_predict": ngen, "temperature": 0, "top_k": 1, "cache_prompt": False}).encode(), headers={"Content-Type": "application/json"})
+try:
+    r = json.load(urllib.request.urlopen(req, timeout=900)); t = r["timings"]; c = r["content"]
+    print("n=%d: prompt %d tok, gen %d @ %.1f t/s, sha %s | %s" % (n, t["prompt_n"], t["predicted_n"], t["predicted_per_second"], hashlib.sha256(c.encode()).hexdigest()[:12], c[:90].replace("\n", " ")))
+except Exception as e:
+    print("n=%d: ERROR %s" % (n, e))
