@@ -55,6 +55,22 @@
 #                   two different decode arms and could never pass (fixed in r264).
 #     and one assertion beyond residency (r217): `pres` must keep >= `PREFILL_MIN_PCT` (40 %) of `pref`'s
 #     PROMPT rate.  `plegacy` runs with the verify oracle and is not a timing arm.
+#   Pool across TWO REQUESTS (r363, GitHub PR #369) -- the STALE-PAGE class, which no arm above can reach
+#   because llama-cli runs one request per process: a second request that RE-PREFILLS cells a previous
+#   request left resident.  The writer rule re-fills a pool page only when the batch that wrote it also
+#   RESOLVED (the decode band), so a prefill chunk (and the QSA dense/shortcut arm) used to leave those
+#   pages holding the previous request's bytes.  Measured on the r362 build at the shape below: 225 M
+#   mismatching words, and the answer agreeing with the stale copies (`91 entries` for a 90-entry prompt).
+#   `ggml_kv_pool_drop` unmaps the pages a non-resolving batch wrote, so the next resolve re-fills them.
+#     pstale_ref    no pool + the SPARSE decode arm (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`): the text the pool
+#                   must reproduce, i.e. the correct answer
+#     pstale_res    `--kv-attendance-pool on`: must read `bad 0` and reproduce pstale_ref's 2nd-request text
+#     pstale_ctl    the same pool + `LLAMA_KV_POOL_DROP=0`: must read `bad > 0`, or the arm is VACUOUS (a
+#                   gate that cannot see the class it was added for)
+#   One llama-server per arm (the two requests are POSTs to /completion, `cache_prompt: false` so the second
+#   really is re-prefilled), the prompts share a PREFIX by construction -- the same seeded generator with 390
+#   then 90 entries, `PSTALE_ENTRIES` -- and both request hashes plus the prompt-token counts go to the log.
+#   Cost: ~30 s per arm plus the model load (3 arms), on `PSTALE_DEVS` (default: the pool arms' device).
 #   Pool, MULTI-DEVICE (`-sm layer`, the same model/prompt/knobs on `MULTI_DEVICES`, default `0,1`): the pool
 #   is per layer AND per device (one mirror buffer type, device pool, page table and counter block per
 #   device), so a multi-device arm is a distinct placement, not a rerun: r213 shipped a fix for exactly the
@@ -123,6 +139,14 @@
 #   MULTI_DEVICES  the devices the multi-device pool arms use (default `0,1`; needs two real GPUs and the
 #                `-sm layer` split, which is the default -- a tensor split declines the pool by design and
 #                would make those arms vacuous).  `MULTI_DEVICES=0` disables the section (1 GPU box).
+#   LLAMA_SERVER  binary for the two-request arms (default: llama-server beside LLAMA_CLI)
+#   PSTALE_ENTRIES  the two requests' entry counts (default `390 90`; the 2nd prompt is a PREFIX of the 1st,
+#                ~18.1k then ~4.1k tokens).  Shrinking them below the pool's capacity makes the arm vacuous:
+#                at 4.6k/1.4k the resident set and the rewritten cells do not overlap and the r362 build reads
+#                `bad 0` too, which is how this shape was chosen
+#   PSTALE_DEVS  devices for the two-request arms (default: RUN_DEVS, i.e. the pool arms' single device --
+#                the class reproduces on one device and on a `-sm layer` pair alike)
+#   PSTALE_PORT  the port the arm's llama-server listens on (default 8097; the arm refuses to run if it answers)
 #   PREFILL_MIN_PCT  the share of `pref`'s PROMPT rate (`pres` must keep), default 40.  A placement may not be
 #                correct and slow: block 15's pool costs ~48 % of the prompt on a KV that fits (r217), so this
 #                is a REGRESSION floor and not a target -- it is set below the measured cost so the known
@@ -158,6 +182,7 @@ set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLAMA_CLI="${LLAMA_CLI:-$HOME/llama.cpp/build-rocm/bin/llama-cli}"
+LLAMA_SERVER="${LLAMA_SERVER:-$(dirname "$LLAMA_CLI")/llama-server}"
 LLAMA_FIT="${LLAMA_FIT:-$(dirname "$LLAMA_CLI")/llama-fit-params}"
 MODEL_WIN="${MODEL_WIN:-/llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf}"
 MODEL_POOL="${MODEL_POOL:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}"
@@ -170,6 +195,7 @@ CTX_POOL="${CTX_POOL:-32768}"
 POOL_LEGACY="${POOL_LEGACY:-32768}"
 PREFILL_MIN_PCT="${PREFILL_MIN_PCT:-40}"
 MULTI_DEVICES="${MULTI_DEVICES:-0,1}"
+PSTALE_ENTRIES="${PSTALE_ENTRIES:-390 90}"
 KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 REUSE="${REUSE:-0}"
 KEEP=0
@@ -194,6 +220,7 @@ GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 
 [ -x "$LLAMA_CLI" ]      || { echo "error: no llama-cli at $LLAMA_CLI" >&2; exit 2; }
 [ -x "$LLAMA_FIT" ]      || { echo "error: no llama-fit-params at $LLAMA_FIT (the placement-hint arms need it)" >&2; exit 2; }
+[ -x "$LLAMA_SERVER" ]   || { echo "error: no llama-server at $LLAMA_SERVER (the two-request arms need it)" >&2; exit 2; }
 [ -f "$MODEL_WIN" ]      || { echo "error: no model at $MODEL_WIN" >&2; exit 2; }
 [ -f "$PROMPT_WIN" ]     || { echo "error: no prompt at $PROMPT_WIN" >&2; exit 2; }
 if [ "$DO_POOL" = 1 ] || [ "$DO_MULTI" = 1 ]; then
@@ -299,6 +326,85 @@ claims_per_resolve() {
 }
 # ... and the same ratio scaled by 100 for the integer comparison (`>`, not a float compare)
 claims_x100() { awk -v v="$(claims_per_resolve "$1")" 'BEGIN { printf "%d", v*100 }'; }
+# --- the two-request (stale-page) arms: a llama-server, two /completion POSTs -----------------------------
+# pstale_prompt <path> <n_entries>: the same seeded generator the report used, so the n=90 prompt is a PREFIX
+# of the n=390 one (both end with the same instruction line) and the second request re-prefills cells 0..N.
+pstale_prompt() {
+    python3 - "$1" "$2" <<'PY'
+import random, sys
+out, n = sys.argv[1], int(sys.argv[2])
+R = random.Random(20261106)
+A = "pump valve filter gauge sensor relay bearing rotor stator flange gasket impeller coupling manifold actuator solenoid regulator thermostat compressor condenser".split()
+B = "inspected replaced calibrated cleaned tightened lubricated tested rebuilt adjusted logged flagged measured".split()
+C = "north south east west upper lower inner outer primary secondary spare auxiliary".split()
+body = " ".join("Entry %d: the %s %s at station %d was %s by crew %d on day %d, reading %.2f, cost %d." %
+                (i, R.choice(C), R.choice(A), R.randrange(9000), R.choice(B), R.randrange(97),
+                 R.randrange(365), R.random()*500, R.randrange(100000)) for i in range(n))
+open(out, "w", encoding="utf-8").write(body + "\nSummarize the entries above in three sentences.")
+PY
+}
+# one greedy request: prints `prompt_n=... sha=...` (the hash of the content, as the delivery reports text)
+pstale_req() {
+    python3 - "$1" "$2" <<'PY'
+import hashlib, json, sys, urllib.request
+port, path = sys.argv[1], sys.argv[2]
+prompt = open(path, encoding="utf-8").read()
+req = urllib.request.Request("http://127.0.0.1:%s/completion" % port,
+        data=json.dumps({"prompt": prompt, "n_predict": 32, "temperature": 0, "top_k": 1,
+                         "cache_prompt": False}).encode(),
+        headers={"Content-Type": "application/json"})
+r = json.load(urllib.request.urlopen(req, timeout=3600))
+print("prompt_n=%d sha=%s" % (r["timings"]["prompt_n"],
+                               hashlib.sha256(r["content"].encode()).hexdigest()[:12]))
+PY
+}
+# pstale_hash <arm> <request 1|2> / pstale_tok <arm> <request 1|2>
+pstale_line() { sed -n "${2}p" "$KEEPOUT/$1.out" 2>/dev/null; }
+pstale_hash() { pstale_line "$1" "$2" | sed -nE 's/.*sha=//p'; }
+pstale_tok()  { pstale_line "$1" "$2" | sed -nE 's/prompt_n=([0-9]+).*/\1/p'; }
+# pstale_arm <arm> <on|off> [VAR=VAL ...]: one llama-server, the two requests, then a graceful stop so the
+# teardown writes LLAMA_KV_POOL_STATS (`bad` is only in the stats line; the KVPOOL_BAD printfs flush at exit).
+pstale_arm() {
+    local arm=$1 pool=$2
+    shift 2
+    local out="$KEEPOUT/$arm.out" err="$KEEPOUT/$arm.err"
+    if [ "$REUSE" = 1 ]; then
+        [ -s "$out" ] || { fail "$arm: no result to re-grade at $out"; return 1; }
+        return 0
+    fi
+    local port="${PSTALE_PORT:-8097}"
+    if curl -sf -m 2 "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
+        fail "$arm: port $port already answers -- another server is running"; return 1
+    fi
+    : > "$out"
+    HIP_VISIBLE_DEVICES="${PSTALE_DEVS:-${RUN_DEVS:-0}}" ROCBLAS_USE_HIPBLASLT=0 MOE_EXPERT_HEATMAP=load \
+        LLAMA_KV_POOL_VERIFY=1 LLAMA_KV_POOL_STATS="$KEEPOUT/$arm.stats" env "$@" \
+        timeout 2400 "$LLAMA_SERVER" -m "$MODEL_POOL" -ngl 99 -fit off -c "$CTX_POOL" -ctk q8_0 -ctv q8_0 \
+            -ncmoe 48 -ot 'per_layer_token_embd.*=CPU' -lm none -lzm off -b 2048 -ub 2048 \
+            --kv-attendance-pool "$pool" --port "$port" --host 127.0.0.1 >"$err" 2>&1 &
+    local pid=$!
+    local ready=0 i n
+    for i in $(seq 1 300); do
+        curl -sf -m 2 "http://127.0.0.1:$port/health" >/dev/null 2>&1 && { ready=1; break; }
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 2
+    done
+    if [ "$ready" != 1 ]; then
+        kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+        fail "$arm: llama-server never became ready (see $err)"; return 1
+    fi
+    local rc=0
+    for n in $PSTALE_ENTRIES_RUN; do
+        pstale_req "$port" "$KEEPOUT/pstale-n$n.txt" >>"$out" 2>>"$err" || rc=1
+    done
+    # graceful first: the pool's counters (and the verify `bad` total) are written at teardown
+    kill "$pid" 2>/dev/null
+    for i in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+    kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    [ "$rc" = 0 ] && return 0
+    fail "$arm: a /completion request failed (see $err)"
+    return 1
+}
 
 # ---------------------------------------------------------------------------------------------------------
 echo "==> gate: KV residency (block 15: the window and the attendance pool; wip/kv-residency-cleanup §2.1 P0)"
@@ -606,6 +712,78 @@ not the whole context"
         || fail "pres's hit rate '$H_RES %' is outside (0,100): the counters are not a probe rate"
     fi   # end: placement graded (discrete GPU) | decline graded (shared host/device pool)
 
+fi
+
+# ===== the pool across TWO REQUESTS: the stale-page class (r363, GitHub PR #369) =========================
+# WHY THIS EXISTS.  Every arm above is ONE llama-cli request in one process, so none of them can reach the
+# class this section exists for: a SECOND request that re-prefills cells a previous request left RESIDENT.
+# The pool's writer rule re-fills a page only when the batch that wrote it also RESOLVED (the decode band);
+# a prefill chunk -- and the QSA dense/shortcut arm -- writes the mirror without resolving, so the resident
+# copy of every block it wrote kept the PREVIOUS request's bytes and the pool served them.  On the r362 build
+# at this shape that is 225 M mismatching words and an answer that agrees with the stale copies (a 90-entry
+# prompt answered as "91 entries"), while every residency arm above reads `bad 0` -- the gate was blind, not
+# wrong.  `ggml_kv_pool_drop` unmaps the pages a non-resolving batch wrote, so the next resolve claims and
+# re-fills them from the authoritative mirror (block 14; `LLAMA_KV_POOL_DROP=0` is the A/B kill switch).
+#
+# The three arms are the claim, its oracle and the non-vacuity witness:
+#   pstale_ref   no pool + the SPARSE decode arm          -- the text the pool must reproduce (the answer)
+#   pstale_res   `--kv-attendance-pool on`                -- `bad 0`, and request 2 == pstale_ref byte for byte
+#   pstale_ctl   the same pool + `LLAMA_KV_POOL_DROP=0`   -- `bad > 0`, or the section cannot see the class it
+#                was added for (a green arm on a build that never drops is exactly the pre-fix state)
+# The 2nd prompt is a PREFIX of the 1st (~18.1k then ~4.1k tokens) and both are sent with
+# `cache_prompt: false`, so the second really is re-prefilled rather than served from the prompt cache.
+if [ "$DO_POOL" = 1 ]; then
+    echo "-- the pool across two requests (a re-prefill over resident cells: block 14, r363 / PR #369)"
+    PSTALE_ENTRIES_RUN="$PSTALE_ENTRIES"
+    if [ "$REUSE" != 1 ]; then
+        for n in $PSTALE_ENTRIES_RUN; do
+            pstale_prompt "$KEEPOUT/pstale-n$n.txt" "$n" \
+                || { fail "could not generate the $n-entry prompt"; exit 1; }
+        done
+    fi
+    pstale_arm pstale_ref off LLAMA_QSA_DENSE_DECODE_UNTIL=0 || exit 1
+    pstale_arm pstale_res on                                  || exit 1
+    pstale_arm pstale_ctl on LLAMA_KV_POOL_DROP=0             || exit 1
+
+    HREF=$(pstale_hash pstale_ref 2);  HRES=$(pstale_hash pstale_res 2);  HCTL=$(pstale_hash pstale_ctl 2)
+    HREF1=$(pstale_hash pstale_ref 1); HRES1=$(pstale_hash pstale_res 1)
+    BAD_RES=$(pool_field pstale_res bad); BAD_CTL=$(pool_field pstale_ctl bad)
+    info "request 1 (a fresh prompt): ref $HREF1 | pool $HRES1"
+    info "request 2 (the re-prefill) : ref $HREF  | pool $HRES  | pool+LLAMA_KV_POOL_DROP=0 $HCTL"
+    info "verify mismatching words    : pool $BAD_RES | control $BAD_CTL"
+    # the SHAPE must be the one that reaches the class: a long first request, a re-prefill of thousands of
+    # cells and the pool really placed.  Without these the assertions below can pass vacuously.
+    T1=$(pstale_tok pstale_res 1); T2=$(pstale_tok pstale_res 2)
+    if [ "${T2:-0}" -ge 2048 ] 2>/dev/null && [ "${T1:-0}" -gt $(( ${T2:-0} * 3 )) ] 2>/dev/null; then
+        pass "the two requests are $T1 then $T2 prompt tokens (a long shared prefix, re-prefilled)"
+    else
+        fail "the two-request shape is wrong ('$T1' then '$T2' prompt tokens): the arm would be vacuous"
+    fi
+    [ "$(count pstale_res 'ATTENDANCE POOL ENABLED')" = 1 ] \
+        && pass "pstale_res placed the attendance pool" \
+        || fail "pstale_res 'ATTENDANCE POOL ENABLED' count = $(count pstale_res 'ATTENDANCE POOL ENABLED') (want 1)"
+    [ "$(count pstale_ref 'ATTENDANCE POOL ENABLED')" = 0 ] \
+        && pass "pstale_ref built no pool (the resident sparse reference)" \
+        || fail "pstale_ref reports 'ATTENDANCE POOL ENABLED' -- it is not the resident reference"
+    [ -n "$HREF1" ] && [ "$HREF1" = "$HRES1" ] \
+        && pass "the pool reproduces request 1 (a fresh prompt) byte for byte ($HREF1)" \
+        || fail "request 1 differs between the pooled and the resident arm: '$HRES1' vs '$HREF1'"
+    # THE FIX: request 2 re-prefilled cells that a resident pool page held.
+    [ -n "$BAD_RES" ] && [ "$BAD_RES" = 0 ] \
+        && pass "pstale_res: VERIFY reads bad 0 across the re-prefill (no stale pool page is served)" \
+        || fail "pstale_res: verify bad = '$BAD_RES' (want 0) -- the re-prefill left stale copies in the pool"
+    [ -n "$HREF" ] && [ "$HREF" = "$HRES" ] \
+        && pass "the pooled arm's re-prefilled request == the resident sparse arm ($HREF)" \
+        || fail "the pooled arm's re-prefilled request differs from the resident sparse arm: '$HRES' vs '$HREF'"
+    # NON-VACUITY: the pre-fix behaviour must still read mismatches, or the assertion above proves nothing.
+    if [ -n "$BAD_CTL" ] && [ "$BAD_CTL" -gt 0 ] 2>/dev/null; then
+        pass "LLAMA_KV_POOL_DROP=0 reproduces the class ($BAD_CTL mismatching words): the arm is not vacuous"
+    else
+        fail "LLAMA_KV_POOL_DROP=0 reads bad '$BAD_CTL' (want > 0): the two-request arm cannot see the stale-page class, so a green pstale_res is meaningless"
+    fi
+    [ -n "$HCTL" ] && [ "$HCTL" != "$HRES" ] \
+        && pass "the control arm's text differs from the fixed arm ($HCTL vs $HRES)" \
+        || info "the control arm's text reads '$HCTL' (the counters, not the text, carry the difference here)"
 fi
 
 # ===== the pool across a multi-device `-sm layer` split (r213) ===========================================

@@ -3552,3 +3552,31 @@ loses everywhere measurable, so the delivery's default went back to the dense fo
   experts the arena holds (§89's corrected doctrine reaches this shape), and the next things to compare on their
   box are the BLAS state, the PLE's lazy reads and the *set* of tables standing down — which is why
   `MOE_EXPERT_CACHE_TABLES=1` exists.  The one lever this box did show is the ring hole above.
+* **(r363, block 14, GitHub PR #369) THE POOL'S WRITER RULE ONLY COVERED THE BATCHES THAT RESOLVE — a prefill
+  chunk writes the mirror and used to leave every resident page it touched STALE, so a second request over a
+  shared prefix read the FIRST request's K/V.**  The mirror is authoritative and the pool only ever holds copies,
+  so "a page is re-filled here when the batch that wrote it also resolves" (`wids` in
+  `kv_pool_mark_kernel`) covers the decode band and nothing else.  A prefill ubatch — and the QSA
+  dense/shortcut arm, `shortcut && n_kv <= width`, which covers the first ~2051 cells of *every* request — writes
+  cells whose blocks are still resident from the previous request and never queues them for re-fill; the block
+  table still says "resident", the map step hands the reader that slot, and the pool serves the old bytes.
+  Measured on the r362 build (2× R9700 `-sm layer`, Flash-Next GSQ-RCO-IQ3_XXS `-ncmoe 24 -c 65536`,
+  `--kv-attendance-pool on`, `LLAMA_KV_POOL_VERIFY=1`, an 18 140-token request then a 4 123-token request sharing
+  its prefix, `cache_prompt: false`): **225-228 M mismatching words**, a 90-entry prompt answered as "91 entries",
+  and the wrong text reproducible under `LLAMA_KV_POOL_DROP=0` — **and every arm of `gate-kv-residency.sh` was
+  green**, because each of its arms is ONE `llama-cli` request in one process and nothing in the gate ever
+  re-prefilled over a resident page.  `kv_pool_invalidate()` is not the missing piece (it is for in-place
+  rewriters: the K-shift and a state restore, and it is complete); the missing piece is the non-resolving
+  WRITER.  A non-resolving batch now **drops** the blocks it wrote (`ggml_kv_pool_drop`, the same
+  `GGML_OP_KV_POOL` with op param 1 = 1): the kernel stores `tbl[cell/page] = -1`, the next resolve claims and
+  fills them from the mirror, and the stale `inv[slot]` is harmless (a later claim clears `tbl[prev]` only
+  through `atomicCAS(&tbl[prev], cand, -1)`, which cannot fire once the block has moved).  It runs in-graph on the
+  compute stream, allocates nothing, and costs a `n_tokens`-wide launch per layer per prefill chunk (measured:
+  prompt 34.5 vs 34.9 t/s, decode 36.5 vs 36.5 t/s — noise; the pool's per-id hit rate does move, 89.5 % -> 84.3 %,
+  because the re-prefilled blocks must be claimed again — that is the cost of being correct).  With the drop the
+  pooled arm reads the **resident sparse arm's text byte for byte** (`5c4eb5da3364` == pool-off
+  `LLAMA_QSA_DENSE_DECODE_UNTIL=0`), `bad 0`; **the reference must force `LLAMA_QSA_DENSE_DECODE_UNTIL=0`** —
+  gfx1201's default decode arm is DENSE, so the default-dense text legitimately differs (`3a6ad0505fc6`) and
+  comparing against it would blame the pool for the arch policy.  Kill switch `LLAMA_KV_POOL_DROP=0`
+  (`DIAGNOSTIC.md` §17.1); gate `scripts/gate-kv-residency.sh`'s two-request section (`pstale_ref` / `pstale_res`
+  / `pstale_ctl`, whose control arm must read > 0 mismatches or the section is vacuous).

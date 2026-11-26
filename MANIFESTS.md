@@ -579,8 +579,18 @@ in CI.  The model-level gates are manual:
    accepted and **ignored**, with `LLAMA_KV_POOL_VERIFY=1`); text and `draft_n`/`draft_n_accepted` identical
    across all three, `bad 0`, claims/resolves/hits non-zero, the derived pool **smaller** than the cache (so
    the claim pressure is real), `plegacy` reporting the compatibility WARN and holding the SAME page count as
-   `pres` (the size is not a knob since r247), and a per-id hit rate inside (0, 100).  `REUSE=1 KEEPOUT=<dir>` re-grades a run; it also prints a per-cache **KV accounting** block from the
+   `pres` (the size is not a knob since r247), and a per-id hit rate inside (0, 100).
+   `REUSE=1 KEEPOUT=<dir>` re-grades a run; it also prints a per-cache **KV accounting** block from the
    log (cells, bytes, the buffer the placement got, host-backed MiB, pool geometry, the counters line).
+   **r363 (GitHub PR #369): the pool is also driven across TWO REQUESTS**, because every other arm is ONE
+   `llama-cli` request and nothing in them re-prefills over a resident page -- which is how a 225 M-word
+   stale-read defect shipped green.  `pstale_ref` (no pool + `LLAMA_QSA_DENSE_DECODE_UNTIL=0`) is the text
+   the pool must reproduce; `pstale_res` (`--kv-attendance-pool on`) must read `bad 0` and equal it byte for
+   byte on the re-prefilled request; `pstale_ctl` (the same pool + `LLAMA_KV_POOL_DROP=0`) must read `bad >
+   0`, or the section cannot see the class it was added for and a green `pstale_res` means nothing.  The
+   prompts are ~18.1k then ~4.1k tokens and share a PREFIX by construction (`PSTALE_ENTRIES`, one seeded
+   generator), both sent with `cache_prompt: false`; the arm refuses a shape short of 2 048 re-prefilled
+   tokens.  It needs `llama-server` beside `LLAMA_CLI` and adds ~30 s per arm.
    **r217: the pool section also asserts the PROMPT RATE** -- `pres` must keep `PREFILL_MIN_PCT` (default
    40 %) of `pref`'s `prompt eval` tokens/s, both read from the arms' own logs, so a placement that is
    *correct and slow* now fails: block 14's pool was measured at 427.5 against 829.3 t/s at pp32K (-48 %,

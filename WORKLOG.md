@@ -16,6 +16,123 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.011 (r363) -- the pool fix cross-checked on gfx1100 and gfx1151, the beta artifact re-verified on the r363 tree, and TODO #378 gets its prime suspect (the pool was ON in the corruption run)
+
+**gfx1100 (`fingon`, ROCm 10.2.0-gfx1100, 1 GPU): the same defect, the same fix.**  `~/llama.cpp` reset to
+`919794500`, the r362 set strict-`git am`'d (tree `45beb90c0`, matching `release.json` of that release), built; then
+the same set with the fix (tree `a03e4acf8`) built in the same source path.  Flash-Next GSQ-RCO-IQ3_XXS,
+`-ncmoe 48 -c 32768`, q8_0, `--kv-attendance-pool on`, `LLAMA_KV_POOL_VERIFY=1`, the 18 140-then-4 123-token pair:
+
+| arm (gfx1100) | request 1 | request 2 | VERIFY mismatching words |
+|---|---|---|---|
+| r362 | `7ef47914cb40` | `6dc64d403e34` ("91 entries") | 217 019 052 |
+| r363 | `7ef47914cb40` | `5c4eb5da3364` ("90 entries") | **0** |
+| r363, no pool + `LLAMA_QSA_DENSE_DECODE_UNTIL=0` | `7ef47914cb40` | `5c4eb5da3364` (= r363 pool) | – |
+
+So the stale-page class is not an RDNA4 artifact, the fix restores the resident sparse arm byte for byte there too,
+and request 2's correct text is **the same hash as gfx1201's** (`5c4eb5da3364`) while request 1's differs by arch
+(`7ef47914cb40` vs `8f4998e050cd`) — the pool changes where the bytes live on both.
+
+**gfx1151 (`halo`, an APU): INERT, and by construction, not by luck.**  The tree builds for gfx1151 and
+`--kv-attendance-pool on` declines with the documented line (`--kv-attendance-pool was declined: this device's memory
+is a SHARED host/device pool (an integrated GPU, RDNA3.5 / gfx1151) … the KV cache is unchanged`), so `has_kv_pool()`
+is false, the drop node is never built and `ggml_kv_pool_drop` is unreachable; the text is identical with the flag on
+and off (`200edcd422c7`, a 160-char arm over `prompts/prose-rdna-boosts.txt`).  **The decline is about the memory
+TIER, not about where the weights live** — the predicate is `ggml_backend_dev_type(dev) == IGPU` per KV layer, so a
+run whose weights stream from disk or sit in a host-expert tier takes the same refusal; there is no host pool to
+begin with and nothing for the fix to change.  The same reasoning covers the tensor split (a mirrored cache declines
+the pool, so the op is unreachable there — verified on the patched build: 2-device and 3-device `-sm tensor` arms are
+bit-identical to the r362 build, as recorded in 261125.010).
+
+**`beta/prefill-decode-arms/` re-verified on the r363 tree** (the maintainer asked): `apply-all.sh --include-beta`
+from `919794500` applies the default set and then **all three** candidate patches strictly, one commit each, in
+filename order (`prefill-decode-arms.patch`, then `state-split-2d-read.patch`, then `two-arm-drop-boundary.patch`) —
+**applied tree `c1d50b664e8f95e93590135074d8aca7595b30c5`**.  No re-cut was needed: nothing the candidate touches
+moved in r363 (block 14's change is the pool's drop op).  The README now records the r363 base/tree beside the
+r355-era one it was cut against, and the `--include-beta` comment block should read `c1d50b664` (it still names the
+old `dc9c657e6`).
+
+**TODO #378 has its prime suspect, and the maintainer's hunch is recorded as the experiment.**  The corruption was
+observed on a pair run **with the attendance pool ON**: `LLAMA_KV_REGION_POOL=N` (`--kv-region-pool N`) is the same
+switch as `--kv-attendance-pool on` — the numeric size is accepted and IGNORED since r247, the placement is not —
+and this box's Flash-Next IQ4_NL `runme` sets `LLAMA_KV_REGION_POOL=32768`.  A two-arm server under concurrent
+prefill + decode re-prefills cells a parked/other slot left resident constantly, which is exactly the shape that
+read stale pool copies, so **the pool alone is sufficient to corrupt an answer** (measured above, 217-228 M words,
+on two arches) and no pair-specific race is needed to explain it.  `TODO` #378 now carries both suspects and the
+closing run: r362+beta vs r363+beta on the load shape with `--kv-attendance-pool on LLAMA_KV_POOL_VERIFY=1` — the
+r362 arm must read `bad > 0`, r363 `bad 0` with the pool-off arm's text.  The PR author has offered to run the
+pair with and without the patch; the beta README's "RE-TEST THIS FIRST" note gives them the flags.
+
+## 261125.010 (r363) -- PR #369 accepted: the attendance pool DROPS the pages a non-resolving batch wrote (the writer rule only ever covered the decode band), so a re-prefill over resident cells no longer reads the previous request's K/V
+
+**The report.**  GitHub PR #369 (`@briansp2020`, `wip/kv-pool-drop-r361/`): with `--kv-attendance-pool on`, the
+second of two requests that share a prompt prefix read STALE K/V out of the pool.  On their r361 build
+`LLAMA_KV_POOL_VERIFY=1` counted ~226 M mismatching words over the two requests and the answer differed from the
+resident-KV result (a 90-entry prompt answered as "91 entries").  Their diagnosis: the writer rule re-fills a
+resident page only when the batch that wrote it also RESOLVES (`wids`, the decode band), and pool invalidation
+covers `clear`/`park_move`/the K-shift/`state_read_data`, so a prefill chunk that rewrites cells a previous
+request left resident leaves the old bytes in the pool — and with a shared prefix the new K is nearly identical,
+so the stale copies look plausible.
+
+**Reproduced on our r362 tree, and both of their claims hold.**  2× R9700 `-sm layer`, Flash-Next GSQ-RCO-IQ3_XXS
+`-ncmoe 24 -c 65536`, `--kv-attendance-pool on`, `LLAMA_KV_POOL_VERIFY=1`, an 18 140-token request then a 4 123-token
+request sharing its prefix (`cache_prompt: false`):
+
+| arm (r362) | request 1 | request 2 | VERIFY mismatching words |
+|---|---|---|---|
+| stock | `8f4998e050cd` | `4af498db50ab` ("91 entries") | 228 717 907 |
+| stock + their patch | `8f4998e050cd` | `5c4eb5da3364` ("90 entries") | **0** |
+| patched, `LLAMA_KV_POOL_DROP=0` | `8f4998e050cd` | `4af498db50ab` (= stock) | 230 744 396 |
+| no pool, `LLAMA_QSA_DENSE_DECODE_UNTIL=0` (resident **sparse**) | `8f4998e050cd` | `5c4eb5da3364` (= patched) | – |
+
+Request 1's hash matches theirs byte for byte, so the shapes are the same.  The fix restores the pool's design
+intent exactly (it changes WHERE the bytes live, never WHICH), and the kill switch reproduces the defect.  The
+1-GPU shape reproduces too (226 681 693), which is what lets the gate arm sit in the single-device pool section.
+**One correction to their table:** on gfx1201 the DEFAULT decode arm is dense, so the pool only equals the
+*resident sparse* arm; against the default-dense arm the text legitimately differs (`3a6ad0505fc6`) — their R arm
+did pin `LLAMA_QSA_DENSE_DECODE_UNTIL=0`, and the PR body should say why.
+
+**Why no gate caught it, and the gate is not optional.**  Every arm of `gate-kv-residency.sh` is ONE `llama-cli`
+request in one process, so nothing in it ever re-prefills over a page a previous request left resident: the gate
+was BLIND, not wrong, and it shipped green through a 225 M-word stale read.  `gate-kv-residency.sh` gains a
+two-request section (three `llama-server` arms, ~18.1k then ~4.1k prompt tokens that share a prefix by
+construction, `cache_prompt: false`):
+
+* `pstale_ref` — no pool + `LLAMA_QSA_DENSE_DECODE_UNTIL=0`: the text the pool must reproduce;
+* `pstale_res` — `--kv-attendance-pool on`: `bad 0` **and** request 2 == `pstale_ref` byte for byte;
+* `pstale_ctl` — the same pool + `LLAMA_KV_POOL_DROP=0`: **`bad > 0`**, or the section cannot see the class it was
+  added for and a green `pstale_res` means nothing (it reads 220-225 M here).
+
+The first green run: `ref 8f4998e050cd | pool 8f4998e050cd`, `request 2: ref 5c4eb5da3364 | pool 5c4eb5da3364 |
+control 4af498db50ab`, `verify: pool 0 | control 220 681 486` — 3 arms, ~30 s each on top of the pool section.
+A shape below the pool's capacity is vacuous (4.6k/1.4k reads `bad 0` on the r362 build too), which is why the
+arm asserts its own prompt-token counts.
+
+**The fix, folded into block 14** (the block that owns the pool — a bug fix inside the owning block, so no new
+block and no renumbering; the maintainer approved the fold and the cut).  `ggml_kv_pool_drop(wids, tbl, page)`
+is the SAME `GGML_OP_KV_POOL` with op param 1 = 1: its CUDA kernel stores `tbl[cell / page] = -1` for every cell
+the batch wrote, so the next resolve claims and fills those blocks from the mirror.  qwen4exp builds it per layer
+whenever the cache has a pool and the batch did not resolve through it — `build_attn_qsa` when `top_k_kv ==
+nullptr`, and the dense `build_attn` arm (which covers the QSA shortcut, i.e. the first ~2051 cells of EVERY
+request).  It runs in-graph on the compute stream and allocates nothing; the stale `inv[slot]` is harmless (a
+later claim clears `tbl[prev]` only through `atomicCAS(&tbl[prev], cand, -1)`, which cannot fire once the block
+has moved).  `LLAMA_KV_POOL_DROP=0` is the A/B kill switch; without `--kv-attendance-pool` nothing is built.
+Scheduler placement needs no special case: the op's only sources are the host idx list and a plain device buffer
+(not a WEIGHTS buffer), so `backend_id_from_cur` returns -1 and passes 2-4 expand from the layer's own nodes —
+which the 2-device `-sm layer` arms exercise.  Cost: prompt 34.5 vs 34.9 t/s and decode 36.5 vs 36.5 t/s
+(noise); the pool's per-id hit rate moves 89.5 % -> 84.3 % because the re-prefilled blocks must be claimed again.
+
+**Default-path and tensor-split neutrality** (five arms, stock r362 build vs the amended tree, same source path,
+`build-rocm-stock` beside `build-rocm`): 2-device `-sm tensor` 4B `d2ffb97ccb76`, 3-device `d2ffb97ccb76`,
+Flash-Next tensor-split `13406dc51399`, Flash-Next tensor-split with `--kv-attendance-pool on` (declined)
+`13406dc51399`, and layer-split no-pool `97a8c2a4929b` — identical on both builds.  With `--kv-attendance-pool`
+the tensor split declines exactly as documented and the new op is unreachable there.
+
+**Recorded.**  `DIAGNOSTIC.md` §17.1 (`LLAMA_KV_POOL_DROP`), `ENVIRONMENT.md` §17.1 (pointer row),
+`patches/README.md` block 14's row + the attendance-pool invariants' item 4 (which said the only in-place
+rewriters were the K-shift and a state restore — the writers themselves were the hole), `INVARIANTS.md` r363,
+`MANIFESTS.md` gate 19, `scripts/README.md`, and the block-14 commit body.
+
 ## 261125.009 (r362, release cut) -- tagged, pushed, the fork branch refreshed to the re-cut tip, the images building off-host, issue #368 answered with the instrument
 
 **The cut.**  `v18-919794500-r362` = fork re-cut tip `ca149fbe6`, base `919794500`, tree

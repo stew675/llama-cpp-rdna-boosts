@@ -1,4 +1,4 @@
-From d117bb569dd093c2bdb5843232620495b0e8a8a8 Mon Sep 17 00:00:00 2001
+From aef43e28742f1a29dc74894a2f725cc78f503ce9 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 14/18] rdna-boosts: block 14: the streamed KV -- a fixed-VRAM
@@ -112,6 +112,21 @@ user's behalf -- a placement chosen for the user is exactly the r246 -> r247 reg
 Also fixes a pre-existing units bug in the line above it: `ctx_mib` is a BYTE count, so the per-1024-token
 figure printed 67721728 instead of 64.  The byte figure is kept (so the token estimate, whose units cancelled,
 is unchanged) and divided by MiB only for display.
+
+r363 amendment (GitHub PR #369, @briansp2020): a batch that writes the KV mirror WITHOUT resolving
+through the pool (a prefill chunk, the QSA dense/shortcut arm) left any resident copy of the cells it
+wrote stale, so a second request over a shared prefix read the first request's K/V -- the writer rule
+only re-filled a page when the batch that wrote it also resolved.  Measured on r362 (2 devices,
+`-sm layer`, `LLAMA_KV_POOL_VERIFY=1`, an 18.1k request then a 4.1k request sharing its prefix):
+227 M mismatching words and a wrong count in the answer; the fix reads 0 and the text equals the
+resident sparse arm byte for byte (gfx1201 and gfx1100).  A non-resolving batch now drops the pool
+pages it wrote (`ggml_kv_pool_drop`: the same `GGML_OP_KV_POOL`, op param 1 = 1), so the next resolve
+claims and re-fills them from the authoritative mirror.  `LLAMA_KV_POOL_DROP=0` is the A/B kill
+switch; without `--kv-attendance-pool` nothing is built (and the pool declines on an APU / a shared
+host-device pool, so the fix is inert there).  The block-14 notes, `DIAGNOSTIC.md` 17.1 and
+`INVARIANTS.md` r363 carry the record; `scripts/gate-kv-residency.sh` gains the two-request arm that
+catches the class.
+
 ---
  common/arg.cpp                             |   95 +
  common/common.cpp                          |   41 +-
@@ -123,7 +138,7 @@ is unchanged) and divided by MiB only for display.
  common/speculative.h                       |    6 +
  ggml/include/ggml-backend.h                |   22 +
  ggml/include/ggml-rpc.h                    |   10 +-
- ggml/include/ggml.h                        |   42 +
+ ggml/include/ggml.h                        |   52 +
  ggml/src/ggml-backend-meta.cpp             |  145 +-
  ggml/src/ggml-cpu/ggml-cpu.c               |    1 +
  ggml/src/ggml-cpu/ggml-cpu.cpp             |    4 +
@@ -133,9 +148,9 @@ is unchanged) and divided by MiB only for display.
  ggml/src/ggml-cuda/fattn-qsa3.cu           |    4 +
  ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1284 +++++++++++++
  ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  144 ++
- ggml/src/ggml-cuda/ggml-cuda.cu            | 1940 +++++++++++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu            | 1946 +++++++++++++++++++-
  ggml/src/ggml-cuda/indexer-score.cu        |   14 +-
- ggml/src/ggml-cuda/kv-pool.cu              |  353 ++++
+ ggml/src/ggml-cuda/kv-pool.cu              |  406 ++++
  ggml/src/ggml-cuda/kv-pool.cuh             |    7 +
  ggml/src/ggml-cuda/mmb.cu                  |   11 +-
  ggml/src/ggml-cuda/mmid.cu                 |   27 +
@@ -143,14 +158,14 @@ is unchanged) and divided by MiB only for display.
  ggml/src/ggml-cuda/mmq.cu                  |   15 +-
  ggml/src/ggml-cuda/moe-expert-cache.cu     |   43 +-
  ggml/src/ggml-cuda/vendors/hip.h           |    4 +
- ggml/src/ggml.c                            |   83 +-
+ ggml/src/ggml.c                            |  104 +-
  include/llama.h                            |   23 +
  src/llama-context.cpp                      |   29 +
  src/llama-context.h                        |    3 +
  src/llama-cparams.h                        |    9 +
  src/llama-ext.h                            |   90 +
- src/llama-kv-cache.cpp                     | 1369 +++++++++++++-
- src/llama-kv-cache.h                       |  125 +-
+ src/llama-kv-cache.cpp                     | 1388 +++++++++++++-
+ src/llama-kv-cache.h                       |  130 +-
  src/llama-memory-hybrid-idx.cpp            |   10 +-
  src/llama-memory-hybrid-idx.h              |    5 +-
  src/llama-memory-hybrid.cpp                |   15 +-
@@ -158,13 +173,13 @@ is unchanged) and divided by MiB only for display.
  src/llama-memory.h                         |   19 +
  src/llama-mmap.cpp                         |   21 +
  src/llama-mmap.h                           |    8 +
- src/llama-model-loader.cpp                 | 1636 +++++++++--------
+ src/llama-model-loader.cpp                 | 1636 ++++++++--------
  src/llama-model-loader.h                   |   29 +
  src/llama-model.cpp                        |  219 ++-
  src/llama-model.h                          |    7 +
- src/models/qwen4exp.cpp                    |   66 +-
+ src/models/qwen4exp.cpp                    |   78 +-
  tools/llama-bench/llama-bench.cpp          |   52 +-
- 51 files changed, 8004 insertions(+), 971 deletions(-)
+ 51 files changed, 8130 insertions(+), 971 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cu
@@ -1543,7 +1558,7 @@ index a4eaf2940..be558eb24 100644
  
  #define GGML_RPC_MAX_SERVERS       16
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 445c15230..5dd92aba7 100644
+index 445c15230..5a14e5273 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -416,6 +416,7 @@ extern "C" {
@@ -1554,7 +1569,7 @@ index 445c15230..5dd92aba7 100644
          GGML_OP_INDEXER_TOPK,
          GGML_OP_INDEXER_SCORE,
          GGML_OP_INDEXER_FILL,
-@@ -2374,6 +2375,47 @@ extern "C" {
+@@ -2374,6 +2375,57 @@ extern "C" {
      GGML_API enum ggml_prec ggml_flash_attn_qsa_get_prec(
              const struct ggml_tensor * a);
  
@@ -1593,6 +1608,16 @@ index 445c15230..5dd92aba7 100644
 +            struct ggml_tensor  * pool_v,
 +            struct ggml_tensor  * wids,
 +            struct ggml_tensor  * use);
++
++    // ours: the attendance pool's DROP form (same op, op param 1 = 1).  A batch that writes the KV mirror
++    // without resolving through the pool (a prefill chunk, a dense-arm batch) leaves any resident copy of the
++    // pages it wrote stale; this unmaps them (tbl[cell / page_cells] = -1), so the next resolve claims them
++    // again and fills them from the mirror.  `wids` is the I64/I32 cell list the batch wrote.
++    GGML_API struct ggml_tensor * ggml_kv_pool_drop(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * wids,
++            struct ggml_tensor  * tbl,
++            int                   page_cells);
 +
 +    // the page size in cells (one QSA indexer block); stored in the op params
 +    GGML_API void ggml_kv_pool_set_page(
@@ -3471,7 +3496,7 @@ index 000000000..5f47fce87
 +// can call it before the KV buft lands.
 +bool   ggml_cuda_vmm_region_selftest(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 4a5d2a402..6c2d7f98c 100644
+index 4a5d2a402..8c8e4f255 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -31,6 +31,7 @@
@@ -5547,11 +5572,17 @@ index 4a5d2a402..6c2d7f98c 100644
          const int cc_reorder = ggml_cuda_info().devices[cuda_ctx->device].cc;
          if (cat_reorder && (GGML_CUDA_CC_IS_RDNA4(cc_reorder) || GGML_CUDA_CC_IS_RDNA3_0(cc_reorder))) {
              ggml_tensor ** n = cgraph->nodes;
-@@ -9711,6 +11492,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -9711,6 +11492,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_FLASH_ATTN_QSA:
              return ggml_cuda_flash_attn_qsa_supported(dev_ctx->device, op);
 +        case GGML_OP_KV_POOL:
++            if (ggml_get_op_params_i32(op, 1) == 1) {
++                // ours: the drop form (ggml_kv_pool_drop)
++                return op->type == GGML_TYPE_I32 && op->src[0] != nullptr &&
++                    (op->src[0]->type == GGML_TYPE_I64 || op->src[0]->type == GGML_TYPE_I32) &&
++                    op->src[1] != nullptr && op->src[1]->type == GGML_TYPE_I32;
++            }
 +            // the page-table resolve: I32 ids -> I32 pool positions, plus the mirror->pool fills
 +            return op->type == GGML_TYPE_I32 && op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_I32 &&
 +                op->src[1] != nullptr && op->src[1]->type == GGML_TYPE_I32 &&
@@ -5562,7 +5593,7 @@ index 4a5d2a402..6c2d7f98c 100644
          case GGML_OP_INDEXER_TOPK:
              return ggml_cuda_indexer_top_k_supported(dev_ctx->device, op);
          case GGML_OP_INDEXER_SCORE:
-@@ -9748,7 +11537,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -9748,7 +11543,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
@@ -5572,7 +5603,7 @@ index 4a5d2a402..6c2d7f98c 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -10269,8 +12059,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -10269,8 +12065,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
  }
  
  
@@ -5638,7 +5669,7 @@ index 4a5d2a402..6c2d7f98c 100644
      if (strcmp(name, "ggml_backend_cuda_fattn_stage_bound") == 0) {
          return (void *) ggml_backend_cuda_fattn_stage_bound;
      }
-@@ -10398,6 +12245,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -10398,6 +12251,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
      // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
      moe_cache_init(device);
  
@@ -5694,10 +5725,10 @@ index bee930e22..af0d7a184 100644
      qsa_score_log(1, "derived-fill", dst, ktype, "incremental");
 diff --git a/ggml/src/ggml-cuda/kv-pool.cu b/ggml/src/ggml-cuda/kv-pool.cu
 new file mode 100644
-index 000000000..d5265eba6
+index 000000000..d63497e48
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/kv-pool.cu
-@@ -0,0 +1,353 @@
+@@ -0,0 +1,406 @@
 +#include "kv-pool.cuh"
 +#include "common.cuh"
 +
@@ -5718,8 +5749,12 @@ index 000000000..d5265eba6
 +//       hold the previous cell's bytes -- `wids`),
 +//     * a page that is read but not resident is claimed and filled from the mirror BEFORE the
 +//       attention runs (this op is ordered before it on the same stream).
-+//   A page therefore never needs to be invalidated -- not after a rejected draft, not on a resume,
-+//   not on `seq_rm`/`seq_cp`.  The pool can only change WHERE the bytes are, never WHICH.
++//   That covers every batch that RESOLVES (the decode band).  A batch that writes the mirror without a
++//   resolve -- a prefill chunk, e.g. the next request's prompt over cells a previous request left
++//   resident, or a dense-arm batch -- unmaps the blocks it wrote instead (the drop form below,
++//   `ggml_kv_pool_drop`), so the next resolve claims and fills them again.  With that, a page needs no
++//   other invalidation -- not after a rejected draft, not on a resume, not on `seq_rm`/`seq_cp`.  The pool
++//   can only change WHERE the bytes are, never WHICH.
 +//
 +// THE PHASES, and why they are separate kernels
 +//   1 MARK   every page this launch's selection already holds resident (`use[slot] = epoch`) and list the
@@ -5967,7 +6002,56 @@ index 000000000..d5265eba6
 +    }
 +}
 +
++// ours: the drop form (ggml_kv_pool_drop).  The writer rule above re-fills a resident page only when the batch
++// that wrote it also RESOLVES (decode band).  A prefill chunk writes the mirror without a resolve -- e.g. the next
++// request's prompt over cells a previous request left resident -- and the pool kept the old bytes (VERIFY: millions
++// of mismatches, empty or wrong text; FINDINGS 1125/1126).  Unmapping the written blocks makes the next resolve
++// claim and fill them from the mirror.  The slot's inverse entry may keep naming the block: a later claim of that
++// slot only clears tbl[prev] when it still points at the slot (atomicCAS), so a stale inverse is harmless.
++template <typename T>
++static __global__ void kv_pool_drop_kernel(const T * __restrict__ wids, const int n_wids, int * __restrict__ tbl,
++        const int page_cells, const int n_blocks) {
++    const int i = blockIdx.x*blockDim.x + threadIdx.x;
++    if (i >= n_wids) {
++        return;
++    }
++    const int64_t c = (int64_t) wids[i];
++    if (c < 0) {
++        return;
++    }
++    const int64_t b = c / page_cells;
++    if (b < n_blocks) {
++        tbl[b] = -1;
++    }
++}
++
++static void ggml_cuda_kv_pool_drop(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * wids = dst->src[0];
++    const ggml_tensor * tbl  = dst->src[1];
++    GGML_ASSERT(ggml_is_contiguous(wids) && tbl->type == GGML_TYPE_I32);
++    const int page_cells = ggml_get_op_params_i32(dst, 0);
++    GGML_ASSERT(page_cells > 0);
++    const int n_wids   = (int) ggml_nelements(wids);
++    const int n_blocks = (int) tbl->ne[0];
++    if (n_wids == 0) {
++        return;
++    }
++    cudaStream_t stream = ctx.stream();
++    const int nthread = 256;
++    const int nblock  = (n_wids + nthread - 1)/nthread;
++    if (wids->type == GGML_TYPE_I64) {
++        kv_pool_drop_kernel<<<nblock, nthread, 0, stream>>>((const int64_t *) wids->data, n_wids, (int *) tbl->data, page_cells, n_blocks);
++    } else {
++        kv_pool_drop_kernel<<<nblock, nthread, 0, stream>>>((const int *) wids->data, n_wids, (int *) tbl->data, page_cells, n_blocks);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
 +void ggml_cuda_kv_pool(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (ggml_get_op_params_i32(dst, 1) == 1) {
++        ggml_cuda_kv_pool_drop(ctx, dst);
++        return;
++    }
 +    const ggml_tensor * ids      = dst->src[0];
 +    const ggml_tensor * tbl      = dst->src[1];
 +    const ggml_tensor * inv      = dst->src[2];
@@ -6277,7 +6361,7 @@ index ba899d904..f879b05a3 100644
  #define CU_MEM_LOCATION_TYPE_DEVICE hipMemLocationTypeDevice
  #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE hipMemAccessFlagsProtReadWrite
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 22875b31b..bcff734f4 100644
+index 22875b31b..afbd42b23 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1100,6 +1100,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -6358,7 +6442,7 @@ index 22875b31b..bcff734f4 100644
  void ggml_flash_attn_qsa_set_prec(
          struct ggml_tensor * a,
          enum ggml_prec       prec) {
-@@ -5742,6 +5763,60 @@ enum ggml_prec ggml_flash_attn_qsa_get_prec(
+@@ -5742,6 +5763,81 @@ enum ggml_prec ggml_flash_attn_qsa_get_prec(
      return (enum ggml_prec) prec_i32;
  }
  
@@ -6404,6 +6488,27 @@ index 22875b31b..bcff734f4 100644
 +    result->src[7] = pool_v;
 +    result->src[8] = wids;
 +    result->src[9] = use;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_kv_pool_drop(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * wids,
++        struct ggml_tensor  * tbl,
++        int                   page_cells) {
++    GGML_ASSERT(wids->type == GGML_TYPE_I64 || wids->type == GGML_TYPE_I32);
++    GGML_ASSERT(tbl->type == GGML_TYPE_I32 && tbl->ne[0] > 0);
++    GGML_ASSERT(page_cells > 0);
++
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
++
++    ggml_set_op_params_i32(result, 0, page_cells);
++    ggml_set_op_params_i32(result, 1, 1);           // the drop form
++
++    result->op     = GGML_OP_KV_POOL;
++    result->src[0] = wids;
++    result->src[1] = tbl;
 +
 +    return result;
 +}
@@ -6661,7 +6766,7 @@ index ccca467fa..860a4281a 100644
 +// true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
 +LLAMA_API bool llama_kv_region_resident_cells_decided(uint32_t * cells);
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 1b943c452..8c3e89419 100644
+index 1b943c452..f37767617 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -18,6 +18,435 @@ static bool ggml_is_power_of_2(int n) {
@@ -7946,7 +8051,7 @@ index 1b943c452..8c3e89419 100644
      }
  
      assert(res.s1 >= res.s0);
-@@ -1588,6 +2631,164 @@ bool llama_kv_cache::get_can_shift() const {
+@@ -1588,6 +2631,183 @@ bool llama_kv_cache::get_can_shift() const {
      return true;
  }
  
@@ -8088,6 +8193,21 @@ index 1b943c452..8c3e89419 100644
 +    return res;
 +}
 +
++ggml_tensor * llama_kv_cache::build_kv_pool_drop(ggml_context * ctx, ggml_tensor * wids, int32_t il) const {
++    // LLAMA_KV_POOL_DROP=0: the pre-fix behaviour (stale pages after a prefill over resident cells), for A/B only
++    static const bool on = [] { const char * e = getenv("LLAMA_KV_POOL_DROP"); return e == nullptr || atoi(e) != 0; }();
++    if (!on || kv_pool_page == 0 || wids == nullptr) {
++        return nullptr;
++    }
++    const int32_t ikv = map_layer_ids.at(il);
++    GGML_ASSERT(ikv >= 0 && (size_t) ikv < pool_layers.size());
++    const kv_pool_layer & pl = pool_layers[ikv];
++    if (pl.tbl == nullptr) {
++        return nullptr;
++    }
++    return ggml_kv_pool_drop(ctx, wids, pl.tbl, (int) kv_pool_page);
++}
++
 +bool llama_kv_cache_context::has_kv_pool() const {
 +    return kv->has_kv_pool();
 +}
@@ -8108,10 +8228,14 @@ index 1b943c452..8c3e89419 100644
 +    return kv->kv_pool_serves(n_rows);
 +}
 +
++ggml_tensor * llama_kv_cache_context::build_kv_pool_drop(ggml_context * ctx, ggml_tensor * wids, int32_t il) const {
++    return kv->build_kv_pool_drop(ctx, wids, il);
++}
++
  uint32_t llama_kv_cache::get_size() const {
      const auto & cells = v_cells[seq_to_stream[0]];
  
-@@ -1649,6 +2850,54 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+@@ -1649,6 +2869,54 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
      return seq_to_stream[seq_id];
  }
  
@@ -8166,7 +8290,7 @@ index 1b943c452..8c3e89419 100644
  uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
      uint32_t result = 0;
  
-@@ -2057,6 +3306,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+@@ -2057,6 +3325,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
  }
  
  void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
@@ -8176,7 +8300,7 @@ index 1b943c452..8c3e89419 100644
      GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
  
      int32_t * data = (int32_t *) dst->data;
-@@ -3516,6 +4768,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+@@ -3516,6 +4787,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
          }
      }
  
@@ -8186,7 +8310,7 @@ index 1b943c452..8c3e89419 100644
      return true;
  }
  
-@@ -3693,6 +4948,12 @@ bool llama_kv_cache_context::apply() {
+@@ -3693,6 +4967,12 @@ bool llama_kv_cache_context::apply() {
      n_kv      = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
      n_kv_rows = kv->get_n_kv_rows(ubatches[i_cur]);
  
@@ -8200,7 +8324,7 @@ index 1b943c452..8c3e89419 100644
  }
  
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 3def9c4df..800d8023c 100644
+index 3def9c4df..754078e57 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -120,9 +120,23 @@ public:
@@ -8253,7 +8377,7 @@ index 3def9c4df..800d8023c 100644
      // state write/load
  
      void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
-@@ -178,6 +201,35 @@ public:
+@@ -178,6 +201,37 @@ public:
      uint32_t get_n_seq_max() const;
      uint32_t get_n_stream() const;
  
@@ -8285,11 +8409,13 @@ index 3def9c4df..800d8023c 100644
 +    ggml_tensor * get_v_pool(ggml_context * ctx, int32_t il) const;
 +    // the page-table resolve for one layer's selection: dst = the selected cells' POOL positions
 +    ggml_tensor * build_kv_pool_resolve(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * wids, int32_t il) const;
++    // ours: unmap the pool pages of the cells a non-resolving batch wrote (see llama_kv_cache_context)
++    ggml_tensor * build_kv_pool_drop(ggml_context * ctx, ggml_tensor * wids, int32_t il) const;
 +
      bool get_has_shift() const;
  
      ggml_type type_k() const;
-@@ -211,6 +263,9 @@ public:
+@@ -211,6 +265,9 @@ public:
  
      uint32_t get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const;
  
@@ -8299,7 +8425,7 @@ index 3def9c4df..800d8023c 100644
      // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
      // the ubatch splits into n_slices groups of tokens with one sequence each
      // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
-@@ -333,6 +388,15 @@ private:
+@@ -333,6 +390,15 @@ private:
      // SWA
      const uint32_t n_swa = 0;
  
@@ -8315,7 +8441,7 @@ index 3def9c4df..800d8023c 100644
      const bool is_indexer = false;
  
      // env: LLAMA_ATTN_ROT_DISABLE
-@@ -361,6 +425,47 @@ private:
+@@ -361,6 +427,47 @@ private:
      // ggml contexts for the KV cache along with the allocated backend buffers:
      llama_memory_bufs ctxs_bufs;
  
@@ -8363,7 +8489,7 @@ index 3def9c4df..800d8023c 100644
      // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
      // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
      std::vector<uint32_t> v_heads;
-@@ -477,6 +582,20 @@ public:
+@@ -477,6 +584,23 @@ public:
      uint32_t get_n_kv() const;
      uint32_t get_n_kv_rows() const;
  
@@ -8380,6 +8506,9 @@ index 3def9c4df..800d8023c 100644
 +    // WROTE (the pages holding them are re-filled from the mirror), or nullptr.
 +    ggml_tensor * build_kv_pool_resolve(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * wids, int32_t il) const;
 +    bool kv_pool_serves(uint32_t n_rows) const;
++    // ours: unmap the pool pages of the cells `wids` (a batch that did not resolve through the pool) wrote; nullptr
++    // when there is nothing to do (no pool, LLAMA_KV_POOL_DROP=0)
++    ggml_tensor * build_kv_pool_drop(ggml_context * ctx, ggml_tensor * wids, int32_t il) const;
 +
      ggml_type type_k() const;
      ggml_type type_v() const;
@@ -10794,7 +10923,7 @@ index 84e7a3683..0bbb1b585 100644
      uint64_t n_elements() const;
  
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 73ba7fa59..59feb3522 100644
+index 73ba7fa59..622da94da 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -269,6 +269,34 @@ static bool qwen4exp_mtp_sparse_arm(int64_t n_tokens, int64_t n_kv,
@@ -10859,7 +10988,7 @@ index 73ba7fa59..59feb3522 100644
      if (pin_block_out) {
          ggml_set_output(block_out);
      }
-@@ -2566,9 +2594,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -2566,9 +2594,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
      }
  
@@ -10879,6 +11008,12 @@ index 73ba7fa59..59feb3522 100644
 +            ggml_build_forward_expand(gf, top_k_kv);
 +        }
 +    }
++    // ours: a batch that wrote the mirror without the resolve unmaps the pages it wrote (ggml_kv_pool_drop)
++    if (top_k_kv == nullptr && mctx_cur->has_kv_pool()) {
++        if (ggml_tensor * drop = mctx_cur->build_kv_pool_drop(ctx0, inp->get_k_idxs(), il)) {
++            ggml_build_forward_expand(gf, drop);
++        }
++    }
 +
      ggml_tensor * q = q_cur;
 -    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
@@ -10888,7 +11023,7 @@ index 73ba7fa59..59feb3522 100644
      // the natural cache views, kept for the qsa3 packs (which must cast before permuting)
      ggml_tensor * k_raw = k;
      ggml_tensor * v_raw = v;
-@@ -2587,6 +2632,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -2587,6 +2638,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          // derives each cell's visibility from cell_vis/q_vis instead - see findings 2c
          cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f,
                  qsa_cell_vis, qsa_q_vis);
@@ -10899,7 +11034,7 @@ index 73ba7fa59..59feb3522 100644
          // qsa3 (packed-block WMMA) needs the packed F16 layouts; it is prefill-only, so the whole
          // W=1..8 decode/verify band keeps the VEC kernel and width purity holds by construction.
          // Compile-time gate (see LLAMA_QSA3_ENABLE at the top of this file, default 1) plus the
-@@ -2747,10 +2796,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -2747,10 +2802,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
          const int64_t qsa_decode_band = std::max<int64_t>(QSA_DECODE_BAND, (int64_t) cparams.n_rs_batch);
          if (shortcut && n_kv <= width) {
              build_qsa_store_k(mctx_hyb, cur, il);
@@ -10914,7 +11049,20 @@ index 73ba7fa59..59feb3522 100644
              build_qsa_store_k(mctx_hyb, cur, il);
          } else if (qsa_dense_prefill_until > 0 && n_tokens > qsa_decode_band &&
                     n_kv < qsa_dense_prefill_until) {
-@@ -3311,7 +3363,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+@@ -2825,6 +2883,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+         cur = build_attn(inp,
+                     nullptr, nullptr, nullptr,
+                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
++        // ours: the dense arm wrote the mirror without the pool's resolve (see build_attn_qsa)
++        if (inp->mctx->has_kv_pool()) {
++            if (ggml_tensor * drop = inp->mctx->build_kv_pool_drop(ctx0, inp->get_k_idxs(), il)) {
++                ggml_build_forward_expand(gf, drop);
++            }
++        }
+     }
+     cb(cur, "attn_pregate", il);
+ 
+@@ -3311,7 +3375,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
  
          // copy the strided tail straight into the slot (one copy, a 2D memcpy on CUDA) instead of cont + cpy;
          // LLAMA_CONV_TAIL_CONT=1 restores the intermediate contiguous copy for A/B

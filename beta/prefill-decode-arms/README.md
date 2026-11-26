@@ -30,7 +30,7 @@ tested (its sha256 is unchanged through this split).
 | sha256 | `fd50d736e4ee959175d5f99f98afd3a8c0f9c219e47ad0c2da4f301d31030963` |
 | size | 4 files, **+97/−4** |
 | cut against | `release.json` base `919794500`, tree **`27db9bfd4ef7f41c7df60f704410de28863beac3`** |
-| **applied tree** | **`dc9c657e6e9d0cd3af485153e69a7cbfaf5ef941`** (release tree + all three patches; verified below) |
+| **applied tree** | **`dc9c657e6e9d0cd3af485153e69a7cbfaf5ef941`** on the r355-era tree it was cut from; **re-verified on r363 (2026-11-25): base `919794500`, default tree `a03e4acf8053e8faa4ca462ea69f72a01b0fcc79`, all three patches apply STRICTLY, applied tree `c1d50b664e8f95e93590135074d8aca7595b30c5`** (no re-cut was needed: nothing the candidate touches moved in r363 — block 14's change is the pool's drop op) |
 | options | `--prefill-decode-arms` / `--no-prefill-decode-arms` (`LLAMA_ARG_PREFILL_DECODE_ARMS`), `--prefill-decode-arms-mode off\|on\|auto` (`LLAMA_ARG_PREFILL_DECODE_ARMS_MODE`) — **both default OFF** |
 | campaign record | `wip/prefill-decode-arms-v2/` (`DESIGN.md`, `RUNS.md`, `HANDOVER.md`, `gates/`, `baseline/`) |
 
@@ -40,11 +40,11 @@ tested (its sha256 is unchanged through this split).
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 919794500
 bash <delivery>/scripts/apply-all.sh --include-beta .
-#   18 delivery blocks (tip 13df5e2c7, tree 4244d077e...), then 2 beta candidate patches:
+#   18 delivery blocks + 1 temporary (r363: tip 6b3420f22, tree a03e4acf8), then 3 beta candidate patches:
 #     prefill-decode-arms.patch     (block 17, the two-arm server)
 #     state-split-2d-read.patch     (STEP 15, the 2-D read fix  -- delivery-level, dropped at promotion)
 #     two-arm-drop-boundary.patch   (STEP 16, the drop fence      -- delivery-level, dropped at promotion)
-#   applied tree: dc9c657e6e9d0cd3af485153e69a7cbfaf5ef941
+#   applied tree: c1d50b664e8f95e93590135074d8aca7595b30c5   (r363; the r355-era cut gave dc9c657e6)
 ```
 
 **Verified three ways on this box**, all reading tree **`dc9c657e6…`**: the tester path
@@ -55,6 +55,24 @@ STEP 14), patch 2 from one more `steps/` replay to STEP 15, with the generated d
 trees equal the campaign's own trees exactly.
 
 ## KNOWN OPEN DEFECT — this candidate is NOT bug free
+
+> **RE-TEST THIS FIRST on r363+ (2026-11-25).**  The corruption below has a strong candidate explanation that was
+> found and FIXED in the delivery after this artifact was frozen: block 14's attendance pool served **stale K/V**
+> after any batch that wrote the KV mirror without resolving through the pool (a prefill chunk, the QSA
+> dense/shortcut arm) — i.e. exactly what a two-arm server under concurrent prefill + decode does all the time
+> when a slot's prompt re-prefills cells another slot left resident (`WORKLOG.md` 261125.010, `INVARIANTS.md`
+> r363, GitHub PR #369).  **The pool was ON in the maintainer's corruption run**: `LLAMA_KV_REGION_POOL=N` and
+> `--kv-region-pool N` are the same switch as `--kv-attendance-pool on` (the numeric size has been ignored since
+> r247, the placement is still enabled), and the Flash-Next IQ4_NL `runme` on this box sets
+> `LLAMA_KV_REGION_POOL=32768`.  Measured on the r362 tree at 1 GPU, `-ncmoe 48 -c 32768`, two sequential
+> requests sharing a prefix: 225 M mismatching words and a wrong answer, `0` with the fix — so the pool alone is
+> sufficient to corrupt an answer, without any pair-specific race.
+> **The experiment, and it is cheap:** `apply-all.sh --include-beta` (r363 tree), build, then run the load shape
+> with `--kv-attendance-pool on` **and `LLAMA_KV_POOL_VERIFY=1`** on both r362+beta and r363+beta.  If the r362
+> arm reports `bad > 0` (the counters line at teardown) and r363 reports `bad 0` with the same text as the pool-off
+> arm, `TODO` #378 is this defect and the pool can be cleared.  Until that run exists, #378 stays open **for both
+> suspects** — the pool (now fixed in the delivery, unverified on the pair) and the pair itself.
+
 
 **The maintainer reproduced a CORRUPTION under heavy concurrent load on 2026-11-24** (pair ON, pushing the server
 hard; the same build passes the crash, split-state, text-identity and gate ladders below).  There is no reproducer
