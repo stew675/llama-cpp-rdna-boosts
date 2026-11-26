@@ -16,6 +16,34 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.014 (r364, release cut) -- tagged, the fork branch re-cut to `786bdfecd` and pushed; the ladder recorded, the images owed
+
+**The cut.**  `v18-919794500-r364` = fork re-cut tip `786bdfecdad311b5b7c5685b7bb4a63d2f06ccd8`, base `919794500`,
+default tree `981f4ab89de3d0372509831b10e5734e7d6b70b8`, 18 official + 1 temporary = 19 default blocks, 2 optional
+(`0100` alone `08ee71ae0`, `0101` alone `d3a57c764`, cumulative `876cd48cf` — both still apply STRICTLY on the new
+tree).  The GitHub Release carries its 4 assets; CI (tier 1) green on the commit.
+
+**The ladder.**  `validate-set.sh` green; the rung reconciliation **0 unexplained, 0 new** (21 blocks / 575 files /
+185 defines / 587 envs / 14 options — the change is code inside block 14, no new file, define, env or option);
+`check-shlib-symbols.sh` 16/16; `check-gen-docs.sh` ok; `check-system-headers` ok; `gate-prefill-logits.sh`
+**0.000000 / 100.000 %**; `gate-state-pipe.sh` **PASS** (the batched save+load 1.48x / 1.58x / 1.54x / 1.62x of the
+synchronous arm against a 3.0x bound — this is the gate that owns the 1-D/2-D state read); `gate-meta-seg-drain.sh`
+**PASS** (the drain fires, 90 per load, greedy text `e2dde701fc04` on both arms); `gate-kv-residency.sh` **PASS**
+(window + pool + multi-device + the two-request section, all `bad 0`); the eight coherence arms identical to r363
+(2-/3-device `-sm tensor` 4B `d2ffb97ccb76`, Flash-Next tensor plain/pool-declined `13406dc51399`, layer no-pool
+`97a8c2a4929b`, 27B `-sm tensor` `d03d0bc727a8`, 35B-A3B `-ncmoe 40` `e2dde701fc04`, Flash-Next IQ4_NL
+`98433e24c147`); `beta/prefill-decode-arms/` applies as ONE patch on the new tree (applied tree `c1d50b664`, the
+same tree the three-file form produced).
+
+**The fork.**  `gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` reads
+**`786bdfecdad311b5b7c5685b7bb4a63d2f06ccd8`**, which is what `release.json.tip` records.
+
+**The images (owed, not verified).**  `v18-919794500-r363` was picked up by the worker (`radiance`) on its 20:30
+poll and was still building when r364 was cut; the watcher polls every 10 minutes, so it takes r364 on its next
+poll after finishing r363 (the r363 build is superseded, not lost — the shared `--prune` window keeps both for 7
+days).  The check that closes **r364** is `scripts/build-containers.sh --verify-only` reading all 23 tags resolving
+with every moving tag carrying this release (issue #364: a push's exit status is not proof).
+
 ## 261125.013 (r364) -- the beta artifact's DELIVERY-level fix folded in (block 14: a row-block D2H is never a 2-D copy -- the abort `TODO` #124 misdiagnosed), and the pair-only piece squashed into the ONE two-arm patch
 
 **The question, and the split.**  `beta/prefill-decode-arms/` carried two delivery-repo fixes it had found while
