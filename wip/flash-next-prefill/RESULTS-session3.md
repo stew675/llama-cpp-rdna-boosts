@@ -14,6 +14,25 @@ not confounded with arm position). Fixed env for every arm: `MOE_EXPERT_HEATMAP=
 
 ---
 
+
+## 0. Naming — one table, used verbatim below
+
+Every arm with `GGML_SCHED_DEVGATHER=0` is **"staged"** (the scheduler's host-weight ring). Three knobs vary
+inside it:
+
+| label | fill engine (`MOE_HOST_POOL_STAGE_BULK`) | consumes the ring slot… (`GGML_SCHED_STAGE_REDIRECT`) |
+|---|---|---|
+| `hybr-kern` | `0` — the cache's two-tier kernel (arena + host) | in place |
+| `bulk1` | `1` — one copy-engine copy of the whole table | in place |
+| `hyb-copy` | `2` — **hybrid**: coalesced host-run DMAs + one kernel for the arena side | **copy** into the graph input |
+| **`hyb-redir` = "staged + in-place"** | `2` — **hybrid** (default) | **in place** (the ping-pong; default) |
+
+"Staged + in-place" therefore means **hybrid fill + ping-pong redirect**, which is the prototype's default.
+`GGML_SCHED_STAGE_AHEAD` (one-split lookahead) and `MOE_HOST_POOL_STAGE_MERGE` (over-fetch across short
+resident runs) sit on top and are separate.
+
+---
+
 ## 1. The ABBA matrix — Flash-Next IQ3_XXS, GPU0 (Gen5 **x8**, 28.6 GB/s), `-ncmoe 48`, 89 234-token prompt
 
 5 cycles × 6 arms = 30 runs, order rotated each cycle. `GGML_SCHED_DEVGATHER=0` is "staged" (the scheduler's
@@ -85,6 +104,73 @@ Same-seed greedy text (128 tokens): gather `sha=c3f4da781f01`, staged `sha=c3f4d
 **+39.7 % prefill** on a shape the rewrite was not tuned for, from a transport change alone. This is the
 strongest single result of the campaign and it is the one that should lead the pitch: the win scales with the
 transport share, and on a 17 %-coverage 122B on one card the share is large.
+
+## 3.5 A tensor split: the hybrid now fills a shard, and the result is residency-dependent
+
+`-sm tensor` was the one geometry where the prototype *lost* (session 2's hybrid declined a sliced table and
+the two-tier kernel ran). A one-shot geometry census (`-lv 4`) showed why, and both split shapes reduce to the
+same thing — **one 2-D copy per coalesced run**, because the destination is always packed in expert order:
+
+| shape | `n_copies` | `do2d` | `t.expert_bytes` | `t.host_bytes` | pool stride | copy |
+|---|---|---|---|---|---|---|
+| unsplit whole table | 1 | 0 | full expert | = expert | = expert | 1-D (degenerate 2-D) |
+| split axis 1 (contiguous shard) | 512 | 0 | 189 440 (the shard) | 473 600 | 473 600 | height = experts, width = shard, pitch = 473 600 |
+| split axis 0 (row slice) | 1 310 720 | 1 | 368 640 | 921 600 | 921 600 | height = experts × 2 560 rows, width = 144, pitch = 360 |
+
+`experiments/0006` generalizes the gate from `n_copies == 1 && !do2d && pool->host_bytes == t.expert_bytes` to
+`pool->host_bytes == t.host_bytes` plus a coverage check, and issues `cudaMemcpy2DAsync` per run
+(`ce_rows`/`ce_bytes`/`ce_pitch`). Measured (text byte-identical in every arm below):
+
+| arm (5.2k-token prompt, 64 tokens) | prefill | vs gather |
+|---|---:|---:|
+| **122B-A10B**, 2 devices, gather | 1554.3 | — |
+| 122B-A10B, 2 devices, kernel fill (`BULK=0`) | 1196.0 | **−23.0 %** |
+| 122B-A10B, 2 devices, **2-D hybrid** | **1790.4** | **+15.2 %** (**+49.7 %** over the kernel) |
+| Flash-Next, 2 devices, gather | 2275.5 | — |
+| Flash-Next, 2 devices, 2-D hybrid | 2018.1 | **−11.3 %** |
+| Flash-Next, 3 devices, gather | 2054.0 | — |
+| Flash-Next, 3 devices, 2-D hybrid | 2046.1 | −0.4 % (parity) |
+
+Text identical on 2 and on 3 devices (`sha=7454a02b99bf` / `sha=e98c06d6427a`), and the census now shows
+`BULK 26 calls 2781.6 MiB, 245 host DMAs` where it used to read `BULK 0 calls`.
+
+**The pattern is residency, not the split**: the 122B's 2-device arena covers a third of the tables and the
+hybrid wins big; Flash-Next's 2-device arena covers *all* of them (40 925 MiB of pool mirrored by a 40 925 MiB
+arena), so staging copies 100 % of a table that the gather would read entirely from VRAM — and loses. The same
+rule the single-GPU arms show (win ∝ transport share) simply carries over.
+
+## 3.6 Coalescing tactics (the DMA chop) — link-dependent, and now explained
+
+The hybrid spends **68 DMAs per table** on Flash-Next at `-ncmoe 48` (105 468 DMAs / 1 551 calls) because a
+53 %-resident arena chops the host side into short runs. `MOE_HOST_POOL_STAGE_MERGE=<n>` already implements
+the obvious tactic — over-fetch a resident run shorter than `n` experts so two host runs become one — so it was
+swept (3 cycles, rotated; text identical throughout):
+
+| link | MERGE=1 (default) | MERGE=2 | MERGE=4 | MERGE=8 |
+|---|---:|---:|---:|---:|
+| x8 | **2523.0** (4.7 %) | 2386.6 (1.6 %) | 2408.8 (2.3 %) | 2369.9 (4.4 %) |
+| x16 | 2479.7 (1.9 %) | 2504.1 (1.0 %) | **2553.1** (0.2 %) | — |
+
+and the trade it makes (x8 census): MERGE=4 takes **105 468 → 16 038 DMAs** (68 → 10 per table) for
+**303 036 → 388 949 MiB** of transfer and 141 515 over-fetched experts.
+
+**Why the boxes disagree, quantitatively.** `wip/expert-transfer-engine` §7.2's own probe prices a copy-engine
+issue at ~18 µs (125 run-coalesced 0.65 MiB copies: 48.2 against 55.8 GB/s ⇒ 2.2 ms over 125 copies), and
+over-fetching one 0.55 MiB expert costs `0.55 MiB / bw`:
+
+| link | over-fetch cost | vs 18 µs/issue | measured |
+|---|---:|---|---|
+| x8 (28.7 GB/s) | ~20 µs | break-even, slightly worse | **merge loses ~4.5 %** |
+| x16 (~51 GB/s) | ~11 µs | cheaper than the issue it saves | **merge wins +3.0 %** |
+
+So the tactic is right and the *constant* is wrong: `MOE_HOST_POOL_STAGE_MERGE` should be chosen from the
+measured link (merge only while `expert_bytes / bw < issue_cost`), not fixed. A hand-set default is guaranteed
+to be wrong on one of the two boxes. Note also that merging **shrinks the variance** (x8 4.7 % → 1.6 %; x16
+1.9 % → 0.2 %), which is the clearest evidence yet that the staged arms' spread comes from the DMA issue path.
+
+A caution this session produced: the single census run of MERGE=4 read **2557.4 t/s** against MERGE=1's 2438.4,
+while the rotated 3-cycle medians read 2408.8 against 2523.0 — the opposite order. One run per arm is worthless
+here (that is the whole reason `abba.sh` exists).
 
 ## 4. Is it the prompt? (DanoPTT's hypothesis, issue #368 comment)
 
@@ -207,16 +293,19 @@ handover's answer stands, but the candidate list is now one item shorter.
 
 ## 9. Retirement assessment (handover C) — for the maintainer's decision
 
+**Updated after §3.5/§3.6: the two-tier kernel fill is still the fallback for a *partial* pool only — a
+tensor split no longer needs it (`experiments/0006`), and the merge policy must become link-derived.**
+
 Nothing was removed; `patches/`, `release.json` and every gate are untouched.
 
 | candidate | verdict from this session |
 |---|---|
 | `moe_cache_gather_*` (device gather) | **Do NOT retire wholesale.** It is also the decode-width path: with `GGML_SCHED_DEVGATHER=0` the decode falls to the per-expert bounce (−2.4 % at 512 tokens, and that is where the 2061 ranges come from). The correct shape is the one `GGML_SCHED_DEVGATHER` mode 1 nearly has already — **gather at/below the cache band, stage above it** — i.e. flip only the *prefill* half of mode 1. |
 | `moe_cache_upload_pageable`'s per-expert bounce | **Cannot be retired while the gather can be off**: it *is* the decode path in that configuration (§8.3). Retire it only together with the "gather owns the band" rule. |
-| the two-tier `moe_cache_stage_kernel` + `stage_span_fill` | **Keep — it is the fallback for two real geometries**: a non-covering (partial/heat-ranked) pool, and **any tensor split** (`-sm tensor`: the hybrid's `expert_bytes == host_bytes` gate fails, `BULK 0 calls`, −12 % vs the gather, §7 B5). Extending the hybrid to per-slice runs is the follow-up that would make the rewrite shape-independent. |
+| the two-tier `moe_cache_stage_kernel` + `stage_span_fill` | **Keep, but only for a non-covering (partial/heat-ranked) pool.** A tensor split no longer falls back to it: `experiments/0006` fills a shard with one 2-D copy per run (+15.2 % over the gather on a partially-resident 122B split, +49.7 % over the kernel fill), text byte-identical on 2 and 3 devices. |
 | `GGML_SCHED_STAGE_AHEAD` | **Retire as a knob if the prototype ships**: neutral-to-negative at both links (2373 vs 2440 on x8). Keep the double-buffered *code* if it is needed to keep the drain off the compute stream — but do not ship the variable. |
 | `MOE_HOST_POOL_STAGE_STANDDOWN` | **Not dead — load-bearing** (§8.2, +25 %). Keep. |
-| `MOE_HOST_POOL_STAGE_MERGE` | stays 1 (session 2: `MERGE=4` is a 1.6 % loss at 53 % coverage); this session did not re-test it. |
+| `MOE_HOST_POOL_STAGE_MERGE` | **do not ship a constant**: it is a loss at x8 (−4.5 %) and a win at x16 (+3.0 %, and the tightest arm measured, 0.2 % spread). Derive it from the calibrated link (§3.6), then it is a win on both. |
 
 Worth recording for the promotion decision: **the win is real and large where the transport share is large**
 (+39.7 % on a 17 %-coverage 122B on one card, +11-16 % on Flash-Next at `-ncmoe 48` on x8, +5-8 % on x16,
@@ -228,6 +317,8 @@ geometry holds; otherwise keep the gather.
 
 * `abba.sh` — new interleaved/rotated A/B harness (`EXTRAENV`, per-arm `PROMPT=`, medians + spreads).
 * `experiments/0005-redirect-capture-guard.patch` — the capture-safety check (§7 B4).
+* `experiments/0006-tensor-split-hybrid-fill.patch` — the hybrid fill on a tensor split (§3.5), plus a
+  `-lv 4` geometry census (`bulk-decline diag:`) that should be removed before promotion.
 * `c1-code-290k.txt` — the code prompt (`sha256 e92133b4ea9cb889…`, 290 000 B of `ggml-opencl.cpp`; generated,
   never committed as a shipped `prompts/` entry).
 * `results-session3/` — the committed per-run tables (`abba-s3-*.tsv`, the rotated-run summaries) and the

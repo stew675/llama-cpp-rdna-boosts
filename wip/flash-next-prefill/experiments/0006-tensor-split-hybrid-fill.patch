@@ -1,0 +1,116 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index f0e125570..3063017ec 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -10656,9 +10656,49 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+                 const int v = e != nullptr ? atoi(e) : 1;
+                 return v < 1 ? 1 : v;
+             }();
+-            if (stage_bulk > 0 && n_copies == 1 && pool != nullptr && !pool->failed &&
++            // wip/flash-next-prefill DIAGNOSTIC (remove before promotion): why did the bulk/hybrid fill decline
++            // this table's geometry?  Printed once per distinct destination per process, at `-lv 4`.
++            if (stage_bulk > 0 && pool != nullptr) {
++                static std::vector<const void *> diag_seen;
++                bool fresh = true;
++                for (const void * p : diag_seen) { if (p == (const void *) dst) { fresh = false; break; } }
++                if (fresh && diag_seen.size() < 8) {
++                    diag_seen.push_back((const void *) dst);
++                    bool mir = pool->slot_expert.size() >= (size_t) t.n_experts &&
++                               pool->slot_state.size() >= (size_t) t.n_experts;
++                    int mir_bad = -1;
++                    if (mir) {
++                        for (int e = 0; e < t.n_experts; e++) {
++                            if (pool->slot_expert[(size_t) e] != e || pool->slot_state[(size_t) e] != 1) { mir_bad = e; break; }
++                        }
++                    }
++                    GGML_LOG_INFO("%s: bulk-decline diag: nc=%zu do2d=%d width=%zu stride_src=%zu off=%lld | "
++                                  "t.expert=%lld t.host=%lld n_experts=%d split_axis=%d host_pitch=%lld | "
++                                  "pool.host=%lld pool.slots=%d pool.base_dev=%p failed=%d mirror_bad=%d\n",
++                                  __func__, n_copies, (int) do2d, width, stride_src, (long long) offset,
++                                  (long long) t.expert_bytes, (long long) t.host_bytes, t.n_experts,
++                                  t.split_axis, (long long) t.host_pitch,
++                                  (long long) pool->host_bytes, pool->slots, (const void *) pool->base_dev,
++                                  (int) pool->failed, mir_bad);
++                }
++            }
++            // Copy-engine geometry for a staged table.  ONE 2-D copy per coalesced run covers all three
++            // shapes the ring stages, because the destination is always packed in expert order:
++            //   unsplit whole table / pinned master : rows_per = 1,    bytes = expert_bytes, src pitch = host_bytes
++            //   tensor split, axis 1 (a contiguous expert shard): rows_per = 1, bytes = expert_bytes, pitch = host_bytes
++            //   tensor split, axis 0 (a row slice):   rows_per = rows, bytes = row_bytes,   pitch = host_pitch
++            // and a run of E experts is (E * rows_per) rows of `bytes` at the destination's own pitch.  A
++            // tensor split is therefore NOT a reason to fall back to the kernel: neither an axis-1 shard
++            // nor an axis-0 row slice breaks the running, it only changes the source stride and the height.
++            const int64_t ce_rows  = do2d ? rows : 1;
++            const int64_t ce_bytes = do2d ? row_bytes : (int64_t) t.expert_bytes;
++            const int64_t ce_pitch = do2d ? (int64_t) t.host_pitch : (int64_t) t.host_bytes;
++            const bool    ce_geom  = ce_rows > 0 && ce_bytes > 0 &&
++                                     (int64_t) (ce_rows * ce_bytes) == (int64_t) t.expert_bytes &&
++                                     t.src_off + t.expert_bytes <= t.host_bytes;
++            if (stage_bulk > 0 && pool != nullptr && !pool->failed && ce_geom &&
+                 pool->base_dev != nullptr && pool->slots >= t.n_experts &&
+-                pool->host_bytes == t.expert_bytes && pool->slot_expert.size() >= (size_t) t.n_experts &&
++                pool->host_bytes == t.host_bytes && pool->slot_expert.size() >= (size_t) t.n_experts &&
+                 pool->slot_state.size() >= (size_t) t.n_experts) {
+                 // The mirror invariant: slot `e` holds expert `e` and is resident.  Anything else (a partial
+                 // pool, a heat-ranked layout, an in-flight retire) keeps the kernel path below, which encodes
+@@ -10672,11 +10712,14 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+                     }
+                 }
+                 if (mirror && stage_bulk == 1) {
+-                    const size_t span = (size_t) t.n_experts * pool->host_bytes;
+-                    const size_t n    = width < span ? width : span;   // the caller's MMQ tail pad stays as it was
+-                    err = cudaMemcpyAsync(dst, pool->base_dev, n, cudaMemcpyHostToDevice,
+-                                          (cudaStream_t) copy_stream);
++                    // One 2-D copy of the whole staged extent: `n_experts * ce_rows` rows of `ce_bytes` from
++                    // the pool mirror (which holds the FULL expert, so the slice's `src_off` is added).
++                    err = cudaMemcpy2DAsync(dst, (size_t) ce_bytes,
++                                            (const char *) pool->base_dev + t.src_off, (size_t) ce_pitch,
++                                            (size_t) ce_bytes, (size_t) (t.n_experts * ce_rows),
++                                            cudaMemcpyHostToDevice, (cudaStream_t) copy_stream);
+                     if (err == cudaSuccess) {
++                        const size_t n = (size_t) t.n_experts * t.expert_bytes;
+                         g_stage_ok++;
+                         g_stage_host_bytes += (int64_t) n;
+                         g_stage_bulk_calls++;
+@@ -10686,10 +10729,10 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+                     (void) cudaGetLastError();
+                     err = cudaSuccess;
+                 }
+-                // ---- THE HYBRID.  Whole-table geometry only (a strided slice keeps the two-tier kernel):
+-                // the destination is the table in expert order, a host run is contiguous in the pool mirror,
+-                // and an arena-resident expert is copied from its slot by the kernel below.
+-                if (mirror && stage_bulk >= 2 && !do2d && t.expert_bytes == pool->host_bytes) {
++                // ---- THE HYBRID.  The destination is the table in expert order, a host RUN is a strided
++                // block of the pool mirror, and an arena-resident expert is copied from its slot by the
++                // kernel below -- so each engine does the half it is good at, on every staged shape.
++                if (mirror && stage_bulk >= 2) {
+                     const int            ne  = t.n_experts;
+                     std::vector<int32_t> prs_new((size_t) ne, -1);   // arena slot, or -1 = not the kernel's job
+                     std::vector<uint8_t> from_host((size_t) ne, 1);
+@@ -10719,7 +10762,7 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+                             e = e2;
+                         }
+                     }
+-                    // (a) the host side: one DMA per coalesced run, straight out of the pinned mirror
++                    // (a) the host side: one 2-D DMA per coalesced run, straight out of the pinned mirror
+                     bool ok = true;
+                     int  n_runs = 0;
+                     for (int e = 0; e < ne && ok; ) {
+@@ -10727,9 +10770,13 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+                         int e2 = e;
+                         while (e2 < ne && from_host[(size_t) e2]) { e2++; }
+                         const size_t nb = (size_t) (e2 - e) * t.expert_bytes;
+-                        ok = cudaMemcpyAsync((char *) dst + (size_t) e * t.expert_bytes,
+-                                             (const char *) pool->base_dev + (size_t) e * pool->host_bytes,
+-                                             nb, cudaMemcpyHostToDevice, (cudaStream_t) copy_stream) == cudaSuccess;
++                        // The run is (e2-e) experts of `ce_rows` rows each, packed at the destination and
++                        // `ce_pitch` apart in the mirror, so ONE strided copy covers all of them.
++                        ok = cudaMemcpy2DAsync((char *) dst + (size_t) e * t.expert_bytes, (size_t) ce_bytes,
++                                               (const char *) pool->base_dev + (size_t) e * pool->host_bytes + t.src_off,
++                                               (size_t) ce_pitch, (size_t) ce_bytes,
++                                               (size_t) ((e2 - e) * ce_rows),
++                                               cudaMemcpyHostToDevice, (cudaStream_t) copy_stream) == cudaSuccess;
+                         if (ok) {
+                             g_stage_host_bytes += (int64_t) nb;
+                             g_stage_bulk_bytes += (int64_t) nb;
