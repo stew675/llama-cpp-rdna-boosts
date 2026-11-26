@@ -109,6 +109,28 @@
 > per-layer stand-down / re-arm tally.  Record: `WORKLOG.md` 261125.008,
 > `benchmarks/2026-11-25-issue-368-pool-tier-ring-hole.md`, `DIAGNOSTIC.md` §28.
 >
+> **r366: the WIDE (prefill) band is armed by the prefill PASS, not by the carved ring hole -- r362's hole removal
+> silently disabled it, an amendment to block 10 (GitHub issue #368, the reporter's r365 follow-up).**
+> `ring_armed` -- which `ggml_cuda_slab_wide_available()` and the wide-aux allocator gate on -- was
+> `ring_region > 0 && ...`, so declining the hole on a pool tier made the band structurally impossible: the FA
+> staging arena, the CUDA pool's large prefill allocations, the MMB activation cache and the chunked-GDN/QSA3
+> `wide_scratch` all fell outside the slab onto the ~1536 MiB cushion (**924 `SLAB_WIDE_AUX` refusals in one 90k
+> prefill**), and the prefill view was then classified *narrow* (the same test required a carved region), so it
+> learned `narrow_floor` as its own size (`work=3328 MiB (narrow=3328)` at the drop, against 1792) and the band
+> could never come back -- the reporter's "compute buffer 1536 -> 2875 MiB".  Now `wide_armed` (armed by
+> `ring_requested` + the boundary covering the LIVE view) and `ggml_cuda_slab_wide_place()` is the one placement
+> rule (above a carved ring, the narrow base when none is), which `ggml_cuda_slab_seed_floor` also uses; the ring
+> itself is unchanged (`ring_slot_capacity()` / `arena_alloc_transient()` still need `ring_region > 0`, so a pool
+> tier stages nothing).  Measured on the reporter's shape (1x R9700 x8, Flash-Next GSQ-RCO-IQ3_XXS, `-ncmoe 47
+> --host-experts pool -c 131072 -b 8192 -ub 8192`, an 89182-token L1): r365 default 2073.3/2076.8 t/s prefill and
+> 30.8/30.7 decode -> **2106.6/2107.4** and **32.2/32.8**; the hole layout 1983.2/1981.5 and 27.5/27.1.  Server
+> visits: L1 **1959.5 t/s / 34.37 tg**, S2 46.33, L2 34.61, stand-downs `L47x2`, arena 20 352 MiB against the
+> hole's 1888.9 / 33.74 / 40.15 / 35.02 and `L31..L47x3` = 51 tables at 12 416 MiB.  Text identical at every visit
+> point in both layouts.  Gates: `validate-set.sh` (`0 unexplained`), `gate-host-pool.sh` 59/59,
+> `gate-kv-residency.sh` PASS, `gate-prefill-logits.sh` **0.000000 / 100.000 %**, `gate-host-expert-text.sh` 3/3,
+> `check-shlib-symbols.sh` 16/16, `check-gen-docs.sh` ok.  Record: `WORKLOG.md` 261126.001,
+> `benchmarks/2026-11-26-issue-368-wide-band-coupling.md`, `INVARIANTS.md` r366.
+>
 > **r326: the graph-replay width band is `GGML_CUDA_GRAPH_MAX_TOKENS` (default 16, was 8) -- a repeating 9..16-row verify or pre-fill ubatch is replayed (+3.5 % on a 4-slot server, +1.2 % at `llama-batched-bench -npl 16`), a moving width pays a capture per new width, and the FA staging arena is no longer grown from inside a capture (contributor PR #336, `@overdoingism`), an amendment to block 10.**
 >
 > **r321: a fused MoE launch's STAGED answer is a PLACEMENT, not a stand-down -- and it owns the broken-promise repair (GitHub issue #332), an amendment to block 10.**

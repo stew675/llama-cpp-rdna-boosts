@@ -3638,3 +3638,28 @@ it); making deferral ordinary made it reliable.
 Text: a deferred-then-admitted request produces the SAME tokens as when it runs alone (measured: `gate-kv-admit.sh`'s
 purity arm, both answers `1dfd5ced6f3e` with `cache_prompt: false`, the deferred request re-prefilling all 5246 tokens).
 Gate: `scripts/gate-kv-admit.sh` (`MANIFESTS.md` gate 46); knobs `ENVIRONMENT.md` §29 / `DIAGNOSTIC.md` §29; PR #370.
+
+**r366 -- the slab's WIDE (prefill) band is armed by the prefill PASS, never by the carved H2D ring hole.**
+`ring_armed` was `ring_region > 0 && wide_off > narrow_floor && boundary >= wide_off`, and it is what
+`ggml_cuda_slab_wide_available()` and `ggml_cuda_slab_wide_aux_alloc()` gate on, so a slab that carves NO ring
+hole -- which r362 made the pool-backed host-expert default (r362) -- had no wide band at all.  Two consequences,
+both silent: (a) every prefill-only transient that lives in the band (the FA staging arena, the CUDA pool's large
+allocations under `GGML_CUDA_POOL_WIDE`, the MMB activation cache, the chunked-GDN/QSA3 `wide_scratch`) falls
+outside the slab onto the outside headroom (~1536 MiB on one GPU), and a starved cushion is a slow path or an
+allocator failure, never a diagnostic; (b) `ring_wide` also required `ring_region > 0`, so a prefill view was
+classified NARROW and *learned* `narrow_floor` as its own size (measured 1792 -> 3328 MiB, which is the
+`compute buffer 1536 -> 2875 MiB` a reporter sees as a reallocation), permanently: the band could not be
+re-armed and the arena lost the difference at every decode.  So *"the hole is arena nothing reads"* (r362) is
+true of the RING and says nothing about the BAND -- the ring is one consumer of the band, not its definition.
+The rule now: `wide_armed` is `ring_requested && narrow_floor > 0 && boundary >= (placement + the view's extent)`,
+and `ggml_cuda_slab_wide_place()` is the ONE placement rule (`narrow_floor + ring_region` above a carved ring,
+base 0 when none is carved, the pre-hierarchy layout) used by both `work_alloc` and `ggml_cuda_slab_seed_floor`.
+The ring keeps its own gates (`ring_slot_capacity()`, `arena_alloc_transient()` require `ring_region > 0`), so a
+pool tier still stages nothing and r362's win stands.  A `SLAB_WIDE_AUX ... refused: slab=1 wide_armed=0` line
+that repeats every request is this defect, not a transient; `SLAB_STATS`' `aux_refused` and the `work=…(narrow=…)`
+field are the two numbers to read.  Measured on the reporter's shape (1x R9700 x8, Flash-Next GSQ-RCO-IQ3_XXS,
+`-ncmoe 47 --host-experts pool -ub 8192`, an 89182-token L1): 924 refusals and `narrow=3328` at the drop before,
+0 and `narrow=1792` after, +1.8 % prefill / +6 % decode against r365 and +6.4 % / +19 % against the hole layout,
+text identical; server visits L1 1959.5 t/s / 34.37 tg and stand-downs down from 51 tables to 2.  Gate ladder:
+`benchmarks/2026-11-26-issue-368-wide-band-coupling.md` §5. (r366, GitHub issue #368 -- the reporter's r365
+follow-up; `WORKLOG.md` 261126.001.)

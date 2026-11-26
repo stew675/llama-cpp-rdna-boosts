@@ -1,4 +1,4 @@
-From cf69431b90801806beae46e25533ed4adc650c34 Mon Sep 17 00:00:00 2001
+From 4e8cb70e09755af5e005543be81db435eb4200fc Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/18] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -3044,10 +3044,10 @@ index 3bf0b0906..f554c7a54 100644
  bool   ggml_backend_cuda_moe_cache_remap(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, bool check_only);
  size_t ggml_backend_cuda_fattn_stage_bound(ggml_backend_t backend, int type_k, int type_v);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-index 5b72804a3..01087b511 100644
+index 169dd3e22..922b42553 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-@@ -593,8 +593,9 @@ static size_t ggml_cuda_slab_up(size_t x, size_t a) {
+@@ -604,8 +604,9 @@ static size_t ggml_cuda_slab_up(size_t x, size_t a) {
  // wip/moe-verify-fusions: the arena's VA ceiling and usable top when a narrow-2 region is pinned at the
  // top of the reserved VA.  Before narrow-2 exists the ceiling is the whole reserved VA (`size`); after, it
  // stops at `narrow2_off` so neither `slab_extend` nor `arena_alloc` can touch the pinned region.  The
@@ -3059,7 +3059,7 @@ index 5b72804a3..01087b511 100644
  static size_t ggml_cuda_slab_arena_limit(const ggml_cuda_slab & s) {
      return s.narrow2_floor > 0 ? s.narrow2_off : s.size;
  }
-@@ -1009,7 +1010,27 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+@@ -1020,7 +1021,27 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
  // The size is FIXED at the first establishment: narrow-2 is anchored at the top (`off = size - floor`), so
  // a later, larger request would move a live view's base.  In practice the first request is the draft's
  // `sched_reserve` pp layout, which is its widest graph, so the region never needs to grow.
@@ -3088,7 +3088,7 @@ index 5b72804a3..01087b511 100644
      if (!s.inited || bytes == 0) {
          return 0;
      }
-@@ -1021,9 +1042,8 @@ static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s
+@@ -1032,9 +1053,8 @@ static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s
          const size_t off = s.size - nf2;
          const size_t min_arena = ggml_cuda_slab_min_arena_bytes();
          // The work region (`boundary`, which includes the wide prefill view and the ring) and a usable
@@ -3100,7 +3100,7 @@ index 5b72804a3..01087b511 100644
              GGML_LOG_WARN("%s: device %d: no room for a %.2f GiB narrow-2 region above the work region "
                            "(%.2f GiB) and a %.2f GiB arena floor in a %.2f GiB slab (mapped %.2f GiB); "
                            "the draft compute buffer stays on the cudaMalloc path\n",
-@@ -1032,21 +1052,12 @@ static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s
+@@ -1043,21 +1063,12 @@ static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s
                            (double) s.mapped / (1ull << 30));
              return 0;
          }
@@ -3128,7 +3128,7 @@ index 5b72804a3..01087b511 100644
          GGML_LOG_WARN("%s: device %d: narrow-2 request %.2f GiB exceeds the pinned %.2f GiB and the region "
                        "cannot grow without moving a live view; falling back\n",
                        __func__, device, (double) nf2 / (1ull << 30), (double) s.narrow2_floor / (1ull << 30));
-@@ -1055,15 +1066,163 @@ static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s
+@@ -1066,15 +1077,163 @@ static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s
      return s.narrow2_off;
  }
  
@@ -3296,7 +3296,7 @@ index 5b72804a3..01087b511 100644
  }
  
  // This is a MULTISET, not a flag: more than one compute buffer is live at a time (the main context and the
-@@ -1112,6 +1271,11 @@ void ggml_cuda_slab_work_release(int device, size_t off, size_t need) {
+@@ -1123,6 +1282,11 @@ void ggml_cuda_slab_work_release(int device, size_t off, size_t need) {
  // when the wide view is dropped.  The ring is never part of the arena, so arming it is an ordinary
  // boundary move (evicting the COLDEST tables), not an independent arena eviction.
  void * ggml_cuda_slab_work_alloc(int device, size_t need) {
@@ -3308,7 +3308,7 @@ index 5b72804a3..01087b511 100644
      size_t lo = 0, hi = 0;
      bool   move = false;
      size_t ret_off = 0;
-@@ -1126,36 +1290,9 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+@@ -1137,36 +1301,9 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
              if (!ggml_cuda_slab_init_locked(device, s, need)) {
                  return nullptr;
              }
@@ -3348,16 +3348,16 @@ index 5b72804a3..01087b511 100644
          }
          // Establish the fixed narrow floor: the first reserve smaller than the boundary (the
          // prefill -> decode drop re-reserves the decode/verify layout there).  Its ring region then sits
-@@ -1567,7 +1704,7 @@ void * ggml_cuda_slab_wide_aux_alloc(int device, size_t size, size_t * gen_out)
+@@ -1580,7 +1717,7 @@ void * ggml_cuda_slab_wide_aux_alloc(int device, size_t size, size_t * gen_out)
              }
          };
-         if (!s.inited || !s.ring_armed) {
+         if (!s.inited || !s.wide_armed) {
 -            if (getenv("GGML_CUDA_SLAB_STATS") != nullptr) {
 +            if (ggml_cuda_slab_stats_on()) {
                  if (s.wide_aux_denied_n == 0) {
-                     GGML_LOG_WARN("SLAB_WIDE_AUX dev=%d req=%.1f MiB refused: slab=%d ring_armed=%d\n",
-                                   device, (double) size/1048576.0, (int) s.inited, (int) s.ring_armed);
-@@ -1589,7 +1726,7 @@ void * ggml_cuda_slab_wide_aux_alloc(int device, size_t size, size_t * gen_out)
+                     GGML_LOG_WARN("SLAB_WIDE_AUX dev=%d req=%.1f MiB refused: slab=%d wide_armed=%d\n",
+                                   device, (double) size/1048576.0, (int) s.inited, (int) s.wide_armed);
+@@ -1602,7 +1739,7 @@ void * ggml_cuda_slab_wide_aux_alloc(int device, size_t size, size_t * gen_out)
          // Never grow past the MAPPED region (the arena's top): the slab's VA may carry spare unmapped
          // space above `mapped`, and a kernel writing there would fault.
          const size_t aux_limit = std::min(ggml_cuda_slab_arena_limit(s), s.mapped);

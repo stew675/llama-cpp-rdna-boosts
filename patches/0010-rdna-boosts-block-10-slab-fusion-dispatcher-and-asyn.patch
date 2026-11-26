@@ -1,4 +1,4 @@
-From faec44b6027610873f21579df9f8bfbfbcbf2eb2 Mon Sep 17 00:00:00 2001
+From 23cc79964db12ec0e7e78840b9983f6c7f25e0db Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/18] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -151,6 +151,24 @@ abed0bf40d87), Qwen3-Coder-30B-A3B Q4_K_M (903 ch fc94447651c1) and gemma-4-26B-
   ubatches are captured too.  Gate: scripts/gate-graph-replay-width.sh; knobs: ENVIRONMENT.md 1.1c.
 
 Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
+
+- r366 (GitHub issue #368, the r362 follow-up): the slab's WIDE (prefill) band is no longer defined by the
+  H2D ring hole.  r362 declines the ring region on a pool-backed host-expert tier (nothing stages those
+  tables there), but `ring_armed` -- which `ggml_cuda_slab_wide_available()` and the wide-aux allocator gate
+  on -- was `ring_region > 0 && ...`, so declining the hole silently disabled the whole band: every
+  prefill-only transient (the FA staging arena, the CUDA pool's large allocations, the MMB activation cache,
+  the chunked-GDN/QSA3 wide scratch) fell outside the slab, on the ~1536 MiB outside cushion, and the
+  prefill view was then classified NARROW (the size/mark test also required a carved region), so it learned
+  `narrow_floor` as its own size and the band could never come back.  Measured on the field GSQ shape
+  (1 x R9700, `-ncmoe 47 --host-experts pool -ub 8192`, 89199-token L1): 924 wide-aux refusals per prefill
+  and `narrow_floor` 1792 -> 3328 MiB with the r362 layout, 0 refusals and 1792 with this.  The band is now
+  armed on the context's wide mark (`ring_requested`) and on the boundary covering the live view, wherever
+  that view was placed; `ggml_cuda_slab_wide_place()` is the single placement rule (above the ring when one
+  is carved, the narrow base when none is) and the seed floor uses it too.  The ring hole itself is
+  unchanged: `ggml_cuda_slab_arena_alloc_transient` and `ring_slot_capacity` still require `ring_region > 0`,
+  so a pool tier keeps staging nothing.  Text byte-identical (`c9da1e69a0b5` on the shape above,
+  `461ca8cd0e88` on 35B-A3B Q8_0 with and without a ring); measured 2107 t/s prefill / 32.5 t/s decode
+  against 2075 / 30.7 for r365's default and 1982 / 27.3 for the `GGML_CUDA_SLAB_RING_MIB=6144` layout.
 ---
  ggml/include/ggml-alloc.h                     |   13 +
  ggml/include/ggml.h                           |    1 -
@@ -188,7 +206,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  ggml/src/ggml-cuda/ggml-cuda-arena.cuh        |   15 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cu    |  295 +
  .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |   27 +
- ggml/src/ggml-cuda/ggml-cuda-slab.cu          | 1867 +++++
+ ggml/src/ggml-cuda/ggml-cuda-slab.cu          | 1880 +++++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu      | 3542 +++++++++
  ggml/src/ggml-cuda/ggml-cuda-try-fuse.cuh     |   43 +
  ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   60 +
@@ -240,7 +258,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  tests/test-fusion-gate-beta-multiseq.cpp      |  321 +
  tests/test-logits-width-probe.cpp             |  234 +-
  tools/server/server-context.cpp               |   30 +-
- 88 files changed, 18326 insertions(+), 5666 deletions(-)
+ 88 files changed, 18339 insertions(+), 5666 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -6105,10 +6123,10 @@ index 000000000..3bf0b0906
 +size_t ggml_backend_cuda_h2d_stage_bound(ggml_backend_t backend, size_t max_table);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
 new file mode 100644
-index 000000000..5b72804a3
+index 000000000..169dd3e22
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
-@@ -0,0 +1,1867 @@
+@@ -0,0 +1,1880 @@
 +// Movable-boundary slab (OPEN 2 / r42): the per-device VMM reserve + work/arena boundary move.
 +// Split out of ggml-cuda.cu (an upstream hub); the API is declared in ggml-cuda-vmm.h.
 +
@@ -6275,7 +6293,10 @@ index 000000000..5b72804a3
 +    size_t                   narrow2_off   = 0; // = size - narrow2_floor, fixed once established
 +    int                      narrow2_live  = 0; // live narrow-2 views (diagnostic/guard)
 +    size_t                   ring_region  = 0;  // ring bytes above the narrow floor (0 = no ring)
-+    bool                     ring_armed   = false; // the wide view (hence the ring region) is reserved
++    bool                     wide_armed   = false; // a wide (prefill) pass is live and the boundary covers
++                                                //  its view: the WIDE BAND is armed, whether or not an H2D
++                                                //  ring region was carved (r362 declines the ring on a
++                                                //  pool tier; the band's other consumers still live here)
 +    // wip/slab-transient-absorption: the WIDE-PHASE auxiliary region (the FA prefill staging arena), bump
 +    // allocated just above the boundary so it is reclaimed with the ring/wide band on the prefill -> decode
 +    // transition.  `wide_aux_off` is the base offset, `wide_aux_size` the bytes reserved (0 = none), and
@@ -6427,6 +6448,14 @@ index 000000000..5b72804a3
 +    return s.narrow_floor + s.ring_region;
 +}
 +
++// The base offset the WIDE (prefill) view is actually PLACED at.  With a carved ring region it sits above
++// it (the ring's VA must not move).  With NO ring region (a pool-backed tier since r362) there is no hole
++// to protect, so the wide view takes the narrow base -- the pre-hierarchy layout, one growing compute view
++// -- and only its extent floors the boundary.  Placement and `wide_armed` must agree, so both use this.
++static size_t ggml_cuda_slab_wide_place(const ggml_cuda_slab & s) {
++    return s.ring_region > 0 ? ggml_cuda_slab_wide_offset(s) : 0;
++}
++
 +// wip/slab-ring-region: pin the always-resident narrow (decode/verify) floor.  The context knows the real
 +// decode/verify compute size (from the narrow re-reserve), which is more reliable than inferring it from the
 +// reserve sizes -- a decode view can be LARGER than the first small reserve (measured: the field's target
@@ -6498,7 +6527,7 @@ index 000000000..5b72804a3
 +    if (!s.inited || s.narrow_floor == 0) {
 +        return 0;
 +    }
-+    const size_t wide_off = ggml_cuda_slab_wide_offset(s);
++    const size_t wide_off = ggml_cuda_slab_wide_place(s);
 +    return wide_off + (s.wide_reserve_bytes > 0 ? ggml_cuda_slab_up(s.wide_reserve_bytes, s.chunk) : 0);
 +}
 +
@@ -7067,7 +7096,7 @@ index 000000000..5b72804a3
 +    s.narrow2_off   = 0;
 +    s.narrow2_live  = 0;
 +    s.ring_region  = 0;
-+    s.ring_armed   = false;
++    s.wide_armed   = false;
 +    s.ring_used    = 0;
 +    s.wide_aux_off  = 0;
 +    s.wide_aux_size = 0;
@@ -7285,9 +7314,11 @@ index 000000000..5b72804a3
 +        // narrow (decode/verify) floor -- the 35B-A3B and GSQ configs have a size-independent compute
 +        // layout, so a size-only test left the prefill at base 0, `boundary == narrow_floor`, and the
 +        // carved ring region was never armed (`ring_slot_capacity() == 0`): the H2D staging fell back to a
-+        // capped cudaMalloc and the prefill streamed.  Only force it when a region was actually carved, so
-+        // a no-ring model keeps the plain size classification.
-+        const bool   ring_wide = s.ring_region > 0 && s.ring_requested && s.narrow_floor > 0;
++        // capped cudaMalloc and the prefill streamed.  A wide (prefill) pass is therefore classified by the
++        // CONTEXT's mark, not by its size, on every slab layout -- with no ring region carved (a pool-backed
++        // tier since r362) the mark also keeps the view out of the narrow band, so it cannot raise
++        // `narrow_floor` to the prefill size (measured: floor 1792 -> 3328 MiB, the band lost at decode).
++        const bool   ring_wide = s.ring_requested && s.narrow_floor > 0;
 +        // A view that is NOT a requested wide (prefill) pass belongs to the always-resident narrow band even
 +        // when it is wider than the floor established so far.  The ring region is only carved while a wide
 +        // pass is live, so when it is not (`boundary <= narrow_floor` and the ring is disarmed) a wider
@@ -7298,13 +7329,14 @@ index 000000000..5b72804a3
 +        // While a wide view IS live the ring VA must not move, so that case keeps the above-the-ring
 +        // placement (a later decode pass drops the wide view first, then the band grows here).
 +        // A live wide view is the only thing that makes the ring region part of the reserved layout:
-+        // `ring_armed` is set exactly when the boundary covers the carved ring.  `ring_used` is NOT a
++        // `wide_armed` is set exactly when the boundary covers the LIVE wide view -- a carved ring region is
++        // one consumer of the band, not its definition.  `ring_used` is NOT a
 +        // usable test (it is a bump cursor that stays at the end after a prefill) and neither is
 +        // `boundary > narrow_floor` (the boundary can sit a chunk or two above the floor for an
 +        // unrelated narrow view) -- treating either as "the ring may not move" stopped the band from
 +        // being learned on a single device: measured gfx1100 `-ncmoe 40`, floor 1280 MiB against a
 +        // 1536 MiB decode view, one arena eviction per prefill -> decode transition.
-+        const bool   narrow   = s.narrow_floor > 0 && !ring_wide && (!s.ring_armed || need <= s.narrow_floor);
++        const bool   narrow   = s.narrow_floor > 0 && !ring_wide && (!s.wide_armed || need <= s.narrow_floor);
 +        if (narrow && need > s.narrow_floor) {
 +            // Learn the band from the real graph: the floor is estimated before the first carve from a
 +            // reserve that is not necessarily the widest narrow layout (the `n_rs_batch` probe measures
@@ -7315,15 +7347,14 @@ index 000000000..5b72804a3
 +            s.ring_region  = ggml_cuda_slab_ring_candidate(s, s.narrow_floor);
 +            s.ring_slots   = ggml_backend_cuda_context::h2d_stage_slots();
 +            s.ring_used    = 0;
-+            s.ring_armed   = false;
++            s.wide_armed   = false;
 +        }
-+        const size_t wide_off = ggml_cuda_slab_wide_offset(s);
 +
 +        // The boundary may shrink only to the TALLEST live view's boundary contribution.  Each view's
 +        // contribution is `base_off + up(need)` (a narrow view at base 0, a wide view above the ring), so
 +        // the multiset stores that directly and a view placed before the narrow floor existed cannot
 +        // inflate the floor after the fact.
-+        ret_off = narrow ? 0 : wide_off;
++        ret_off = narrow ? 0 : ggml_cuda_slab_wide_place(s);
 +        // TEMP diagnostic (wip/moe-verify-fusions): show the base offset each compute buffer gets.
 +        if (ggml_cuda_work_alloc_debug()) {
 +            GGML_LOG_WARN("WORK_ALLOC dev=%d need=%.1f MiB narrow=%d ret_off=%.1f MiB narrow_floor=%.1f ring=%.1f boundary=%.1f\n",
@@ -7418,7 +7449,7 @@ index 000000000..5b72804a3
 +                }
 +                s.arena_free[lo2] = hi2 - lo2;
 +            }
-+            s.ring_armed = s.ring_region > 0 && wide_off > s.narrow_floor && s.boundary >= wide_off;
++            s.wide_armed = s.ring_requested && s.narrow_floor > 0 && s.boundary >= contrib;
 +            s.work_needs.insert(contrib);
 +            return (void *) (uintptr_t) ((char *) s.base + ret_off);
 +        }
@@ -7451,9 +7482,9 @@ index 000000000..5b72804a3
 +            }
 +        }
 +        if (s.inited) {
-+            const size_t wide_off = s.narrow_floor + s.ring_region;
-+            s.ring_armed = s.ring_region > 0 && wide_off > s.narrow_floor && s.boundary >= wide_off;
-+            s.work_needs.insert(ret_off + ggml_cuda_slab_up(need, s.chunk));
++            const size_t contrib = ret_off + ggml_cuda_slab_up(need, s.chunk);
++            s.wide_armed = s.ring_requested && s.narrow_floor > 0 && s.boundary >= contrib;
++            s.work_needs.insert(contrib);
 +        }
 +        return (void *) (uintptr_t) ((char *) base + ret_off);
 +    }
@@ -7537,7 +7568,7 @@ index 000000000..5b72804a3
 +size_t ggml_cuda_slab_ring_slot_capacity(int device) {
 +    std::lock_guard<std::mutex> lock(g_slab_mutex);
 +    const ggml_cuda_slab & s = g_slabs[device];
-+    if (!s.inited || !s.ring_armed || s.ring_region == 0 || s.ring_slots <= 0) {
++    if (!s.inited || !s.wide_armed || s.ring_region == 0 || s.ring_slots <= 0) {
 +        return 0;
 +    }
 +    return (s.ring_region / (size_t) s.ring_slots) / s.unit * s.unit;
@@ -7624,7 +7655,7 @@ index 000000000..5b72804a3
 +    }
 +    std::lock_guard<std::mutex> lock(g_slab_mutex);
 +    ggml_cuda_slab & s = g_slabs[device];
-+    if (!s.inited || !s.ring_armed || s.ring_region == 0) {
++    if (!s.inited || !s.wide_armed || s.ring_region == 0) {
 +        return nullptr;
 +    }
 +    const size_t want = ggml_cuda_slab_up(size, s.unit);
@@ -7677,11 +7708,11 @@ index 000000000..5b72804a3
 +                              extra > 0 ? (double) extra/1048576.0 : 0.0);
 +            }
 +        };
-+        if (!s.inited || !s.ring_armed) {
++        if (!s.inited || !s.wide_armed) {
 +            if (getenv("GGML_CUDA_SLAB_STATS") != nullptr) {
 +                if (s.wide_aux_denied_n == 0) {
-+                    GGML_LOG_WARN("SLAB_WIDE_AUX dev=%d req=%.1f MiB refused: slab=%d ring_armed=%d\n",
-+                                  device, (double) size/1048576.0, (int) s.inited, (int) s.ring_armed);
++                    GGML_LOG_WARN("SLAB_WIDE_AUX dev=%d req=%.1f MiB refused: slab=%d wide_armed=%d\n",
++                                  device, (double) size/1048576.0, (int) s.inited, (int) s.wide_armed);
 +                }
 +                s.wide_aux_denied_n++;
 +            }
@@ -7706,7 +7737,7 @@ index 000000000..5b72804a3
 +                          device, (double) size/1048576.0, (double) want/1048576.0,
 +                          (double) aux_end/1048576.0, (double) s.wide_aux_size/1048576.0,
 +                          (double) target/1048576.0, (double) s.boundary/1048576.0,
-+                          (double) aux_limit/1048576.0, (int) s.ring_armed);
++                          (double) aux_limit/1048576.0, (int) s.wide_armed);
 +        }
 +        // Never grow into the pinned narrow-2 region (the draft's compute VA) or past the mapping.
 +        if (target > aux_limit) {
@@ -7746,7 +7777,7 @@ index 000000000..5b72804a3
 +        // instead looks equivalent but is not: the base is set to the boundary BEFORE the move, and the
 +        // move then rounds the boundary up to `chunk`, so the retained base normally sits a whole chunk
 +        // below the boundary -- every later growth would be refused and fall back outside the slab.)
-+        if (!s.inited || !s.ring_armed || s.boundary != lo || s.wide_aux_off + s.wide_aux_size != off) {
++        if (!s.inited || !s.wide_armed || s.boundary != lo || s.wide_aux_off + s.wide_aux_size != off) {
 +            // TODO #70: the growth was ALREADY paid for (a band of arena tables was evicted) and the layout
 +            // it was sized against moved while the lock was dropped, so this snapshot is unusable.  This is
 +            // the RECOVERABLE class: the racing thread is the MTP draft context's reserve and retrying from
@@ -7802,7 +7833,7 @@ index 000000000..5b72804a3
 +bool ggml_cuda_slab_wide_available(int device) {
 +    std::lock_guard<std::mutex> lock(g_slab_mutex);
 +    const ggml_cuda_slab & s = g_slabs[device];
-+    return s.inited && s.ring_armed;
++    return s.inited && s.wide_armed;
 +}
 +
 +// The current generation of the wide-phase auxiliary region.  A caller that caches a pointer from
@@ -7862,7 +7893,7 @@ index 000000000..5b72804a3
 +// ring_region` -- but the classification must NOT be inferred from the work request size: for the
 +// 35B-A3B / GSQ configs the whole compute layout is size-independent (`GRAPH_RESERVE n_tokens=2048` and
 +// the narrow probe both measure 1280 MiB), so a size test left the prefill at base 0 with
-+// `boundary == narrow_floor` and `ring_armed == false`.  `work_alloc` reads this flag and places the
++// `boundary == narrow_floor` and `wide_armed == false`.  `work_alloc` reads this flag and places the
 +// prefill view above the ring.  A no-op for the generic arm/disarm plumbing stays valid for a future
 +// non-slab allocator.
 +// The ring hole is released on the prefill -> decode transition (see `ggml_cuda_slab_ring_set`), and so is
