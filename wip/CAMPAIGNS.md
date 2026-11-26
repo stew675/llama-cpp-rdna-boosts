@@ -1,5 +1,16 @@
 # Open WIP campaigns (index)
 
+> **Promoted (r363, 2026-11-26):** `kv-pool-drop` became a **block-14 amendment** (`LLAMA_KV_POOL_DROP` kill
+> switch; the attendance pool drops the pool pages a batch wrote without resolving through it, so a re-prefill over
+> resident cells no longer reads the previous request's K/V).  It was submitted as `wip/kv-pool-drop-r361/` by
+> contributor PR #369 (`@briansp2020`) and never had a row in this index; its record moved to
+> [`../archive/work/kv-pool-drop/`](../archive/work/kv-pool-drop/README.md) with the integration work named there
+> (the `gate-kv-residency.sh` two-request section, because every existing arm was ONE `llama-cli` request and the
+> gate was blind to the class; the sparse reference the comparison needs; the docs) and the submitted patch kept as
+> the reproduction.  Gate: `scripts/gate-kv-residency.sh` (`MANIFESTS.md` gate 19); knob `DIAGNOSTIC.md` §17.1.  It
+> is not an open campaign and it is not kept here as a stub.  `TODO` #378 (the two-arm server's corruption) now
+> names the pool as suspect 1 for the same reason, with the closing run recorded there.
+>
 > **Promoted (r357, 2026-11-24):** `tool-text` became a **block-12 amendment** (`LLAMA_SERVER_TOOL_TEXT` kill switch,
 > default-on; the server keeps a tool result's, a tool call's arguments' and an assistant text's special-token
 > strings as TEXT).  It was submitted as `wip/tool-text/` by contributor PR #360 (`@overdoingism`) and never had a row

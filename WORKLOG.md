@@ -65,7 +65,7 @@ pair with and without the patch; the beta README's "RE-TEST THIS FIRST" note giv
 
 ## 261125.010 (r363) -- PR #369 accepted: the attendance pool DROPS the pages a non-resolving batch wrote (the writer rule only ever covered the decode band), so a re-prefill over resident cells no longer reads the previous request's K/V
 
-**The report.**  GitHub PR #369 (`@briansp2020`, `wip/kv-pool-drop-r361/`): with `--kv-attendance-pool on`, the
+**The report.**  GitHub PR #369 (`@briansp2020`, submitted as `wip/kv-pool-drop-r361/`, record now `archive/work/kv-pool-drop/`): with `--kv-attendance-pool on`, the
 second of two requests that share a prompt prefix read STALE K/V out of the pool.  On their r361 build
 `LLAMA_KV_POOL_VERIFY=1` counted ~226 M mismatching words over the two requests and the answer differed from the
 resident-KV result (a 90-entry prompt answered as "91 entries").  Their diagnosis: the writer rule re-fills a
