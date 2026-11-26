@@ -16,6 +16,28 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.016 (r365, release cut) -- tagged, main and the fork pushed, the release assets published; the container images are OWED
+
+**The cut.**  `v18-919794500-r365` (annotated tag, pushed) = fork re-cut tip
+`7ad7f533cbc6923a9ec4d78f00384901108236f5`, base `919794500`, default tree `21efb08247edc142c649d2dcda771abb73fee810`,
+18 official + 1 temporary = 19 default blocks, 2 optional re-cut on the new tree (`0100` alone `3d7804c3d`, `0101` alone
+`f31b444f1`, cumulative `43ee504d4`).  The GitHub Release carries its 4 assets (`SHA256SUMS`, `patches.tar.gz`,
+`rdna-boosts-all.patch`, `release.json`).
+
+**The fork.**  `fork-refresh.sh --push` re-cut `~/llama.cpp` from `patches/` (strict `git am`, 19 commits), asserted
+`tip 7ad7f533c == release.json .tip`, and force-with-lease pushed to the **personal fork only**:
+`gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` reads `7ad7f533cbc6923a9ec4d78f00384901108236f5`.
+
+**The PR.**  Merged (`--rebase`, attribution kept) and the merged `wip/kv-admit-r362/` copy removed in the next commit
+(the record is `archive/work/kv-admit/`; a promoted campaign leaves no stub).  The reply on #370 records the claim
+check, the design change, the two defects stress-testing found, the gate, and the `TODO` #384 finding for the reporter.
+
+**The images (owed, not verified).**  `scripts/build-containers.sh --verify-only` still reads **8 missing**, 15/23
+present, every moving tag carrying the *previous* release: the worker watcher (`radiance`) polls every ~10 min and was
+still on r364's build when this cut landed, so r365 is picked up on its next poll after that finishes.  The check that
+closes r365 is `--verify-only` reading all 23 tags resolving with every moving tag carrying this release (issue #364:
+a push's exit status is not proof).
+
 ## 261125.015 (r365) -- contributor PR #370 promoted into block 16: the server's KV admission (a task that cannot fit beside the running slots is deferred, through the SCHEDULER's oracle)
 
 **The assessment.**  PR #370 (`briansp2020`) reported that with a unified KV cache the server launches every request
