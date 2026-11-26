@@ -34,9 +34,11 @@ and applied STRICTLY; their own diffs are unchanged).  The GitHub Release carrie
 `radix` reproduced from the patches independently (261126.002), so the `.tip` contract holds across machines.
 
 **The images.**  The worker (`radiance`) picked the tag up on its next poll and started the two-line ROCm build
-off-host (`~/.cache/rdna-containers/build-v18-919794500-r366.log`); they are **OWED and unverified** until
-`scripts/build-containers.sh --verify-only` reads every tag resolved and every moving tag carrying this release
-(the check issue #364 exists for).  Nothing was built on the primary box.
+off-host (`~/.cache/rdna-containers/build-v18-919794500-r366.log`), finished it and set `last-built` to
+`v18-919794500-r366` (240 versions retained after the 7-day prune).  `scripts/build-containers.sh --verify-only`
+then read **all 23 tags resolve and every moving tag carries this release** (`latest` and the 10.2 line at
+`sha256:55f08a939e78`, the 7.14.1 line at `ba64e21c6d5d`) -- the check that issue #364 exists for, where r354-r358
+published nothing and only the worker's own log knew.  Nothing was built on the primary box.
 
 **Record.**  This entry is the release narrative; the change itself is 261126.001, the second-platform confirmation
 is 261126.002, and the measurement is `benchmarks/2026-11-26-issue-368-wide-band-coupling.md`.
