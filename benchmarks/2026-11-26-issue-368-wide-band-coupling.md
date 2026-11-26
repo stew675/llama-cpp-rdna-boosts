@@ -76,14 +76,30 @@ shape — consistent with the r362 record's eleven one-variable arms.
 The L2 figure is a near-total cache hit in this harness (10 re-prefilled tokens), so it is a decode point at depth,
 not the earlier record's 721-902 t/s re-prefill; the L2 *revisit* claim of that record is not re-derived here.
 
-## 4. What was NOT measured, and why
+## 4. A second platform on a full-bandwidth link (`radix`, x16)
 
-* **`radix` (the x16 box) was not re-measured.**  Its checkout carries an unrelated, uncommitted in-flight slab
-  experiment (issue #367's `GGML_CUDA_SLAB_ARENA_CAP_MIB`), in `ggml-cuda-slab.cu` — the same file this fix
-  changes.  Disturbing it would have destroyed that campaign's state, so the x16 row of the 2026-11-25 record
-  stands unmodified and the r366 numbers above are x8 only.
-* **The reporter's two states are still not reproduced here** (3 fresh visits per arm, one state, one text each).
-  This record claims the band defect and its fix; it does not claim the flip.
+`radix` is a single R9700 on an uncontended PCIe 5.0 x16 link, 93 GiB: its own H2D probe reads **55.0 GB/s**
+against this box's 28.7.  Its checkout carried an unrelated, uncommitted in-flight slab experiment (issue #367's
+`GGML_CUDA_SLAB_ARENA_CAP_MIB`); with the maintainer's approval that was backed up
+(`~/scratch/issue367-slab-experiment-backup.diff`) and the tree re-cut from `patches/` instead.  The re-cut there
+reproduced the canonical ids exactly -- tip **`489810652`**, tree **`82afebd10`** -- which is a third independent
+reproduction of `.tip` and the first on another machine.
+
+| arm | L1 pp (3 visits) | L1 tg | S2 tg | L2 tg | stand-downs | arena (at the drop) |
+|---|---:|---:|---:|---:|---|---:|
+| hole (`RING_MIB=6144`) | 2217.5 (2216.5-2218.4) | 44.11 | 55.89 | 45.89 | `L31..L47x3` = 51 tables | 12 288 MiB |
+| **r366** | **2262.9** (2262.4-2263.8) | **44.78** | **60.10** | 44.84 (43.23/45.64/45.66) | `L47x3` (3 tables) | 20 224 MiB |
+
+**+2.0 % L1 prefill, +1.5 % L1 decode, +7.5 % S2 decode, -2.3 % L2 decode** (one 43.23 outlier; the other two
+visits read 45.64/45.66 against 45.89, i.e. -0.5 %).  Texts identical (`L1 98c4f67d6ed9`, `L2 4b2af40814aa`),
+residency `L1..L48 285/512` in both.  The cli arms on the same box agree: r366 **2359.3 / 2341.6** t/s prefill and
+42.0 / 42.2 tg against the hole's 2264.0 / 2259.5 and 37.3 / 37.2 (**+4.1 % / +13 %**), `aux_refused=0` and
+`work=3904 MiB (narrow=1792)` against the hole's 11 840.
+
+So the fix's direction holds on a full-bandwidth link, at roughly half the x8 box's gain on prefill
+(+2.0 % against +3.7 %) -- the narrower the link, the more a whole-table stand-down costs, which is the direction
+the 2026-11-25 record established.  The reporter's flip was not reproduced there either (three fresh visits per arm,
+one state, one text).
 
 ## 5. Gates (r366)
 

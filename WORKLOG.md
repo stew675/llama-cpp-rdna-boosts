@@ -16,6 +16,32 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261126.002 (r366) -- confirmed on the x16 box, the canonical tip reproduced on a second machine, and the #367 slab experiment backed up before the tree was re-cut there
+
+**The measurement.**  `radix` (1 x R9700, uncontended PCIe 5.0 **x16**, its own H2D probe **55.0 GB/s** against this
+box's 28.7) at the reporter's shape, three server visits per arm alternating with a cold heat prior:
+**r366 L1 2262.9 t/s / 44.78 tg, S2 60.10, L2 44.84, stand-downs `L47x3`, arena 20 224 MiB**; the
+`GGML_CUDA_SLAB_RING_MIB=6144` layout 2217.5 / 44.11 / 55.89 / 45.89, stand-downs `L31..L47x3` = 51 tables, arena
+12 288 MiB.  That is **+2.0 % prefill / +1.5 % decode / +7.5 % S2 decode / -2.3 % L2 decode** (the L2 arm has one
+43.23 outlier; its other two visits read 45.64/45.66 against 45.89, i.e. -0.5 %).  cli arms on the same box agree
+and are wider apart: **2359.3 / 2341.6** t/s and 42.0 / 42.2 tg against the hole's 2264.0 / 2259.5 and 37.3 / 37.2
+(**+4.1 % / +13 %**).  Texts identical in both layouts (`L1 98c4f67d6ed9`, `L2 4b2af40814aa`), residency
+`L1..L48 285/512` in both, `aux_refused=0` and `work=3904 MiB (narrow=1792)` against the hole's 11 840.  Prefill's
+gain is roughly half the x8 box's (+2.0 % against +3.7 %), the direction the 2026-11-25 record established: the
+narrower the link, the more a whole-table stand-down costs.  The flip is still not reproduced there either.
+
+**The tip, on a second machine.**  `radix`'s tree was re-cut from `patches/` with `scripts/apply-all.sh` (a clean
+checkout of `919794500`) and read tip **`489810652`** / tree **`82afebd10`** -- the third independent reproduction of
+`release.json.tip` and the first on another box, which is what the `.tip` contract buys.
+
+**The #367 collision (a finding for the maintainer).**  `radix`'s `~/llama.cpp` carried an **uncommitted** in-flight
+slab experiment (issue #367's `GGML_CUDA_SLAB_ARENA_CAP_MIB`, 62 lines in `ggml-cuda-slab.cu` -- the same file r366
+changes).  The maintainer confirmed it is backed up and released the tree; it was copied to
+`~/scratch/issue367-slab-experiment-backup.diff` on that box before the checkout, and that campaign must now rebase
+onto r366.  Nothing on `radix` was left dirty: checkout `919794500`, `apply-all.sh`, built, measured.
+
+**Record.**  `benchmarks/2026-11-26-issue-368-wide-band-coupling.md` section 4.
+
 ## 261126.001 (r366) -- the slab's WIDE band is armed by the PREFILL PASS, not by the carved ring hole (GitHub issue #368, the r362 follow-up): r365's pool-tier default silently disabled every prefill transient's home in the slab
 
 **The report.**  `@DanoPTT` re-ran issue #368 on r365 with the `MOE_EXPERT_CACHE_TABLES=1` instrument and 16
@@ -58,10 +84,8 @@ S2 -> L2, three per arm alternating, a cold heat prior): r366 **1959.5 t/s L1 pr
 every visit point in both layouts (`L1 98c4f67d6ed9`, `L2 4b2af40814aa`), and `MOE_EXPERT_CACHE_TABLES=1` reads
 `L1..L48 261/512` in both.  The reporter's flip is still not reproduced here (three fresh visits per arm).
 
-**Not re-measured: the x16 box.**  `radix` carries an unrelated, uncommitted in-flight slab experiment (issue
-#367's `GGML_CUDA_SLAB_ARENA_CAP_MIB`) in the same file, so its checkout was left alone and the 2026-11-25
-record's x16 row stands; the numbers above are x8 only.  That also means the #367 campaign must rebase onto this
-change.
+**x16 box:** measured afterwards -- `WORKLOG.md` 261126.002, `benchmarks/…wide-band-coupling.md` section 4
+(+2.0 % prefill / +1.5 % decode / +7.5 % S2 there, and the canonical tip reproduced on that machine).
 
 **Gates.**  `validate-set.sh` green (base `919794500`, applied tree
 `82afebd108d63b6220884d41080009561f0821e2`, both optional artifacts strict on the new tree, rung reconciliation
