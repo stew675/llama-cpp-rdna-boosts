@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 26 Nov 2026 18:32:19 +0000
+Subject: [PATCH 2/2] llama: a state copy larger than the stage limit
+ (LLAMA_STATE_ASYNC_MAX_MIB, 256) runs the batched pinned copy in rounds of
+ the limit instead of the plain per-tensor copy (LLAMA_STATE_ASYNC_ROUNDS=0:
+ off; LLAMA_STATE_ROUNDS_VERIFY=1: compare each save with the plain copy)
+
+Above the limit the window list is cut into rounds of at most the limit (a
+larger window only on a 2-D tensor, at multiples of its nb[1], the unit the
+meta backend serves directly), and each round runs flush_async; any round
+failing falls back to the plain copy of everything.  Same bytes.
+
+Under -sm tensor on r364+ this needs the queued row-block reads of the
+previous commit: without them each round's K/V windows are one copy per row
+and a 339 MiB save takes ~1.3 s.  With them (stock r366, -sm tensor
+-c 65536, IQ3_XXS): 339-353 MiB saves 51-57 -> 28-34 ms after the first
+(the first, which grows the pinned stage to the limit, 81 ms); VERIFY: 109
+windows in 2 rounds, 0 differ.
+---
+ src/llama-context.cpp | 115 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 112 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 65ad2af70b..61e3a52de1 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -4795,13 +4795,67 @@ private:
+ // 16 MiB, so a context holds the checkpoint size (never more than LLAMA_STATE_ASYNC_MAX_MIB) in pinned host memory
+ // for its lifetime.  It is ONE buffer per context, so state saves and restores on the same context must not run
+ // concurrently; the llama state API is not documented as thread-safe, and this makes that concrete.
+-static bool llama_state_async_enabled(size_t total) {
+-    static const bool on = [] { const char * e = getenv("LLAMA_STATE_ASYNC"); return e == nullptr || atoi(e) != 0; }();
++static size_t llama_state_async_max_bytes() {
+     static const size_t max_bytes = [] {
+         const char * e = getenv("LLAMA_STATE_ASYNC_MAX_MIB");
+         return (size_t) (e != nullptr ? atoll(e) : 256) << 20;
+     }();
+-    return on && total > 0 && total <= max_bytes;
++    return max_bytes;
++}
++
++static bool llama_state_async_enabled(size_t total) {
++    static const bool on = [] { const char * e = getenv("LLAMA_STATE_ASYNC"); return e == nullptr || atoi(e) != 0; }();
++    return on && total > 0 && total <= llama_state_async_max_bytes();
++}
++
++// A state copy larger than the stage limit (LLAMA_STATE_ASYNC_MAX_MIB, default 256) -- a prompt-cache save or load of a
++// long context, 273 MiB at 11k tokens, GiBs at 100k -- used to skip the batched path and copy tensor by tensor through
++// pageable memory (~5 GB/s against ~10-18 on the batched path).  Instead it runs through the same bounded stage in rounds:
++// the windows are cut into rounds of at most the limit (a window larger than the limit at multiples of its row size,
++// the unit the meta backend serves directly), and each round is one batched copy.  Same bytes.  Returns false (rounds
++// empty) when the copy fits the limit or the rounds are off (LLAMA_STATE_ASYNC_ROUNDS=0).
++template <typename T>
++static bool llama_state_rounds(const std::vector<T> & infos, std::vector<std::vector<T>> & rounds) {
++    static const bool on = [] { const char * e = getenv("LLAMA_STATE_ASYNC_ROUNDS"); return e == nullptr || atoi(e) != 0; }();
++    const size_t max_bytes = llama_state_async_max_bytes();
++    size_t total = 0;
++    for (const auto & w : infos) {
++        total += w.size;
++    }
++    if (!on || total <= max_bytes || !llama_state_async_enabled(max_bytes)) {
++        return false;
++    }
++    std::vector<T> cur;
++    size_t cur_n = 0;
++    for (const auto & w : infos) {
++        // a window that fits is never cut; a larger one only on a 2-D tensor, at multiples of its row
++        const size_t unit  = w.tensor->nb[1] != 0 ? w.tensor->nb[1] : 1;
++        const bool   flat  = w.tensor->ne[2] == 1 && w.tensor->ne[3] == 1;
++        const size_t chunk = w.size <= max_bytes ? w.size : (flat ? max_bytes / unit * unit : 0);
++        if (chunk == 0) {
++            rounds.clear();
++            return false;
++        }
++        for (size_t done = 0; done < w.size; ) {
++            const size_t n = std::min(w.size - done, chunk);
++            if (cur_n > 0 && cur_n + n > max_bytes) {
++                rounds.push_back(std::move(cur));
++                cur.clear();
++                cur_n = 0;
++            }
++            T p = w;
++            p.data_offset += done;
++            p.offset      += done;
++            p.size         = n;
++            cur.push_back(p);
++            cur_n += n;
++            done  += n;
++        }
++    }
++    if (!cur.empty()) {
++        rounds.push_back(std::move(cur));
++    }
++    return true;
+ }
+ 
+ // Pipelined batched state copies (fold r151, PR #233).  The batched copy ran the host memcpy into/out of the
+@@ -5162,6 +5216,42 @@ public:
+         if (winfos.empty()) {
+             return;
+         }
++        // larger than the stage: the batched copy in rounds (each round is copied out of the stage before the next)
++        std::vector<std::vector<write_info>> rounds;
++        if (lctx != nullptr && llama_state_rounds(winfos, rounds)) {
++            std::vector<write_info> all;
++            all.swap(winfos);
++            bool ok = true;
++            for (auto & r : rounds) {
++                winfos = std::move(r);
++                if (!flush_async()) {
++                    ok = false;
++                    break;
++                }
++            }
++            winfos.swap(all);
++            if (ok) {
++                // LLAMA_STATE_ROUNDS_VERIFY=1 (a check, off by default): the plain copy into a scratch buffer, compared
++                static const bool verify = getenv("LLAMA_STATE_ROUNDS_VERIFY") != nullptr;
++                if (verify) {
++                    size_t span = 0;
++                    for (const auto & w : winfos) {
++                        span = std::max(span, w.data_offset + w.size);
++                    }
++                    std::vector<uint8_t> ref(span);
++                    for (const auto & w : winfos) {
++                        ggml_backend_tensor_get(w.tensor, ref.data() + w.data_offset, w.offset, w.size);
++                    }
++                    size_t bad = 0;
++                    for (const auto & w : winfos) {
++                        bad += memcmp(ref.data() + w.data_offset, base_ptr + w.data_offset, w.size) != 0;
++                    }
++                    LLAMA_LOG_INFO("state rounds verify: %zu windows in %zu rounds, %zu differ\n", winfos.size(), rounds.size(), bad);
++                }
++                return;
++            }
++            // a round could not take the batched path: the plain copy of everything below (same bytes again)
++        }
+ 
+         std::vector<ggml_tensor *> tensors;
+         std::vector<size_t> offsets;
+@@ -5295,6 +5385,25 @@ public:
+         if (rinfos.empty()) {
+             return;
+         }
++        // larger than the stage: the batched restore in rounds (each round packs, queues and synchronizes before the next)
++        std::vector<std::vector<read_info>> rounds;
++        if (lctx != nullptr && llama_state_rounds(rinfos, rounds)) {
++            std::vector<read_info> all;
++            all.swap(rinfos);
++            bool ok = true;
++            for (auto & r : rounds) {
++                rinfos = std::move(r);
++                if (!flush_async()) {
++                    ok = false;
++                    break;
++                }
++            }
++            rinfos.swap(all);
++            if (ok) {
++                return;
++            }
++            // a round could not take the batched path: the plain copy of everything below (same bytes again)
++        }
+ 
+         std::vector<ggml_tensor *> tensors;
+         std::vector<size_t> offsets;
+-- 
+2.53.0
+
