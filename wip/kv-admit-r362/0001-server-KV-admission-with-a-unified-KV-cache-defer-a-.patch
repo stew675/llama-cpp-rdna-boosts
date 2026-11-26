@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Wed, 25 Nov 2026 23:33:58 +0000
+Subject: [PATCH] server: KV admission -- with a unified KV cache, defer a task
+ whose prompt cannot fit next to the running slots (prompt + 16384-cell
+ generation reserve each) until a slot is released, instead of admitting both
+ and failing a generating slot mid-decode (2x150K at 256K: HTTP 500
+ "speculative batch index 2 is not inside the current sub-batch" -> both
+ complete, 134 -> 98 s); with every slot idle, wake one deferred task
+ (LLAMA_SERVER_KV_ADMIT=0: off; LLAMA_SERVER_KV_ADMIT_RESERVE: cells)
+
+---
+ tools/server/server-context.cpp | 48 +++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 0a030aa6fb..c6491e5abd 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1242,6 +1242,23 @@ private:
+ 
+     std::unique_ptr<server_prompt_cache> prompt_cache;
+ 
++    // LLAMA_SERVER_KV_ADMIT (on unless 0): with a unified KV cache, a task whose prompt cannot fit next to the slots
++    // already running is deferred until a slot is released, instead of being launched into a cache the running slots
++    // will need.  Otherwise both prompts are admitted, and once the cells run out the decode retry loop shrinks the
++    // batch until a running slot fails mid-generation (with MTP: "speculative batch index 2 is not inside the current
++    // sub-batch [0, 2)" at n_batch 2).  Each running slot is counted at max(prompt, cells held) plus a generation
++    // reserve of LLAMA_SERVER_KV_ADMIT_RESERVE cells (default 16384, capped by its own n_predict); the new task at its
++    // whole prompt plus the same reserve.  Idle slots are not counted: they are saved and cleared to make room.  With
++    // nothing running the task always launches, so a prompt that fits the context alone is never starved by this.
++    const bool kv_admit = [] {
++        const char * e = getenv("LLAMA_SERVER_KV_ADMIT");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    const int32_t kv_admit_reserve = [] {
++        const char * e = getenv("LLAMA_SERVER_KV_ADMIT_RESERVE");
++        return e == nullptr ? 16384 : std::max(0, atoi(e));
++    }();
++
+     // LLAMA_SERVER_LAZY_IDLE_SLOTS (on unless 0): with a unified KV cache, an idle slot keeps its context when a new task
+     // starts and is saved to the prompt cache and cleared only once the KV cache runs out of room, so conversations that
+     // take turns on their own slots do not copy their whole state to host memory and back on every switch
+@@ -3574,6 +3591,30 @@ private:
+                         break;
+                     }
+ 
++                    if (kv_admit && params_base.kv_unified && !task.is_parent() && task.n_tokens() > 0) {
++                        // see kv_admit: the cells the running slots will hold, plus this prompt, must fit the context
++                        auto reserve_for = [&](const server_task & t) {
++                            const int32_t np = t.params.n_predict != -1 ? t.params.n_predict : params_base.n_predict;
++                            return (int64_t) (np >= 0 ? std::min(np, kv_admit_reserve) : kv_admit_reserve);
++                        };
++                        int64_t n_held  = 0;
++                        int     n_run   = 0;
++                        for (const auto & other : slots) {
++                            if (&other == slot || !other.is_processing() || other.task == nullptr) {
++                                continue;
++                            }
++                            n_run  += 1;
++                            n_held += std::max<int64_t>(other.task->n_tokens(), other.prompt.n_tokens()) + reserve_for(*other.task);
++                        }
++                        const int64_t n_need = (int64_t) task.n_tokens() + reserve_for(task);
++                        if (n_run > 0 && n_held + n_need > n_ctx) {
++                            SRV_WRN("KV admission: task %d needs %" PRId64 " cells, %d running slot(s) hold %" PRId64 " of %d; deferred until a slot is released\n",
++                                    id_task, n_need, n_run, n_held, n_ctx);
++                            queue_tasks.defer(std::move(task));
++                            break;
++                        }
++                    }
++
+                     std::vector<server_slot *> child_slots;
+                     if (task.is_parent()) {
+                         // try getting free slots for all child tasks
+@@ -4111,6 +4152,13 @@ private:
+ 
+                 metrics_flush_idle();
+ 
++                // KV admission (kv_admit) defers tasks while other slots run, and a release wakes only one of them;
++                // if that one never took a slot (dropped at launch, or cancelled after the wake), the rest would
++                // wait for an unrelated request.  With every slot idle, a deferred task always fits, so wake one.
++                if (kv_admit && queue_tasks.queue_tasks_deferred_size() > 0) {
++                    queue_tasks.pop_deferred_task(-1);
++                }
++
+                 return; // skip further processing
+ 
+             } else {
+-- 
+2.53.0
+
