@@ -1,0 +1,21 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 72fadf225..2ddba52fc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -9623,6 +9623,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                          (long long) node->src[1]->ne[1]);
+                 key += buf;
+             }
++            // wip/flash-next-prefill: a broadcast/repeat is otherwise the ONLY large item in the op budget
++            // whose size a census cannot show, and its cost is a function of the tensor it MATERIALISES.
++            if ((node->op == GGML_OP_REPEAT || node->op == GGML_OP_CONT) && node->src[0] != nullptr) {
++                char buf[96];
++                snprintf(buf, sizeof(buf), " [%lldx%lldx%lldx%lld f%d]",
++                         (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1],
++                         (long long) node->src[0]->ne[2], (long long) node->src[0]->ne[3],
++                         (int) node->type);
++                key += buf;
++            }
+             op_ms[key] += ms;
+             op_cnt[key]++;
+             op_ms_total[key] += ms;

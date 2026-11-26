@@ -1,0 +1,112 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 407f9855f..884d07dcd 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -806,6 +806,10 @@ bool                                g_cold_uva        = false;  // MOE_EXPERT_CA
+ bool                                g_stage_cache     = true;
+ // Prefill staging accounting (per call = per table per ubatch).
+ int64_t                             g_stage_ok        = 0;
++// wip/flash-next-prefill: of `g_stage_ok`, the calls served by ONE copy-engine DMA out of the pool's covering
++// mirror instead of the staging kernel (or the per-expert bounce).
++int64_t                             g_stage_bulk_calls = 0;
++int64_t                             g_stage_bulk_bytes = 0;
+ // Gather accounting (wip/host-pool-speed mechanism (b)): `calls` = gather invocations that returned true,
+ // `pool` = of those, the ones served from a POOL-backed table (the new third source), `miss_fills` = routed
+ // experts that were in neither tier and were copied into the destination before the kernel.
+@@ -9167,8 +9171,25 @@ bool moe_cache_stage_ready(const struct ggml_tensor * weight, int device) {
+     if (!g_sized) {
+         return false;
+     }
+-    for (const table_t & t : g_tables) {
++    // wip/flash-next-prefill: a POOL-BACKED master does not need the ARENA to be staged.  The pinned pool is
++    // its source (`moe_cache_stage_table`'s pool branch fills the ring slot from the arena where the table is
++    // resident and from the pool everywhere else), so an arena stand-down is not a reason to refuse staging.
++    // It used to be, and the refusal is per SPLIT (`sched_stage_issue` returns for the whole split on the
++    // first table that answers false), so every stood-down layer's split fell to the scheduler's pageable
++    // per-table bounce instead: one host memcpy + one sub-MiB H2D PER EXPERT, under a bounded pinned ring.
++    // Measured 2026-11-26 (Flash-Next IQ3_XXS, `--host-experts pool -ub 8192`, 89 234-token prefill): 174 GB
++    // of a run's 420 GB took that bounce, and the host could not keep the GPU fed (36 % of the prefill was in
++    // no op at all, against 24 % for the gather).  `MOE_HOST_POOL_STAGE_STANDDOWN=0` restores the refusal.
++    static const bool standdown_stage = [] {
++        const char * e = getenv("MOE_HOST_POOL_STAGE_STANDDOWN");
++        return e == nullptr || e[0] == '\0' || atoi(e) != 0;
++    }();
++    for (table_t & t : g_tables) {
+         if (t.device == device && t.host == (const void *) weight->data) {
++            if (!t.host_pinned && standdown_stage) {
++                const host_pool_t * p = table_pool_locked(t);
++                return p != nullptr && !p->failed && p->base_dev != nullptr && p->slots > 0;
++            }
+             return t.arena != nullptr && t.slots > 0;
+         }
+     }
+@@ -10598,6 +10619,54 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+         if (!t.host_pinned) {
+             host_pool_t * pool = table_pool_locked(t);
+             cudaError_t   err  = cudaSuccess;
++            // wip/flash-next-prefill: the BULK fill.  A covering mirror is laid out `slot == expert`
++            // (`pool_fill_mirror_locked`: "the file layout IS the slot layout"), so a whole table is ONE
++            // contiguous run of the pool -- and the pool is `cudaHostAlloc(portable|mapped)`, so that run is
++            // device-readable (`base_dev`).  One copy-engine DMA then fills the ring slot in expert order,
++            // byte-for-byte what the staging kernel produces, instead of a kernel (or, worse, the bounce
++            // path's per-expert host memcpy) walking 512 experts of it.  Only the SOURCE of the bytes and the
++            // engine change, so every consumer is unchanged.
++            //
++            // Measured 2026-11-26 (Flash-Next GSQ-RCO-IQ3_XXS, `--host-experts pool -ub 8192`, 89 234-token
++            // prefill, 1 x R9700 at 28.7 GB/s): the prefill transport is 24 % of the wall as a compute-stream
++            // gather and ~36 % as the per-expert bounce, while a copy-engine bulk upload of the same table set
++            // is almost entirely hidden behind the split's compute (`MOE_EXPERT_CACHE_MIB=0` reads 2329-2482
++            // t/s against the gather's 2117).  `MOE_HOST_POOL_STAGE_BULK=0` is the kill switch.
++            static const bool stage_bulk = [] {
++                const char * e = getenv("MOE_HOST_POOL_STAGE_BULK");
++                return e == nullptr || e[0] == '\0' || atoi(e) != 0;
++            }();
++            if (stage_bulk && n_copies == 1 && pool != nullptr && !pool->failed &&
++                pool->base_dev != nullptr && pool->slots >= t.n_experts &&
++                pool->host_bytes == t.expert_bytes && pool->slot_expert.size() >= (size_t) t.n_experts &&
++                pool->slot_state.size() >= (size_t) t.n_experts) {
++                // The mirror invariant: slot `e` holds expert `e` and is resident.  Anything else (a partial
++                // pool, a heat-ranked layout, an in-flight retire) keeps the kernel path below, which encodes
++                // both tiers.  A full-coverage mirror never demotes or retires a slot (the arena exchange is
++                // INERT for it), so an in-flight DMA cannot be overtaken by a fill.
++                bool mirror = true;
++                for (int e = 0; e < t.n_experts; e++) {
++                    if (pool->slot_expert[(size_t) e] != e || pool->slot_state[(size_t) e] != 1) {
++                        mirror = false;
++                        break;
++                    }
++                }
++                if (mirror) {
++                    const size_t span = (size_t) t.n_experts * pool->host_bytes;
++                    const size_t n    = width < span ? width : span;   // the caller's MMQ tail pad stays as it was
++                    err = cudaMemcpyAsync(dst, pool->base_dev, n, cudaMemcpyHostToDevice,
++                                          (cudaStream_t) copy_stream);
++                    if (err == cudaSuccess) {
++                        g_stage_ok++;
++                        g_stage_host_bytes += (int64_t) n;
++                        g_stage_bulk_calls++;
++                        g_stage_bulk_bytes += (int64_t) n;
++                        return true;
++                    }
++                    (void) cudaGetLastError();
++                    err = cudaSuccess;
++                }
++            }
+             {
+                 const int64_t resident = (int64_t) t.expert_slot.size();
+                 g_stage_ok++;
+@@ -13704,12 +13773,13 @@ static void report_locked() {
+         const double total = (double) g_stage_arena_bytes + (double) g_stage_host_bytes;
+         GGML_LOG_INFO("%s: prefill cache staging: ok=%lld geom_decline=%lld unusable=%lld nomatch=%lld "
+                       "unsized=%lld (the priming pass); arena=%.1f MiB host=%.1f MiB (H2D %.1f%% of staged); "
+-                      "PRS rebuilds=%lld\n",
++                      "BULK %lld calls %.1f MiB; PRS rebuilds=%lld\n",
+                       __func__, (long long) g_stage_ok, (long long) g_stage_decline_geom,
+                       (long long) g_stage_decline_usable, (long long) g_stage_decline_nomatch,
+                       (long long) g_stage_decline_unsized,
+                       (double) g_stage_arena_bytes / (1024 * 1024), (double) g_stage_host_bytes / (1024 * 1024),
+                       total > 0 ? 100.0 * (double) g_stage_host_bytes / total : 0.0,
++                      (long long) g_stage_bulk_calls, (double) g_stage_bulk_bytes / (1024 * 1024),
+                       (long long) g_prs_rebuilds);
+     }
+     if (g_stage_span_reads + g_stage_span_fallback > 0) {

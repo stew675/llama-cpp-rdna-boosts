@@ -274,3 +274,88 @@ at ub 4096, so §2.2's 0.9 s is the host-expert path only), the H2D calibration 
 * Strata's exact version + flags behind the ~3500 figure (our copy's log shows 1636 t/s on ROCm 10.1 for a 70K
   prompt; the newer number is what the target should be measured against, and its `--prefill`/ring settings are
   in `~/Strata/docs/DETAILS.md` §1218-§1220).
+
+## 10. Session 2 (2026-11-26, second session) — the ring is not a ring, and the fill engine is the transport
+
+**Nothing here is in `patches/`.** Three experiment patches are in [`experiments/`](experiments/) and were
+measured on a build carrying them (`~/llama.cpp` uncommitted; `release.json` untouched, so `validate-set.sh`
+is unaffected). All numbers are GPU0 (Gen5 x8) unless the row says `radix` (Gen5 x16), `-ub 8192`, Dano's
+flags from §0, and `MOE_EXPERT_HEATMAP=load` (residency pinned — §89 makes the heat prior an *input* to greedy
+text, so an unpinned A/B compares two different configs).
+
+### 10.1 Measured (prefill t/s, 89 234-token prompt)
+
+| arm | x8 | x16 | decode | note |
+|---|---:|---:|---:|---|
+| default (pool + device gather) | 2099-2117 | 2355-2359 | 32.7 | baseline; very reproducible on x16 (±0.1 %) |
+| forced ring, cache's two-tier kernel fill, arena stand-down refused (pre-r366 behaviour) | 1790-1791 | — | 26 | the A/B control |
+| same + `MOE_HOST_POOL_STAGE_STANDDOWN=1` (a stood-down table may still stage) | 1831-1843 | — | 26-27 | the split-level refusal was real, but this is only +3 % |
+| same + **bulk fill** (one copy-engine DMA per table from the pool mirror) | **2265-2367** | — | 26-36 | **+10-12 % over the gather, same-seed text identical** |
+| bulk fill + one-split scheduler lookahead | 2272-2359 | — | — | **no change** — the transfer was already overlapped |
+| `MOE_EXPERT_CACHE_MIB=0` (no cache at all: ring + one async pageable DMA per table) | 2329-2482 | 2531 | — | the existence proof, but decode collapses |
+
+Same-seed greedy text (128 tokens, heat prior pinned, `scripts/extract-generated.py`): gather
+`sha=43d0b1f4629e`, bulk fill `sha=43d0b1f4629e` — **byte-identical**, so the fill is a pure transport change.
+
+### 10.2 Why the two intended transports both lose (the answer to "the arena is 640 GB/s, the link is 28")
+
+The intended design — fill the ring from the arena for resident experts, from the host only for the gaps — is
+`moe_cache_stage_table`'s two-tier kernel, and it is **the slowest of the three fills**, because of its *engine*,
+not its byte count:
+
+| fill | host bytes / ubatch | engine | stream | effective |
+|---|---:|---|---|---:|
+| device gather | ~19 GB (arena D2D for the rest) | kernel | **compute** | ~20 GB/s, fully exposed (0.94 s/ubatch) |
+| two-tier cache stage | ~19 GB | kernel | copy | **~10 GB/s** → 1.9 s/ubatch |
+| bulk DMA (this session) | **40 GB** | copy engine | copy | ~28 GB/s → 1.4 s/ubatch |
+
+So the fill that moves **2.1x the host bytes wins by 23 %**: a kernel reading the `cudaHostAlloc`-mapped pool
+reaches roughly a third of the link, and the copy engine reaches ~all of it. The gather is byte-optimal and
+still loses because it runs on the *compute* stream, where nothing hides it.
+
+The ring cannot rescue either one because **it is not a pipeline**: `ggml_backend_sched_compute_splits` issued
+`sched_stage_issue(split N)` and then, in the same iteration, drained split N — so a transfer could only hide
+behind the *previous* split's compute. Its 8 slots exist to hold the several host weights *of one split*, not to
+run ahead. §10.1 shows the honest result of fixing that: with a bulk fill there is nothing left to hide, so a
+one-split lookahead buys nothing. It would matter with the kernel fill.
+
+### 10.3 Other findings that change the arithmetic
+
+* **Compute budget, corrected.** The routed MoE is 415 TFLOP and the dense `MUL_MAT` 527 TFLOP (the earlier
+  "8.8 TFLOP MoE" forgot the 47 host layers), i.e. **~29 TFLOPS aggregate over 32.75 s of ops**. Strata's
+  ~3500 t/s implies ~37 TFLOPS and Dano's 2951 ~31, so the compute gap is **1.28x, not 1.5x** — the ops side is
+  a tuning problem, not a different architecture. Shapes: `n_embd` 2560, expert FFN 640, 512 experts, 10 used,
+  hyper-connections 4 @ rank 320.
+* **`FUSED REPEAT` + `FUSED MUL` are 3.9 s = 12 % of the op budget.** `build_moe_ffn`'s `weight_before_ffn` path
+  does `ggml_repeat_4d(cur[n_embd,1,n_tokens] → [n_embd,10,n_tokens], F32)` and then multiplies it: the repeat
+  **materialises 839 MB of F32 per call** (measured via the new shape print, `experiments/0003`) and the mul
+  writes another 839 MB. No REPEAT+MUL fusion exists for this pair. Fusing them writes 839 MB once, which should
+  return ~2.6 s (≈8 %).
+* **`moe_cache_stage_ready()` refused staging for a POOL-backed table whenever its arena was stood down**
+  (`t.arena != nullptr && t.slots > 0`), although a pooled table's source is the pool. The refusal is per
+  *split*, so a stood-down layer sent its whole split to the scheduler's pageable per-table bounce: **174-189 GB
+  per run through one host `memcpy` + one sub-MiB H2D per expert** under a bounded pinned ring. That is the
+  erratic/starved GPU the session saw. Fixed in `experiments/0001` (worth only +3 % on its own, because the
+  two-tier kernel it then reaches is the slow engine above).
+* **The pool's covering mirror is already `slot == expert`** (`pool_fill_mirror_locked`: "the file layout IS the
+  slot layout"), so one table is one contiguous run of `cudaHostAlloc(mapped)` memory and one DMA is a
+  byte-identical fill. Nothing used that.
+* **`-ub > 16384` is blocked by VRAM arbitration, not compute**: the ~21-22.6 GiB arena grows into the ~11 GiB
+  wide prefill view (`SLAB_WIDE_AUX refused: slab=1 wide_armed=0`, `HipVMM Failure: out of memory`), and an
+  explicit `MOE_EXPERT_CACHE_MIB` only shrinks it at slab init — the settle grows it back before the first wide
+  ubatch. Explicitly out of scope for this campaign (maintainer, session 2).
+
+### 10.4 What to do next, in order
+
+1. **Land the bulk fill** (`experiments/0001`): one copy-engine DMA per table out of the pool mirror when the
+   mirror invariant holds, falling back to the two-tier kernel otherwise. +10-12 % at ub 8192, text identical.
+   It needs the *default* transport on the pool tier to become "stage at prefill width" rather than "gather"
+   (today `GGML_SCHED_DEVGATHER` default mode 1 gathers them), and the slab's ring hole must be carved for it
+   (r362 declines the hole only while the tier *gathers*).
+2. **Fuse the `ffn_moe_weighted` REPEAT+MUL** (~2.6 s, +8 %): a block-10 dispatcher fusion writing the mul's
+   output directly from `cur` and the per-expert weights.
+3. Then the remaining exposure (~5 s, 13 % at the bulk fill) is *not* transport and not the ring: it is what is
+   left of `wall − ops` and needs a split-level timeline to attribute (the PLE page-ins and the ring→input D2D
+   are the two candidates that have not been separated yet).
+4. Re-measure on `radix` (x16) after 1-2; the x16 box is where the 2900 target lives and where the gather is
+   already only 13 % of the wall.
