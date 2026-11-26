@@ -1,4 +1,4 @@
-From aef43e28742f1a29dc74894a2f725cc78f503ce9 Mon Sep 17 00:00:00 2001
+From 2688092bc06ec26e02f32c2e89ab2f3134a5dcb0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 14/18] rdna-boosts: block 14: the streamed KV -- a fixed-VRAM
@@ -127,13 +127,26 @@ host-device pool, so the fix is inert there).  The block-14 notes, `DIAGNOSTIC.m
 `INVARIANTS.md` r363 carry the record; `scripts/gate-kv-residency.sh` gains the two-request arm that
 catches the class.
 
+r364 amendment (the delivery-level half of the two-arm campaign's STEP 15, `TODO` #376, closed):
+a row-block DEVICE->HOST read is never a 2-D copy on this backend.  On ROCm a `hipMemcpy2DAsync` D2H into
+host memory asks for a peer grant of the destination's pinned allocation to the copying device's agent,
+and every buffer of the pinned host type (llama.cpp's output buffer above all) is allocated by ONE device
+and read by ALL devices of a `-sm tensor` split, so a copy from a non-owning device needs that grant -- on
+a box whose slabs leave the driver no room it is refused ("hsa_amd_agents_allow_access ... err 4096") and
+the copy returns `invalid argument`, i.e. a hard abort of the request.  That is the abort `TODO` #124
+recorded for a windowed KV on a tensor split, where the delivery's answer was "the arguments are what the
+caller got wrong"; they were not.  `ggml_cuda_rows_to_host()` serves all three sites (the buffer's
+synchronous 2-D read, the KV region's row helper, and the async 2-D read) with a 1-D copy for a tight
+block, the device-staged chunked form when the call may synchronize, and one 1-D copy per row otherwise;
+a row larger than the 64 MiB staging pair is never staged.  The async read also selects its own device
+(the write twin already did) -- it issued the copy on its context's stream without that.
 ---
  common/arg.cpp                             |   95 +
  common/common.cpp                          |   41 +-
  common/common.h                            |   25 +
  common/draft-reserve.cpp                   |   57 +-
  common/draft-reserve.h                     |   12 +-
- common/fit.cpp                             |  639 ++++++-
+ common/fit.cpp                             |  639 +++++-
  common/speculative.cpp                     |  108 +-
  common/speculative.h                       |    6 +
  ggml/include/ggml-backend.h                |   22 +
@@ -148,7 +161,7 @@ catches the class.
  ggml/src/ggml-cuda/fattn-qsa3.cu           |    4 +
  ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu | 1284 +++++++++++++
  ggml/src/ggml-cuda/ggml-cuda-vmm-region.h  |  144 ++
- ggml/src/ggml-cuda/ggml-cuda.cu            | 1946 +++++++++++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu            | 2029 +++++++++++++++++++-
  ggml/src/ggml-cuda/indexer-score.cu        |   14 +-
  ggml/src/ggml-cuda/kv-pool.cu              |  406 ++++
  ggml/src/ggml-cuda/kv-pool.cuh             |    7 +
@@ -164,7 +177,7 @@ catches the class.
  src/llama-context.h                        |    3 +
  src/llama-cparams.h                        |    9 +
  src/llama-ext.h                            |   90 +
- src/llama-kv-cache.cpp                     | 1388 +++++++++++++-
+ src/llama-kv-cache.cpp                     | 1388 ++++++++++++-
  src/llama-kv-cache.h                       |  130 +-
  src/llama-memory-hybrid-idx.cpp            |   10 +-
  src/llama-memory-hybrid-idx.h              |    5 +-
@@ -179,7 +192,7 @@ catches the class.
  src/llama-model.h                          |    7 +
  src/models/qwen4exp.cpp                    |   78 +-
  tools/llama-bench/llama-bench.cpp          |   52 +-
- 51 files changed, 8130 insertions(+), 971 deletions(-)
+ 51 files changed, 8193 insertions(+), 991 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.cu
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-vmm-region.h
  create mode 100644 ggml/src/ggml-cuda/kv-pool.cu
@@ -3496,7 +3509,7 @@ index 000000000..5f47fce87
 +// can call it before the KV buft lands.
 +bool   ggml_cuda_vmm_region_selftest(int device);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 4a5d2a402..8c8e4f255 100644
+index 4a5d2a402..97da6a598 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -31,6 +31,7 @@
@@ -3678,7 +3691,19 @@ index 4a5d2a402..8c8e4f255 100644
          if (slab_view) {
              ggml_cuda_slab_work_release(device, slab_off, slab_need);   // the slab owns the region; the slack may go to the arena
              return;
-@@ -2127,7 +2244,7 @@ struct ggml_cuda_async_input_done_guard {
+@@ -1737,6 +1854,11 @@ struct ggml_backend_cuda_buffer_context {
+ 
+ static void ggml_cuda_async_input_drain(int device);   // GGML_CUDA_ASYNC_INPUT_BATCH, defined with the async input ring below
+ 
++// A row-block DEVICE->HOST read, defined with the 2-D interfaces below.  The CUDA buffer's own 2-D read reaches it
++// long before that, because this backend never issues a 2-D D2H into host memory (see the definition).
++static void ggml_cuda_rows_to_host(int device, const char * src, void * data, size_t size, size_t n_copies,
++        size_t stride_tensor, size_t stride_data, cudaStream_t stream, bool sync);
++
+ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+     ggml_cuda_async_input_drain(ctx->device);   // a queued upload into this buffer must not run after it is freed
+@@ -2127,7 +2249,7 @@ struct ggml_cuda_async_input_done_guard {
          }
          // default on only with GGML_CUDA_ASYNC_INPUT_BATCH=1 (i.e. the default): with per-copy uploads alone it measured
          // ~1 % slower on one GPU
@@ -3687,7 +3712,40 @@ index 4a5d2a402..8c8e4f255 100644
          if (lazy) {
              o.done_pending = true;
              o.done_stream  = stream;
-@@ -2610,6 +2727,11 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
+@@ -2420,26 +2542,12 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
+     ggml_cuda_async_input_drain(ctx->device);
+     // A 2-D D2H into pageable memory is slow on ROCm even when small (~57 us per call on gfx1201): under -sm tensor the
+     // server's prompt-cache save reads every split KV / recurrent-state row range this way, thousands of calls per slot.
+-    // Pack the rows into the pinned chunk and scatter them on the host instead (see ggml_cuda_bounce_min).
+-    std::unique_lock<std::mutex> lock;
+-    char * pin = nullptr;
+-    if (size > 0 && n_copies > 0 && size <= ggml_cuda_pin_chunk_bytes && size * n_copies >= ggml_cuda_bounce_min() &&
+-        ggml_cuda_host_ptr_pageable(data) && (pin = ggml_cuda_pin_chunk(ctx->device, lock)) != nullptr) {
+-        const size_t rows = ggml_cuda_pin_chunk_bytes / size;
+-        for (size_t e0 = 0; e0 < n_copies; e0 += rows) {
+-            const size_t n = std::min(rows, n_copies - e0);
+-            CUDA_CHECK(cudaMemcpy2DAsync(pin, size, (const char *) tensor->data + offset + e0 * stride_tensor, stride_tensor,
+-                    size, n, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+-            for (size_t e = 0; e < n; ++e) {
+-                memcpy((char *) data + (e0 + e) * stride_data, pin + e * size, size);
+-            }
+-        }
+-        return;
+-    }
+-    CUDA_CHECK(cudaMemcpy2DAsync(
+-        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    // So the row block is packed through the device staging + pinned chunk and scattered on the host when that is
++    // worth it -- and it is NEVER read with a 2-D copy: a PINNED destination is one device's allocation read by
++    // every device of a split, and the peer grant that direction needs is refused here (see
++    // ggml_cuda_rows_to_host, which also serves the region buffer and the async form).
++    ggml_cuda_rows_to_host(ctx->device, (const char *) tensor->data + offset, data, size, n_copies,
++            stride_tensor, stride_data, cudaStreamPerThread, /*sync =*/ true);
+ }
+ 
+ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer, struct ggml_tensor * const * tensors, const void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
+@@ -2610,6 +2718,11 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
  struct ggml_backend_cuda_buffer_type_context {
      int device;
      std::string name;
@@ -3699,7 +3757,7 @@ index 4a5d2a402..8c8e4f255 100644
  };
  
  // See ggml-cuda-arena.cuh: the compute-buffer chunk decision needs this buffer type's device, because
-@@ -2778,30 +2900,1169 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
+@@ -2778,30 +2891,1221 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
      /* .get_compute_chunk_bytes = */ ggml_backend_cuda_buffer_type_get_compute_chunk_bytes,
  };
  
@@ -4548,27 +4606,72 @@ index 4a5d2a402..8c8e4f255 100644
 +    return (char *) buf[device];
 +}
 +
-+static void ggml_backend_cuda_kv_region_rows_to_host(ggml_backend_cuda_buffer_context * ctx, const char * src, void * data,
-+        size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
-+    if (stride_tensor == size && stride_data == size) {
-+        CUDA_CHECK(cudaMemcpyAsync(data, src, (n_copies - 1) * stride_tensor + size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
-+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++// A row-block DEVICE->HOST read is never a 2-D copy on this backend.
++//
++// WHY (r364): on ROCm a `hipMemcpy2DAsync` D2H into host memory asks the runtime for a peer grant of the
++// destination's pinned allocation to the copying device's agent (`hsa_amd_agents_allow_access`, and
++// `hipMemSetAccess` for a VMM allocation).  Every buffer of `ggml_backend_cuda_host_buffer_type()` -- llama.cpp's
++// pinned output buffer (`llama_context::output_host_buft`) and its state stage above all -- is allocated by ONE
++// device and read from ALL devices of a `-sm tensor` split, so a copy issued from a device that does not own it
++// needs that grant; on a box whose slabs leave the driver no room the grant is REFUSED ("Allow p2p access failed -
++// hsa_amd_agents_allow_access with err 4096", the same refusal `ggml_cuda_peer_copy_ok` exists for) and
++// `hipMemcpy2D` returns `invalid argument` — a hard abort of the request.  Measured (the two-arm beta campaign,
++// INVARIANTS.md r384-wip): a 5-row logits read of a split `result_output` aborted the server on device 1 while its
++// twin copy on device 0 -- the allocation's owner -- succeeded:
++//   2-D read of 'result_output' failed (invalid argument): 331092 bytes x 5 copies, tensor pitch 331092,
++//   host pitch 993280, offset 0 (ROCm1 buffer)
++// The same abort is what `TODO` #124 recorded for a windowed KV on a tensor split, where the delivery's answer was
++// "the arguments are what the caller got wrong"; they were not, the grant was refused.  A **1-D** copy of the same
++// bytes is accepted from every device, which is the class already recorded for the movable-boundary slab
++// (INVARIANTS.md r183) and the mixed KV region (r204).  So this issues:
++//   * ONE 1-D copy when the block is tight (both pitches are the width),
++//   * the device-staged chunked form when the call may synchronize and the block is above the bounce threshold:
++//     one 2-D DEVICE-to-DEVICE gather into the reading device's own staging buffer, one 1-D D2H per chunk into that
++//     device's own pinned chunk, then a host scatter -- a 2-D gather on a device buffer needs no grant, and no
++//     2-D device-to-host copy is issued anywhere, and
++//   * one 1-D copy per row otherwise: the ASYNC form, which must not synchronize (the caller batches many reads
++//     behind one backend synchronize), and the small block the staging pair would only slow down.
++// `GGML_CUDA_BOUNCE_MIN=0` keeps the per-row arm selectable, as it does for the pageable bounce.
++static void ggml_cuda_rows_to_host(int device, const char * src, void * data, size_t size, size_t n_copies,
++        size_t stride_tensor, size_t stride_data, cudaStream_t stream, bool sync) {
++    if (n_copies == 0 || size == 0) {
 +        return;
 +    }
-+    if (size * n_copies >= ggml_cuda_bounce_min()) {   // GGML_CUDA_BOUNCE_MIN=0 keeps the per-row arm selectable
++    // a bare CUDA_CHECK names the API and the error, never the block that was refused
++    auto check = [&](cudaError_t err) {
++        if (err == cudaSuccess) {
++            return;
++        }
++        (void) cudaGetLastError();
++        GGML_LOG_ERROR("%s: device %d: row-block read failed (%s): %zu bytes x %zu copies, tensor pitch %zu, "
++                       "host pitch %zu (%s)\n", __func__, device, cudaGetErrorString(err), size, n_copies,
++                       stride_tensor, stride_data, sync ? "staged" : "async");
++        GGML_ABORT("%s: row-block read failed", __func__);
++    };
++
++    if (stride_tensor == size && stride_data == size) {   // a tight block is ONE 1-D copy
++        check(cudaMemcpyAsync(data, src, (n_copies - 1) * stride_tensor + size, cudaMemcpyDeviceToHost, stream));
++        if (sync) {
++            check(cudaStreamSynchronize(stream));
++        }
++        return;
++    }
++    // `size <= ggml_cuda_pin_chunk_bytes`: a row bigger than the staging pair cannot be staged at all (the chunk
++    // is capped, so the gather would overflow it) -- such a block is read one 1-D copy per row instead.
++    if (sync && size <= ggml_cuda_pin_chunk_bytes && size * n_copies >= ggml_cuda_bounce_min()) {   // GGML_CUDA_BOUNCE_MIN=0 keeps the per-row arm selectable
 +        std::unique_lock<std::mutex> pin_lock;
 +        std::unique_lock<std::mutex> stg_lock;
-+        char * pin   = ggml_cuda_pin_chunk(ctx->device, pin_lock);
-+        char * stage = ggml_cuda_kv_region_dev_stage(ctx->device,
++        char * pin   = ggml_cuda_pin_chunk(device, pin_lock);
++        char * stage = ggml_cuda_kv_region_dev_stage(device,
 +                std::min(ggml_cuda_kv_region_stage_max, size * n_copies), stg_lock);
 +        if (pin != nullptr && stage != nullptr) {
 +            const size_t rows = std::max<size_t>(1, std::min<size_t>(ggml_cuda_pin_chunk_bytes,
 +                    ggml_cuda_kv_region_stage_max) / size);
 +            for (size_t e0 = 0; e0 < n_copies; e0 += rows) {
 +                const size_t n = std::min(rows, n_copies - e0);
-+                ggml_cuda_cpy_2d_rows(stage, src + e0 * stride_tensor, size, n, stride_tensor, size, cudaStreamPerThread);
-+                CUDA_CHECK(cudaMemcpyAsync(pin, stage, n * size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
-+                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++                ggml_cuda_cpy_2d_rows(stage, src + e0 * stride_tensor, size, n, stride_tensor, size, stream);
++                check(cudaMemcpyAsync(pin, stage, n * size, cudaMemcpyDeviceToHost, stream));
++                check(cudaStreamSynchronize(stream));
 +                for (size_t e = 0; e < n; ++e) {
 +                    memcpy((char *) data + (e0 + e) * stride_data, pin + e * size, size);
 +                }
@@ -4577,10 +4680,17 @@ index 4a5d2a402..8c8e4f255 100644
 +        }
 +    }
 +    for (size_t e = 0; e < n_copies; ++e) {
-+        CUDA_CHECK(cudaMemcpyAsync((char *) data + e * stride_data, src + e * stride_tensor, size, cudaMemcpyDeviceToHost,
-+                cudaStreamPerThread));
++        check(cudaMemcpyAsync((char *) data + e * stride_data, src + e * stride_tensor, size, cudaMemcpyDeviceToHost, stream));
 +    }
-+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    if (sync) {
++        check(cudaStreamSynchronize(stream));
++    }
++}
++
++static void ggml_backend_cuda_kv_region_rows_to_host(ggml_backend_cuda_buffer_context * ctx, const char * src, void * data,
++        size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
++    ggml_cuda_rows_to_host(ctx->device, src, data, size, n_copies, stride_tensor, stride_data,
++            cudaStreamPerThread, /*sync =*/ true);
 +}
 +
 +// the write direction is the mirror image: pack the host rows into the pinned chunk, one 1-D H2D per chunk, then
@@ -4884,7 +4994,7 @@ index 4a5d2a402..8c8e4f255 100644
  }
  
  // Communication context for multi-GPU AllReduce during tensor parallelism.
-@@ -4707,6 +5968,395 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+@@ -4707,6 +6011,395 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
      return ggml_backend_cuda_host_buffer_type_dev(0);
  }
  
@@ -5280,7 +5390,7 @@ index 4a5d2a402..8c8e4f255 100644
  // wip/host-expert-master-drop (TODO #55): the POOL-BACKED host expert master buffer type.
  //
  // It is a host buffer type that carries its device (`ROCm_HostMap`), so a `MUL_MAT_ID` weight placed in it
-@@ -4873,7 +6523,7 @@ static bool    g_cgc_reg = false;
+@@ -4873,7 +6566,7 @@ static bool    g_cgc_reg = false;
  static const bool g_cgc_on       = getenv("GGML_CUDA_GCDBG") != nullptr;
  static const bool g_op_timing_on = getenv("GGML_CUDA_OP_TIMING") != nullptr;
  static const bool g_stream_dbg_on = getenv("GGML_STREAMDBG") != nullptr;
@@ -5289,7 +5399,7 @@ index 4a5d2a402..8c8e4f255 100644
  // Meta/op-offload A/B switch.  This sits on the per-copy staging path (thousands of calls per pass
  // under -sm tensor), so it is resolved once instead of per call.
  static const bool g_cuda_splice_env_on = [] {
-@@ -6325,6 +7975,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -6325,6 +8018,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_FLASH_ATTN_QSA:
              ggml_cuda_flash_attn_qsa(ctx, dst);
              break;
@@ -5299,7 +5409,7 @@ index 4a5d2a402..8c8e4f255 100644
          case GGML_OP_INDEXER_TOPK:
              ggml_cuda_indexer_top_k(ctx, dst);
              break;
-@@ -6422,11 +8075,48 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
+@@ -6422,11 +8118,48 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
      delete backend;
  }
  
@@ -5349,7 +5459,7 @@ index 4a5d2a402..8c8e4f255 100644
  
      // A pinned-source cudaMemcpyAsync is read by the copy engine when the stream reaches it, not when it is
      // issued, so the caller must not modify `data` until the copy has completed -- and this path's caller
-@@ -6472,7 +8162,30 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
+@@ -6472,7 +8205,30 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -5381,7 +5491,7 @@ index 4a5d2a402..8c8e4f255 100644
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
      CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
-@@ -6483,7 +8196,35 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+@@ -6483,7 +8239,35 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -5418,7 +5528,7 @@ index 4a5d2a402..8c8e4f255 100644
      ggml_cuda_async_input_drain(cuda_ctx->device);
  
      ggml_cuda_set_device(cuda_ctx->device);
-@@ -6577,11 +8318,47 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+@@ -6577,11 +8361,47 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
      ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
  
@@ -5453,23 +5563,23 @@ index 4a5d2a402..8c8e4f255 100644
  
 -    CUDA_CHECK(cudaMemcpy2DAsync(
 -        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
-+    // A failed copy here used to abort through CUDA_CHECK with nothing but the driver's word, which is what
-+    // made the windowed-KV-on-a-tensor-split checkpoint save (TODO #124) a naked `ROCm error: invalid
-+    // argument`: the arguments are what the caller got wrong, so print them.
-+    const cudaError_t err = cudaMemcpy2DAsync(
-+        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream());
-+    if (err != cudaSuccess) {
-+        (void) cudaGetLastError();
-+        GGML_LOG_ERROR("%s: device %d: 2-D read of '%s' failed (%s): %zu bytes x %zu copies, tensor pitch %zu, "
-+                       "host pitch %zu, offset %zu (%s buffer)\n", __func__, cuda_ctx->device, tensor->name,
-+                       cudaGetErrorString(err), size, n_copies, stride_tensor, stride_data, offset,
-+                       ggml_backend_buft_name(buf->buft));
-+        GGML_ABORT("%s: 2-D read failed", __func__);
-+    }
++    // The write twin (ggml_backend_cuda_set_tensor_2d_async) selects its device here; the copies below are issued on
++    // this context's stream, so the current device must be this one.
++    ggml_cuda_set_device(cuda_ctx->device);
++
++    // NOT a 2-D copy (r364): a split tensor's row block lands in ONE device's pinned host allocation (llama.cpp's
++    // output buffer / state stage), and the peer grant a `hipMemcpy2DAsync` D2H needs for the destination is
++    // refused on this box -- the abort that `TODO` #124 recorded ("2-D read of 'result_output' failed (invalid
++    // argument)", 331092 bytes x 5 copies, host pitch 3 x tensor pitch) is this path, and the arguments were not
++    // what was wrong.  See ggml_cuda_rows_to_host.  The copies stay QUEUED on the context's stream (the caller
++    // batches them behind one backend synchronize, and this stream orders them after the graph that produced the
++    // rows).
++    ggml_cuda_rows_to_host(cuda_ctx->device, (const char *) tensor->data + offset, data, size, n_copies,
++            stride_tensor, stride_data, cuda_ctx->stream(), /*sync =*/ false);
  }
  
  // Staged cross-device copy (pinned host bounce).
-@@ -7390,13 +9167,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -7390,13 +9210,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
              }
  
              if (t_ev) { g_ev_pre_us += ggml_time_us() - t_ev; g_loop_start = ggml_time_us(); }
@@ -5492,7 +5602,7 @@ index 4a5d2a402..8c8e4f255 100644
              ggml_cuda_gdn_gather_index gdn_gather_index;
              cuda_ctx->gdn_deferred_gathers.clear();
              for (int i = 0; i < cgraph->n_nodes; i++) {
-@@ -7793,7 +9574,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -7793,7 +9617,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      use_cuda_graph = true;
                      // recapture a graph whose pool temporaries or scratch buffers were freed since its capture
                      // (GGML_CUDA_GRAPH_MEM_GEN=0 disables the check, A/B only)
@@ -5501,7 +5611,7 @@ index 4a5d2a402..8c8e4f255 100644
                      cuda_graph_update_required = graph->instances.empty() ||
                          (mem_gen_check && graph->mem_gen != ggml_cuda_graph_mem_gen(cuda_ctx->device));
                  }
-@@ -7939,7 +9720,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7939,7 +9763,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // first win.  STRUCTURE ONLY: inside graph_optimize the data pointers are not assigned yet, so
      // the check must not look at alias/buffer state.  LLAMA_MMB_HC16>=1 (== GGML_CUDA_MMB_HC16).
      {
@@ -5510,7 +5620,7 @@ index 4a5d2a402..8c8e4f255 100644
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
              auto reads = [](const ggml_tensor * t, const ggml_tensor * x) {
-@@ -7970,7 +9751,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7970,7 +9794,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  }
                  if (ok && nread > 0 && elide_f32) {
                      ggml_cuda_mmb_mark_bf16_only(gr);
@@ -5519,7 +5629,7 @@ index 4a5d2a402..8c8e4f255 100644
                      if (lg) { static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_HC16 gate marked BF16-only: %s (M=%d K=%d T=%d)\n",
                              gr->name, (int) gr->ne[1], (int) gr->ne[0], (int) (gr->ne[2] * gr->ne[3])); }
                  }
-@@ -7985,7 +9766,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7985,7 +9809,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // copy is RNE-rounded exactly as mmb_cvt_f32_bf16, so the GEMM arithmetic is bit-identical.
      // Dense MUL_MAT only; F32-weight GEMMs read the activation directly (tiny-M / f32split).
      {
@@ -5528,7 +5638,7 @@ index 4a5d2a402..8c8e4f255 100644
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
              auto rootof = [](const ggml_tensor * t) { while (t->view_src) t = t->view_src; return t; };
-@@ -8099,7 +9880,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8099,7 +9923,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
              ggml_cuda_hc_combine_norm_args ca;
              if (ggml_cuda_hc_combine_norm_identify(cgraph, i, ca)) comb.push_back(ca);
          }
@@ -5537,7 +5647,7 @@ index 4a5d2a402..8c8e4f255 100644
          if (blk_dbg) fprintf(stderr, "HC_BLK16 comb=%zu\n", comb.size());
          if (ggml_cuda_mmb_blk16()) {   // block_out (attention out-proj / MoE merge) is read only by the fused combine
              std::vector<const ggml_tensor *> blks;
-@@ -8231,7 +10012,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8231,7 +10055,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -5546,7 +5656,7 @@ index 4a5d2a402..8c8e4f255 100644
  
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
  
-@@ -8253,14 +10034,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8253,14 +10077,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          // projections (MUL_MAT + RESHAPE / VIEW, which read none of the Q nodes) in front of the Q projection: the same
          // nodes, one stream, so the results are bit-identical.  Structural only (no data pointers yet), every ubatch
          // size.  GGML_CUDA_QK_ROTATE=0: off.
@@ -5563,7 +5673,7 @@ index 4a5d2a402..8c8e4f255 100644
          const auto is_had = [](const ggml_tensor * t) {
              return t->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD;
          };
-@@ -8383,7 +10164,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -8383,7 +10207,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          // With the GDN gate / beta epilogue on (GGML_CUDA_FUSE_GDN_EPI, mmvq.cu) the larger one goes in front of the small ones
          // ([z, beta, alpha]), so the small pair and its gate chains stay adjacent for the verify band's epilogue launch; the
          // decode row concat takes the same three in any order.
@@ -5572,7 +5682,7 @@ index 4a5d2a402..8c8e4f255 100644
          const int cc_reorder = ggml_cuda_info().devices[cuda_ctx->device].cc;
          if (cat_reorder && (GGML_CUDA_CC_IS_RDNA4(cc_reorder) || GGML_CUDA_CC_IS_RDNA3_0(cc_reorder))) {
              ggml_tensor ** n = cgraph->nodes;
-@@ -9711,6 +11492,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -9711,6 +11535,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_FLASH_ATTN_QSA:
              return ggml_cuda_flash_attn_qsa_supported(dev_ctx->device, op);
@@ -5593,7 +5703,7 @@ index 4a5d2a402..8c8e4f255 100644
          case GGML_OP_INDEXER_TOPK:
              return ggml_cuda_indexer_top_k_supported(dev_ctx->device, op);
          case GGML_OP_INDEXER_SCORE:
-@@ -9748,7 +11543,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -9748,7 +11586,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
  static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
      const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
@@ -5603,7 +5713,7 @@ index 4a5d2a402..8c8e4f255 100644
  }
  
  static int64_t get_op_batch_size(const ggml_tensor * op) {
-@@ -10269,8 +12065,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+@@ -10269,8 +12108,65 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
  }
  
  
@@ -5669,7 +5779,7 @@ index 4a5d2a402..8c8e4f255 100644
      if (strcmp(name, "ggml_backend_cuda_fattn_stage_bound") == 0) {
          return (void *) ggml_backend_cuda_fattn_stage_bound;
      }
-@@ -10398,6 +12251,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+@@ -10398,6 +12294,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
      // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
      moe_cache_init(device);
  

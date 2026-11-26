@@ -16,6 +16,50 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.013 (r364) -- the beta artifact's DELIVERY-level fix folded in (block 14: a row-block D2H is never a 2-D copy -- the abort `TODO` #124 misdiagnosed), and the pair-only piece squashed into the ONE two-arm patch
+
+**The question, and the split.**  `beta/prefill-decode-arms/` carried two delivery-repo fixes it had found while
+being developed (`TODO` #376): `state-split-2d-read.patch` (STEP 15) and `two-arm-drop-boundary.patch` (STEP 16).
+The maintainer asked whether they are real for the delivery *today* and, if so, to fold them -- with the
+two-arm-specific pieces going into the two-arm patch so there is a single beta file to manage.  They are not the
+same kind of thing:
+
+* **STEP 15 is a real delivery defect and it was misdiagnosed.**  On ROCm a `hipMemcpy2DAsync` D2H into host memory
+  asks for a peer grant of the destination's pinned allocation to the copying device's agent; every buffer of the
+  pinned host type (the context's output buffer, its state stage) is allocated by ONE device and read by ALL devices
+  of a `-sm tensor` split, so a copy from a non-owning device needs it.  On a box whose slabs leave the driver no
+  room the grant is refused (`hsa_amd_agents_allow_access ... err 4096`) and the copy returns `invalid argument` --
+  a hard abort.  The delivery issues exactly that copy at three sites (the CUDA buffer's synchronous 2-D read, the
+  KV region's row helper, the async 2-D read) and its own record for the abort (`TODO` #124, retired with the
+  region-only 1-D routing) blamed the caller's arguments, not the grant: measured on the beta campaign a 5-row
+  logits read of a split `result_output` aborted on device 1 while device 0's twin copy of the same bytes
+  succeeded.  The async form also issued its copy without selecting its own device (its write twin always did).
+* **STEP 16 is pair-only.**  It re-enables the prefill->decode compute-buffer drop inside the pair and fences the
+  other arm out with a new `llama_context_set_drop_boundary()` callback; a single-context server installs nothing and
+  is unchanged.  Shipping it in `patches/` would add an API nothing in the delivery calls.
+
+**What landed (r364, one re-cut, block 14 amendment).**  `ggml_cuda_rows_to_host()` now serves all three sites:
+ONE 1-D copy for a tight block; the device-staged chunked form (2-D device-to-DEVICE gather into the reading
+device's own staging buffer, one 1-D D2H per chunk into that device's own pinned chunk, host scatter) when the call
+may synchronize and the block is above `ggml_cuda_bounce_min()`; one 1-D copy per row otherwise (the async form,
+which must not synchronize, and a block whose row exceeds the 64 MiB staging pair).  **Block 14, not block 09**
+(`TODO` #376's guess): the helper needs the region staging primitives block 14 owns (`ggml_cuda_kv_region_dev_stage`,
+`ggml_cuda_cpy_2d_rows`), and a later block amending an earlier block's file is the delivery's normal layering (this
+same block already amends `ggml-cuda.cu`'s `supports_op`).  The delivery's copy uses `cudaStreamPerThread`; the pair
+converts those streams to its per-(thread, device) host stream, which is pair machinery and stays in the artifact.
+
+**Verified.**  Text-neutral everywhere it is reachable: `gate-state-pipe.sh` PASS (batched save+load 1.48x / 1.58x /
+1.54x / 1.62x of the synchronous arm against a 3.0x bound), `gate-meta-seg-drain.sh` PASS (the drain fires, 90 per
+load, and the greedy text is `e2dde701fc04`, identical to the r362/r363 arm), and the eight coherence arms
+(2- and 3-device `-sm tensor` 4B, Flash-Next tensor plain/pool-declined, layer-split no-pool, 27B `-sm tensor`,
+35B-A3B `-ncmoe 40`, Flash-Next IQ4_NL) reading their r363 hashes.  The whole ladder for the cut is 261125.014.
+
+**The beta artifact is now ONE patch.**  `prefill-decode-arms.patch` (+45 files, +3379/-766, sha256
+`4ba17090a1...`) carries the two-arm server **plus** STEP 16 and the host stream; `state-split-2d-read.patch` and
+`two-arm-drop-boundary.patch` are deleted.  `apply-all.sh --include-beta` applies exactly one commit and produces
+**the same applied tree as the three-file form, `c1d50b664`** -- the check that the squash changed no code -- and
+the README/BETA-TESTING record the split, the new base/tree (r364, `981f4ab89`) and the sha256.
+
 ## 261125.012 (r363, release cut) -- tagged, the fork branch re-cut to `5d7be81a9` and pushed, the images building off-host; the ladder recorded
 
 **The cut.**  `v18-919794500-r363` = fork re-cut tip `5d7be81a9ca79f692ce25514ccee67832122f871`, base `919794500`

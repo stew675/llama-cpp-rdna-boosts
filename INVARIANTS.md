@@ -3580,3 +3580,27 @@ loses everywhere measurable, so the delivery's default went back to the dense fo
   comparing against it would blame the pool for the arch policy.  Kill switch `LLAMA_KV_POOL_DROP=0`
   (`DIAGNOSTIC.md` §17.1); gate `scripts/gate-kv-residency.sh`'s two-request section (`pstale_ref` / `pstale_res`
   / `pstale_ctl`, whose control arm must read > 0 mismatches or the section is vacuous).
+* **(r364, block 14, GitHub PR #369 follow-up / `TODO` #376) A ROW-BLOCK DEVICE->HOST READ MUST NEVER BE A 2-D COPY
+  ON ROCm, because a 2-D D2H into host memory needs a PEER GRANT of the destination's pinned allocation to the
+  copying device's agent — and llama.cpp's pinned host buffers are allocated by ONE device and read by ALL devices
+  of a `-sm tensor` split.**  `hipMemcpy2DAsync` D2H asks the runtime for `hsa_amd_agents_allow_access` on the
+  destination (`hipMemSetAccess` for a VMM allocation); `ggml_backend_cuda_host_buffer_type()`'s buffers — the
+  context's output buffer (`output_host_buft`) and the state stage above all — are one device's allocation read from
+  every device, so a copy issued by a device that does not own it needs that grant.  On a box whose slabs leave the
+  driver no room it is REFUSED (`Allow p2p access failed - hsa_amd_agents_allow_access with err 4096`, the same
+  refusal `ggml_cuda_peer_copy_ok`/`ggml_cuda_slab_peer_copy_ok` exist for) and the copy returns `invalid argument` —
+  a hard abort of the request: measured on the two-arm beta campaign as `2-D read of 'result_output' failed (invalid
+  argument): 331092 bytes x 5 copies, tensor pitch 331092, host pitch 993280 (ROCm1 buffer)`, where device 0's twin
+  copy of the same bytes (the allocation's owner) succeeded.  **The delivery had this too, and had diagnosed it
+  wrongly**: `TODO` #124's abort was recorded as "the arguments are what the caller got wrong" and answered with a
+  diagnostic that printed them.  `ggml_cuda_rows_to_host()` now serves all three sites (the CUDA buffer's synchronous
+  2-D read, the KV region's row helper, and `ggml_backend_cuda_get_tensor_2d_async`) with: ONE 1-D copy for a tight
+  block; the device-staged chunked form (2-D device-to-DEVICE gather into the reading device's own staging buffer,
+  one 1-D D2H per chunk into that device's own pinned chunk, host scatter) when the call may synchronize and the
+  block is above `ggml_cuda_bounce_min()`; one 1-D copy per row otherwise (the async form, which must not
+  synchronize, and blocks whose row exceeds the 64 MiB staging pair).  The async form also now selects its own
+  device (`ggml_cuda_set_device(cuda_ctx->device)`, which its write twin always did) — it issued the copy on its
+  context's stream without it.  Text-neutral: `gate-state-pipe` 1.48-1.62x of the synchronous arm, `gate-meta-seg-drain`
+  `e2dde701fc04` on both arms, the eight coherence arms unchanged.  Gate: `scripts/gate-state-pipe.sh` +
+  `scripts/gate-meta-seg-drain.sh`; the pair's own copy of these streams is `ggml_cuda_host_stream()`, which is pair
+  machinery and lives in the beta artifact.

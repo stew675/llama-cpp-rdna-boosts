@@ -84,6 +84,16 @@ inactive and did **not** reproduce on any of the seven arms re-run at r352 (both
 recorded control set and **no fix**: a gate on a fault that does not fire would be vacuous.  Its subject is the
 delivery's host-expert tier, so it stays.
 
+**`r364` housekeeping (2026-11-26):** `#376` closed and left the list -- **both folds landed**.  **STEP 15** (the
+CUDA backend's 2-D device->host read of a split tensor into a host buffer another device owns) is DELIVERY code:
+block 14's r364 amendment, `ggml_cuda_rows_to_host()`, which serves the CUDA buffer's synchronous 2-D read, the KV
+region's row helper and the async 2-D read with 1-D copies (the peer grant a 2-D D2H needs for a host destination is
+what the driver refuses; `#124`'s "the arguments are what the caller got wrong" was the wrong diagnosis) and makes
+the async form select its own device.  **STEP 16** (the compute-buffer drop fence) is PURELY pair-side -- a
+single-context server installs no callback and is byte-identical -- so, by the maintainer's decision of 2026-11-26,
+it was squashed into the beta artifact's ONE patch instead of the delivery: `beta/prefill-decode-arms/` is now a
+single file, applied tree `c1d50b664` on the r364 tree (`WORKLOG.md` 261125.013).
+
 | # | subject | kind | status |
 |---|---|---|---|
 | **116** | native FP8 E4M3 for RDNA4: a `GGML_TYPE_F8_E4M3` weight type plus an aiter-style `mul_mat_fp8_wmma` GEMM | performance / new type (`wip/fp8-support/`) | **PARKED** (2026-09-26) — builds on gfx1201, gate 2 fails (0.69x Q8_0) — §116 |
@@ -91,7 +101,6 @@ delivery's host-expert tier, so it stays.
 | **361** | the r334 RDNA2 items (PR #338) are validated on the contributor's V620, not on the released tree: blocks 05/08/10 now carry an RDNA2-only FA tile-cap removal, a one-warp narrow `RMS_NORM`, a `H * n_seqs` GDN chunked gate and a rows-abreast MoE K walk, and no RDNA2 device is in the maintainer's fleet | validation / external (delivery) | **WAITING on `@jstamagal`** -- re-run on the r334 tree: full `test-backend-ops` on `gfx1030` at default flags (**especially `FLASH_ATTN_EXT` with the caps gone: the failure mode is `GGML_ASSERT(max_blocks_per_sm > 0)` in `launch_fattn`, not a rate**), `MUL_MAT_ID` with `GGML_CUDA_MOE_ROWS_ABREAST` on and off, `RMS_NORM*` in the default/`NARROW=0`/`VEC=1` arms, a model-level decode+prefill (a GDN model for the chunked gate, a MoE for the K walk) and an MTP-acceptance run; **it should also confirm that PR #339's BF16 `RMS_NORM + MUL (+ ADD)` abort is gone there** (fixed at r328 by the re-base, `archive/work/can-fuse-bf16-rms-norm-r324/` -- `RMS_NORM_MUL_ADD` now includes `type=bf16,type_w=f32` and `type=bf16,type_w=f32,type_add=bf16` arms); §361 |
 | **363** | `-of`/`--optional-features` exists with ONE tag (`tp-ffn-even`); the delivery's other env-only opt-in features are still environment-only, so a user who reads `--help` still cannot find them | tooling / docs (delivery) | **OPEN** -- migrate them one at a time: add the row to `common_optional_features()` with its switch, confirm the tag produces exactly what the env var produces (the arm `gate-ffn-even-split.sh` C-section runs), and delete the row if the feature gets a first-class option; candidates are the opt-in switches `ENVIRONMENT.md` already marks as such (§4 `LLAMA_KV_N_PAD_MIN`, §7.6 `--wmma-verify`-adjacent switches are options already, §1.2's arena knobs, block 14's `LLAMA_KV_SPILL_RAM_PCT`); §363 |
 | **369** | three gates still name the RETIRED Flash-Next `GSQ-IQ3_XXS` tree (`gate-hc-base-copy`, `gate-hc-fusions`, `gate-host-expert-text`) and were deliberately NOT repointed at r346, because each carries recorded text/KLD anchors for that class | tooling (delivery) | **OPEN** -- repoint each AND re-record its anchors on the new class (the STEW675 IQ4_NL tree) in the same change, then run each once. §369 |
-| **376** | the block-17 beta artifact (`beta/prefill-decode-arms/`) carries a fix for a DELIVERY-level defect -- the CUDA backend issued a 2-D device->host copy of a split tensor into a pinned host buffer another device owns, which the driver refuses (`2-D read of 'result_output' failed (invalid argument): 331092 bytes x 5 copies, tensor pitch 331092, host pitch 993280`; the mechanism is the peer grant, `hsa_amd_agents_allow_access ... err 4096`) -- so on promotion that fix must be folded into the OWNING delivery block (**block 09**, the CUDA iface/scheduler block; it is `ggml-cuda.cu`) **independently of the two-arm block**, and the beta artifact re-cut against the new tree | delivery / block structure (maintainer) | **OPEN (fold only)** -- the fix LANDED as STEP 15 (`WORKLOG.md` 261124.007, `INVARIANTS.md` r384-wip, `steps/STEP-15-0022-no-2d-d2h.patch`); the FOLD is owed at promotion and is a block amendment, so it is asked first.  **A SECOND fold rides with it (261124.009)**: STEP 16 -- the pair keeps the compute-buffer drop, fenced by the other arm's step window (`llama_context_set_drop_boundary()` in `include/llama.h` + `src/llama-context.*`, and the server fence) -- is delivery code too, so the delivery takes two amendments (or one, if block 09 is cut with both) |
 | **377** | `scripts/gate-seqpar.sh` needs a **Flash-Next prefill-logit base** (`~/.cache/rdna-boosts/gates/prefill-logit-*Flash-Next*`) that this box did not have -- only the 27B one existed, so its arm 2 ("the `LLAMA_SEQPAR=0` arm is the recorded base") could not pass on ANY build, and arms 3a/3b scored nothing.  The base is machine-local, so a fresh box or CI hits the same red gate | delivery / gate plumbing | **OPEN (housekeeping)** -- recorded 2026-11-24 on the STEP-14 tip with the gate's own `--record` (the documented first-run path), which makes `gate-seqpar` meaningful again here; the open part is that a *fresh* box has no base and the gate's failure message does not say "record one first".  `gate-seqpar --record` must be run on a PRE-change tree, never on the build under test |
 | **378** | the `beta/prefill-decode-arms/` two-arm server **corrupts output under heavy concurrent load**: the maintainer reproduced a corruption on 2026-11-24 by pushing it hard (pair ON, concurrent prefill + decode; the candidate otherwise passes its own crash/state/text/gate ladder).  No reproducer, no captured failing run and no localisation yet -- this is the campaign's last known open defect and it is why the artifact ships as BETA | beta candidate / correctness | **OPEN -- TWO SUSPECTS, one now fixed.**  **SUSPECT 1 (r363): block 14's attendance pool served STALE K/V after any batch that wrote the KV mirror without resolving through it (a prefill chunk, the QSA dense/shortcut arm) — i.e. exactly a slot re-prefilling cells another slot left resident, which is what a pair under concurrent prefill + decode does constantly.  The pool WAS ON in the corruption run: `LLAMA_KV_REGION_POOL=N` (`--kv-region-pool N`) is the same switch as `--kv-attendance-pool on` (the numeric size is IGNORED since r247, the placement is not), and this box's Flash-Next IQ4_NL `runme` sets `LLAMA_KV_REGION_POOL=32768`.  It is FIXED in block 14 (r363, `ggml_kv_pool_drop`, GitHub PR #369) and the pool ALONE is measured to corrupt an answer (225-228 M VERIFY mismatches on the r362 tree, 0 with the fix, gfx1201 and gfx1100) — see §378.**  SUSPECT 2 is the pair itself, still needing a REPRODUCER first (the shape, the request pattern and the symptom are not recorded beyond "pushed hard"); then the usual split: text/KLD oracles on the same shape, the gate that owns the mechanism, and `INVARIANTS.md` for the fact.  Re-entry: any pair run that returns text differing from the single-context server at the same seed, or a `state-split`/`arms` gate failure that is not reproducible on the pair-off arm |
 | **381** | block 17's **gfx1100** arm was not run: `fingon` rebooted twice mid-build and then dropped off the network during the r356 session, so the cross-arch matrix is gfx1201 + gfx1151 only | validation / external (delivery) | **WAITING on `fingon`** -- when the box is back: pull `main`, apply the set in a worktree at `release.json.base`, build, then `./scripts/gate-tq.sh --build <dir> --tq2 ~/models/Llama3-8B-1.58/TQ2_0.gguf --tq1 ~/models/Llama3-8B-1.58/TQ1_0.gguf --dense <a 4B Q8_0> --dense-ref '' --device 0 --no-split --bench`.  gfx1100 has no RDNA4 int8-WMMA kernel, so `mma=0` there is by design (gfx1151 already covers that path: **305/305 and 84/84 exactly 0**); what gfx1100 adds is a second non-MMA arch on the neutrality and rate arms.  Note the two instrument traps the gfx1151 run found: the CPU-placement text arm is not an oracle, and `TQ_CENSUS` can print more than one line per device (both now handled by the gate); §381 |
@@ -282,41 +291,6 @@ defaults unchanged.  Recorded in `WORKLOG.md` 261124.003 / `INVARIANTS.md` r380-
 re-report it.
 
 
-
-## 376. On promotion, the block-17 beta artifact's Meta-backend fix must be folded into its OWNING block
-
-**Record:** the defect is `WORKLOG.md` 261124.004/005 (the original reading) and **261124.007** (the fix and the
-corrected mechanism), `INVARIANTS.md` **r384-wip** (r383-wip item 4 carried the earlier, wrong reading and is
-corrected in place); the work order is `wip/prefill-decode-arms-v2/HANDOVER.md`.  The maintainer's instruction
-(2026-11-24) is explicit: the fix goes into the beta candidate **for now**, and at promotion it is folded back
-**independently of the two-arm block**.
-
-A 3-device `-sm tensor` split, with the two-arm server on and an MTP drafter, aborted ~6 s into a ~77K-token
-prefill:
-
-```
-E ggml_backend_cuda_get_tensor_2d_async: device 1: 2-D read of 'result_output' failed (invalid argument):
-    331092 bytes x 5 copies, tensor pitch 331092, host pitch 993280, offset 0 (ROCm1 buffer)
-```
-
-`host pitch = 3 x tensor pitch` -- a SPLIT 2-D tensor read against one device's slice.  **The split arithmetic is
-exact** (per-device chunks 331092 / 331092 / 331096 sum to the meta row 993280 and device 0's copy of the same
-arguments succeeded); the refusal is the **peer grant a 2-D D2H copy needs on the destination's pinned
-allocation** (`hsa_amd_agents_allow_access ... err 4096`), which this box refuses.  The buggy code is therefore
-**delivery** code in `ggml/src/ggml-cuda/ggml-cuda.cu` (the 2-D read entry points), not the Meta backend's chunked
-path; the caller was the ordinary per-ubatch logits readback of a 5-row verify batch, which the two-arm decode arm
-is what composes.
-
-**Why it must not simply stay in the two-arm block:** block 17 is a beta candidate that may never be promoted, and
-this is a defect in blocks 09/13's code.  Leaving the fix only in block 17 means a delivery that ships without the
-pair still carries the bug -- and a promoted block 17 would silently modify a lower block's behaviour.
-
-**The work at promotion:** cut the fix against the release tree as a delta on the owning block -- **block 09**
-(`patches/0009-rdna-boosts-block-09-*.patch` owns `ggml-cuda.cu`'s 2-D iface and the scheduler; the `ggml-backend-meta.cpp`
-reading is refuted and no block-13 delta is needed) -- re-cut that block's patch in place, run
-`scripts/check-rung-file-sets.py` for the rung plus `scripts/validate-set.sh` (a block must not shrink), then re-cut
-the beta artifact against the new tree so the candidate keeps only what is its own (the STEP-15 hunk becomes a
-no-op there).  Record the transition in `WORKLOG.md` and in the beta artifact's README.
 
 ## 380. block 17's CUDA (nvcc) build is unverified — the ternary path has only ever been compiled by HIP
 
