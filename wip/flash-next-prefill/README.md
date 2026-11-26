@@ -381,6 +381,41 @@ never copied at all* — a bigger effect than any transfer-efficiency win. The m
 `-ncmoe 48`, where the arena (and therefore decode) keeps its size, and to fix the transport instead. That
 ordering is what this section does.
 
+### 10.6 The slot ping-pong (branch `wip/prefill-slot-pingpong`, `experiments/0004`)
+
+The design the maintainer asked for from the start: **the ring slot IS the compute buffer.** A staged host
+weight is consumed *in the slot* instead of being copied into the graph-allocated split input first, the slot is
+released after that split's compute is enqueued, and the fill for split N+1 is issued while split N runs
+(`0002`). That is the retired r250 "redirect" form -- safe here for the reason r250 lacked: such a split is a
+multi-token prefill split, and **`GGML_CUDA_GRAPH_MAX_TOKENS` is 16**, so no captured graph can bake the input
+pointer in. `GGML_SCHED_STAGE_REDIRECT=0` restores the copy.
+
+Measured at `-ncmoe 48`, ub 8192, x8, heat prior pinned, hybrid fill:
+
+| arm | prefill |
+|---|---:|
+| copy into the split input (pre-change) | 2229 / 2274 |
+| **consume the slot in place** | **2305 / 2313 / 2466 / 2471** |
+
+Mean **~2390 vs ~2250 (+6 %)**, and same-seed text is identical (`sha=43d0b1f4629e`, 128 tokens) — the content
+of the buffer is unchanged, only where the consumer reads it from. Against the 2100 gather baseline this is
+**+14 %**, with the ops-only ceiling at ~2725.
+
+### 10.7 The GPU is NOT I/O-starved — a third pipeline stage would target the wrong thing
+
+The maintainer proposed a 3-stage pipeline (host fill -> arena-expert fill -> process). Measured with
+`arm_gpu.sh` on the redirect arm, during the prefill: **`GPU use` median 100 %, p25 92 %** (the 79 % mean
+includes model load). The GPU is saturated, so there is no I/O stall left to hide: the ~5.8 s of
+`wall - ops` at this arm (38.6 s vs 32.75 s) is **unbracketed GPU work**, not waiting. At `-ncmoe 47` that
+5.8 s was the device gather (a compute-stream kernel outside the op table); with the hybrid fill its remaining
+components are the arena-side fill kernel and DRAM contention from the copy engine's writes, and the split
+between them is **unmeasured**.
+
+Consequence for the campaign's ordering: the transport is now within ~14 % of the ops ceiling and the GPU is
+busy, so further pipeline depth buys little. The remaining 12-14 % to 2900 lives in the op set — the
+`ffn_moe_weighted` REPEAT+MUL (3.9 s, 12 % of ops) first, then the GEMM rate (~29 TFLOPS aggregate, against
+radiance's implied ~68 on the same per-card link and Strata's ~37).
+
 ### 10.4 What to do next, in order
 
 1. **Land the bulk fill** (`experiments/0001`): one copy-engine DMA per table out of the pool mirror when the
