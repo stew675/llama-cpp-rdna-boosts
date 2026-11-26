@@ -3,7 +3,8 @@
 # issue-#368 flags.  One process, one prompt, prints the H2D calibration and the rates.
 #
 #   usage: ./arm.sh TAG [ENV=V ...]
-#   env:   DEV=<gpu index>   UB=<8192>   PROMPT=<file>   VERBOSE=<-lv 4 for a census arm>   EXTRA=<cli args>
+#   env:   DEV=<gpu index>   UB=<8192>   NCMOE=<47> (host-expert layers; fewer = more layers resident)
+#          PROMPT=<file>   VERBOSE=<-lv 4 for a census arm>   EXTRA=<cli args>
 #   out:   runs/TAG/run.log
 set -uo pipefail
 TAG=${1:?usage: arm.sh TAG [ENV=V ...]}; shift
@@ -26,7 +27,7 @@ export ROCBLAS_USE_HIPBLASLT=${ROCBLAS_USE_HIPBLASLT:-1}
 if [ $# -gt 0 ]; then export "$@"; fi
 "${LLAMA_CLI:-$HOME/llama.cpp/build-rocm/bin/llama-cli}" \
   -m "$MODEL" \
-  --fit off -ngl all --n-cpu-moe 47 --host-experts pool --load-mode auto --lazy-mode on \
+  --fit off -ngl all --n-cpu-moe ${NCMOE:-47} --host-experts pool --load-mode auto --lazy-mode on \
   -c 131072 -fa on -ctk q8_0 -ctv q8_0 -b ${UB:-8192} -ub ${UB:-8192} -t 8 --cache-ram 4096 ${EXTRA:-} \
   -f "$PROMPT" -n ${NGEN:-24} --temp 0 --seed 1 --no-display-prompt --single-turn ${VERBOSE:-} \
   > "$DIR/run.log" 2>&1

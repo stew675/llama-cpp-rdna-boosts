@@ -345,6 +345,42 @@ one-split lookahead buys nothing. It would matter with the kernel fill.
   explicit `MOE_EXPERT_CACHE_MIB` only shrinks it at slab init — the settle grows it back before the first wide
   ubatch. Explicitly out of scope for this campaign (maintainer, session 2).
 
+### 10.5 The hybrid fill (implemented 2026-11-26, session 2) — the shape asked for from the start
+
+`experiments/0001` now carries the design the slab/arena work should have started from: **each engine does the
+half it is good at.** `MOE_HOST_POOL_STAGE_BULK=2` (the default of the patch):
+
+* the **host** side is a handful of **coalesced run DMAs** on the copy engine, straight out of the pool's
+  expert-ordered mirror — adjacent non-resident experts become ONE transfer (measured 68 transfers per table
+  instead of 512, i.e. ~5 experts per run), and `MOE_HOST_POOL_STAGE_MERGE=<n>` deliberately over-fetches
+  across resident runs shorter than `n` experts to lengthen them (a merge needs no patch pass: the pool mirrors
+  every expert, so the boundary residents simply come from the host too);
+* the **arena** side is **ONE kernel launch** for the whole table (`skip_miss`, the host runs already wrote
+  everything else) — a kernel is the right engine here because it never crosses PCIe.
+
+Measured (ub 8192, x8, heat prior pinned, `MOE_EXPERT_HEATMAP=load`):
+
+| `-ncmoe` | gather (baseline) | whole-table DMA (`BULK=1`) | **hybrid (`BULK=2`)** |
+|---|---:|---:|---:|
+| 48 (max arena, 21.8 GiB) | 2100 | 2232 | **2301 / 2309 / 2361** |
+| 47 | 2117 | 2231-2367 | 2231 |
+| 36 (12 layers resident) | 2119 | 2468-2510 | 2427 |
+
+So the hybrid is +11 % over the gather at `-ncmoe 48`, but only +4 % over one DMA of the whole table — and
+`MERGE=4` is a small *loss* (2265 vs 2301), exactly as the arithmetic said it would be at 53 % coverage
+(over-fetched bytes cost more than the extra run length saves). Keep it at `1` (coalesce only).
+
+**What this proves:** making the fill three times more transfer-efficient bought ~4 %. The residual at
+`-ncmoe 48` is ~5.5 s of `wall − ops` and it is **not** transfer volume; it needs a split-level timeline to
+attribute (the ring→input D2D on the compute stream is ~0.7 s of it, and the arena's fill ramp is the next
+candidate — but the fill timing census does not fire for a pool-promoted fill, so that is unmeasured, not
+assumed).
+
+Note `-ncmoe 36` remains the fastest prefill arm *because a whole-layer-resident table is read in place and
+never copied at all* — a bigger effect than any transfer-efficiency win. The maintainer's decision is to stay at
+`-ncmoe 48`, where the arena (and therefore decode) keeps its size, and to fix the transport instead. That
+ordering is what this section does.
+
 ### 10.4 What to do next, in order
 
 1. **Land the bulk fill** (`experiments/0001`): one copy-engine DMA per table out of the pool mirror when the
