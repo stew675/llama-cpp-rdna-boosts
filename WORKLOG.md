@@ -16,7 +16,7 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
-## 261125.016 (r365, release cut) -- tagged, main and the fork pushed, the release assets published; the container images are OWED
+## 261125.016 (r365, release cut) -- tagged, main and the fork pushed, the release assets published and the images verified 23/23
 
 **The cut.**  `v18-919794500-r365` (annotated tag, pushed) = fork re-cut tip
 `7ad7f533cbc6923a9ec4d78f00384901108236f5`, base `919794500`, default tree `21efb08247edc142c649d2dcda771abb73fee810`,
@@ -32,11 +32,11 @@ otherwise look its day up in the index.
 (the record is `archive/work/kv-admit/`; a promoted campaign leaves no stub).  The reply on #370 records the claim
 check, the design change, the two defects stress-testing found, the gate, and the `TODO` #384 finding for the reporter.
 
-**The images (owed, not verified).**  `scripts/build-containers.sh --verify-only` still reads **8 missing**, 15/23
-present, every moving tag carrying the *previous* release: the worker watcher (`radiance`) polls every ~10 min and was
-still on r364's build when this cut landed, so r365 is picked up on its next poll after that finishes.  The check that
-closes r365 is `--verify-only` reading all 23 tags resolving with every moving tag carrying this release (issue #364:
-a push's exit status is not proof).
+**The images (verified).**  The worker watcher (`radiance`) was still on r364's build when this cut landed, so the
+first `--verify-only` read 8 missing / 15 present with every moving tag on the previous release.  It picked r365 up on
+its next poll and built it off-host: `scripts/build-containers.sh --verify-only` now reads
+**OK: all 23 tags for v18-919794500-r365 resolve and every moving tag carries this release** (`sha256:e5c77c8316ed`
+for the moving tags).  CI (tier 1, `.github/workflows/validate.yml`) is green on `main`.
 
 ## 261125.015 (r365) -- contributor PR #370 promoted into block 16: the server's KV admission (a task that cannot fit beside the running slots is deferred, through the SCHEDULER's oracle)
 
