@@ -1,0 +1,36 @@
+From 59c60332e13e84597735fe3d4777f6382ddc9c73 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 26 Nov 2026 10:05:04 -0800
+Subject: [PATCH] server: the max-min prompt share divides the pass's budget,
+ not what the earlier slots of the pass left over
+
+With `budget`, each slot's share is taken from what the slots before it in the
+same pass left, so two prompts prefilling at once got 1365 + 682 tokens of a
+2048 window instead of 1024 + 1024.  `budget_before` (the pass's budget) gives
+the max-min share the comment describes.
+
+Stock r366, Flash-Next IQ3_XXS, -sm tensor, -c 262144 (4 slots, unified KV):
+two fresh prompts at once, 39K + 34K: 25.9 -> 22.1 s wall; 59K + 59K:
+45.1 -> 36.8 s.  Each prompt alone gives the same reply as before.
+---
+ tools/server/server-context.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 196e0bfffe..4d3bc75486 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2432,7 +2432,9 @@ private:
+             for (size_t i = 0; i < active.size(); ++i) {
+                 const size_t  k = active[i];
+                 const int64_t w = (i == skew_i ? prefill_skew : 1);
+-                const int64_t share_i = (int64_t) budget * w / wsum;
++                // a share of the pass's budget (budget_before), not of what the earlier slots of this pass left over:
++                // with `budget` two equal prompts got 2/3 and 1/3 of the window (1365 + 682 of 2048)
++                const int64_t share_i = (int64_t) budget_before * w / wsum;
+                 const int64_t take    = std::min<int64_t>(remaining[k], share_i);
+ 
+                 prompt_budget[k] += (int32_t) take;
+-- 
+2.53.0
+
