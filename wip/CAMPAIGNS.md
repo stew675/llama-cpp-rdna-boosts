@@ -1,5 +1,17 @@
 # Open WIP campaigns (index)
 
+> **Promoted (r365, 2026-11-26):** `kv-admit` became a **block-16 amendment** (the server's KV admission:
+> `server_slot_sched::admit`, a reply reserve of `min(n_ctx / n_parallel, n_ctx_slot())` cells, `LLAMA_SERVER_KV_ADMIT`
+> as the kill switch).  It was submitted as `wip/kv-admit-r362/` by contributor PR #370 (`@briansp2020`) and never had
+> a row in this index; its record moved to [`../archive/work/kv-admit/`](../archive/work/kv-admit/README.md) with the
+> integration changes named there (the decision moved from a post-selection veto in `process_single_task` to the
+> scheduler's injected oracle, so a refusal travels the stock defer path; the per-sequence reserve; the answer for a
+> never-launched task at `terminate()`, which fixed a pre-existing SIGTERM hang; and the audio-wait slot skipped in the
+> accounting and in the wake, which is what makes the wake provably spin-free) and the submitted patch kept as the
+> reproduction.  Gate: `scripts/gate-kv-admit.sh` (`MANIFESTS.md` gate 46); knobs `ENVIRONMENT.md` §29 /
+> `DIAGNOSTIC.md` §29.  It is not an open campaign and it is not kept here as a stub.  The Gemma4 two-sequence abort
+> found while stress-testing it is `TODO` #384 (upstream's, not this delivery's).
+>
 > **Promoted (r363, 2026-11-26):** `kv-pool-drop` became a **block-14 amendment** (`LLAMA_KV_POOL_DROP` kill
 > switch; the attendance pool drops the pool pages a batch wrote without resolving through it, so a re-prefill over
 > resident cells no longer reads the previous request's K/V).  It was submitted as `wip/kv-pool-drop-r361/` by

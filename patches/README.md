@@ -15,7 +15,7 @@
 > together and they cannot drift; a pair that really stages (mixed, bf16 without bf16 MMA, the staged arm, an
 > unbounded cap) reserves exactly as before.  Blocks: the CUDA side is block 10 (`fattn-rdna.cuh`,
 > `ggml-cuda-moe-cache-hooks.{cu,cuh}`), the `--fit` accounting is block 09 (`src/llama-context.cpp`).  Gates:
-> `scripts/gate-fit-staging.sh` (new, `MANIFESTS.md` gate 44; the r359 build FAILS its A1/A2/B1 arms),
+> `scripts/gate-fit-staging.sh` (new, `MANIFESTS.md` gate 46; the r359 build FAILS its A1/A2/B1 arms),
 > `gate-prefill-logits.sh` 0.000000 / 100.000 %, byte-identical greedy text on 1 GPU, 3-GPU `-sm tensor` and a
 > 16K-context q8_0 prefill, `validate-set.sh` green, the optional `0100`/`0101` re-cut onto the new tree.
 
@@ -772,7 +772,7 @@ packed one on a tile-selected layout, +0.6-1.3 % pp512 there and one abort class
 | 13 | `0013-…-block-13-MTP-draft-vocabulary-subset-spe` | MTP draft vocabulary subset (`--spec-draft-mtp-vocab N`, opt-in) | +588 / −8 | 19 |
 | 14 | `0014-…-block-14-the-streamed-KV-a-fixed-VRAM-re` | **streamed KV** (opt-in, `--kv-window N\|auto`; the attendance pool `--kv-attendance-pool on\|off`; the MTP draft window `--spec-draft-kv-window N\|auto`, default `0`) (+ r248: the MTP draft window is a true ring for batches whose positions do not advance, a drafter failure can no longer fail a request, and the reserve reads the draft context's own ubatch — issue #297; + r264: the attendance pool is NOT SUPPORTED on a shared host/device pool (refused by design, one WARN — `TODO` #300 retired), `--fit` offers a placement only where this model+device can take it and prints the advice at WARN, and `gate-kv-residency.sh` grades the refusal, the hint and its own UMA reference arm; + r286: a region-backed buffer's 2-D state directions are **1-D only in both interfaces** (a 2-D device copy on the window's VMM region is refused by the driver on some stacks, which aborted a mixed gfx1100+gfx1201 `-sm tensor` server's prompt-cache save — issue #313), the block is gathered/scattered on the device (`ggml_cuda_cpy_2d_rows`) so a slot save+load went 4 686 → 24.5 ms on a windowed split, `--kv-window`/`--kv-attendance-pool` are common options (they were missing from `llama-bench` and every other non-server tool), `llama-bench` accepts `--kv-window`, and the spill's per-token cost is modelled on the **calibrated in-place read rate** (16-29 GB/s on gfx1201, its own measurement rather than the copy engine's, which is the number that diverges on a card reading its aperture slowly) — `ENVIRONMENT.md` §17.0, `benchmarks/2026-11-14-kv-window-313.md`); **r294: this is the block that makes a hole MAPPING-BACKED, so it carries the storage/transport split** — `host_expert_master_mapped()` (a hole set exists and `llama_mmap::SUPPORTED`) replaces five `use_mmap` tests, in `host_expert_buft`, both pool gates, `init_mappings` and the per-tensor mapped-or-read decision, so NO load mode can turn `-lme` into "pin the whole set" (measured: `-lme 30` under `--load-mode dio` pinned 48 284.6 MiB with no pool before, 31 363.7 MiB with the pool after, 0 mapping memcpys in both); **r295: the shipped text loses the superseded `11-26 %` spill cost** — `common/arg.cpp`'s `--kv-window` help line and `common/fit.cpp`'s placement hint now say the cost is linear in the depth past the window (nothing at or above the run depth), which is what the docs have said since r292 -- `TODO` #331, no computed number moves ; **r363: a batch that writes the mirror WITHOUT resolving through the pool — a prefill chunk, the QSA dense/shortcut arm — now DROPS the pages it wrote** (`ggml_kv_pool_drop`, the same `GGML_OP_KV_POOL` op with param 1 = 1; `LLAMA_KV_POOL_DROP=0` is the A/B arm), because the writer rule re-filled a resident page only when the batch that wrote it also resolved: a second request over a shared prefix read the first request's stale pool copies (225 M mismatching words under `LLAMA_KV_POOL_VERIFY=1`, a 90-entry prompt answered as "91 entries"; GitHub PR #369, `WORKLOG.md` 261125.010), and `gate-kv-residency.sh` gained the two-request arm that catches the class; **r364: a row-block device->host read is never a 2-D copy** (`ggml_cuda_rows_to_host()`): on ROCm a 2-D D2H into host memory needs a peer grant of the destination's pinned allocation, which is refused on a box whose slabs leave the driver no room, and llama.cpp's output/state buffers are ONE device's allocation read by every device of a `-sm tensor` split -- the abort `TODO` #124 recorded ("2-D read of 'result_output' failed (invalid argument)") and the delivery- level half of the two-arm campaign's STEP 15 (`TODO` #376 closed); the async form also selected no device before it issued its copy | +8004 / −971 | 51 |
 | 15 | `0015-…-block-15-the-UMA-GTT-expert-store-an-APU` | **the UMA GTT expert store** (an APU's MoE expert set in one registered, mlocked region; `-lme` sizes it and is the streaming opt-in) | new in r263: the arena tier per `-lme`, the MTP head pinned outside that budget, the direct fill, the RDNA3_5 transport start arm and prefill streaming.  A model whose weights do not fit RAM is refused at load with the fix; the store/arena is inert on a discrete GPU (measured); **r294: the PLACEMENT transport is the one decision that must NOT follow `--load-mode`,** so `MOE_HOST_POOL_BULK_DIO` is renamed `MOE_HOST_POOL_PLACEMENT_MODE=dio|buffered` and is reported once per load (`+1 675 MiB` of page cache on `dio` against `+31 796 MiB` on `buffered` for a 47.9 GiB placement, measured cold), and `-lme mirror` reaches the GTT store's budget too; **r295: the pool exchange's inertness is NAMED** — the exit census reports `sink no-demote tables (...)`, the sub-mirror pools whose demote cannot be expressed (`n_slices != 0` or `host_bytes != expert_bytes`), so a `-sm tensor` split's `0 demoted / 0 declines / 0 retirements` carries its reason -- `TODO` #334; **r337: the ARENA arm declares its hole set, so its master is the read-only model mapping** (issue #347).  The arena makes no `-lme` plan by construction, so `host_expert_master_mapped()` said "not mapped" and the loader allocated a pageable copy of the WHOLE expert set on every `--load-mode` (18 662.0 MiB / 23 649 MiB peak `RssAnon` on 35B-A3B; 46 800 MiB in the reporter's Flash-Next).  `plan_gtt_expert_store()` now records its tables in `host_experts_holes`, and the predicate accepts the arena as a hole source; the two census lines that named the discrete pool on this tier were corrected | +4949 / −368 | 16 |
-| 16 | `0016-…-block-16-the-server-s-prompt-admission-p` | **the server's prompt admission policy**: the max-min fair share of the step, the per-step `CHUNK`, the shortest-remaining `SKEW` and the prefill/decode `DUTY` cycle (moved OUT of block 12 at r301 -- `TODO` #339; `ENVIRONMENT.md` §22) | +367 / −2 | 3 |
+| 16 | `0016-…-block-16-the-server-s-prompt-admission-p` | **the server's prompt admission policy**: the max-min fair share of the step, the per-step `CHUNK`, the shortest-remaining `SKEW` and the prefill/decode `DUTY` cycle (moved OUT of block 12 at r301 -- `TODO` #339; `ENVIRONMENT.md` §22) **and, since r365, the KV admission of a whole task** (`server_slot_sched::admit`, the reply reserve `LLAMA_SERVER_KV_ADMIT_RESERVE`, the `LLAMA_SERVER_KV_ADMIT` kill switch; `ENVIRONMENT.md` §29, PR #370) | +579 / −20 | 5 |
 | 17 | `0017-…-block-17-TQ1_0-TQ2_0-ternary-weights-on-` | **TQ1_0 / TQ2_0 (ternary) weights on the GPU**: `MUL_MAT` + `GET_ROWS` + the fp16/fp32/bf16 conversions, bit-identical to the CPU's AVX2 path (default-on, `GGML_CUDA_TQ=0` refuses the types again) — contributor PR #358, r356 | +974 / −2 | 9 |
 | — | *(withdrawn)* | **the two-arm server — was block 17 until r352, withdrawn from the delivery**; it lives in [`../beta/prefill-decode-arms/`](../beta/prefill-decode-arms/README.md) (apply with `--include-beta`), it is not counted in `v<N>`, and its gates are beta-only | — | — |
 | 0300 | `0300-…-block-0300-relaxed-tensor-split-mode-TEM` | **TEMPORARY**: `-sm relaxed-tensor` — tensor split with a per-device MoE amax scalar for `flint`/`mellum`/`mistral4` (in the default apply, but NOT an official block: it is not counted in `v<N>`) | +130 / −17 | 12 |
@@ -4431,7 +4431,7 @@ cannot tell the two arms apart).  Record: `archive/work/qsa-topk-regular/`.
 >   (472 fast / 228 full, text identical to the full-path arm).
 > * Host-side C++ only (`common/sampling.cpp`, two accessors in `src/llama-sampler.cpp` and their declarations), so
 >   no ggml, kernel or backend file is touched and every backend runs it.  Gate:
->   `scripts/gate-fast-topk-penalties.sh` (`MANIFESTS.md` gate 44) — the full-vocabulary arm is the oracle, the
+>   `scripts/gate-fast-topk-penalties.sh` (`MANIFESTS.md` gate 46) — the full-vocabulary arm is the oracle, the
 >   census is the non-vacuity check, and the self-check's rank-swap control proves the text arms are sensitive.
 >   Knobs: `DIAGNOSTIC.md` §27.  Record: `archive/work/fast-topk-penalties/`.
 
@@ -6477,6 +6477,49 @@ and each arm must take the transport its load mode names; every text arm still `
 green.  Record: `WORKLOG.md` 261122.004, `INVARIANTS.md` (r344).
 
 ## Block 16 — the server's prompt admission policy (the fair share, `-ib`, the skew, the duty cycle)
+
+> **r365 amendment (contributor PR #370, `briansp2020`): the SAME policy now also decides whether a task is
+> admitted at all — and the decision is the scheduler's, not a new defer site.**
+> The block's fair share divides the *step*; it never asked whether the whole request fit the cache.  With a
+> unified KV cache (the **default** server: `-np -1` = 4 slots, `kv_unified = true`) the server launched every
+> request that found a free slot, so two prompts whose sum exceeds the context both prefilled until the cache was
+> full and then **decode** failed: the retry loop can only clear *idle* slots (`try_clear_idle_slots` skips a
+> processing one), so it halved `n_batch` to 1 and answered **HTTP 500 "Context size has been exceeded."** (with a
+> speculator, "speculative batch index N is not inside the current sub-batch").  Measured on r364 in **0.8 s** at
+> `-c 8192 -np 4 --kv-unified` with two ~4.8 k-token prompts (Qwen3.5-4B, 1 x R9700): both 500, versus both 200
+> with the same two texts as when each runs alone.
+> **Where the decision lives.**  `server_slot_sched` gains an injected `admit` oracle (`std::function<bool(const
+> server_task &)>`) and `server_slot_plan` gains a `why` (`none` / `no_slot` / `no_capacity`).  `select()` asks the
+> oracle **once, before a candidate is chosen**, so the predicate is a whole-request go/no-go and the scheduler
+> learns nothing about cells, reserves or margins; a refusal travels the existing `plan.id_slot == -1 → defer`
+> path, so there is **no second defer site**, `pop_deferred_task()` and `/metrics`' `n_tasks_deferred` cover it for
+> free, and a prompt pinned to an idle `id_slot` is refused by the same path.  The server context owns the
+> accounting (`kv_admit_ok()`): each running slot is charged `max(its prompt, its task's tokens)` plus a reply
+> reserve, and **idle slots are not counted** (the launch path parks and then clears them for want of room, so an
+> idle slot never has to be waited for) nor is a realtime slot waiting for audio (it is `is_processing()` but holds
+> no batch work — counting it would refuse a task no release could make room for).  With nothing running a task is
+> always admitted, so a prompt that fits the context on its own is never starved.
+> **The reserve** is `min(n_ctx / n_parallel, n_ctx_slot())` cells — the per-sequence share a *non-unified* cache
+> would have given each slot — capped further by the request's own `n_predict`; `LLAMA_SERVER_KV_ADMIT_RESERVE`
+> overrides it.  `LLAMA_SERVER_KV_ADMIT=0` restores the pre-r365 server exactly.  The startup line states both
+> (`KV admission: on, reserve = 2048 cells/request, unified = true`) and each refusal is one INFO line with its
+> numbers, which is the non-vacuity reading for an A/B.  Inert without `--kv-unified`, and for a parent task
+> (`n > 1` completions) and a prompt that alone exceeds the context — documented limitations, not bugs.
+> **A wake, and a defect it exposed.**  A release wakes exactly one deferred task, so a task that is re-offered and
+> refused again would wait for an unrelated request: `update_slots()` now re-offers one deferred task when **no**
+> slot is processing (that condition is what makes it provably spin-free: with nothing processing the popped task
+> is always admitted, so the loop makes progress).  That made a **pre-existing** shutdown hole ordinary: a task in
+> the deferred queue was never launched, so nothing ever answered it and `server_http_context::join()` waited on
+> its HTTP worker — a SIGTERM with 3 deferred tasks never returned (stuck in HIP's teardown; the stock "no free
+> slot" deferral escaped it only because the release path launches the task and then aborts it).  `server_context::
+> terminate()` now answers every deferred task (`take_deferred_tasks()`) and aborts the running slots, so the
+> process exits in 0.1 s.
+> **Gate:** `scripts/gate-kv-admit.sh` (`MANIFESTS.md` gate 46) — fit (no deferral, text == the kill switch),
+> overlap (both 200, deferred, serialised, and each answer **byte-identical to the same prompt run alone**, the
+> deferred request re-prefilling all 5246 tokens), the `LLAMA_SERVER_KV_ADMIT=0` control (**both 500** — the gate
+> fails on the pre-amendment server, verified with `--self-test`: 12 failing checks), four-way drain, the reserve
+> census (`n_ctx/n_parallel` and both overrides), non-unified inertness, SIGTERM with a pending deferred queue, and
+> the no-spin/log-storm arm.
 
 > **r329 amendment (docs, no behaviour change): the generated help documents are regenerated.**  Block 16 is the
 > last OFFICIAL block that touches `common/arg.cpp`, so it owns the regeneration of the three files

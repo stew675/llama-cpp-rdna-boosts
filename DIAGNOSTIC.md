@@ -710,6 +710,25 @@ worth its arena" comparison must use.
 | `MOE_EXPERT_CACHE_TABLES` | `0` (off) | **diagnostic** | At exit, one INFO line with the per-layer residency map (`L12 261/512`, `I` appended when a table of that layer is on the identity fast path) and one with this run's per-layer **slab-reclaim stand-downs** and **re-arms** (`L30x3 L31x3`).  The eviction and re-arm messages carry counts and bytes only, so a report that says "the same eviction sizes" can still hide a different *set*: read this first when comparing two runs of a host-expert shape, and change nothing until the two maps agree or the difference is explained.  Nothing is printed when the cache is off. |
 | `GGML_CUDA_SLAB_RING_MIB` | unset (auto) | tuning (pre-existing) | The whole-table H2D staging ring the slab reserves as a fixed hole above the narrow floor.  Since r362 it is **not reserved at all when the loader's host tier is the POOL** (`--host-experts pool`, or an `-lme` budget that resolves to the per-expert pool): that tier has no device-readable host master, so the default `GGML_SCHED_DEVGATHER` mode gathers a pool-backed table at every prefill width and the hole holds nothing for it.  An explicit value restores a hole of that size (the r361 behaviour is `GGML_CUDA_SLAB_RING_MIB=6144`), and an explicit `GGML_SCHED_DEVGATHER=0` also keeps it, because that arm really does stage.  Measured on the shape of issue #368: hole 6656 MiB -> work boundary 3264 -> 11776 MiB -> 8500 MiB / 51 tables stood down at every prefill, L1 prefill 1895 t/s / decode 34.18; without the hole, boundary 3328 MiB, no stand-down, 1958 / 34.94 (+3.4 % / +2.2 %) and the L2 revisit 728 -> 902 t/s. |
 
+## 29. The server's KV admission: the kill switch (block 16, r365)
+
+A refusal is a **scheduling** decision, so it is visible: the refusal is one INFO line with the cells it charged
+(`KV admission: task 2 needs 4884 cells, 1 running slot(s) hold 4887 of 8192; deferred until a slot is released`),
+the deferred request shows up in `/metrics`'s `n_tasks_deferred` (it is the same counter the stock "no slot is
+available" deferral uses — one deferral path, one counter), and the startup line states the configuration.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `LLAMA_SERVER_KV_ADMIT` | unset (**on**) | **kill switch** | `0` restores the pre-r365 server exactly: every request that finds a free slot is launched, whether or not its prompt fits beside the slots that are running, and two prompts whose sum exceeds the context answer HTTP 500 once the cache is full (the retry loop can only clear **idle** slots, so it halves `n_batch` to 1 and fails a running slot mid-generation).  Set it to bisect this class, or to run a server whose clients are expected to fit their own prompts.  Without a unified KV cache the whole path is inert (`--no-kv-unified`, or `-np N` with `N > 1`, which does not unify unless asked), because a per-slot cache cannot have slots take each other's cells. |
+| `LLAMA_SERVER_KV_ADMIT_RESERVE` | see [`ENVIRONMENT.md`](ENVIRONMENT.md) §29 | tuning | `0` makes admission depend on the prompts alone (the documented limit: two admitted replies can then grow into each other and fail as before); a small value admits more concurrency at the same risk. |
+
+Accepted limitations (recorded, not bugs): a request with `n > 1` completions (a parent task) and a request whose
+prompt alone exceeds the context are **not** checked; the reserve does not bound a reply that outgrows it; and at a
+small context the reserve makes concurrent prompts take turns rather than overfill the cache.
+
+Gate: `scripts/gate-kv-admit.sh` (`MANIFESTS.md` gate 46) — its `--self-test` runs every arm with
+`LLAMA_SERVER_KV_ADMIT=0` and requires the gate to fail.
+
 ---
 
 ## Maintaining this file

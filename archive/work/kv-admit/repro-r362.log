@@ -1,0 +1,112 @@
+# repro-r362.log: stock r362 (tag stew-r362 5cbe418f2c) vs r362 + 0001 (wip-kv-admit-r362 44cd11405b), both built in rocm/dev-ubuntu-24.04:10.2.0-full
+# model: Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS (2 shards), 2x R9700, ROCR/HIP_VISIBLE_DEVICES=0,1; experts placed by the default fit (host pool)
+# llama-server -m MODEL -c 65536 -sm layer -ngl 99 -ctk q8_0 -ctv q8_0 -cram 2048 -ub 2048 -b 2048 --reasoning-effort low --temp 0.7 --top-k 20 --top-p 0.95 --min-p 0 --port 8099   (no MTP; 4 slots, unified KV)
+# arms: S = stock; K = stock + 0001; K0 = stock + 0001 with LLAMA_SERVER_KV_ADMIT=0 (the K0 run also had MTP_DRAFT_N_UBATCH=256 set, which does nothing without MTP)
+# requests: kadrep.py (end of file): two ~12K-token prompts at once, two ~40K-token prompts at once, one short prompt after; /completion, greedy, n_predict 128
+# "log:" lines are matching server log lines (KV admission, decode retries, errors)
+
+=== S (stock) 5:53 PM r362  
+   srv    load_model: initializing, n_slots = 4, n_ctx_slot = 65536, kv_unified = 'true'
+   == two ~12K at once (fit) (wall 13.5 s)
+      M1  done   13.0 s | prompt  11625 tok @  1195 t/s | gen  128 @  38.6 t/s | sha f7a7555f |   <think> The user wants me to summarize
+      M2  done   13.5 s | prompt  11616 tok @  1166 t/s | gen  128 @  53.0 t/s | sha 7faff34a |   <think> The user wants me to summarize
+         log: slot      release: id  0 | task 0 | stop processing: n_tokens = 11752, truncated = 0
+         log: slot      release: id  1 | task 2 | stop processing: n_tokens = 11743, truncated = 0
+   == two ~40K at once (do not fit together in 64K) (wall 33.0 s)
+      L1  HTTP 500 after 33.0 s: b'{"error":{"code":500,"message":"Context size has been exceeded.","type":"server_error"}}'
+      L2  HTTP 500 after 33.0 s: b'{"error":{"code":500,"message":"Context size has been exceeded.","type":"server_error"}}'
+         log: decode: failed to find a memory slot for batch of size 2044
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 0, n_batch = 1024, ret = 1
+         log: decode: failed to find a memory slot for batch of size 1024
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 0, n_batch = 512, ret = 1
+         log: decode: failed to find a memory slot for batch of size 512
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 0, n_batch = 256, ret = 1
+         log: decode: failed to find a memory slot for batch of size 1788
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 256, n_batch = 1024, ret = 1
+   == one short after (wall 1.4 s)
+      S1  done    1.4 s | prompt    921 tok @  2181 t/s | gen   64 @  68.1 t/s | sha 63ec171a |   <think> The user wants me to summarize
+         log: srv  update_slots: decode() failed: Context size has been exceeded.
+         log: slot      release: id  0 | task 209 | stop processing: n_tokens = 984, truncated = 0
+   health after: {"status":"ok"}
+   faults 0
+=== K (stock + 0001) 5:57 PM kad362  
+   srv    load_model: initializing, n_slots = 4, n_ctx_slot = 65536, kv_unified = 'true'
+   == two ~12K at once (fit) (wall 13.7 s)
+      M1  done   13.2 s | prompt  11625 tok @  1174 t/s | gen  128 @  38.5 t/s | sha f7a7555f |   <think> The user wants me to summarize
+      M2  done   13.7 s | prompt  11616 tok @  1146 t/s | gen  128 @  53.2 t/s | sha 7faff34a |   <think> The user wants me to summarize
+         log: slot      release: id  0 | task 0 | stop processing: n_tokens = 11752, truncated = 0
+         log: slot      release: id  1 | task 2 | stop processing: n_tokens = 11743, truncated = 0
+   == two ~40K at once (do not fit together in 64K) (wall 35.3 s)
+      L1  done   17.6 s | prompt  39274 tok @  2565 t/s | gen  128 @  60.5 t/s | sha d24cd1dc |   <think> The user wants me to summarize
+      L2  done   35.3 s | prompt  39203 tok @  2523 t/s | gen  128 @  60.3 t/s | sha 8a0652fc |   <think> The user wants me to summarize
+         log: srv  process_sing: KV admission: task 174 needs 39331 cells, 1 running slot(s) hold 39402 of 65536; deferred until a slot is released
+         log: slot      release: id  2 | task 172 | stop processing: n_tokens = 39401, truncated = 0
+         log: decode: failed to find a memory slot for batch of size 2048
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 0, n_batch = 2048, ret = 1
+         log: slot      release: id  3 | task 174 | stop processing: n_tokens = 39330, truncated = 0
+   == one short after (wall 1.4 s)
+      S1  done    1.4 s | prompt    921 tok @  2184 t/s | gen   64 @  68.6 t/s | sha 63ec171a |   <think> The user wants me to summarize
+         log: slot      release: id  0 | task 470 | stop processing: n_tokens = 984, truncated = 0
+   health after: {"status":"ok"}
+   faults 0
+=== K0 (0001, LLAMA_SERVER_KV_ADMIT=0) 6:07 PM kad362 -e LLAMA_SERVER_KV_ADMIT=0 -e MTP_DRAFT_N_UBATCH=256 
+   srv    load_model: initializing, n_slots = 4, n_ctx_slot = 65536, kv_unified = 'true'
+   == two ~12K at once (fit) (wall 13.6 s)
+      M1  done   13.1 s | prompt  11625 tok @  1180 t/s | gen  128 @  38.6 t/s | sha f7a7555f |   <think> The user wants me to summarize
+      M2  done   13.6 s | prompt  11616 tok @  1151 t/s | gen  128 @  53.3 t/s | sha 7faff34a |   <think> The user wants me to summarize
+         log: slot      release: id  0 | task 0 | stop processing: n_tokens = 11752, truncated = 0
+         log: slot      release: id  1 | task 2 | stop processing: n_tokens = 11743, truncated = 0
+   == two ~40K at once (do not fit together in 64K) (wall 33.4 s)
+      L1  HTTP 500 after 33.4 s: b'{"error":{"code":500,"message":"Context size has been exceeded.","type":"server_error"}}'
+      L2  HTTP 500 after 33.4 s: b'{"error":{"code":500,"message":"Context size has been exceeded.","type":"server_error"}}'
+         log: decode: failed to find a memory slot for batch of size 2044
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 0, n_batch = 1024, ret = 1
+         log: decode: failed to find a memory slot for batch of size 1024
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 0, n_batch = 512, ret = 1
+         log: decode: failed to find a memory slot for batch of size 512
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 0, n_batch = 256, ret = 1
+         log: decode: failed to find a memory slot for batch of size 1788
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 256, n_batch = 1024, ret = 1
+   == one short after (wall 1.3 s)
+      S1  done    1.3 s | prompt    921 tok @  2164 t/s | gen   64 @  68.6 t/s | sha 63ec171a |   <think> The user wants me to summarize
+         log: srv  update_slots: decode() failed: Context size has been exceeded.
+         log: slot      release: id  0 | task 209 | stop processing: n_tokens = 984, truncated = 0
+   health after: {"status":"ok"}
+   faults 0
+
+## kadrep.py
+#!/usr/bin/env python3
+# kadrep.py PORT LOG: KV admission repro at -c 65536 (stock r362): two ~12K requests at once (fit), two ~40K at once
+# (do not fit together), one short request after.  Per request: timings, stop, sha; KV-related server log lines.
+import hashlib, json, random, re, sys, threading, time, urllib.request, urllib.error
+port, log = sys.argv[1], sys.argv[2]
+A_ = "pump valve filter gauge sensor relay bearing rotor stator flange gasket impeller coupling manifold actuator solenoid".split()
+B_ = "inspected replaced calibrated cleaned tightened lubricated tested rebuilt adjusted logged flagged measured".split()
+def text(seed, n):
+    R = random.Random(seed)
+    return " ".join("Entry %d: the %s at station %d was %s by crew %d on day %d, reading %.2f." % (i, R.choice(A_), R.randrange(9000), R.choice(B_), R.randrange(97), R.randrange(365), R.random()*500) for i in range(n)) + "\nSummarize the entries above in one sentence."
+def logpos(): return sum(1 for _ in open(log, errors="replace"))
+def newl(p): return [l for i, l in enumerate(open(log, errors="replace")) if i >= p]
+def one(name, p, ngen, out):
+    try:
+        r = json.load(urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:%s/completion" % port, data=json.dumps({"prompt": p, "n_predict": ngen, "temperature": 0, "top_k": 1, "cache_prompt": True}).encode(), headers={"Content-Type": "application/json"}), timeout=3600))
+        t = r["timings"]
+        out[name] = "%-3s done %6.1f s | prompt %6d tok @ %5.0f t/s | gen %4d @ %5.1f t/s | sha %s | %s" % (name, time.time() - T0, t["prompt_n"], t["prompt_per_second"], t["predicted_n"], t["predicted_per_second"], hashlib.sha256(r["content"].encode()).hexdigest()[:8], r["content"][:40].replace("\n", " "))
+    except urllib.error.HTTPError as e:
+        out[name] = "%-3s HTTP %d after %.1f s: %s" % (name, e.code, time.time() - T0, e.read()[:180])
+    except Exception as e:
+        out[name] = "%-3s ERROR %s after %.1f s" % (name, e, time.time() - T0)
+def run(title, jobs):
+    global T0
+    p0 = logpos(); out = {}; T0 = time.time()
+    th = [threading.Thread(target=one, args=(n, p, g, out)) for n, p, g in jobs]
+    for x in th: x.start(); time.sleep(0.2)
+    for x in th: x.join()
+    print("== %s (wall %.1f s)" % (title, time.time() - T0))
+    for n, _, _ in jobs: print("   " + out[n])
+    ev = [l for l in newl(p0) if re.search(r"KV admission|failed to find|decode: failed|retrying|speculative batch|exception|error|no free|context size|truncat", l, re.I)]
+    for l in ev[:8]: print("      log: " + re.sub(r"^[0-9.]+ [A-Z] ", "", l.strip())[:170])
+    sys.stdout.flush()
+run("two ~12K at once (fit)", [("M1", text(21, 310), 128), ("M2", text(22, 310), 128)])
+run("two ~40K at once (do not fit together in 64K)", [("L1", text(31, 1040), 128), ("L2", text(32, 1040), 128)])
+run("one short after", [("S1", text(14, 25), 64)])

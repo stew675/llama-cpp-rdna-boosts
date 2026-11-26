@@ -1,10 +1,10 @@
-From c7bd103392c4a9610a7eb58a019d5706ea4c30a0 Mon Sep 17 00:00:00 2001
+From 4cd2287c07e817ea6d9c70f8ef8044c8a80af6d4 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Mon, 16 Nov 2026 23:43:27 -0600
 Subject: [PATCH 16/18] rdna-boosts: block 16: the server's prompt admission
  policy -- max-min fair share of the step, an interactive batch size (-ib)
- that applies only while a decoder waits, a shortest-remaining skew and the
- prefill/decode duty cycle
+ that applies only while a decoder waits, a shortest-remaining skew, the
+ prefill/decode duty cycle, and the KV admission of a whole task
 
 A batch is assembled once per step and cannot be joined mid-flight, so the policy that
 decides WHICH prompt tokens enter that step also decides how long every other slot waits.
@@ -28,26 +28,70 @@ decides WHICH prompt tokens enter that step also decides how long every other sl
     duration, so a decoder gets a burst at the decode-only step time instead of one token
     per slow step.
 
-Measured (r306, one R9700, 4B Q8_0, -b 2048 -ub 512, lone 8401-token prompt, nothing
-decoding): the default and -ib 512 both prefill in 2048-wide steps, 18 x 512 -> 6 x 2048.
-With a decoder already generating, the prefilling slot's step list is IDENTICAL to before
-(511 x 9, 486, 511, 1, 4) at the same wall time, and the decoder's rate while a prompt runs
-is 137 tokens per 2.18 s at -ib 512 against 69 per 1.48 s at -ib 2048 (worst gap 89 vs
-276 ms).  Flash-Next IQ3_XXS with host-resident experts (1 GPU, -ncmoe 47, -b/-ub 16384,
-8401 tokens): 18 x 512 = 683.7 t/s against 2 x 8400 = 1885.8 t/s (2.76x).
+New at r365 (contributor PR #370, briansp2020): the same policy now also decides whether a
+TASK is admitted at all, because with a unified KV cache -- the delivery's DEFAULT server,
+since -np -1 resolves to 4 slots and kv_unified = true -- every slot may use the whole
+context, so "a slot is free" says nothing about whether the prompt fits.  Two prompts whose
+sum exceeded the context were launched together and the failure landed in DECODE, where
+nothing can recover it: the retry loop can only clear IDLE slots (try_clear_idle_slots skips
+a processing one), so it halved n_batch to 1 and aborted a running slot (measured on r364 at
+-c 8192 -np 4 --kv-unified with two ~4.8k-token prompts: both HTTP 500 "Context size has
+been exceeded", and with a speculator "speculative batch index N is not inside the current
+sub-batch"; the same two prompts alone: both 200).
 
-The three GENERATED documents (tools/cli, tools/completion, tools/server) are regenerated at r338 for the
-`-of`/`--optional-features` option the block-09 tag layer adds (`llama-gen-docs`, checked by
-scripts/check-gen-docs.sh).  They live here because this is the last official block that touches
-common/arg.cpp -- never in the temporary 0300.
+  * server_slot_sched gains an injected `admit` oracle (std::function<bool(const
+    server_task &)>) and server_slot_plan a `why` (none / no_slot / no_capacity).  select()
+    asks the oracle ONCE, before a candidate is chosen, so the predicate is a whole-request
+    go/no-go and the scheduler learns nothing about cells, reserves or margins; a refusal
+    travels the existing "plan.id_slot == -1 -> queue_tasks.defer()" path, so there is no
+    second defer site, pop_deferred_task() and /metrics' n_tasks_deferred cover it for free,
+    and a prompt pinned to an idle id_slot is refused by the same path.
+  * The server context owns the accounting (kv_admit_ok): each RUNNING slot is charged
+    max(its prompt, its task's tokens) plus a reply reserve.  Idle slots are not charged (the
+    launch path parks the residents and then clears them for want of room) and neither is a
+    realtime slot waiting for audio (is_processing() but no batch work).  With nothing
+    running a task is always admitted, so a prompt that fits the context alone is never
+    starved.
+  * LLAMA_SERVER_KV_ADMIT_RESERVE (default min(n_ctx / n_parallel, n_ctx_slot()) cells, the
+    per-sequence share a non-unified cache would give each slot) is the reply space charged
+    per request, capped by the request's own n_predict.  LLAMA_SERVER_KV_ADMIT=0 restores
+    the pre-r365 server exactly.  Inert without --kv-unified.
+  * A release wakes exactly one deferred task, so a task that is re-offered and refused
+    again would wait for an unrelated request: update_slots() re-offers one when NO slot is
+    processing -- the condition that makes the wake provably spin-free, since the popped
+    task is then always admitted.
+  * A task that was never launched is answered at termination: server_context::terminate()
+    drains the deferred queue (server_queue::take_deferred_tasks) and aborts the running
+    slots.  Without it a SIGTERM with a deferred task pending never returned -- the exit
+    hung in HIP's teardown because server_http_context::join() waits for an HTTP worker
+    waiting on a result nothing produced.  PRE-EXISTING (the stock "no free slot" deferral
+    escaped it because the release path launches the task and then aborts it).
+
+Measured (r365, one R9700, 4B Qwen3.5 Q8_0, -c 8192 -np 4 --kv-unified): two copies of
+prompts/prose-rdna-boosts.txt (5246 tokens, cache_prompt false) answer 500/500 on
+LLAMA_SERVER_KV_ADMIT=0 and 200/200 with it, at 2.1 s then 4.0 s (serialised), and BOTH
+answers are 1dfd5ced6f3e -- the same text the prompt gives when it runs alone, the deferred
+one re-prefilling all 5246 tokens.  A pair that fits is untouched (no deferral, text equal
+to the kill-switch arm), four overlapping prompts drain in order, the reserve census reads
+2048 at -c 8192 / 4096 at -c 16384 / 256 with LLAMA_SERVER_KV_ADMIT_RESERVE=256 / +n_predict
+when the request caps it, a non-unified server defers nothing, SIGTERM with three pending
+deferrals exits in 0.1 s (it never returned before), and a waiting task adds no CPU while
+the server idles at 0 ticks after the drain.  Gate: scripts/gate-kv-admit.sh (MANIFESTS.md
+gate 46), whose --self-test runs every arm on the kill switch and rejects it on 12 checks.
+Knobs: ENVIRONMENT.md 29 / DIAGNOSTIC.md 29.  Record: WORKLOG.md 261126.001, INVARIANTS.md
+r365, patches/README.md block 16.
 ---
- common/arg.cpp                  |  17 ++
- common/common.h                 |  10 +
- tools/cli/README.md             |  18 +-
- tools/completion/README.md      |  14 +-
- tools/server/README.md          |  19 +-
- tools/server/server-context.cpp | 342 +++++++++++++++++++++++++++++++-
- 6 files changed, 404 insertions(+), 16 deletions(-)
+ common/arg.cpp                     |  17 ++
+ common/common.h                    |  10 +
+ tools/cli/README.md                |  18 +-
+ tools/completion/README.md         |  14 +-
+ tools/server/README.md             |  19 +-
+ tools/server/server-context.cpp    | 469 ++++++++++++++++++++++++++++-
+ tools/server/server-queue.cpp      |  11 +
+ tools/server/server-queue.h        |   4 +
+ tools/server/server-slot-sched.cpp |  13 +-
+ tools/server/server-slot-sched.h   |  24 ++
+ 10 files changed, 579 insertions(+), 20 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index f7cd72d85..ee0bbac3e 100644
@@ -290,10 +334,10 @@ index 3c89ff19d..f5b262254 100644
  | `--spec-draft-n-start N` | initial adaptive MTP draft depth: the first verify round of each generation starts here instead of the default cold start.  Clamped to [--spec-draft-n-min-adaptive, --spec-draft-n-max].  Use it to start deeper when the workload settles high (e.g. verbatim recall) or shallower for a short generation at a deep context, where a wide verify batch costs more.  Unset: three steps below the ceiling, bounded by the floor.<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_START) |
  | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index fde607ac3..0a030aa6f 100644
+index fde607ac3..196e0bfff 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -1165,6 +1165,81 @@ private:
+@@ -1165,8 +1165,112 @@ private:
  
      int n_empty_consecutive = 0;
  
@@ -374,8 +418,39 @@ index fde607ac3..0a030aa6f 100644
 +
      std::unique_ptr<server_prompt_cache> prompt_cache;
  
++    // LLAMA_SERVER_KV_ADMIT (on unless 0): with a unified KV cache, admit a task only when the cells the running
++    // slots hold, plus this prompt, plus a generation reserve for each of them, fit the context -- otherwise defer
++    // it, through the scheduler's refusal, so it travels the stock "no slot -> defer" path and the stock release
++    // wake re-offers it, instead of launching it into a cache that the prompts already running will need.  Without
++    // the check both prompts prefill side by side until the cache is full, and the decode retry loop can only clear
++    // IDLE slots (try_clear_idle_slots skips a processing one), so it halves n_batch until a RUNNING slot fails
++    // mid-generation: HTTP 500 "Context size has been exceeded." (measured), or with a speculator "speculative
++    // batch index N is not inside the current sub-batch".  This is a PRE-LAUNCH veto: once launch_slot_with_task()
++    // has run, the prompt is committed and there is no later point at which the request can be held back.  Inert
++    // without `--kv-unified` (a per-slot cache gives every slot its own room, so no slot can take another's cells),
++    // and for a parent task (its children are launched together and a child's prompt is the parent's).
++    const bool kv_admit = [] {
++        const char * e = getenv("LLAMA_SERVER_KV_ADMIT");
++        return e == nullptr || atoi(e) != 0;
++    }();
++
++    // LLAMA_SERVER_KV_ADMIT_RESERVE (cells; -1 = the default, resolved once the context exists): the room reserved
++    // for each admitted request's REPLY on top of its prompt.  The default is min(n_ctx / n_parallel, n_ctx_slot())
++    // -- the per-sequence share a NON-unified cache would give each slot -- so a unified cache admits, and keeps
++    // admitting, as many concurrent requests as its slots were promised room for, and the request that could not
++    // finish its reply beside the others is the one that waits.  A request's own n_predict caps its reserve further
++    // (`n_predict: 32` reserves 32 cells, not a whole share); -1 ("as many as the context allows") reserves in full.
++    // The reserve is an ADMISSION heuristic, not a bound: a reply that grows past it can still fill the cache and
++    // fail the way it did before (the accepted limitation in MANIFESTS.md's block-16 row).
++    int32_t kv_admit_reserve = [] {
++        const char * e = getenv("LLAMA_SERVER_KV_ADMIT_RESERVE");
++        return e == nullptr ? -1 : std::max(0, atoi(e));
++    }();
++
      // LLAMA_SERVER_LAZY_IDLE_SLOTS (on unless 0): with a unified KV cache, an idle slot keeps its context when a new task
-@@ -1419,6 +1494,32 @@ private:
+     // starts and is saved to the prompt cache and cleared only once the KV cache runs out of room, so conversations that
+     // take turns on their own slots do not copy their whole state to host memory and back on every switch
+@@ -1419,6 +1523,32 @@ private:
  
      // load the model and initialize llama_context
      // this may also be called to resume from sleeping state
@@ -408,7 +483,7 @@ index fde607ac3..0a030aa6f 100644
      bool load_model(common_params & params) {
          load_progress_data load_progress_text  (this, "text_model");
          load_progress_data load_progress_mmproj(this, "mmproj_model");
-@@ -1431,6 +1532,8 @@ private:
+@@ -1431,6 +1561,8 @@ private:
          params_base.n_outputs_max = output_limits.total;
          params_base.n_outputs_max_per_seq = output_limits.per_seq;
  
@@ -417,10 +492,23 @@ index fde607ac3..0a030aa6f 100644
          const bool has_mmproj = !params.mmproj.path.empty();
          const bool has_draft = params.speculative.has_dft() && params.speculative.uses_dft();
          const bool spec_mtp = params_base.speculative.has_mtp();
-@@ -1704,6 +1807,15 @@ private:
+@@ -1704,6 +1836,28 @@ private:
          SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                  params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
  
++        // KV admission: resolve the generation reserve now that the context exists, and hand the scheduler its
++        // oracle (a null predicate admits everything, which is what LLAMA_SERVER_KV_ADMIT=0 has to mean)
++        if (kv_admit_reserve < 0) {
++            const int64_t n_ctx_total = llama_n_ctx(ctx_tgt);
++            const int64_t n_share     = n_ctx_total / std::max(1, params_base.n_parallel);
++            kv_admit_reserve = (int32_t) std::max<int64_t>(1, std::min(n_share, (int64_t) n_ctx_slot()));
++        }
++        slot_sched.admit = kv_admit ? std::function<bool(const server_task &)>([this](const server_task & t) {
++            return kv_admit_ok(t);
++        }) : nullptr;
++        SRV_INF("KV admission: %s, reserve = %d cells/request, unified = %s\n",
++                kv_admit ? "on" : "off", kv_admit_reserve, params_base.kv_unified ? "true" : "false");
++
 +        // the prompt admission policy, so a log always says which one ran (wip/session-scheduling)
 +        // `chunk` is the cap on a step that carries decode work; a step with no decoder waiting takes the
 +        // whole window (`no-decode = n_batch`), which is why the chunk is not a throughput setting.
@@ -433,7 +521,56 @@ index fde607ac3..0a030aa6f 100644
          // initialize slots
          for (int i = 0; i < params_base.n_parallel; i++) {
              slots.emplace_back();
-@@ -2144,6 +2256,119 @@ private:
+@@ -2042,6 +2196,48 @@ private:
+         return res;
+     }
+ 
++    // LLAMA_SERVER_KV_ADMIT: the cells an admitted request is charged.  `n_prompt` is what it will hold -- a
++    // running slot's committed prompt OR its request's prompt, whichever is larger, because a slot that has not
++    // prefilled yet holds nothing but is about to hold its whole prompt; the reserve is for its reply, capped by
++    // its own n_predict.
++    int64_t kv_admit_cells(const server_task & task, int64_t n_prompt) const {
++        const int32_t n_predict = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
++        const int64_t reserve   = n_predict >= 0 ? std::min<int64_t>(n_predict, kv_admit_reserve) : kv_admit_reserve;
++        return n_prompt + reserve;
++    }
++
++    // LLAMA_SERVER_KV_ADMIT, the oracle server_slot_sched::admit asks before it picks a slot: may this task be
++    // launched now?  A refusal defers it until a slot is released (the member's comment says why this is the only
++    // point at which a request can be held back).  Slot-INDEPENDENT by contract -- see server_slot_sched::admit.
++    bool kv_admit_ok(const server_task & task) const {
++        if (!kv_admit || !params_base.kv_unified || task.is_parent() || task.n_tokens() <= 0) {
++            return true;
++        }
++        int64_t n_held = 0;
++        int     n_run  = 0;
++        for (const auto & other : slots) {
++            // an idle slot does not count: the launch path parks the residents and clears them for want of room
++            // (park_idle_slots_for_launch / try_clear_idle_slots), so an idle slot never has to be waited for.  A
++            // realtime slot WAITING FOR AUDIO does not count either: it is_processing() but holds no batch work
++            // (update_slots' all_idle counts it idle for the same reason), and charging it here would refuse a
++            // task that no release can ever make room for.
++            if (!other.is_processing() || other.audio_wait || other.task == nullptr) {
++                continue;
++            }
++            n_run  += 1;
++            n_held += kv_admit_cells(*other.task, std::max<int64_t>(other.task->n_tokens(), other.prompt.n_tokens()));
++        }
++        const int64_t n_need = kv_admit_cells(task, task.n_tokens());
++        // with nothing running the task always launches, so a prompt that fits the context on its own is never
++        // starved by this
++        if (n_run == 0 || n_held + n_need <= llama_n_ctx(ctx_tgt)) {
++            return true;
++        }
++        SRV_INF("KV admission: task %d needs %" PRId64 " cells, %d running slot(s) hold %" PRId64 " of %d; deferred until a slot is released\n",
++                task.id, n_need, n_run, n_held, (int) llama_n_ctx(ctx_tgt));
++        return false;
++    }
++
+     // call only when the task is sure to launch on the slot
+     void update_prompt_cache(server_slot & slot, const server_task & task) {
+         SRV_TRC("%s", "updating prompt cache\n");
+@@ -2144,6 +2340,119 @@ private:
          }
      }
  
@@ -553,7 +690,47 @@ index fde607ac3..0a030aa6f 100644
      // return true if at least one slot has been cleared
      // TODO: improve logic
      //       - smarter decision which slot to clear (LRU or longest prompt?)
-@@ -4300,6 +4525,101 @@ private:
+@@ -3337,7 +3646,11 @@ private:
+ 
+                     if (slot == nullptr) {
+                         // if no slot is available, we defer this task for processing later
+-                        SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
++                        if (plan.why == server_slot_refusal::no_capacity) {
++                            SRV_DBG("no room in the KV cache for the prompt, defer task, id_task = %d\n", id_task);
++                        } else {
++                            SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
++                        }
+                         queue_tasks.defer(std::move(task));
+                         break;
+                     }
+@@ -3886,6 +4199,26 @@ private:
+ 
+                 metrics_flush_idle();
+ 
++                // KV admission refuses a task that does not fit BESIDE the slots that run, and a released slot wakes
++                // exactly one deferred task: so a task that is re-offered and refused again (it still does not fit,
++                // or the released slot went to a newer request) waits for an unrelated request to finish.  With no
++                // slot processing at all every deferred task is admitted (kv_admit_ok's n_run == 0), so re-offer
++                // one.  The condition is deliberately "nothing is processing", not this branch's all_idle: a
++                // realtime slot waiting for audio is is_processing() and the loop still counts it idle, and
++                // re-offering into that state is refused again -- the wake would spin.
++                if (kv_admit && queue_tasks.queue_tasks_deferred_size() > 0) {
++                    bool any_processing = false;
++                    for (const auto & slot : slots) {
++                        if (slot.is_processing()) {
++                            any_processing = true;
++                            break;
++                        }
++                    }
++                    if (!any_processing) {
++                        queue_tasks.pop_deferred_task(-1);
++                    }
++                }
++
+                 return; // skip further processing
+ 
+             } else {
+@@ -4300,6 +4633,101 @@ private:
          auto & alora_scale       = batch.alora_scale;
          auto & alora_disabled_id = batch.alora_disabled_id;
  
@@ -655,7 +832,7 @@ index fde607ac3..0a030aa6f 100644
          // next, batch any pending prompts without exceeding n_batch
          if (params_base.cont_batching || batch.size() == 0) {
              bool add_ok = true; // false means the batch is full, skip remaining slots
-@@ -4313,6 +4633,13 @@ private:
+@@ -4313,6 +4741,13 @@ private:
                      return;
                  }
  
@@ -669,7 +846,7 @@ index fde607ac3..0a030aa6f 100644
                  // check if we can batch this slot with the previous one
                  if (slot_batched && !slot_batched->can_batch_with(slot)) {
                      return;
-@@ -4772,8 +5099,12 @@ private:
+@@ -4772,8 +5207,12 @@ private:
  
                      const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
  
@@ -684,7 +861,7 @@ index fde607ac3..0a030aa6f 100644
                          // get next token to process
                          llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                          if (cur_tok == LLAMA_TOKEN_NULL) {
-@@ -4849,6 +5180,9 @@ private:
+@@ -4849,6 +5288,9 @@ private:
                      // the number of tokens added to the batch for the current slot
                      const auto n_tokens_cur = batch.size() - n_tokens_prev;
  
@@ -694,7 +871,7 @@ index fde607ac3..0a030aa6f 100644
                      const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
  
                      const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
-@@ -4913,6 +5247,10 @@ private:
+@@ -4913,6 +5355,10 @@ private:
                  }
              });
          }
@@ -705,6 +882,162 @@ index fde607ac3..0a030aa6f 100644
      }
  
      // see https://github.com/ggml-org/llama.cpp/pull/29969
+@@ -5535,6 +5981,23 @@ void server_context::start_loop() {
+ 
+ void server_context::terminate() {
+     impl->queue_tasks.terminate();
++
++    // A deferred task was never launched, so no slot, release or abort will ever answer it, and its HTTP worker sits
++    // in the response reader until something does -- and `server_http_context::join()`, which runs before the process
++    // exits, waits for that worker.  A request left in the deferred queue therefore hangs the exit inside HIP's
++    // teardown (measured: a SIGTERM with 3 tasks deferred by KV admission never returned, while the stock "no free
++    // slot" deferral exits cleanly because the release path launches the task and then aborts it like any other).
++    for (auto & task : impl->queue_tasks.take_deferred_tasks()) {
++        impl->send_error(task, "the server is shutting down");
++        for (auto & child : task.child_tasks) {
++            impl->send_error(child, "the server is shutting down");
++        }
++    }
++
++    // ... and the same for a slot that is still working: its reader waits on a result that the terminated queue will
++    // no longer produce, and nothing else aborts it on the way out (the connection-close cancel is racy against the
++    // HTTP server stopping).
++    impl->abort_all_slots("the server is shutting down");
+ }
+ 
+ llama_context * server_context::get_llama_context() const {
+diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
+index 75daebb0d..e59c6e063 100644
+--- a/tools/server/server-queue.cpp
++++ b/tools/server/server-queue.cpp
+@@ -112,6 +112,17 @@ void server_queue::pop_deferred_task(int id_slot) {
+     condition_tasks.notify_one();
+ }
+ 
++std::vector<server_task> server_queue::take_deferred_tasks() {
++    std::unique_lock<std::mutex> lock(mutex_tasks);
++    std::vector<server_task> res;
++    res.reserve(queue_tasks_deferred.size());
++    for (auto & task : queue_tasks_deferred) {
++        res.push_back(std::move(task));
++    }
++    queue_tasks_deferred.clear();
++    return res;
++}
++
+ void server_queue::wait_until_no_sleep() {
+     std::unique_lock<std::mutex> lock(mutex_tasks);
+     if (sleeping) {
+diff --git a/tools/server/server-queue.h b/tools/server/server-queue.h
+index f9d66be64..c6f9c9a12 100644
+--- a/tools/server/server-queue.h
++++ b/tools/server/server-queue.h
+@@ -66,6 +66,10 @@ public:
+     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
+     void pop_deferred_task(int id_slot);
+ 
++    // Remove every deferred task and hand them back.  For a shutdown: a deferred task was never launched, so no
++    // slot, release or abort will ever answer it, and its HTTP worker waits on its result until something does.
++    std::vector<server_task> take_deferred_tasks();
++
+     // if sleeping, request exiting sleep state and wait until it is done
+     // returns immediately if not sleeping
+     // the server then stays awake until the caller calls release_inflight()
+diff --git a/tools/server/server-slot-sched.cpp b/tools/server/server-slot-sched.cpp
+index c6e2738aa..bd2eed2a6 100644
+--- a/tools/server/server-slot-sched.cpp
++++ b/tools/server/server-slot-sched.cpp
+@@ -432,6 +432,13 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
+ 
+     bool update_cache = false;
+ 
++    // the KV admission verdict comes FIRST, before any candidate is considered: it is a whole-request decision
++    // (see `admit`), so it cannot depend on which slot would have been picked, and asking it here means a request
++    // that cannot fit is deferred exactly like one that finds no slot -- the caller needs no second defer site
++    if (admit && !admit(task)) {
++        return { -1, false, server_slot_refusal::no_capacity };
++    }
++
+     // if a specific slot is requested, use it (still goes through cache update logic below)
+     if (task.id_slot != -1 && !slots.empty()) {
+         // note: allow id_slot to be out of bounds (wrap around)
+@@ -447,7 +454,7 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
+         if (ret) {
+             // a busy slot is returned untouched, the caller defers the task
+             if (ret->is_processing) {
+-                return { ret->id, false };
++                return { ret->id, false, server_slot_refusal::no_slot };
+             }
+ 
+             SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+@@ -526,11 +533,11 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
+     }
+ 
+     if (ret == nullptr) {
+-        return {};
++        return { -1, false, server_slot_refusal::no_slot };
+     }
+ 
+     // cache prompts only for the tasks that reuse them
+     update_cache = update_cache && !task.is_stateless();
+ 
+-    return { ret->id, update_cache };
++    return { ret->id, update_cache, server_slot_refusal::none };
+ }
+diff --git a/tools/server/server-slot-sched.h b/tools/server/server-slot-sched.h
+index 1005ee09a..29ac89cc0 100644
+--- a/tools/server/server-slot-sched.h
++++ b/tools/server/server-slot-sched.h
+@@ -3,6 +3,7 @@
+ #include "server-common.h"
+ #include "server-task.h"
+ 
++#include <functional>
+ #include <list>
+ #include <memory>
+ #include <vector>
+@@ -128,18 +129,41 @@ struct server_slot_info {
+     const server_prompt * prompt = nullptr;
+ };
+ 
++// why the plan refused the task.  The caller defers the task either way (and the same release wake re-offers it),
++// so this is not a control path: it exists because "no slot is available" is the wrong thing to print when a slot
++// IS free and the request cannot be admitted into the KV cache, and because a gate needs a non-vacuous count.
++enum class server_slot_refusal {
++    none = 0,     // a slot was chosen (id_slot >= 0)
++    no_slot,      // every slot is busy, or the task's own pinned slot is
++    no_capacity,  // a free slot exists, but the task cannot be admitted into the KV cache right now
++};
++
+ struct server_slot_plan {
+     // -1 if no slot is available; a busy slot if the task asks for it by id, the caller defers the task
+     int id_slot = -1;
+ 
+     // save the slot state to the prompt cache, then load the best match for the task
+     bool update_cache = false;
++
++    // id_slot == -1: why, so the caller logs the honest reason
++    server_slot_refusal why = server_slot_refusal::no_slot;
+ };
+ 
+ // decides only, the caller applies the plan
+ struct server_slot_sched {
+     float slot_prompt_similarity = 0.0f;
+ 
++    // The KV admission ORACLE: may this task be admitted into the KV cache at all right now?  Injected by the
++    // owner (the server context, which owns the context size and the slots' held cells), so the scheduler stays a
++    // decision object that knows nothing about cells, reserves or margins.  It is asked ONCE, before a candidate
++    // is chosen, and a refusal travels the caller's existing "no slot is available -> defer" path -- so there is
++    // no second defer site, the release wake and the deferred count cover it for free, and a prompt pinned to an
++    // idle `id_slot` is refused by the same path.  It therefore MUST stay slot-INDEPENDENT: a whole-request
++    // go/no-go, never "does it fit on this candidate" (that would have to be asked per candidate, inside the
++    // selection loops below, and a refinement such as "reuse this slot's resident prefix" would silently be
++    // wrong here).  Null = admit everything (the stock behaviour).
++    std::function<bool(const server_task &)> admit;
++
+     // idle slots that lose the least by being reused: empty slots first, then the least recently used ones
+     std::vector<int> get_free_slots(const std::vector<server_slot_info> & slots, size_t n_slots_needed, int exclude_id_slot) const;
+ 
 -- 
 2.56.1
 

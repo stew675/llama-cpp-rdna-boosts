@@ -322,7 +322,7 @@ and Q8_0.  It cannot become default-on while width 1 keeps the K-split kernel: t
 | `GGML_HIP_FA_BAND_H128_MIN_WORK` | `20000` | tuning | The constant of that work gate: cells × passes the band must save before its per-launch cost is paid back.  `0` withholds the gate. |
 | `GGML_HIP_FA_BAND_H256_MIN_WORK` | `20000` | tuning | The constant of the 256-dim work gate.  `0` withholds the gate. |
 | `GGML_CUDA_FA_KV_NATIVE` / `GGML_CUDA_FA_MASK_SKIP` | unset | tuning | Native-KV and mask-skip paths. |
-| `GGML_CUDA_FA_STAGE_MAX_MB` | unset | tuning | The **per-operand** cap on a FA staging request (`0` = unbounded).  A K/V view larger than the cap is not staged at all (the native read is used); it also caps the growth hint, so it is the knob that bounds the arena on a deep prefill.  It is per operand because the arena request covers both: `=256` on a K+V op caps each at 256 MiB and the arena at 512 MiB.  `=1` is the "never stage" arm.  **Since r360 it also sizes `--fit`'s reserve for the arena, and only when the K/V pair can actually be staged**: a pair the kernels read natively (the delivery default `-ctk q8_0 -ctv q8_0`, and any other pair `ggml_cuda_fattn_tile_type` resolves to the operand's own type) reserves nothing, so the flat 1024 MiB that every quantized K cache used to claim is gone (`MANIFESTS.md` gate 44, GitHub issue #367). |
+| `GGML_CUDA_FA_STAGE_MAX_MB` | unset | tuning | The **per-operand** cap on a FA staging request (`0` = unbounded).  A K/V view larger than the cap is not staged at all (the native read is used); it also caps the growth hint, so it is the knob that bounds the arena on a deep prefill.  It is per operand because the arena request covers both: `=256` on a K+V op caps each at 256 MiB and the arena at 512 MiB.  `=1` is the "never stage" arm.  **Since r360 it also sizes `--fit`'s reserve for the arena, and only when the K/V pair can actually be staged**: a pair the kernels read natively (the delivery default `-ctk q8_0 -ctv q8_0`, and any other pair `ggml_cuda_fattn_tile_type` resolves to the operand's own type) reserves nothing, so the flat 1024 MiB that every quantized K cache used to claim is gone (`MANIFESTS.md` gate 46, GitHub issue #367). |
 | `GGML_CUDA_FA_STAGE_CHUNK` | off (`0`/unset) | **opt-in** | `<rows>` = the FA prefill staging becomes a **KV-chunked ring**: the prefill is launched one KV chunk at a time over ONE slot of `<rows>` F16 rows per operand instead of converting the whole prefix first, and the launcher merges the chunks with an online softmax.  The staging transient becomes O(chunk) and flat at any depth, so **use it when the prefix-sized transient is what hurts** (tight VRAM against `--fit`, or Windows/WDDM where the late arena step lands in shared memory).  Cost: ~1.5 % of prefill per chunk beyond the second, and the same shape applies to prefill-logit drift.  Rows are rounded to `lcm(nbatch_fa, FATTN_KQ_STRIDE)` and chunking only engages at ≥ 2 chunks.  **On a slab config (`-ncmoe` host experts) leave it off** — that arena already comes out of the wide-aux region and is released at the drop.  `GGML_CUDA_FA_STAGE_CHUNK_DEBUG=1` prints one `FA_CHUNK` decision line per op — the census a chunked arm needs, since a chunked arm that never engages reads as a flat no-op. |
 | `GGML_CUDA_FA_STAGE_PREALLOC` | **`1`** | tuning (opt-in `2`) | Growth policy of the prefill staging arena: `0` = the plain 1.25× ladder, `1` = the default (a growth aims for at most 4× the request), `2` = **eager**, allocating the root-based hint in one go at the first request — the answer for Windows/WDDM, where a freed allocation stays committed and a late step lands in shared memory, at the cost of the full peak.  The growth is capped upwards by the F16 size of the K/V view roots and the hint is honoured only while the free cap allows it.  **It is a ceiling, not a target** (r156, issue #237).  `GGML_CUDA_SLAB_STATS=1` prints one growth line per allocation. |
 | `LLAMA_QSA_KEYS_ONLY`, `LLAMA_QSA_PLE_HOSTGATHER`, `LLAMA_QSA_DENSE_SHORTCUT`, `LLAMA_QSA_SCORE_BOUNDS`, `LLAMA_QSA_SCORE_STRIP`, `LLAMA_QSA_SCORE_WMMA`, `LLAMA_QSA_SCORE_WMMA_MB`, `GGML_CUDA_QSA_IDENTITY`, `GGML_CUDA_QSA_SLICES`, `GGML_CUDA_QSA3`, `GGML_CUDA_QSA_INDEXER_CACHE`, `GGML_CUDA_QSA_INDEXER_SCORE`, `GGML_QSA_DERIVED_BIAS`, `GGML_QSA_DERIVED_VIS`, `GGML_QSA_SCORE_MEM` | off / unset | tuning | QSA variants and indexer tuning.  (`GGML_CUDA_QSA_INDEXER_SCORE` has no `test-backend-ops` oracle: its reference is the per-op chain, and `gate-qwen4exp-quant-coherence.sh` requires the sparse arm's text to equal its chain arm byte for byte.) |
@@ -771,6 +771,26 @@ nothing.  Without the hole the slab's work boundary stops 8.5 GiB lower, 51 expe
 layers hold what.
 
 *The two knobs that change this, and the residency-map diagnostic, are in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §28.*
+
+## 29. The server's KV admission: the generation reserve (block 16, r365)
+
+With a unified KV cache (the delivery's **default** server: `-np -1` resolves to 4 slots and `kv_unified = true`)
+the server now defers a request whose prompt cannot fit beside what the other slots already hold, instead of
+launching it into a cache the running prompts will need — the shape that used to answer HTTP 500 "Context size has
+been exceeded." (or, with a speculator, "speculative batch index N is not inside the current sub-batch") once two
+prompts together exceeded the context.  A deferred task is re-offered by the stock release wake, so it is serviced
+in turn, and it produces the same tokens as when it runs alone.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `LLAMA_SERVER_KV_ADMIT_RESERVE` | `min(n_ctx / n_parallel, n_ctx_slot())` cells | tuning | The reply space the admission charges for **each** admitted request: a request is admitted when every running slot's held cells plus this prompt, plus a reserve for every one of them, still fit the context.  The default is the per-sequence share a non-unified cache would have given each slot — so a unified cache admits as many concurrent requests as its slots were promised room for, and the one that could not finish its reply beside the others is the one that waits.  A request's own `n_predict` caps its reserve (`n_predict: 32` reserves 32 cells), and `-1` reserves the whole share.  It is an **admission heuristic, not a bound**: replies that grow past their reserves can still fill the cache and fail as before.  Smaller values admit more concurrent work and protect less; `0` admits on the prompts alone. |
+
+The startup line `KV admission: on, reserve = N cells/request, unified = true` states the configuration each run
+used, and every refusal is one INFO line with the numbers (`KV admission: task 2 needs 4884 cells, 1 running
+slot(s) hold 4887 of 8192; deferred until a slot is released`) — the non-vacuity reading for any A/B on this path.
+Gate: `scripts/gate-kv-admit.sh` (`MANIFESTS.md` gate 46).
+
+*The kill switch (and why turning it off is the pre-r365 behaviour) is in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §29.*
 
 ---
 

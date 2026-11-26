@@ -3604,3 +3604,37 @@ loses everywhere measurable, so the delivery's default went back to the dense fo
   `e2dde701fc04` on both arms, the eight coherence arms unchanged.  Gate: `scripts/gate-state-pipe.sh` +
   `scripts/gate-meta-seg-drain.sh`; the pair's own copy of these streams is `ggml_cuda_host_stream()`, which is pair
   machinery and lives in the beta artifact.
+
+**r365 — a unified cache's admission is a PRE-LAUNCH decision, and it belongs to the scheduler's oracle, not to a new defer site.**
+The delivery's default server is `-np -1` ⇒ 4 slots and `kv_unified = true` (`server.cpp`), and with a unified cache every
+slot may use the WHOLE context — so "a slot is free" says nothing about whether a prompt fits.  Two prompts whose sum
+exceeds the context used to be launched together, and the failure lands in **decode**, where nothing can recover it: the
+retry loop can only clear IDLE slots (`try_clear_idle_slots` skips a processing one), so it halves `n_batch` to 1 and aborts
+a *running* slot (measured on r364, `-c 8192 -np 4 --kv-unified`, two ~4.8k prompts: both HTTP 500 "Context size has been
+exceeded."; the same two prompts alone: both 200).  Facts that follow, and that a later change must not re-derive:
+(a) the only point at which a request can be held back is BEFORE `launch_slot_with_task()`, which commits the prompt —
+so a fit check is a pre-launch veto, not a per-step budget (block 16's fair share divides the step and is orthogonal);
+(b) the veto must be SLOT-INDEPENDENT: the accounting sums the *running* slots' held cells, and the candidate is always an
+idle one, so `server_slot_sched::select()` can ask the context's oracle once, before choosing a candidate, and the refusal
+travels the existing `plan.id_slot == -1 → queue_tasks.defer()` path — one defer site, so `pop_deferred_task()` and
+`/metrics`' `n_tasks_deferred` cover it for free (a second `defer()` call site would have to re-earn both);
+(c) IDLE slots must not be charged: the launch path parks the residents and then `try_clear_idle_slots()` clears them for
+want of room, so an idle slot never has to be waited for — charging it would defer a request for room that is already
+there.  A realtime slot waiting for audio must not be charged either: it is `is_processing()` but holds no batch work
+(`update_slots()`' `all_idle` counts it idle for the same reason), and charging it defers a task no release can rescue;
+(d) the reply reserve is `min(n_ctx / n_parallel, n_ctx_slot())` cells — the per-sequence share a non-unified cache would
+give each slot — capped by the request's own `n_predict`; it is an admission HEURISTIC, not a bound (a reply that outgrows
+it can still fill the cache and fail as before);
+(e) the wake must be provably spin-free: a release wakes exactly one deferred task, and a task that is re-offered and
+refused again would wait for an unrelated request, so `update_slots()` re-offers one when **no** slot is processing — that
+condition is the proof (with nothing processing the popped task is always admitted, so the loop makes progress).  Counting
+an audio-waiting slot as busy on the admission side but idle on the wake side is exactly how a wake spins at 100 % CPU;
+(f) a task that was never launched is answered at **termination**: `server_context::terminate()` drains
+`queue_tasks_deferred` (`server_queue::take_deferred_tasks()`) and aborts the running slots.  Without it a SIGTERM issued
+while a deferred task existed never returned — the exit hung inside HIP's teardown (`__hip_module_dtor` → `amd_comgr_destroy_metadata`), because
+`server_http_context::join()` waits for an HTTP worker that is still waiting on a result nothing will produce.  This was
+PRE-EXISTING (the stock "no free slot" deferral escaped it only because the release path launches the task and then aborts
+it); making deferral ordinary made it reliable.
+Text: a deferred-then-admitted request produces the SAME tokens as when it runs alone (measured: `gate-kv-admit.sh`'s
+purity arm, both answers `1dfd5ced6f3e` with `cache_prompt: false`, the deferred request re-prefilling all 5246 tokens).
+Gate: `scripts/gate-kv-admit.sh` (`MANIFESTS.md` gate 46); knobs `ENVIRONMENT.md` §29 / `DIAGNOSTIC.md` §29; PR #370.

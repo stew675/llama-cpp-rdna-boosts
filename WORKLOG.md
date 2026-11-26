@@ -16,6 +16,84 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.015 (r365) -- contributor PR #370 promoted into block 16: the server's KV admission (a task that cannot fit beside the running slots is deferred, through the SCHEDULER's oracle)
+
+**The assessment.**  PR #370 (`briansp2020`) reported that with a unified KV cache the server launches every request
+that finds a free slot, so two prompts whose sum exceeds the context both prefill until the cache is full and then
+**decode** fails: the retry loop can only clear idle slots, so it halves `n_batch` to 1 and answers HTTP 500 "Context
+size has been exceeded." (with a speculator, "speculative batch index N is not inside the current sub-batch").  Every
+claim checked out on the delivery, at 1/8th scale and with no contributor code: `-c 8192 -np 4 --kv-unified` (the
+DEFAULT server shape -- `-np -1` resolves to 4 slots and `kv_unified = true`), two ~4.85k-token prompts, one R9700,
+Qwen3.5-4B: both 500 in 0.8 s, versus both 200 and the two texts a lone run gives.  Their numbers, their reserve
+arithmetic, their two documented limits and their kill switch were all accurate; the patch applied cleanly to r364.
+
+**What changed in the integration (their one-block veto became the scheduler's decision).**  The submitted patch put
+the fit check after `slot_sched.select()`, using the chosen slot only to exclude itself from the sum (a test that can
+never fire -- the candidate is always idle), and logged a WARN per deferral.  The maintainer's review took it further
+than a hoist: the check has no business in `process_single_task` at all, because the *deferral* already has a home.
+`server_slot_sched` now carries an injected **oracle** (`std::function<bool(const server_task &)> admit`) and
+`server_slot_plan` a `why` (`none`/`no_slot`/`no_capacity`); `select()` asks it **once, before a candidate is chosen**,
+so the predicate stays slot-INDEPENDENT and the scheduler learns nothing about cells or reserves, and a refusal
+travels the stock `plan.id_slot == -1 -> defer` path.  One defer site, so `pop_deferred_task()` and `/metrics`'
+`n_tasks_deferred` cover it for free and a prompt pinned to an idle `id_slot` is refused by the same path.  The
+accounting (`kv_admit_ok`) stays in the context that owns `n_ctx`, and charges each *running* slot
+`max(its prompt, its task's tokens)` plus a reply reserve -- **idle** slots are not charged (the launch path parks the
+residents and then clears them for want of room) and neither is a realtime slot waiting for audio.
+
+**C (the maintainer's decision): the reserve is `min(n_ctx / n_parallel, n_ctx_slot())` cells**, not their flat 16384
+-- the per-sequence share a NON-unified cache would have given each slot, further capped by the request's own
+`n_predict`, with `LLAMA_SERVER_KV_ADMIT_RESERVE` as the override.  Measured by the census (the only place the
+formula is visible): 2048 at `-c 8192`/4 slots, 4096 at `-c 16384`/4 slots, 256 with the override, and
+prompt+`n_predict` when the request caps it.
+
+**Three defects found by stress-testing it, all fixed in the same block (no TODO).**
+1. **The idle wake could spin at 100 % CPU.**  `update_slots()`' `all_idle` counts a realtime slot waiting for audio
+   as idle, while the admission counted it as running: a re-offered task was refused again, `pop_deferred_task()` kept
+   the queue non-empty, and the loop never waited.  The wake now re-offers only when **no** slot is processing --
+   which is also the proof it cannot spin, since the popped task is then always admitted (an `audio_wait` slot is not
+   `is_processing()`-for-admission either, so the two sides agree).
+2. **SIGTERM hung with a deferred queue.**  A task that was never launched is answered by nothing, and
+   `server_http_context::join()` waits for its HTTP worker, so the exit died inside HIP's teardown
+   (`__hip_module_dtor` -> `amd_comgr_destroy_metadata`, three runs out of three; eu-stack attached).  **PRE-EXISTING**
+   -- the stock "no free slot" deferral escaped it only because the release path launches the task and then aborts it
+   -- but this feature makes the state ordinary.  `server_context::terminate()` now drains
+   `queue_tasks_deferred` (`server_queue::take_deferred_tasks()`, new) and aborts the running slots: exit in 0.1 s.
+3. **`LLAMA_SERVER_KV_ADMIT_RESERVE` was documented but never parsed** (my own first cut, caught by the census arm):
+   added, and the gate now asserts the override.
+
+**Stress campaign** (4B Qwen3.5 = a GDN hybrid, 1 GPU, `-c 8192`/`-c 16384`, 14 arms, ~2 h): a fitting pair is
+untouched (0 deferrals, text == the kill-switch arm); an overlap recovers with BOTH texts equal to the lone-run text
+(`1dfd5ced6f3e`, `cache_prompt: false`, the deferred request re-prefilling all 5246 tokens) and repeat-stable across
+runs; the kill switch reproduces 500/500; four overlapping prompts drain one at a time (2.1/3.9/5.7/7.6 s); a
+12-request mixed-size soak loses nothing; q8_0 K/V caches; a client aborting while deferred; SIGTERM with 3 pending
+deferrals; the idle CPU after a drain (0 ticks); and a no-spin arm that reads the log instead of CPU ticks (this box's
+decode saturates a core in every arm, so ticks cannot discriminate).
+
+**One unrelated pre-existing defect found and filed** (`TODO` #384): a **Gemma4** server aborts
+(`src/models/gemma4.cpp:646`, the prune mask must be in host memory) when TWO sequences are co-batched under
+`--kv-unified` -- no MTP, no speculation, and it reproduces with `LLAMA_SERVER_KV_ADMIT=0`; `-np 4` without
+`--kv-unified` is clean.  Upstream file (last touched by upstream #32342), so it is an `upstream/` candidate, not a
+block.  It also cost the campaign its MTP arm: the Gemma4 MTP overlap aborts before any deferral.
+
+**The cut.**  Block 16 amended in place (18 official + `0300` unchanged, 5 files instead of 3, +2 env vars);
+`v18-919794500-r365` = fork re-cut tip **`7ad7f533cbc6923a9ec4d78f00384901108236f5`**, base `919794500`, default tree
+**`21efb08247edc142c649d2dcda771abb73fee810`**; the two optional artifacts were re-cut against it (`0100` alone
+`3d7804c3d`, `0101` alone `f31b444f1`, cumulative `43ee504d4`).
+
+**The ladder.**  `validate-set.sh` green (19 default + 2 optional, strict apply, cumulative optional order, Windows
+portability 521 files, **0 unexplained** rung reconciliation: 21 blocks / 575 -> 577 files / 185 defines / 587 -> 589
+envs / 14 options -- the +2 files are `server-queue.{h,cpp}`, the +2 envs are the admission pair, 0 lost);
+`check-shlib-symbols.sh` 16/16; `check-gen-docs.sh` ok (no option added); coherence `1c5d32ac537d` on 1 and 3 GPUs
+(the repo's recorded 4B reference); `gate-prefill-logits.sh` **0.000000 / 100.000 %**; `gate-prefill-fairness.sh`
+**PASS** and its `--self-test` **PASS** (the gate still rejects the unfixed build); `gate-prefill-duty.sh` **PASS**
+(16 -> 133 decode tokens, 2.11x stretch, lone prefill +0.0 %); `gate-park-idle-slots.sh` **PASS** (every arm
+`park == lazyoff`); **`gate-kv-admit.sh` PASS** (all arms) and its **`--self-test` PASS** (12 failing checks on the
+kill switch); `check-gpu-faults.sh` clean in every gate's window.
+
+**The PR.**  Accepted as an amendment with those fixes: the reply on #370 records the design change (the oracle
+replaces the post-selection veto), the reserve default the maintainer chose, the two defects stress-testing found
+(the spin, the shutdown hang) and the one this campaign found for them (the Gemma4 assert, which is upstream's).
+
 ## 261125.014 (r364, release cut) -- tagged, the fork branch re-cut to `786bdfecd` and pushed; the ladder recorded, the images owed
 
 **The cut.**  `v18-919794500-r364` = fork re-cut tip `786bdfecdad311b5b7c5685b7bb4a63d2f06ccd8`, base `919794500`,
