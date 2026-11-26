@@ -16,6 +16,31 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261126.003 (r366, release cut) -- tagged, main and the fork pushed, the release assets published; the container images are building off-host
+
+**The cut.**  `v18-919794500-r366` (annotated tag, pushed) = fork re-cut tip
+`489810652b1c34d03b7a03a74f4dd15edc8805f4`, base `919794500`, base tree `916941663346eb86004bed77f74e90fcf9c43126`,
+default tree `82afebd108d63b6220884d41080009561f0821e2`, 18 official + 1 temporary = 19 default blocks; optional
+`0100` alone `1d7909492`, `0101` alone `791c489d6`, cumulative `f54c5d78e` (both re-cut against the new default tree
+and applied STRICTLY; their own diffs are unchanged).  The GitHub Release carries its 4 assets (`SHA256SUMS`,
+`patches.tar.gz`, `rdna-boosts-all.patch`, `release.json`); tier-1 CI green on `main` and on the tag.
+
+**The fork.**  `scripts/fork-refresh.sh --build --gates --push` re-cut `~/llama.cpp` from `patches/` (strict
+`git am`, 19 commits), asserted `tip 489810652 == release.json .tip` and the tree, built it, ran
+`check-shlib-symbols.sh` (**16/16**), the coherence gate and `gate-prefill-logits.sh`
+(**0.000000 / 100.000 %**, no GPU faults), and force-with-lease pushed (the lease read the old branch at
+`7ad7f533c`): `gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` reads
+**`489810652b1c34d03b7a03a74f4dd15edc8805f4`**, which is what `release.json.tip` records.  This is the same tip
+`radix` reproduced from the patches independently (261126.002), so the `.tip` contract holds across machines.
+
+**The images.**  The worker (`radiance`) picked the tag up on its next poll and started the two-line ROCm build
+off-host (`~/.cache/rdna-containers/build-v18-919794500-r366.log`); they are **OWED and unverified** until
+`scripts/build-containers.sh --verify-only` reads every tag resolved and every moving tag carrying this release
+(the check issue #364 exists for).  Nothing was built on the primary box.
+
+**Record.**  This entry is the release narrative; the change itself is 261126.001, the second-platform confirmation
+is 261126.002, and the measurement is `benchmarks/2026-11-26-issue-368-wide-band-coupling.md`.
+
 ## 261126.002 (r366) -- confirmed on the x16 box, the canonical tip reproduced on a second machine, and the #367 slab experiment backed up before the tree was re-cut there
 
 **The measurement.**  `radix` (1 x R9700, uncontended PCIe 5.0 **x16**, its own H2D probe **55.0 GB/s** against this
