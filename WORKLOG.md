@@ -16,6 +16,55 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261125.012 (r363, release cut) -- tagged, the fork branch re-cut to `5d7be81a9` and pushed, the images building off-host; the ladder recorded
+
+**The cut.**  `v18-919794500-r363` = fork re-cut tip `5d7be81a9ca79f692ce25514ccee67832122f871`, base `919794500`
+(tree `916941663346eb86004bed77f74e90fcf9c43126`), default tree `a03e4acf8053e8faa4ca462ea69f72a01b0fcc79`, 18
+official + 1 temporary = 19 default blocks, 2 optional (`0100` alone `b3cbae784`, `0101` alone `c76f2953e`,
+cumulative `b7df5dac5` — both still apply STRICTLY on the new default tree, and their recorded trees moved only
+because the r363 default tree moved).  The GitHub Release carries its 4 assets.
+
+**The ladder, in the order it ran** (every item on the delivery build, `~/bin/build-llama-rocm`, all profile):
+`validate-set.sh` green (19 default patches, 2 optional, cumulative optional tree, the Windows-portability and
+system-header checks); the rung reconciliation **0 unexplained** (21 blocks / 575 files / 185 defines / 586 -> 587
+envs / 14 options, `LLAMA_KV_POOL_DROP` counted as the one new key); `check-shlib-symbols.sh` 16/16;
+`check-gen-docs.sh` ok; `gate-prefill-logits.sh` **0.000000 / 100.000 %**; `gate-kv-residency.sh` **PASS**
+(window + pool + multi-device + the new two-request section: `pstale_ref`/`pstale_res`/`pstale_ctl`, the control
+reading 220 681 486 mismatching words); `gate-host-expert-text.sh --quick` 2/2 identical; coherence arms —
+2- and 3-device `-sm tensor` 4B, Flash-Next tensor plain and pool-declined, layer-split no-pool, 27B `-sm tensor`,
+35B-A3B `-ncmoe 40`, Flash-Next IQ4_NL — **every one bit-identical to the r362 build**; an MTP `draft-mtp` arm
+(Flash-Next + its sidecar) reading the same text (`7c5a512a8447`) **and the same acceptance** (`0.40860`, 38/93)
+on both builds; no GPU fault in any run's window (the journal's only faults are 2026-11-22 and 2026-11-24,
+pre-change).
+
+**Two policy gates were NOT run, deliberately, and this is the record of it.**  Item 2 (the MTP four-axis
+protocol) needs a model + draft pair and a 3000-token run per axis; the change cannot reach that path (the drop
+node exists only for a POOLED trunk cache, the MTP draft cache is never pooled, and the default path is
+bit-identical on the eight coherence arms), so a reduced text + acceptance arm was run instead of the four axes —
+the same treatment r361/r362 gave it.  Item 3 (`gate-uma-experts.sh`, block 15) is untouched by this change, and
+item 8 (idle-slot parking) is not reachable from it.  **Item 19 (`gate-kv-residency.sh`) DID run** — it is this
+change's own gate and it is the reason the fix is guarded.
+
+**The fork.**  `scripts/fork-refresh.sh --build --gates --push` re-cut the branch deterministically, asserted the
+tree, built it, ran its gates (shlib + coherence + prefill-logit KLD) and pushed (the confirmation prompt was
+answered by the same run's verification, then the push issued directly):
+`gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` reads **`5d7be81a9ca79f692ce25514ccee67832122f871`**,
+which is what `release.json.tip` records.
+
+**The contributor PR.**  #369 is squash-merged (the merge commit keeps `@briansp2020`'s authorship of the
+submitted patch), the campaign record is `archive/work/kv-pool-drop/` (patch verbatim + their run log + the
+promoted header), `wip/CAMPAIGNS.md` carries the "Promoted (r363)" note, and the `wip/` copy is deleted — no stub.
+The PR comment (7180841064) records what the delivery added beyond the patch, the two corrections to their table
+(the reference must pin `LLAMA_QSA_DENSE_DECODE_UNTIL=0`, and the "fully in VRAM" correction), the gfx1100/gfx1151
+results, and the `TODO` #378 experiment we offered to accept from them.
+
+**The images (owed, not yet verified).**  The worker (`radiance`) picked the tag up on its 20:30 poll
+(`new release v18-919794500-r363 (last built: v18-919794500-r362); building (attempt 1/3)`).  At the time of
+writing, `scripts/build-containers.sh --verify-only` still reads **8 missing / 15 present** (the r362 tags), which
+is the pre-build state and not a verdict: **the check that closes this release is that command AFTER the worker
+finishes** (issue #364 — a push's exit status is not proof).  Until it reads all 23 tags resolving and every moving
+tag carrying this release, the images are unverified.
+
 ## 261125.011 (r363) -- the pool fix cross-checked on gfx1100 and gfx1151, the beta artifact re-verified on the r363 tree, and TODO #378 gets its prime suspect (the pool was ON in the corruption run)
 
 **gfx1100 (`fingon`, ROCm 10.2.0-gfx1100, 1 GPU): the same defect, the same fix.**  `~/llama.cpp` reset to
