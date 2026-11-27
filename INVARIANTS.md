@@ -3806,4 +3806,4 @@ so the deliverable part of it is an opt-in switch for the 129..511 band.
 
 **Record.** `archive/work/flash-next-prefill/` (`RESULTS-session7.md` §6-§7, `REVIEW-squashed.md` §10-§12,
 `HANDOVER-session8.md`); `patches/README.md` blocks 09/10/12/15 (r369 amendments); `ENVIRONMENT.md` §1.3/§2/§31;
-`DIAGNOSTIC.md` §2/§28/§31; `TODO.md` #376-#379.
+`DIAGNOSTIC.md` §2/§28/§31; `TODO.md` #385-#391.
