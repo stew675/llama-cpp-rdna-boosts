@@ -1,0 +1,221 @@
+diff --git a/ggml/src/ggml-cuda/binbcast.cu b/ggml/src/ggml-cuda/binbcast.cu
+index f7c3a7322..0b4c65637 100644
+--- a/ggml/src/ggml-cuda/binbcast.cu
++++ b/ggml/src/ggml-cuda/binbcast.cu
+@@ -435,7 +435,65 @@ static void ggml_cuda_op_bin_bcast(
+     }
+ }
+ 
++// wip/flash-next-prefill D1: a DEDICATED broadcast-copy kernel for the dense F32 case.  `op_repeat` used to run
++// through the generic binary-broadcast kernel, which computes a broadcasted source index PER ELEMENT and moves
++// one scalar at a time: measured on the qwen4exp hyper-connection expansion ([2560 x 4 x 8192] F32, 846 calls in
++// an 89k prefill) it costs 2622 ms = 7.4 % of the op budget, i.e. ~3.1 ms for 335 MB = ~108 GB/s -- a third of
++// what a vectorised copy of the same bytes reaches.  When dim 0 matches and both tensors are dense F32, the
++// output is just ne1*ne2*ne3 copies of one contiguous row block, so one block copies one row with float4 loads.
++// Bit-identical: a copy is a copy.  `GGML_CUDA_REPEAT_VEC=0` restores the generic kernel (A/B and bisection).
++static __global__ void k_repeat_f32_vec(float * __restrict__ dst, const float * __restrict__ src,
++                                        const int64_t ne0, const int64_t ne1, const int64_t ne2,
++                                        const int64_t ne01, const int64_t ne02, const int64_t ne03) {
++    const int64_t b  = blockIdx.x;                 // one block per destination row
++    const int64_t i1 = b % ne1;
++    const int64_t r  = b / ne1;
++    const int64_t i2 = r % ne2;
++    const int64_t i3 = r / ne2;
++    const int64_t row = (i1 % ne01) + ne01 * ((i2 % ne02) + ne02 * (i3 % ne03));
++    const float4 * s4 = (const float4 *) (src + row * ne0);
++    float4 *       d4 = (float4 *)       (dst + b   * ne0);
++    const int64_t  n4 = ne0 >> 2;
++    for (int64_t j = threadIdx.x; j < n4; j += blockDim.x) {
++        d4[j] = s4[j];
++    }
++}
++
+ void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    // DEFAULT OFF: it is correct (text identical) but UNPROVEN.  At the widths this kernel actually sees -- the
++    // generation-width repeats, e.g. [2560 x 4 x 2] -- the op census shows no change (2683 vs 2671 ms), because the
++    // 89k-prefill REPEAT that costs 2622 ms (7.4 % of the op budget) is served by a FUSED window in
++    // `ggml-cuda-try-fuse.cu`, not by this dispatch.  Flip it on only with a per-width win; the prefill win has to
++    // be made inside that fusion (`RESULTS-session3.md` §11).
++    static const bool vec = [] {
++        const char * e = getenv("GGML_CUDA_REPEAT_VEC");
++        return e != nullptr && e[0] != '\0' && atoi(e) != 0;
++    }();
++    const ggml_tensor * src0 = dst->src[0];
++    if (vec && src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++        src0->ne[0] == dst->ne[0] && (dst->ne[0] & 3) == 0 &&
++        src0->ne[3] == 1 && src0->ne[2] <= dst->ne[2] && src0->ne[1] <= dst->ne[1] &&
++        ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
++        const int64_t n_rows = dst->ne[1] * dst->ne[2] * dst->ne[3];
++        if (n_rows > 0 && n_rows <= (int64_t) 0x7fffffff) {
++            k_repeat_f32_vec<<<(unsigned) n_rows, 256, 0, ctx.stream()>>>(
++                (float *) dst->data, (const float *) src0->data,
++                dst->ne[0], dst->ne[1], dst->ne[2], src0->ne[1], src0->ne[2], src0->ne[3]);
++            if (cudaGetLastError() == cudaSuccess) {
++                static const bool dbg = getenv("GGML_CUDA_REPEAT_VEC_DEBUG") != nullptr;
++                if (dbg) {
++                    static int n = 0;
++                    if (n++ < 4) {
++                        GGML_LOG_INFO("%s: repeat f32 vec path [%lld x %lld x %lld x %lld] rows=%lld\n", __func__,
++                                      (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2],
++                                      (long long) dst->ne[3], (long long) n_rows);
++                    }
++                }
++                return;
++            }
++            (void) cudaGetLastError();
++        }
++    }
+     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_repeat, 0>>(dst, dst->src[0], dst, nullptr, dst->src[0]->data, dst->data, ctx.stream());
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+index 558d46a24..7263fd23f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-try-fuse.cu
+@@ -2431,6 +2431,12 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
+         return n_mwr;
+     }
+ 
++    // wip/flash-next-prefill D1: the `weight_before_ffn` REPEAT + MUL pair (owned by moe-weighted-reduction.cu).
++    // GGML_CUDA_FUSE_MOE_WEIGHT=0 turns it off.
++    if (const int n_mwb = ggml_cuda_moe_weight_broadcast_try_fuse(*cuda_ctx, cgraph, i)) {
++        return n_mwb;
++    }
++
+     // Verify band: the residual ADD in front of such a norm is folded into the norm kernel (norm surface).
+     // GGML_CUDA_FUSE_ADD_RMS_Q8=0 turns it off.
+     if (const int n_add_rms_q8 = ggml_cuda_add_rms_q8_1_try_fuse(*cuda_ctx, cgraph, i)) {
+diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
+index d022a5097..c58e1a8f2 100644
+--- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu
++++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
+@@ -439,3 +439,114 @@ void ggml_cuda_mwr_fold_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph
+     ctx.mwr_fold_graph   = cgraph;
+     ctx.mwr_fold_idx     = i + 1;
+ }
++
++// ============================================================================================
++// wip/flash-next-prefill D1: the `weight_before_ffn` REPEAT + MUL pair of `build_moe_ffn`.
++//
++// src/llama-graph.cpp emits, for an arch that applies the routing weights BEFORE the expert FFN:
++//
++//     repeated = ggml_repeat_4d(cur, n_embd, n_expert_used, n_tokens, 1);   // [n_embd,1,T] -> [n_embd,K,T]
++//     cur      = ggml_mul(repeated, weights);                               // weights [1,K,T]
++//
++// The repeat MATERIALISES the broadcast: n_embd * K * T * 4 B (839 MB for the 89k Flash-Next prefill at
++// `-ub 8192`: 2560 x 10 x 8192 x 4), which the mul then reads back and writes again -- 2.5 GB of traffic per
++// layer per ubatch for one multiply per element.  Measured with GGML_CUDA_OP_TIMING on that shape: REPEAT
++// 2622 ms (7.4 % of the op budget) + MUL 1134 ms (3.2 %) = 3.76 s, 10.6 % of the whole op set.
++//
++// The fusion writes the product directly, `dst[j,k,t] = src[j,t] * w[k,t]`, which is the SAME two F32 operands
++// multiplied ONCE in F32 -- bit-identical, not an approximation (this is why it needs no KLD allowance).
++// Anchored at the REPEAT: it is served here and the MUL is skipped, so the materialised buffer is never
++// written.  Declines (and the pair runs unfused) unless the repeat is a pure dim-1 broadcast with exactly one
++// consumer, the mul is the same shape, both are contiguous F32, and the fusion-window range check passes.
++// GGML_CUDA_FUSE_MOE_WEIGHT=0 is the kill switch (A/B and bisection).
++// ============================================================================================
++
++static __global__ void moe_weight_broadcast_kernel(float * __restrict__ dst, const float * __restrict__ src,
++                                                    const float * __restrict__ w, int64_t n_embd, int64_t n_used) {
++    // One block per (token, expert) row: the row's activation segment `src[t]` times ONE scalar weight.
++    const int64_t row = blockIdx.x;          // t * n_used + k == the row of `w`
++    const float   wv  = w[row];
++    const float * s   = src + (row / n_used) * n_embd;
++    float *       d   = dst + row * n_embd;
++    if ((n_embd & 3) == 0) {
++        const float4 * s4 = (const float4 *) s;
++        float4 *       d4 = (float4 *) d;
++        const int64_t  n4 = n_embd >> 2;
++        for (int64_t j = threadIdx.x; j < n4; j += blockDim.x) {
++            float4 v = s4[j];
++            v.x *= wv; v.y *= wv; v.z *= wv; v.w *= wv;
++            d4[j] = v;
++        }
++        return;
++    }
++    for (int64_t j = threadIdx.x; j < n_embd; j += blockDim.x) {
++        d[j] = s[j] * wv;
++    }
++}
++
++static bool ggml_cuda_fuse_moe_weight_on() {
++    // DEFAULT OFF: measured 2305.9 vs 2412.1 t/s (-4.4 %) on the Flash-Next 89k prefill against the unfused
++    // pair, with identical text.  `GGML_OP_MUL` is in-place-capable, so the unfused pair already writes the
++    // broadcast ONCE and multiplies it in place -- there is no second 839 MB buffer to remove, and this fusion
++    // adds a redundant source re-read plus a second live buffer.  Kept only as the record of that measurement
++    // (`wip/flash-next-prefill/RESULTS-session3.md`); a vectorised REPEAT kernel is the win instead.
++    static const bool on = [] {
++        const char * e = getenv("GGML_CUDA_FUSE_MOE_WEIGHT");
++        return e != nullptr && e[0] != '\0' && atoi(e) != 0;
++    }();
++    return on;
++}
++
++static bool ggml_cuda_fuse_moe_weight_debug() {
++    static const bool on = [] { const char * e = getenv("GGML_CUDA_FUSE_MOE_WEIGHT_DEBUG"); return e != nullptr && atoi(e) != 0; }();
++    return on;
++}
++
++// Returns the number of graph nodes to skip when the pair is fused (always 1, the MUL), 0 otherwise.
++int ggml_cuda_moe_weight_broadcast_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
++    if (!ggml_cuda_fuse_moe_weight_on() || cgraph->nodes[i]->op != GGML_OP_REPEAT) {
++        return 0;
++    }
++    const ggml_tensor * rep = cgraph->nodes[i];
++    if (rep->type != GGML_TYPE_F32 || !ggml_is_contiguous(rep) || rep->ne[3] != 1 || rep->ne[1] < 2) {
++        return 0;
++    }
++    const ggml_tensor * s0 = rep->src[0];
++    if (s0 == nullptr || s0->type != GGML_TYPE_F32 || !ggml_is_contiguous(s0) ||
++        s0->ne[0] != rep->ne[0] || s0->ne[1] != 1 || s0->ne[2] != rep->ne[2] || s0->ne[3] != rep->ne[3]) {
++        return 0;   // not a pure dim-1 broadcast
++    }
++    // the repeat must have exactly ONE consumer: the mul.  Otherwise its buffer is still a graph result (a
++    // LoRA delta, a second reader) and the fusion would silently drop a consumer.
++    if (!ggml_node_has_n_uses(cgraph, i, 1) || i + 1 >= cgraph->n_nodes) {
++        return 0;
++    }
++    const ggml_tensor * mul = cgraph->nodes[i + 1];
++    if (mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) ||
++        !ggml_are_same_shape(mul, rep)) {
++        return 0;
++    }
++    const ggml_tensor * w = mul->src[0] == rep ? mul->src[1] : (mul->src[1] == rep ? mul->src[0] : nullptr);
++    if (w == nullptr || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
++        w->ne[0] != 1 || w->ne[1] != rep->ne[1] || w->ne[2] != rep->ne[2] || w->ne[3] != 1) {
++        return 0;
++    }
++    const int output_idx = i + 1;
++    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, &output_idx, 1)) {
++        return 0;
++    }
++    ggml_tensor * dst = const_cast<ggml_tensor *>(mul);
++    const int64_t n_used = rep->ne[1];
++    const int64_t n_tok  = rep->ne[2];
++    moe_weight_broadcast_kernel<<<(unsigned) (n_used * n_tok), 256, 0, ctx.stream()>>>(
++        (float *) dst->data, (const float *) s0->data, (const float *) w->data, rep->ne[0], n_used);
++    if (cudaGetLastError() != cudaSuccess) {
++        (void) cudaGetLastError();
++        return 0;   // the MUL/REPEAT pair then runs unfused, which is the correct (slower) answer
++    }
++    if (ggml_cuda_fuse_moe_weight_debug()) {
++        GGML_LOG_INFO("MWB FUSED %s [%lld x %lld x %lld]\n", mul->name,
++                      (long long) rep->ne[0], (long long) n_used, (long long) n_tok);
++    }
++    return 1;
++}
+diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cuh b/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
+index 5752f8b7d..096b53582 100644
+--- a/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
++++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cuh
+@@ -7,6 +7,10 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
+                                          ggml_tensor *               dst,
+                                          const ggml_tensor *         merge = nullptr);
+ int ggml_cuda_moe_weighted_reduction_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
++// wip/flash-next-prefill D1: fuse the `weight_before_ffn` REPEAT(broadcast) + MUL pair into one broadcast-multiply
++// kernel (bit-identical; the materialised 839 MB F32 broadcast buffer is never written).  Returns the node count to
++// skip (the MUL) when it fired.  GGML_CUDA_FUSE_MOE_WEIGHT=0 is the kill switch.
++int ggml_cuda_moe_weight_broadcast_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+ void ggml_cuda_mwr_fold_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+ // GGML_CUDA_MWR_EXACT (default 1; =0 restores the pre-r324 fma-contracted kernels): no fma contraction in the expert
+ // weighted sum, so the fold and the standalone kernels round exactly as the graph's MUL / VIEW / ADD chain does.

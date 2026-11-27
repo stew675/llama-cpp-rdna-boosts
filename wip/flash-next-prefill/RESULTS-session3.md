@@ -420,3 +420,33 @@ geometry holds; otherwise keep the gather.
 * `results-session3/` — the committed per-run tables (`abba-s3-*.tsv`, the rotated-run summaries) and the
   suite logs (`abba-s3-*.log`) behind every number here, plus the x16 run's table from `radix`. The individual
   run logs are NOT committed (20 MiB, regenerable with `arm.sh`/`abba.sh`).
+
+
+## 11. D1 probe: the REPEAT+MUL pair — where it actually is, and two attempts
+
+The handover's D1 said "`ffn_moe_weighted` REPEAT+MUL, 3.9 s = 12 % of ops; fuse them". Measured with
+`GGML_CUDA_OP_TIMING` on the staged arm: **`FUSED REPEAT` 2 622 ms (7.4 %) + `FUSED MUL` 1 134 ms (3.2 %) = 3.76 s,
+10.6 % of the op budget.** Three findings, in the order they arrived:
+
+1. **The pair is not what D1 said it was.** `weight_before_ffn` (the `repeat_4d(cur) -> mul` site in
+   `build_moe_ffn`, `src/llama-graph.cpp:2696`) is **`LLM_ARCH_LLAMA4`-only**. On Flash-Next the REPEAT that costs
+   2.6 s is the **hyper-connection expansion** (`[2560 x 4 x T]`, the 4 HC streams) — a different pair with the
+   same shape, so the same treatment applies, but the D1 write-up does not describe this model's graph.
+2. **Fusing the pair is a −4.4 % LOSS.** `experiments/0009` implements it (anchor at the REPEAT, broadcast-multiply
+   kernel, skip the MUL; `GGML_CUDA_FUSE_MOE_WEIGHT`, now default OFF after the measurement): text
+   **byte-identical** (`sha=43d0b1f4629e`), rate **2305.9 vs 2412.1** (3 cycles). Cause: **`GGML_OP_MUL` is
+   in-place-capable** (`ggml_op_can_inplace`, `ggml-alloc.c`), so the unfused pair already writes the broadcast
+   ONCE and multiplies it in place — there is no second 839 MB buffer to remove, and the fusion instead adds a
+   redundant source re-read plus a second live buffer. The "2.5 GB of traffic per layer per ubatch" in session 2's
+   note is therefore **not** what the graph does.
+3. **The cost is the REPEAT kernel's engineering, not its redundancy.** `REPEAT` dispatches to the *generic
+   binary-broadcast kernel* (`bin_bcast_cuda<op_repeat, 0>`), which computes a broadcast source index per element
+   and moves scalars: ~3.1 ms for 335 MB ≈ **108 GB/s**. A vectorised broadcast-copy kernel (`GGML_CUDA_REPEAT_VEC`)
+   is implemented and **correct** (text identical, +4.3 % measured) but **unproven**: it only sees the
+   *generation*-width repeats (`[2560 x 4 x 2]`), because the 89k-prefill REPEAT is served by a **fused window** in
+   `ggml-cuda-try-fuse.cu` (no census change: 2683 vs 2671 ms). So it is default OFF until it has a per-width win.
+
+**Where the 2.6 s actually has to be attacked**: inside the fusion that serves the HC chain, or by making that
+chain not need the broadcast at all. That is a block-10 change with the full fusion gate set
+(`gate-lora-fusion.sh`, `gate-fused-probe-splits.sh`, `gate-prefill-logits.sh`), and it is the next op-side item —
+not the fusion of two ops that the allocator already overlaps.
