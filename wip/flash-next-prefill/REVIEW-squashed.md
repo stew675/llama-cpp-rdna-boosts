@@ -314,8 +314,13 @@ caller anywhere in `ggml/src`:
    and honouring it here would refuse staging for a whole first prefill (`!g_sized` is true until the first sizing,
    which a long prefill never reaches).  **Not re-wired, and the campaign's `MOE_HOST_POOL_STAGE_STANDDOWN` branch
    on it was deleted**: that branch was a dead knob whose documented effect (restore the refusal for a stood-down
-   pool table) no longer exists, because nothing asks.  The now-callerless hook itself is **left in place** and named
-   here: retiring it is a block amendment, i.e. the maintainer's call, not a review fix.
+   pool table) no longer exists, because nothing asks.  **The hook itself was RETIRED on the maintainer's
+   instruction the same day**: the `ggml_backend_i` member, the CUDA wrapper + its `.cuh` declaration + iface row,
+   the Meta forwarder + its row, the CPU/RPC rows and `moe_cache_stage_ready()` in `moe-expert-cache.{h,cu}` are
+   gone, with no tombstone left behind.  The retirement also left the positional initializers COMPLETE (CPU/RPC now
+   list the trailing `stage_release` / `moe_cache_residency` rows, and both device interfaces the trailing
+   `.gtt_store_arena_min` row they had been missing since that hook landed), so the build has no
+   `-Wmissing-field-initializers` warning anywhere.
 
 ### 10.3 The new "release the carve" block was a latent path back to the serial upload
 
@@ -398,3 +403,72 @@ offset inside the shape's own unexplained variation (an unpinned heat prior — 
 the seven fixes is a behaviour change on any validated shape; two of them (10.2 and 10.3) are the ones that would
 have been found on a *fully resident* arena and on a *second prefill of the same compute size*, neither of which the
 campaign's arms exercise.
+
+## 11. CORRECTION to the record: what the tensor-split "staged" arms actually measured
+
+Raised by the maintainer, who was told four sessions ago that a tensor-split staging path had been implemented and
+was then told (by §9 and by the session-7 hand-over) that it "was never a valid fallback".  **They were right and the
+later framing was wrong.**  The evidence, in the order that settles it:
+
+### 11.1 The Meta path was reachable, then one commit made it unreachable
+
+`git show <commit>:ggml/src/ggml-backend.cpp`, the copy-input branch that reaches the Meta backend's per-device ring:
+
+| commit | gate |
+|---|---|
+| `402da9c44` ("ping-pong -- apply the staging WIDTH GATE ..."), the last ring-era commit | `sched->stage_split_ok[sched->stage_cur] && callback_eval == NULL && iface.stage_input != NULL && is_host_weight` — **reachable on a Meta split** |
+| `855f2c55c` ("REMOVE the slot-ring staging transport") and every commit after it | `sched->pp_on && sched_pp_entry_off(sched, input_cpy) != (size_t) -1 && callback_eval == NULL && iface.stage_input != NULL && ...` — **always false on a Meta split**: `pp_on` is off there (the pipeline needs backend slots, which the Meta backend does not have) and there are no pipeline entries to match |
+
+So from `855f2c55c` on, a `-sm tensor` split could **not** reach its own ring, and the fall-through was
+`ggml_backend_tensor_copy(input, input_cpy)` — the **serial whole-split upload**.
+
+### 11.2 Therefore the tensor-split "staged" numbers measured the SERIAL path
+
+`RESULTS-session4.md` §4(b) says *"the split keeps its own per-device ring"* and its §4/§5 tables label the
+`-sm tensor` `GGML_SCHED_DEVGATHER=0` arms **"the split's ring"** (2 dev 3028.7 / 3 dev 3144.2).  Both are wrong: those
+arms measured the serial upload, and the 13 %/2 % "the gather still wins" conclusion compares the gather against the
+serial path.  The same applies to every later tensor-split "staged" figure in this campaign, including the field
+shape's 370-385 vs 2682 t/s: one configuration (2 cards, pool tier, 77.5 % coverage, `-ub 2048`) of gather vs
+**serial**, not gather vs ring.  (A pointer was added at the top of `RESULTS-session4.md`; its numbers are left as
+written, which is the dated-record rule.)
+
+### 11.3 The ring was implemented, and it has a measured win on a tensor split
+
+`archive/work/moe-expert-cache/item3-findings-session20.md` (2026-10-02, r28 era, warm `-r 3`), 2-GPU
+`-sm tensor`, Q4_K_M, `-ub 8192`: **staging (the per-device ring) 5283 t/s against the gather's 4035, +31 %**; at
+`-ub 2048` it is a tie (1988.6 / 1995.4); IQ4 ub8192 1414 vs gather.  That is the mechanism the maintainer remembers,
+it existed in the delivery for months, and it won.  What changed since is not the mechanism but its *availability*:
+the campaign deleted the scheduler ring, and no later commit restored the Meta gate, so the delivery's tensor-split
+staging was lost as a side effect of this campaign — this is a **regression this campaign introduced and then
+mis-recorded**, not a feature that "never worked".
+
+### 11.4 What that means for §9 (the delete-or-finish decision)
+
+The §9 argument for *delete* was "unreachable in practice, behind the gather on every arm measured".  With 11.2 in
+hand that reads: *the serial upload is behind the gather*, which is trivially true and says nothing about the ring.
+So the honest state is: **no arm in this campaign has ever measured the per-device ring**, and the only measurement on
+record has it winning on this exact layout.  Recommendation: **finish it** — restore the Meta branch's gate
+(`split->stage_ok` already exists for it), make the arm carve the per-device region (a `work_alloc` from
+`slab_stage_set`, or let `stage_candidate` fire there) and un-gate the `llama_context` drop — then measure at 60-80 %
+coverage on a 2-card tensor split, which is the open question below.  Deleting it is defensible only with that
+measurement in hand.  Nothing here is a gate outcome: it stays the maintainer's decision.
+
+### 11.5 The residency question, answered from the measurements
+
+"Does staging beat the gather below ~90 % residency?"  Residency is not the predicate this code uses, and the
+measurements say why: **the discriminator is the host bytes the gather would pull per token against the link**.
+Same-seed, 89k prompt, `-ub 8192`, one card at 28.7 GB/s (`RESULTS-session4.md` §5, 3 rotated cycles):
+
+| shape | host set | coverage | exposed/token | gather | staged | winner |
+|---|---|---|---|---|---|---|
+| 35B-A3B Q8_0 | 16.3 GB | 30 % | 1.37 MB/tok | 2807.7 | **2943.9** | staged +4.9 % |
+| 35B-A3B Q8_0 | 16.3 GB | **45 %** | 1.07 MB/tok | 2966.7 | 2961.7 | **TIE** |
+| 35B-A3B Q8_0 | 16.3 GB | 56 % | 0.86 MB/tok | **3072.5** | 2956.3 | gather +3.9 % |
+| Flash-Next GSQ | 40.0 GB | 51 % | 2.01 MB/tok | 2105 | **2509** | staged +19 % |
+
+The tie is one number — **~1.07 MB/token ≈ 38 µs/token at 28.7 GB/s** — and the crossover *residency* follows from
+it: ~45 % for the 16.3 GB set, **~78 % for the 40 GB set** (at `-ub 8192`).  So "staging wins below ~90 % residency" is
+the right shape of the rule but too aggressive: on this link the boundary sits at ~78 % for the field-size set and
+falls as the link gets faster (a faster link needs *more* exposure to lose the gather).  On a **tensor split** the
+same per-device exposure applies, so the potential is real — and it is exactly the measurement this campaign never
+took, because the transport that would take it was unreachable (11.1).

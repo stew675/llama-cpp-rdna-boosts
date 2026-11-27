@@ -16,8 +16,7 @@
 > 1: 1028.4, 0: 930.8 with `request 1890 -> 0 MiB` and zero refusals — the caps must be SMALLER than §4's labels
 > assume, because the arena settles ~500-900 MiB higher; the rate tracks the buffer count, not the label).  **§0.3 is
 > where it stopped:** the block decision (09 / 10), the §3.1 decision (delete the Meta staged transport or finish it)
-> and the ladder are the maintainer's, and their own user-side check comes first.  `~/llama.cpp` is on the fixed tip
-> and built; nothing in the delivery moved.
+> and the ladder are the maintainer's, and their own user-side check comes first.  **Two same-day follow-ups:** `moe_cache_stage_ready` is RETIRED on the maintainer's instruction (zero tombstones; the build is now free of `-Wmissing-field-initializers`), and **`REVIEW-squashed.md` §11 CORRECTS this hand-over's §3.1/§5 framing** -- the tensor-split "staged" arms (3028.7 / 2798.8 / 3144.2, and the field shape's 370-385 vs 2682) measured the SERIAL whole-split upload, not the ring, because `855f2c55c` removed the reachable `stage_split_ok` gate; the ring does have a measured win (`archive/work/moe-expert-cache/item3-findings-session20.md`: 2-GPU `-sm tensor` Q4_K_M ub8192 staging 5283 vs gather 4035, +31 %), so the §3.1 "delete it" evidence is void and the recommendation is now to finish it and measure.  Tip `76b7a2a31`; nothing in the delivery moved.
 
 **Read this, then [`REVIEW-squashed.md`](REVIEW-squashed.md) (§§1-9: the review that stands) and
 [`RESULTS-session6.md`](RESULTS-session6.md) (§8: the rework, §8.6: the open finding).  Sessions 1-5 are history;

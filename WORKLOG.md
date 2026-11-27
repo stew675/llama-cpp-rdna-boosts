@@ -16,6 +16,50 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.013 (r368, `wip/`) -- flash-next-prefill: retire `moe_cache_stage_ready`, and a CORRECTION -- the tensor-split "staged" arms measured the serial upload, not the ring
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push, nothing promoted, ladder still not
+started.  Squashed prototype `~/llama.cpp` `wip/prefill-slot-pingpong-squashed`, tip **`76b7a2a31`**; patch
+[`SQUASHED-campaign-r368.patch`](wip/flash-next-prefill/SQUASHED-campaign-r368.patch) **5287 lines / 18 files**;
+`REVIEW-squashed.md` **§11 is the correction** and §10.2 records the retirement.
+
+**Retired, on the maintainer's instruction, with zero tombstones.**  `moe_cache_stage_ready` is gone from the
+`ggml_backend_i` interface (member + comment), from the CUDA backend (wrapper, `.cuh` declaration, iface row), from the
+Meta forwarder (function + row), from the CPU/RPC rows and from `moe-expert-cache.{h,cu}`; the one comment elsewhere
+that named the "two transport queries" now names the one that remains.  It had had no scheduler caller since the
+pipeline replaced `sched_stage_issue`, and the D2D-era trade it encoded does not exist for an in-place fill.  The
+retirement also left the positional initializers **complete** (CPU/RPC now list the trailing `stage_release` /
+`moe_cache_residency` rows, and both device interfaces the trailing `.gtt_store_arena_min` row they had been missing
+since that hook landed), so the build is free of `-Wmissing-field-initializers`; the only warning left is upstream
+`tests/test-backend-ops.cpp`'s `-Wreorder-ctor`, in a file neither the delivery nor this campaign touches.  Verified:
+89k 1-GPU `2427.9` (the box's low phase) then `2494.1` t/s, `43d0b1f4629e` on both.
+
+**The correction, which the maintainer's question forced and which the record had wrong.**  Three claims were made
+here across sessions 3-7 that do not survive the code: (a) that the `-sm tensor` arms labelled "the split's ring"
+measured that ring; (b) that "the gather is the split's transport" followed from a 13 %/2 % comparison; (c) that a
+tensor-split staging path "was never a valid fallback".  `git show 402da9c44:ggml/src/ggml-backend.cpp` still gates the
+Meta branch on `stage_split_ok` -- reachable; `855f2c55c` ("REMOVE the slot-ring staging transport") replaced that gate
+with `pp_on && sched_pp_entry_off(...) != -1`, which is **always false on a Meta split** (`pp_on` is off there and there
+are no pipeline entries).  So from that commit on, `GGML_SCHED_DEVGATHER=0` on `-sm tensor` took the **serial
+whole-split upload**, and every tensor-split "staged" number in `RESULTS-session3/4/6/7` (3028.7, 2798.8, 3144.2, and
+the field shape's 370-385 vs 2682) is a gather-vs-**serial** comparison.  The mechanism the maintainer was told about
+four sessions ago did exist and does have a measured win: `archive/work/moe-expert-cache/item3-findings-session20.md`
+(r28 era, 2-GPU `-sm tensor`, Q4_K_M, `-ub 8192`) reads **staging 5283 vs gather 4035 (+31 %)**, `-ub 2048` a tie
+(1988.6/1995.4).  What this campaign did was **delete the scheduler ring and never restore the Meta gate** -- a
+regression introduced by the campaign (the `-sm tensor` repair in session 4 even wrote "the split keeps its own
+per-device ring" in the same change that made it unreachable) and then recorded as if the feature had never worked.
+`RESULTS-session4.md` carries a dated-record pointer to §11; its numbers are left as written.
+
+**Consequence for the §9 decision, and the residency answer.**  The "delete it, the gather wins on every measured arm"
+argument is void: no arm in this campaign has measured the ring.  The recommendation is therefore **finish it**
+(restore the gate -- `split->stage_ok` already exists -- carve the per-device region on the arm, un-gate the drop) and
+then measure 60-80 % coverage on a 2-card tensor split; delete only with that result in hand.  On the maintainer's core
+question: residency is not the predicate -- the tie is **~1.07 MB/token of exposed host bytes ≈ 38 us/token at 28.7
+GB/s**, which is ~45 % coverage for the 16.3 GB 35B set and **~78 %** for the 40 GB Flash-Next set at `-ub 8192`
+(staging wins below it, and the boundary falls as the link gets faster).  Per-device exposure is the same physics on a
+tensor split, so staging *can* be faster there; it is unmeasured, and it is unmeasurable until the transport is
+reachable again.  The decision stays the maintainer's.
+
 ## 261127.012 (r368, `wip/`) -- flash-next-prefill: the final review pass (seven defects fixed), the §4 tests re-run, and STOP before the ladder
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push, nothing promoted, and the gate

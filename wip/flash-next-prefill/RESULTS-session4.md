@@ -1,5 +1,11 @@
 # RESULTS — session 4: the reporting audit, the tensor-split repair, and a measured transport selector
 
+> **CORRECTION (2026-11-27, `REVIEW-squashed.md` §11): the three `-sm tensor` rows in §4/§5 labelled "the
+> split's ring" (`GGML_SCHED_DEVGATHER=0`, 3028.7 / 2798.8 / 3144.2) measured the SERIAL whole-split upload,
+> not the per-device ring: `855f2c55c` had made the Meta branch's gate unreachable before these arms ran.  The
+> numbers are left as written; read them as gather vs serial until §11's fix and re-measurement land.**
+
+
 **Read this after `HANDOVER-session4.md` (§6 was the ask) and `RESULTS-session3.md` (the measurements of
 record).**  Prototype: `~/llama.cpp` branch `wip/prefill-slot-pingpong`, tip **`b209da8cd`**, one commit
 (`experiments/0014-reporting-audit-and-transport-selector.patch`, cut against `86ff5f9ce`).  The delivery is
