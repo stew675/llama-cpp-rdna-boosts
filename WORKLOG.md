@@ -16,6 +16,44 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.011 (r368, `wip/`) -- flash-next-prefill: cold-start handover for session 7 (one final code-review pass, then the block decision)
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push, nothing promoted.  Squashed
+prototype `~/llama.cpp` `wip/prefill-slot-pingpong-squashed`, tip **`dc335794b`**; patch
+[`SQUASHED-campaign-r368.patch`](wip/flash-next-prefill/SQUASHED-campaign-r368.patch) **5055 lines / 18 files**;
+handover [`HANDOVER-session7.md`](wip/flash-next-prefill/HANDOVER-session7.md).
+
+The campaign is ready to be reviewed one last time and then promoted, so the session closes with a handover rather
+than work in flight.  Its order is fixed: (1) one final code-review pass on the current tree, starting at the one
+thing known not to work; (2) the quick tests; (3) **STOP** -- promotion is a block decision and is asked first
+(selector + re-keyed zero-carve rule into **block 09**; pipeline / transport region / cushion / depth authority into
+**block 10**; the VMM pool's fail-soft growth into **block 10**); (4) only then the ladder (`gate-prefill-logits`
+first, then host-pool / kv-residency / fused-probe-splits / moe-promise, `check-shlib-symbols` + a
+`GGML_HIP_NO_VMM=ON` build, the MTP four axes), the doc edits (listed mechanically in `RESULTS-session6.md` §6) and
+the cut.
+
+**The review's first item is a real open finding**, raised by the maintainer's question "are staging buffers still
+possible in tensor split mode?": **one GPU yes** (their `runme` is single-device, so `-sm tensor` is a plain CUDA
+backend and the PIPELINE stages -- that is the `144 splits x 2 x 450 MiB` in every field log); **two or more no**.
+The split is then served by the Meta backend, which has no backend slots, so the pipeline declines by design and the
+per-device ring is the only staged transport.  Two layers of why it could not be reached were fixed here: the
+copy-input gate was `pipe_on && entry != -1`, which is always false on a Meta split (the base gated on
+`stage_split_ok`; the split now carries its own `stage_ok`), and the **meta DEVICE forwarded none of the
+transport-region hooks**, so its per-device slabs were never armed (they now forward, like `narrow2` does).  It is
+still refused at every fill because the per-device region is never carved on a split (the wide buffer is allocated
+once at reserve and reused, and the drop that would re-reserve it is gated on a region existing) -- so
+`GGML_SCHED_DEVGATHER=0` takes the serial upload (2-dev GSQ 89k: gather 3431-3462 t/s vs 3284-3299).  The default
+gathers, which is the measured-better arm, and no validated shape changes (89k 2488.4 t/s, `43d0b1f4629e`; the field
+sequence `144 x 2 x 450 MiB` with no refusal/drift/grow line).  **The decision is the maintainer's**: delete the Meta
+staged transport (unreachable in practice, behind the gather on every arm ever measured) or finish it (carve on the
+arm, un-gate the drop).  `REVIEW-squashed.md` §9.
+
+Everything the rework changed (`slab_stage_*`, the 0/1/2/3 buffer table, the over-carved unit fixed, the graph-token
+cap) is in `RESULTS-session6.md` §8 and reviewed in `REVIEW-squashed.md` §8; the handover's §2 is that list in the
+form the next reviewer needs, §3 the checklist, §4 the tests with expected numbers, §6 the traps (the `--amend`
+index trap, a SIGTERM-resistant stray process holding 33 GB of VRAM, the heat-prior/reserve-partition trap on the
+field shape, "attributing a number is a rebuild not an argument").
+
 ## 261127.010 (r368, `wip/`) -- flash-next-prefill: the rework after the maintainer's user test (`slab_stage_*`, the 0/1/2/3 buffer table, the over-carved unit fixed, the graph-token cap)
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push, nothing promoted.  Squashed
