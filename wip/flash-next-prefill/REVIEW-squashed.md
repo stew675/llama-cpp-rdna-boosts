@@ -1,6 +1,6 @@
 # Code review — `SQUASHED-campaign-r368.patch`
 
-The campaign as one diff: base `af7a57ba8` (r368 block tip) → `a6ede394b`, i.e. `SQUASHED-campaign-r368.patch`
+The campaign as one diff: base `af7a57ba8` (r368 block tip) → `253e2630e`, i.e. `SQUASHED-campaign-r368.patch`
 (22 files).  **Every finding in §1-§3 is fixed in that same commit** (that is what the squash is for: the review's
 fixes are part of the change, not a follow-up on top of churn), and the tree was re-verified after them (§6).
 §4 is the checked-and-clean list — "I looked and it was fine" is the other half of a review — and §5 the
@@ -8,7 +8,7 @@ judgement calls left to the maintainer (one of which is now implemented, §5.1).
 
 | | |
 |---|---|
-| review target | `~/llama.cpp` branch `wip/prefill-slot-pingpong-squashed`, tip **`4b3e54017`** (one commit on `af7a57ba8`) |
+| review target | `~/llama.cpp` branch `wip/prefill-slot-pingpong-squashed`, tip **`253e2630e`** (one commit on `af7a57ba8`) |
 | the same tree, pre-review, as a 21-commit chain | branch `wip/prefill-slot-pingpong-r368` (kept as history only) |
 | patch | [`SQUASHED-campaign-r368.patch`](SQUASHED-campaign-r368.patch) |
 

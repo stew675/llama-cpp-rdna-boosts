@@ -280,4 +280,5 @@ Still open from session 4, unchanged:
   time, census after each drop).  `runs/field-cushion/`, `runs/field-nocushion/`, `runs/field-r368/`.
 * `runs/abba-hc-test/` (pre-rebase) and `runs/abba-r368-cushion/` — the two 3-cycle A/Bs of §2.1.
 * `runs/hc-cen2/`, `runs/hc-cen0/` — the two census arms behind the `SLAB_STATS` numbers in §2.1.
-* `~/llama.cpp` branch `wip/prefill-slot-pingpong-r368`, tip `d57f4a837`.
+* `~/llama.cpp` branch `wip/prefill-slot-pingpong-r368`, tip `d57f4a837` (the 21-commit chain; **now squashed to one
+  commit**, `wip/prefill-slot-pingpong-squashed` tip `253e2630e`, reviewed in `REVIEW-squashed.md`).

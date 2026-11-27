@@ -16,10 +16,32 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.006 (r368, `wip/`) -- the campaign docs pushed, and a process trap recorded: `git commit --amend` commits the INDEX, not the tree
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  `main` pushed to
+`github.com/stew675/llama-cpp-rdna-boosts` (`0f56d4aa..c4369e46`), then the squashed prototype corrected to
+**`253e2630e`** and re-exported.
+
+**The slip.**  Every "amend" of the squashed commit after the first one (`a6ede394b`, then `8ed2ead6f`,
+`4b3e54017`) was run as `git commit --amend -F <msg>` **without staging the edits** that the message described: the
+amend rewrote the message and kept the older tree from the index.  The built binaries were correct (they came from
+the working tree, which is why the runs verified the fixes) while the commit, and therefore
+`SQUASHED-campaign-r368.patch`, still carried the pre-review code.  Caught when the delivery push was verified and
+`git status` in `~/llama.cpp` showed ten modified files *after* the amend that was supposed to contain them.
+
+**Fixed.**  `git add -A` then the amend: `253e2630e` (tree of the tested working tree, `git status` clean), patch
+re-exported (3803 -> 4022 lines -- that difference is the review + J1-J4 + J3-follow-up content that had been
+missing), `REVIEW-squashed.md` / the current-state lines re-pointed at the new tip.
+
+**The trap, for the next session:** a tool that edits files leaves them unstaged, and `--amend` (like `commit`)
+takes the index.  After any scripted edit, `git add -A` before amending -- and verify the amend with
+`git show HEAD:<file> | grep <marker>` or `git status` afterwards, not by the message.  The same class as "a gate
+that only checks the tree is not evidence": the message is not the diff.
+
 ## 261127.005 (r368, `wip/`) -- flash-next-prefill: J3's follow-up -- the removed scan WAS a safety net, so the hole is closed and the invariant is now verified
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  Squashed prototype
-`~/llama.cpp` `wip/prefill-slot-pingpong-squashed`, tip **`4b3e54017`**; record
+`~/llama.cpp` `wip/prefill-slot-pingpong-squashed`, tip **`253e2630e`**; record
 [`wip/flash-next-prefill/REVIEW-squashed.md`](wip/flash-next-prefill/REVIEW-squashed.md) §5 (J3) + §3.
 
 **The question (the maintainer's):** was that table scan ever active where the host experts are not fully resident
