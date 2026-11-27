@@ -450,3 +450,61 @@ The handover's D1 said "`ffn_moe_weighted` REPEAT+MUL, 3.9 s = 12 % of ops; fuse
 chain not need the broadcast at all. That is a block-10 change with the full fusion gate set
 (`gate-lora-fusion.sh`, `gate-fused-probe-splits.sh`, `gate-prefill-logits.sh`), and it is the next op-side item —
 not the fusion of two ops that the allocator already overlaps.
+
+
+## 12. The two-buffer ping-pong (the maintainer's design) — implemented and measured
+
+**`experiments/0010`.** Everything before this section was measured on the **slot ring** (`GGML_SCHED_STAGE_SLOTS`
+= 8, round-robin, one staged tensor per slot, a one-split lookahead bolted on). The ring was never the design
+that was asked for; it was reused because it was the shortest path to a measurement, and this section replaces it.
+
+**The design, as implemented.** `GGML_SCHED_PINGPONG` (default ON; `=0` selects the ring for the A/B):
+
+* **N buffers**, each sized ONCE to the **largest split's host-weight set** (`sched_pp_split_set()` sums the
+  stageable host weights of a split, 256-byte aligned), allocated from the backend's stage slots;
+* **N is fixed at scheduler construction** from the device's **free VRAM at startup**
+  (≤14 GiB → 1, ≤24 GiB → 2, else 3; `GGML_SCHED_PINGPONG_BUFS` overrides). Measured on the 32 GB R9700:
+  **26.0 GiB free at construction → 3 buffers** of 912.5-1137.5 MiB;
+* host split k is filled into `buf[k % N]`; the fill for split **k+N** is issued into that same buffer as soon as
+  k's compute is enqueued, waiting on that buffer's **free** event on the COPY stream;
+* split k consumes `buf[k % N]` **in place** at its entry offset (no drain, no copy);
+* the prologue fills buffers 0..N-1 with the first N host sets, so split 0 computes while the rest stream in.
+
+What it deletes: the slot ring (`stage_n_slots`, `stage_slot_next`, per-slot growth and slot-exhaustion declines),
+the `[2]` plan arrays, the `stage_d2d` copy-out, and `GGML_SCHED_STAGE_AHEAD` (there is no "drain" step to
+anticipate).
+
+**Measured** (89k prefill, `-ncmoe 48`, `GGML_SCHED_DEVGATHER=0`, 3 rotated cycles each, text byte-identical to
+the ring and to the gather: `sha=43d0b1f4629e` at 128 tokens):
+
+| staging structure | median t/s | spread |
+|---|---:|---:|
+| ping-pong, **1** buffer | 1943.5 | 0.2 % |
+| ping-pong, **2** buffers | 2401.4 | 0.7 % |
+| **ping-pong, 3 buffers** | **2446.1** | 1.0 % |
+| **ring** (8 slots + lookahead) | ~2458 | 3.6-5.8 % |
+
+So: **one buffer is the serial baseline** (−21 %: the fill and the compute want the same buffer, so the wait on its
+free event exposes the whole transfer), **two buffers are correct but ~2.3 % behind the ring** (the fill for k+2
+cannot start until k's kernels have finished reading `buf[k%2]` — a *device* dependency, not CPU blocking: the
+wait is a `cudaStreamWaitEvent` on the copy stream), and **three buffers reach parity with the ring while cutting
+the run-to-run spread by ~4x** (1.0 % against 3.6-5.8 %). The variance result is the design's real win: the ring's
+in-flight depth is an emergent property of the ubatch's split layout, which is why the ring arms swung 5-9 % while
+`gather` read ±0.2 %.
+
+**A fixed count is mandatory.** An earlier revision re-chose the depth per graph execution by probing allocations;
+it flapped (1 buffer on the priming pass while the slab's transient band is held, 3 once it settles, then 1 again
+on a later probe) and every 1-buffer graph costs ~21 %. It also logged only its first choice, which read as
+"this run used 1 buffer" when it did not. The count is now decided once, at construction, from free VRAM at that
+moment, and never changes.
+
+**Still open from this design** (the maintainer's two questions):
+
+* **the gather could read the ping-pong buffer instead of copying into it** — with the buffers, every byte a routed
+  op needs is VRAM-resident and addressable, so a gather variant that assembles the op input from *pp buffer +
+  arena slot* (rather than pp buffer holding a dense copy with the holes filled in) would remove the hole-fill
+  copy. That is the next experiment, and it is only possible with the ping-pong: the ring's slot indirection is
+  what made it awkward.
+* **staging, in the ring sense, is already gone**; what remains is the *fill* (`moe_cache_stage_table`'s hybrid:
+  coalesced mirror runs + the arena-side kernel), which stays because it is the only thing that knows which
+  experts are arena-resident.

@@ -1,0 +1,328 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 5b91c2cde..d6a87939f 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1596,6 +1596,21 @@ struct ggml_backend_sched {
+     // being DRAINED lives in buffer `stage_cur` and `sched_stage_issue` writes the NEXT split's plan into the
+     // other one, so its transfer is in flight while the current split runs.  `GGML_SCHED_STAGE_AHEAD=0`
+     // restores the same-split issue/drain (A/B and bisection).
++    // wip/flash-next-prefill (the maintainer's design): the TWO-BUFFER PING-PONG.  Two buffers, each sized to the
++    // largest split's host-weight set, laid out at fixed 256-byte-aligned offsets; the fill for host split k+1
++    // runs while host split k computes, and split k consumes ITS buffer IN PLACE (no drain, no slot ring).  One
++    // `done` and one `free` event per buffer.  `GGML_SCHED_PINGPONG=0` selects the ring below (A/B, and the
++    // shipping path until this replaces it).
++    bool    pp_on;
++    // (the buffer COUNT is fixed once, at construction: see sched_pp_choose_bufs)
++    double  pp_free_gib;                         // the free-VRAM figure the count was chosen from                        // pick 1..3 from free VRAM (default) or honour the env
++    int     pp_n_buf;                            // 2 (default) or 3/4: how many sets may be in flight
++    size_t  pp_size;                             // bytes per buffer (the largest set seen, grown once)
++    void *  pp_base[4];                          // the buffers (backend slot buffers, index 0..n-1)
++    int     pp_backend[4];                       // which backend owns each buffer (device-local!)
++    int     pp_n_ent[4];                         // entries laid out in each buffer
++    int     pp_cur;                              // buffer being consumed by the current split
++    struct pp_ent { struct ggml_tensor * dst; size_t off; size_t size; } pp_ent[4][64];
+     int  stage_consumed_n[2];
+     bool stage_split_ok[2]; // this split passed the enable + width gates (a backend-owned `stage_input` reads it)
+     int  stage_cur;         // which buffer holds the plan of the split being drained
+@@ -2831,6 +2846,163 @@ static bool sched_stage_redirect(void) {
+     return on;
+ }
+ 
++// forward declarations for the ping-pong helpers below (both are defined further down, next to the ring).
++static bool sched_stage_is_host_weight(const struct ggml_tensor * input);
++static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
++                                   const struct ggml_tensor * input, const struct ggml_tensor * input_cpy);
++
++// wip/flash-next-prefill: the ping-pong (default) vs the slot ring (A/B).
++static bool sched_pp_on(void) {
++    static const bool on = [] {
++        const char * e = GGML_ENV_STR("GGML_SCHED_PINGPONG");
++        return e == nullptr || e[0] == '\0' || atoi(e) != 0;
++    }();
++    return on;
++}
++
++// The buffer COUNT, chosen ONCE at scheduler construction from the device's FREE VRAM at startup (the earliest
++// point the scheduler can ask; nothing of ours is allocated yet) and then fixed for the life of the process:
++// 1 buffer <= 14 GiB free, 2 <= 24 GiB free, 3 above.  The buffers do not overlap compute with one
++// (measured 1943 vs 2401/2446 t/s for 2/3 on the 89k prefill), and each costs the largest split set of VRAM that
++// the decode band would otherwise keep, so a small card gets the small pipeline.  A count that is re-chosen later
++// FLAPS (measured: 1 on the priming pass, 3 once the slab settles, then 1 again) and every 1-buffer graph costs
++// ~21 %; hence "set once, before anything else is allocated".
++// `GGML_SCHED_PINGPONG_BUFS=1|2|3` overrides (A/B and bisection).
++static double sched_pp_startup_free_gib(ggml_backend_sched_t sched) {
++    size_t min_free = 0;
++    for (int b = 0; b < sched->n_backends; b++) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
++        if (dev == NULL) { continue; }
++        const enum ggml_backend_dev_type t = ggml_backend_dev_type(dev);
++        if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_ACCEL) { continue; }
++        size_t fr = 0, tot = 0;
++        ggml_backend_dev_memory(dev, &fr, &tot);
++        if (fr != 0 && (min_free == 0 || fr < min_free)) { min_free = fr; }
++    }
++    return (double) min_free / (1024.0 * 1024.0 * 1024.0);
++}
++
++static int sched_pp_choose_bufs(ggml_backend_sched_t sched) {
++    const char * e = GGML_ENV_STR("GGML_SCHED_PINGPONG_BUFS");
++    if (e != nullptr && e[0] != '\0') {
++        const int nb = atoi(e);
++        return nb < 1 ? 1 : (nb > 3 ? 3 : nb);
++    }
++    size_t min_free = 0;    // the SMALLEST free figure: on a split each device owns its own buffers
++    for (int b = 0; b < sched->n_backends; b++) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
++        if (dev == NULL) {
++            continue;
++        }
++        const enum ggml_backend_dev_type t = ggml_backend_dev_type(dev);
++        if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
++            continue;
++        }
++        size_t fr = 0, tot = 0;
++        ggml_backend_dev_memory(dev, &fr, &tot);
++        if (fr != 0 && (min_free == 0 || fr < min_free)) {
++            min_free = fr;
++        }
++    }
++    const size_t GiB = (size_t) 1 << 30;
++    if (min_free == 0)               { return 3; }   // unknown device: the deepest stage
++    if (min_free <= 14 * GiB)        { return 1; }
++    if (min_free <= 24 * GiB)        { return 2; }
++    return 3;
++}
++
++// Does this split carry a host-resident weight that would be STAGED (a gatherable input is left to the gather)?
++static int sched_pp_split_set(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
++                              size_t * bytes) {
++    int n = 0;
++    size_t total = 0;
++    for (int i = 0; i < split->n_inputs; i++) {
++        struct ggml_tensor * input = split->inputs[i];
++        if (!sched_stage_is_host_weight(input)) {
++            continue;
++        }
++        struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
++        if (sched_input_gatherable(sched, split, input, input_cpy)) {
++            continue;
++        }
++        n++;
++        total += (ggml_nbytes(input) + 255u) & ~(size_t) 255u;   // 256-byte aligned layout
++    }
++    if (bytes != NULL) {
++        *bytes = total;
++    }
++    return n;
++}
++
++// Is this input one of the entries the CURRENT ping-pong buffer holds?  Returns the offset, or (size_t) -1.
++static size_t sched_pp_entry_off(ggml_backend_sched_t sched, const struct ggml_tensor * input_cpy) {
++    for (int k = 0; k < sched->pp_n_ent[sched->pp_cur]; k++) {
++        if (sched->pp_ent[sched->pp_cur][k].dst == input_cpy) {
++            return sched->pp_ent[sched->pp_cur][k].off;
++        }
++    }
++    return (size_t) -1;
++}
++
++// Fill one buffer with a split's host-weight set: the wait on the buffer's FREE event first (the split that
++// consumed it may still be reading), then the uploads, then the DONE event the consumer waits on.
++static bool sched_pp_issue(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, int buf) {
++    ggml_backend_t backend = sched->backends[split->backend_id];
++    size_t  need  = 0;
++    const int n = sched_pp_split_set(sched, split, &need);
++    sched->pp_n_ent[buf] = 0;
++    if (n <= 0) {
++        return false;
++    }
++    if (n > (int) (sizeof(sched->pp_ent[0]) / sizeof(sched->pp_ent[0][0]))) {
++        return false;   // a set too wide to lay out: leave it to the serial path
++    }
++    if (need > sched->pp_size) {
++        if (sched->pp_size != 0) {
++            static bool warned = false;
++            if (!warned) {
++                warned = true;
++                GGML_LOG_WARN("%s: ping-pong buffer grows %.1f -> %.1f MiB (a split set larger than the "
++                              "largest seen so far; sized once to the largest layer, this should not recur)\n",
++                              __func__, (double) sched->pp_size / (1024.0 * 1024.0),
++                              (double) need / (1024.0 * 1024.0));
++            }
++        }
++        sched->pp_size = need;
++    }
++    // the previous consumer of this buffer must have finished reading it
++    backend->iface.stage_wait(backend, sched_stage_ev(sched, split->backend_id, buf, false));
++    void * base = backend->iface.stage_buffer(backend, buf, sched->pp_size);
++    if (base == NULL) {
++        return false;
++    }
++    sched->pp_base[buf]    = base;
++    sched->pp_backend[buf] = split->backend_id;
++
++    size_t off = 0;
++    int    k   = 0;
++    for (int i = 0; i < split->n_inputs; i++) {
++        struct ggml_tensor * input = split->inputs[i];
++        if (!sched_stage_is_host_weight(input)) {
++            continue;
++        }
++        struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
++        if (sched_input_gatherable(sched, split, input, input_cpy)) {
++            continue;
++        }
++        const size_t size = ggml_nbytes(input);
++        backend->iface.stage_upload(backend, (char *) base + off, input->data, size,
++                                    sched_stage_ev(sched, split->backend_id, buf, true));
++        sched->pp_ent[buf][k].dst  = input_cpy;
++        sched->pp_ent[buf][k].off  = off;
++        sched->pp_ent[buf][k].size = size;
++        k++;
++        off += (size + 255u) & ~(size_t) 255u;
++    }
++    sched->pp_n_ent[buf] = k;
++    return k > 0;
++}
++
+ static bool sched_stage_is_host_weight(const struct ggml_tensor * input) {
+     return input->buffer != NULL &&
+            ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+@@ -3297,6 +3469,18 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         }
+         ggml_backend_tensor_copy(input, input_cpy);
+     } else {
++        // wip/flash-next-prefill (the maintainer's design): in PING-PONG mode the split input IS an offset inside
++        // the current buffer -- wait for that buffer's fill, point the input at it, and consume it in place.  No
++        // slot lookup, no drain, and the capture-safety width check is the same one the redirect uses.
++        if (sched->pp_on) {
++            const size_t pp_off = sched_pp_entry_off(sched, input_cpy);
++            if (pp_off != (size_t) -1 && sched_stage_batch_tokens(split) > SCHED_STAGE_CAPTURE_SAFE_TOKENS) {
++                const int b = sched->pp_cur;
++                ggml_backend_event_wait(split_backend, sched_stage_ev(sched, sched->pp_backend[b], b, true));
++                input_cpy->data = (char *) sched->pp_base[b] + pp_off;
++                return;
++            }
++        }
+         // staged input (issue #50 WIP): wait on the ring slot's upload event, D2D it into the
+         // real split input, then free the slot.  Both the D2D and the compute are on the main
+         // stream, so this stays ordered after the previous split's compute.
+@@ -3806,7 +3990,43 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         const char * e = GGML_ENV_STR("GGML_SCHED_STAGE_AHEAD");
+         return e != nullptr ? atoi(e) : 1;
+     }();
+-    if (stage_ahead > 0) {
++    // ---- the TWO-BUFFER PING-PONG (the maintainer's design), per graph execution ----
++    // Collect the splits that carry a stageable host-weight set, fill buffer 0 with the first and buffer 1 with
++    // the second BEFORE the first split computes, then per host split k: consume buf[k&1] in place, and after
++    // its compute is enqueued record buf[k&1] free and fill split k+2 into it.  Two buffers, one fill in flight,
++    // always exactly one host set ahead -- no ring, no slot bookkeeping, no drain.
++    int  pp_host[256];
++    int  pp_n_host = 0;
++    int  pp_k      = -1;   // this split's index in pp_host, or -1
++    if (sched->pp_on) {
++        for (int i = 0; i < sched->n_splits && pp_n_host < (int) (sizeof(pp_host) / sizeof(pp_host[0])); i++) {
++            if (sched_pp_split_set(sched, &splits[i], NULL) > 0) {
++                pp_host[pp_n_host++] = i;
++            }
++        }
++        sched->pp_cur = 0;
++        // fill every buffer with its first set: with N buffers that is the first N host splits, so split 0 can
++        // compute while the other N-1 sets stream in (N = 2 is the ping-pong, N = 3 adds the extra stage you
++        // asked for: the fill for k+2 is still running while k+1 computes).
++        for (int b = 0; b < sched->pp_n_buf && b < pp_n_host; b++) {
++            sched_pp_issue(sched, &splits[pp_host[b]], b);
++        }
++        if (pp_n_host > 0) {
++            // Log on CHANGE, not once: the depth is re-chosen per graph execution (the first graph runs while the
++            // slab has VRAM at its tightest, so it may legitimately pick a smaller pipeline and grow later), and a
++            // one-shot line printed only the first choice -- which read as "this run used 1 buffer" when it did
++            // not.  A depth the user forced (GGML_SCHED_PINGPONG_BUFS) never changes.
++            static int logged_n = -1;
++            if (sched->pp_n_buf != logged_n) {
++                logged_n = sched->pp_n_buf;
++                GGML_LOG_INFO("%s: ping-pong staging: %d host-weight split(s), %d buffer(s) of %.1f MiB "
++                              "(the largest set, sized once; %.1f GiB free at startup -> fixed)\n",
++                              __func__, pp_n_host, sched->pp_n_buf,
++                              (double) sched->pp_size / (1024.0 * 1024.0),
++                              sched->pp_free_gib);
++            }
++        }
++    } else if (stage_ahead > 0) {
+         sched->stage_cur = 0;
+         sched_stage_issue(sched, &splits[0], 0);
+     }
+@@ -3816,7 +4036,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
+-        if (stage_ahead > 0) {
++        if (sched->pp_on) {
++            // which ping-pong buffer this split consumes (the input loop below reads `pp_cur`)
++            pp_k = -1;
++            for (int h = 0; h < pp_n_host; h++) {
++                if (pp_host[h] == split_id) { pp_k = h; break; }
++            }
++            if (pp_k >= 0) {
++                sched->pp_cur = pp_k % sched->pp_n_buf;
++            }
++        } else if (stage_ahead > 0) {
+             sched->stage_cur = split_id & 1;   // the plan this split's input loop drains
+         } else {
+             sched->stage_cur = 0;
+@@ -3853,7 +4082,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
+-        if (stage_ahead > 0 && split_id + 1 < sched->n_splits) {
++        if (!sched->pp_on && stage_ahead > 0 && split_id + 1 < sched->n_splits) {
+             // its transfer now runs on the copy stream while this split computes
+             sched_stage_issue(sched, &splits[split_id + 1], (split_id + 1) & 1);
+         }
+@@ -3897,10 +4126,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        // PING-PONG: this split's buffer is released once its compute is ENQUEUED (the event fires when the
++        // kernels have actually read it), and the fill for split k+2 goes into that same buffer straight away --
++        // it waits on the event on the copy stream, so it cannot overtake the consumer.
++        if (sched->pp_on && pp_k >= 0) {
++            const int b = pp_k % sched->pp_n_buf;
++            ggml_backend_event_record(sched_stage_ev(sched, sched->pp_backend[b], b, false), split_backend);
++            if (pp_k + sched->pp_n_buf < pp_n_host) {
++                sched_pp_issue(sched, &splits[pp_host[pp_k + sched->pp_n_buf]], b);
++            }
++        }
++
+         // wip/flash-next-prefill (the ping-pong): release this split's ring slots now that its compute is
+         // ENQUEUED -- the event fires when the kernels have actually read them, which is exactly the lifetime
+         // a redirect-mode slot needs (in copy mode this only frees a slot a little later than before).
+-        if (sched_stage_redirect()) {
++        if (!sched->pp_on && sched_stage_redirect()) {
+             for (int k = 0; k < sched->stage_consumed_n[sched->stage_cur]; k++) {
+                 const int b    = sched->stage_consumed[sched->stage_cur][k].backend_id;
+                 const int slot = sched->stage_consumed[sched->stage_cur][k].slot;
+@@ -4005,6 +4245,23 @@ ggml_backend_sched_t ggml_backend_sched_new(
+         sched->stage_enabled = stage_env == NULL || atoi(stage_env) != 0;
+         const char * slots_env = GGML_ENV_STR("GGML_SCHED_STAGE_SLOTS");
+         sched->stage_n_slots = slots_env != NULL ? atoi(slots_env) : GGML_SCHED_STAGE_SLOTS_DEFAULT;
++        // wip/flash-next-prefill: the TWO-BUFFER PING-PONG (the maintainer's design) replaces the slot ring by
++        // default.  It is two buffers, each sized once to the largest split's host-weight set, one fill in flight,
++        // consumed in place -- GGML_SCHED_PINGPONG=0 selects the ring for the A/B.
++        sched->pp_on = sched_pp_on();
++        if (sched->pp_on && sched->stage_n_slots < 2) {
++            sched->stage_n_slots = 2;   // the two buffers are backend slots 0 and 1
++        }
++        sched->pp_size = 0;
++        sched->pp_cur  = 0;
++        // Fixed for the process lifetime (see sched_pp_choose_bufs): 1 / 2 / 3 by the device's FREE VRAM here.
++        sched->pp_free_gib = sched_pp_startup_free_gib(sched);
++        sched->pp_n_buf    = sched_pp_choose_bufs(sched);
++        for (int i = 0; i < 4; i++) {
++            sched->pp_n_ent[i]   = 0;
++            sched->pp_base[i]    = NULL;
++            sched->pp_backend[i] = 0;
++        }
+         if (sched->stage_n_slots < 1) {
+             sched->stage_n_slots = 1;
+         }
