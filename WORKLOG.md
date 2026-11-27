@@ -16,6 +16,45 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.003 (r368, `wip/`) -- flash-next-prefill squashed to ONE patch and code-reviewed; every finding fixed
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  The campaign's 21 commits are
+now one commit, `~/llama.cpp` branch `wip/prefill-slot-pingpong-squashed` tip `a6ede394b` (on `af7a57ba8`, tree
+identical to the chain's), exported as `wip/flash-next-prefill/SQUASHED-campaign-r368.patch`; the old chain
+(`wip/prefill-slot-pingpong-r368`) is kept as history only.  The review is
+[`wip/flash-next-prefill/REVIEW-squashed.md`](wip/flash-next-prefill/REVIEW-squashed.md).
+
+**Why squash.**  Five sessions of churn are not reviewable as a chain: each fix sits on top of the previous
+session's experiment, so a reader cannot tell which half of a number is current.  As one diff (22 files) the review
+is of the tree that would ship.
+
+**What the review found, all fixed in the same commit.**  Two real bugs the compiler also knew about but nobody had
+read: the transport-decision `-lv 4` line passed `sched_moe_cache_band(backend)` with **no format specifier** (so
+it never printed the band it names), and the transport-exhaustion `WARN` fed `%zu` an **`int`** (`s.ring_slots`),
+i.e. the one line that says how many slots exist printed garbage.  A **behavioural regression** was restored: the
+ping-pong consulted the staging width gate BEFORE checking whether a split had anything to stage, and that gate
+runs the one-off H2D calibration -- which `cudaMalloc`s a probe buffer that Windows does not get back after
+`cudaFree` (issue #97); the ring path it replaces returned first for a dense/fully-resident split, and so does the
+ping-pong again.  Dead code removed: `sched_pp_startup_free_gib()` + `pp_free_gib` (the deleted free-VRAM count
+decision, which also carried a comment stating the old policy directly above the function that replaced it), the
+ring-era `sched_stage_min_tokens_for[_bytes]()` and the table-ref scaling only they used, and the Meta backend's
+`stage_n_slots = 8` default.  Comments/logs corrected: the residency rule's header (stale "divided by the current
+depth"), its "the region becomes X MiB" line (a prediction, now the request BEFORE and AFTER), the scheduler's
+staging line (it labelled every non-env depth "the expert-cache residency rule", including the free-VRAM fallback),
+the transport cap's header, and `llama-context`'s new line (it printed the provisional depth as if it were a
+decision).  "Checked and clean" is recorded too, so the next reader does not re-derive it: `ring_candidate` calling
+`moe_cache_residency` under the slab lock is safe (atomic mirrors, no lock), the one real deadlock this campaign
+hit is documented at the call site, and the D1 probes are default-off by construction.
+
+**One judgement call implemented:** `GGML_SCHED_PINGPONG_BUFS` (and the deprecated `GGML_SCHED_STAGE_SLOTS`) is
+clamped to the ping-pong's own **1..3** -- the ring's 8/16 sized the transport region for buffers nothing could
+use, and every consumer now agrees because they all read the one authority.
+
+**Re-verified after the fixes** (the review is not allowed to change behaviour): 1 GPU 89k `43d0b1f4629e` on both
+cycles, 2488.1 t/s median; the field three-request sequence reproduces to the MiB -- `3 -> 2`, region 3412.5 ->
+2275.0 MiB, carves 2304, arena after each drop 15 960.2 / 15 960.2 / 15 827.7 MiB, prefill 2224.6 t/s; and the
+build is warning-free in every file the change touches.
+
 ## 261127.002 (r368, `wip/`) -- flash-next-prefill: the transport buffer COUNT comes from the arena's RESIDENCY, and the startup decision that sized it is deleted
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  Prototype `~/llama.cpp`

@@ -1,6 +1,8 @@
 # Flash-Next prefill — why do other engines reach 2900-3500 t/s where we reach 2100-2600?
 
-**Status: OPEN — a measured rewrite in the prototype, nothing in `patches/`; pick it up from
+**Status: OPEN — a measured rewrite in the prototype, nothing in `patches/`; the campaign is **squashed to
+one commit** (`SQUASHED-campaign-r368.patch`) and **code-reviewed** ([`REVIEW-squashed.md`](REVIEW-squashed.md),
+all findings fixed), which is the form it goes to promotion in.  Pick it up from
 [`RESULTS-session5.md`](RESULTS-session5.md) (session 5: the `transport_base` cushion, the field verification,
 and the re-base onto **r368** — the campaign chain now sits on the current release) and
 [`HANDOVER-session5.md`](HANDOVER-session5.md) (the ask it answered; §4 of RESULTS-session5 is the promotion
