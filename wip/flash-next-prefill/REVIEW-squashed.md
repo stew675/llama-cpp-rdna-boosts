@@ -232,3 +232,40 @@ unchanged (decision 2, `144 x 2 x 450 MiB`, `band_raise[absorbed=2 overrun=0]`, 
 35B-A3B 3 213.7 (+3.5 %); 122B 1 199/1 202 (neutral); the 89k staging census is the same 138 splits into 3 buffers of
 450 MiB with 2.5-3x less region.  Lock order unchanged (the new call into `ggml_cuda_slab_min_arena_mib()` is a
 read-only getter, and the region re-request still runs under the cache mutex only).
+
+## 9. OPEN at hand-over: the Meta backend's staged ring is not reachable on a `-sm tensor` split
+
+Surfaced by the maintainer's question "are staging buffers still possible in tensor split mode?".  The answer is
+**yes on one GPU** (their `runme` is single-device: `-sm tensor` over one device is served by the plain CUDA backend,
+so the PIPELINE stages -- that is the `144 splits x 2 x 450 MiB` in every field log) and **no on two or more** (the
+split is served by the Meta backend, which has no backend slots, so the pipeline declines by design and the
+per-device ring is the only staged transport -- and it cannot currently be reached).  Four facts, in the order they
+bite:
+
+1. **The copy-input gate was wrong (this review's defect, §1's rewrite).**  The Meta branch was gated on
+   `sched->pipe_on && sched_pipe_entry_off(...) != -1`, which is FALSE on a Meta split (`pipe_on` is deliberately
+   off there, and there are no pipeline entries).  The base gated it on `stage_split_ok`, set by the deleted
+   `sched_stage_issue`.  **Fixed:** the split carries its own `stage_ok` flag (computed by `sched_pipe_split_set`,
+   so the gather and the width gate still decide) and the branch gates on that.
+2. **The meta DEVICE forwarded none of the transport-region hooks** (`slab_stage_set` / `slab_stage_region` /
+   `slab_stage_slots` / `slab_set_stage_cap` / `slab_set_stage_unit` were all `nullptr`, unlike its `narrow2` /
+   `compute_plain` forwarding).  So the per-device slabs were never armed and never asked.  **Fixed:** they forward
+   to the simple devices (the region hook takes the largest child region, the depth the smallest).
+3. **The per-device region is still never carved on a split.**  With both fixed the ring IS attempted and is
+   refused every time (`stage_buffer` -> "no transport region is carved for this pass"), because the wide compute
+   buffer is allocated once at *reserve* and then reused, so no `work_alloc(!narrow)` runs after the arm; and the
+   `llama_context` drop that would re-reserve it is gated on `ring_carved`, which is false precisely because no
+   region was ever carved.  Chicken-and-egg, and it is why nothing noticed: the selector's measured-better answer
+   for a tensor split is the gather, so the default never asks.
+4. **So a 2+ device `-sm tensor` split has no working staged arm.**  `GGML_SCHED_DEVGATHER=0` (the A/B) now says so
+   (one refusal line) and takes the serial whole-split upload: measured 2-dev GSQ 89k, gather **3431-3462 t/s** vs
+   `DEVGATHER=0` **3284-3299**.
+
+**The decision this needs** (maintainer's, at promotion): either **delete** the Meta staged transport (the ring,
+`stage_input`, `stage_n_slots`, its event vectors -- unreachable in practice and behind the gather on every arm
+measured), or **finish** it (make the arm carve: `work_alloc` on the arm, or let `stage_candidate` fire from
+`slab_stage_set`, and un-gate the drop).  Nothing in the delivery's validated shapes is affected either way -- the
+1-GPU pipeline and every `-sm tensor` default are unchanged (89k 2 488.4 t/s, `43d0b1f4629e`; field
+`144 x 2 x 450 MiB`, no refusal/drift/grow lines) -- and the docs must not claim tensor-split staging works until
+one of the two is done (`ENVIRONMENT.md`'s `GGML_SCHED_DEVGATHER` entry says the gather "is the transport" on that
+tier, which is true; `patches/README.md`'s block note must say the same).

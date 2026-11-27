@@ -345,6 +345,21 @@ on that shape must pin `MOE_EXPERT_HEATMAP` (the campaign's arms do; `field-seq.
 gap).  This is what made the field numbers move between builds before the rework and has nothing to do with the
 transport.
 
+## 8.6 Open at hand-over: the Meta ring (2+ device `-sm tensor`) cannot be reached
+
+Your question -- "are staging buffers still possible in tensor split mode?" -- has two answers.  **One GPU: yes**,
+that is the pipeline (your `runme` is single-device, so `-sm tensor` over one device is a plain CUDA backend; the
+field log's `144 splits x 2 x 450 MiB` IS staging).  **Two or more: no**, not today -- and it took three fixes to see
+it clearly: the review's copy-input gate made the Meta branch unreachable (`pipe_on && entry != -1` is false on a
+Meta split; **fixed**, the split now carries its own `stage_ok`), the meta DEVICE forwarded none of the
+transport-region hooks so its slabs were never armed (**fixed**, they forward like `narrow2` does), and the
+per-device region is still never carved on a split (the wide buffer is allocated once at reserve and reused, and the
+drop that would re-reserve it is gated on a region existing) -> every ring slot is refused and
+`GGML_SCHED_DEVGATHER=0` takes the serial upload (2-dev GSQ 89k: gather **3431-3462** t/s vs `DEVGATHER=0`
+**3284-3299**).  The default is unaffected (it gathers, which measures better), the 1-GPU shapes are unchanged, and
+the decision -- delete the Meta staged transport or finish it -- is the final review's first item
+([`REVIEW-squashed.md`](REVIEW-squashed.md) §9).
+
 ## 9. For the next session
 
 * **Attributing a number to a review is a rebuild, not an argument**: `git checkout <pre-review sha>` +
