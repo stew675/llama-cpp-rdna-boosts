@@ -16,6 +16,42 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.015 (r368, `wip/`) -- flash-next-prefill: the drain-overlap attempt CORRUPTED OUTPUT and is REVERTED; the follow-up moves to `wip/tensor-split-stage-overlap/`
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  The campaign tip is **still
+`a666f8637`** (patch 5327 lines / 18 files, already pushed); the experiment below was reverted rather than landed.
+
+**What was tried.**  The Meta (tensor-split) staged transport is coherent and wins at low coverage (§.014's numbers),
+but its drain -- a slot -> split-input device-to-device copy on the COMPUTE stream -- is worth real money.  Two
+probes: the existing `GGML_STAGE_META_REDIRECT=1` A/B (which removes the drain) is a **rate** probe and read
+**3066.4 vs 2868.6 t/s (+6.9 %)**; so the drain-overlap change was implemented (issue the drain on the auxiliary copy
+stream behind its own H2D, record an event the consumer waits on, free the slot there), which read **3379.0 / 3393.5
+t/s -- +18.6 % -- and produced garbage text** (`3333…` against the gather arm's coherent "We need answer to user…").
+
+**It is reverted, and the cause is understood.**  `ggml_backend_i.event_record` records on the device's MAIN (compute)
+stream, so the new `copy_ev` recorded the compute stream's position rather than the copy stream's: the consumer was
+ordered against nothing and read the split input before the drain landed.  The mechanism the fix needs already exists
+inside `stage_upload` (which records its DONE event on the copy stream) -- it has to be exposed, not re-invented.
+
+**The check that caught it, and the rule it reinforces.**  A staged-vs-gather *hash* difference is NOT the test on a
+Meta tensor split: per `GREEDY-PURITY.md`, a different configuration legitimately gives different-but-correct text
+(order-of-operation near-ties), and the landed tree's own arms differ run to run (both transports, 40 % and 100 %).
+**Coherence is the test** -- the broken arm was `3333…`, the landed arms are prose.  The landed 40/60/80 % arms were
+re-read for it: all coherent.
+
+**The in-place consume stays out of scope for a landed change too.**  The redirect cannot be correct as a Meta-side
+pointer swap: the consumer of a host-offloaded expert table resolves it through the cache's arena/remap
+(`moe_cache_get_table`), not through `simple_tensor->data`, so the slot is ignored (receipt: `////`, MTP acc 1.00 vs
+3.88).  Making it work is a CACHE-side feature (an identity view of the staged split input for one pass, with the
+take-over promise's lifetime rules), and it is the follow-up campaign's step 4, not this campaign's.
+
+**Moved to [`wip/tensor-split-stage-overlap/`](wip/tensor-split-stage-overlap/README.md)** (registered in
+`wip/CAMPAIGNS.md`): the two root causes, the prize (+6.9 % drain latency measured; ~+18.6 % seen but not earned), the
+gated plan (copy-stream event record -> correct overlap -> coherence + near-tie gate at 40/60/80/100 % -> cache-side
+in-place -> re-calibrate the crossover), the landed numbers of record, and the harness recipe.  The landed transport
+stays exactly as measured: **wired in, selectable, coherent, +8.1 % at 40 % coverage**, and retained whatever policy
+follows.
+
 ## 261127.014 (r368, `wip/`) -- flash-next-prefill: the Meta (tensor-split) staging transport is WIRED IN and measured (+8.1 % at 40 % coverage); the support stays whatever the policy is
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push, nothing promoted, ladder still not
