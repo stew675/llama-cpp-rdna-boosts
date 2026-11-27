@@ -1,7 +1,19 @@
 # wip/rdna4-q6k-dense-vdr4: dense Q6_K mmvq VDR-4 on RDNA4 (opt-in)
 
-Written with Claude (AI). This is the Q6_K counterpart of the dense Q5_K form from #374. The gfx12 numbers and the
-first version of this patch were posted in
+Written with Claude (AI).
+
+**Where it comes from:** this patch follows the dense Q5_K VDR-4 path that r368 added for
+[#374](https://github.com/stew675/llama-cpp-rdna-boosts/issues/374). @mjohanning99 reported the missing path and you
+implemented it, with `-DGGML_HIP_RDNA4_Q5K_DENSE_VDR4` as the RDNA4 opt-in. When we measured that flag on gfx12, Q6_K
+was the next-largest dense type in our model and still took the 16-element chunk. This patch therefore applies the same
+recipe to Q6_K:
+
+- one 32-element call;
+- one integer dp4a chain per sub-block before its single scale;
+- an opt-in flag that matches the Q5_K one.
+
+The Q6_K-specific part is the −32 offset, folded in with the `__builtin_amdgcn_perm` lookup that the existing VDR-2
+kernel already uses. The gfx12 numbers and the first version of this patch were posted in
 [#374](https://github.com/stew675/llama-cpp-rdna-boosts/issues/374#issuecomment-7222381702).
 
 - **Patch:** one `git am` file made on `v18-919794500-r368`, the tree `scripts/apply-all.sh` makes (tip `af7a57ba8`,
