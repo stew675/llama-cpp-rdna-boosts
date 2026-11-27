@@ -16,6 +16,51 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261126.008 (r368) -- issue #374: Q5_K gets the dense VDR-4 mmvq dot product Q4_K already had (blocks 07/08/10), and RDNA3_0's Q6_K prefill band turns out to be block 06's already
+
+**The report.**  `@mjohanning99` profiled two RDNA3 (gfx1100) gaps from a 7900 GRE in a `-sm tensor` split: (1)
+Q5_K has no 32-element dense `mmvq` dot product while Q4_K does, so a Q5_K-heavy quant decodes 30-45 % slower than
+its neighbours at every width (their table: `m 4096 k 14336`, Q5_K 36.5 µs at n = 1 against Q4_K's 22.6, and Q5_K
+slower than Q6_K at every width although Q6_K carries more bits); they built it themselves and measured Q5_K
+36.5/94.2/134.9 -> 27.5/61.2/79.5 µs at n = 1/5/8 with the two rows per block RDNA3_0 was also missing for Q5_K and
+IQ4_XS.  (2) RDNA3_0's `ggml_cuda_should_use_mmq()` caps Q6_K at `ne11 <= 128`, so above that the type is
+dequantised and handed to rocBLAS; their switch made the GRE's Q6_K take 161 ms instead of 297 and read +6.2 %
+prefill.
+
+**Finding 1 held.**  `vec_dot_q5_K_q8_1_vdr4_dense` is the Q4_K dense kernel plus the `qh` fifth bit (Q5_K shares
+Q4_K's 6-bit scale/min layout), and merging the MoE `VDR=4` kernel's two half-chains into one chain per sub-block is
+a pure integer reordering -- same scale, same `d8`, `|dot1| <= 16*31*127` times a 6-bit scale < 2^22, exact.  It is
+the default on RDNA3_0, with RDNA4 behind `-DGGML_HIP_RDNA4_Q5K_DENSE_VDR4` mirroring Q4_K's flag.  Block 07 owns
+the kernel and the opt-in Q6_K band, block 08 the rows (`calc_rows_per_block_weight`: Q5_K and IQ4_XS 1 -> 2 rows,
+bit-identical), block 10 the host VDR and the dispatch case (the K partition must agree on both sides).  Measured on
+this box's gfx1100 (7900 XTX), 27B UD-Q4_K_M: Q5_K `33.01/44.57/81.15/115.09 -> 22.23/27.20/51.08/70.21` µs at
+n = 1/2/5/8, the model's own Q5_K shapes -29 % at n = 1, IQ4_XS `18.39/24.95/43.39/63.84 ->
+18.40/22.06/34.84/47.37`, and the Q4_K/Q6_K controls inside 0.5 %.
+
+**Finding 2 was already fixed above 512 tokens.**  The `ne11 <= 128` line is exactly as they read it, but block
+06's MMB dense tile is dispatched first: `GGML_CUDA_GCDBG=1` on the 27B shows **0 cublas GEMMs** at `-ub 512` and
+`-ub 1024` (7888 / 3944 `mmb` launches) and 672 at `-ub 256`.  Their profile is from r249, before MMB.  The
+reachable hole is the **129..511 band**, and there the swap is a wash on this card (pp4096 at `-ub 256`
+1026.2 vs 1027.9; `-ub 384` 1091.2 vs 1093.4) with prefill KLD **0.005112 / 96.01 %** against the rocBLAS arm -- a
+family switch outside the gate's absolute limits.  So it ships as **`GGML_CUDA_Q6K_MMQ=1`, opt-in**
+(`ENVIRONMENT.md` §30): their GRE's 1.8x on the Q6_K GEMMs is reachable, and no RDNA3_0 prefill reference moves by
+default.
+
+**What it is worth end to end, honestly.**  tg128 **+0.85 %**, pp4096 unchanged, `llama-batched-bench -npl 1,4,8`
+**+0.9 / +3.4 / +14.7 %** at B = 1/4/8 (S_TG +8.5 %), MTP decode neutral, plain == draft-mtp byte-identical on
+both axes.  The 39 % kernel win is measured on a 40 MB matrix that fits the 96 MiB Infinity Cache; a 27B model's
+15.3 GiB does not, so single-stream decode is at the DRAM roof and cannot show it -- at B = 8 eight columns share
+one weight read and the win lands.  That distinction (with the footer-polluted text hash that made the first
+matrix read six false differences) is `INVARIANTS.md` r368 and `GREEDY-PURITY.md` §111.
+
+**Gates.**  `test-backend-ops test -o MUL_MAT` **2753/2753**; `test-logits-width-probe` **PASS** (worst maxdiff 0)
+on f16/f=512, q8_0/bf16 P=3584; `gate-prefill-logits.sh` **0.000000 / 100.000 %**; 9B Q8_0 text byte-identical;
+`check-rung-file-sets.py` 0 loss / 0 gone / 0 shrunk (+4 defines, +1 env).  Greedy text moves once on RDNA3_0 (2 of
+6 prompt arms unchanged; every pre-r368 gfx1100 text reference is superseded, gfx1201/gfx1151 untouched).
+
+**Record.**  `archive/work/issue-374-kquant/` (both builds, every table, the harness scripts); `patches/README.md`
+blocks 07/08/10; `ENVIRONMENT.md` §14/§30; `DIAGNOSTIC.md` §30; `INVARIANTS.md` r368; `GREEDY-PURITY.md` §111.
+
 ## 261126.007 (r367) -- the container images verified 23/23 by the worker; the release is finished
 
 The `radiance` worker picked the tag up on its next poll, ran that tag's own `scripts/build-containers.sh --push

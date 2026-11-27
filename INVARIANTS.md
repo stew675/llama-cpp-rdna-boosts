@@ -3701,3 +3701,51 @@ applies every artifact in numeric order, asserts `release.json.optional_tree`, a
 class is *content drift inside an artifact*, which no inventory reconciliation sees (the file, its define set and its
 options are unchanged), so the check has to be a build.  (r367, GitHub issue #371;
 `optional/mixed-kv/README.md`; `MANIFESTS.md` gate 47.)
+
+## r368 (2026-11-26, `WORKLOG.md` 261126.008) — a per-TYPE hole in a per-ARCH kernel table is invisible to every output gate, a kernel win's end-to-end size is set by where the weights live, and a text hash must be the GENERATED TEXT (blocks 07/08/10, GitHub issue #374)
+
+The reporter's Q5_K decode finding is real and was fixed by giving Q5_K the dense 32-element `VDR=4` dot product
+Q4_K already had (`vec_dot_q5_K_q8_1_vdr4_dense`, block 07; host VDR + dispatch in block 10) plus the two rows per
+block Q5_K and IQ4_XS were missing at the verify widths (block 08).  Their second finding — RDNA3_0's Q6_K prefill
+above 128 tokens going to rocBLAS — is real against upstream but **already covered by block 06 above 512 tokens**,
+so the deliverable part of it is an opt-in switch for the 129..511 band.
+
+1. **A type that is uniformly slower than its neighbours passes every gate the delivery has.**  Q5_K computed a
+   correct matvec; `test-backend-ops test`, the prefill-logit gate, the width probe and every text arm say "fine"
+   because they ask whether the *output* is right, never whether a type takes a kernel its bpw does not explain.
+   The instrument for this class is a **per-type µs/call sweep at the model's own shapes with the neighbouring
+   types as controls** (`test-backend-ops perf -o MUL_MAT`, and the reporter's per-type table is the same idea
+   done by hand).  Measured here: Q5_K `m 4096 k 14336` n = 1/2/5/8 `33.01/44.57/81.15/115.09 ->
+   22.23/27.20/51.08/70.21` µs (−33..−40 %), the model's own Q5_K shapes −29 % at n = 1, and the Q4_K/Q6_K
+   controls inside 0.5 %.
+2. **The dense form is an exact integer reordering, so it costs purity nothing — and the row count less than
+   nothing.**  Merging the MoE `VDR=4` kernel's two half-chains into one chain per sub-block uses the same scale
+   and the same `d8` (`|dot1| <= 16*31*127`, times a 6-bit scale < 2^22), and rows per block are a row-block
+   decomposition, so each row's accumulation is unchanged.  `test-logits-width-probe` PASS (worst `maxdiff` 0) on
+   `KV=f16 P=512 ub=1024`, `KV=q8_0 P=3584` and `KV=bf16 P=3584`, and `gate-prefill-logits.sh` reads 0.000000 /
+   100.000 %.  The *cross-build* greedy text does move on RDNA3_0 (the K partition; `GREEDY-PURITY.md` §111) —
+   2 of 6 prompt arms are unchanged and a Q8_0-only model is byte-identical, which is the same asymmetry class as
+   r170's upstream VDR bump.
+3. **A kernel's µs/call win is bounded by the cache residency of the shape it was measured on, and the same
+   kernel serves both regimes.**  The 39 % is measured on a 40 MB matrix that fits the 96 MiB Infinity Cache
+   (instruction bound); a 27B model's 15.3 GiB does not fit, single-stream decode sits at the ~800 GB/s DRAM roof
+   where the Q5_K tensors already were, and the end-to-end number is **tg128 +0.85 %**.  At `B = 8` (and in a
+   verify batch) eight columns share one weight read, the same shape returns to instruction bound, and the win
+   lands: `llama-batched-bench -npl 1,4,8` **+0.9 / +3.4 / +14.7 %** at B = 1 / 4 / 8, S_TG +8.5 %, MTP decode
+   neutral.  So **quote a kernel win with its shape class**, and never infer a single-stream decode win from a
+   cache-resident microbenchmark.
+4. **Read the DISPATCH, not the source line, before believing a path is taken.**  The Q6_K `ne11 <= 128` cap is
+   still in `ggml_cuda_should_use_mmq()` exactly as the reporter read it — and it is **unreachable above 512
+   tokens on the delivery**, because block 06's MMB dense tile is dispatched first: `GGML_CUDA_GCDBG=1` on the 27B
+   reports `mmb=7888 ... cublas` absent at `-ub 512` and `-ub 1024`, and 672 `cublas` GEMMs at `-ub 256`.  A
+   source-level reading of a threshold is a hypothesis; the branch census is the measurement.
+5. **A fresh-process text hash must be the generated text, and nothing else.**  The `[ Prompt: ... | Generation:
+   ... ]` footer is part of `llama-cli`'s STDOUT and its t/s figures differ every run, so `sha256sum` of a whole
+   capture reports a different hash for identical text (this session's first text matrix "found" six arm
+   differences that were six footers).  `scripts/extract-generated.py` is the only correct slice, and `-lv` must be
+   absent from a text arm for the same reason — with `-lv 4` the same extraction returned 194 KB of census lines
+   where the text was 7.8 KB.
+
+**Record.**  `archive/work/issue-374-kquant/README.md` (all tables, both builds, every gate);
+`GREEDY-PURITY.md` §111; `patches/README.md` blocks 07/08/10 (r368 amendments); `ENVIRONMENT.md` §14
+(`-DGGML_HIP_RDNA4_Q5K_DENSE_VDR4`) and §30 (`GGML_CUDA_Q6K_MMQ`, opt-in); `DIAGNOSTIC.md` §30; GitHub issue #374.

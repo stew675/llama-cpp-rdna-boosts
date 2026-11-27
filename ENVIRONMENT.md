@@ -426,6 +426,7 @@ Compile-time, because a device-side runtime gate does not work cleanly here.
 |---|---|---|
 | `-DGGML_HIP_RDNA4_Q4K_DENSE_VDR4` | off | RDNA4 uses the 32-element dense Q4_K VDR-4 dot product (RDNA3_0 always uses it).  One flag gates both the device selection and the host K-split, because the K partition must match.  It changes the K summation order, so greedy text moves on some prompts (deterministically); width purity is preserved.  A small win, so it stays off. |
 | `-DGGML_HIP_RDNA4_Q4K_MOE_VDR4` | off | The **MoE expert** kernel uses the same dot product; only the summation changes.  Separate from the dense flag, so the two can be A/B'd independently.  The patch also defines a host-visible constant so ccache keys the HIP object on this device-only flag.  Flat on single-token decode, small and mixed gains at verify widths — not a clear default-on win. |
+| `-DGGML_HIP_RDNA4_Q5K_DENSE_VDR4` | off | RDNA4 uses the 32-element dense Q5_K VDR-4 dot product; RDNA3_0 always uses it (r368, issue #374).  The mirror of `-DGGML_HIP_RDNA4_Q4K_DENSE_VDR4`, for the same reason: one flag gates the device selection and the host K-split, because the partition must match.  It changes the K summation order, so greedy text moves on some prompts; width purity is preserved.  Unmeasured on RDNA4 (this repo has no gfx12 on the box that cut it), so it stays off. |
 | `-DGGML_HIP_Q6K_DENSE_VDR1` | off (dense Q6_K VDR=2) | The dense Q6_K `mmvq` uses the **VDR=1** chunk on every arch, i.e. the association order a pre-chunked base produced.  This is a **reproducibility** escape, not a performance switch — VDR sets the fp32 reduction order, so greedy text moves by design.  One macro gates both sides, so the partition cannot disagree. |
 | `-DGGML_HIP_NO_DPP_XOR` | off (DPP on) | Restores `__shfl_xor` for the wave32 warp reductions on RDNA3/RDNA4.  The DPP path is bit-identical and speeds up the HC_MIX/band work.  **There is deliberately no runtime env var**: a device-side runtime gate was implemented and reproducibly wedged the FA prefill at ~4096 tokens with MTP. |
 
@@ -791,6 +792,26 @@ slot(s) hold 4887 of 8192; deferred until a slot is released`) — the non-vacui
 Gate: `scripts/gate-kv-admit.sh` (`MANIFESTS.md` gate 46).
 
 *The kill switch (and why turning it off is the pre-r365 behaviour) is in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §29.*
+
+---
+
+## 30. RDNA3's Q6_K prefill band: MMQ below the MMB floor (block 07, r368)
+
+Upstream's `ggml_cuda_should_use_mmq()` caps Q6_K on RDNA3_0 at `ne11 <= 128`, so above that the type is
+dequantised and the GEMM goes to rocBLAS.  That cap is card-shaped, not universal: on a **7900 GRE** the rocBLAS
+GEMM plus its dequantise costs 297 ms where `mul_mat_q<Q6_K>` costs 161 ms on a 2048-token prefill (+6.2 %
+prefill, issue #374), and on this repo's **7900 XTX** the two are within noise (pp4096 at `-ub 256`
+1026.2 vs 1027.9 t/s) with a large-`-ub` MMQ regression at one shape (`n = 2048`, `m 2560 k 6144`: 1115 vs
+1090 µs).  Above **512 tokens the choice does not matter in the delivery at all**: block 06's MMB dense tile
+takes Q6_K first (`mmb_min_t` is 512), so the switch only reaches the 129..511 band and any
+`GGML_CUDA_MMB=0` build.  Hence a switch, not a default.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `GGML_CUDA_Q6K_MMQ` | **off** = upstream's cap; `=1` opts in | **opt-in**, RDNA3_0 (`gfx110x`) only | `=1` extends the RDNA3_0 MMQ ceiling for Q6_K from 128 to 512, i.e. to block 06's MMB floor.  Select it on a card whose rocBLAS tile selection is poor for the Q6_K shapes (a 7900 GRE measured +6.2 % prefill); it is a different reduction order, so prefill logits move a little (mean KLD 0.005112 / same top-1 96.01 % against the rocBLAS arm on this box, `GREEDY-PURITY.md` §46), and it changes nothing at all at `-ub 512` and above.  Read the dispatch with `GGML_CUDA_GCDBG=1` (`cublas` -> `mmq` in the `CUDAGC_MATMUL` line). |
+
+Record: `archive/work/issue-374-kquant/README.md`; gate: `scripts/gate-prefill-logits.sh` at `--ub 256` (the
+band it reaches), which is a **family-switch** point rather than a rounding-level one.
 
 ---
 

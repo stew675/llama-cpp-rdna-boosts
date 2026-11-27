@@ -3323,3 +3323,45 @@ to see.
 **Record.**  This entry; `scripts/gate-fast-topk-penalties.sh`; `patches/README.md` block 12 (r361); `DIAGNOSTIC.md`
 §27; `MANIFESTS.md` gate 45; `INVARIANTS.md` r361; `WORKLOG.md` 261125.006; `archive/work/fast-topk-penalties/`;
 GitHub issue #366.
+
+## 111 (r368, blocks 07/08/10) — a per-TYPE hole in a per-ARCH kernel policy is invisible to every gate that asks "is the output right", and a kernel win's end-to-end size is set by where the weights LIVE
+
+**Claim.**  `get_vdr_mmvq_dense()` gave Q4_K a 32-element (`VDR=4`) dense `mmvq` dot product on RDNA3_0 and left
+Q5_K on the generic 16-element form, so one k-quant was 30-45 % slower than its neighbours at every decode and
+verify width (issue #374: a 7900 GRE at `m 4096 k 14336` reads Q5_K 36.5 µs against Q4_K's 22.6 at n = 1, and Q5_K
+is slower than Q6_K although Q6_K carries more bits).  Q5_K shares Q4_K's scale/min layout, so
+`vec_dot_q5_K_q8_1_vdr4_dense` is that kernel plus the `qh` fifth bit, and merging the MoE `VDR=4` kernel's two
+half-chains into one chain per sub-block is a **pure integer reordering** (identical scale, identical `d8`,
+`|dot1| <= 16*31*127` times a 6-bit scale < 2^22).  It is the default on RDNA3_0; RDNA4 opts in
+(`-DGGML_HIP_RDNA4_Q5K_DENSE_VDR4`).  Two row-block policies were missing with it (Q5_K and IQ4_XS sat at 1 row
+while Q4_K/Q6_K took 2) and that half is bit-identical by construction, because rows are a row-block decomposition.
+
+**Rule.**  Three, in order of how expensive they are to learn.
+1. **A per-type asymmetry inside a per-arch dispatch table is not a defect any output gate can see.**  Q5_K
+   computed a correct matvec; it was just slower than the type beside it.  Nothing in the delivery compares a
+   type's kernel time against its neighbours' *per bpw* — the ladder asks "is the text right", the KLD gate asks
+   "did the prefill move", the width probe asks "do the widths agree", and a uniformly slow type passes all three.
+   So a change to a per-type table owes a **per-type per-width µs/call sweep** (here `test-backend-ops perf -o
+   MUL_MAT` on the model's own shapes), with the neighbouring types as controls: they must not move.
+2. **A K-partition change moves the greedy text once on the arch that takes it, and that is not an impurity.**
+   Width purity is a *within-build* property (`W = 1..8` must agree), which the `test-logits-width-probe` PASS
+   under three KV types and two prefixes establishes.  A cross-build text move is the documented association-order
+   class (§2/§9) and it is asymmetric by arch here: gfx1201/gfx1151 keep every recorded text reference, every
+   **gfx1100** reference recorded before r368 is superseded.
+3. **"The kernel is 39 % faster" does not transfer to single-stream decode: the number's cache residency decides
+   how much of it survives.**  The µs/call win above is measured on a 40 MB matrix, resident in a 96 MiB Infinity
+   Cache, where the K-split kernel is instruction bound.  A 27B model's 15.3 GiB is not resident: single-stream
+   decode sits at the DRAM roof, where the Q5_K tensors already were, and a cheaper dot product cannot show
+   (tg128 **+0.85 %**).  At `B = 8`, and in a verify batch, eight columns share ONE weight read, which puts the
+   same shape back on the instruction roof -- and that is where the win lands (`llama-batched-bench -npl 1,4,8`
+   **+0.9 / +3.4 / +14.7 %**, MTP decode neutral).  Quote a kernel win together with the shape class it was
+   measured in, or the next reader will spend a day looking for the missing 38 %.
+
+**Numbers.**  gfx1100 (7900 XTX), 27B UD-Q4_K_M: Q5_K `m 4096 k 14336` **33.01 / 44.57 / 81.15 / 115.09 ->
+22.23 / 27.20 / 51.08 / 70.21 µs** at n = 1 / 2 / 5 / 8; the model's own Q5_K shapes -29 % at n = 1; IQ4_XS (rows
+only) `18.39 / 24.95 / 43.39 / 63.84 -> 18.40 / 22.06 / 34.84 / 47.37`; Q4_K and Q6_K controls within 0.5 %;
+widths above 8 are MMQ and untouched (+0.6 % noise).  `test-backend-ops test -o MUL_MAT` **2753/2753**; prefill
+KLD **0.000000 / 100.000 %**; 9B Q8_0 (no Q5_K/IQ4_XS) text byte-identical, 27B 2 of 6 prompt arms unchanged.
+
+**Record.**  This entry; `archive/work/issue-374-kquant/README.md`; `patches/README.md` blocks 07/08/10 (r368);
+`ENVIRONMENT.md` §14 + §30; `INVARIANTS.md` r368; `WORKLOG.md` 261126.008; GitHub issue #374.

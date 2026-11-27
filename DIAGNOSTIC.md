@@ -738,6 +738,16 @@ Gate: `scripts/gate-kv-admit.sh` (`MANIFESTS.md` gate 46) — its `--self-test` 
 
 ---
 
+## 30. RDNA3's Q6_K prefill band: MMQ below the MMB floor (block 07, r368)
+
+`GGML_CUDA_Q6K_MMQ` is an **opt-in enable**, not a kill switch: there is no default-on behaviour here to turn
+off, so the variable and its measurements are in [`ENVIRONMENT.md`](ENVIRONMENT.md) §30.  The diagnostic that
+makes the change observable is the existing `GGML_CUDA_GCDBG=1` (`ENVIRONMENT.md` §11): its `CUDAGC_MATMUL`
+line counts the `cublas` and `mmq` branches per process, so the switch's non-vacuity is `cublas` going to 0
+and `mmq` gaining those launches at `-ub 256`.
+
+---
+
 ## Maintaining this file
 
 The same recipe as [`ENVIRONMENT.md`](ENVIRONMENT.md) → *Maintaining this file* derives the names; this file is

@@ -1,4 +1,4 @@
-From c1efd4a065a680930c5269b3315f5e6e3a04cc3c Mon Sep 17 00:00:00 2001
+From 2ed062cbfaf51729f842e72b347d1c8c3d578b7f Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 08/18] rdna-boosts: block 08: fused kernels (old-08 fusions +
@@ -48,7 +48,7 @@ Co-authored-by: burnoutIA <72673971+burnoutIA@users.noreply.github.com>
  ggml/src/ggml-cuda/mmq-vec-dot.cuh            |   16 +-
  ggml/src/ggml-cuda/mmq.cu                     |  400 +++-
  ggml/src/ggml-cuda/mmq.cuh                    |  473 +++-
- ggml/src/ggml-cuda/mmvq-rdna-params.cuh       |  179 ++
+ ggml/src/ggml-cuda/mmvq-rdna-params.cuh       |  201 ++
  ggml/src/ggml-cuda/mmvq-rdna.cuh              |   78 +
  ggml/src/ggml-cuda/mmvq.cu                    | 1966 +++++++++++++++--
  ggml/src/ggml-cuda/mmvq.cuh                   |   31 +
@@ -73,7 +73,7 @@ Co-authored-by: burnoutIA <72673971+burnoutIA@users.noreply.github.com>
  ggml/src/ggml-cuda/unary.cu                   |  231 ++
  ggml/src/ggml-cuda/unary.cuh                  |   12 +
  tests/test-backend-ops.cpp                    |   19 +-
- 38 files changed, 5812 insertions(+), 461 deletions(-)
+ 38 files changed, 5834 insertions(+), 461 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv.cuh
  create mode 100644 ggml/src/ggml-cuda/mmvq-rdna-params.cuh
@@ -1673,7 +1673,7 @@ index 29ebe24fa..c8b706f63 100644
              load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
  
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 6065f5886..623a4508b 100644
+index 197d32b3c..216f79390 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -131,21 +131,130 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_type type, const ggml_pr
@@ -2898,10 +2898,10 @@ index be2f11430..55df94723 100644
  
 diff --git a/ggml/src/ggml-cuda/mmvq-rdna-params.cuh b/ggml/src/ggml-cuda/mmvq-rdna-params.cuh
 new file mode 100644
-index 000000000..d2dc42bb3
+index 000000000..c0ac65e10
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmvq-rdna-params.cuh
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,201 @@
 +#pragma once
 +
 +#include "common.cuh"
@@ -3034,9 +3034,31 @@ index 000000000..d2dc42bb3
 +#ifndef GGML_MMVQ_RDNA3_Q4K_WEIGHT_RPB
 +#define GGML_MMVQ_RDNA3_Q4K_WEIGHT_RPB 2
 +#endif
++// Q5_K and IQ4_XS sat at 1 row while Q4_K and Q6_K took 2, because the dense 32-element dot product
++// that makes multiple rows pay (see the Q4_K dense kernel) only existed for Q4_K.  Issue #374: with
++// vec_dot_q5_K_q8_1_vdr4_dense landed (and these rows), gfx1100 27B UD-Q4_K_M, m = 4096 k = 14336,
++// us/call -- Q5_K 33.01/44.57/69.10/81.15/115.09 -> 22.23/27.20/41.61/51.08/70.21 at n = 1/2/4/5/8;
++// IQ4_XS (rows only; the dot product is unchanged) 18.39/24.95/37.73/43.39/63.84 ->
++// 18.40/22.06/30.51/34.84/47.37, i.e. flat at n = 1 as it must be because n = 1 takes one row either
++// way.  The model's own Q5_K shapes gain the same ~30 % (n = 1, m = 6144/10240/12288 k = 5120:
++// 18.54/28.87/34.35 -> 13.02/20.21/24.54), and every width above 8 is MMQ, so it is untouched.
++// Rows are a row-block decomposition, so each row's accumulation -- and therefore the W = 1..8
++// logits -- is unchanged (bit-identical, test-logits-width-probe PASS).
++#ifndef GGML_MMVQ_RDNA3_Q5K_WEIGHT_RPB
++#define GGML_MMVQ_RDNA3_Q5K_WEIGHT_RPB 2
++#endif
++#ifndef GGML_MMVQ_RDNA3_IQ4XS_WEIGHT_RPB
++#define GGML_MMVQ_RDNA3_IQ4XS_WEIGHT_RPB 2
++#endif
 +static constexpr __host__ __device__ int calc_rows_per_block_weight(ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
 +    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && type == GGML_TYPE_Q4_K && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
 +        return GGML_MMVQ_RDNA3_Q4K_WEIGHT_RPB;
++    }
++    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && type == GGML_TYPE_Q5_K && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
++        return GGML_MMVQ_RDNA3_Q5K_WEIGHT_RPB;
++    }
++    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && type == GGML_TYPE_IQ4_XS && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
++        return GGML_MMVQ_RDNA3_IQ4XS_WEIGHT_RPB;
 +    }
 +    // Q6_K (8-warp blocks) peaks at 2 rows: gfx1100 W = 4 kernel times vs 1 row, Qwen3.8-27B: lm_head 248320 x 5120
 +    // -18 %, attn_qkv 10240 x 5120 -14 %, ffn_down 5120 x 17408 -3 %; 4 rows is slower on the last two, 8 spills.

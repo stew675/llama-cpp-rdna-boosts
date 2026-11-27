@@ -1,4 +1,4 @@
-From d953ba9c2a3f4694badcb342f4f99ae449b1e2da Mon Sep 17 00:00:00 2001
+From 1099845d1f5c2f0403b0cad4025d52e8663dbdcf Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/18] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -221,8 +221,8 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  ggml/src/ggml-cuda/mmvq-ksplit-body.inc       |  366 +
  ggml/src/ggml-cuda/mmvq-moe.cu                |  529 ++
  ggml/src/ggml-cuda/mmvq-moe.cuh               |   14 +
- ggml/src/ggml-cuda/mmvq-vecdot.cuh            |   96 +
- ggml/src/ggml-cuda/mmvq.cu                    | 1756 +++--
+ ggml/src/ggml-cuda/mmvq-vecdot.cuh            |  101 +
+ ggml/src/ggml-cuda/mmvq.cu                    | 1769 +++--
  ggml/src/ggml-cuda/mmvq.cuh                   |   22 +-
  ggml/src/ggml-cuda/moe-expert-cache.cu        |  519 +-
  ggml/src/ggml-cuda/moe-expert-cache.h         |   51 +-
@@ -258,7 +258,7 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
  tests/test-fusion-gate-beta-multiseq.cpp      |  321 +
  tests/test-logits-width-probe.cpp             |  234 +-
  tools/server/server-context.cpp               |   30 +-
- 88 files changed, 18340 insertions(+), 5667 deletions(-)
+ 88 files changed, 18358 insertions(+), 5667 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -19693,7 +19693,7 @@ index fd8085897..491c52bc9 100644
  bool ggml_cuda_mmb_active();
  // A fusion that stands down for MMB must ask ggml_cuda_mmb_supported_mm()/_supported_mmid() (the top
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 623a4508b..d11c0e7e0 100644
+index 216f79390..68555fee7 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -1,5 +1,7 @@
@@ -19825,7 +19825,7 @@ index 623a4508b..d11c0e7e0 100644
          const ggml_prec prec_i = ggml_cuda_mmq_get_prec_src1(src0_i->type, ggml_prec_get_src(dst_i, 1), cc);
          ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_i);
      }
-@@ -906,3 +940,198 @@ bool ggml_cuda_mmq_fusion_is_efficient(
+@@ -923,3 +957,198 @@ bool ggml_cuda_mmq_fusion_is_efficient(
      const int64_t tiles_efficiency_percent = 100 * ntiles / (nsm*tiles_nwaves);
      return tiles_efficiency_percent >= 90;
  }
@@ -21658,10 +21658,10 @@ index 000000000..4a37ad960
 +        const int warp_size, const int nchannels_dst, cudaStream_t stream);
 diff --git a/ggml/src/ggml-cuda/mmvq-vecdot.cuh b/ggml/src/ggml-cuda/mmvq-vecdot.cuh
 new file mode 100644
-index 000000000..b471e4949
+index 000000000..4f55a2854
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmvq-vecdot.cuh
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,101 @@
 +// Shared vec-dot / VDR selectors for the MMVQ kernels (immovable module-local
 +// declarations split out of mmvq.cu so the MoE kernel (mmvq-moe.cu) and the dense
 +// dispatch (mmvq.cu) can share them).
@@ -21708,7 +21708,12 @@ index 000000000..b471e4949
 +#else
 +        case GGML_TYPE_Q4_K:    return moe ? vec_dot_q4_K_q8_1_vdr4 : vec_dot_q4_K_q8_1;
 +#endif
++#if defined(GGML_CUDA_Q5K_DENSE_VDR4)
++        // dense Q5_K: same 32-element layout and VDR as vec_dot_q5_K_q8_1_vdr4, one integer chain per sub-block
++        case GGML_TYPE_Q5_K:    return moe ? vec_dot_q5_K_q8_1_vdr4 : vec_dot_q5_K_q8_1_vdr4_dense;
++#else
 +        case GGML_TYPE_Q5_K:    return moe ? vec_dot_q5_K_q8_1_vdr4 : vec_dot_q5_K_q8_1;
++#endif
 +#if !defined(GGML_HIP_Q6K_DENSE_VDR1) && (defined(RDNA4) || defined(RDNA3_0))
 +        // the 16-element chunk with its HIP-optimised unpack; with the VDR=1 escape every arch
 +        // takes the generic kernel (whose VDR comes from the same macro)
@@ -21759,7 +21764,7 @@ index 000000000..b471e4949
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 4b4cc8df2..8980720be 100644
+index 4b4cc8df2..556be20e6 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,8 +1,10 @@
@@ -21861,26 +21866,39 @@ index 4b4cc8df2..8980720be 100644
  
  enum mmvq_parameter_table_id {
      MMVQ_PARAMETERS_GENERIC = 0,
-@@ -156,6 +81,18 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+@@ -156,6 +81,31 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
  #endif
  }
  
 +// VDR of the dense mmvq kernels.  get_vec_dot_q_cuda() picks vec_dot_q4_K_q8_1_vdr4_dense for dense Q4_K on RDNA3_0,
 +// and on RDNA4 when built with GGML_HIP_RDNA4_Q4K_DENSE_VDR4 (device side, by arch macro); the host's K-split
-+// arithmetic must use the same VDR, so both sides read it here.
++// arithmetic must use the same VDR, so both sides read it here.  Q5_K mirrors it (vec_dot_q5_K_q8_1_vdr4_dense,
++// GGML_HIP_RDNA4_Q5K_DENSE_VDR4): the same dense 32-element form, and the same caveat -- it is a K partition, so
++// greedy text changes once on the arch that takes it while W = 1..N stay bit-identical.
 +static constexpr __host__ __device__ int get_vdr_mmvq_dense(ggml_type type, mmvq_parameter_table_id table_id) {
 +#if defined(GGML_HIP_RDNA4_Q4K_DENSE_VDR4)
 +    const bool q4k_dense_vdr4 = table_id == MMVQ_PARAMETERS_RDNA3_0 || table_id == MMVQ_PARAMETERS_RDNA4;
 +#else
 +    const bool q4k_dense_vdr4 = table_id == MMVQ_PARAMETERS_RDNA3_0;
 +#endif
-+    return q4k_dense_vdr4 && type == GGML_TYPE_Q4_K ? VDR_Q4_K_Q8_1_MMVQ_RDNA3_0 : get_vdr_mmvq(type);
++#if defined(GGML_HIP_RDNA4_Q5K_DENSE_VDR4)
++    const bool q5k_dense_vdr4 = table_id == MMVQ_PARAMETERS_RDNA3_0 || table_id == MMVQ_PARAMETERS_RDNA4;
++#else
++    const bool q5k_dense_vdr4 = table_id == MMVQ_PARAMETERS_RDNA3_0;
++#endif
++    if (q4k_dense_vdr4 && type == GGML_TYPE_Q4_K) {
++        return VDR_Q4_K_Q8_1_MMVQ_RDNA3_0;
++    }
++    if (q5k_dense_vdr4 && type == GGML_TYPE_Q5_K) {
++        return VDR_Q5_K_Q8_1_MMVQ_RDNA3_0;
++    }
++    return get_vdr_mmvq(type);
 +}
 +
  static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
      if (GGML_CUDA_CC_IS_RDNA4(cc)) {
          return MMVQ_PARAMETERS_RDNA4;
-@@ -332,12 +269,21 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+@@ -332,12 +282,21 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
  // 1-token decode and an (n_draft + 1)-token speculative verify batch of the same MoE matmul to be
  // bit-identical, and MUL_MAT_ID mmvq (mul_mat_vec_q_moe, one warp per token) and MMQ reduce in
  // different orders, so no cap may split the band.  The cap still applies above the band.
@@ -21905,20 +21923,20 @@ index 4b4cc8df2..8980720be 100644
      // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
      if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
          cc = ggml_cuda_highest_compiled_arch(cc);
-@@ -353,24 +299,38 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+@@ -353,24 +312,38 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
      // AMD
      if (GGML_CUDA_CC_IS_AMD(cc)) {
          if (GGML_CUDA_CC_IS_RDNA4(cc)) {
 -            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type));
 +            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type), MMVQ_MOE_MAX_BATCH_SIZE);
-         }
--        if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc)) {
--            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type));
++        }
 +        if (GGML_CUDA_CC_IS_RDNA3(cc)) {
 +            // gfx1100 (RDNA3_0) and gfx1151 (RDNA3_5): the routed-expert 16-wide band is not used.
 +            const int floor_band = MMVQ_MAX_BATCH_SIZE;
 +            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type), floor_band);
-+        }
+         }
+-        if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc)) {
+-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type));
 +        if (GGML_CUDA_CC_IS_RDNA4_M(cc)) {
 +            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type), MMVQ_MAX_BATCH_SIZE);
          }
@@ -21950,7 +21968,7 @@ index 4b4cc8df2..8980720be 100644
  bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
      if (!ggml_is_quantized(type)) {
          return false;
-@@ -495,15 +455,19 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+@@ -495,15 +468,19 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
  template <ggml_type type>
  static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
  #if defined(RDNA4)
@@ -21975,7 +21993,7 @@ index 4b4cc8df2..8980720be 100644
  #elif !defined(GGML_USE_MUSA) && (__CUDA_ARCH__ == GGML_CUDA_CC_PASCAL || __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
      return MMVQ_MAX_BATCH_SIZE;
  #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
-@@ -781,7 +745,7 @@ static __global__ void mul_mat_vec_q(
+@@ -781,7 +758,7 @@ static __global__ void mul_mat_vec_q(
  
      constexpr int qk  = ggml_cuda_type_traits<type>::qk;
      constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -21984,7 +22002,7 @@ index 4b4cc8df2..8980720be 100644
      constexpr mmvq_parameter_table_id table_id = get_device_table_id();
      constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
      constexpr int rows_per_cuda_block = calc_rows_per_block_override(rows_per_block, type, ncols_dst, table_id, small_k, nwarps);
-@@ -1110,566 +1074,87 @@ static __device__ __forceinline__ float ggml_cuda_lf_reduce_scatter(const float
+@@ -1110,566 +1087,87 @@ static __device__ __forceinline__ float ggml_cuda_lf_reduce_scatter(const float
  // 12-block release kernel (same per-row chunk->group mapping as the old
  // ncols_dst == 1 path).
  // ---------------------------------------------------------------------------
@@ -22620,7 +22638,7 @@ index 4b4cc8df2..8980720be 100644
  template<ggml_type type, bool weight_rule = false>
  static std::pair<dim3, dim3> calc_launch_params(
          const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-@@ -1715,6 +1200,14 @@ static void mul_mat_vec_q_switch_fusion(
+@@ -1715,6 +1213,14 @@ static void mul_mat_vec_q_switch_fusion(
          sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
  }
  
@@ -22635,7 +22653,7 @@ index 4b4cc8df2..8980720be 100644
  template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false, bool small_m = false>
  static void mul_mat_vec_q_switch_fusion_ksplit(
          const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-@@ -1728,7 +1221,42 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+@@ -1728,7 +1234,42 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
      const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                              fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
                              fusion.conv_input != nullptr;
@@ -22678,7 +22696,7 @@ index 4b4cc8df2..8980720be 100644
          if (has_fusion) {
              const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
              ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, true, small_k, halve_iters, rows_per_block, long_k, small_m>, launch_params,
-@@ -1748,98 +1276,6 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+@@ -1748,98 +1289,6 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
          sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
  }
  
@@ -22777,7 +22795,7 @@ index 4b4cc8df2..8980720be 100644
  
  template <ggml_type type>
  static void mul_mat_vec_q_switch_ncols_dst(
-@@ -1852,7 +1288,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1852,7 +1301,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
          const int ids_stride, cudaStream_t stream) {
  
      GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
@@ -22788,7 +22806,7 @@ index 4b4cc8df2..8980720be 100644
  
      const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
      const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
-@@ -1868,7 +1306,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1868,7 +1319,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
      // How the K loop divides up at the baseline block width, both decisions below use these.
      constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
      constexpr int qi                    = ggml_cuda_type_traits<type>::qi;
@@ -22797,7 +22815,7 @@ index 4b4cc8df2..8980720be 100644
      const int     blocks_per_row_x      = ncols_x / qk;
      const int     blocks_per_iter_1warp = vdr * warp_size / qi;
  
-@@ -1949,7 +1387,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1949,7 +1400,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
      }
  
      switch (ncols_dst) {
@@ -22807,7 +22825,7 @@ index 4b4cc8df2..8980720be 100644
              // dispatch per ncols with a compile-time tag
              const auto dispatch = [&](auto ncols_tag) {
                  constexpr int c_ncols_dst = decltype(ncols_tag)::value;
-@@ -1998,7 +1437,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1998,7 +1450,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                      const int blocks_per_row_x = ncols_x / ggml_cuda_type_traits<type>::qk;
                      const int qi_type = ggml_cuda_type_traits<type>::qi;
                      const int n_groups = qi_type > 0
@@ -22816,7 +22834,7 @@ index 4b4cc8df2..8980720be 100644
                          : 0;
                      int rpb = 1;
                      if (blocks_per_row_x > 0 && n_groups > 0 && blocks_per_row_x < n_groups) {
-@@ -2066,7 +1505,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -2066,7 +1518,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  // Every row keeps its own one-warp dot product: bit-identical.
                  uint32_t nrows_loop = 0;
                  constexpr int c_rpb_eff = c_rpb > 0 ? c_rpb : 1;
@@ -22825,7 +22843,7 @@ index 4b4cc8df2..8980720be 100644
                      c_rpb_eff <= 2 && dims.second.y == 1 && dims.first.x * c_rpb_eff == (unsigned) nrows_x &&
                      nrows_x >= 2048 && nrows_x <= 16384 && dims.first.x > GGML_MMVQ_RDNA4_DECODE_GRID) {
                      const int nblocks = dims.first.x;
-@@ -2112,7 +1551,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -2112,7 +1564,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  constexpr int c_rpb_weight = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, 1);
                  if constexpr (c_rpb_weight > 1) {
                      // the rows the launch will actually use (Q8_0 short-K: 8-warp blocks take fewer rows;
@@ -22834,7 +22852,7 @@ index 4b4cc8df2..8980720be 100644
                      const int rpb_w = calc_rows_per_block_weight(type, c_ncols_dst, table_id, false,
                          calc_nwarps_weight(type, c_ncols_dst, table_id, long_k, small_m));
                      if ((table_id == MMVQ_PARAMETERS_RDNA4 || table_id == MMVQ_PARAMETERS_RDNA3_0) && rpb_w > 1 &&
-@@ -2226,6 +1665,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -2226,6 +1678,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
              // item-split accumulator layout is register-bound at ncols_dst > 1.
              launch_ksplit(std::integral_constant<int, 8>{});
          } break;
@@ -22852,7 +22870,7 @@ index 4b4cc8df2..8980720be 100644
                  default: GGML_ABORT("fatal error"); break;
              }
          } break;
-@@ -2405,18 +1855,21 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -2405,18 +1868,21 @@ void ggml_cuda_mul_mat_vec_q(
      GGML_ASSERT(        nb0        == ts_dst);
      GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
  
@@ -22876,7 +22894,7 @@ index 4b4cc8df2..8980720be 100644
          // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
          // non-negligible for some models such as gpt-oss-20b. The per-token MoE scale is a second exception.
          GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4 || fusion->x_scale_channel_dst);
-@@ -2482,11 +1935,86 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -2482,11 +1948,86 @@ void ggml_cuda_mul_mat_vec_q(
          }
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;
@@ -22964,7 +22982,7 @@ index 4b4cc8df2..8980720be 100644
  
      // If src0 is a temporary compute buffer, clear any potential padding.  A redirected expert
      // table (wip/moe-expert-cache) carries no buffer; its compact arena has no padding to clear,
-@@ -2562,7 +2090,7 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -2562,7 +2103,7 @@ void ggml_cuda_mul_mat_vec_q(
  
      mul_mat_vec_q_switch_type(
          src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
@@ -22973,7 +22991,7 @@ index 4b4cc8df2..8980720be 100644
          ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
          ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
  }
-@@ -3338,11 +2866,714 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
+@@ -3338,11 +2879,714 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
              (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
      }
  }
@@ -23689,7 +23707,7 @@ index 4b4cc8df2..8980720be 100644
      if (i + 8 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
          return 0;
      }
-@@ -3412,8 +3643,10 @@ int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const g
+@@ -3412,8 +3656,10 @@ int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const g
  // Shared-expert output chain: down + gate + gating + residual adds.  Returns 5 when fused.
  // GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1 turns it off.
  int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
@@ -23702,7 +23720,7 @@ index 4b4cc8df2..8980720be 100644
      if (disable_shexp_down_gate || i + 5 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
          return 0;
      }
-@@ -3505,6 +3738,9 @@ bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool
+@@ -3505,6 +3751,9 @@ bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool
      return use_mul_mat_vec_q;
  }
  
@@ -23712,7 +23730,7 @@ index 4b4cc8df2..8980720be 100644
  bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
      if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
          return false;
-@@ -3554,6 +3790,8 @@ bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, in
+@@ -3554,6 +3803,8 @@ bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, in
      return true;
  }
  
@@ -23721,7 +23739,7 @@ index 4b4cc8df2..8980720be 100644
  int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
      if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID || !ctx.stream_context().concurrent_events.empty() ||
              !ggml_cuda_match_shared_expert(cgraph, i, i + 3) ||
-@@ -3574,12 +3812,32 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
+@@ -3574,12 +3825,32 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
      fusion.shared_up = shared->src[1]->src[0];
      fusion.shared_gate = shared->src[0]->src[0];
      fusion.shared_dst = shared;
