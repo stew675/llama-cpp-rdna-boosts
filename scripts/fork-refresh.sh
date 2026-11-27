@@ -138,8 +138,17 @@ if [ "$DO_GATES" -eq 1 ]; then
         ( cd "$REPO_DIR" && ./scripts/check-shlib-symbols.sh "${SHLIB_DIR:-$LLAMA/build-rocm}" )
     fi
     echo "==> coherence gate (same-seed greedy text)"
+    # The default names the primary box's small dense model.  A box without it used to fail as the opaque
+    # "the server exited before becoming ready" from inside llama-cli (the model path is the last thing the
+    # error names); name the missing file and the override instead.
+    coherence_model="${COHERENCE_MODEL:-/llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf}"
+    [ -f "$coherence_model" ] || {
+        echo "ERROR: coherence model not found: $coherence_model" >&2
+        echo "ERROR: set COHERENCE_MODEL to a small dense GGUF on this box (e.g. the 9B Q8_0)" >&2
+        exit 2
+    }
     HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" "$LLAMA/build-rocm/bin/llama-cli" \
-        -m "${COHERENCE_MODEL:-/llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf}" \
+        -m "$coherence_model" \
         -ngl 99 -sm tensor -c 4096 -p "The capital of France is" -n 24 --seed 42 --temp 0 \
         --no-display-prompt --single-turn -t 8 -lv 1 2>&1 | tail -3
     # The reference base is resolved PER ROCm LINE by the gate itself (its file name carries the line since
