@@ -51,10 +51,19 @@ inside `stage_upload`, which records its DONE event on the copy stream; it needs
 2. **Re-do the drain overlap** with the correct event, and keep the slot's free-event discipline explicit (the slot is
    dead after its drain; the free event goes on the copy stream right behind the drain, *only* for the drain path —
    the redirect path's slot is read by the consumer and must stay free-after-launch).
-3. **Gate it**: at 40 %, 60 %, 80 % and 100 % coverage on 2 cards, 3 rotated cycles, both transports; staged must be
-   coherent on every cycle and the per-token comparison must show near-tie flips only (per `GREEDY-PURITY.md`: a
-   Meta tensor split is not bit-identical to a non-Meta gather, so the *hashes may differ* — coherence and the
-   first-divergence point are the test, not hash equality).
+3. **Gate it**, in two SEPARATE runs, because one run cannot do both:
+   * **text run, NO `-lv`** (`llama-cli`'s default is errors-only).  `extract-generated.py` does not strip log lines,
+     so a `-lv 4` run hashes interleaved timestamped lines — that alone makes hashes differ between arms and between
+     cycles, and it faked a divergence on 2026-11-27 (`WORKLOG.md` 261127.016; `flash-next-prefill/tailcheck.sh`
+     warns when a log carries `-lv` lines inside the stream);
+   * **census run, `-lv 4`**, separately, for the transport lines.
+
+   Then judge **coherence at the TAIL, not the head** (`./tailcheck.sh LOG 200`): a divergence often shows up half-way
+   through generation.  A configuration difference *may* legitimately move near-ties (`GREEDY-PURITY.md`), but on this
+   shape it does not: on clean text the landed baseline is **byte-identical** between the two transports at 40 / 80 /
+   100 % coverage (321 chars `sha=184dc307181b` on all of them).  So after a drain change **any** divergence is a real
+   defect, not a configuration artifact -- gate on 4 coverage points x 3 rotated cycles, both transports, tail checked
+   on every single arm.
 4. **Only then** the in-place consume, as a cache feature with its own text + KLD gate; the redirect switch is deleted
    when it lands (or stays labelled A/B until it does).
 5. **Re-measure the crossover** and hand the result to the policy question: on the landed tree the exposure rule's

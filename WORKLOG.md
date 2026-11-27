@@ -16,6 +16,40 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.016 (r368, `wip/`) -- flash-next-prefill: the tensor-split transport is BYTE-IDENTICAL to the gather on clean text, and the `-lv 4` hash trap that faked a divergence
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push; the campaign tip is still
+**`a666f8637`** (patch 5327 lines / 18 files).
+
+**The trap, found by the maintainer's question about tail-checking.**  `scripts/extract-generated.py` takes the span
+between the prompt echo and the footer but does **not** strip log lines, and every tensor-split arm here was run with
+`-lv 4` (it is the only way to see the transport lines).  At `-lv 4` llama-cli's per-slot statistics and `LLAMA_LOG_INFO`
+lines are interleaved *into the token stream*, so the "text" that got hashed contained timestamped log lines: the
+lengths and hashes differed run to run **for every arm, including the gather**, and I briefly read that as a purity
+problem.  AGENTS.md already says text/hash arms take **no `-lv` at all** and that a census arm is a separate run; this
+is what that rule costs when it is skipped, and it is now recorded with the receipt.
+
+**Re-checked on clean text (no `-lv`), 2 cards `-sm tensor`, GSQ-IQ3_XXS 89k, `-ub 8192`, `NGEN=64`,
+`HOSTEXP=pinned LME=mirror LAZY=off`:**
+
+| coverage | staged t/s | gather t/s | winner | generated text |
+|---|---|---|---|---|
+| 40 % | **2861.0** | 2648.2 | staged **+8.0 %** | **321 chars `sha=184dc307181b`** (both) |
+| 80 % | 3091.1 | **3171.1** | gather +2.6 % | **321 chars `sha=184dc307181b`** (both) |
+| ~100 % | 3453.4 | 3431.2 | tie | **321 chars `sha=184dc307181b`** (both) |
+
+**The staged Meta transport and the gather produce BYTE-IDENTICAL output on this shape at every coverage point** --
+cleaner than expected, and it removes the last question over the landed measurement (the 60 % arm was 3009.6 vs
+2910.9 in the `-lv` sweep, +3.4 %).  The rates here are the authoritative ones (a `-lv 4` census arm reads 0.3-0.7 %
+lower because of the log overhead; the winner never changes).
+
+**Two rules now written down, with a tool.**  (1) A text/coherence arm takes **no `-lv`**; a transport/census arm is a
+SEPARATE run.  (2) Judge the **tail**, not the head -- a coherence divergence often appears half-way through
+generation.  `wip/flash-next-prefill/tailcheck.sh LOG [N]` prints the last N characters of the extracted text, warns
+when the log carries `-lv` lines inside the stream, and flags a 20+ repeated character.  The gate for the follow-up
+campaign (`wip/tensor-split-stage-overlap/`) now requires exactly this: clean text, tail checked, at 4 coverage points,
+and any staged-vs-gather divergence there is a real defect -- the landed baseline is identical.
+
 ## 261127.015 (r368, `wip/`) -- flash-next-prefill: the drain-overlap attempt CORRUPTED OUTPUT and is REVERTED; the follow-up moves to `wip/tensor-split-stage-overlap/`
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  The campaign tip is **still

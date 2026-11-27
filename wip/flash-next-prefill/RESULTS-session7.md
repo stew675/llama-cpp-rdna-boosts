@@ -235,3 +235,24 @@ stay **reachable and selectable**: the selector treats both staging forms as eli
 remain the two controls, and no configuration may encode "the gather always wins on that tier" again.  Removing it is
 a maintainer decision, recorded as such — which is why it is written here rather than left as a comment in a
 threshold.
+
+## 7. Coherence, checked the way the maintainer asked (clean text, tail first)
+
+The arms in §6 were `-lv 4` runs (the transport lines need it), and `scripts/extract-generated.py` does **not** strip
+log lines from its span — so those hashes contained interleaved timestamped lines and differed run to run for *every*
+arm.  That is a methodology trap, not a result.  Re-run with **no `-lv`** (a text arm takes none; the census is a
+separate run) and with the **tail** checked, not the head:
+
+| coverage | staged t/s | gather t/s | winner | generated text |
+|---|---|---|---|---|
+| 40 % | **2861.0** | 2648.2 | staged **+8.0 %** | **321 chars `sha=184dc307181b`** (both) |
+| 80 % | 3091.1 | **3171.1** | gather +2.6 % | **321 chars `sha=184dc307181b`** (both) |
+| ~100 % | 3453.4 | 3431.2 | tie | **321 chars `sha=184dc307181b`** (both) |
+
+**The staged Meta transport and the gather are byte-identical on this shape at every coverage point** (the 60 % point
+was not re-run clean; its `-lv` rate was 3009.6 vs 2910.9).  The tails are coherent prose on every arm
+(`... User likely expects maybe summarize? There is no question. We need produce final`).  So the landed measurement
+has no purity question attached: the transport changes the *rate*, not the *answer*.
+
+`tailcheck.sh` (this directory) is the tool: last N characters of the extracted text, a warning when the log carries
+`-lv` lines inside the stream, and a flag for a 20+ repeated character.

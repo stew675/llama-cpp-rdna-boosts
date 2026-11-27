@@ -12,6 +12,13 @@ into block 09; pipeline / transport region / cushion / depth authority and the V
 10), and the `REVIEW-squashed.md` §9 design question (delete the Meta backend's staged transport, or finish it).
 Nothing is cut, renumbered or folded without that answer, and the gate ladder has not been started.
 
+**Two measurement rules this campaign paid for (2026-11-27)**: a **text/coherence arm takes NO `-lv`** -- and a
+transport/census arm is a separate `-lv 4` run -- because `extract-generated.py` does not strip log lines, so a `-lv 4`
+"text" hash is polluted by the interleaved timestamped lines (it faked a staged-vs-gather divergence); and **judge the
+tail** of the generated text, not just the head, because a coherence break often appears half-way through
+(`./tailcheck.sh LOG 200`).  With both applied, the tensor-split staged transport and the gather are **byte-identical**
+(321 chars `sha=184dc307181b` at 40 / 80 / 100 % coverage).
+
 **The previous hand-over's order was** (and sessions 6-7 followed it): a fresh code review with the no-tombstone
 rule (no dead-code remnants in the source, `ENVIRONMENT.md` or `DIAGNOSTIC.md`), the quick tests, then **STOP** for
 the maintainer's user-level test — promotion (which begins with the block decision) only on their explicit
