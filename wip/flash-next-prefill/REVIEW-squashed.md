@@ -269,3 +269,132 @@ measured), or **finish** it (make the arm carve: `work_alloc` on the arm, or let
 `144 x 2 x 450 MiB`, no refusal/drift/grow lines) -- and the docs must not claim tensor-split staging works until
 one of the two is done (`ENVIRONMENT.md`'s `GGML_SCHED_DEVGATHER` entry says the gather "is the transport" on that
 tier, which is true; `patches/README.md`'s block note must say the same).
+
+## 10. The final pass (session 7): seven defects, and what each one would have cost
+
+Read as a reviewer against the *post-rework* tip (`dc335794b`), not against the reviewed squash.  Everything below is
+fixed in the same single campaign commit (now `79d48465e`); the measurements that show the fixes changed no result
+are [`RESULTS-session7.md`](RESULTS-session7.md).  §9 stays OPEN — it is a design decision, not a defect.
+
+### 10.1 A hook inserted in the MIDDLE of the backend interface (the positional-ABI defect)
+
+`ggml_backend_i.moe_cache_residency` was added next to the other `moe_cache_*` hooks, i.e. **before**
+`cpy_tensor_async_nowait`, `moe_cache_pending`, ... `moe_cache_prefill_stream`.  This struct's members are
+initialised POSITIONALLY by every backend (`/* .moe_cache_pool_backed = */ ...`), and its own comments say why new
+members are always appended ("APPENDED so the other backends' positional initializers stay valid").  Only
+`ggml_backend_cuda_interface` and `ggml_backend_meta_i` were updated, so in **`ggml_backend_cpu_i`** and
+**`ggml_backend_rpc_interface`** every row from `cpy_tensor_async_nowait` to `moe_cache_prefill_stream` shifted by
+one and the last member was left out of the list.
+
+**Why it would have survived**: every shifted row is `NULL` in both, so the CPU and RPC backends behave identically
+today — the defect is invisible until someone implements one of those hooks in either backend, at which point it is
+called as its neighbour (a `cpy_tensor_async_nowait` invoked as `moe_cache_residency` does not build, but
+`moe_cache_pending` read where `moe_cache_register` is expected is a silent wrong call).  It also fires the
+`-Wmissing-field-initializers` class of warning on any stricter build.
+
+**Fixed**: the member is APPENDED, after `stage_release`, with a comment that says it is appended *because of* its
+name-neighbours, and both initializers were re-ordered to match.
+
+### 10.2 Both released staging gates were dropped and their hooks left dangling
+
+The rewrite of `sched_stage_issue` into `sched_pipe_split_set` kept the gather predicate and the width gate but
+dropped the other two gates the released block had, leaving `moe_cache_in_place` and `moe_cache_stage_ready` with no
+caller anywhere in `ggml/src`:
+
+1. **`moe_cache_in_place` (TODO #133)** — "this table will be served from the ARENA in place, so do not stage it".
+   Without it the pipeline stages a table whose op then reads the arena anyway: a whole-table fill per split per
+   ubatch that nothing reads.  That is the exact defect TODO #133 measured and closed (61 GiB re-copied out of VRAM
+   for a 3049-token prompt on a 100 %-resident arena, serialised against the compute, leaving 3-GPU prefill slower
+   than 1-GPU).  The campaign's own arms are 35-51 % resident, so none of them could see it — `moe_cache_serves_in_place`
+   is `moe_cache_prefill_in_place()`-gated and that is ON by default, so a fully resident `-ncmoe` table reaches it.
+   **Fixed**: restored in `sched_pipe_split_set`, all-or-nothing per split like the gather, calling the same
+   predicate the dispatch path uses (`moe_cache_serves_in_place` only *reports* the decision).
+2. **`moe_cache_stage_ready`** — the D2D-era trade ("a ring round trip that gains nothing still pays a slot plus the
+   slot -> input D2D", measured 3446 vs 2658 t/s).  A pipeline fill lands **in place**, so the trade does not exist;
+   and honouring it here would refuse staging for a whole first prefill (`!g_sized` is true until the first sizing,
+   which a long prefill never reaches).  **Not re-wired, and the campaign's `MOE_HOST_POOL_STAGE_STANDDOWN` branch
+   on it was deleted**: that branch was a dead knob whose documented effect (restore the refusal for a stood-down
+   pool table) no longer exists, because nothing asks.  The now-callerless hook itself is **left in place** and named
+   here: retiring it is a block amendment, i.e. the maintainer's call, not a review fix.
+
+### 10.3 The new "release the carve" block was a latent path back to the serial upload
+
+`work_alloc` gained a block that zeroed `s.stage_region` at a narrow placement once the wide pass was disarmed and
+the scheduler had released its buffers.  Two problems:
+
+* **It returns no VRAM.**  The region lives INSIDE the work band, so with the wide pass disarmed the boundary is
+  floored by the live narrow views and the arena already owns everything above it; `arena_alloc_transient` also
+  requires `wide_armed`.  The field log's own `context-exit` line shows it: `work=2048.0 (narrow=2048.0
+  transport=960.0) arena_region=18368.0` — the 960 MiB is carved and is arena at that moment.
+* **It disables the gate that re-arms the transport.**  `llama_context` forces the narrow -> wide layout drop only
+  when `slab_stage_region() > 0` (`ring_carved`).  A narrow placement that ran AFTER the scheduler's release would
+  zero the carve -> the next prefill reuses the narrow compute buffer (the documented size-independent layout:
+  GSQ/35B-A3B) -> no wide view is placed -> the region is never re-carved -> and then the split either gathers for
+  the whole prefill (-16 % on the 89k GSQ arm) or stages into an unarmed region, whose fill is refused and takes the
+  serial whole-table upload (the 12.3 s / 47 t/s field defect).  The measured field sequence never reaches it only
+  because the drop's narrow placement happens BEFORE the release — an ordering, not a rule.
+
+**Fixed**: removed.  A depth change still drops an idle carve in `ggml_cuda_slab_set_stage_region` (its correct job).
+The **buffers** are unchanged: `h2d_stage_release` + `ggml_cuda_slab_transport_reset` still hand them back at every
+prefill -> decode transition, and the release log line still prints.  `RESULTS-session7.md` §2 shows the resulting
+state per transition (`transport_used` 960 -> 0 at every drop, `transport=960` carved at the next arm).
+
+### 10.4 `return` from a constructor body
+
+The transport sizing in `llama_context::llama_context` grew `if (unit == 0) { return; }` — a plain return inside a
+CONSTRUCTOR: a model with a host-expert map but no per-device slice would have abandoned the rest of the constructor
+(the MTP draft vocabulary, the scheduler reserve, the output buffers) and produced a half-built context, with no
+error.  **Fixed**: it skips the transport sizing only.
+
+### 10.5 `GGML_SCHED_STAGE_MIN_TOKENS=0` could never reach the selector
+
+"Stage for every batch" makes the width gate pass at every width, but the selector's `pipe_wide_cur` (and therefore
+`pipe_wide_prev`, which is the only thing that lets a wide graph stage at all) was marked only when the gate was
+`> 0`.  A user-set 0 therefore silently gathered every pool-backed prefill — the knob's opposite.  **Fixed**: a gate
+of 0 counts as wide above `SCHED_STAGE_CAPTURE_SAFE_TOKENS`, which is the same in-place invariant the cap exists for
+(a gate of 0 cannot stage below the capture limit either).
+
+### 10.6 The zero-carve test misread the gather mode switch
+
+`slab_stage_region_bytes`' zero-carve rule read `GGML_SCHED_DEVGATHER` as `== 1` for "gathers pool-backed tables".
+`2` (force) also gathers them, so the force arm carved a region it never fills — an A/B measuring the arena with the
+thing it removes.  **Fixed**: `!= 0` (both gather modes), with the mode list in a comment.
+
+### 10.7 The hybrid fill's census double count
+
+The hybrid counted its arena-side bytes BEFORE issuing the host DMAs, so a failed DMA (which falls through to the
+two-tier path, which accounts the whole fill again) reported them twice.  Text unaffected; the census is the
+evidence for the transport, so it is still a defect.  **Fixed**: counted after the host runs succeed.
+
+### 10.8 Re-checked and clean on this pass
+
+* **No tombstones** were reintroduced (the two comments that name a knob's history do so to explain a *live* alias:
+  `GGML_SCHED_STAGE_SLOTS`, `GGML_CUDA_SLAB_STAGE_FALLBACK`).
+* **Lock order**: the new calls are `ggml_cuda_slab_min_arena_mib()` (a pure getter), the cache's atomic residency
+  mirrors (lock-free by construction), and `ggml_cuda_slab_set_stage_region` from the cache's sizing — cache -> slab,
+  never the reverse.  No new function takes `g_slab_mutex` and then the cache's lock.
+* **One authority per number** still holds: the depth is `ggml_backend_cuda_transport_bufs()` (one parser, aliases
+  included) and every other layer reads it through `slab_stage_slots`; the unit is `slab_set_stage_unit`; the cap is
+  VRAM/4; the low end of the table is `GGML_CUDA_SLAB_MIN_ARENA_MIB`.  The one soft edge is documented rather than
+  "fixed": with a decision of 0, `h2d_stage_slots()` floors the depth at 1 (it has to — the cudaMalloc arm has no
+  region to divide), so the scheduler believes in a 1-buffer pipeline whose region request is 0; the selector
+  gathers on the region test, so nothing is filled, and an A/B that forces staging self-reports.  `RESULTS-session7.md`
+  §3 is the measurement (the 0 branch: `request 1890 -> 0 MiB`, 930.8 t/s, zero refusal lines).
+* **Cap pairing**: `GGML_CUDA_GRAPH_MAX_TOKENS_CAP` (32) has exactly one reader and `SCHED_STAGE_CAPTURE_SAFE_TOKENS`
+  (32) one comparison; the invariant comment names the other constant in both places.
+* **`stage_ok`** is reset per split per graph, is only computed when the pipeline declined, and is inert on a backend
+  without `stage_input` (CPU/RPC) — re-checked on the current tree.
+* **Format strings / unused**: the build is clean (exit 0) with no warning from any file the change touches.
+* **The Meta path** re-checked as a no-op on the default: 2-device `-sm tensor` reads 3429.3 t/s with the pipeline's
+  one decline line and no ring attempt (RESULTS-session7 §4).  §9 above remains the open decision.
+
+### 10.9 The A/B that proves this pass changed no result
+
+The pre-pass tree (`dc335794b`) and the fixed tree were both built from the same source path and run through the
+campaign arm and the field sequence: 89k text **`43d0b1f4629e` on every cycle at 2478.8-2492.4 t/s** (pre-pass:
+2495.4 median); the field sequence's decision (`3 -> 2`), buffers (`144 x 2 x 450 MiB`), band walk (1536 -> 1792 ->
+2048, all absorbed) and arena re-arm pattern are identical, with the 1 % rate difference and the 65-100 MiB arena
+offset inside the shape's own unexplained variation (an unpinned heat prior — the trap in HANDOVER §6).  So none of
+the seven fixes is a behaviour change on any validated shape; two of them (10.2 and 10.3) are the ones that would
+have been found on a *fully resident* arena and on a *second prefill of the same compute size*, neither of which the
+campaign's arms exercise.

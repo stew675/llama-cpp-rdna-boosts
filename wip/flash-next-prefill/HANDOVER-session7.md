@@ -1,5 +1,24 @@
 # HANDOVER — session 7: ONE final code-review pass on the post-rework tip, then STOP for the block decision
 
+> **OUTCOME (2026-11-27, the session that ran this hand-over): done, and stopped where §0.3 says.**  The review pass
+> found **seven defects**, all fixed in the same single commit — tip **`79d48465e`**, patch **5119 lines / 18 files**
+> ([`REVIEW-squashed.md`](REVIEW-squashed.md) §10): the `moe_cache_residency` hook was inserted in the middle of a
+> positionally-initialised interface (CPU and RPC shifted by one row); **both** released staging gates had been dropped
+> and their hooks left with no caller (`moe_cache_in_place` restored — TODO #133's 61 GiB whole-table re-copy was
+> reachable on a fully resident arena; `moe_cache_stage_ready` deliberately not re-wired, its dead
+> `MOE_HOST_POOL_STAGE_STANDDOWN` branch deleted); the new "release the carve" block was a latent path back to the
+> serial 47 t/s upload and returned no VRAM (removed — the BUFFERS are still released every transition); a `return`
+> in the `llama_context` constructor; `GGML_SCHED_STAGE_MIN_TOKENS=0` never reaching the selector; the zero-carve test
+> misreading `GGML_SCHED_DEVGATHER=2`; and the hybrid fill's arena census double count.  §4 was then re-run on the
+> fixed tree ([`RESULTS-session7.md`](RESULTS-session7.md)): 89k `2492.4 / 2478.8`, `43d0b1f4629e` both cycles; field
+> `3 -> 2` / `144 x 2 x 450 MiB` / band 1536 -> 1792 -> 2048 all absorbed / no refusal-drift-grow; 2-device
+> `-sm tensor` 3429.3 t/s with only the decline line; and **all four buffer branches** (3: 3210.4, 2: 1196.8/1201.6,
+> 1: 1028.4, 0: 930.8 with `request 1890 -> 0 MiB` and zero refusals — the caps must be SMALLER than §4's labels
+> assume, because the arena settles ~500-900 MiB higher; the rate tracks the buffer count, not the label).  **§0.3 is
+> where it stopped:** the block decision (09 / 10), the §3.1 decision (delete the Meta staged transport or finish it)
+> and the ladder are the maintainer's, and their own user-side check comes first.  `~/llama.cpp` is on the fixed tip
+> and built; nothing in the delivery moved.
+
 **Read this, then [`REVIEW-squashed.md`](REVIEW-squashed.md) (§§1-9: the review that stands) and
 [`RESULTS-session6.md`](RESULTS-session6.md) (§8: the rework, §8.6: the open finding).  Sessions 1-5 are history;
 every dated detail is in `WORKLOG.md` (today's entries) and `archive/worklog/`.**
@@ -161,7 +180,10 @@ DEV=0,2 VERBOSE="-lv 4" EXTRA="-sm tensor -dev ROCm0,ROCm1" EXTRAENV="NCMOE=48 N
    `ENVIRONMENT.md`/`DIAGNOSTIC.md` entries (`GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS`,
    `GGML_CUDA_SLAB_TRANSPORT_FALLBACK`, `GGML_SCHED_PIPELINE_BUFS`, `GGML_SCHED_STAGE_SELECT`,
    `GGML_SCHED_STAGE_EXPOSE_US`, `MOE_HOST_POOL_STAGE_BULK[_GBPS]`, `MOE_HOST_POOL_STAGE_MERGE_FLOOR[_GBPS]`,
-   `MOE_HOST_POOL_STAGE_STANDDOWN`, `GGML_MOE_STAGE_DEBUG`), and `INVARIANTS.md` entries for: the derived region, the
+   `GGML_MOE_STAGE_DEBUG`) -- **`MOE_HOST_POOL_STAGE_STANDDOWN` is NOT in that list any more**: session 7 deleted it
+   with the dead `moe_cache_stage_ready` branch it gated (REVIEW §10.2), so documenting it would document a variable
+   that does nothing; the hook it belonged to is either retired or re-wired as part of the block decision -- and
+   `INVARIANTS.md` entries for: the derived region, the
    cushion, the depth authority, the `resident=`/`arena_region=` naming, the over-carve/eviction-refill trade, and the
    capture/consume pairing.  `check-gen-docs.sh` only if an *option* ships (none do today).
 5. **Cut**: blocks, `scripts/make-patches.sh` from a canonical chain rebuilt with `apply-all.sh`,

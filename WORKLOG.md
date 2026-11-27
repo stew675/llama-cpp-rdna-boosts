@@ -16,6 +16,72 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.012 (r368, `wip/`) -- flash-next-prefill: the final review pass (seven defects fixed), the §4 tests re-run, and STOP before the ladder
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push, nothing promoted, and the gate
+ladder was NOT started (it needs the block decision).  Squashed prototype `~/llama.cpp`
+`wip/prefill-slot-pingpong-squashed`, tip **`79d48465e`**; patch
+[`SQUASHED-campaign-r368.patch`](wip/flash-next-prefill/SQUASHED-campaign-r368.patch) **5119 lines / 18 files**;
+review [`REVIEW-squashed.md`](wip/flash-next-prefill/REVIEW-squashed.md) **§10**; re-measurement
+[`RESULTS-session7.md`](wip/flash-next-prefill/RESULTS-session7.md).  Box free (`pgrep` empty, 59 MB VRAM/card,
+46 GB RAM), `PORT=8199`, `LD_LIBRARY_PATH` unset for every arm.
+
+**The review found seven defects, all fixed in the same single commit** (the deliverable is still ONE commit; the
+patch's line count moved 5055 -> 5119, which is the §6 check).  The three that matter:
+
+1. **A hook inserted in the MIDDLE of `ggml_backend_i`.**  `moe_cache_residency` was added beside the other
+   `moe_cache_*` hooks, but those structs are initialised POSITIONALLY and their own comments say new members are
+   always APPENDED.  `ggml_backend_cpu_i` and `ggml_backend_rpc_interface` do not list it, so every row from
+   `cpy_tensor_async_nowait` to `moe_cache_prefill_stream` shifted by one in both.  It survives today only because
+   every shifted row is `NULL`; it is a silent wrong call the day either backend implements one of them.  Moved to
+   the end.
+2. **Both released staging gates were dropped by the rework, leaving their hooks with no caller.**
+   `moe_cache_in_place` (TODO #133) is the one that matters: a fully resident identity table is served from the ARENA
+   in place, so without the guard the pipeline stages a whole table nothing then reads -- the exact defect TODO #133
+   closed (61 GiB re-copied out of VRAM for a 3049-token prompt on a 100 %-resident arena).  **Restored** in
+   `sched_pipe_split_set`.  `moe_cache_stage_ready` is deliberately NOT re-wired (a pipeline fill lands IN PLACE, so
+   its "slot + slot -> input D2D" trade no longer exists, and honouring it would refuse staging for a whole first
+   prefill because `!g_sized`), and its campaign-added `MOE_HOST_POOL_STAGE_STANDDOWN` branch is deleted as a dead
+   knob; retiring the now-callerless hook is a block amendment, i.e. the maintainer's call.
+3. **The new "release the carve at the narrow placement" block was a latent path back to the serial upload.**  It
+   zeroed `stage_region`, which is exactly what `llama_context` gates its narrow -> wide layout drop on
+   (`ring_carved`): a narrow placement after the scheduler's buffer release would drop the carve, the next prefill
+   would reuse the narrow compute buffer (the size-independent GSQ/35B layout), no wide view would be placed, the
+   region would never be re-carved -- gather for the whole prefill (-16 % on the 89k GSQ arm) or the serial
+   whole-table upload (the 12.3 s / 47 t/s field defect).  It also returned no VRAM: the region lives inside the work
+   band, so the boundary has already shrunk below it (`context-exit work=2048 transport=960 arena_region=18368`).
+   **Removed**; the BUFFERS are still released at every transition (`h2d_stage_release` -> `transport_reset`), and a
+   depth change still drops an idle carve in `ggml_cuda_slab_set_stage_region`.  The other four are smaller: a
+   `return` in the `llama_context` **constructor** body; `GGML_SCHED_STAGE_MIN_TOKENS=0` never reaching the selector
+   (`pipe_wide_prev` was only marked when the gate was > 0 -- the knob's opposite); the zero-carve test reading
+   `GGML_SCHED_DEVGATHER` as `== 1` so the FORCE arm carved a region it never fills; and the hybrid fill's arena
+   census being counted before the host DMAs (double-counted on the fall-through).
+
+**Re-measured on the fixed tree (build clean, no warning in any touched file).**  89k 1-GPU: **2492.4 / 2478.8**
+(median 2485.6), `43d0b1f4629e` on both cycles -- i.e. none of the seven fixes moves the campaign's result, which is
+the first thing to prove because one of them can veto staging per split.  The census arm stages `138 splits x 3
+buffers of 450.0 MiB` (decision `3 -> 3` on a 51.4 % arena, request 1350 MiB) with **0** refusals and 124 720 bulk
+DMAs.  The field three-request sequence reproduces session 6 in pattern: `3 -> 2`, region 1350 -> 900 MiB,
+`144 x 2 x 450 MiB`, band 1536 -> 1792 -> 2048 all inside the cushion, `band_raise[absorbed_by_cushion=2
+overrun_deferred=0]`, **no** `residency mirrors drifted` / `pipeline buffer grows` / `h2d_stage_buffer` / `transport
+region exhausted` line, and `transport_used` 960 -> 0 at every drop with the carve persisting for the next prefill
+(2136.2 t/s against 2157.4 last session -- the shape's unpinned heat prior, and the arena-after-drop samples are
+65-100 MiB lower at each of the same points).  2-device `-sm tensor`: **3429.3 t/s**, the pipeline's one decline line,
+no Meta-ring attempt (the §3.1 state, unchanged).  **All four buffer branches reached** on the 122B / 35B shapes --
+3: 3210.4 (3 x 272 MiB), 2: 1196.8 and 1201.6 (2 x 630), 1: 1028.4, **0: 930.8 with the request going 1890 -> 0 MiB
+and zero refusal lines**; the caps have to be **smaller** than the handover's labels assumed (4096/3072 put me on
+2/1, not 1/0) because the arena settles ~500-900 MiB higher here -- the throughput tracks the buffer count, not the
+label, and the rule's arithmetic is printed on the decision line.
+
+**STOP, as the handover requires.**  Promotion is a **block decision**: the selector + the re-keyed zero-carve rule
+into **block 09**; the pipeline / transport region / cushion / depth authority, and the VMM pool's fail-soft growth,
+into **block 10**.  The §3.1/§9 question is a design choice, not a gate outcome: **delete the Meta backend's staged
+transport** (unreachable at every fill -- the per-device region is never carved on a split -- and behind the gather on
+every arm measured) **or finish it**.  The maintainer's own user-side check comes before the ladder
+(`gate-prefill-logits` first, then host-pool / kv-residency / fused-probe-splits / moe-promise, `check-shlib-symbols`
+plus a `GGML_HIP_NO_VMM=ON` build, and the MTP four axes), the doc edits listed in `RESULTS-session6.md` §6, and the
+cut.
+
 ## 261127.011 (r368, `wip/`) -- flash-next-prefill: cold-start handover for session 7 (one final code-review pass, then the block decision)
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push, nothing promoted.  Squashed

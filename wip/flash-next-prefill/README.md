@@ -4,10 +4,18 @@
 push.**  The campaign is **squashed to one commit** (`SQUASHED-campaign-r368.patch`) and **code-reviewed**
 ([`REVIEW-squashed.md`](REVIEW-squashed.md), all findings fixed), which is the form it goes to promotion in.
 
-**A new session starts at [`HANDOVER-session6.md`](HANDOVER-session6.md)**, in this order: purge the tombstones
-(no dead-code remnants in the source, `ENVIRONMENT.md` or `DIAGNOSTIC.md`), a fresh code review, the quick tests,
-then **STOP** for the maintainer's user-level test — promotion (which begins with the block decision) only on
-their explicit all-clear.
+**A session starts at [`HANDOVER-session7.md`](HANDOVER-session7.md) — and session 7 has DONE it: the final
+code-review pass (seven defects, all fixed in the same single commit, tip `79d48465e`, patch 5119 lines), the §4
+tests re-run ([`RESULTS-session7.md`](RESULTS-session7.md)), and then a STOP before the promotion ladder.**  What is
+left is the maintainer's: their own user-side check, the **block decision** (selector + the re-keyed zero-carve rule
+into block 09; pipeline / transport region / cushion / depth authority and the VMM pool's fail-soft growth into block
+10), and the `REVIEW-squashed.md` §9 design question (delete the Meta backend's staged transport, or finish it).
+Nothing is cut, renumbered or folded without that answer, and the gate ladder has not been started.
+
+**The previous hand-over's order was** (and sessions 6-7 followed it): a fresh code review with the no-tombstone
+rule (no dead-code remnants in the source, `ENVIRONMENT.md` or `DIAGNOSTIC.md`), the quick tests, then **STOP** for
+the maintainer's user-level test — promotion (which begins with the block decision) only on their explicit
+all-clear.
 
 The history behind it: [`RESULTS-session5.md`](RESULTS-session5.md) (the `transport_base` cushion, the buffer
 count from the arena's residency, and the re-base onto **r368**), [`RESULTS-session4.md`](RESULTS-session4.md)
@@ -315,7 +323,7 @@ text, so an unpinned A/B compares two different configs).
 |---|---:|---:|---:|---|
 | default (pool + device gather) | 2099-2117 | 2355-2359 | 32.7 | baseline; very reproducible on x16 (±0.1 %) |
 | forced ring, cache's two-tier kernel fill, arena stand-down refused (pre-r366 behaviour) | 1790-1791 | — | 26 | the A/B control |
-| same + `MOE_HOST_POOL_STAGE_STANDDOWN=1` (a stood-down table may still stage) | 1831-1843 | — | 26-27 | the split-level refusal was real, but this is only +3 % |
+| same + `MOE_HOST_POOL_STAGE_STANDDOWN=1` (a stood-down table may still stage) | 1831-1843 | — | 26-27 | the split-level refusal was real, but this is only +3 % (the knob is **deleted** in the delivery candidate: session 7 removed the gate and its hook caller, `REVIEW-squashed.md` §10.2) |
 | same + **bulk fill** (one copy-engine DMA per table from the pool mirror) | **2265-2367** | — | 26-36 | **+10-12 % over the gather, same-seed text identical** |
 | bulk fill + one-split scheduler lookahead | 2272-2359 | — | — | **no change** — the transfer was already overlapped |
 | `MOE_EXPERT_CACHE_MIB=0` (no cache at all: ring + one async pageable DMA per table) | 2329-2482 | 2531 | — | the existence proof, but decode collapses |
