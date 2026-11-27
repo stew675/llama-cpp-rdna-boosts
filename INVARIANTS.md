@@ -3663,3 +3663,41 @@ field are the two numbers to read.  Measured on the reporter's shape (1x R9700 x
 text identical; server visits L1 1959.5 t/s / 34.37 tg and stand-downs down from 51 tables to 2.  Gate ladder:
 `benchmarks/2026-11-26-issue-368-wide-band-coupling.md` §5. (r366, GitHub issue #368 -- the reporter's r365
 follow-up; `WORKLOG.md` 261126.001.)
+
+**r367 -- one lost boolean on `verify_band_arch` silently disabled five fusions AND two newer verify paths on every
+RDNA3_0 card.**  `ggml_cuda_should_fuse_mul_mat_vec_q(..., verify_band = true)` is the SINGLE gate a family of
+2..8-token fusions shares, so its arch term is a single point of failure for all of them, not for one kernel:
+the three Q8_1 pre-quantize fusions (`ADD` + `rms_norm`, plain `rms_norm`, gated unary), the `GLU` -> Q8_1 mark, and
+-- through the same predicate -- the newer `GGML_CUDA_FUSE_GATE_BETA_VERIFY` and r304's GDN gate/beta epilogue
+verify band (`mmvq.cu`'s `ok()`).  The r353 re-cut rebuilt the block from a chain that had **lost** the r95/r325
+`verify_band_arch = RDNA4 || RDNA3_0` term; `gdn-conv.cu`'s `verify_ok` and `cpy-batch.cu` kept their RDNA3_0
+halves, so only this predicate narrowed to RDNA4 -- and the function's doc comment was reflowed in the same release
+to say "RDNA4 and RDNA3_0", so prose and code disagreed and no gate could notice: a fusion that stops matching
+produces the same text and the same logits, only slower.  Two rules follow.  (1) **A gate that no census covers must
+be measured, not read**: the r95 acceptance evidence was a gfx1100 A/B against `GGML_CUDA_FUSE_Q8_1_VERIFY=0`, and it
+is the only thing that separates "the band runs" from "the band is unreachable".  r367 restores it and re-measures on
+gfx1100 (27B Q4_K_M, MTP `draft-mtp`, `-n 700`, 3 interleaved rounds): **77.4 / 77.4 / 77.3 t/s against
+74.7 / 74.9 / 74.9 with the switch off = +3.4 %**, text identical (`2cbc569a7a76`), width probe `W=1..8` identical
+hashes and `maxdiff 0`, `gdn_epi: verify q4_K tokens 2` present on the default arm and absent on `=0`, and the
+`GGML_CUDA_FUSE_GDN_EPI=0` arm's probe identical too.  (2) **A re-cut is the class that loses a boolean**: the r353
+loss was invisible to the build (the predicate compiles either way), to the text gates (it is a performance-only
+decision) and to `check-rung-file-sets.py` (no file, define, env var or option disappeared -- a *predicate term* is
+not an inventory row, gate 38's known blind spot).  A re-cut therefore owes the arch A/B of any default-on gate whose
+only evidence is a percentage, not only the coherence/text ladder.  Block 08 carries the amendment (it introduces
+the predicate; block 09's extraction carries it to `mmvq.cu`, where the delivered line lives).
+(r367, GitHub issue #373; `benchmarks/2026-11-26-issue-373-rdna3-verify-band.md`; `patches/README.md` block 10.)
+
+**r367 -- an optional artifact's tree must BUILD; "it applies and re-verifies" is not a compile.**  `0101-mixed-kv`
+carried a missing closing brace in `fattn-rdna.cuh` from the r360 re-cut to r366: r360 added
+`ggml_cuda_fattn_kv_pair_native_host` at exactly the spot where the artifact inserts `ggml_cuda_fattn_tile_type_V`,
+the rebase kept both functions, and the hunk ended at the outer function's `return` -- so the artifact's inserted
+function became a NESTED function definition (`97 open / 96 close`), which is illegal in C++ and which every
+FA template-instance TU reports as `function definition is not allowed here` at the first line after it.  It was
+invisible by construction: the patch applied STRICTLY, `validate-set.sh` check 8 compared the produced tree to
+`release.json.optional`, the tree matched (the broken content IS the recorded tree), and optional artifacts are
+outside the release gate ladder, so nothing compiled it.  Optional artifacts are shipped code a consumer builds, so
+a tree that applies is not evidence of anything: `scripts/gate-optional-build.sh` (gate 47) applies the default set,
+applies every artifact in numeric order, asserts `release.json.optional_tree`, and builds the `all` target.  The
+class is *content drift inside an artifact*, which no inventory reconciliation sees (the file, its define set and its
+options are unchanged), so the check has to be a build.  (r367, GitHub issue #371;
+`optional/mixed-kv/README.md`; `MANIFESTS.md` gate 47.)

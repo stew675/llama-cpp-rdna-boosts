@@ -22,6 +22,8 @@ fresh tarball (19/19, strict), tree equality, a conflict-marker/subject scan of 
 applied strictly and tree-checked, the Windows portability lint of the files the set adds — issue
 #231 — then the **file-set reconciliation** of every block against the release it replaces, `TODO` #358,
 which is what catches a re-base that landed fewer files than the patch it replaces carried — checks 1-9).
+The optional **build** is not in CI: `scripts/gate-optional-build.sh` (gate 47) compiles the cumulative
+optional-applied tree on a GPU box, once per release (issue #371).
 **The two-arm server (block 17 until r352) is WITHDRAWN from the delivery** and lives in
 `beta/prefill-decode-arms/` (apply with `--include-beta`); it is not in `patches/`, not counted in `v<N>`,
 and its gates (`gate-arms-spec.sh`, `gate-draft-ctx.sh`, `gate-arms-soak.sh`, and gate 17's TIER rows) are
@@ -97,6 +99,9 @@ silently drops hunks (measured: 30 files / 2483 lines instead of 35 / 6094).  Th
    `release.json.optional_tree`), on the freshly built default tree, and fails when one has drifted
    (`TODO` #324: both artifacts had gone stale for 40+ releases because "rebase it every release" was a
    policy with no instrument).
+   **And since r367 the cumulative tree must BUILD**: `scripts/gate-optional-build.sh` (gate 47) is a release
+   gate, because a tree that applies and re-verifies is not a tree that compiles -- issue #371 shipped a
+   non-compiling `0101` tree through r360-r366 with check 8 green.
 
 ## Release gates (all mandatory, recorded in the release's `WORKLOG.md` entry)
 
@@ -1211,6 +1216,21 @@ in CI.  The model-level gates are manual:
     plus no `GGML_ASSERT`/abort in any arm's log and `check-gpu-faults.sh` clean.  Required for any change to
     `server_slot_sched::admit`/`select`, `kv_admit_ok`/`kv_admit_cells`, `LLAMA_SERVER_KV_ADMIT[_RESERVE]`, the
     wake logic in `update_slots`, or `server_queue::take_deferred_tasks`.
+47. **An optional artifact's tree must BUILD, not only apply** (r367, `optional/mixed-kv` `0101`, GitHub issue #371) --
+    `scripts/gate-optional-build.sh`.  `validate-set.sh` check 8 proves every `optional/*/01xx-*.patch` still applies
+    strictly and produces `release.json.optional`/`.optional_tree`, but **nothing compiled an optional-applied tree**:
+    the r360 re-cut rebased `0101` onto block 10's new `ggml_cuda_fattn_kv_pair_native_host` and kept both functions
+    while dropping the outer one's closing brace, so `fattn-rdna.cuh` (97 open / 96 close) put every later function
+    definition inside a function body.  The patch applied, the tree re-verified, every gate stayed green, and the tree
+    did not compile from r360 to r366 (`function definition is not allowed here` at `fattn-rdna.cuh:369` onwards,
+    first hit by the reporter on Windows/ROCm 10.2 with gfx1100 in the target set).  The gate applies the default set
+    at `release.json.base`, applies every artifact in **numeric order** (the `--include-optional-all` consumer path)
+    with `scripts/scratch-tree.sh`, asserts `release.json.optional_tree`, and builds the **`all` target once**; it
+    prints `OPTIONAL_BUILD=PASS`.  **Non-vacuity**: run the PRE-fix artifact through the same scratch path and the
+    build must fail (r367: the old `0101` reproduces the reporter's errors; the repaired one builds in 438 s).  The
+    artifact's own behaviour gate is separate and still `scripts/gate-mixed-kv.sh` on that build (`BUILD=<scratch>/bin`).
+    Required for any re-cut of an artifact, any block amendment that touches a file an artifact patches (the r360
+    collision class), and every release (`WORKLOG.md` 261126.005).
 
 
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.

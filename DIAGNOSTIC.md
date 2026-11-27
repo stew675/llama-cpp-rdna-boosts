@@ -229,6 +229,13 @@ All are value-gated: unset = **on**, `0` = off.  Notes that change what an arm m
   (`GREEDY-PURITY.md` §49).
 * The GDN-norm pair is the only fusion whose skip and emit are two decisions, so while a norm is pending no
   other fusion may start in between.
+* `GGML_CUDA_FUSE_Q8_1_VERIFY=0` covers a whole family, not one fusion: `ggml_cuda_should_fuse_mul_mat_vec_q(..., verify_band = true)`
+  is the single gate the 2..8-token Q8_1 pre-quantize fusions share (residual `ADD` + `rms_norm`, plain
+  `rms_norm`, gated unary, the `GLU` mark) **and** the gate the newer GDN verify paths ask
+  (`GGML_CUDA_FUSE_GATE_BETA_VERIFY`, and r304's GDN gate/beta epilogue through `mmvq.cu`'s `ok()` predicate).
+  The band is **RDNA4 and RDNA3_0 (gfx1100-1102)**, and `=0` is therefore also the pre-r95 arm on gfx1100 —
+  which is how the r353 loss of the RDNA3_0 term (restored at r367, GitHub issue #373) was measured.  RDNA3_5
+  is excluded by the macro (`0x1100 <= cc < 0x1150`).  The fusion notes are in `patches/README.md` block 10.
 
 | variable | default | class | what it does |
 |---|---|---|---|

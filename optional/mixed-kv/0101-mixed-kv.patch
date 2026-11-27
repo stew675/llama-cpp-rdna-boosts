@@ -1,11 +1,11 @@
-From 53107699058c8a1538ebd0d711fb3134e760aa97 Mon Sep 17 00:00:00 2001
+From 971f417e9a799667c90123481d91d5f9927e0ed1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 21 Nov 2026 18:16:14 -0600
 Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types (optional: NOT
  in the default apply)
 
 ---
- ggml/src/ggml-cuda/fattn-rdna.cuh             | 33 +++++++-
+ ggml/src/ggml-cuda/fattn-rdna.cuh             | 34 +++++++-
  ggml/src/ggml-cuda/fattn-tile.cu              | 24 ++++++
  ggml/src/ggml-cuda/fattn-tile.cuh             | 83 +++++++++++--------
  ggml/src/ggml-cuda/fattn.cu                   |  2 +-
@@ -16,13 +16,13 @@ Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types (optional: NOT
  src/llama-context.cpp                         | 23 ++++-
  tests/test-backend-ops.cpp                    |  9 ++
  tests/test-logits-width-probe.cpp             | 11 +--
- 11 files changed, 170 insertions(+), 42 deletions(-)
+ 11 files changed, 171 insertions(+), 42 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q4_0.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_0.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_1.cu
 
 diff --git a/ggml/src/ggml-cuda/fattn-rdna.cuh b/ggml/src/ggml-cuda/fattn-rdna.cuh
-index 831a964fa..a55c256ee 100644
+index 831a964fa..e78f1ccb5 100644
 --- a/ggml/src/ggml-cuda/fattn-rdna.cuh
 +++ b/ggml/src/ggml-cuda/fattn-rdna.cuh
 @@ -265,6 +265,29 @@ static inline int ggml_cuda_fattn_tile_kv_native_type(const ggml_tensor * K, con
@@ -65,18 +65,19 @@ index 831a964fa..a55c256ee 100644
      const int tile_native = ggml_cuda_fattn_tile_kv_native_type(K, V);
      return (tile_native == FATTN_KV_NATIVE_BF16) ? GGML_TYPE_F16
                                                   : ggml_cuda_fattn_native_ggml_type(tile_native);
-@@ -338,6 +364,10 @@ static inline bool ggml_cuda_fattn_kv_pair_native_host(int cc, ggml_type type_k,
-     // arm only when both operands name the SAME type (the tile kernel has one K/V type parameter).
-     const ggml_type tile = ggml_cuda_fattn_tile_type(&k, &v, cc);
+@@ -340,6 +366,11 @@ static inline bool ggml_cuda_fattn_kv_pair_native_host(int cc, ggml_type type_k,
      return tile == type_k && tile == type_v;
-+
+ }
+ 
 +// The tile instantiation's V type: its K/V type, except for a mixed pair the tile kernel has an instance for.
 +static inline ggml_type ggml_cuda_fattn_tile_type_V(const ggml_tensor * K, const ggml_tensor * V, const int cc) {
 +    return ggml_cuda_fattn_tile_kv_mixed_ok(K, V) ? V->type : ggml_cuda_fattn_tile_type(K, V, cc);
- }
- 
++}
++
  // Decode/verify band (n_q <= 8) on RDNA4: the whole GQA group is folded into one block
-@@ -642,7 +672,8 @@ static inline bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_te
+ // (ncols2 = 8) via the WMMA kernel instead of the tile kernel's ncols2 = 2, which fetches and
+ // dequantizes every K/V element once per head pair (3x for GQA 6).  This is the default; the env var
+@@ -642,7 +673,8 @@ static inline bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_te
      // is the default since the r6 flip; it is deliberately NOT banded while it is staged, where the
      // whole-cache conversion dominates (that staged case only appears under GGML_CUDA_FA_KV_NATIVE=0).
      const int  kv_native = ggml_cuda_fattn_kv_native_type(K);

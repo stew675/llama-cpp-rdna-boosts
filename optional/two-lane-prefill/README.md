@@ -1,10 +1,13 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r366` and verified on `r353`.**
-r358 (18 official blocks `0000`-`0017` + temporary `0300`, default tree `84d50a416183a159c504fab508a84c0d5ddb859f`, default tip `dcee0fc34`):
-applies strictly, sha256 `d7fec59339459519f47f45e7f9f8bda5ecc13521abd5ae54ec0d4d6fbb4b809f` (the sha moved with
-the exported commit id; the diff is unchanged -- r358 amends block 05, none of this artifact's files), trees
-`6fa3dea6715471d4768d7d10c188323279a98d0c` alone and `b00ce41dd2d408a969cfc7ad1af42f9ce7eb1daf` cumulative.
+**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r367` and verified on `r353`.**
+r367 (18 official blocks `0000`-`0017` + temporary `0300`, default tree `2ff670ba83e5160abf16d20355aeded52cb744f0`, default tip `83b254bea`):
+applies strictly, sha256 `4093ef671432e8370f50955b719f0b084214b5fefc4c1da93f9602a3bab89227` (the sha moved with
+the exported commit id; the diff is unchanged -- r367 amends block 08's `mmvq.cu` verify-band predicate, none of
+this artifact's files), trees `9f9acf91fb8db391e3a80393108f09d61e33bb99` alone and
+`c5ad54d972c59c0717c8476647fd64d6621977d8` cumulative.  The optional-applied tree is now also **built** by
+`scripts/gate-optional-build.sh` (gate 47, added for issue #371) -- this artifact's own port verification was
+never a compile.
 The port verification and the numbers of record are the r353 run below, against the r353
 default delivery tree `27db9bfd4ef7f41c7df60f704410de28863beac3` = official blocks `0000`-`0016` plus the
 temporary `0300`; the r320 cut and its port verification are kept below; the r319 cut is at the bottom of the list, against the r319 default delivery tree

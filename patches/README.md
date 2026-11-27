@@ -3465,6 +3465,19 @@ block's own symbols (QSA/HC matchers, the indexer relu-sum, the HC_BLK16/RES16 m
   the 2..255-token verify batches too and keeps its pre-existing single-device restriction.
   `GGML_CUDA_FUSE_Q8_1_VERIFY=0` / `GGML_CUDA_FUSE_GDN_CONV_VERIFY=0` still disable them; RDNA3_5 is
   excluded by the macro (`0x1100 <= cc < 0x1150`).
+  **Restored at r367 (GitHub issue #373).**  The r353 re-cut rebuilt this block from a working chain that
+  had lost the `verify_band_arch` term — `gdn-conv.cu` and `cpy-batch.cu` kept their RDNA3_0 halves, only
+  this predicate was reduced to `GGML_CUDA_CC_IS_RDNA4(cc)`, and the function's own doc comment was even
+  reflowed to claim "RDNA4 and RDNA3_0" (the r360 block-10 reflow), so the code and the prose disagreed and
+  nothing failed.  Since the predicate is the single gate, every consumer lost the verify band on gfx1100:
+  the five Q8_1 pre-quantize fusions *and* the two newer verify paths that ask it — `GGML_CUDA_FUSE_GATE_BETA_VERIFY`
+  and r304's GDN gate/beta epilogue.  The amendment puts the r325 expression back in the block that
+  INTRODUCES the predicate (block 08's `ggml-cuda.cu`); block 09's extraction carries it into `mmvq.cu`,
+  where the delivered line lives.  Measured on gfx1100 (RX 7900 XTX, 27B Q4_K_M, MTP `draft-mtp`, prose
+  prompt, `-n 700`, 3 interleaved rounds): **77.4 / 77.4 / 77.3 t/s with the band vs 74.7 / 74.9 / 74.9
+  with `GGML_CUDA_FUSE_Q8_1_VERIFY=0` (+3.4 %)**, identical text (`2cbc569a7a76`), width probe `W=1..8`
+  identical hashes and `maxdiff 0`, and the GDN epi's `gdn_epi: verify q4_K tokens 2` line present with the
+  band and absent without it (r367 record: `../../benchmarks/2026-11-26-issue-373-rdna3-verify-band.md`).
 * **The DSV4_HC_POST arm is chosen by the split mode** (r97).  The `hc_combine_norm` chain spelled out
   (scale → sigmoid → scale → repeat → mul → add → rms → mul) is faster than the op on **one** device
   (+0.9..+1.8 % prefill on qwen4exp IQ4_NL, gfx1151) and stays the default there, but the chain's

@@ -16,6 +16,84 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261126.005 (r367) -- issue #373: the RDNA3_0 verify band is back (the r353 re-cut had lost one boolean, and it is the gate five fusions and two newer verify paths share)
+
+**The report.**  `@mjohanning99` measured a reproducible 1-3 % MTP decode regression on gfx1100 from r353 on and
+traced it to `ggml_cuda_should_fuse_mul_mat_vec_q()` (`ggml/src/ggml-cuda/mmvq.cu`): r325 (the r95 / PR #192
+promotion) had `const bool verify_band_arch = RDNA4(cc) || RDNA3_0(cc)` and used it in the verify-band condition;
+r353's re-cut rebuilt the block from a chain where that term was gone, leaving `GGML_CUDA_CC_IS_RDNA4(cc)` inline.
+The other two r95 pieces (`gdn-conv.cu`'s `verify_ok`, `cpy-batch.cu`) still had their RDNA3_0 half, so it was a
+merge loss, not a decision.  Worse, the function's doc comment was reflowed at r360 to say *"on RDNA4 and RDNA3_0
+the verify band"*, so the prose and the code disagreed and nothing failed: a fusion that stops matching is
+text-, logit- and acceptance-identical, only slower.
+
+**Why one boolean matters.**  That predicate is the SINGLE gate a family shares: the three Q8_1 pre-quantize
+fusions (`ADD` + `rms_norm` -> Q8_1, plain `rms_norm` -> Q8_1, gated unary -> Q8_1), the `GLU` -> Q8_1 mark, and
+through the same call the newer `GGML_CUDA_FUSE_GATE_BETA_VERIFY` and r304's GDN gate/beta epilogue verify band
+(`mmvq.cu`'s `ok()`).  So the r353 loss disabled seven things on gfx1100 at once, including two paths that did not
+exist at r95 -- which is the reporter's own "the GDN gate/beta epilogue's verify path is newer, worth a run".
+
+**The fix.**  A block-08 amendment (`ggml-cuda.cu`, where the predicate is INTRODUCED; block 09's extraction
+carries it into `mmvq.cu`, where the delivered line lives).  Folded, not a new block: it restores r325's
+expression, and the r95 promotion rules name block 08/09 for it.  The rebase resolved the two expected conflicts
+(the block-09 move and the block-10 comment reflow) by keeping the block's own side and carrying the new term into
+the moved copy.
+
+**Measured on gfx1100** (this box: one RX 7900 XTX, ROCm 10.2 build, `LD_LIBRARY_PATH` unset, `ROCBLAS_USE_HIPBLASLT=0`).
+The A/B is the same binary with `GGML_CUDA_FUSE_Q8_1_VERIFY=0`, i.e. exactly the pre-fix predicate.  27B Q4_K_M
+(embedded MTP head), prose prompt, `-n 700`, three interleaved rounds: **77.4 / 77.4 / 77.3 t/s against
+74.7 / 74.9 / 74.9 = +3.4 %**.  Four-axis MTP protocol (`-ctk bf16 -ctv bf16 -c 16384 --fit false -n 3000`,
+n_max 3): **R 80.3 vs 77.6 (+3.5 %), P 92.3 vs 89.5 (+3.1 %), C 108.0 vs 104.9 (+3.0 %), K 116.4 vs 113.0
+(+3.0 %)**, draft acceptance **identical to the last digit on every axis** (0.59283 / 0.81378 / 0.91625 /
+0.99200), and `none == draft-mtp` byte-identical on all four axes (`0300030b5b2e` / `90616580c463` /
+`9c814032b3a4` / `25785aa1fbd6`).  `llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8` (q8_0 KV, 3 interleaved
+rounds): **B=1 flat** 42.87/42.82/42.85 vs 42.86/42.74/42.84, **B=4 +3.3 %** (135.37 vs 131.02), **B=8 +1.7 %**
+(178.2 vs 175.2).  Width probe `W=1..8`, `KV=q8_0`: PASS, every hash identical across default / `FUSE_Q8_1_VERIFY=0` /
+`FUSE_GDN_EPI=0`, `maxdiff 0`.  Mechanism (non-vacuity): on the 35B-A3B LMStudio Q4_K_M, `GDN_EPI_LOG=1` prints
+`gdn_epi: verify q4_K rows 32 K 2048 tokens 2` on the default arm and **no verify line** on `=0`.
+`test-backend-ops -o MUL_MAT,RMS_NORM,ADD,MUL` 3184/3184; cross-build coherence r366 == r367 (9B
+`6541eadb9041`, 27B plain and MTP `2cbc569a7a76`); `gate-prefill-logits.sh` **0.000000 / 100.000 %** against a
+base recorded from the r366 build on this ROCm line (new base file, `...-rocm-10.2.0-gfx1100.kld`); `validate-set.sh`
+green; `check-gen-docs.sh` ok; `check-shlib-symbols.sh` 16/16; GPU-fault checks clean.
+
+**Rule recorded.**  `INVARIANTS.md` r367: a re-cut is the class that loses a boolean, a predicate term is not an
+inventory row (gate 38 cannot see it), and a default-on gate whose only evidence is a percentage owes its arch A/B
+on every re-cut -- not only the text ladder.  Record: `benchmarks/2026-11-26-issue-373-rdna3-verify-band.md`.
+
+## 261126.004 (r367) -- issue #371: the optional `0101` tree did not compile for seven releases; a tree that applies is not a build (new gate 47)
+
+**The report.**  `@mjohanning99` found that `optional/mixed-kv/0101-mixed-kv.patch` applies strictly and produces a
+tree that does not compile: the r360 re-cut rebased the artifact's `ggml_cuda_fattn_tile_type_V` hunk onto block 10's
+exactly-there `ggml_cuda_fattn_kv_pair_native_host`, kept both functions, and ended the hunk at the outer function's
+`return` -- so the inserted function became a NESTED definition (illegal in C++).  `fattn-rdna.cuh` brace balance
+97 open / 96 close; every FA template-instance TU reports `function definition is not allowed here` from line 369.
+Reproduced exactly here: applying the r366 artifact gives 97/96 and the reporter's error text.
+
+**Why nothing caught it.**  The patch applied STRICTLY, `validate-set.sh` check 8 compared the produced tree with
+`release.json.optional` and the tree matched (the broken content IS the recorded tree), and optional artifacts sit
+outside the release gate ladder -- so no step ever compiled an optional-applied tree.  The r360 README even records
+the conflict resolution that dropped the brace.
+
+**The fix.**  Regenerated, never hand-edited: a `git am` of the artifact on the r367 default tree, the missing `}`
+restored (97/97), commit amended, `make-patches.sh ... --optional` re-exported.  New sha256
+`0783b165c67d497c1d8db7160b3557cec0f3b41c2fa4c27338804f0dbf0f70d3`; tree alone
+`9357ca2924e80cbb0bf4593e3af7c9b1248dc553`; cumulative `c5ad54d972c59c0717c8476647fd64d6621977d8` (both artifacts
+re-cut against the new default tree; `0100`'s diff is unchanged, its sha moved with the exported commit id).
+
+**The missing instrument -- gate 47, `scripts/gate-optional-build.sh`.**  It applies the default set at
+`release.json.base`, applies every optional artifact in numeric order on the `scratch-tree.sh` path (ccache-warm),
+asserts `release.json.optional_tree`, and builds the **`all`** target once.  Non-vacuity measured both ways: the
+old artifact at the same tree fails the build with the reporter's errors, the repaired one builds in 438 s.  The
+artifact's own behaviour gate ran on that build: `scripts/gate-mixed-kv.sh` **14/14 PASS** on gfx1100
+(`FLASH_ATTN_EXT` 7493/7493 in the default, `GGML_CUDA_FA_KV_MIXED=0` and `GGML_CUDA_FA_KV_NATIVE=0` arms; width
+purity q8_0/q8_0 and the three mixed pairs `maxdiff 0`; four text arms; both refusal arms; journal clean).
+`scripts/scratch-tree.sh`'s `arm` also now says "worktree is dirty" instead of the misleading "release tip not in
+this checkout" when an earlier session left modified files behind (it cost this session a detour).
+
+**Rule recorded.**  `INVARIANTS.md` r367: an optional artifact is shipped code a consumer builds, so a tree check is
+not evidence; gate 47 is a release gate and is owed by any artifact re-cut and by any block amendment that touches a
+file an artifact patches (the r360 collision class).
+
 ## 261126.003 (r366, release cut) -- tagged, main and the fork pushed, the release assets published; the container images are building off-host
 
 **The cut.**  `v18-919794500-r366` (annotated tag, pushed) = fork re-cut tip

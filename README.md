@@ -20,8 +20,8 @@ assumes its predecessors), so the set is applied whole.  **Block `0300` is tempo
 and treat it as a stop-gap, not a feature.  Two further blocks are **optional** and are NOT in the
 default set: `0100` (two-lane prefill) and `0101` (mixed K/V cache types), applied only with
 `--include-optional` (see [`optional/README.md`](optional/README.md)).  The release `v<N>-...` prefix is
-the **official** block count (`N` = 17); `0300` and the optional blocks are not counted.  The current
-release is **`v17-919794500-r355`** (read `.release` in `release.json` -- it is the source of truth, not this
+the **official** block count (`N` = 18); `0300` and the optional blocks are not counted.  The current
+release is **`v18-919794500-r367`** (read `.release` in `release.json` -- it is the source of truth, not this
 line): the release
 identity (fork point, canonical tip/tree, block count and per-artifact sha256) is
 [`release.json`](release.json), and the release note for it -- and for every earlier `rN` -- is at the top of

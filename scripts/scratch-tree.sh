@@ -173,8 +173,17 @@ case "$SUB" in
     arm)
         [ $# -ge 1 ] || { echo "ERROR: arm needs one or more patch files" >&2; exit 2; }
         ensure_worktree
+        # A dirty worktree makes the checkout BELOW fail, and that used to be reported as "release tip not in
+        # $SCRATCH" -- a misleading message, because the tip is reachable through the shared object store and
+        # the actual cause was two modified files left behind by an earlier session.  Name the real cause.
+        if [ -n "$(git -C "$SCRATCH" status --porcelain)" ]; then
+            echo "ERROR: $SCRATCH has uncommitted changes; 'arm' checks out $TIP and would discard them." >&2
+            git -C "$SCRATCH" status --short | head -10 >&2
+            echo "ERROR: commit/stash them there, or run this arm with another --path" >&2
+            exit 2
+        fi
         git -C "$SCRATCH" checkout -q --detach "$TIP" 2>/dev/null \
-            || { echo "ERROR: release tip $TIP not in $SCRATCH; run 'blocks' first" >&2; exit 2; }
+            || { echo "ERROR: release tip $TIP is not a commit in $SCRATCH (run 'blocks' first, or fetch it into $FORK)" >&2; exit 2; }
         for p in "$@"; do
             [ -f "$p" ] || { echo "ERROR: no such patch: $p" >&2; exit 2; }
             echo "==> git am $p"
