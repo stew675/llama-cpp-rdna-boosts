@@ -1,0 +1,102 @@
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 3063017ec..8f824c83f 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -10656,6 +10656,35 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+                 const int v = e != nullptr ? atoi(e) : 1;
+                 return v < 1 ? 1 : v;
+             }();
++            // `MOE_HOST_POOL_STAGE_MERGE_BYTES=<MiB>`: the same policy in BYTES, which is the currency the trade
++            // is really denominated in.  A resident gap splits one host DMA into two, so the gap costs a DMA issue
++            // (plus the short-run rate penalty) and merging it costs the gap's bytes at the link rate.  Merge while
++            // `gap_bytes / bw < issue_cost`, i.e. while the gap is SMALLER than `bw * issue_cost` -- a threshold that
++            // is a property of the LINK (and of the DEVICE's own link, which matters on a heterogeneous split), not
++            // of the model's expert size.  The expert count above is only a proxy for it, and a different GGUF moves
++            // it: the same `MERGE=4` is 2.2 MiB of Flash-Next expert and 3.5 MiB of a 122B-A10B expert.  Measured
++            // 2026-11-26: the break-even gap is ~0.5 MiB/device at 28.7 GB/s (x8) and ~1-2 MiB at 51 GB/s (x16),
++            // which is exactly why a fixed expert count loses on one box and wins on the other.
++            // `MOE_HOST_POOL_STAGE_MERGE_FLOOR=<MiB>`: **no host DMA smaller than this** (a table boundary is the one
++            // exception -- there is nothing to absorb there).  This is the policy the transport wants: the copy
++            // engine's penalty is a function of the DMA's own size (measured here: 0.65 MiB copies reach 41 GB/s,
++            // 2.87 MiB runs 48, one 333 MiB copy 55.8), so a host run that a lone arena-resident expert split into
++            // two sub-floor pieces should absorb that expert from the pool mirror instead -- the mirror has every
++            // expert, so the over-fetch needs no second source.  NOT a gap budget (`..._MERGE_BYTES`): a big
++            // resident region that leaves a small host run is fixed here and left alone there.  Per DEVICE, since
++            // each device has its own link.
++            static const int64_t stage_merge_floor = [] {
++                const char * e = getenv("MOE_HOST_POOL_STAGE_MERGE_FLOOR");
++                if (e == nullptr || e[0] == '\0') { return (int64_t) 0; }
++                const double mib = atof(e);
++                return mib > 0.0 ? (int64_t) (mib * 1024.0 * 1024.0) : (int64_t) 0;
++            }();
++            static const int64_t stage_merge_bytes = [] {
++                const char * e = getenv("MOE_HOST_POOL_STAGE_MERGE_BYTES");
++                if (e == nullptr || e[0] == '\0') { return (int64_t) 0; }
++                const double mib = atof(e);   // fractional: the x8 break-even gap is ~0.5 MiB
++                return mib > 0.0 ? (int64_t) (mib * 1024.0 * 1024.0) : (int64_t) 0;
++            }();
+             // wip/flash-next-prefill DIAGNOSTIC (remove before promotion): why did the bulk/hybrid fill decline
+             // this table's geometry?  Printed once per distinct destination per process, at `-lv 4`.
+             if (stage_bulk > 0 && pool != nullptr) {
+@@ -10746,13 +10775,15 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+                     // Over-fetch across SHORT resident runs, so a host run is not split for the sake of one or
+                     // two resident experts (the pool has them too, so the merge needs no second source and no
+                     // patch pass): the boundary resident experts simply come from the host as well.
+-                    if (stage_merge > 1) {
++                    if (stage_merge > 1 || stage_merge_bytes > 0) {
+                         for (int e = 0; e < ne; ) {
+                             if (from_host[(size_t) e]) { e++; continue; }
+                             int e2 = e;
+                             while (e2 < ne && !from_host[(size_t) e2]) { e2++; }
+-                            if (e > 0 && from_host[(size_t) e - 1] && e2 < ne && from_host[(size_t) e2] &&
+-                                (e2 - e) < stage_merge) {
++                            const int64_t gap_bytes = (int64_t) (e2 - e) * (int64_t) t.expert_bytes;
++                            const bool  merge_gap = (e2 - e) < stage_merge ||
++                                                    (stage_merge_bytes > 0 && gap_bytes <= stage_merge_bytes);
++                            if (e > 0 && from_host[(size_t) e - 1] && e2 < ne && from_host[(size_t) e2] && merge_gap) {
+                                 for (int k = e; k < e2; k++) {
+                                     prs_new[(size_t) k]   = -1;
+                                     from_host[(size_t) k] = 1;
+@@ -10762,6 +10793,42 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+                             e = e2;
+                         }
+                     }
++                    // The RUN FLOOR: grow every host run smaller than `stage_merge_floor` by absorbing its adjacent
++                    // arena-resident experts (the shorter side first, so the over-fetch is minimal) until the run
++                    // reaches the floor, hits a table boundary, or has nothing left to absorb.  A pass may join two
++                    // runs, so relabel from the top; `ne` passes bound it.
++                    for (int pass = 0; stage_merge_floor > 0 && pass < ne; pass++) {
++                        bool grew = false;
++                        for (int e = 0; e < ne && !grew; ) {
++                            if (!from_host[(size_t) e]) { e++; continue; }
++                            int e2 = e;
++                            while (e2 < ne && from_host[(size_t) e2]) { e2++; }
++                            if ((int64_t) (e2 - e) * (int64_t) t.expert_bytes >= stage_merge_floor) { e = e2; continue; }
++                            int nl = 0, nr = 0;
++                            while (e - 1 - nl >= 0 && !from_host[(size_t) (e - 1 - nl)]) { nl++; }
++                            while (e2 + nr < ne && !from_host[(size_t) (e2 + nr)]) { nr++; }
++                            if (nl == 0 && nr == 0) { e = e2; continue; }   // a table boundary: the only legal short run
++                            if (nl > 0 && (nr == 0 || nl <= nr)) {
++                                from_host[(size_t) e - 1] = 1;
++                                prs_new[(size_t) e - 1]   = -1;
++                            } else {
++                                from_host[(size_t) e2] = 1;
++                                prs_new[(size_t) e2]   = -1;
++                            }
++                            g_stage_overfetch_experts++;
++                            grew = true;
++                        }
++                        if (!grew) { break; }
++                    }
++                    // Account the ARENA side before the host runs are issued: these experts are served by the
++                    // kernel launch below (VRAM -> VRAM) and never touch PCIe.  Without this the hybrid's staged
++                    // line reads `arena=0.0 MiB ... (H2D 100.0% of staged)`, which is not a measurement of the
++                    // transport at all -- it is a census that only the two-tier path used to increment.
++                    {
++                        int64_t n_arena = 0;
++                        for (int e = 0; e < ne; e++) { if (prs_new[(size_t) e] >= 0) { n_arena++; } }
++                        g_stage_arena_bytes += n_arena * (int64_t) t.expert_bytes;
++                    }
+                     // (a) the host side: one 2-D DMA per coalesced run, straight out of the pinned mirror
+                     bool ok = true;
+                     int  n_runs = 0;

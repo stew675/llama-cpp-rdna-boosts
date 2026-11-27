@@ -28,6 +28,20 @@ inside it:
 | **`hyb-redir` = "staged + in-place"** | `2` — **hybrid** (default) | **in place** (the ping-pong; default) |
 
 "Staged + in-place" therefore means **hybrid fill + ping-pong redirect**, which is the prototype's default.
+
+**Where a resident expert's bytes come from (the row everyone gets wrong).** In `hyb-redir`/`hyb-copy`, an expert
+that is in the arena is served **from its arena slot** by the arena-side kernel launch (VRAM -> VRAM, no PCIe);
+only the **non-resident** experts are fetched from the pool mirror over the link. Two deliberate exceptions, and
+they are the reason "it depends" is the honest answer: a **merged gap** (`MOE_HOST_POOL_STAGE_MERGE*`) converts
+the residents it absorbs into host-served experts, and `BULK=1` over-fetches *every* resident from the mirror.
+Measured per arm once the accounting was fixed (the hybrid used to leave `g_stage_arena_bytes` at 0, so a staged
+line read `arena=0.0 MiB ... (H2D 100.0%)` and hid this):
+
+| 1 card, 89k, `-ncmoe 48` | arena-served | host-served | H2D share | host DMAs | over-fetched |
+|---|---:|---:|---:|---:|---:|
+| default (no merging) | 135 451 MiB | 303 036 MiB | 69.1 % | 105 468 | 0 |
+| `MERGE_BYTES=2` (gap budget) | 58 445 MiB | 380 043 MiB | 86.7 % | 19 492 | 133 034 |
+| `MERGE_FLOOR=8` (run floor) | 40 859 MiB | 397 629 MiB | 90.7 % | 14 586 | 159 291 |
 `GGML_SCHED_STAGE_AHEAD` (one-split lookahead) and `MOE_HOST_POOL_STAGE_MERGE` (over-fetch across short
 resident runs) sit on top and are separate.
 
@@ -134,10 +148,39 @@ same thing — **one 2-D copy per coalesced run**, because the destination is al
 Text identical on 2 and on 3 devices (`sha=7454a02b99bf` / `sha=e98c06d6427a`), and the census now shows
 `BULK 26 calls 2781.6 MiB, 245 host DMAs` where it used to read `BULK 0 calls`.
 
-**The pattern is residency, not the split**: the 122B's 2-device arena covers a third of the tables and the
-hybrid wins big; Flash-Next's 2-device arena covers *all* of them (40 925 MiB of pool mirrored by a 40 925 MiB
-arena), so staging copies 100 % of a table that the gather would read entirely from VRAM — and loses. The same
-rule the single-GPU arms show (win ∝ transport share) simply carries over.
+**On the 89k prompt (the only apples-to-apples comparison with §1-§3)**, 3 cycles, spreads 0.1-0.3 %:
+
+| arm | prefill | vs gather |
+|---|---:|---:|
+| **Flash-Next, 2 devices, gather** | **3140.8** | — |
+| Flash-Next, 2 devices, hybrid + in-place | 2967.6 | **−5.5 %** |
+| Flash-Next, 2 devices, `bulk1` | 2938.4 | −6.4 % |
+| Qwen3.5-122B-A10B, 2 devices, gather | 1439.8 | — |
+| Qwen3.5-122B-A10B, 2 devices, hybrid + in-place | **1615.0** | **+12.2 %** |
+
+Two cards are *much* faster than one at 89k in both transports (3140 vs 2106 gather; 2968 vs 2440 staged). An
+earlier draft of this section compared the 5.2k-prompt split arms against the 89k single-card arms and drew a
+"−11 % is a regression" conclusion from it — **that was a prompt-length artifact, not a result**: prefill t/s is
+not comparable across prompt lengths (one card reads ~1580 at 5.2k against 2106 at 89k with the same arm).
+
+**Why the Flash-Next split still prefers the gather** — and it is *not* "the arena covers everything" (an earlier
+claim here that was wrong): 40 925 MiB over 288 tables is 142 MiB/table, i.e. **256 of 512 experts per table, 50 %**,
+the same coverage as one card. The `-lv 4` censuses of the two arms show the difference is the **cache state the
+two transports leave behind**:
+
+| 2 devices, 89k | staged | gather |
+|---|---:|---:|
+| `MoE expert cache h=` | 0.6471 | **1.0000** |
+| staged calls / host bytes | 374 / 39 GB | — |
+| arena remap (zero-copy take-over) | 592 tables served | 0 served (25/25 declined) |
+| gather calls | — | 24 (all from arena slots) |
+
+So on that shape the staged path moves only **39 GB** (592 tables were served by the arena remap and only ~34
+tables/ubatch were staged at all) — there is almost no host traffic for a coalesced fill to improve — while the
+gather path's routing-driven fills leave the arena holding what is actually reached (`h=1.000` vs `0.647`). A
+third of the staged arm's reaches are therefore host reads that the gather arm does not pay. **No coalescing
+policy can fix a worse placement**, which is why this box disagrees with the 122B split (+12.2 %, where the
+arena cannot cover and the host streamer wins).
 
 ## 3.6 Coalescing tactics (the DMA chop) — link-dependent, and now explained
 
@@ -163,10 +206,37 @@ over-fetching one 0.55 MiB expert costs `0.55 MiB / bw`:
 | x8 (28.7 GB/s) | ~20 µs | break-even, slightly worse | **merge loses ~4.5 %** |
 | x16 (~51 GB/s) | ~11 µs | cheaper than the issue it saves | **merge wins +3.0 %** |
 
-So the tactic is right and the *constant* is wrong: `MOE_HOST_POOL_STAGE_MERGE` should be chosen from the
-measured link (merge only while `expert_bytes / bw < issue_cost`), not fixed. A hand-set default is guaranteed
-to be wrong on one of the two boxes. Note also that merging **shrinks the variance** (x8 4.7 % → 1.6 %; x16
-1.9 % → 0.2 %), which is the clearest evidence yet that the staged arms' spread comes from the DMA issue path.
+### Three coalescing policies were implemented and measured
+
+The tactic is right; the *denomination* and the *target* are what matter, and the first two attempts were wrong:
+
+1. **Expert count** (`MOE_HOST_POOL_STAGE_MERGE=<n>`) — merge a resident run shorter than `n` experts. A proxy:
+   the same `4` is 2.2 MiB on Flash-Next and 3.5 MiB on the 122B, and it does nothing for a *large* resident
+   region that leaves a small host run.
+2. **Gap budget** (`MOE_HOST_POOL_STAGE_MERGE_BYTES=<MiB>`) — merge any resident gap up to XX MiB. Reads
+   naturally but targets the wrong quantity, and measures flat on x16 (2495.6 / 2511.4 / 2516.1 for 0 / 1 / 2 MiB)
+   and neutral on x8.
+3. **Run floor** (`MOE_HOST_POOL_STAGE_MERGE_FLOOR=<MiB>`, `experiments/0007`) — **no host DMA smaller than XX**;
+   a run below the floor absorbs its adjacent residents (shorter side first) until it reaches XX or hits a table
+   boundary. This is the one the hardware model asks for, because the copy engine's penalty is a function of the
+   *DMA's own size* (0.65 MiB ⇒ 41 GB/s, 2.87 MiB ⇒ 48, one 333 MiB ⇒ 55.8), not of the gap's.
+
+| policy | x8 (median) | x16 (median) |
+|---|---:|---:|
+| none (default) | **2513.7** (2.8 %) | 2492.3 (3.4 %) |
+| expert count 4 | 2408.8 (2.3 %) | **2553.1** (0.2 %) — +3.0 % |
+| gap budget 1 / 2 MiB | ≈ neutral | 2511.4 / 2516.1 — ≈ neutral |
+| run floor 2 / 8 / 16 / 32 MiB | 2436.9 / 2470.1 / — / — | 2498.9 / 2521.4 / **2527.7** (0.8 %) / 2484.4 |
+
+**Conclusions.** (a) Below ~50 GB/s do not merge at all: every policy is neutral-to-negative at x8, because a
+0.55 MiB over-fetch costs ~20 µs against an ~18 µs issue. (b) At x16 merging pays and the *run floor* is the
+principled knob, with an optimum at **8-16 MiB** and a real fall-off by 32 MiB — exactly the size at which the
+probe says the short-DMA penalty is gone, past which you are only buying bytes. (c) The expert count still
+measured best at x16 (+3.0 %), but it is a coincidence of this model's expert size and it over-fetches ~20 % of
+all reaches to get there; the floor gets most of the win with a quantity that transfers across models and links.
+(d) **The floor is per DEVICE**: on a heterogeneous split each device's link sets its own XX. (e) Every policy
+shrinks the variance (x8 4.7 % → 1.6 %; x16 3.4 % → 0.8-1.4 %), the clearest evidence yet that the staged arms'
+spread lives in the DMA issue path.
 
 A caution this session produced: the single census run of MERGE=4 read **2557.4 t/s** against MERGE=1's 2438.4,
 while the rotated 3-cycle medians read 2408.8 against 2523.0 — the opposite order. One run per arm is worthless
@@ -305,7 +375,7 @@ Nothing was removed; `patches/`, `release.json` and every gate are untouched.
 | the two-tier `moe_cache_stage_kernel` + `stage_span_fill` | **Keep, but only for a non-covering (partial/heat-ranked) pool.** A tensor split no longer falls back to it: `experiments/0006` fills a shard with one 2-D copy per run (+15.2 % over the gather on a partially-resident 122B split, +49.7 % over the kernel fill), text byte-identical on 2 and 3 devices. |
 | `GGML_SCHED_STAGE_AHEAD` | **Retire as a knob if the prototype ships**: neutral-to-negative at both links (2373 vs 2440 on x8). Keep the double-buffered *code* if it is needed to keep the drain off the compute stream — but do not ship the variable. |
 | `MOE_HOST_POOL_STAGE_STANDDOWN` | **Not dead — load-bearing** (§8.2, +25 %). Keep. |
-| `MOE_HOST_POOL_STAGE_MERGE` | **do not ship a constant**: it is a loss at x8 (−4.5 %) and a win at x16 (+3.0 %, and the tightest arm measured, 0.2 % spread). Derive it from the calibrated link (§3.6), then it is a win on both. |
+| `MOE_HOST_POOL_STAGE_MERGE*` (all three forms) | **do not ship a constant, and prefer the RUN FLOOR form** (`..._MERGE_FLOOR=8-16 MiB`, per device): neutral at x8, +1.4 % at x16 with the tightest spread measured, and its constant transfers across models where an expert count does not. Ship it *off* below ~50 GB/s. |
 
 Worth recording for the promotion decision: **the win is real and large where the transport share is large**
 (+39.7 % on a 17 %-coverage 122B on one card, +11-16 % on Flash-Next at `-ncmoe 48` on x8, +5-8 % on x16,
@@ -319,6 +389,9 @@ geometry holds; otherwise keep the gather.
 * `experiments/0005-redirect-capture-guard.patch` — the capture-safety check (§7 B4).
 * `experiments/0006-tensor-split-hybrid-fill.patch` — the hybrid fill on a tensor split (§3.5), plus a
   `-lv 4` geometry census (`bulk-decline diag:`) that should be removed before promotion.
+* `experiments/0007-merge-floor-and-arena-accounting.patch` — `MOE_HOST_POOL_STAGE_MERGE_BYTES` (gap budget),
+  `MOE_HOST_POOL_STAGE_MERGE_FLOOR` (run floor, the policy §3.6 endorses) and the arena-side byte accounting the
+  hybrid was missing (which is what exposed that residents come from the arena unless over-fetched).
 * `c1-code-290k.txt` — the code prompt (`sha256 e92133b4ea9cb889…`, 290 000 B of `ggml-opencl.cpp`; generated,
   never committed as a shipped `prompts/` entry).
 * `results-session3/` — the committed per-run tables (`abba-s3-*.tsv`, the rotated-run summaries) and the
