@@ -42,6 +42,19 @@ line read `arena=0.0 MiB ... (H2D 100.0%)` and hid this):
 | default (no merging) | 135 451 MiB | 303 036 MiB | 69.1 % | 105 468 | 0 |
 | `MERGE_BYTES=2` (gap budget) | 58 445 MiB | 380 043 MiB | 86.7 % | 19 492 | 133 034 |
 | `MERGE_FLOOR=8` (run floor) | 40 859 MiB | 397 629 MiB | 90.7 % | 14 586 | 159 291 |
+
+**Three different "coverage" notions, and they are not interchangeable** (this cost the campaign a wrong claim):
+
+| term | code | meaning |
+|---|---|---|
+| **covering pool / mirror** | `pool->slot_expert[e] == e` for all `e` | the **host** tier holds every expert in file order — what makes one whole-table DMA or run-coalescing possible at all |
+| **arena static coverage** | `expert_slot.size() / n_experts` | how many experts have a **VRAM** slot (Flash-Next 1 card and the 2-card split: 256/512 = 50 %) |
+| **reach hit rate `h`** | census `MoE expert cache: h=` | which of those slots the routing actually reaches (a property of the *placement*, i.e. an outcome of the fill policy) |
+
+On the 2-card split the pool was **covering in both arms** and the static arena coverage was **identical**; the
+arms differed in *which* experts were resident (`h` 0.647 vs 1.000). A transport selector therefore cannot be keyed
+on "is the table covered" — the measured discriminator is **effective host traffic per ubatch** against that
+ubatch's compute time, and `h` cannot be an input either because it is an outcome of which transport ran.
 `GGML_SCHED_STAGE_AHEAD` (one-split lookahead) and `MOE_HOST_POOL_STAGE_MERGE` (over-fetch across short
 resident runs) sit on top and are separate.
 
@@ -238,6 +251,16 @@ all reaches to get there; the floor gets most of the win with a quantity that tr
 shrinks the variance (x8 4.7 % → 1.6 %; x16 3.4 % → 0.8-1.4 %), the clearest evidence yet that the staged arms'
 spread lives in the DMA issue path.
 
+**Shipped default (maintainer's decision, 2026-11-26): `MOE_HOST_POOL_STAGE_MERGE_FLOOR=auto` = 16 MiB when the
+DEVICE's calibrated H2D link is >= `MOE_HOST_POOL_STAGE_MERGE_FLOOR_GBPS` (default 50), off below.** Implemented
+with a per-device read-only peek at the existing calibration (`ggml_cuda_device_h2d_gbps`), so it can differ per
+card on a heterogeneous split and never forces the 512 MiB probe. Verified on both boxes:
+
+| box | calibrated link | resolved floor | host DMAs | over-fetched | arena-served |
+|---|---:|---|---:|---:|---:|
+| x8 | 28.7 GB/s | **off** | 105 468 | 0 | 135 451 MiB |
+| x16 | 54.2 GB/s | **16 MiB** | 7 881 | 186 413 | 26 249 MiB |
+
 A caution this session produced: the single census run of MERGE=4 read **2557.4 t/s** against MERGE=1's 2438.4,
 while the rotated 3-cycle medians read 2408.8 against 2523.0 — the opposite order. One run per arm is worthless
 here (that is the whole reason `abba.sh` exists).
@@ -375,7 +398,7 @@ Nothing was removed; `patches/`, `release.json` and every gate are untouched.
 | the two-tier `moe_cache_stage_kernel` + `stage_span_fill` | **Keep, but only for a non-covering (partial/heat-ranked) pool.** A tensor split no longer falls back to it: `experiments/0006` fills a shard with one 2-D copy per run (+15.2 % over the gather on a partially-resident 122B split, +49.7 % over the kernel fill), text byte-identical on 2 and 3 devices. |
 | `GGML_SCHED_STAGE_AHEAD` | **Retire as a knob if the prototype ships**: neutral-to-negative at both links (2373 vs 2440 on x8). Keep the double-buffered *code* if it is needed to keep the drain off the compute stream — but do not ship the variable. |
 | `MOE_HOST_POOL_STAGE_STANDDOWN` | **Not dead — load-bearing** (§8.2, +25 %). Keep. |
-| `MOE_HOST_POOL_STAGE_MERGE*` (all three forms) | **do not ship a constant, and prefer the RUN FLOOR form** (`..._MERGE_FLOOR=8-16 MiB`, per device): neutral at x8, +1.4 % at x16 with the tightest spread measured, and its constant transfers across models where an expert count does not. Ship it *off* below ~50 GB/s. |
+| `MOE_HOST_POOL_STAGE_MERGE*` (all three forms) | **keep the RUN FLOOR form only** (`..._MERGE_FLOOR`), **default `auto` = 16 MiB at >= 50 GB/s per device, off below** (maintainer's decision, implemented and verified on both boxes). The expert-count and gap-budget forms are measurements, not candidates. |
 
 Worth recording for the promotion decision: **the win is real and large where the transport share is large**
 (+39.7 % on a 17 %-coverage 122B on one card, +11-16 % on Flash-Next at `-ncmoe 48` on x8, +5-8 % on x16,
