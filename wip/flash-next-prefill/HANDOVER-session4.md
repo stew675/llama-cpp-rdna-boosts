@@ -193,9 +193,21 @@ means, when it is sampled, and whether it is verified.
    measure whether the freed space reaches the arena; if not, the sizing path is where the fix belongs.
 5. **Re-key the zero-carve rule** in `slab_ring_region_bytes()` from `GGML_SCHED_DEVGATHER` (now misleading: the
    ring is gone and staging is the default transport) to "the ping-pong will stage".
-6. **Retire the ring vocabulary** once the above is green: `GGML_CUDA_SLAB_RING_MIB` -> `..._STAGE_MIB` (keep the
-   old name as a deprecated alias), `ring_region`/`ring_slots` -> `stage_*`, and drop "ring" from log lines.
-   `GGML_SCHED_STAGE_SLOTS` is already a deprecated alias for the ping-pong depth.
+6. **Retire BOTH stale vocabularies** once the above is green. The maintainer's own misreading is the test: reading
+   "staging" he pictured *a third buffer* that does not exist. So the words must be split by what they denote:
+
+   | concept | name to use | names to retire |
+   |---|---|---|
+   | the operation (host -> VRAM copy of a split's host weights: coalesced CE runs + one arena-hole kernel) | **fill** | "staging" as a noun, "upload" |
+   | the N ping-pong buffers, each = the largest split's host-weight set | **transport buffers** | "stage buffers", "ring slots" |
+   | the slab carve that reserves VRAM for them before they exist (region 2 of the layout) | **transport region** | "stage region", "ring region", "ring hole" |
+   | how the fill is shaped (hybrid vs bulk, coalescing) | the existing filter names (`MOE_HOST_POOL_STAGE_BULK` / `_MERGE*`) | — |
+
+   Renames: `GGML_CUDA_SLAB_RING_MIB` -> `GGML_CUDA_SLAB_TRANSPORT_MIB` (old name kept as a **deprecated alias**),
+   `slab_ring_region`/`slab_ring_slots`/`ring_region`/`ring_slots` -> `slab_transport_*`/`transport_*`, the log field
+   `ring=` -> `transport=`, `h2d_stage_*` -> `h2d_transport_*`, and `GGML_SCHED_STAGE_SLOTS` stays a deprecated alias
+   for the ping-pong depth. Any env var or log field that ships needs the same entry in `ENVIRONMENT.md` /
+   `DIAGNOSTIC.md` under its new name (the old one listed as deprecated, not deleted from the record).
 
 **Acceptance**: a single run prints, in order, the carve, the wide arm, the disarm and the teardown, with every
 number defined in one doc line; and `--fit`'s numbers agree with the runtime ones on all four shapes. Nothing in
