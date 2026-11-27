@@ -8,7 +8,7 @@ judgement calls left to the maintainer (one of which is now implemented, §5.1).
 
 | | |
 |---|---|
-| review target | `~/llama.cpp` branch `wip/prefill-slot-pingpong-squashed`, tip **`8ed2ead6f`** (one commit on `af7a57ba8`) |
+| review target | `~/llama.cpp` branch `wip/prefill-slot-pingpong-squashed`, tip **`4b3e54017`** (one commit on `af7a57ba8`) |
 | the same tree, pre-review, as a 21-commit chain | branch `wip/prefill-slot-pingpong-r368` (kept as history only) |
 | patch | [`SQUASHED-campaign-r368.patch`](SQUASHED-campaign-r368.patch) |
 
@@ -41,6 +41,16 @@ judgement calls left to the maintainer (one of which is now implemented, §5.1).
 | 12 | `llama-context.cpp`, the new `transport buffer:` line | "(3412 MiB at 3 buffers)" | 3 is the provisional pre-decision depth, not a decision this layer makes; the line reads as one. |
 | 13 | `ggml-backend-meta.cpp` | two consecutive comment blocks (session 4's and session 5's) say the same thing — "the slot count must be the same number the slab sizes the region from" — one above the other. |
 | 14 | `ggml-backend.cpp` | `(wuip/flash-next-prefill)` typo; and `sched->pp_wide_prev = …` sits at loop-body indentation after the loop's closing brace (it is correctly *outside* the loop, but the indentation says otherwise, and moving it back inside is a silent behaviour change). |
+
+### The trap this class of change keeps setting (hit twice in this campaign)
+
+*A function that takes `g_mutex` called from a context that already holds it.*  First: the residency rule's
+re-request went through `slab_ring_region_bytes()` -> `moe_cache_host_pool_requested()`, from inside
+`alloc_all_locked`.  Second, a day later: the drift audit took `g_mutex` from inside `report_locked()`, so the
+server answered **all three requests** and then hung one line before the Census summary -- and a hung process
+ignores SIGTERM (it needed `kill -9`, and the leftover held 25 GB of VRAM, which made the next run fail at load
+with an OOM that looked like a new defect).  Both sites name the trap in their comment now, and the audit follows
+the file's `_locked` convention.
 
 ## 4. Checked and clean (do not "fix" these — they are deliberate)
 
@@ -75,7 +85,7 @@ judgement calls left to the maintainer (one of which is now implemented, §5.1).
 |---|---|---|
 | **J1** | clamp 1..3; the ring's 4..16 is not kept | `ggml_backend_cuda_transport_bufs()` clamps the override to the pipeline's own 1..3, in the one authority every consumer reads. |
 | **J2** | *measured first*: how likely is 256, and what does the fallback cost? | **Measured ceilings**: Flash-Next 144 stageable splits (48 layers × 3 roles), 122B-A10B 120 — i.e. 56 % of the old 256. **The fallback's cost**: a split past the cap is not in the list, so `pipe_k = -1` and its host weights take the plain whole-table upload on the compute stream — *the exactly-unstaged path this transport replaces*, i.e. those layers contribute nothing to the +17 % and pay a synchronous copy. Silent before. **Raised to 512** (2 KiB of stack in a frame that already had 1 KiB) and it now logs once when it fills, naming the graph's split count. |
-| **J3** | *quantify it*: is the O(n²) the pause you see at a drop? | **No — it is 0.02 % of it.** Measured with a temporary timer on the scan: **0.3 µs per call**, **146 µs cumulative** by the first drop and **197 µs** across the whole three-request sequence, against drop pauses of **~170-990 ms** (the first drop evicts 5.6 GiB and re-arms 144 tables; the second re-arms 78 in 168 ms). At 1000 tables it would be ~2 ms per drop, so a hash map was never warranted — and it is not needed at all: **`covered` IS the per-device resident figure `arena_bytes_delta` already keeps O(1)** (capacity = Σ slots × expert_bytes = the resident bytes), and the host total only changes when a table is **registered** (`g_tables` never shrinks). The scan is gone; the mirrors are O(1) per change. |
+| **J3** | *quantify it*: is the O(n²) the pause you see at a drop? | **No — it is 0.02 % of it.** Measured with a temporary timer on the scan: **0.3 µs per call**, **146 µs cumulative** by the first drop and **197 µs** across the whole three-request sequence, against drop pauses of **~170-990 ms** (the first drop evicts 5.6 GiB and re-arms 144 tables; the second re-arms 78 in 168 ms). At 1000 tables it would be ~2 ms per drop, so a hash map was never warranted — and it is not needed at all: **`covered` IS the per-device resident figure `arena_bytes_delta` already keeps O(1)** (capacity = Σ slots × expert_bytes = the resident bytes), and the host total only changes when a table is **registered** (`g_tables` never shrinks). The scan is gone; the mirrors are O(1) per change.  **It did double as a safety net**, though, and that came out of the maintainer's follow-up: every `t.slots` write is paired with `arena_bytes_delta` except `moe_cache_shrink_arena()` (caller-less today, kept for a future pressure release), where the scan re-derived `covered` from `t.slots` and so papered over the omission (it never fixed `g_arena_bytes`, which was already over-counted there). That path now calls the delta, and the **exit census re-derives both mirrors from the table set and warns on drift** (`residency_audit_locked`), so the invariant is checkable instead of trusted -- O(n) only when someone asks for the census. |
 | **J4** | rename `GGML_SCHED_PINGPONG_BUFS` → `GGML_SCHED_PIPELINE_BUFS`, and "wherever you see PINGPONG, PIPELINE" | `GGML_SCHED_PIPELINE_BUFS` (+ `GGML_SCHED_PINGPONG_BUFS`, the development name, and `GGML_SCHED_STAGE_SLOTS`, the ring's, as **deprecated aliases**) and `GGML_SCHED_PINGPONG` → `GGML_SCHED_PIPELINE`; every "ping-pong" in this campaign's code, logs, comments and identifiers is now "pipeline" (`sched_pipe_*`, `pipe_*`); the three unrelated upstream uses (`fattn-common.cuh`, `ggml-hexagon`) are untouched. **One parser**: the environment is read only in the CUDA backend's transport authority — the scheduler and the Meta backend read the answer through the existing `slab_ring_slots` hook (so a rename cannot leave a layer on an old spelling), and the free-VRAM rule now only caps a transport that is not slab-backed. |
 
 One further finding fell out of J4: the kill switch's comment claimed `GGML_SCHED_PINGPONG=0` "selects the ring for
@@ -92,6 +102,9 @@ upload). The comment now says that.
   `15 960.2 / 15 960.2 / 15 827.7` MiB, prefill 2224.6 t/s, `pipeline staging: 144 split(s), 2 buffer(s)`, and the
   selector reading `exposed 30513.2 MiB / 8192 tok at 28.6 GB/s = 136.3 us/tok vs 38.0 -> STAGE (cache band 16 tok)`
   (the band is printed — it was the dropped format argument).
+* The exit census reaches its summary (`MoE expert cache: h=0.8217 … tables=144, slots=28776, resident=15827.7 MiB`)
+  and the mirror audit reports **no drift**, so the O(1) accounting is verified on a real run, not just reasoned
+  about.
 * Builds with no warning from any file this change touches (the remaining `-Wmissing-field-initializers` hits are
   two pre-existing delivery ifaces, `moe_cache_prefill_stream` on cpu/rpc and `gtt_store_arena_min` on cpu/rpc,
   which are not this campaign's).

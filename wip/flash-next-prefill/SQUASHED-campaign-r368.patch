@@ -1,4 +1,4 @@
-From 8ed2ead6f2f8ebcc1d6bc0d810f1315cbcabcf6a Mon Sep 17 00:00:00 2001
+From 4b3e540176afa3c3c568a00a7a64f518a7d7dfb2 Mon Sep 17 00:00:00 2001
 From: stew675 <stew675@users.noreply.github.com>
 Date: Fri, 27 Nov 2026 07:29:39 -0600
 Subject: [PATCH] wip: flash-next-prefill, the whole campaign as ONE change
@@ -22,38 +22,45 @@ D1 probes kept default-off with their measurements.
 Reviewed as a squashed diff (wip/flash-next-prefill/REVIEW-squashed.md) with every finding fixed in this commit:
 two format-string bugs (a dropped argument in the transport-decision line, a %zu fed an int in the
 transport-exhaustion WARN), a Meta iface entry that was default-initialised instead of declared, the dead
-free-VRAM start-up sizing (function + field + its contradictory comment) and the ring-era per-split width sizing
-(both helpers and the table-ref scaling they carried), a stale Meta slot default, a duplicated forward
-declaration comment, and five comments/log lines that described the deleted decision or predicted a number the
-code did not set.  One behavioural fix: the pipeline now collects a split's stageable set BEFORE it touches the
-width gate, because that gate runs the one-off H2D calibration (a cudaMalloc probe that Windows does not get back,
-issue #97) and a dense or fully resident split must not ask for it.
+free-VRAM start-up sizing and the ring-era per-split width sizing, a stale Meta slot default, a duplicated
+forward-declaration comment, and five comments/log lines that described the deleted decision or predicted a number
+the code did not set.  One behavioural fix: the pipeline collects a split's stageable set BEFORE it touches the
+width gate, because that gate runs the one-off H2D calibration (a cudaMalloc probe Windows does not get back,
+issue #97).
 
-The review's four judgement calls, decided by the maintainer and implemented here:
+The review's four judgement calls, decided by the maintainer and implemented:
 
-  J1  the buffer-count override is clamped to the PIPELINE's own 1..3 (the ring's 8/16 sized the region for
-      buffers nothing could use).
-  J2  the per-graph split list is 512 entries (was 256) and says so once when it fills: past the cap those splits
-      take the serial upload -- the exactly-unstaged path this transport exists to replace -- and the old code was
-      silent about it.  Measured ceilings here: Flash-Next 144 (48 layers x 3 roles), 122B-A10B 120.
-  J3  the residency mirrors are O(1).  `covered` IS the per-device resident figure `arena_bytes_delta` already
-      keeps (capacity = sum(slots x expert_bytes) = the resident bytes), so it needs no mirror of its own, and the
-      host total only changes when a table is REGISTERED (`g_tables` never shrinks).  Measured before the change
-      with a temporary timer on the scan: 0.3 us per call, 146 us cumulative across the first drop and 197 us
-      across all three requests of the field sequence -- i.e. ~0.02 % of a drop's ~170-990 ms pause, so a hash map
-      was never warranted; the scan is simply gone.
-  J4  `GGML_SCHED_PINGPONG_BUFS` -> `GGML_SCHED_PIPELINE_BUFS` (deprecated aliases `GGML_SCHED_PINGPONG_BUFS`,
-      the development name, and `GGML_SCHED_STAGE_SLOTS`, the deleted ring's) and `GGML_SCHED_PINGPONG` ->
-      `GGML_SCHED_PIPELINE`; every "ping-pong" in this campaign's code, logs and identifiers is now "pipeline"
-      (`sched_pipe_*`, `pipe_*`).  The environment is parsed in ONE place (the CUDA backend's transport
-      authority): the scheduler and the Meta backend read the answer through the existing `slab_ring_slots` device
-      hook, so a rename cannot leave a layer on an old spelling.  The kill switch's comment now says what it does
-      (no staged transport at all -- the ring it used to select is deleted).
+  J1  the buffer-count override is clamped to the PIPELINE's own 1..3.
+  J2  the per-graph split list is 512 entries (was 256) and says so once when it fills (measured ceilings here:
+      Flash-Next 144, 122B-A10B 120).  Past the cap those splits take the serial upload -- the path this
+      transport exists to replace -- and the old code was silent about it.
+  J3  the residency mirrors are O(1): `covered` IS the per-device resident figure `arena_bytes_delta` already
+      keeps, and the host total only changes when a table is registered.  Measured the old scan before removing
+      it: 0.3 us per call, 146 us by the first drop and 197 us across the whole three-request sequence, against
+      ~170-990 ms drop pauses (so a hash map was never warranted).  Because that scan doubled as a SAFETY NET -- it
+      recomputed `covered` from `t.slots` -- two things came with the change: the one path that clears `t.slots`
+      without the accounting (`moe_cache_shrink_arena`, caller-less today, kept for a future pressure release) now
+      calls `arena_bytes_delta`, and the exit census re-derives both mirrors from the table set and warns on drift
+      (`residency_audit_locked`), so the invariant is checkable instead of trusted.
+  J4  `GGML_SCHED_PINGPONG_BUFS` -> `GGML_SCHED_PIPELINE_BUFS` and `GGML_SCHED_PINGPONG` ->
+      `GGML_SCHED_PIPELINE` (the old spellings plus the deleted ring's `GGML_SCHED_STAGE_SLOTS` are deprecated
+      aliases, read in ONE place -- the CUDA backend's authority, which the scheduler and Meta read through the
+      existing `slab_ring_slots` hook); every "ping-pong" in this campaign's code, logs and identifiers is now
+      "pipeline", and the three unrelated upstream uses are untouched.  The kill switch's comment now says what it
+      does (no staged transport at all -- the ring it used to select is gone).
 
-Verified after all of it: 1 GPU 89k greedy text 43d0b1f4629e on every run (2456-2485 t/s), and the field
-three-request sequence reproduces to the MiB -- decision `3 -> 2`, region 3412.5 -> 2275.0 MiB, carves 2304,
-arena after each drop 15 960.2 / 15 960.2 / 15 827.7 MiB, prefill 2224.6 t/s, selector reading
-`exposed 30513.2 MiB / 8192 tok at 28.6 GB/s = 136.3 us/tok vs 38.0 -> STAGE (cache band 16 tok)`.
+Two deadlocks of the same class were hit and fixed in this campaign, both "a function that takes g_mutex called
+from a context that already holds it": `moe_cache_host_pool_requested()` from inside `alloc_all_locked` (the first
+version of the residency rule re-requested the region through `slab_ring_region_bytes`), and an audit that took
+`g_mutex` from inside `report_locked()`.  Both are named at their call sites now, and both were caught by the
+server hanging -- the second one after answering every request, which is why the `_locked` convention is stated in
+the comment.
+
+Verified: 1 GPU 89k greedy text 43d0b1f4629e on every run (2456-2485 t/s); the field three-request sequence
+reproduces to the MiB (decision `3 -> 2`, region 3412.5 -> 2275.0 MiB, carves 2304, arena after each drop
+15 960.2 / 15 960.2 / 15 827.7 MiB, prefill 2224.6 t/s, selector `exposed 30513.2 MiB / 8192 tok at 28.6 GB/s =
+136.3 us/tok vs 38.0 -> STAGE (cache band 16 tok)`), the exit census reaches its summary and the mirror audit
+reports no drift.
 ---
  ggml/include/ggml-backend.h                   |  12 +-
  ggml/include/ggml-cuda.h                      |  15 +

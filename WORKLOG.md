@@ -16,6 +16,39 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.005 (r368, `wip/`) -- flash-next-prefill: J3's follow-up -- the removed scan WAS a safety net, so the hole is closed and the invariant is now verified
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  Squashed prototype
+`~/llama.cpp` `wip/prefill-slot-pingpong-squashed`, tip **`4b3e54017`**; record
+[`wip/flash-next-prefill/REVIEW-squashed.md`](wip/flash-next-prefill/REVIEW-squashed.md) §5 (J3) + §3.
+
+**The question (the maintainer's):** was that table scan ever active where the host experts are not fully resident
+(some on disk)?  **Yes, and the trigger is host-tier independent.**  The scan ran from `arena_bytes_delta`, i.e.
+whenever a *table's arena slot count* changed -- stand-down, alloc/grow, re-layout, evict, device move.  Those paths
+do not care where the host copy lives (VRAM-only, pinned pool, or the pool's disk tier that `pread`s into a vacated
+slot): the arena's slots are per table either way.  A low-residency shape runs them *more* often (measured: 486
+calls by the first drop on the 35.9 % field shape), at the same ~0.3 us/call, which is still 0.02 % of a drop -
+the pause is the evict/re-arm loop, not this.
+
+**What the scan was also doing.**  It recomputed `covered` from `t.slots`, so it was a **safety net** for the
+accounting, and one path needed it: `moe_cache_shrink_arena()` frees arenas and zeroes `t.slots` **without**
+`arena_bytes_delta`, so the scan self-healed the selector's figure there (it never fixed `g_arena_bytes`, which was
+already over-counted on that path).  That path is **caller-less today** ("currently unreferenced", kept deliberately
+for a future pressure release -- the file already argues that this is exactly why it must not be the path that
+forgets), so no run was ever mis-computed; but the O(1) change would have left its first future caller with a wrong
+`covered`.  Both halves are now closed: the shrink path calls the delta, and the **exit census re-derives both
+mirrors from the table set and warns on drift** (`residency_audit_locked`; O(n) only when the census is asked for,
+so the hot path stays O(1)).  The audit is the check the scan used to be, and it is verified clean on the field
+sequence (`h=0.8217 ... tables=144, slots=28776, resident=15827.7 MiB`, no drift).
+
+**Third instance of the campaign's favourite trap, recorded.**  The audit's first version took `g_mutex` from
+inside `report_locked()`, which already holds it: the server answered **all three requests** and then hung one line
+before the census.  The same class as `moe_cache_host_pool_requested()` from `alloc_all_locked` earlier today.  It
+is `residency_audit_locked` now, with the trap named in its comment.  Operational note for the next session: a
+process hung there ignores SIGTERM (needs `kill -9`) and its leftover holds ~25 GiB of VRAM, after which the next
+run fails at load with an OOM that looks like a brand-new defect -- check `pgrep -x llama-server` and the VRAM
+before believing a load failure.
+
 ## 261127.004 (r368, `wip/`) -- flash-next-prefill: the review's four judgement calls decided and implemented, and the transport is renamed to the PIPELINE
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  The squashed prototype is
