@@ -1,0 +1,13 @@
+# RX 7900 XTX (gfx1100), 1 GPU, ROCm 10.1 image rocm/dev-ubuntu-24.04:10.1.0-full
+# build: stew r366 e10879b0b3 + 0001 + 0002 (tree d3c8b209f5), -DAMDGPU_TARGETS=gfx1100
+# model: Qwen3.8-27B-NVFP4-MTP-HIGH.gguf (dense NVFP4 on MMB by default on gfx1100)
+# script: gfx1100-q38.sh (llama-bench -fa 1 -r 2 -p 512,2048 -n 0 -ub 512 -ctk q8_0 -ctv q8_0; then llama-server + depth2.py n=60 / n=650)
+perm=0             pp512          931.27 ± 4.19
+perm=0            pp2048          917.47 ± 0.94
+perm=1             pp512         1124.76 ± 2.21
+perm=1            pp2048         1107.68 ± 0.02
+perm=0 q38-0-60 n=60: prompt 2761 tok, gen 130, sha 56e22b304bce
+perm=0 q38-0-650 n=650: prompt 30297 tok, gen 121, sha 4744da2deff3
+perm=1 q38-1-60 n=60: prompt 2761 tok, gen 130, sha 56e22b304bce
+perm=1 q38-1-650 n=650: prompt 30297 tok, gen 121, sha 4744da2deff3
+# perm=0 = GGML_CUDA_MMB_FP4_PERM=0 (old path), perm=1 = default (0001 + 0002). No GPU faults.
