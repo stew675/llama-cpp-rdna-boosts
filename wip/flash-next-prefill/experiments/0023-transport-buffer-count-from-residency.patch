@@ -1,0 +1,795 @@
+From 7cd30601435ac198ecef7dae8c0b47162924ea27 Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 07:27:24 -0600
+Subject: [PATCH] wip: the transport buffer COUNT comes from the arena
+ RESIDENCY, not from free VRAM at startup
+
+Now that the ping-pong buffers are a carve INSIDE the slab (released at every prefill -> decode transition), the
+count is no longer a VRAM question at scheduler construction -- it is the trade the maintainer named: three
+buffers are ~2 % faster at prefill than two, but the third one's set (~1.1 GiB on the field GSQ shape) comes out
+of the DECODE arena, and on a shape whose arena cannot hold a good working/hot set that costs more decode than
+the prefill gains.
+
+The decision moves to the point where the arena is settled -- the "MoE expert cache (auto): arena X MiB of Y host
+experts (Z% residency)" line, where the slab has grown -- and uses the maintainer's rule, with one buffer of slack
+at each step because the marginal question is what the NEXT buffer leaves behind:
+
+  * arena left after TWO buffers   < 20 % of the host set  ->  1 buffer
+  * arena left after THREE buffers < 40 % of the host set  ->  2 buffers
+  * otherwise                                              ->  3 buffers
+
+The old startup decision is GONE, not shadowed: llama_context no longer multiplies anything by a depth.  It
+publishes the one thing only it knows -- ONE BUFFER's bytes (the largest host-weight split set, floored by the
+largest table, + 512 B) and the VRAM/4 cap -- through a new slab_set_ring_unit hook, and the backend DERIVES the
+request as "unit x depth", capped, in one place.  The depth has exactly one owner:
+ggml_backend_cuda_transport_bufs() (declared in ggml-cuda.h), driven by the residency rule and frozen after its
+first decision (a count that follows every arena re-size flaps, and a 1-buffer graph costs ~21 %).
+
+The generic layers keep no copy: the scheduler's ping-pong depth and the Meta backend's per-device ring depth both
+read it through the EXISTING generic slab_ring_slots device hook, so they cannot drift from the region the slab
+carved (they disagreed once already: 8 slots vs a 3-buffer region, and every staged input was refused).  The
+scheduler re-derives its depth per graph execution (the decision lands after it was constructed) and only falls
+back to the free-VRAM rule for a transport that is NOT slab-backed.  A changed request also drops an IDLE carve,
+so the first prefill of a process uses the decided depth instead of the provisional one (guarded on wide_armed: a
+live wide view sits above the region).
+
+Field GSQ server, three requests (645 / 71 816 / 239 tok), same build, 3 buffers (the control) vs the rule's 2:
+
+  decision      transport buffers: 3 -> 2 (arena 14 707.4 MiB = 35.9 % of 40 925.0 MiB; after 2 buffers 30.4 %,
+                after 3 27.6 %; thresholds 20 / 40) -> region request 3412.5 -> 2275.0 MiB, carve 3456 -> 2304
+  prefill       arena during the 71 816-token prefill 9199.8/9057.4/8915.1/8788.3 -> 10411.8/10305.7/10199.6/
+                10057.2 MiB resident (+1.2 GiB back to the hot set); prefill 2209.4 -> 2224.6 t/s (noise)
+  decode arena  16 049.9 -> 15 879.7 -> 15 576.0  becomes  15 960.2 -> 15 960.2 -> 15 827.7 MiB
+
+Campaign arm unchanged: 1 GPU 89k, 3 cycles, text 43d0b1f4629e on every run, prefill 2483.8 t/s (2493.7 before,
+spread 4.8 %).
+---
+ ggml/include/ggml-backend.h                   |   8 +
+ ggml/include/ggml-cuda.h                      |  15 ++
+ ggml/src/ggml-backend-impl.h                  |   1 +
+ ggml/src/ggml-backend-meta.cpp                |  58 +++++-
+ ggml/src/ggml-backend.cpp                     |  83 +++++++--
+ ggml/src/ggml-cpu/ggml-cpu.cpp                |   1 +
+ ggml/src/ggml-cuda/common.cuh                 |  19 +-
+ .../ggml-cuda/ggml-cuda-moe-cache-hooks.cuh   |   5 +
+ ggml/src/ggml-cuda/ggml-cuda-slab.cu          |  22 +++
+ ggml/src/ggml-cuda/ggml-cuda-vmm.h            |   5 +
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 167 +++++++++++++++++-
+ ggml/src/ggml-cuda/moe-expert-cache.cu        |  30 ++--
+ ggml/src/ggml-rpc/ggml-rpc.cpp                |   1 +
+ src/llama-context.cpp                         |  52 +++---
+ 14 files changed, 405 insertions(+), 62 deletions(-)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index cf57601f5..feb5354ee 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -167,6 +167,14 @@ extern "C" {
+     // `llama_context` from the ubatch and the host-expert device count.  Call before the slab is created.
+     // No-op for a backend without a slab.  `GGML_CUDA_SLAB_TRANSPORT_MIB` overrides it per GPU.
+     GGML_API void                  ggml_backend_dev_slab_set_ring_cap(ggml_backend_dev_t dev, size_t bytes);
++
++    // wip/flash-next-prefill (session 5): ONE transport buffer's bytes -- the largest host-weight split set the
++    // staged pipeline carries (or the one-table floor for a model that reports no per-layer mapping).  The
++    // transport region is `unit x the transport's DEPTH`, and the depth is NOT this layer's decision: it comes
++    // from the expert-cache residency rule (`ggml_backend_cuda_transport_bufs`, decided when the arena settles),
++    // so `llama_context` publishes the unit and the backend derives the request.  No-op for a backend without a
++    // slab / a transport region.
++    GGML_API void                  ggml_backend_dev_slab_set_ring_unit(ggml_backend_dev_t dev, size_t bytes);
+     // issue #164: whether this device's movable-boundary slab is enabled (armed for a host-expert model).
+     // The ring sizing warns about a too-small `GGML_CUDA_SLAB_TRANSPORT_MIB` only when the slab will use it.
+     GGML_API bool                  ggml_backend_dev_slab_enabled(ggml_backend_dev_t dev);
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 1cd81eeae..206ba6694 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -42,6 +42,21 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
+ 
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
+ 
++// wip/flash-next-prefill (session 5): the H2D transport's buffer COUNT -- how many host-weight sets the staging
++// pipeline holds.  ONE number, because the scheduler's ping-pong depth, this backend's stage slots and the slab's
++// transport region (and, through the `slab_ring_slots` device hook, the Meta backend's ring depth) must agree: a
++// region carved for fewer buffers than the pipeline uses makes `ggml_cuda_slab_arena_alloc_transient` refuse the
++// fills, and every staged input falls back to the scheduler's serial upload.
++//
++// It is chosen LATE, from the MoE expert cache's SETTLED arena (the residency rule in
++// `ggml_cuda_moe_transport_decide`), not from the free VRAM at startup: the buffers are a carve INSIDE the slab
++// now, so their cost is the decode hot set they take out of the arena.  `ggml_backend_cuda_transport_bufs_set`
++// is the only writer and ignores a second, different value (a count that follows every arena re-size flaps).
++// Both read `GGML_SCHED_PINGPONG_BUFS` (deprecated alias `GGML_SCHED_STAGE_SLOTS`) first -- a user override always
++// wins, and `set` then declines.
++GGML_BACKEND_API int  ggml_backend_cuda_transport_bufs(void);
++GGML_BACKEND_API void ggml_backend_cuda_transport_bufs_set(int n);
++
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index 8f3308cdb..a631db1a7 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -549,6 +549,7 @@ extern "C" {
+         // computed by `llama_context` from the ubatch and the host-expert device count.  The caller must set
+         // it BEFORE the slab is created.  Appended like the fields above.
+         void (*slab_set_ring_cap)(ggml_backend_dev_t dev, size_t bytes);
++        void (*slab_set_ring_unit)(ggml_backend_dev_t dev, size_t bytes);
+ 
+         // (optional) issue #164: whether this device's movable-boundary slab is enabled.  `llama_context`
+         // consults it before warning about a too-small `GGML_CUDA_SLAB_TRANSPORT_MIB`.  Appended like the fields
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 5d8e56e09..4b30a6cf4 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -340,6 +340,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+     /* .slab_compute_plain   = */ ggml_backend_meta_device_slab_compute_plain,
+     /* .slab_ring_region     = */ nullptr,
+     /* .slab_set_ring_cap    = */ nullptr,
++    /* .slab_set_ring_unit   = */ nullptr,
+     /* .slab_enabled         = */ nullptr,
+     /* .slab_ring_slots      = */ nullptr,
+     // The optional hooks appended to `ggml_backend_device_i` after the slab ones: the meta device owns no host
+@@ -3104,6 +3105,20 @@ static ggml_guid_t ggml_backend_meta_guid() {
+     return &guid;
+ }
+ 
++// wip/flash-next-prefill (session 5): how deep ONE device's H2D staging ring is, as that device reports it through
++// the generic `slab_ring_slots` hook -- the SAME number the slab carves the transport region for, so a ring slot
++// can never fail to fit (a slot that does not fit makes the whole input decline: that is what the old 8-vs-3
++// split did on every prompt).  0 when the device has no such hook (the pre-slab / cudaMalloc arm).
++//
++// The value can be LOWERED late -- the expert cache's residency rule runs after the context (and this backend)
++// exist -- so `stage_input` re-reads it per upload instead of trusting the construction-time copy.
++static int ggml_backend_meta_dev_bufs(ggml_backend_t simple_backend) {
++    if (simple_backend == nullptr) {
++        return 0;
++    }
++    return (int) ggml_backend_dev_slab_ring_slots(ggml_backend_get_device(simple_backend));
++}
++
+ struct ggml_backend_meta_context {
+     struct cgraph_config {
+         ggml_cgraph * cgraph_main = nullptr;
+@@ -3225,10 +3240,17 @@ struct ggml_backend_meta_context {
+         // 2 devices `-sm tensor`, `-ncmoe 48` pinned master, `-ub 2048`): startup ... and any prompt stalled
+         // ~20 s with the GPUs idle.  Same depth as the scheduler, one number, no drift.
+         {
+-            const char * pp_env   = GGML_ENV_STR("GGML_SCHED_PINGPONG_BUFS");
+-            const char * slot_env = GGML_ENV_STR("GGML_SCHED_STAGE_SLOTS");   // deprecated alias
+-            const char * slots_env = (pp_env != nullptr && pp_env[0] != '\0') ? pp_env : slot_env;
+-            stage_n_slots = slots_env != nullptr ? atoi(slots_env) : 3;
++            // wip/flash-next-prefill (session 5): the count is the transport's ONE number, read from the devices
++            // this split wraps through the generic `slab_ring_slots` hook (the same value the slab carves the
++            // transport region for).  It starts at 3 and may be LOWERED LATE by the expert cache's residency
++            // rule -- after this backend was constructed -- so the staging path re-reads it as well.
++            stage_n_slots = 3;
++            for (size_t j = 0; j < n_devs && j < simple_backends.size(); j++) {
++                const int v = ggml_backend_meta_dev_bufs(simple_backends[j]);
++                if (v > 0 && v < stage_n_slots) {
++                    stage_n_slots = v;   // the minimum: every device stages into its own ring
++                }
++            }
+             if (stage_n_slots < 1) {
+                 stage_n_slots = 1;
+             }
+@@ -3628,6 +3650,20 @@ static ggml_backend_event_t ggml_backend_meta_stage_ev(ggml_backend_meta_context
+     return evs[device][slot];
+ }
+ 
++// wip/flash-next-prefill (session 5): the transport's buffer count as this split's devices report it, or 3 (the
++// pre-decision default) when none has a slab-backed ring.
++static int ggml_backend_meta_transport_bufs(ggml_backend_t meta_backend) {
++    const size_t n_backends = ggml_backend_meta_n_backends(meta_backend);
++    int n = 0;
++    for (size_t j = 0; j < n_backends; j++) {
++        const int v = ggml_backend_meta_dev_bufs(ggml_backend_meta_simple_backend(meta_backend, j));
++        if (v > 0 && (n == 0 || v < n)) {
++            n = v;
++        }
++    }
++    return n > 0 ? n : 3;
++}
++
+ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor * input, ggml_tensor * input_cpy) {
+     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+@@ -3664,6 +3700,20 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor *
+     }
+     const size_t n_chunks = gather ? size / chunk_size_full : 0;
+ 
++    // wip/flash-next-prefill (session 5): follow the transport's one number.  The residency rule that picks the
++    // count runs when the expert cache's arena settles, i.e. AFTER this backend was constructed, and it only
++    // ever LOWERS the depth (from the default 3), so the ring's event vectors -- sized at construction -- stay
++    // large enough and the per-device region keeps fitting its slots.
++    {
++        const int pp_now = ggml_backend_meta_transport_bufs(backend);
++        if (pp_now > 0 && pp_now < backend_ctx->stage_n_slots) {
++            backend_ctx->stage_n_slots = pp_now;
++            if (backend_ctx->stage_slot_next >= backend_ctx->stage_n_slots) {
++                backend_ctx->stage_slot_next = 0;
++            }
++        }
++    }
++
+     const int slot = backend_ctx->stage_slot_next;
+     backend_ctx->stage_slot_next = (backend_ctx->stage_slot_next + 1) % backend_ctx->stage_n_slots;
+ 
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 441afef03..7f4735919 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -480,9 +480,22 @@ bool ggml_backend_dev_slab_enabled(ggml_backend_dev_t dev) {
+     return dev->iface.slab_enabled(dev);
+ }
+ 
++void ggml_backend_dev_slab_set_ring_unit(ggml_backend_dev_t dev, size_t bytes) {
++    // wip/flash-next-prefill (session 5): one transport buffer's bytes.  Optional hook.
++    if (dev == nullptr || dev->iface.slab_set_ring_unit == nullptr) {
++        return;
++    }
++    dev->iface.slab_set_ring_unit(dev, bytes);
++}
++
+ size_t ggml_backend_dev_slab_ring_slots(ggml_backend_dev_t dev) {
+     // issue #164: the ring depth, so the context can size the ring region for one staged table per slot.
+     // Optional hook; 0 means "unknown" and the caller falls back to the default depth.
++    //
++    // wip/flash-next-prefill (session 5): this hook is ALSO how the generic layers read the transport's ONE
++    // buffer count without depending on the CUDA backend's header -- the scheduler's ping-pong depth and the
++    // Meta backend's per-device ring depth both take it from here, so they cannot drift from the region the
++    // slab carved (they disagreed once: 8 slots against a 3-buffer region, and every staged input was refused).
+     if (dev == nullptr || dev->iface.slab_ring_slots == nullptr) {
+         return 0;
+     }
+@@ -2857,12 +2870,21 @@ static double sched_pp_startup_free_gib(ggml_backend_sched_t sched) {
+     return (double) min_free / (1024.0 * 1024.0 * 1024.0);
+ }
+ 
+-static int sched_pp_choose_bufs(ggml_backend_sched_t sched) {
+-    const char * e = GGML_ENV_STR("GGML_SCHED_PINGPONG_BUFS");
+-    if (e != nullptr && e[0] != '\0') {
+-        const int nb = atoi(e);
+-        return nb < 1 ? 1 : (nb > 3 ? 3 : nb);
+-    }
++// The buffer COUNT.  wip/flash-next-prefill (session 5, the maintainer's change request): it is NOT chosen
++// from the device's free VRAM any more.  The buffers moved INSIDE the slab (the transport region is a carve in
++// the slab's work band, released at every prefill -> decode transition), so their real cost is the hot set they
++// take away from the DECODE arena -- and the free-VRAM figure at scheduler construction knows nothing about the
++// arena, which is sized later (`MoE expert cache (auto): arena ... residency`).  Three buffers are ~2 % faster
++// at prefill than two, but the third one's set hurts decode badly when the arena cannot hold a good working set.
++//
++// So: the number comes from the RESIDENCY RULE in the backend that owns the slab
++// (`ggml_cuda_moe_transport_decide`, run when the expert cache's arena settles), read through the existing
++// generic device hook (`slab_ring_slots`, which the CUDA backend answers with its own decided count) so this
++// layer keeps no copy of it -- the SAME number sizes the transport region and the Meta backend's ring depth.
++// This function only chooses the FALLBACK for a transport that is not slab-backed (plain `cudaMalloc` slots),
++// where the budget still is free VRAM at startup.  `GGML_SCHED_PINGPONG_BUFS=1|2|3` always wins (A/B and
++// bisection).
++static int sched_pp_free_vram_rule(ggml_backend_sched_t sched) {
+     size_t min_free = 0;    // the SMALLEST free figure: on a split each device owns its own buffers
+     for (int b = 0; b < sched->n_backends; b++) {
+         ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+@@ -2886,6 +2908,32 @@ static int sched_pp_choose_bufs(ggml_backend_sched_t sched) {
+     return 3;
+ }
+ 
++static int sched_pp_choose_bufs(ggml_backend_sched_t sched) {
++    const char * e = GGML_ENV_STR("GGML_SCHED_PINGPONG_BUFS");
++    if (e != nullptr && e[0] != '\0') {
++        const int nb = atoi(e);
++        return nb < 1 ? 1 : (nb > 3 ? 3 : nb);
++    }
++    // A slab-backed transport owns the number (its region is carved for exactly this many buffers, so a
++    // disagreement is not a slower run, it is a refused fill: `ggml_cuda_slab_arena_alloc_transient` refuses
++    // what the region was not sized for, and every staged input falls back to the serial upload).
++    int slab_depth = 0;
++    for (int b = 0; b < sched->n_backends; b++) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
++        if (dev == NULL || !ggml_backend_dev_slab_enabled(dev)) {
++            continue;
++        }
++        const int n = (int) ggml_backend_dev_slab_ring_slots(dev);
++        if (n > 0 && (slab_depth == 0 || n < slab_depth)) {
++            slab_depth = n;   // the MINIMUM: on a split every staged device must own a slot
++        }
++    }
++    if (slab_depth > 0) {
++        return slab_depth > 3 ? 3 : slab_depth;
++    }
++    return sched_pp_free_vram_rule(sched);
++}
++
+ // Does this split carry a host-resident weight that would be STAGED (a gatherable input is left to the gather)?
+ static int sched_pp_split_set(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
+                               size_t * bytes) {
+@@ -3904,22 +3952,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         // fill every buffer with its first set: with N buffers that is the first N host splits, so split 0 can
+         // compute while the other N-1 sets stream in (N = 2 is the ping-pong, N = 3 adds the extra stage you
+         // asked for: the fill for k+2 is still running while k+1 computes).
++        //
++        // wip/flash-next-prefill (session 5): the depth is RE-DERIVED here, because the number it depends on
++        // arrives after this scheduler was built -- the residency rule reads the expert cache's arena, which is
++        // sized at first use.  Only while no buffer is held, so a shrink can never strand one.
++        if (!sched->pp_held) {
++            const int nb = sched_pp_choose_bufs(sched);
++            if (nb > 0 && nb != sched->pp_n_buf) {
++                sched->pp_n_buf = nb;
++            }
++        }
+         for (int b = 0; b < sched->pp_n_buf && b < pp_n_host; b++) {
+             sched_pp_issue(sched, &splits[pp_host[b]], b);
+         }
+         if (pp_n_host > 0) {
+-            // Log on CHANGE, not once: the depth is re-chosen per graph execution (the first graph runs while the
+-            // slab has VRAM at its tightest, so it may legitimately pick a smaller pipeline and grow later), and a
+-            // one-shot line printed only the first choice -- which read as "this run used 1 buffer" when it did
+-            // not.  A depth the user forced (GGML_SCHED_PINGPONG_BUFS) never changes.
++            // Log on CHANGE, not once: the depth is re-derived per graph execution (the first graph runs while
++            // the slab has VRAM at its tightest, and the residency decision that settles the arena lands after
++            // the scheduler exists), and a one-shot line printed only the first choice -- which read as "this
++            // run used 1 buffer" when it did not.  A depth the user forced never changes.
+             static int logged_n = -1;
+             if (sched->pp_n_buf != logged_n) {
+                 logged_n = sched->pp_n_buf;
+                 GGML_LOG_INFO("%s: ping-pong staging: %d host-weight split(s), %d buffer(s) of %.1f MiB "
+-                              "(the largest set, sized once; %.1f GiB free at startup -> fixed)\n",
++                              "(the largest set, sized once; %s)\n",
+                               __func__, pp_n_host, sched->pp_n_buf,
+                               (double) sched->pp_size / (1024.0 * 1024.0),
+-                              sched->pp_free_gib);
++                              GGML_ENV_STR("GGML_SCHED_PINGPONG_BUFS") != nullptr ?
++                                  "forced by GGML_SCHED_PINGPONG_BUFS" : "the expert-cache residency rule");
+             }
+         }
+     }
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index af0dfefa2..e8dbf7b87 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -727,6 +727,7 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
+     /* .slab_compute_plain   = */ nullptr,
+     /* .slab_ring_region     = */ nullptr,
+     /* .slab_set_ring_cap    = */ nullptr,
++    /* .slab_set_ring_unit   = */ nullptr,
+     /* .slab_enabled         = */ nullptr,
+     /* .slab_ring_slots      = */ nullptr,
+     /* .moe_host_master_buft      = */ nullptr,
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index b9c4cf149..ab3b434b7 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -2406,17 +2406,14 @@ struct ggml_backend_cuda_context {
+     // carved for a ~3.4 GiB need on the 89k Flash-Next shape.  `GGML_SCHED_STAGE_SLOTS` is still honoured as a
+     // deprecated alias (A/B and bisection).
+     static int h2d_stage_slots() {
+-        static const int n = []() {
+-            const char * e = getenv("GGML_SCHED_PINGPONG_BUFS");
+-            if (e == nullptr || e[0] == '\0') {
+-                e = getenv("GGML_SCHED_STAGE_SLOTS");   // deprecated alias
+-            }
+-            int v = e ? atoi(e) : 3;
+-            if (v < 1) v = 1;
+-            if (v > H2D_STAGE_SLOTS) v = H2D_STAGE_SLOTS;
+-            return v;
+-        }();
+-        return n;
++        // wip/flash-next-prefill (session 5): the ONE process-wide count (`ggml_backend_cuda_transport_bufs`) --
++        // the scheduler's ping-pong depth, this backend's stage array and the slab's transport region follow the
++        // SAME number, and it is decided LATE from the expert cache's settled arena (the residency rule in
++        // `ggml_cuda_moe_transport_decide`) instead of from free VRAM at startup.  Read at USE time: the decision
++        // lands after the scheduler and the slab exist, so a cached copy would be the old one.
++        // `GGML_SCHED_PINGPONG_BUFS` (deprecated alias `GGML_SCHED_STAGE_SLOTS`) still wins.
++        const int n = ggml_backend_cuda_transport_bufs();
++        return n < 1 ? 1 : (n > H2D_STAGE_SLOTS ? H2D_STAGE_SLOTS : n);
+     }
+ 
+     // Explicit budget from GGML_SCHED_STAGE_MAX_MB (MiB), or 0 when unset (auto-sized).
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
+index 9c58ae08c..a29954679 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
++++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
+@@ -21,6 +21,11 @@ float  ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend);
+ // backend handle) so a link-dependent policy can read the DEVICE's own link.  Returns the cached value once the
+ // scheduler has calibrated; 0.0 when it has not run yet (callers must treat 0 as "unknown", not "slow").
+ float  ggml_cuda_device_h2d_gbps(int device);
++// wip/flash-next-prefill (session 5): choose the H2D transport's buffer COUNT from the expert cache's SETTLED
++// arena (`arena_bytes` = the arena this run got, `host_bytes` = the host expert set it serves).  Called from the
++// cache's deferred sizing, i.e. after the slab has grown and the arena is settled; it applies the residency rule,
++// freezes the count through `ggml_backend_cuda_transport_bufs_set` and re-requests the slab's transport region for it.
++void   ggml_cuda_moe_transport_decide(int64_t arena_bytes, int64_t host_total_bytes);
+ bool   ggml_backend_cuda_moe_cache_update(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis, const struct ggml_backend_moe_slice * slices, int n_slices);
+ bool   ggml_backend_cuda_moe_cache_take_over(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, int64_t n_tok);
+ bool   ggml_backend_cuda_moe_cache_in_place(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, int64_t n_tok);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index 742e2f704..7c4371576 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -306,7 +306,29 @@ static bool ggml_cuda_slab_narrow2_enabled() {
+ static size_t g_slab_ring_region_bytes = 0;
+ static size_t ggml_cuda_slab_up(size_t x, size_t a);   // defined below (used by the ring-floor pin)
+ void ggml_cuda_slab_set_ring_region(size_t bytes) {
++    if (bytes == g_slab_ring_region_bytes) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_slab_mutex);
+     g_slab_ring_region_bytes = bytes;
++    // wip/flash-next-prefill (session 5): the request is derived from the transport's DEPTH, and the depth is
++    // chosen when the expert cache's arena settles -- which can be after a carve already happened (the warmup
++    // carves at the provisional depth).  A carve that is IDLE (nothing staged, no wide view placed above it) is
++    // therefore dropped here, so the next wide view re-carves at the decided size instead of the provisional one.
++    // Guarded on `wide_armed` because a live wide view sits ABOVE the region: moving the region under it would
++    // move the view.
++    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
++        ggml_cuda_slab & s = g_slabs[d];
++        if (s.inited && !s.wide_armed && s.ring_used == 0 && s.ring_region != 0) {
++            s.ring_region = 0;
++        }
++    }
++}
++
++// wip/flash-next-prefill (session 5): the region this slab was last ASKED for.  One buffer's bytes is this over
++// the depth, which is how the maintainer's residency rule prices a buffer (see `ggml_cuda_moe_transport_decide`).
++size_t ggml_cuda_slab_ring_request(void) {
++    return g_slab_ring_region_bytes;
+ }
+ 
+ // wip/flash-next-prefill (session 5): the unit a decode/verify COMPUTE-band raise actually moves in -- the
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm.h b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+index c56bce67e..85db1325a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm.h
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+@@ -87,6 +87,11 @@ size_t ggml_cuda_slab_ring_slot_capacity(int device);
+ // The ring hole's reserved size (0 when the slab carved none): `llama_context` uses it to skip the
+ // narrow -> wide compute-buffer drop when there is no ring to arm.  wip/slab-ring-region (issue #164).
+ size_t ggml_cuda_slab_ring_region(int device);
++// wip/flash-next-prefill (session 5): the region the slab was last ASKED for (`g_slab_ring_region_bytes`), i.e.
++// `depth x (largest staged set + 512)` as the context capped it.  Divided by the depth it is ONE BUFFER's bytes --
++// which is what the maintainer's residency rule needs, and taking it from the request (not from a fresh formula)
++// keeps the rule and the carve from disagreeing about what a buffer costs.
++size_t ggml_cuda_slab_ring_request(void);
+ // wip/slab-transient-absorption (F5, step 0): was the ring hole REQUESTED for this model?  The ring
+ // fallback is refused only when it was (an operator can still leave the ring outside the slab with
+ // GGML_CUDA_SLAB_TRANSPORT_MIB=0, which is the pre-slab behaviour).
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 170f1a7a2..dfef364a4 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -12108,6 +12108,69 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+ // (same value, same precedence) so an existing script or a bisect arm keeps working; nothing new should set it.
+ static size_t g_h2d_ring_cap_bytes = 0;
+ static size_t g_ring_max_table    = 0;
++// wip/flash-next-prefill (session 5): ONE transport buffer's bytes, published by `llama_context`
++// (`slab_set_ring_unit`).  The region request is DERIVED from it -- `unit x depth`, capped -- so the depth has
++// exactly one owner and no layer re-derives the other's half of the number.  0 = the context did not size a unit
++// (a pre-context preflight, or an explicit `GGML_CUDA_SLAB_TRANSPORT_MIB`, which wins verbatim).
++static size_t g_transport_unit_bytes = 0;
++
++// wip/flash-next-prefill (session 5): the H2D transport's buffer COUNT -- the backend's own number (declared in
++// `ggml-cuda.h`, so the CUDA layer reads it without pulling `ggml-backend.h` into `common.cuh`).  The generic
++// layers do not call it: they read it through the existing `slab_ring_slots` device hook, which returns it, so
++// the scheduler's ping-pong depth, this backend's stage slots + the slab's transport region and the Meta
++// backend's per-device ring depth cannot drift apart.
++//
++// Precedence: `GGML_SCHED_PINGPONG_BUFS` (deprecated alias `GGML_SCHED_STAGE_SLOTS`), then the LATE residency
++// decision (`ggml_backend_cuda_transport_bufs_set`, taken when the expert cache's arena settles), then 3.
++static int g_transport_bufs_env     = -2;  // -2 = not read yet, -1 = unset, >0 = the override
++static int g_transport_bufs_decided = 0;   // 0 = not decided yet
++
++static int ggml_cuda_transport_bufs_env(void) {
++    if (g_transport_bufs_env != -2) {
++        return g_transport_bufs_env;
++    }
++    const char * e = getenv("GGML_SCHED_PINGPONG_BUFS");
++    if (e == nullptr || e[0] == '\0') {
++        e = getenv("GGML_SCHED_STAGE_SLOTS");   // deprecated alias
++    }
++    int v = (e != nullptr && e[0] != '\0') ? atoi(e) : -1;
++    if (v < 1) {
++        v = -1;
++    } else if (v > 16) {
++        v = 16;
++    }
++    g_transport_bufs_env = v;
++    return v;
++}
++
++int ggml_backend_cuda_transport_bufs(void) {
++    const int env = ggml_cuda_transport_bufs_env();
++    if (env > 0) {
++        return env;
++    }
++    return g_transport_bufs_decided > 0 ? g_transport_bufs_decided : 3;
++}
++
++void ggml_backend_cuda_transport_bufs_set(int n) {
++    const int env = ggml_cuda_transport_bufs_env();
++    if (env > 0) {
++        GGML_LOG_INFO("%s: the transport's buffer count is pinned at %d by GGML_SCHED_PINGPONG_BUFS; the "
++                      "residency rule's answer (%d) is not applied\n", __func__, env, n);
++        return;
++    }
++    const int v = n < 1 ? 1 : (n > 3 ? 3 : n);   // the ping-pong's own range (its buffer arrays are [4])
++    if (g_transport_bufs_decided != 0) {
++        // Decided ONCE.  A count that follows every arena re-size flaps (measured before: 1 on the priming
++        // pass, 3 once the slab settled, then 1 again, and every 1-buffer graph costs ~21 %), so a later
++        // disagreement is reported and ignored.
++        if (v != g_transport_bufs_decided) {
++            GGML_LOG_INFO("%s: the transport's buffer count is already decided as %d; keeping it (a later call "
++                          "wants %d)\n", __func__, g_transport_bufs_decided, v);
++        }
++        return;
++    }
++    g_transport_bufs_decided = v;
++}
+ 
+ // The explicit override, whichever spelling set it (new name first), or nullptr.
+ static const char * h2d_transport_mib_env() {
+@@ -12130,6 +12193,25 @@ void ggml_cuda_h2d_ring_cap_set(size_t bytes) {
+     g_h2d_ring_cap_bytes = bytes;
+ }
+ 
++// wip/flash-next-prefill (session 5): DERIVE the transport region's request -- one buffer's bytes times the
++// transport's DEPTH, capped -- and publish it to the slab.  This is the ONLY place the two halves are combined:
++// the context publishes the unit (it knows the model's largest split set), the residency rule publishes the
++// depth (it knows the arena), and neither multiplies by a number it does not own.  An explicit
++// `GGML_CUDA_SLAB_TRANSPORT_MIB` owns the region outright, so nothing is derived then.
++static void ggml_cuda_transport_region_request(void) {
++    if (h2d_transport_mib_env() != nullptr || g_transport_unit_bytes == 0) {
++        return;
++    }
++    size_t want = g_transport_unit_bytes * (size_t) ggml_backend_cuda_transport_bufs();
++    const size_t cap = ggml_cuda_h2d_ring_cap_bytes();
++    if (cap > 0 && want > cap) {
++        want = cap;
++    }
++    // `ggml_cuda_slab_set_ring_region` drops an IDLE carve when the value changes, so the first prefill of a
++    // process uses the depth the residency rule settled on instead of the provisional one.
++    ggml_cuda_slab_set_ring_region(want);
++}
++
+ // r362 (issue #368): bytes the movable-boundary slab should reserve for the whole-table H2D staging ring.
+ //
+ // On the loader's POOL tier (`--host-experts pool`, or an `-lme` budget that resolves to the per-expert
+@@ -12173,6 +12255,76 @@ static size_t slab_ring_region_bytes(size_t max_host_table) {
+     return ggml_backend_cuda_context::h2d_stage_region_bytes(max_host_table);
+ }
+ 
++// wip/flash-next-prefill (session 5, the maintainer's change request): choose the H2D transport's buffer COUNT
++// from the expert cache's SETTLED ARENA instead of the free VRAM at startup.
++//
++// The buffers used to be sized from whatever VRAM happened to be free at scheduler construction, which knows
++// nothing about the arena the run actually gets.  They are a carve INSIDE the slab now (`transport region`), so
++// the real trade is PREFILL overlap against the DECODE arena: three buffers are ~2 % faster at prefill than two,
++// but the third one's set comes out of the arena, and on a shape whose arena cannot hold a good working/hot set
++// that costs more decode than the prefill gains.  Hence, once the slab has grown and the arena is settled (the
++// `MoE expert cache (auto): arena ... residency` line is the moment), the maintainer's rule -- with one buffer of
++// slack at each step, because the marginal question is always "what does the NEXT buffer leave behind":
++//
++//   * the arena left after TWO buffers holds < 20 % of the host set  ->  1 buffer
++//   * the arena left after THREE buffers holds < 40 % of the host set  ->  2 buffers
++//   * otherwise                                                         ->  3 buffers
++//
++// One buffer's bytes are taken from the region the context actually requested (`ggml_cuda_slab_ring_request`)
++// divided by the current depth, so the rule and the carve cannot disagree about what a buffer costs.  The answer
++// is FROZEN (`ggml_backend_cuda_transport_bufs_set`) -- a count that follows every arena re-size flaps -- and the
++// is re-requested for it, which the next wide view re-carves.
++void ggml_cuda_moe_transport_decide(int64_t arena_bytes, int64_t host_total_bytes) {
++    if (arena_bytes <= 0 || host_total_bytes <= 0) {
++        return;
++    }
++    const int      cur    = ggml_backend_cuda_transport_bufs();
++    const size_t   region = ggml_cuda_slab_ring_request();
++    if (region == 0 || g_ring_max_table == 0) {
++        return;   // no transport region requested (staging off, or the cache keeps the whole host set)
++    }
++    // One buffer's bytes: what the context published when it can, else the carve itself over the current depth.
++    const size_t unit = g_transport_unit_bytes > 0 ? g_transport_unit_bytes
++                                                  : region / (size_t) (cur > 0 ? cur : 1);
++    if (unit == 0) {
++        return;
++    }
++    const auto res_after = [&](int n) -> double {
++        const int64_t left = arena_bytes - (int64_t) n * (int64_t) unit;
++        return left <= 0 ? 0.0 : 100.0 * (double) left / (double) host_total_bytes;
++    };
++    const double res_after_2 = res_after(2);
++    const double res_after_3 = res_after(3);
++    int n = 3;
++    if (res_after_3 < 40.0) {
++        n = 2;
++    }
++    if (res_after_2 < 20.0) {
++        n = 1;
++    }
++    ggml_backend_cuda_transport_bufs_set(n);
++    const int now = ggml_backend_cuda_transport_bufs();
++    GGML_LOG_INFO("%s: transport buffers: %d -> %d.  From the settled arena (%.1f MiB = %.1f %% of the %.1f MiB "
++                  "host set) and %.1f MiB per buffer: the arena left after 2 buffers holds %.1f %% (threshold "
++                  "20 %%), after 3 holds %.1f %% (threshold 40 %%); one buffer = %.1f %%, two = %.1f %%, three = "
++                  "%.1f %% residency.  The transport region becomes %.1f MiB (was %.1f MiB).\n",
++                  __func__, cur, now,
++                  (double) arena_bytes / 1048576.0, 100.0 * (double) arena_bytes / (double) host_total_bytes,
++                  (double) host_total_bytes / 1048576.0, (double) unit / 1048576.0,
++                  res_after_2, res_after_3, res_after(1), res_after(2), res_after(3),
++                  (double) (now * (int64_t) unit) / 1048576.0, (double) region / 1048576.0);
++    if (now != cur) {
++        // The region is `unit x depth`: re-derive it through the ONE helper (this runs under the cache mutex,
++        // so it must not go through `slab_ring_region_bytes`, which re-runs the zero-carve test and that takes
++        // the same mutex -- measured: the run stops dead at the census line).  A change also drops an idle carve,
++        // so the depth applies to the NEXT wide view rather than after the next prefill -> decode transition.
++        ggml_cuda_transport_region_request();
++        GGML_LOG_INFO("%s: transport region request re-derived for %d buffer(s): %.1f -> %.1f MiB\n",
++                      __func__, now, (double) region / 1048576.0,
++                      (double) ggml_cuda_slab_ring_request() / 1048576.0);
++    }
++}
++
+ static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes, size_t max_host_table_bytes) {
+     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+     const bool on = moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
+@@ -12448,7 +12600,19 @@ static void ggml_backend_cuda_device_slab_set_ring_cap(ggml_backend_dev_t dev, s
+     // the slab will carve.  Runs BEFORE the slab exists (context reserve), so the whole layout sees it.
+     GGML_UNUSED(dev);
+     ggml_cuda_h2d_ring_cap_set(bytes);
+-    ggml_cuda_slab_set_ring_region(slab_ring_region_bytes(g_ring_max_table));
++    if (g_transport_unit_bytes > 0) {
++        ggml_cuda_transport_region_request();   // the region is `unit x depth`, capped by this
++    } else {
++        ggml_cuda_slab_set_ring_region(slab_ring_region_bytes(g_ring_max_table));
++    }
++}
++
++static void ggml_backend_cuda_device_slab_set_ring_unit(ggml_backend_dev_t dev, size_t bytes) {
++    // wip/flash-next-prefill (session 5): ONE transport buffer's bytes, from `llama_context`.  The request is
++    // derived here (`unit x depth`), so publishing the unit is the whole API the depth's owner needs.
++    GGML_UNUSED(dev);
++    g_transport_unit_bytes = bytes;
++    ggml_cuda_transport_region_request();
+ }
+ 
+ static size_t ggml_backend_cuda_device_slab_headroom_bytes(ggml_backend_dev_t dev) {
+@@ -12546,6 +12710,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
+     /* .slab_compute_plain        = */ ggml_backend_cuda_device_slab_compute_plain,
+     /* .slab_ring_region          = */ ggml_backend_cuda_device_slab_ring_region,
+     /* .slab_set_ring_cap         = */ ggml_backend_cuda_device_slab_set_ring_cap,
++    /* .slab_set_ring_unit        = */ ggml_backend_cuda_device_slab_set_ring_unit,
+     /* .slab_enabled              = */ ggml_backend_cuda_device_slab_enabled,
+     /* .slab_ring_slots           = */ ggml_backend_cuda_device_slab_ring_slots,
+     /* .moe_host_master_buft      = */ ggml_backend_cuda_device_moe_host_master_buft,
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 234173149..2ec163bb3 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -7028,17 +7028,20 @@ void alloc_all_locked() {
+     // per-op path), which is ~8x slower than the cache-less run's fused path (measured: MIB=64 ->
+     // 4.3 t/s vs MIB=0 32.0).  Disabling here (before the first decode graph is built) leaves the run
+     // byte-identical to `MOE_EXPERT_CACHE_MIB=0`.
+-    if (g_auto) {
+-        int64_t planned = 0;
+-        int64_t host_total = 0;
+-        for (int d = 0; d <= max_dev; d++) {
+-            planned += (int64_t) slots_d[d] * dev_one_bytes[d];
+-        }
+-        for (const table_t & t : g_tables) {
+-            if (!t.allocated) {
+-                host_total += (int64_t) t.n_experts * (int64_t) t.expert_bytes;
+-            }
++    // The arena total and the host set this run actually got: the two numbers every residency decision below
++    // (and the census line) is stated in.  Session 5 needs them for a non-auto budget too, so they are summed
++    // before the `g_auto` branch.
++    int64_t planned    = 0;
++    int64_t host_total = 0;
++    for (int d = 0; d <= max_dev; d++) {
++        planned += (int64_t) slots_d[d] * dev_one_bytes[d];
++    }
++    for (const table_t & t : g_tables) {
++        if (!t.allocated) {
++            host_total += (int64_t) t.n_experts * (int64_t) t.expert_bytes;
+         }
++    }
++    if (g_auto) {
+         const int64_t floor_bytes = moe_cache_max_i64(
+             (int64_t) g_min_mib * 1024 * 1024,
+             (g_min_res_pct > 0 && host_total > 0) ? host_total * g_min_res_pct / 100 : (int64_t) 0);
+@@ -7069,6 +7072,13 @@ void alloc_all_locked() {
+         }
+     }
+ 
++    // wip/flash-next-prefill (session 5, the maintainer's change request): the H2D transport's buffer count is
++    // a trade of PREFILL overlap against the DECODE arena, so it is chosen HERE -- the first point where the
++    // slab has grown and the arena is settled -- from the residency above, not from the free VRAM at startup
++    // (which knows nothing about the arena).  The backend owns the rule and re-sizes the transport region from
++    // its answer (`ggml_cuda_moe_transport_decide`); the scheduler and the Meta ring follow the same number.
++    ggml_cuda_moe_transport_decide(planned, host_total);
++
+     // Layer-uniform slot count.  gate/up/down of one layer still share a slot count (an expert
+     // resident for gate must be resident for up and down, or the remap points a role at the wrong
+     // expert).  Under `-sm tensor` a layer's tables live on *several* devices, so the count must also
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 13c3ed786..84962b409 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -3208,6 +3208,7 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
+     /* .slab_compute_plain   = */ nullptr,
+     /* .slab_ring_region     = */ nullptr,
+     /* .slab_set_ring_cap    = */ nullptr,
++    /* .slab_set_ring_unit   = */ nullptr,
+     /* .slab_enabled         = */ nullptr,
+     /* .slab_ring_slots      = */ nullptr,
+     /* .moe_host_master_buft      = */ nullptr,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index b8add5cb2..6649db599 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1170,23 +1170,26 @@ llama_context::llama_context(
+             if (ring_env == nullptr) {
+                 const double n_stage = (double) model.moe_host_expert_bytes.size();
+                 if (n_stage > 0.0) {
+-                    // wip/flash-next-prefill (session 4, the sizing audit): size the transport region from what
+-                    // the PING-PONG actually holds -- `n_slots` buffers, each ONE split's host-weight set --
+-                    // instead of the throughput knee that was derived for the deleted 8-slot ring.  The old
+-                    // formula (1800/n + ub/(1.7 n^2)) reads 6618 MiB on the 89k Flash-Next shape where the
+-                    // buffers hold 3 x 1137.5 = 3412.5 MiB, so ~3.2 GiB of the work band was reserved for
+-                    // nothing and the arena could not have it (measured: 51 tables stood down at every prefill,
+-                    // r362).  `slice_floor` (one TABLE per slot) stays as a FLOOR: a set can never be smaller
+-                    // than its largest member, and it is also what a model that reports no per-layer mapping
+-                    // gets.  `GGML_CUDA_SLAB_TRANSPORT_MIB` still wins verbatim (see the branch below).
+-                    size_t ring_bytes = n_slots * (slice + 512);
++                    // wip/flash-next-prefill (session 4, the sizing audit / session 5, the depth split): the
++                    // transport region is `ONE BUFFER x the transport's DEPTH`, sized from what the ping-pong
++                    // actually holds -- one split's host-weight set -- instead of the throughput knee that was
++                    // derived for the deleted 8-slot ring (the old formula, 1800/n + ub/(1.7 n^2), reads 6618
++                    // MiB where the buffers hold 3412.5, so ~3.2 GiB of the work band was reserved for nothing
++                    // and the arena could not have it: 51 tables stood down per prefill, r362).
++                    //
++                    // This layer publishes the UNIT only (it is the only one that knows the model's largest
++                    // split set): the DEPTH is chosen from the expert-cache RESIDENCY once the arena settles
++                    // (`ggml_backend_cuda_transport_bufs`, results-session5), and the backend derives the
++                    // request as `unit x depth`.  Deciding the depth here as well would be a second, earlier
++                    // answer to the same question -- the one this change replaced.
+                     const size_t layer_set = model.max_host_expert_layer_bytes();
+-                    if (layer_set > 0) {
+-                        ring_bytes = n_slots * (layer_set + 512);
+-                    }
+-                    if (slice_floor > ring_bytes) {
+-                        ring_bytes = slice_floor;
++                    size_t unit = layer_set > 0 ? layer_set : slice;
++                    // A set can never be smaller than its largest member; a model that reports no per-layer
++                    // mapping keeps the one-TABLE floor.
++                    if (slice > 0 && unit < slice) {
++                        unit = slice;
+                     }
++                    unit += 512;
+                     size_t vram_cap = (size_t) -1;
+                     for (const auto & kv : model.moe_host_expert_bytes) {
+                         size_t free_b = 0, total_b = 0;
+@@ -1195,16 +1198,17 @@ llama_context::llama_context(
+                             vram_cap = std::min(vram_cap, total_b / 4);
+                         }
+                     }
+-                    if (vram_cap != (size_t) -1) {
+-                        ring_bytes = std::min(ring_bytes, vram_cap);
+-                    }
+-                    ggml_backend_dev_slab_set_ring_cap(stage_dev, ring_bytes);
++                    ggml_backend_dev_slab_set_ring_cap(stage_dev, vram_cap == (size_t) -1 ? 0 : vram_cap);
++                    ggml_backend_dev_slab_set_ring_unit(stage_dev, unit);
+                     // Say WHERE the number comes from: the transport region is a carve the user cannot see in
+-                    // the fit report, so the line names the buffers, the set and the floor (session 4).
+-                    LLAMA_LOG_INFO("%s: transport region: %zu MiB = %zu buffer(s) x (largest host-weight split "
+-                            "set %zu MiB + 512 B); one-table floor %zu MiB, VRAM/4 cap %s\n",
+-                            __func__, ring_bytes >> 20, n_slots, layer_set >> 20, slice_floor >> 20,
+-                            vram_cap == (size_t) -1 ? "n/a" : (std::to_string(vram_cap >> 20) + " MiB").c_str());
++                    // the fit report, so the line names one buffer, the set and the floor -- and says that the
++                    // depth (hence the region's size) is decided later, from the arena.
++                    LLAMA_LOG_INFO("%s: transport buffer: %zu MiB (largest host-weight split set %zu MiB + 512 B, "
++                            "one-table floor %zu MiB), VRAM/4 cap %s; the DEPTH is chosen from the expert-cache "
++                            "residency once the arena settles (%zu MiB at %zu buffers)\n",
++                            __func__, unit >> 20, layer_set >> 20, slice ? (slice + 512) >> 20 : 0,
++                            vram_cap == (size_t) -1 ? "n/a" : (std::to_string(vram_cap >> 20) + " MiB").c_str(),
++                            (unit * n_slots) >> 20, n_slots);
+                 }
+             } else if (slab_enabled && slice_floor > 0) {
+                 const size_t env_bytes = (size_t) atoll(ring_env) << 20;
+-- 
+2.56.1
+

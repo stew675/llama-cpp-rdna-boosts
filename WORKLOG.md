@@ -16,6 +16,49 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.002 (r368, `wip/`) -- flash-next-prefill: the transport buffer COUNT comes from the arena's RESIDENCY, and the startup decision that sized it is deleted
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  Prototype `~/llama.cpp`
+`wip/prefill-slot-pingpong-r368`, tip `7cd306014`, exported as
+`wip/flash-next-prefill/experiments/0023-transport-buffer-count-from-residency.patch`; the record is
+[`wip/flash-next-prefill/RESULTS-session5.md`](wip/flash-next-prefill/RESULTS-session5.md) §1b.
+
+**The change request (the maintainer's).**  Now that the ping-pong buffers are a carve INSIDE the slab (released at
+every prefill -> decode transition), the count is no longer a VRAM question at scheduler construction: it is the
+trade between prefill overlap and the DECODE arena.  Three buffers are ~2 % faster at prefill than two, but the
+third one's set (~1.1 GiB on the field GSQ shape) comes out of the arena, and where the arena cannot hold a good
+working/hot set that costs more decode than the prefill gains.  So the decision moves to the `MoE expert cache
+(auto): arena X MiB of Y MiB host experts (Z% residency)` line -- the first moment the slab has grown and the arena
+is settled -- with the maintainer's rule (one buffer of slack at each step, because the marginal question is what
+the NEXT buffer leaves behind): arena left after TWO buffers < 20 % of the host set -> 1 buffer; after THREE
+< 40 % -> 2; otherwise 3.
+
+**The old decision is deleted, not shadowed** (the maintainer's follow-up, and the right call): `llama_context` no
+longer multiplies anything by a depth.  It publishes the one thing only it knows -- ONE BUFFER's bytes (the largest
+host-weight split set, floored by the largest table, + 512 B) and the VRAM/4 cap -- through a new
+`slab_set_ring_unit` hook, and the backend DERIVES the request as `unit x depth`, capped, in one place.  The depth
+has exactly one owner, `ggml_backend_cuda_transport_bufs()` (`ggml-cuda.h`), driven by the residency rule and frozen
+after its first decision (a count that follows every arena re-size flaps; a 1-buffer graph costs ~21 %).  The
+generic layers keep no copy: the scheduler's ping-pong depth and the Meta backend's per-device ring depth read it
+through the EXISTING `slab_ring_slots` device hook, the scheduler re-derives per graph execution (the decision lands
+after it was constructed), a transport that is not slab-backed still gets the old free-VRAM rule, and a changed
+request drops an IDLE carve so the first prefill uses the decided depth.  `GGML_SCHED_PINGPONG_BUFS` still pins it
+for an A/B.
+
+**Measured** (field GSQ server, 645 / 71 816 / 239-token requests, same build, 3 buffers as the control): decision
+`3 -> 2` (arena 14 707.4 MiB = 35.9 % of 40 925.0; after 2 buffers 30.4 %, after 3 27.6 %), region 3412.5 -> **2275**
+MiB (carve 3456 -> 2304), expert residency during the 71k prefill 9199.8/9057.4/8915.1/8788.3 ->
+**10411.8/10305.7/10199.6/10057.2** MiB, arena after each drop 16 049.9 -> 15 879.7 -> 15 576.0 becomes
+**15 960.2 -> 15 960.2 -> 15 827.7** MiB, prefill 2209.4 -> 2224.6 t/s (noise).  The campaign shape is unchanged by
+design (it decides 3): 1 GPU 89k 3 cycles, text `43d0b1f4629e` on every run, 2483.8 t/s median against 2493.7 before
+(4.8 % spread), and `GGML_SCHED_PINGPONG_BUFS=1` still pins 1 buffer (`forced by ...`, 2025 t/s) -- the non-vacuity
+arm for the env escape hatch.
+
+**Trap recorded.**  The first version re-requested the region via `slab_ring_region_bytes()`, which re-runs the
+zero-carve env test, and THAT calls `moe_cache_host_pool_requested()`, which takes the expert cache's mutex that
+`alloc_all_locked` (the caller) already holds: the server stopped dead one line after the decision, with no host
+tier allocated.  The re-request now goes through the derived form only.
+
 ## 261127.001 (r368, `wip/`) -- flash-next-prefill session 5: the `transport_base` cushion closes the last field defect, and the campaign chain is re-based onto r368
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  The prototype is `~/llama.cpp`

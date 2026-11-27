@@ -20,6 +20,8 @@ still being deferred), and the re-base the delivery's r367/r368 made necessary.
 | 1 GPU 89k prefill, 3 rotated cycles, cushion vs `=0` | **2504.8 vs 2496.3 t/s** (pre-rebase) and **2493.7 vs 2437.4** (on r368) — neutral inside the 2-3 % bimodal spread; decode 37.5 vs 37.4; text `43d0b1f4629e` on every arm |
 | what the cushion costs | the dead band before the band learns its size: **512 MiB during the first (645-token) prefill, 256 during the second**, and **nothing** once the band has grown into it (the third drop's whole difference against the control is the +256 MiB band the decode view needs) |
 | re-base | campaign chain replayed **clean** on r368 (`git rebase --onto af7a57ba8 489810652`, 21 commits, no conflicts); rebuilt; text unchanged on gfx1201, prefill neutral, field sequence identical to the MiB |
+| **transport buffer COUNT** (the maintainer's change request, §1b) | chosen from the **arena residency** once the arena settles, not from free VRAM at startup; the old startup decision is **deleted**, not shadowed (the context publishes one buffer's bytes, the backend derives `unit x depth`) |
+| field GSQ, 3 buffers vs the rule's 2 | decision `3 -> 2`, region 3412 → **2275** MiB (carve 3456 → 2304); **+1.2 GiB** of expert residency during the 71k prefill; decode arena after each drop 16 050/15 880/15 576 → **15 960/15 960/15 828** MiB; prefill 2209 → 2225 t/s (noise) |
 | promotion ladder | **not climbed**: the gate list is in §4, and the block decision is the maintainer's and is asked, not taken |
 
 ## 1. `transport_base`: the cushion (handover §2.1, as specified)
@@ -73,6 +75,61 @@ size instead of guessing):
 Knob: **`GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS`** (default `2`; `0` = the pre-cushion layout, which is the
 A/B control *and* the kill switch).  It is a tuning value, so it is an `ENVIRONMENT.md` entry at promotion
 (§4).
+
+## 1b. The transport buffer COUNT: from the arena's residency (a change request, mid-session)
+
+The maintainer's call, and the reason for it: the buffers are a carve **inside** the slab now, so the count is no
+longer a VRAM question at scheduler construction -- it is the trade between prefill overlap and the **decode**
+arena.  Three buffers are ~2 % faster at prefill than two, but the third one's set (~1.1 GiB on the field GSQ
+shape) comes out of the arena, and where the arena cannot hold a good working/hot set that costs more decode than
+the prefill gains.
+
+The rule, as specified (one buffer of slack at each step, because the marginal question is what the NEXT buffer
+leaves behind):
+
+```
+arena left after TWO buffers   < 20 % of the host set  ->  1 buffer
+arena left after THREE buffers < 40 % of the host set  ->  2 buffers
+otherwise                                              ->  3 buffers
+```
+
+The decision point is the `MoE expert cache (auto): arena X MiB of Y MiB host experts (Z% residency)` line -- the
+first moment the slab has grown and the arena is settled.
+
+**The old startup decision is gone, not shadowed.**  `llama_context` no longer multiplies anything by a depth: it
+publishes the one thing only it knows, **one buffer's bytes** (the largest host-weight split set, floored by the
+largest table, + 512 B) and the VRAM/4 cap, through a new `slab_set_ring_unit` hook.  The backend derives the
+request as `unit x depth` in one place, and the depth has exactly one owner:
+`ggml_backend_cuda_transport_bufs()` (`ggml-cuda.h`), driven by the residency rule and **frozen** after its first
+decision (a count that follows every arena re-size flaps, and a 1-buffer graph costs ~21 %).  The generic layers
+keep no copy: the scheduler's ping-pong depth and the Meta backend's per-device ring depth both read it through
+the **existing** generic `slab_ring_slots` device hook (the same number the region is carved for), and the
+scheduler re-derives its depth per graph execution because the decision lands after it was constructed.  A
+changed request also drops an **idle** carve, so the first prefill of a process uses the decided depth instead of
+the provisional one.  `GGML_SCHED_PINGPONG_BUFS` still pins the count for an A/B.
+
+**Measured** (field GSQ server, the three-request sequence, same build):
+
+| | 3 buffers (the control, unchanged) | the rule's 2 |
+|---|---|---|
+| decision | — | `transport buffers: 3 -> 2` (arena 14 707.4 MiB = 35.9 % of 40 925.0; after 2 buffers 30.4 %, after 3 27.6 %) |
+| transport region | 3412.5 MiB (carve 3456) | **2275.0 MiB (carve 2304)** |
+| arena resident during the 71 816-token prefill | 9199.8 / 9057.4 / 8915.1 / 8788.3 | **10411.8 / 10305.7 / 10199.6 / 10057.2** |
+| prefill t/s | 2209.4 | 2224.6 |
+| arena after each drop | 16 049.9 -> 15 879.7 -> 15 576.0 | **15 960.2 -> 15 960.2 -> 15 827.7** |
+
+So the third buffer's ~1.05-1.2 GiB goes back to the hot set during the prefill and the decode arena ends
+~250 MiB larger, with no measurable prefill cost.  The campaign shape (1 GPU 89k) is **unchanged by design** -- it
+decides 3 (51.4 % residency) -- and reads `43d0b1f4629e` on all three cycles, 2483.8 t/s median (2493.7 before
+this change, 4.8 % spread).  Non-vacuity: `GGML_SCHED_PINGPONG_BUFS=1` on that shape still pins 1 buffer, prints
+`forced by GGML_SCHED_PINGPONG_BUFS` in the staging line and reads 2025 t/s -- i.e. the old free-VRAM default
+(3 there) is what the rule replaces, and the env escape hatch still works.
+
+One trap found while landing it, worth recording: the first version re-requested the region through
+`slab_ring_region_bytes()`, which re-runs the zero-carve env test, and **that** calls
+`moe_cache_host_pool_requested()` -- which takes the expert cache's mutex that `alloc_all_locked` (the caller)
+already holds.  The server stopped dead one line after the decision with no host tier allocated.  The re-request now
+goes through the derived `unit x depth` form only; the comment in `ggml_cuda_moe_transport_decide` says why.
 
 ## 2. Measurements
 
@@ -169,8 +226,10 @@ selector + the re-keyed zero-carve rule into **block 09**, the ping-pong replaci
 prototype-only), and the VMM pool's fail-soft growth into **block 10**.  `ENVIRONMENT.md`/`DIAGNOSTIC.md`
 entries are owed at that point for `GGML_SCHED_STAGE_SELECT`, `GGML_SCHED_STAGE_EXPOSE_US`,
 `GGML_SCHED_STAGE_SELECT_DEBUG`, `GGML_CUDA_SLAB_TRANSPORT_MIB` (+ the deprecated `_RING_MIB`),
-`GGML_CUDA_SLAB_TRANSPORT_FALLBACK`, `MOE_HOST_POOL_STAGE_BULK_GBPS` **and this session's
-`GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS`**.  This session asked; it did not cut anything.
+`GGML_CUDA_SLAB_TRANSPORT_FALLBACK`, `MOE_HOST_POOL_STAGE_BULK_GBPS`, this session's
+`GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS`, **plus a re-statement of `GGML_SCHED_PINGPONG_BUFS`** (it is now an
+override of the residency rule, not of a free-VRAM rule) and of the "transport buffer"/"transport region" pair the
+buffer count now divides.  This session asked; it did not cut anything.
 
 Still open from session 4, unchanged:
 
