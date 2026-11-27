@@ -16,6 +16,44 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.017 (r368, `wip/`) -- flash-next-prefill: the promotion ladder is GREEN and STOPPED at the block fold -- the maintainer chose the C fold (split by territory) in a FRESH session
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push, no tag.  The campaign tip is
+**`a666f8637`** (patch 5327 lines / 18 files).  **The maintainer approved promotion** ("finally ready"), and the
+ladder was run on the candidate against the delivery tip:
+
+**Green** (numbers in `RESULTS-session7.md`, `REVIEW-squashed.md` §10-§12): `gate-prefill-logits` on **three** points
+-- dense canonical (KLD `0.000000`, top-p 100 %), host-expert 1-GPU pool `-ncmoe 48 -ub 8192` (KLD `-0.000000`,
+top-p 100 %; its base was re-recorded from `af7a57ba8` because the old one was campaign-era), and host-expert 2-device
+`-sm tensor` at 40 % coverage (KLD `-0.000000`, top-p 100 %); `gate-host-pool` **59/59**; `gate-kv-residency` PASS;
+`gate-fused-probe-splits` PASS; `gate-moe-promise` PASS 3/4; `check-shlib-symbols` PASS on **both** the VMM and the
+`GGML_HIP_NO_VMM=ON` build.
+
+**Two gate findings to record, not fix here**: `gate-fused-probe-splits`' `SPLITS_MAX` bound (1) is meaningless for a
+`-ncmoe` arm -- a host-expert graph reads **144** splits *on the delivery tip too*, so the bound must be derived from
+the arm (it passed at `SPLITS_MAX=200`, worst 147); and `gate-moe-promise`'s `MOE_EXPERT_TAKEOVER_FAULT=1` arm
+**aborted once** (exit 134) and did not reproduce in three re-runs (byte-identical text each time, log lost because the
+gate defaults to `mktemp`).  The maintainer accepted both: record, proceed.
+
+**The block fold is the blocker, and it is measured.**  The campaign is written against the tip and spans five
+blocks' territory: un-applying the later blocks on top of the campaign tree (with `git revert --no-commit`, not
+`git apply -R`, which cascades) conflicts in **block 11: 16 files, 12: 20, 13: 3, 14: 4, 15: 7** (16, 17 and 0300
+un-apply cleanly).  So a one-block amendment into the slab block would need ~30 manual resolutions and lands the
+campaign in a block whose own later layers still re-add their content.  **The maintainer chose C**: distribute the
+campaign's hunks by TERRITORY (scheduler/pipeline/selector + Meta transport + the cache's residency mirrors -> block
+**09**; slab / transport region / cushion / depth / VMM fail-soft -> block **10**; CPU/RPC iface rows + hooks ->
+block **12**), **in a fresh session** (this one is deep into its context budget), with one acceptance command: the
+promoted set must produce the tree of `a666f8637` byte for byte.
+
+**Left running for session 8 (chained, no idle GPU):** the **MTP four-axis** protocol (mandatory for this campaign --
+it alters the buffers MTP runs on) as two chained arms -- candidate now, base (`/tmp/base-wt/build-rocm-base`) behind
+it -- into `wip/flash-next-prefill/runs/mtp4-{cand,base}/summary.tsv`; and the **remote sanity builds** on
+`fingon` (gfx1100) and `halo` (gfx1151), reference and candidate in separate `BUILD_DIR`s.  Both boxes have **no
+GitHub SSH key** -- they fetch over HTTPS.  **A fresh session starts at
+[`HANDOVER-session8.md`](wip/flash-next-prefill/HANDOVER-session8.md)**: the C fold method and its acceptance test,
+the cut (`make-patches`/`make-release`/`validate-set`/`check-rung-file-sets`), the doc list (with the retirement of
+`MOE_HOST_POOL_STAGE_STANDDOWN` and `moe_cache_stage_ready`), the remote sanity, then tag + fork refresh + containers.
+
 ## 261127.016 (r368, `wip/`) -- flash-next-prefill: the tensor-split transport is BYTE-IDENTICAL to the gather on clean text, and the `-lv 4` hash trap that faked a divergence
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push; the campaign tip is still
