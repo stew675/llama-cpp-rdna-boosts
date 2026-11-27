@@ -1,0 +1,65 @@
+From 31312bb41e4e480bb343ae1c4ddf999bb1a06e07 Mon Sep 17 00:00:00 2001
+From: overdoingism <overdoingism@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 23:33:13 +0800
+Subject: [PATCH] server: the fair-share rotation restarts at slot 0 when no
+ prompt is left to place (LLAMA_SERVER_PREFILL_FAIR_RESTART=0 keeps it
+ running)
+
+share_prompt_budget() starts its walk at slot_next and advances it on every call, decode-only steps included, and nothing
+resets it.  Two prompts that arrive together after an idle stretch are therefore split by a rotation left over from the
+earlier requests: which slot gets the remainder of the window, and so how both prompts are cut into ubatches, depends on how
+many steps those requests took.  Greedy replies to the same two-prompt request then differ from one request to the next in
+one server process (near-tie tokens), while the first request after start is always the same.
+
+On a step with no prompt to place the rotation now returns to slot 0, so every set of prompts starts from the same state;
+the steps of one prompt set still rotate as before.  The first request after start is unchanged bit for bit.  A restart that
+moves the rotation is logged at debug level with a running count.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/server/server-context.cpp | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 196e0bfff..51527df5b 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1240,6 +1240,16 @@ private:
+     // rotating start for the fair-share walk, so the tie-break is not always slot 0
+     int32_t slot_next = 0;
+ 
++    // LLAMA_SERVER_PREFILL_FAIR_RESTART (on unless 0): on a step with no prompt to place, the rotation above starts again
++    // at slot 0.  Prompts that arrive together are then split the same way whatever ran before them; with 0 the rotation
++    // carries over from the earlier requests (it advances on every step, decode-only ones included), so how the prompts
++    // are cut into ubatches -- and with it the values of a reply -- depends on how many steps the earlier requests took.
++    const bool prefill_fair_restart = [] {
++        const char * e = getenv("LLAMA_SERVER_PREFILL_FAIR_RESTART");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    uint64_t prefill_fair_restarts = 0; // census: rotations that were not at slot 0 when they restarted
++
+     std::unique_ptr<server_prompt_cache> prompt_cache;
+ 
+     // LLAMA_SERVER_KV_ADMIT (on unless 0): with a unified KV cache, admit a task only when the cells the running
+@@ -2384,6 +2394,18 @@ private:
+             remaining[k] = r;
+         }
+ 
++        // no prompt to place: nothing to share, and the next prompts start the rotation at slot 0 again
++        // (LLAMA_SERVER_PREFILL_FAIR_RESTART; the steps of a prompt set still rotate as before)
++        if (active.empty() && prefill_fair_restart) {
++            if (slot_next != 0) {
++                slot_next = 0;
++                prefill_fair_restarts++;
++                SRV_DBG("fair-share rotation restarts at slot 0 (no prompt to place; %llu restarts)\n",
++                        (unsigned long long) prefill_fair_restarts);
++            }
++            return;
++        }
++
+         // No permanent starvation: even when the decode tokens have committed the whole window (only
+         // possible when n_parallel is at or above n_batch), every active prompt still gets one token.  The
+         // batch then exceeds n_batch by at most n_active tokens and the outer llama_process() loop splits it
+-- 
+2.43.0
+
