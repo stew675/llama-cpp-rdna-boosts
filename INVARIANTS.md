@@ -3804,6 +3804,14 @@ so the deliverable part of it is an opt-in switch for the 129..511 band.
    transport A/B; an A/B on the field shape must also pin `MOE_EXPERT_HEATMAP` (the reserve partition varies
    between runs of the SAME commit).
 
+11. **A cross-build MTP rate arm needs A B B A with the base arm's own drift as the control** -- a single
+   A-then-B pass on this box read the candidate **-2.4 / -4.2 / -6.5 %** on the f16 arms, and the interleaved
+   re-run of the same two arm-specs puts B vs A at **-0.08 / +0.15 / -0.33 / +0.25 %** while the BASE arm's own
+   A1 -> A2 drift across the same window is **1.02 %** (recall/mtp 189.91 -> 187.97).  The text, acceptance and
+   pos-1 were identical in all 16 runs, so only the rate was ever in question -- and it was the box.  The
+   four-axis protocol's two arms are sequential by construction, which is exactly how a phase difference becomes
+   a "regression" in a record (`WORKLOG.md` 261127.020, `archive/work/flash-next-prefill/abba-f16.sh`).
+
 **Record.** `archive/work/flash-next-prefill/` (`RESULTS-session7.md` §6-§7, `REVIEW-squashed.md` §10-§12,
-`HANDOVER-session8.md`); `patches/README.md` blocks 09/10/12/15 (r369 amendments); `ENVIRONMENT.md` §1.3/§2/§31;
-`DIAGNOSTIC.md` §2/§28/§31; `TODO.md` #385-#391.
+`HANDOVER-session8.md`, `runs/mtp4-abba-f16/`); `patches/README.md` blocks 09/10/12/15 (r369 amendments);
+`ENVIRONMENT.md` §1.3/§2/§31; `DIAGNOSTIC.md` §2/§28/§31; `TODO.md` #385-#391.

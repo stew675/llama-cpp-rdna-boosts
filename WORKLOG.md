@@ -16,6 +16,37 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.020 (r369) -- CORRECTION: the f16 MTP "regression" was box phase -- an A B B A of the two f16 arms reads the candidate within +-0.33 %, and the BASE arm's own drift is 1.02 %
+
+The four-axis protocol's single pass (261127.018) read the candidate **-2.4 % / -4.2 % / -6.5 %** on the f16 arms
+while q8_0 was flat, and that was recorded as the box's 2-5 % bimodality.  It was, and the number is now measured
+rather than inferred: the two f16 arm-specs that carried the deltas were re-run **A B B A** (A = the base build of
+`af7a57ba8` in `/tmp/base-wt`, B = the r369 build, same flags as the four-axis protocol: 3 devices `-sm tensor`,
+`-n 3000`, greedy, f16 KV, `--reasoning on` for the reasoning axis), 2 reps each per arm, interleaved:
+
+| arm | A (base) | B (r369) | B vs A | **A's own drift** |
+|---|---|---|---|---|
+| recall / none | 42.88 (42.96, 42.80) | 42.84 (42.85, 42.84) | **-0.08 %** | -0.37 % |
+| recall / draft-mtp | 188.94 (189.91, 187.97) | 188.32 (188.64, 188.01) | **-0.33 %** | **-1.02 %** |
+| reasoning / none | 42.57 (42.60, 42.54) | 42.63 (42.58, 42.69) | **+0.15 %** | -0.14 % |
+| reasoning / draft-mtp | 83.73 (83.75, 83.71) | 83.94 (84.26, 83.62) | **+0.25 %** | -0.05 % |
+
+So: **no regression** -- three of the four arms are within +-0.15 %, the largest gap (0.33 %) is a third of the base
+arm's OWN drift across the same window (**1.02 %**, 189.91 -> 187.97 on recall/mtp), and the candidate is ahead on
+both reasoning arms.  Text was **identical in 16/16 runs** (`a87c4318b649` recall, `218515b89b31` reasoning),
+draft acceptance identical to five decimals (0.96652 / 0.34306) and pos-1 identical (0.984 / 0.761) in every run,
+so nothing but the rate was ever in question.
+
+**The lesson, which is why this is a correction and not a footnote:** a cross-build MTP rate arm needs **ABBA with
+the base's own drift as the control**, exactly like every other rate claim in this repo; a single A-then-B pass on
+this box can read 6 % from phase alone, and the four-axis protocol's own two arms are sequential by construction.
+The runner and the complete per-run table are in `archive/work/flash-next-prefill/` (`abba-f16.sh`,
+`runs/mtp4-abba-f16/summary.tsv`); the raw stderr logs there cover the reasoning arm-spec only (the run's log names
+lacked the axis/spec, so the first group's were overwritten -- the archived script is fixed).
+
+Nothing in the delivery changes: no code moved, and the release stays `v18-919794500-r369` (this is a record-only
+commit on top of the tag).  `INVARIANTS.md` r369 gains the fact as item 11.
+
 ## 261127.019 (r369) -- `optional/0100` PORTED onto r369 (the pair path meets the staging pipeline), gate 47 + the prefill-logit gate green, and the pair's host-expert arm REFUSED after it livelocked
 
 **Why a port and not a re-cut.**  `0100` splits `ggml_backend_sched_compute_splits` into a per-split
@@ -112,7 +143,8 @@ q8_0); **pos-1 acceptance identical to three decimals** on every axis (f16 0.761
 0.784 / 0.984 / 0.890 / 0.959, all far above the 0.45 criterion); MTP 1.9-4.4x plain on both builds.  The rate
 delta base->candidate is **-6.5 %..+0.3 %**, concentrated in the f16 arms that ran first in each sequence
 (the box is bimodal by 2-5 %; q8_0 is flat within +-1 %), which is the pattern the campaign's own records warn
-about and not a transport effect.  Note: `mtp4axis.sh`'s acceptance grep was **broken in the committed script**
+about and not a transport effect.  **(CORRECTED the same day: an A B B A of those f16 arms reads B vs A within
++-0.33 % while the base arm's own drift is 1.02 % -- there is no regression; `WORKLOG.md` 261127.020.)**  Note: `mtp4axis.sh`'s acceptance grep was **broken in the committed script**
 (unbalanced quotes: the pattern contained `[^"]` inside a `"` string, so the file did not even parse) -- it was
 repaired to capture `draft acceptance` and the `#acc rate/pos` pos-1 figure, and the candidate's rows were
 backfilled from its own `.err` logs.  *Remote sanity* (the maintainer's requirement): both boxes were already
