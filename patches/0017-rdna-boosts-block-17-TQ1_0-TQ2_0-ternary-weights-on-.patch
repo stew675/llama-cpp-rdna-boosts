@@ -1,4 +1,4 @@
-From 28e0911d1e649f205c6d61a06d129370419f1477 Mon Sep 17 00:00:00 2001
+From 7adccb60fd6304876b32aaeee0ed336617c1a0a4 Mon Sep 17 00:00:00 2001
 From: overdoingism <overdoingism@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 22:37:36 +0800
 Subject: [PATCH 17/18] rdna-boosts: block 17: TQ1_0 / TQ2_0 (ternary) weights
@@ -58,7 +58,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 ggml/src/ggml-cuda/tq.cuh
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index f7d49b8dc..7400abbe2 100644
+index 453674ea6..a35ecf326 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1466,6 +1466,28 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ4_NL> {
@@ -90,7 +90,7 @@ index f7d49b8dc..7400abbe2 100644
  template<>
  struct ggml_cuda_type_traits<GGML_TYPE_IQ4_XS> {
      static constexpr int qk = QK_K;
-@@ -1949,6 +1971,11 @@ struct ggml_backend_cuda_context {
+@@ -1954,6 +1976,11 @@ struct ggml_backend_cuda_context {
      // GGML_CUDA_FUSE_GDN_NORM_GATE_SILU=0 declined.  All three are counted AT THE GATE NODE, i.e. where the host walks
      // the graph, so a replayed graph adds nothing.
      uint64_t            gdn_norm_gate_census[3] = {};
@@ -358,7 +358,7 @@ index 06521064f..558d46a24 100644
      // the reverse on gfx1100/gfx1201 -- see the block-15 notes in patches/README.md): it appends the rows of two more
      // same-src1 matmuls to the largest weight's launch, while the dual-output keeps the equal-height pair it owns.
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e64342a64..72fadf225 100644
+index 4b6085da9..85175c171 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -47,6 +47,7 @@
@@ -369,7 +369,7 @@ index e64342a64..72fadf225 100644
  #include "ggml-cuda/mmvq-wmma.cuh"
  #include "ggml-cuda/moe-weighted-reduction.cuh"
  #include "ggml-cuda/mmf32.cuh"
-@@ -1742,6 +1743,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -1878,6 +1879,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
                            (unsigned long long) gdn_norm_gate_census[1], (unsigned long long) gdn_norm_gate_census[2]);
          }
      }
@@ -384,7 +384,7 @@ index e64342a64..72fadf225 100644
      h2d_stage_free();
  
      for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
-@@ -7489,6 +7498,11 @@ bool ggml_cuda_mul_mat_takes_mmq(ggml_backend_cuda_context & ctx, const ggml_ten
+@@ -7624,6 +7633,11 @@ bool ggml_cuda_mul_mat_takes_mmq(ggml_backend_cuda_context & ctx, const ggml_ten
  static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_TENSOR_BINARY_OP_LOCALS
  
@@ -396,7 +396,7 @@ index e64342a64..72fadf225 100644
      if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
          return;
      }
-@@ -10367,6 +10381,42 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -10527,6 +10541,42 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
              i = j + 2;
          }
  
@@ -439,7 +439,7 @@ index e64342a64..72fadf225 100644
          // Small projections and a larger one over the same input (Qwen3.5/3.6 GDN: ssm_beta and ssm_alpha, 32 rows, then
          // the attn_gate z projection a few nodes later): from the first MUL_MAT of <= 256 rows, gather the later MUL_MATs
          // with the same activation, weight type and K (any number of small ones, one larger one) directly after it, so
-@@ -11203,6 +11253,13 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
+@@ -11365,6 +11415,13 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
  }
  
  // TODO: move these functions here
@@ -453,7 +453,7 @@ index e64342a64..72fadf225 100644
  static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
      ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
  
-@@ -11276,6 +11333,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -11438,6 +11495,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                  if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                      return false; // TODO this could in principle be implemented though currently there is no use case.
                  }
@@ -464,7 +464,7 @@ index e64342a64..72fadf225 100644
                  if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 && !ggml_cuda_op_mul_mat_use_fwht(op)) {
                      return false;
                  }
-@@ -11342,6 +11403,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -11504,6 +11565,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
          case GGML_OP_GET_ROWS:
              {

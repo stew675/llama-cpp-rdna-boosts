@@ -5,6 +5,14 @@
 and **nothing is copied between them**.
 
 > **Status (2026-11-24): beta candidate, replacing the withdrawn artifact.**
+>
+> **r369 (2026-11-27): NOT REBASED — known-broken on the current release, deliberately.**  The patch is cut against
+> the r368 default tree, and r369 promoted a cross-cutting layer over blocks 09/10/12/15 that rewrote
+> `ggml_backend_sched_compute_splits` (the staging pipeline), which is the function this candidate's pair path
+> drives.  The maintainer's decision is to accept it broken for the r369 release and port it in a later session —
+> it is `--include-beta` only, so no delivery consumer sees it.  Re-entry is `TODO` #391: the same port
+> `optional/0100` got at r369 (pipeline prologue/per-split/epilogue vs the pair path), plus its own
+> `gate-arms-spec.sh` / `gate-draft-ctx.sh`.
 > This directory used to hold the *previous* design for block 17 (withdrawn at r352).  The maintainer's decision of
 > 2026-11-24 is that this work **replaces it in its entirety**, and that on promotion it becomes **delivery block
 > 17 as ONE self-contained patch-BLOCK** (here: two files, the block plus the delivery-level STEP 15 fix it carries) — a modification to the lower-numbered blocks (it edits files blocks 12/15 own,

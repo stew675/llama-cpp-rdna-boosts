@@ -1,4 +1,4 @@
-From cdbd781373751d9b7e2555587967eeb108f5bbe4 Mon Sep 17 00:00:00 2001
+From 38f02fdbaa802bf11bfa81c966fe929a0834774b Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/18] rdna-boosts: block 09: host-resident MoE (iface,
@@ -87,11 +87,11 @@ refused, 3-device arm untouched).  Measured: benchmarks/2026-11-21-ffn-even-spli
  docs/multi-gpu.md                             |    4 +-
  .../speculative-simple/speculative-simple.cpp |    4 +-
  ggml/include/ggml-alloc.h                     |    1 +
- ggml/include/ggml-backend.h                   |  131 +
+ ggml/include/ggml-backend.h                   |  140 +
  ggml/src/ggml-alloc.c                         |   85 +-
  ggml/src/ggml-backend-impl.h                  |  267 +
- ggml/src/ggml-backend-meta.cpp                | 1629 +++-
- ggml/src/ggml-backend.cpp                     | 1308 ++-
+ ggml/src/ggml-backend-meta.cpp                | 1757 +++-
+ ggml/src/ggml-backend.cpp                     | 1457 +++-
  ggml/src/ggml-blas/ggml-blas.cpp              |    7 +
  ggml/src/ggml-cann/ggml-cann.cpp              |    7 +
  ggml/src/ggml-cpu/amx/amx.cpp                 |    3 +
@@ -105,7 +105,7 @@ refused, 3-device arm untouched).  Measured: benchmarks/2026-11-21-ffn-even-spli
  ggml/src/ggml-cuda/graph.cuh                  |    4 +
  ggml/src/ggml-cuda/mmvq.cu                    |  283 +-
  ggml/src/ggml-cuda/mmvq.cuh                   |   12 +
- ggml/src/ggml-cuda/moe-expert-cache.cu        | 7229 +++++++++++++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu        | 7409 +++++++++++++++++
  ggml/src/ggml-cuda/moe-expert-cache.h         |  384 +
  ggml/src/ggml-cuda/norm.cu                    |   35 +
  ggml/src/ggml-cuda/norm.cuh                   |    1 +
@@ -144,7 +144,7 @@ refused, 3-device arm untouched).  Measured: benchmarks/2026-11-21-ffn-even-spli
  tests/test-backend-tensor.cpp                 |    3 +
  tools/cli/cli.cpp                             |    6 +
  tools/llama-bench/llama-bench.cpp             |   65 +-
- 70 files changed, 18552 insertions(+), 548 deletions(-)
+ 70 files changed, 19018 insertions(+), 548 deletions(-)
  create mode 100644 common/draft-reserve.cpp
  create mode 100644 common/draft-reserve.h
  create mode 100644 ggml/src/ggml-cuda/cpy-batch.cu
@@ -2101,17 +2101,17 @@ index 81cce2e2a..278b2f5ba 100644
  GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
  
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index afb86338a..ef754735e 100644
+index afb86338a..480cbea49 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
-@@ -44,6 +44,102 @@ extern "C" {
+@@ -44,6 +44,111 @@ extern "C" {
      GGML_API bool                  ggml_backend_buft_is_host         (ggml_backend_buffer_type_t buft);
      GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device      (ggml_backend_buffer_type_t buft);
  
 +    // Early MoE expert cache auto-sizing (wip/moe-cache-autosize): called by the model layer after the
 +    // target context is allocated, before an auxiliary context is created.  No-op for backends without a
 +    // cache.  Returns true when a cache remains active.  `max_host_table_bytes` is the largest single
-+    // host-resident weight tensor (wip/slab-ring-region: sizes the slab's H2D-ring hole).
++    // host-resident weight tensor (wip/slab-ring-region: sizes the slab's staging region).
 +    GGML_API bool                  ggml_backend_dev_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes, size_t max_host_table_bytes);
 +
 +    // WIP r42 (TODO #42): reserve `bytes` of this device's free VRAM for the post-prefill compute
@@ -2150,10 +2150,10 @@ index afb86338a..ef754735e 100644
 +    GGML_API void                  ggml_backend_dev_moe_heat_open(ggml_backend_dev_t dev, const char * model_path);
 +    GGML_API int64_t               ggml_backend_dev_moe_heat_score(ggml_backend_dev_t dev, int layer, const char * name, int n_experts, size_t host_bytes);
 +
-+    // wip/slab-ring-region: arm/disarm the allocator's reserved H2D staging-ring hole.  Armed at a wide
++    // wip/slab-ring-region: arm/disarm the allocator's reserved staging region.  Armed at a wide
 +    // (prefill) pass, disarmed at the prefill -> decode drop, so a decode-only stretch gets the VRAM back.
-+    // No-op for a backend without a slab or with no ring hole.
-+    GGML_API void                  ggml_backend_dev_slab_ring_set(ggml_backend_dev_t dev, bool arm);
++    // No-op for a backend without a slab or with no stage region.
++    GGML_API void                  ggml_backend_dev_slab_stage_set(ggml_backend_dev_t dev, bool arm);
 +
 +    // wip/slab-ring-region: pin the always-resident narrow (decode/verify) work size, so the allocator can
 +    // place the staging ring above it.  No-op for a backend without a slab.
@@ -2182,21 +2182,30 @@ index afb86338a..ef754735e 100644
 +    // slab.  `llama_context` uses it to right-size the compute reserve to the observed workload.
 +    GGML_API size_t                ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev);
 +
-+    // wip/slab-ring-region (issue #164): the size of the device's reserved H2D staging-ring hole, or 0
-+    // when the slab carved none.  `llama_context` uses it to skip the narrow -> wide compute-buffer drop
-+    // when there is no ring to arm.  No-op (0) for a backend without a slab.
-+    GGML_API size_t                ggml_backend_dev_slab_ring_region(ggml_backend_dev_t dev);
++    // wip/slab-ring-region (issue #164): the size of the device's reserved transport region (the staging
++    // pipeline's buffers), or 0 when the slab has none carved right now.  `llama_context` uses it to skip the
++    // narrow -> wide compute-buffer drop when there is no region to arm.  No-op (0) for a backend without a slab.
++    GGML_API size_t                ggml_backend_dev_slab_stage_region(ggml_backend_dev_t dev);
 +
-+    // wip/slab-ring-region (issue #164): set the H2D staging-ring auto-size cap (bytes), computed by
-+    // `llama_context` from the ubatch and the host-expert device count.  Call before the slab is created.
-+    // No-op for a backend without a slab.  `GGML_CUDA_SLAB_RING_MIB` overrides it per GPU.
-+    GGML_API void                  ggml_backend_dev_slab_set_ring_cap(ggml_backend_dev_t dev, size_t bytes);
++    // wip/slab-ring-region (issue #164): the transport region's CAP (bytes), computed by `llama_context` (1/4 of
++    // the smallest staging device's VRAM).  The region itself is one buffer x the pipeline's depth.  Call before the
++    // slab is created.  No-op for a backend without a slab.
++    GGML_API void                  ggml_backend_dev_slab_set_stage_cap(ggml_backend_dev_t dev, size_t bytes);
++
++    // wip/flash-next-prefill: ONE transport buffer's bytes -- the largest host-weight split set the staged
++    // pipeline carries (or the one-table floor for a model that reports no per-layer mapping).  The transport
++    // region is `unit x the transport's DEPTH`, and the depth is NOT this layer's decision: it comes from the
++    // expert-cache residency rule (`ggml_backend_cuda_transport_bufs`, decided when the arena settles), so
++    // `llama_context` publishes the unit and the backend derives the request.  No-op for a backend without a
++    // slab / a transport region.
++    GGML_API void                  ggml_backend_dev_slab_set_stage_unit(ggml_backend_dev_t dev, size_t bytes);
 +    // issue #164: whether this device's movable-boundary slab is enabled (armed for a host-expert model).
-+    // The ring sizing warns about a too-small `GGML_CUDA_SLAB_RING_MIB` only when the slab will use it.
++    // The region sizing only applies it when the slab will use it.
 +    GGML_API bool                  ggml_backend_dev_slab_enabled(ggml_backend_dev_t dev);
-+    // issue #164: the backend's H2D staging-ring depth (slots the ring region is divided into), or 0 when
-+    // the backend has no ring.  The context sizes the ring region so one staged table fits per slot.
-+    GGML_API size_t                ggml_backend_dev_slab_ring_slots(ggml_backend_dev_t dev);
++    // issue #164: the backend's transport DEPTH (how many pipeline buffers its transport region is sized for),
++    // or 0 when the backend has no staging transport.  The context sizes the region so one staged host-weight
++    // set fits per buffer.
++    GGML_API size_t                ggml_backend_dev_slab_stage_slots(ggml_backend_dev_t dev);
 +
 +    // wip/fit-slab-accounting (Phase 1): the VRAM this device's allocator must keep free OUTSIDE the
 +    // movable-boundary slab, or 0 when there is no such consumer.  hipBLASLt loads its Tensile code
@@ -2207,7 +2216,7 @@ index afb86338a..ef754735e 100644
      //
      // Backend buffer
      //
-@@ -357,6 +453,11 @@ extern "C" {
+@@ -357,6 +462,11 @@ extern "C" {
      GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
      GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
  
@@ -2219,7 +2228,7 @@ index afb86338a..ef754735e 100644
      GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
      GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
  
-@@ -445,6 +546,36 @@ extern "C" {
+@@ -445,6 +555,36 @@ extern "C" {
      GGML_API ggml_backend_dev_t ggml_backend_meta_device(
          ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
  
@@ -2247,7 +2256,7 @@ index afb86338a..ef754735e 100644
 +
 +    // issue #164: the byte size of device `dev`'s slice of `tensor` under `split_state`.  This is the
 +    // single definition of the meta split size -- `ggml_backend_meta_stage_input` sizes the H2D ring slot
-+    // with it, and the host-expert ring hole is sized from the same value, so the hole always holds the
++    // with it, and the host-expert stage region is sized from the same value, so the hole always holds the
 +    // largest upload the staging will ask for.  Returns the whole tensor for a mirrored split.
 +    GGML_API size_t ggml_backend_meta_split_dev_bytes(
 +        const struct ggml_tensor * tensor, const struct ggml_backend_meta_split_state * split_state,
@@ -2686,7 +2695,7 @@ index 545880b06..6a6e30d01 100644
  
      struct ggml_backend_device {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 930b58fb4..822070752 100644
+index 930b58fb4..0b24e0132 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -4,6 +4,7 @@
@@ -2837,10 +2846,64 @@ index 930b58fb4..822070752 100644
  static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
      GGML_ASSERT(ggml_backend_dev_is_meta(dev));
      ggml_backend_dev_t dev_buft = ggml_backend_buft_get_device(buft);
-@@ -177,6 +270,30 @@ static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_
+@@ -177,6 +270,84 @@ static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_
      return true;
  }
  
++// wip/flash-next-prefill: the transport region's hooks, forwarded to the simple devices for the same reason as
++// the narrow-2 ones below -- the meta device owns no slab of its own.  This is LOAD-BEARING, not tidiness: the
++// ARM (`slab_stage_set`) is what makes a device's slab carve the region for a wide pass (and re-carve it after
++// the prefill -> decode release).  Dropped on the meta device, every device's region stays uncarved on a
++// `-sm tensor` split, so the Meta backend's per-device ring is refused at every fill and the split can only
++// gather or take the serial upload.
++static void ggml_backend_meta_device_slab_stage_set(ggml_backend_dev_t dev, bool arm) {
++    ggml_backend_meta_device_context * ctx = (ggml_backend_meta_device_context *) dev->context;
++    for (ggml_backend_dev_t d : ctx->simple_devs) {
++        ggml_backend_dev_slab_stage_set(d, arm);
++    }
++}
++
++static size_t ggml_backend_meta_device_slab_stage_region(ggml_backend_dev_t dev) {
++    // the LARGEST child region: the context only asks "is anything carved?" (to decide a layout drop), and any
++    // device with a region means the split can stage.
++    ggml_backend_meta_device_context * ctx = (ggml_backend_meta_device_context *) dev->context;
++    size_t region = 0;
++    for (ggml_backend_dev_t d : ctx->simple_devs) {
++        const size_t r = ggml_backend_dev_slab_stage_region(d);
++        if (r > region) {
++            region = r;
++        }
++    }
++    return region;
++}
++
++static size_t ggml_backend_meta_device_slab_stage_slots(ggml_backend_dev_t dev) {
++    // the SMALLEST child depth: every device stages into its own ring, so the split's depth is the minimum.
++    ggml_backend_meta_device_context * ctx = (ggml_backend_meta_device_context *) dev->context;
++    size_t depth = 0;
++    for (ggml_backend_dev_t d : ctx->simple_devs) {
++        const size_t n = ggml_backend_dev_slab_stage_slots(d);
++        if (n > 0 && (depth == 0 || n < depth)) {
++            depth = n;
++        }
++    }
++    return depth;
++}
++
++static void ggml_backend_meta_device_slab_set_stage_cap(ggml_backend_dev_t dev, size_t bytes) {
++    ggml_backend_meta_device_context * ctx = (ggml_backend_meta_device_context *) dev->context;
++    for (ggml_backend_dev_t d : ctx->simple_devs) {
++        ggml_backend_dev_slab_set_stage_cap(d, bytes);
++    }
++}
++
++static void ggml_backend_meta_device_slab_set_stage_unit(ggml_backend_dev_t dev, size_t bytes) {
++    ggml_backend_meta_device_context * ctx = (ggml_backend_meta_device_context *) dev->context;
++    for (ggml_backend_dev_t d : ctx->simple_devs) {
++        ggml_backend_dev_slab_set_stage_unit(d, bytes);
++    }
++}
++
 +static void ggml_backend_meta_device_slab_narrow2_floor(ggml_backend_dev_t dev, size_t bytes) {
 +    // forward to the simple devices: the meta device owns no slab of its own
 +    ggml_backend_meta_device_context * ctx = (ggml_backend_meta_device_context *) dev->context;
@@ -2868,7 +2931,7 @@ index 930b58fb4..822070752 100644
  static const ggml_backend_device_i ggml_backend_meta_device_iface = {
      /* .get_name             = */ ggml_backend_meta_device_get_name,
      /* .get_description      = */ ggml_backend_meta_device_get_description,
-@@ -189,23 +306,37 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+@@ -189,23 +360,37 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
      /* .buffer_from_host_ptr = */ nullptr,
      /* .supports_op          = */ ggml_backend_meta_device_supports_op,
      /* .supports_buft        = */ ggml_backend_meta_device_supports_buft,
@@ -2886,7 +2949,7 @@ index 930b58fb4..822070752 100644
 +    /* .moe_cache_rearm      = */ nullptr,
 +    /* .slab_work_size       = */ nullptr,
 +    /* .slab_headroom_bytes  = */ nullptr,
-+    /* .slab_ring_set        = */ nullptr,
++    /* .slab_stage_set        = */ ggml_backend_meta_device_slab_stage_set,
 +    /* .slab_narrow_floor    = */ nullptr,
 +    /* .slab_reserve_wide    = */ nullptr,
 +    /* .slab_narrow2_floor   = */ ggml_backend_meta_device_slab_narrow2_floor,
@@ -2913,7 +2976,7 @@ index 930b58fb4..822070752 100644
      GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
      const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
      GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
-@@ -289,6 +420,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_buft(ggml_backen
+@@ -289,6 +474,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_buft(ggml_backen
  }
  
  static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
@@ -2921,7 +2984,7 @@ index 930b58fb4..822070752 100644
  
  static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors);
  
-@@ -312,6 +444,34 @@ static size_t ggml_backend_meta_buffer_type_get_max_size(ggml_backend_buffer_typ
+@@ -312,6 +498,34 @@ static size_t ggml_backend_meta_buffer_type_get_max_size(ggml_backend_buffer_typ
      return max_size;
  }
  
@@ -2956,7 +3019,7 @@ index 930b58fb4..822070752 100644
  static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
      const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
      size_t max_alloc_size = 0;
-@@ -341,6 +501,9 @@ static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_ifa
+@@ -341,6 +555,9 @@ static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_ifa
      /* .get_alloc_size      = */ ggml_backend_meta_buffer_type_get_alloc_size,
      /* .get_alloc_size_n    = */ NULL,
      /* .is_host             = */ ggml_backend_meta_buffer_type_is_host,
@@ -2966,7 +3029,7 @@ index 930b58fb4..822070752 100644
  };
  
  bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
-@@ -400,19 +563,100 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
+@@ -400,19 +617,100 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
  //
  
  // Container to hold the tensor slices per simple ggml backend buffer.
@@ -3073,7 +3136,7 @@ index 930b58fb4..822070752 100644
  struct ggml_backend_meta_buffer_context {
      // FIXME
      // Most tensors can simply be stored statically in their own buffer.
-@@ -421,39 +665,101 @@ struct ggml_backend_meta_buffer_context {
+@@ -421,39 +719,101 @@ struct ggml_backend_meta_buffer_context {
      // Current solution: rotating set of 2 "compute" containers to hold external views, works correctly for llama.cpp.
      // Long-term: tie the lifetime of external views to the meta backend executing the graph instead,
      //     currently not possible due to graph-external operations in the backend scheduler.
@@ -3185,7 +3248,7 @@ index 930b58fb4..822070752 100644
      }
  };
  
-@@ -880,6 +1186,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -880,6 +1240,26 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
          return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
      };
  
@@ -3212,7 +3275,7 @@ index 930b58fb4..822070752 100644
      auto handle_lightning_indexer = [&](
              const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
          for (size_t i = 0; i < 4; i++) {
-@@ -921,8 +1247,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -921,8 +1301,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
          if (ggml_nelements(tensor) == 0) {
              return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
          }
@@ -3235,7 +3298,7 @@ index 930b58fb4..822070752 100644
              const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
              ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
              if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
-@@ -1204,65 +1542,181 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1204,65 +1596,181 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
          return split_state;
      };
  
@@ -3460,7 +3523,7 @@ index 930b58fb4..822070752 100644
  }
  
  static bool ggml_backend_meta_is_host_view(const struct ggml_tensor * tensor) {
-@@ -1295,6 +1749,12 @@ static GGML_META_COLD struct ggml_backend_meta_split_state ggml_backend_meta_get
+@@ -1295,6 +1803,12 @@ static GGML_META_COLD struct ggml_backend_meta_split_state ggml_backend_meta_get
          }
      }
  
@@ -3473,7 +3536,7 @@ index 930b58fb4..822070752 100644
      // [TAG_META_HOST_VIEWS]
      // TODO: technically, this check should not be needed if the backend scheduler correctly prevents assigning
      //       such host-buffer views to the meta backend. figure out how to update the scheduler logic to achieve that
-@@ -1340,7 +1800,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+@@ -1340,7 +1854,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
      std::vector<ggml_tensor *> simple_tensors;
      simple_tensors.reserve(n_simple_bufs);
      for (size_t j = 0; j < n_simple_bufs; j++) {
@@ -3482,7 +3545,7 @@ index 930b58fb4..822070752 100644
          ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
  
          if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
-@@ -1401,6 +1861,10 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+@@ -1401,6 +1915,10 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                  init_buf     = t_ij->view_src->buffer;
              }
          } else if (simple_buf != nullptr) {
@@ -3493,7 +3556,7 @@ index 930b58fb4..822070752 100644
              if (ggml_backend_buffer_is_multi_buffer(simple_buf)) {
                  GGML_ABORT("multi buffers are not supported by the meta backend");
              }
-@@ -1448,7 +1912,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+@@ -1448,7 +1966,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
          }
      }
  
@@ -3502,7 +3565,7 @@ index 930b58fb4..822070752 100644
  
      return GGML_STATUS_SUCCESS;
  }
-@@ -1456,7 +1920,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+@@ -1456,7 +1974,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
  static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
      GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
      ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
@@ -3511,7 +3574,7 @@ index 930b58fb4..822070752 100644
      return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
  }
  
-@@ -1568,63 +2032,114 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
+@@ -1568,63 +2086,114 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
      GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
  
      if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
@@ -3666,7 +3729,7 @@ index 930b58fb4..822070752 100644
          return;
      }
  
-@@ -1690,7 +2205,22 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
+@@ -1690,7 +2259,22 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
      }
  }
  
@@ -3690,7 +3753,7 @@ index 930b58fb4..822070752 100644
      const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
      const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
      GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-@@ -1719,7 +2249,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
+@@ -1719,7 +2303,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
                          const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                          GGML_ASSERT(split_state.ne[s*n_bufs + j] % blck_size == 0);
                          const size_t nbytes = split_state.ne[s*n_bufs + j]/blck_size * tensor->nb[0];
@@ -3699,7 +3762,7 @@ index 930b58fb4..822070752 100644
                              simple_offsets[j] + row_start * simple_tensor->nb[1], nbytes,
                              row_count, simple_tensor->nb[1], tensor->nb[1]);
                          offset_data       += nbytes;
-@@ -1744,7 +2274,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
+@@ -1744,7 +2328,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
                  for (size_t j = 0; j < n_bufs; j++) {
                      const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                      const size_t nbytes = split_state.ne[s*n_bufs + j] * tensor->nb[1];
@@ -3708,7 +3771,7 @@ index 930b58fb4..822070752 100644
                          simple_offsets[j] + row_start * simple_tensor->nb[2], nbytes,
                          row_count, simple_tensor->nb[2], tensor->nb[2]);
                      offset_data       += nbytes;
-@@ -1774,7 +2304,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
+@@ -1774,7 +2358,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
                      continue;
                  }
                  const size_t simple_offset = i_start * chunk_size_j;
@@ -3717,7 +3780,7 @@ index 930b58fb4..822070752 100644
                  offset_j += chunk_size_j;
              }
              GGML_ASSERT(offset_j == chunk_size_full);
-@@ -1782,7 +2312,11 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
+@@ -1782,7 +2366,11 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
          case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
              // TODO other simple backend may be better
              const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
@@ -3730,7 +3793,7 @@ index 930b58fb4..822070752 100644
          } break;
          default: {
              GGML_ABORT("fatal error");
-@@ -1790,6 +2324,10 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
+@@ -1790,6 +2378,10 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
      }
  }
  
@@ -3741,7 +3804,7 @@ index 930b58fb4..822070752 100644
  static void ggml_backend_meta_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
      const size_t n_buffers = ggml_backend_meta_buffer_n_bufs(buffer);
      for (size_t i = 0; i < n_buffers; i++) {
-@@ -1826,6 +2364,16 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
+@@ -1826,6 +2418,16 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
      return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
  }
  
@@ -3758,7 +3821,7 @@ index 930b58fb4..822070752 100644
  void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
      GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
      ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
-@@ -1836,7 +2384,7 @@ void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_
+@@ -1836,7 +2438,7 @@ void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_
      }
  }
  
@@ -3767,7 +3830,7 @@ index 930b58fb4..822070752 100644
      const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
  
      const ggml_init_params params = {
-@@ -1852,15 +2400,34 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+@@ -1852,15 +2454,34 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
      std::vector<ggml_backend_buffer_t> bufs;
      bufs.reserve(n_simple_bufts);
      for (size_t i = 0; i < n_simple_bufts; i++) {
@@ -3806,7 +3869,7 @@ index 930b58fb4..822070752 100644
  static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors) {
      const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
  
-@@ -1872,7 +2439,16 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
+@@ -1872,7 +2493,16 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
      // Upstream #31447 also floors the compute container at compute_headroom_min views ("a buffer with
      // few tensors can still get many views"); the two are complementary, and the floor may make part
      // of the raised multiplier redundant -- measured at a later rung (TODO #286).
@@ -3824,7 +3887,7 @@ index 930b58fb4..822070752 100644
      constexpr size_t compute_headroom_min = 256; // floor, regardless of the tensor count (upstream #31447)
      const ggml_init_params params_static = {
          /*.mem_size   =*/ n_tensors * ggml_tensor_overhead(),
-@@ -1889,7 +2465,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
+@@ -1889,7 +2519,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
      ggml_backend_meta_simple_tensor_container stc_compute_1(params_compute, n_simple_bufts);
  
      std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
@@ -3833,7 +3896,7 @@ index 930b58fb4..822070752 100644
  
      ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
      for (int i = 0; i < n_tensors; i++) {
-@@ -1899,7 +2475,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
+@@ -1899,7 +2529,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
          t->data = (void *) 0x2000000000000000; // FIXME
      }
      for (size_t i = 0; i < n_simple_bufts; i++) {
@@ -3842,7 +3905,28 @@ index 930b58fb4..822070752 100644
          ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, i);
  
          // If a ggml_context only has zero-sized tensors, ggml_backend_alloc_ctx_tensors_from_buft returns NULL.
-@@ -1978,6 +2554,38 @@ struct ggml_backend_meta_context {
+@@ -1949,6 +2579,20 @@ static ggml_guid_t ggml_backend_meta_guid() {
+     return &guid;
+ }
+ 
++// wip/flash-next-prefill: how deep ONE device's H2D staging transport is, as that device reports it through the generic
++// `slab_stage_slots` hook -- the SAME number the slab carves the transport region for, so a ring slot can never fail
++// to fit (a slot that does not fit makes the whole input decline).  0 when the device has no such hook (the
++// pre-slab / cudaMalloc arm).
++//
++// The value can be LOWERED late -- the expert cache's residency rule runs after the context (and this backend)
++// exist -- so `stage_input` re-reads it per upload instead of trusting the construction-time copy.
++static int ggml_backend_meta_dev_bufs(ggml_backend_t simple_backend) {
++    if (simple_backend == nullptr) {
++        return 0;
++    }
++    return (int) ggml_backend_dev_slab_stage_slots(ggml_backend_get_device(simple_backend));
++}
++
+ struct ggml_backend_meta_context {
+     struct cgraph_config {
+         ggml_cgraph * cgraph_main = nullptr;
+@@ -1978,6 +2622,38 @@ struct ggml_backend_meta_context {
      size_t                      max_subgraphs = 0;
      size_t                      n_subgraphs   = 0;
      uint64_t                    uid           = 0;
@@ -3875,22 +3959,31 @@ index 930b58fb4..822070752 100644
 +    };
 +    std::vector<stage_entry> stage_pending; // staged by `stage_input`, drained by `graph_compute`
 +    int   stage_slot_next = 0;
-+    int   stage_n_slots   = 8;              // GGML_SCHED_STAGE_SLOTS, clamped to the ring's 16
++    int   stage_n_slots   = 3;              // the transport's buffer count, read from the devices (see the ctor)
 +    std::vector<std::vector<ggml_backend_event_t>> stage_done_ev; // [device][slot], upload complete
 +    std::vector<std::vector<ggml_backend_event_t>> stage_free_ev; // [device][slot], slot reusable
  
      void *                               comm_ctx       = nullptr;
      ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
-@@ -2000,6 +2608,26 @@ struct ggml_backend_meta_context {
+@@ -2000,6 +2676,35 @@ struct ggml_backend_meta_context {
          }
          name += ")";
  
-+        // op-offload H2D staging (issue #50 WIP): the slot count mirrors the single-device ring, so
-+        // GGML_SCHED_STAGE_SLOTS means the same depth on both paths (the ring itself lives in each
-+        // simple backend's context and is bounded by its own GGML_SCHED_STAGE_MAX_MB).
++        // op-offload H2D staging (issue #50 WIP): the ring depth must be the SAME number the slab sizes the
++        // transport region from, because a slot that does not fit makes the WHOLE input decline
++        // (`ggml_backend_meta_stage_input` reserves every device's slot before it uploads anything, so a partial
++        // ring is never used).  It is read from the devices this split wraps through the generic
++        // `slab_stage_slots` hook -- the one number the scheduler's pipeline depth and the slab's region also
++        // follow -- so the three cannot drift.  The staging path re-reads it per upload as well, because the
++        // residency rule that can LOWER it runs after this backend exists.
 +        {
-+            const char * slots_env = GGML_ENV_STR("GGML_SCHED_STAGE_SLOTS");
-+            stage_n_slots = slots_env != nullptr ? atoi(slots_env) : 8;
++            stage_n_slots = 3;
++            for (size_t j = 0; j < n_devs && j < simple_backends.size(); j++) {
++                const int v = ggml_backend_meta_dev_bufs(simple_backends[j]);
++                if (v > 0 && v < stage_n_slots) {
++                    stage_n_slots = v;   // the minimum: every device stages into its own ring
++                }
++            }
 +            if (stage_n_slots < 1) {
 +                stage_n_slots = 1;
 +            }
@@ -3908,7 +4001,7 @@ index 930b58fb4..822070752 100644
          if (n_devs > 1) {
              ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
                  ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_init");
-@@ -2022,6 +2650,12 @@ struct ggml_backend_meta_context {
+@@ -2022,6 +2727,12 @@ struct ggml_backend_meta_context {
              GGML_ASSERT(comm_free != nullptr);
              comm_free(comm_ctx);
          }
@@ -3921,7 +4014,7 @@ index 930b58fb4..822070752 100644
          for (auto & bc : backend_configs) {
              ggml_backend_free(bc.backend);
          }
-@@ -2043,12 +2677,26 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
+@@ -2043,12 +2754,26 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
  
  static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -3951,7 +4044,7 @@ index 930b58fb4..822070752 100644
  
      switch (split_state.axis) {
          case GGML_BACKEND_SPLIT_AXIS_0:
-@@ -2056,25 +2704,105 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -2056,25 +2781,105 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
          case GGML_BACKEND_SPLIT_AXIS_2: {
              // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
              const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
@@ -4072,7 +4165,7 @@ index 930b58fb4..822070752 100644
              for (size_t j = 0; j < n_backends; j++) {
                  ggml_backend_tensor_set_async(
                      ggml_backend_meta_simple_backend(backend, j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
-@@ -2087,57 +2815,262 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
+@@ -2087,57 +2892,290 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
  }
  
  static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -4134,6 +4227,20 @@ index 930b58fb4..822070752 100644
 -                ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_j, offset, chunk_size_j,
 -                    i_stop - i_start, chunk_size_j, chunk_size_full);
 -                offset_j += chunk_size_j;
++// wip/flash-next-prefill: the transport's buffer count as this split's devices report it, or 3 (the pre-decision
++// default) when none has a slab-backed ring.
++static int ggml_backend_meta_transport_bufs(ggml_backend_t meta_backend) {
++    const size_t n_backends = ggml_backend_meta_n_backends(meta_backend);
++    int n = 0;
++    for (size_t j = 0; j < n_backends; j++) {
++        const int v = ggml_backend_meta_dev_bufs(ggml_backend_meta_simple_backend(meta_backend, j));
++        if (v > 0 && (n == 0 || v < n)) {
++            n = v;
++        }
++    }
++    return n > 0 ? n : 3;
++}
++
 +static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor * input, ggml_tensor * input_cpy) {
 +    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 +    const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -4169,6 +4276,30 @@ index 930b58fb4..822070752 100644
 +        return false;
 +    }
 +    const size_t n_chunks = gather ? size / chunk_size_full : 0;
++
++    // wip/flash-next-prefill: follow the transport's one number.  The residency rule that picks the count runs
++    // when the expert cache's arena settles, i.e. AFTER this backend was constructed, and it only ever LOWERS the
++    // depth (from the default 3), so the ring's event vectors -- sized at construction -- stay large enough and the
++    // per-device region keeps fitting its slots.
++    {
++        const int pipe_now = ggml_backend_meta_transport_bufs(backend);
++        if (pipe_now > 0 && pipe_now < backend_ctx->stage_n_slots) {
++            backend_ctx->stage_n_slots = pipe_now;
++            if (backend_ctx->stage_slot_next >= backend_ctx->stage_n_slots) {
++                backend_ctx->stage_slot_next = 0;
+             }
+-            GGML_ASSERT(offset_j == chunk_size_full);
+-        } break;
+-        case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
+-            // TODO other simple backend may be better
+-            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, 0);
+-            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
+-            ggml_backend_tensor_get_async(simple_backend, simple_tensor, data, offset, size);
+-        } break;
+-        default: {
+-            GGML_ABORT("fatal error");
+         }
+     }
 +
 +    const int slot = backend_ctx->stage_slot_next;
 +    backend_ctx->stage_slot_next = (backend_ctx->stage_slot_next + 1) % backend_ctx->stage_n_slots;
@@ -4247,22 +4378,12 @@ index 930b58fb4..822070752 100644
 +                // ring slot unfilled and its done-event unrecorded, so the consuming kernels would read
 +                // whatever the slot last held -- silently correct only while the weights are static.
 +                return false;
-             }
--            GGML_ASSERT(offset_j == chunk_size_full);
--        } break;
--        case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
--            // TODO other simple backend may be better
--            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, 0);
--            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
--            ggml_backend_tensor_get_async(simple_backend, simple_tensor, data, offset, size);
--        } break;
--        default: {
--            GGML_ABORT("fatal error");
++            }
 +        } else {
 +            chunk.backend->iface.stage_upload(chunk.backend, chunk.slot, (const char *) input->data + chunk.src,
 +                                              chunk.size, backend_ctx->stage_done_ev[chunk.device][slot]);
-         }
-     }
++        }
++    }
 +    backend_ctx->stage_pending.push_back(std::move(entry));
 +    return true;
  }
@@ -4286,10 +4407,10 @@ index 930b58fb4..822070752 100644
 +        if (bw == 0.0f || b < bw) {
 +            bw = b;
 +        }
-+    }
+     }
 +    return bw;
-+}
-+
+ }
+ 
 +// The fused per-device kernels (see ggml_cuda_try_fuse) must not write into a
 +// source they still read. The scheduler allocates the graph's tensors before
 +// the Meta backend dispatches the per-device subgraphs, so the CUDA-side
@@ -4344,9 +4465,9 @@ index 930b58fb4..822070752 100644
 +                params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
 +        }
 +        i += match.node_count - 1;
-     }
- }
- 
++    }
++}
++
 +// RAII: once a split's child graphs have been launched their kernels hold the staged slot pointers,
 +// so the simple tensors can be pointed back at their real data and the slots freed -- on every exit
 +// path, an early error return included.  Recording the free event on the device's main stream is what
@@ -4374,7 +4495,7 @@ index 930b58fb4..822070752 100644
  static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
      GGML_ASSERT(cgraph->grads == nullptr);
      const size_t n_backends = ggml_backend_meta_n_backends(backend);
-@@ -2172,11 +3105,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2172,11 +3210,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
          }
          for (ggml_backend_buffer_t buf : used_buffers) {
              ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
@@ -4390,7 +4511,7 @@ index 930b58fb4..822070752 100644
              stc.simple_tensors.clear();
          }
          size_t n_subgraphs  = 0;
-@@ -2187,6 +3119,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2187,6 +3224,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
  
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
@@ -4408,7 +4529,7 @@ index 930b58fb4..822070752 100644
                  if (!ggml_backend_buffer_is_meta(node->buffer)) {
                      // [TAG_META_HOST_VIEWS]
                      GGML_ASSERT(ggml_backend_meta_is_host_view(node));
-@@ -2200,6 +3143,39 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2200,6 +3248,39 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              }
          }
  
@@ -4448,7 +4569,7 @@ index 930b58fb4..822070752 100644
          {
              // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
              auto get_i_delayed_branch = [&](const int i) -> int {
-@@ -2462,12 +3438,43 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2462,12 +3543,43 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  cgraph_ij->uid = ggml_graph_next_uid();
              }
          }
@@ -4492,7 +4613,7 @@ index 930b58fb4..822070752 100644
          ggml_tensor * ret = backend_ctx->nodes_aux[ina++];
          memset(ret, 0, sizeof(ggml_tensor));
          ret->op   = GGML_OP_NONE;
-@@ -2645,6 +3652,232 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2645,6 +3757,255 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
      return GGML_STATUS_SUCCESS;
  }
  
@@ -4599,6 +4720,29 @@ index 930b58fb4..822070752 100644
 +        band = std::min(band, b);
 +    }
 +    return n_backends > 0 ? band : 8;
++}
++
++// wip/flash-next-prefill: the transport selector's input, summed over the children.  A tensor split
++// keeps each device's shard in that device's own arena, so the per-device sums are the aggregate coverage --
++// and the exposure the selector computes from them is the bytes the whole split would pull over N links.
++static void ggml_backend_meta_moe_cache_residency(ggml_backend_t backend, int64_t * covered, int64_t * host) {
++    GGML_ASSERT(ggml_backend_is_meta(backend));
++    if (covered != nullptr) { *covered = 0; }
++    if (host != nullptr)    { *host    = 0; }
++    const size_t n = ggml_backend_meta_n_backends(backend);
++    int64_t cov = 0, all = 0;
++    for (size_t j = 0; j < n; j++) {
++        ggml_backend_t simple = ggml_backend_meta_simple_backend(backend, j);
++        if (simple == nullptr || simple->iface.moe_cache_residency == nullptr) {
++            continue;
++        }
++        int64_t c = 0, h = 0;
++        simple->iface.moe_cache_residency(simple, &c, &h);
++        cov += c;
++        all += h;
++    }
++    if (covered != nullptr) { *covered = cov; }
++    if (host != nullptr)    { *host    = all; }
 +}
 +
 +static bool ggml_backend_meta_moe_cache_gather(ggml_backend_t backend, const struct ggml_tensor * weight,
@@ -4725,7 +4869,7 @@ index 930b58fb4..822070752 100644
  static const ggml_backend_i ggml_backend_meta_i = {
      /* .get_name                = */ ggml_backend_meta_get_name,
      /* .free                    = */ ggml_backend_meta_free,
-@@ -2659,9 +3892,21 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -2659,9 +4020,21 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .graph_plan_update       = */ nullptr,
      /* .graph_plan_compute      = */ nullptr,
      /* .graph_compute           = */ ggml_backend_meta_graph_compute,
@@ -4751,7 +4895,7 @@ index 930b58fb4..822070752 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index d598ca3d8..f93614ad7 100644
+index d598ca3d8..85f547457 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -21,8 +21,21 @@
@@ -4972,19 +5116,25 @@ index d598ca3d8..f93614ad7 100644
      backend->iface.synchronize(backend);
  }
  
-@@ -1183,6 +1369,11 @@ struct ggml_backend_sched_split {
+@@ -1181,8 +1367,17 @@ struct ggml_backend_sched_split {
+     int inputs_capacity;
+     // graph view of this split
      struct ggml_cgraph graph;
++    // wip/flash-next-prefill: this split carries a stageable host-weight set (host weights that are not left to
++    // the gather, at a width the staging gate allows).  For a backend with a per-device staged transport (the
++    // Meta backend under `-sm tensor`, which has `stage_input` and no backend slots) this is the ONLY way its
++    // staged path is reached; the pipeline does not run there.
++    bool stage_ok;
  };
  
-+// Ring depth for the op-offload H2D staging prototype (issue #50 WIP).  This is the compile-time
-+// maximum; the effective depth is GGML_SCHED_STAGE_SLOTS (default 6), clamped to this.
-+#define GGML_SCHED_STAGE_SLOTS 16
-+#define GGML_SCHED_STAGE_SLOTS_DEFAULT 8
++// The staging transport's buffer count is at most GGML_SCHED_PIPE_MAX_BUFS (the scheduler's per-buffer arrays are
++// indexed by it), and the pipeline occupies backend stage slots 0..n-1 of the backend's stage array.
++#define GGML_SCHED_PIPE_MAX_BUFS 4
 +
  struct ggml_backend_sched {
      bool is_reset; // true if the scheduler has been reset since the last graph split
      bool is_alloc;
-@@ -1238,6 +1429,26 @@ struct ggml_backend_sched {
+@@ -1238,6 +1433,26 @@ struct ggml_backend_sched {
  
      bool op_offload;
  
@@ -5011,7 +5161,7 @@ index d598ca3d8..f93614ad7 100644
      int debug;
  
      // graph size of the current and the previous scheduling, used by the realloc callback and for debugging
-@@ -1335,6 +1546,19 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
+@@ -1335,6 +1550,19 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
  #endif
  
  // returns the backend that should be used for the node based on the current locations
@@ -5031,7 +5181,7 @@ index d598ca3d8..f93614ad7 100644
  static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
      // assign pre-allocated nodes to their backend
      int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
-@@ -1385,7 +1609,22 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+@@ -1385,7 +1613,22 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                  int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                  // check if a backend with higher prio wants to offload the op
                  if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
@@ -5054,7 +5204,7 @@ index d598ca3d8..f93614ad7 100644
                          if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                              SET_CAUSE(tensor, "1.off");
                              return b;
-@@ -1451,6 +1690,18 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
+@@ -1451,6 +1694,18 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
      }
  }
  
@@ -5073,7 +5223,7 @@ index d598ca3d8..f93614ad7 100644
  static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
      ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
      ggml_backend_buffer_type_t buft = NULL;
-@@ -1469,6 +1720,21 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
+@@ -1469,6 +1724,21 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
          }
      }
  
@@ -5095,7 +5245,7 @@ index d598ca3d8..f93614ad7 100644
      return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
  }
  
-@@ -1480,6 +1746,55 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
+@@ -1480,6 +1750,55 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
  }
  
  // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
@@ -5151,7 +5301,7 @@ index d598ca3d8..f93614ad7 100644
  void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      // reset splits
      sched->n_splits = 0;
-@@ -1679,6 +1994,86 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1679,6 +1998,86 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
          }
      }
  
@@ -5238,7 +5388,7 @@ index d598ca3d8..f93614ad7 100644
      // pass 4: assign backends to remaining src from dst and view_src
      for (int i = 0; i < graph->n_nodes; i++) {
          struct ggml_tensor * node = graph->nodes[i];
-@@ -1727,7 +2122,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1727,7 +2126,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
          split->i_start = 0;
          split->n_inputs = 0;
          int cur_backend_id = split->backend_id;
@@ -5250,7 +5400,7 @@ index d598ca3d8..f93614ad7 100644
          for (; i < graph->n_nodes; i++) {
              struct ggml_tensor * node = graph->nodes[i];
  
-@@ -1742,7 +2140,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1742,7 +2144,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
              // check if we should start a new split based on the sources of the current node
              // this also applies to a split without inputs, e.g. one that follows a split that only writes to a host buffer
              bool need_new_split = false;
@@ -5266,7 +5416,7 @@ index d598ca3d8..f93614ad7 100644
                  for (int j = 0; j < GGML_MAX_SRC; j++) {
                      struct ggml_tensor * src = node->src[j];
                      if (src == NULL) {
-@@ -1753,7 +2158,74 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1753,7 +2162,74 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                      if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                          int src_backend_id = tensor_backend_id(src);
                          if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
@@ -5341,7 +5491,7 @@ index d598ca3d8..f93614ad7 100644
                              break;
                          }
                      }
-@@ -1778,8 +2250,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1778,8 +2254,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                  split->i_start = i;
                  split->n_inputs = 0;
                  cur_backend_id = node_backend_id;
@@ -5351,7 +5501,7 @@ index d598ca3d8..f93614ad7 100644
  
              // find inputs that are not on the same backend
              for (int j = 0; j < GGML_MAX_SRC; j++) {
-@@ -1802,6 +2274,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1802,6 +2278,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                              if (sched->n_copies > 1) {
                                  ggml_set_input(tensor_copy);
                                  ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
@@ -5360,7 +5510,7 @@ index d598ca3d8..f93614ad7 100644
                              }
                              tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                              SET_CAUSE(tensor_copy, "4.cpy");
-@@ -1811,6 +2285,29 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1811,6 +2289,29 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                              ggml_backend_sched_split_inputs_grow(split);
                          }
                          split->inputs[n_inputs] = src;
@@ -5390,7 +5540,7 @@ index d598ca3d8..f93614ad7 100644
                      }
                      // inputs of nodes that are not computed (e.g. the unselected branches of ggml_build_forward_select)
                      // stay in the split so that the allocation does not change, but they do not need to be copied
-@@ -1894,6 +2391,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1894,6 +2395,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
              }
          },
          /* .user_data     = */ &alloc_deps,
@@ -5401,7 +5551,7 @@ index d598ca3d8..f93614ad7 100644
      };
  
      for (int i = 0; i < sched->n_splits; i++) {
-@@ -2091,13 +2592,376 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -2091,13 +2596,482 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
      return true;
  }
  
@@ -5415,159 +5565,265 @@ index d598ca3d8..f93614ad7 100644
 +    return *pev;
 +}
 +
-+static bool sched_stage_is_host_weight(const struct ggml_tensor * input) {
-+    return input->buffer != NULL &&
-+           ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-+           ggml_backend_buffer_is_host(input->buffer);
++// wip/flash-next-prefill: the capture-safety limit for a pipeline buffer consumed IN PLACE.  A captured CUDA
++// graph bakes the consumer's input pointer in, so an in-place consume is only legal ABOVE the graph-capture limit;
++// the staging width floor (>= 64 tokens, `sched_stage_min_tokens`) makes that true in practice, and the width a
++// split really got is re-checked at the consume so `GGML_SCHED_STAGE_MIN_TOKENS=0` cannot make it a silent wrong
++// answer.
++//
++// The value is the BACKEND's capture limit (`GGML_CUDA_GRAPH_MAX_TOKENS`, which the CUDA backend clamps to the same
++// 32 -- see `GGML_CUDA_GRAPH_MAX_TOKENS_CAP`): a captured graph holds at most that many tokens, and an in-place
++// consume needs more, so the two sets cannot overlap.  Raise one and you must raise the other.
++static constexpr int64_t SCHED_STAGE_CAPTURE_SAFE_TOKENS = 32;
++
++// forward declarations: the pipeline helpers below use each other and the staging predicates, all of which are
++// defined further down in this file (with the rest of the staging transport).
++static bool sched_stage_is_host_weight(const struct ggml_tensor * input);
++static bool sched_stage_exposure_decides(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
++                                         ggml_backend_t backend);
++static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
++                                   const struct ggml_tensor * input, const struct ggml_tensor * input_cpy);
++static int64_t sched_stage_min_tokens(ggml_backend_sched_t sched);
++static int64_t sched_stage_batch_tokens(const struct ggml_backend_sched_split * split);
++
++// wip/flash-next-prefill: the pipeline's kill switch (`GGML_SCHED_PIPELINE=0` leaves every host weight to the
++// serial whole-table upload).
++static bool sched_pipe_on(void) {
++    static const bool on = [] {
++        const char * e = GGML_ENV_STR("GGML_SCHED_PIPELINE");
++        return e == nullptr || e[0] == '\0' || atoi(e) != 0;
++    }();
++    return on;
 +}
 +
-+// Adaptive gate (issue #50 WIP): whole-tensor staging bypasses the used-expert pruning, so it only
-+// wins when the batch is wide enough that pruning would not prune much.  The crossover width is
-+// **link-dependent** (measured: ~2048 tokens at ~14.5 GB/s PCIe5 x4, ~700 at ~25 GB/s PCIe4 x16), so
-+// the default threshold is calibrated from the backend's measured H2D bandwidth.  An explicit
-+// GGML_SCHED_STAGE_MIN_TOKENS overrides it (0 = stage for every batch).
-+static int64_t sched_stage_min_tokens(ggml_backend_sched_t sched) {
-+    const char * e = GGML_ENV_STR("GGML_SCHED_STAGE_MIN_TOKENS");
-+    if (e != nullptr) {
-+        return (int64_t) atoll(e);
-+    }
-+    static int64_t calibrated = -1;
-+    if (calibrated < 0) {
-+        float bw = 0.0f;
-+        for (int b = 0; b < sched->n_backends; b++) {
-+            if (sched->backends[b]->iface.stage_h2d_gbps != NULL) {
-+                bw = sched->backends[b]->iface.stage_h2d_gbps(sched->backends[b]);
-+                break;
-+            }
-+        }
-+        // Two measured crossover points (issue #50 WIP): ~14.5 GB/s (PCIe5 x4) crosses between 1024
-+        // and 2048 tokens, ~25 GB/s (PCIe4 x16) below 1024.  Anchor at 1536 for 14.5 GB/s and take a
-+        // first-order slope; GGML_SCHED_STAGE_MIN_TOKENS overrides it.
-+        const double t = 1536.0 - 132.0*(double(bw) - 14.5);
-+        // Floor the gate above the widest verify batch (16), so a decode/verify batch can never stage
-+        // whole expert tensors even on a link fast enough to push the crossover to 0.  An unknown link
-+        // (bw <= 0) falls to the same conservative floor, since t is then large anyway.
-+        calibrated = (int64_t) (t > 64.0 ? t : 64.0);
-+        GGML_LOG_INFO("%s: H2D staging calibration: %.1f GB/s -> min_tokens=%lld\n",
-+                      __func__, double(bw), (long long) calibrated);
-+        if (GGML_ENV_STR("GGML_SCHED_STAGE") != nullptr) {
-+            // ggml's INFO level maps to TRACE verbosity, which is below llama.cpp's default threshold,
-+            // so a field log would not show which gate this host actually chose (only the messages
-+            // emitted before llama_log_set installs the filter get through by default).  An explicit
-+            // GGML_SCHED_STAGE=1 means the user asked for staging and wants to see the decision, so
-+            // that case also gets a notice at the level that survives by default.  If staging ever
-+            // becomes default-on this stays silent unless the variable is set.
-+            GGML_LOG_WARN("%s: H2D staging: %.1f GB/s link -> whole-weight uploads staged from %lld tokens\n",
-+                          __func__, double(bw), (long long) calibrated);
-+        }
-+    }
-+    return calibrated;
-+}
-+
-+static int64_t sched_stage_batch_tokens(const struct ggml_backend_sched_split * split) {
-+    if (split->graph.n_nodes == 0) {
-+        return 0;
-+    }
-+    const struct ggml_tensor * node = split->graph.nodes[0];
-+    if (node->op == GGML_OP_MUL_MAT_ID && node->src[2] != NULL) {
-+        // MUL_MAT_ID: src[2] is the router's expert ids, ne[1] is the token count
-+        return node->src[2]->ne[1];
-+    }
-+    if (node->src[1] != NULL) {
-+        return node->src[1]->ne[1];
-+    }
-+    return 0;
-+}
-+
-+// Size of the largest host-weight input of this split (0 when there is none).  The staging/gather
-+// crossover is a function of the table size, not just the link: the whole-table copy is bytes/bw, so a
-+// bigger table crosses over at a wider batch.
-+static size_t sched_stage_host_weight_bytes(const struct ggml_backend_sched_split * split) {
-+    size_t max_bytes = 0;
-+    for (int i = 0; i < split->n_inputs; i++) {
-+        if (!sched_stage_is_host_weight(split->inputs[i])) {
++// The buffer COUNT.  wip/flash-next-prefill: it is NOT a free-VRAM decision.  The buffers live INSIDE the slab
++// (the transport region is a carve in the slab's work band, released at every prefill -> decode transition), so
++// their real cost is the hot set they take away from the DECODE arena -- and the free-VRAM figure at scheduler
++// construction knows nothing about the arena, which is sized later (`MoE expert cache (auto): arena ...
++// residency`).  Three buffers are ~2 % faster at prefill than two, but the third one's set hurts decode badly
++// when the arena cannot hold a good working set.
++//
++// So: the number comes from the RESIDENCY RULE in the backend that owns the slab
++// (`ggml_cuda_moe_transport_decide`, run when the expert cache's arena settles), read through the existing
++// generic device hook (`slab_stage_slots`, which the CUDA backend answers with its own decided count) so this
++// layer keeps no copy of it -- the SAME number sizes the transport region and the Meta backend's ring depth.
++// This function only chooses the FALLBACK for a transport that is not slab-backed (plain `cudaMalloc` slots),
++// where the budget still is free VRAM at startup.
++//
++// This layer parses NO environment variable: `GGML_SCHED_PIPELINE_BUFS=1|2|3` (and its aliases) is read in ONE
++// place -- the CUDA backend's transport authority -- and reaches this function through the generic
++// `slab_stage_slots` hook, so a rename cannot leave one layer on an old spelling.
++static int sched_pipe_free_vram_rule(ggml_backend_sched_t sched) {
++    size_t min_free = 0;    // the SMALLEST free figure: on a split each device owns its own buffers
++    for (int b = 0; b < sched->n_backends; b++) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
++        if (dev == NULL) {
 +            continue;
 +        }
-+        const size_t bytes = ggml_nbytes(split->inputs[i]);
-+        if (bytes > max_bytes) {
-+            max_bytes = bytes;
++        const enum ggml_backend_dev_type t = ggml_backend_dev_type(dev);
++        if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
++            continue;
++        }
++        size_t fr = 0, tot = 0;
++        ggml_backend_dev_memory(dev, &fr, &tot);
++        if (fr != 0 && (min_free == 0 || fr < min_free)) {
++            min_free = fr;
 +        }
 +    }
-+    return max_bytes;
++    const size_t GiB = (size_t) 1 << 30;
++    if (min_free == 0)               { return 3; }   // unknown device: the deepest stage
++    if (min_free <= 14 * GiB)        { return 1; }
++    if (min_free <= 24 * GiB)        { return 2; }
++    return 3;
 +}
 +
-+// Reference host-table size the link-calibrated base threshold was fitted at (the campaign's
-+// Qwen3.6-35B-A3B Q4_K_M tables, ~144 MiB).  **Default 0 = the table-size scaling is DISABLED**: the
-+// width-only, bandwidth-calibrated gate is used.  The scaling (issue #93) was added in the same change
-+// as the ring-budget fix, while the old fixed 2048 MiB budget was still disabling the ring mid-run, so
-+// the measurement it was fitted to was confounded.  Re-validated 2026-10-06 on gfx1201 x4 with the ring
-+// fix and the pinned 2-D H2D in place: staging beats the serial path at every `-ub` from 1024 to 8192
-+// for both a 450 MiB (Flash-Next IQ3_XXS `-sm layer`) and an 850 MiB (Flash-Next IQ4_XS `-sm tensor`)
-+// host table, so the scaling only ever turns a win into a loss.  `GGML_SCHED_STAGE_TABLE_REF_MB=<MiB>`
-+// restores the old scaling for A/B (0 is the same as the default).
-+static constexpr size_t SCHED_STAGE_TABLE_REF_BYTES = 0;
-+
-+static int64_t sched_stage_min_tokens_for_bytes(ggml_backend_sched_t sched, size_t bytes) {
-+    const int64_t base = sched_stage_min_tokens(sched);
-+    if (base <= 0) {
-+        return base; // explicit "stage for every batch" (GGML_SCHED_STAGE_MIN_TOKENS=0)
++// `source`, when non-NULL, receives a static string naming where the number came from -- the log line below
++// prints it, and it must not claim the residency rule for a transport that is not slab-backed.
++static int sched_pipe_choose_bufs(ggml_backend_sched_t sched, const char ** source) {
++    // A slab-backed transport owns the number (its region is carved for exactly this many buffers, so a
++    // disagreement is not a slower run, it is a refused fill: `ggml_cuda_slab_arena_alloc_transient` refuses
++    // what the region was not sized for, and every staged input falls back to the serial upload).  The hook
++    // already carries the user's override, so nothing here reads the environment.
++    int slab_depth = 0;   // the MINIMUM across staged devices: on a split every device must own a slot
++    int hook_depth = 0;   // ... and the same figure from any backend, slab-backed or not (for the fallback)
++    for (int b = 0; b < sched->n_backends; b++) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
++        if (dev == NULL) {
++            continue;
++        }
++        const int n = (int) ggml_backend_dev_slab_stage_slots(dev);
++        if (n <= 0) {
++            continue;
++        }
++        if (hook_depth == 0 || n < hook_depth) {
++            hook_depth = n;
++        }
++        if (ggml_backend_dev_slab_enabled(dev) && (slab_depth == 0 || n < slab_depth)) {
++            slab_depth = n;
++        }
 +    }
-+    const char * ref_env = GGML_ENV_STR("GGML_SCHED_STAGE_TABLE_REF_MB");
-+    if (ref_env != nullptr && atoll(ref_env) == 0) {
-+        return base; // scaling disabled
++    if (slab_depth > 0) {
++        if (source != NULL) {
++            *source = "the transport's depth (expert-cache residency rule, or the user's override)";
++        }
++        return slab_depth > 3 ? 3 : slab_depth;
 +    }
-+    const size_t ref = ref_env != nullptr ? (size_t) atoll(ref_env) * 1024 * 1024
-+                                          : SCHED_STAGE_TABLE_REF_BYTES;
-+    if (ref == 0 || bytes == 0) {
-+        return base;
++    // No slab-backed transport: the buffers are plain `cudaMalloc` slots, so free VRAM still caps them -- but a
++    // user override (already in `hook_depth`) wins when it is the smaller of the two.
++    if (source != NULL) {
++        *source = "free VRAM at startup (no slab-backed transport)";
 +    }
-+    const int64_t scaled = base * (int64_t) bytes / (int64_t) ref;
-+    return scaled > 64 ? scaled : 64; // never below the widest verify batch
++    const int vram = sched_pipe_free_vram_rule(sched);
++    return hook_depth > 0 && hook_depth < vram ? hook_depth : vram;
 +}
 +
-+// The staging/gather crossover for this split (its largest host table).  Below it the gather wins: the
-+// whole-table ring copy cannot hide behind the short compute, and it forgoes the used-expert pruning.
-+// When the split has no host-resident weight there is nothing to stage, so return before
-+// `sched_stage_min_tokens()`: that call runs the one-off H2D bandwidth calibration, which cudaMallocs a
-+// large probe buffer and (on Windows) does not get the memory back after `cudaFree` (issue #97), so a
-+// dense full-offload run would strand the buffer for the whole session for no benefit.  The calibration
-+// is deferred until a split that actually carries a host weight.
-+static int64_t sched_stage_min_tokens_for(ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split) {
-+    const size_t bytes = sched_stage_host_weight_bytes(split);
-+    if (bytes == 0) {
++// Does this split carry a host-resident weight that would be STAGED (a gatherable input is left to the gather)?
++static int sched_pipe_split_set(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
++                              size_t * bytes) {
++    int n = 0;
++    size_t total = 0;
++    ggml_backend_t split_backend = sched->backends[split->backend_id];
++    const int64_t  n_tok         = sched_stage_batch_tokens(split);
++    for (int i = 0; i < split->n_inputs; i++) {
++        struct ggml_tensor * input = split->inputs[i];
++        if (!sched_stage_is_host_weight(input)) {
++            continue;
++        }
++        struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
++        if (sched_input_gatherable(sched, split, input, input_cpy)) {
++            continue;
++        }
++        // TODO #133: an expert table the cache serves IN PLACE at this width must not be staged either -- the
++        // take-over skips the `input_cpy` copy entirely and the op reads the arena, so a fill would be a
++        // whole-table re-copy out of VRAM that nothing reads (measured before the guard: 61 GiB for a
++        // 3049-token prompt on a 100 %-resident arena, serialised against the compute, which left 3-GPU prefill
++        // SLOWER than 1-GPU).  All-or-nothing per split, exactly like the gather above: a merged routed-MoE
++        // split holds a layer's gate/up/down together and they agree.
++        // `moe_cache_serves_in_place` only REPORTS the decision; it is the same predicate the dispatch path
++        // takes, so the two cannot disagree.
++        if (split_backend->iface.moe_cache_in_place != NULL &&
++            split_backend->iface.moe_cache_in_place(split_backend, input, input_cpy, n_tok)) {
++            if (bytes != NULL) { *bytes = 0; }
++            return 0;
++        }
++        n++;
++        total += (ggml_nbytes(input) + 255u) & ~(size_t) 255u;   // 256-byte aligned layout
++    }
++    if (n == 0) {
++        // Nothing to stage: return BEFORE the width gate.  `sched_stage_min_tokens()` runs the one-off H2D
++        // bandwidth calibration, which cudaMallocs a large probe buffer and (on Windows) does not get that
++        // memory back after `cudaFree` (issue #97) -- so a dense / fully-resident split must not ask it.
++        if (bytes != NULL) { *bytes = 0; }
 +        return 0;
 +    }
-+    return sched_stage_min_tokens_for_bytes(sched, bytes);
++    // THE STAGING WIDTH GATE: below it, whole-tensor staging cannot hide behind the split's compute and the
++    // used-expert pruning / the arena serve the op instead.  Without this the pipeline would stage the whole
++    // table at DECODE widths too (measured: generation 27.1 t/s against 48.4 when only prefill widths stage).
++    const int64_t min_tokens = sched_stage_min_tokens(sched);
++    if (min_tokens > 0 && sched_stage_batch_tokens(split) < min_tokens) {
++        if (bytes != NULL) { *bytes = 0; }
++        return 0;
++    }
++    if (bytes != NULL) {
++        *bytes = total;
++    }
++    return n;
 +}
 +
-+// Issue this split's offloaded host-weight uploads into the staging ring on the copy stream, before
-+// the split's compute is enqueued.  The upload then overlaps the previous split's compute (the copy
-+// stream is independent).  The input loop below drains stage_consumed with a device-to-device copy
-+// into the actual split input after waiting on the per-slot upload event.
-+//
-+// There is deliberately NO redirect form (it used to be `GGML_SCHED_STAGE_MODE=1`): pointing the split
-+// input's `data` at the ring slot saves that D2D (+0.3 % prefill, measured) but is only correct while
-+// the consuming graph is not captured, i.e. only above the staging width gate -- a heuristic, not an
-+// invariant, and mode 0 is the capture-safe form (its D2D lands in a graph-owned buffer).  Retired in
-+// r250 (TODO #284, INVARIANTS r250); see `archive/work/h2d-staging-ring/`.
++// Is this input one of the entries the CURRENT pipeline buffer holds?  Returns the offset, or (size_t) -1.
++static size_t sched_pipe_entry_off(ggml_backend_sched_t sched, const struct ggml_tensor * input_cpy) {
++    for (int k = 0; k < sched->pipe_n_ent[sched->pipe_cur]; k++) {
++        if (sched->pipe_ent[sched->pipe_cur][k].dst == input_cpy) {
++            return sched->pipe_ent[sched->pipe_cur][k].off;
++        }
++    }
++    return (size_t) -1;
++}
 +
-+// wip/moe-expert-cache (B1): a routed expert table (a MUL_MAT_ID src0) is uploaded far more cheaply by
-+// the device-side expert gather -- it copies only the routed experts straight from the pinned host
-+// master into the split input, on the compute stream, with no ring and no whole-table upload -- than by
-+// whole-tensor H2D staging, which re-uploads all 512 experts on every ubatch (measured: 1814 vs 405
-+// t/s at `-p 8192 -ub 2048` on a single R9700).  When the backend can gather, defer these inputs to
-+// the input loop's gather branch instead of staging them.
-+//
-+// A *large* expert table was the case where the device gather was expected to win even above the
-+// staging width gate: whole-shard staging moves the whole table every ubatch while the gather moves
-+// only the routed experts.  The numbers that originally justified the 224 MiB threshold (qwen4exp
-+// 450 MiB table gather 3052 vs staging 1403 t/s, Q8_0 272 MiB 3595 vs 3552, Q4_K_M 144 MiB 4291 vs
-+// 5624) came from a *corrupted* gather pass: NaN routing made it skip expert work, so they are not
-+// valid.  With the gather made correct (zero every expert head on every gather) it loses to staging
-+// even for the 450 MiB table on a PCIe 5.0 x16 link (reporter's 2026-10-04 measurement, ~35 % slower),
-+// which is why the gather stays default-off (`GGML_SCHED_DEVGATHER=1` is an A/B switch only; see
-+// `wip/moe-mmq-overread/RESOLUTION.md`).  The threshold is retained so A/B runs still select the
-+// gather for large tables; it is not a claim that the gather wins.
++// Fill one buffer with a split's host-weight set: the wait on the buffer's FREE event first (the split that
++// consumed it may still be reading), then the uploads, then the DONE event the consumer waits on.
++static bool sched_pipe_issue(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, int buf) {
++    ggml_backend_t backend = sched->backends[split->backend_id];
++    size_t  need  = 0;
++    const int n = sched_pipe_split_set(sched, split, &need);
++    sched->pipe_n_ent[buf] = 0;
++    if (n <= 0) {
++        if (getenv("GGML_SCHED_STAGE_SELECT_DEBUG") != nullptr) {
++            static int warned = 0;
++            if (warned++ < 4) {
++                GGML_LOG_WARN("%s: pipeline: split %d has no stageable host-weight set (n=%d, need=%zu) -> "
++                              "serial path\n", __func__, split->backend_id, n, need);
++            }
++        }
++        return false;
++    }
++    if (n > (int) (sizeof(sched->pipe_ent[0]) / sizeof(sched->pipe_ent[0][0]))) {
++        return false;   // a set too wide to lay out: leave it to the serial path
++    }
++    if (need > sched->pipe_size) {
++        if (sched->pipe_size != 0) {
++            // The graph pass sizes the buffer from its largest host-weight set BEFORE any fill, so reaching this
++            // line means the two disagreed -- say so instead of resizing silently.
++            static bool warned = false;
++            if (!warned) {
++                warned = true;
++                GGML_LOG_WARN("%s: pipeline buffer grows %.1f -> %.1f MiB (a split set larger than the graph's "
++                              "largest, which is what the buffer is sized from)\n",
++                              __func__, (double) sched->pipe_size / (1024.0 * 1024.0),
++                              (double) need / (1024.0 * 1024.0));
++            }
++        }
++        sched->pipe_size = need;
++    }
++    // The previous consumer of this buffer must have finished reading it.  The free event lives in the array of the
++    // backend that OWNED the buffer at that time, which on a layer split is not necessarily this filler's backend
++    // (each backend keeps its own stage slots, and the record below still names the old owner at the moment it is
++    // recorded).
++    const int prev_owner = (sched->pipe_held && sched->pipe_base[buf] != nullptr) ? sched->pipe_backend[buf]
++                                                                                 : split->backend_id;
++    backend->iface.stage_wait(backend, sched_stage_ev(sched, prev_owner, buf, false));
++    void * base = backend->iface.stage_buffer(backend, buf, sched->pipe_size);
++    if (base == NULL) {
++        if (getenv("GGML_SCHED_STAGE_SELECT_DEBUG") != nullptr) {
++            static int warned = 0;
++            if (warned++ < 4) {
++                GGML_LOG_WARN("%s: pipeline: stage_buffer(%d, %.1f MiB) returned NULL -> the split takes the "
++                              "serial path\n", __func__, buf, (double) sched->pipe_size / 1048576.0);
++            }
++        }
++        return false;
++    }
++    sched->pipe_base[buf]    = base;
++    sched->pipe_backend[buf] = split->backend_id;
++
++    size_t off = 0;
++    int    k   = 0;
++    for (int i = 0; i < split->n_inputs; i++) {
++        struct ggml_tensor * input = split->inputs[i];
++        if (!sched_stage_is_host_weight(input)) {
++            continue;
++        }
++        struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
++        if (sched_input_gatherable(sched, split, input, input_cpy)) {
++            continue;
++        }
++        const size_t size = ggml_nbytes(input);
++        backend->iface.stage_upload(backend, (char *) base + off, input->data, size,
++                                    sched_stage_ev(sched, split->backend_id, buf, true));
++        sched->pipe_ent[buf][k].dst  = input_cpy;
++        sched->pipe_ent[buf][k].off  = off;
++        sched->pipe_ent[buf][k].size = size;
++        k++;
++        off += (size + 255u) & ~(size_t) 255u;
++    }
++    sched->pipe_n_ent[buf] = k;
++    sched->pipe_held       = true;
++    return k > 0;
++}
++
++// The gather/stage crossover for the BELOW-gate band and for a large table (mode 2, the A/B arm): a table this
++// big selects the device gather on its own.  The numbers that originally justified the threshold came from a
++// corrupted gather pass (see the note at the gather predicate), so it is an arm selector, not a win claim.
 +static constexpr size_t SCHED_GATHER_TABLE_MIN_BYTES = (size_t) 224 * 1024 * 1024;
 +
 +static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
@@ -5779,7 +6035,7 @@ index d598ca3d8..f93614ad7 100644
      const int split_backend_id = split->backend_id;
      ggml_backend_t split_backend = sched->backends[split_backend_id];
      ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
-@@ -2113,7 +2977,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -2113,7 +3087,12 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
          }
      }
  
@@ -5793,7 +6049,7 @@ index d598ca3d8..f93614ad7 100644
          // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
          if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
              ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-@@ -2121,31 +2990,323 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+@@ -2121,31 +3100,314 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
              ggml_backend_synchronize(split_backend);
          }
          ggml_backend_tensor_copy(input, input_cpy);
@@ -5806,28 +6062,34 @@ index d598ca3d8..f93614ad7 100644
      } else {
 -        ggml_backend_synchronize(split_backend);
 -    }
-+        // staged input (issue #50 WIP): wait on the ring slot's upload event, D2D it into the
-+        // real split input, then free the slot.  Both the D2D and the compute are on the main
-+        // stream, so this stays ordered after the previous split's compute.
-+        {
-+            int stage_k = -1;
-+            for (int k = 0; k < sched->stage_consumed_n; k++) {
-+                if (sched->stage_consumed[k].dst == input_cpy) {
-+                    stage_k = k;
-+                    break;
-+                }
++        // wip/flash-next-prefill: in PIPELINE mode the split input IS an offset inside the current buffer -- wait
++        // for that buffer's fill, point the input at it, and consume it in place.  No lookup, no drain, and the
++        // capture-safety width check below.
++        if (sched->pipe_on) {
++            const size_t pipe_off = sched_pipe_entry_off(sched, input_cpy);
++            if (pipe_off != (size_t) -1 && sched_stage_batch_tokens(split) > SCHED_STAGE_CAPTURE_SAFE_TOKENS) {
++                const int b = sched->pipe_cur;
++                ggml_backend_event_wait(split_backend, sched_stage_ev(sched, sched->pipe_backend[b], b, true));
++                input_cpy->data = (char *) sched->pipe_base[b] + pipe_off;
++                return;
 +            }
-+            if (stage_k >= 0) {
-+                const int    b    = sched->stage_consumed[stage_k].backend_id;
-+                const int    slot = sched->stage_consumed[stage_k].slot;
-+                const size_t size = sched->stage_consumed[stage_k].size;
-+                ggml_backend_event_t done_ev = sched_stage_ev(sched, b, slot, true);
-+                ggml_backend_event_wait(split_backend, done_ev);
-+                // copy the slot into the real split input, then free it (GGML_SCHED_STAGE_MODE retired)
-+                ggml_backend_event_t free_ev = sched_stage_ev(sched, b, slot, false);
-+                void * buf = split_backend->iface.stage_buffer(split_backend, slot, size);
-+                split_backend->iface.stage_d2d(split_backend, input_cpy->data, buf, size);
-+                ggml_backend_event_record(free_ev, split_backend);
++        }
++        // A backend that stages per DEVICE (the Meta backend, where the upload is spliced across devices) owns
++        // its own transport: `stage_input` lands each device's chunk in that device's ring slot and takes over
++        // the ordering.  `callback_eval` splits one split into several compute calls, which this hand-off does
++        // not model.  Reached only for a split the gates marked stageable (`split->stage_ok`, computed in the
++        // split loop above) -- NOT for the pipeline's splits, which were consumed in place before this point.
++        if (!sched->pipe_on && split->stage_ok &&
++            sched->callback_eval == NULL &&
++            split_backend->iface.stage_input != NULL && sched_stage_is_host_weight(input)) {
++            if (split_backend->iface.stage_input(split_backend, input, input_cpy)) {
++                static bool logged = false;
++                if (!logged) {
++                    logged = true;
++                    GGML_LOG_INFO("%s: transport: staging through %s's per-device ring (it has no backend "
++                                  "slots, so this is its pipeline)\n", __func__,
++                                  ggml_backend_name(split_backend));
++                }
 +                return;
 +            }
 +        }
@@ -5836,27 +6098,6 @@ index d598ca3d8..f93614ad7 100644
 -        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
 -        return;
 -    }
-+        // backend-owned staging (issue #50 WIP, `stage_input`): a backend whose consumers do
-+        // not read this tensor's `data` (the meta backend, where the upload is spliced across
-+        // devices) stages the input itself and takes over the ordering.  `callback_eval`
-+        // splits one split into several compute calls, which this hand-off does not model.
-+        if (sched->stage_split_ok && sched->callback_eval == NULL &&
-+            split_backend->iface.stage_input != NULL && sched_stage_is_host_weight(input)) {
-+            // Above the staging width gate (`sched_stage_min_tokens`) whole-shard staging
-+            // beats the device gather (the campaign's own A/B: Q4_K_M ub8192 staging 5283 vs
-+            // gather 4035).  The gather serves the below-gate band, where `sched_stage_issue`
-+            // skips staging and the copy loop's gather branch runs.  Do not defer this table.
-+            if (split_backend->iface.stage_input(split_backend, input, input_cpy)) {
-+                return;
-+            }
-+        }
- 
--    // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
--    // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
--    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
--        ggml_backend_synchronize(input_backend);
--        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
--            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
 +        // wait for the split backend to finish using the input before overwriting it.  exp37:
 +        // the meta backend has no event_record/event_wait, so this falls through to a FULL host
 +        // synchronize of both devices per expert upload, which keeps the host from running ahead.
@@ -5871,7 +6112,13 @@ index d598ca3d8..f93614ad7 100644
 +                ggml_backend_synchronize(split_backend);
 +            }
 +        };
-+
+ 
+-    // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+-    // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+-    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+-        ggml_backend_synchronize(input_backend);
+-        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+-            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
 +        // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
 +        // wip/moe-expert-cache: find THE `MUL_MAT_ID` consumer of this input copy, not just the
 +        // split's first node.  A cache-merged split holds the layer's routed gate/up/down
@@ -6137,7 +6384,7 @@ index d598ca3d8..f93614ad7 100644
      }
  }
  
-@@ -2215,12 +3376,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2215,12 +3477,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      struct ggml_backend_sched_split * splits = sched->splits;
  
      int prev_backend_id = -1;
@@ -6153,7 +6400,7 @@ index d598ca3d8..f93614ad7 100644
          // ensure the previous split's async work has completed before we start
          // this split, the allocator may have reused buffer regions across splits
          if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-@@ -2236,7 +3400,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2236,7 +3501,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          for (int input_id = 0; input_id < split->n_inputs; input_id++) {
              struct ggml_tensor * input = split->inputs[input_id];
              if (!ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)]) {
@@ -6162,7 +6409,7 @@ index d598ca3d8..f93614ad7 100644
              }
          }
          // after the copies above, which may read host memory reused by the copies of the next split
-@@ -2244,8 +3408,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -2244,8 +3509,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          ggml_backend_sched_prefetch_inputs(sched, split_id);
          for (int input_id = 0; input_id < split->n_inputs; input_id++) {
              struct ggml_tensor * input = split->inputs[input_id];
@@ -6174,7 +6421,36 @@ index d598ca3d8..f93614ad7 100644
              }
          }
  
-@@ -2312,14 +3478,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2288,6 +3555,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        // PIPELINE: this split's buffer is released once its compute is ENQUEUED (the event fires when the
++        // kernels have actually read it), and the fill for split k+2 goes into that same buffer straight away --
++        // it waits on the event on the copy stream, so it cannot overtake the consumer.
++        if (sched->pipe_on && pipe_k >= 0) {
++            const int b = pipe_k % sched->pipe_n_buf;
++            ggml_backend_event_record(sched_stage_ev(sched, sched->pipe_backend[b], b, false), split_backend);
++            if (pipe_k + sched->pipe_n_buf < pipe_n_host) {
++                sched_pipe_issue(sched, &splits[pipe_host[pipe_k + sched->pipe_n_buf]], b);
++            }
++        }
++
+         // record the event of this split
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+@@ -2296,6 +3574,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         prev_backend_id = split_backend_id;
+     }
+ 
++    // After the whole graph: a wide graph has now been executed, so the NEXT one may stage (the selector keeps
++    // the gather for the first, which has nothing to overlap its fill with).
++    sched->pipe_wide_prev = sched->pipe_wide_prev || sched->pipe_wide_cur;
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+@@ -2312,14 +3594,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
  
@@ -6191,7 +6467,7 @@ index d598ca3d8..f93614ad7 100644
      sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
  
      sched->n_backends = n_backends;
-@@ -2357,7 +3523,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2357,7 +3639,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
          sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
          GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
  
@@ -6207,7 +6483,7 @@ index d598ca3d8..f93614ad7 100644
              for (int c = 0; c < sched->n_copies; c++) {
                  sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
              }
-@@ -2366,6 +3539,56 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -2366,6 +3655,89 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
@@ -6221,13 +6497,42 @@ index d598ca3d8..f93614ad7 100644
 +        const char * stage_env = GGML_ENV_STR("GGML_SCHED_STAGE");
 +        const bool stage_forced = stage_env != NULL && atoi(stage_env) != 0;
 +        sched->stage_enabled = stage_env == NULL || atoi(stage_env) != 0;
-+        const char * slots_env = GGML_ENV_STR("GGML_SCHED_STAGE_SLOTS");
-+        sched->stage_n_slots = slots_env != NULL ? atoi(slots_env) : GGML_SCHED_STAGE_SLOTS_DEFAULT;
-+        if (sched->stage_n_slots < 1) {
-+            sched->stage_n_slots = 1;
++        // wip/flash-next-prefill: the staging transport is a PIPELINE of one to three buffers, each sized once to
++        // the largest split's host-weight set, one fill in flight, consumed in place.  `GGML_SCHED_PIPELINE=0` is
++        // the kill switch and means NO staged transport at all (the serial whole-table upload).
++        sched->pipe_on = sched_pipe_on();
++        // wip/flash-next-prefill: the pipeline's buffers are BACKEND SLOTS (`stage_buffer` + `stage_upload` +
++        // `stage_wait`), an interface only a single-device backend implements.  A `-sm tensor` split is served by
++        // the META backend, which stages per DEVICE through `stage_input` instead, so the pipeline must DECLINE
++        // there rather than call a NULL slot function (a 2-card `-sm tensor` arm with `GGML_SCHED_DEVGATHER=0`
++        // took a SIGSEGV inside `sched_pipe_issue`; the split now falls through to the whole-split upload, which is
++        // the transport the 2967-3141 t/s arms measured).  A backend that stages nothing at all (CPU) is not a
++        // reason to decline.
++        if (sched->pipe_on) {
++            for (int b = 0; b < sched->n_backends; b++) {
++                const ggml_backend_i * i = &sched->backends[b]->iface;
++                if (i->stage_buffer == NULL && i->stage_input == NULL) {
++                    continue;
++                }
++                if (i->stage_buffer == NULL || i->stage_upload == NULL || i->stage_wait == NULL) {
++                    sched->pipe_on = false;
++                    GGML_LOG_INFO("%s: pipeline staging off: %s stages per device (`stage_input`), and the "
++                                  "pipeline needs backend slots -- a split uses the whole-split upload\n",
++                                  __func__, ggml_backend_name(sched->backends[b]));
++                    break;
++                }
++            }
 +        }
-+        if (sched->stage_n_slots > GGML_SCHED_STAGE_SLOTS) {
-+            sched->stage_n_slots = GGML_SCHED_STAGE_SLOTS;
++        sched->pipe_size = 0;
++        sched->pipe_cur  = 0;
++        sched->pipe_wide_prev = false;
++        sched->pipe_wide_cur  = false;
++        sched->pipe_n_buf    = sched_pipe_choose_bufs(sched, NULL);   // re-derived per graph (the arena lands later)
++        sched->pipe_held     = false;
++        for (int i = 0; i < GGML_SCHED_PIPE_MAX_BUFS; i++) {
++            sched->pipe_n_ent[i]   = 0;
++            sched->pipe_base[i]    = NULL;
++            sched->pipe_backend[i] = 0;
 +        }
 +        // wip/moe-expert-cache (B2): device-side expert gather for offloaded `MUL_MAT_ID` uploads whose
 +        // width did not qualify for the staging ring.  **Default OFF (2026-10-03):** the gather's one-time
@@ -6260,11 +6565,15 @@ index d598ca3d8..f93614ad7 100644
 +                sched->stage_enabled = false;
 +            }
 +        }
++        if (!sched->stage_enabled) {
++            // `GGML_SCHED_STAGE=0`, or nothing here can stage at all: the transport is the serial upload.
++            sched->pipe_on = false;
++        }
 +    }
  
      ggml_backend_sched_reset(sched);
  
-@@ -2381,6 +3604,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+@@ -2381,6 +3753,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
              ggml_backend_event_free(sched->events[b][c]);
          }
          ggml_backend_event_free(sched->prefetch_events[b]);
@@ -6275,7 +6584,7 @@ index d598ca3d8..f93614ad7 100644
      }
      ggml_gallocr_free(sched->galloc);
      ggml_free(sched->ctx);
-@@ -2447,6 +3674,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
+@@ -2447,6 +3823,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
      return true;
  }
  
@@ -6293,7 +6602,7 @@ index d598ca3d8..f93614ad7 100644
  bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
      GGML_ASSERT(sched);
      GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
-@@ -2484,6 +3722,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
+@@ -2484,6 +3871,8 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
          }
      }
  
@@ -6302,7 +6611,7 @@ index d598ca3d8..f93614ad7 100644
      return ggml_backend_sched_compute_splits(sched);
  }
  
-@@ -2956,6 +4196,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
+@@ -2956,6 +4345,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
              /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
              /* .get_alloc_size_n    = */ NULL,
              /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
@@ -6312,7 +6621,7 @@ index d598ca3d8..f93614ad7 100644
          },
          /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
          /* .context = */ NULL,
-@@ -2981,6 +4224,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
+@@ -2981,6 +4373,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
              /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
              /* .get_alloc_size_n    = */ NULL,
              /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
@@ -11202,10 +11511,10 @@ index 4140f681a..35f625eaa 100644
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
 new file mode 100644
-index 000000000..f1c9aed32
+index 000000000..ad24cda9e
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
-@@ -0,0 +1,7229 @@
+@@ -0,0 +1,7409 @@
 +// wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
 +
 +#include "moe-expert-cache.h"
@@ -11654,7 +11963,7 @@ index 000000000..f1c9aed32
 +// WIP moe-upload-overlap: the per-device host-expert bytes the preflight reported, so the deferred
 +// arena sizing can WAIT until every host table has registered.  Without this, a pass that primes only a
 +// SUBSET of the host tables latches the sizing on that subset -- e.g. a prefill's bulk ubatch is served
-+// by the H2D staging ring (which does not register cache tables) while the final 1-token ubatch reaches
++// by the H2D staging transport (which does not register cache tables) while the final 1-token ubatch reaches
 +// the decode hook and primes only the last host layer.  See `moe_cache_tables_complete_locked`.
 +int64_t                             g_preflight_device_bytes[GGML_CUDA_MAX_DEVICES] = {0};
 +bool                                g_preflight_device_seen [GGML_CUDA_MAX_DEVICES] = {false};
@@ -14170,10 +14479,7 @@ index 000000000..f1c9aed32
 +    free_heat_dev_locked(t);   // folds the prefill tally into `heat` before the mirror goes away
 +    (void) cudaGetLastError();   // fail soft: a bad free must not abort a run
 +
-+    g_arena_bytes -= (int64_t) t.slots * (int64_t) t.expert_bytes;
-+    if (g_arena_bytes < 0) {
-+        g_arena_bytes = 0;
-+    }
++    arena_bytes_delta(t.device, (int64_t) t.slots, (int64_t) t.expert_bytes, -1);
 +    t.slots          = 0;
 +    t.allocated      = false;
 +    t.identity       = false;
@@ -14377,7 +14683,7 @@ index 000000000..f1c9aed32
 +    apply_prefill_seed_locked(t);
 +    // Account the count ACTUALLY allocated (`slots`/`t.slots`), not the requested `arena_slots`: on a
 +    // shrunk table the two differ and the old `arena_slots` accounting over-reported the arena.
-+    g_arena_bytes += (int64_t) slots * t.expert_bytes;
++    arena_bytes_delta(t.device, (int64_t) slots, (int64_t) t.expert_bytes, +1);
 +}
 +
 +// Set when the sizing runs with host-expert tables: the workspace pool then keeps a free-VRAM floor
@@ -14604,17 +14910,20 @@ index 000000000..f1c9aed32
 +    // per-op path), which is ~8x slower than the cache-less run's fused path (measured: MIB=64 ->
 +    // 4.3 t/s vs MIB=0 32.0).  Disabling here (before the first decode graph is built) leaves the run
 +    // byte-identical to `MOE_EXPERT_CACHE_MIB=0`.
++    // The arena total and the host set this run actually got: the two numbers every residency decision below
++    // (and the census line) is stated in.  Session 5 needs them for a non-auto budget too, so they are summed
++    // before the `g_auto` branch.
++    int64_t planned    = 0;
++    int64_t host_total = 0;
++    for (int d = 0; d <= max_dev; d++) {
++        planned += (int64_t) slots_d[d] * dev_one_bytes[d];
++    }
++    for (const table_t & t : g_tables) {
++        if (!t.allocated) {
++            host_total += (int64_t) t.n_experts * (int64_t) t.expert_bytes;
++        }
++    }
 +    if (g_auto) {
-+        int64_t planned = 0;
-+        int64_t host_total = 0;
-+        for (int d = 0; d <= max_dev; d++) {
-+            planned += (int64_t) slots_d[d] * dev_one_bytes[d];
-+        }
-+        for (const table_t & t : g_tables) {
-+            if (!t.allocated) {
-+                host_total += (int64_t) t.n_experts * (int64_t) t.expert_bytes;
-+            }
-+        }
 +        const int64_t floor_bytes = moe_cache_max_i64(
 +            (int64_t) g_min_mib * 1024 * 1024,
 +            (g_min_res_pct > 0 && host_total > 0) ? host_total * g_min_res_pct / 100 : (int64_t) 0);
@@ -14644,6 +14953,13 @@ index 000000000..f1c9aed32
 +                          __func__, 100.0 * res, (long long) g_reserve_mib);
 +        }
 +    }
++
++    // wip/flash-next-prefill: the H2D transport's buffer count is a trade of PREFILL overlap against the DECODE
++    // arena, so it is chosen HERE -- the first point where the slab has grown and the arena is settled -- from the
++    // residency above, not from the free VRAM at startup (which knows nothing about the arena).  The backend owns
++    // the rule and re-sizes the transport region from its answer (`ggml_cuda_moe_transport_decide`); the scheduler
++    // and the Meta ring follow the same number.
++    ggml_cuda_moe_transport_decide(planned, host_total);
 +
 +    // Layer-uniform slot count.  gate/up/down of one layer still share a slot count (an expert
 +    // resident for gate must be resident for up and down, or the remap points a role at the wrong
@@ -15026,6 +15342,22 @@ index 000000000..f1c9aed32
 +    }
 +}
 +
++// wip/flash-next-prefill: one COPY of this device's host expert set, for the transport selector.
++// Caller holds `g_mutex`.  Refreshed when a table is registered, which is the only time it can change.
++static void residency_host_refresh_locked(int device) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return;
++    }
++    int64_t all = 0;
++    for (const table_t & t : g_tables) {
++        if (t.device != device || t.n_experts <= 0 || t.expert_bytes == 0) {
++            continue;
++        }
++        all += (int64_t) t.n_experts * (int64_t) t.expert_bytes;
++    }
++    g_res_host_mirror[device].store(all, std::memory_order_relaxed);
++}
++
 +} // namespace
 +
 +static void devremap_batch_clear_locked();   // device remap: drop the pending sibling batches (defined with g_dr_batch)
@@ -15267,6 +15599,68 @@ index 000000000..f1c9aed32
 +                  __func__, (double) bytes / (1024 * 1024));
 +}
 +
++// wip/flash-next-prefill: the RESIDENT expert bytes, lock-free.  Defined OUTSIDE the file's anonymous namespace
++// (it is a public entry point declared in moe-expert-cache.h) and it reads the atomic mirror the cache keeps beside
++// `g_arena_bytes`, so the slab may call it while holding `g_slab_mutex` without inverting the cache->slab lock
++// order.
++// `residency_audit_locked` below re-derives the same figures from the table set, because the mirrors are maintained
++// INCREMENTALLY (O(1) per change): the invariant is then checkable rather than trusted.  Diagnostics only: called
++// from the exit census, never on a hot path.
++//
++// CALLER HOLDS `g_mutex` (the `_locked` convention every other helper here follows): the exit census path already
++// does, and taking it again is a self-deadlock on a non-recursive mutex -- a server that answers every request and
++// then hangs in the census, one line before the `MoE expert cache:` summary.  Same trap as
++// `moe_cache_host_pool_requested` from `alloc_all_locked`.
++static bool residency_audit_locked(int device) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return true;
++    }
++    int64_t cov = 0, all = 0;
++    for (const table_t & t : g_tables) {
++        if (t.device != device || t.n_experts <= 0 || t.expert_bytes == 0) {
++            continue;
++        }
++        if (t.slots > 0) {
++            cov += (int64_t) t.slots * (int64_t) t.expert_bytes;
++        }
++        all += (int64_t) t.n_experts * (int64_t) t.expert_bytes;
++    }
++    const int64_t cov_m = g_arena_dev_bytes_mirror[device].load(std::memory_order_relaxed);
++    const int64_t all_m = g_res_host_mirror[device].load(std::memory_order_relaxed);
++    if (cov != cov_m || all != all_m) {
++        GGML_LOG_WARN("%s: dev=%d: the residency mirrors drifted from the table set (covered %.1f vs %.1f MiB, "
++                      "host %.1f vs %.1f MiB) -- a `t.slots`/registration change is missing its accounting\n",
++                      __func__, device, (double) cov_m / 1048576.0, (double) cov / 1048576.0,
++                      (double) all_m / 1048576.0, (double) all / 1048576.0);
++        return false;
++    }
++    return true;
++}
++
++int64_t moe_cache_resident_bytes(int device) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return 0;
++    }
++    return g_arena_dev_bytes_mirror[device].load(std::memory_order_relaxed);
++}
++
++bool moe_cache_residency(int device, int64_t * covered, int64_t * host) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        if (covered != nullptr) { *covered = 0; }
++        if (host != nullptr)    { *host    = 0; }
++        return false;
++    }
++    // Capacity, not current occupancy: the selector asks "could the device keep this set", which is what decides
++    // how many bytes come over the link in the steady state.  That capacity IS the device's resident expert bytes
++    // (`g_arena_dev_bytes`, kept O(1) by `arena_bytes_delta`), so no second mirror is needed.  Lock-free -- see the
++    // mirrors' comment.
++    const int64_t cov = g_arena_dev_bytes_mirror[device].load(std::memory_order_relaxed);
++    const int64_t all = g_res_host_mirror[device].load(std::memory_order_relaxed);
++    if (covered != nullptr) { *covered = cov; }
++    if (host != nullptr)    { *host    = all; }
++    return all > 0;
++}
++
 +bool moe_cache_get_stats(int64_t * hits, int64_t * misses, int64_t * arena_bytes) {    // Per-turn accounting for the server: aggregate the same counters `moe_cache_report` prints, so a
 +    // caller can snapshot before/after a turn and log the delta.  The counters are process-global (the
 +    // arena is one per-device cache shared by every slot), so with concurrent slots a delta is the
@@ -15364,10 +15758,7 @@ index 000000000..f1c9aed32
 +    t.slot_dirty   = true;
 +    t.slot_expert.clear();
 +    t.expert_slot.clear();
-+    g_arena_bytes -= (int64_t) old_slots * (int64_t) t.expert_bytes;
-+    if (g_arena_bytes < 0) {
-+        g_arena_bytes = 0;
-+    }
++    arena_bytes_delta(old_device, (int64_t) old_slots, (int64_t) t.expert_bytes, -1);
 +    if (old_device >= 0) {
 +        moe_cache_sync_devices_locked();   // no kernel that reads this arena may still be in flight
 +        device_guard dg(old_device);
@@ -15485,6 +15876,11 @@ index 000000000..f1c9aed32
 +            free_arena_backing(t.device, t.arena, t.arena_reserved, t.slots, t);
 +            t.arena_reserved = 0;
 +        }
++        // The resident accounting is incremental (`arena_bytes_delta` keeps `g_arena_bytes` and the per-device
++        // mirror the transport selector reads), so every `t.slots` write must be paired with it -- including this
++        // path, which has no caller today (kept for a future pressure release).  Same rule the comment above states
++        // for the device sync: do not be the path that forgets.
++        arena_bytes_delta(t.device, (int64_t) t.slots, (int64_t) t.expert_bytes, -1);
 +        t.arena = nullptr;
 +        t.slots = 0;
 +        t.identity = false;
@@ -15679,8 +16075,42 @@ index 000000000..f1c9aed32
 +// tokens against +7.9 % at -ub 16384, where the same growth is 4.4 GiB.  Judge the marginal coverage, not
 +// full residency.
 +static bool settle_decide_locked() {
++    // The capacity this decision would be judged against: the smallest arena the slab currently offers,
++    // across the devices that sized.  Recomputed every call so a LATER drop that offers MORE room can
++    // re-open the decision (see the `decided_at` block below).
++    size_t cap_now = 0;
++    {
++        bool any = false;
++        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
++            if (g_size_avail[d] == 0) {
++                continue;
++            }
++            const size_t cap = ggml_cuda_slab_arena_total(d);
++            const size_t a   = cap > g_size_hold[d] ? cap - g_size_hold[d] : 0;
++            if (!any || a < cap_now) {
++                cap_now = a;
++                any = true;
++            }
++        }
++    }
++    // wip/flash-next-prefill: the decision is not latched for the life of the run.  A band that becomes free AFTER
++    // it could never be harvested otherwise -- the transport carve the scheduler returns at every prefill -> decode
++    // transition, a second sequence going idle, or a later prefill that needs a smaller wide view than the one that
++    // latched it.  Measured on the field GSQ shape: the first drop settles 14 707 -> 16 112 MiB and every later drop
++    // re-arms at that count ("0 layer(s) settled UP") even when it offers 3.4 GiB more room.  Re-open the decision
++    // when the capacity has GROWN by at least 512 MiB (or 5 %) since it was taken; the gate below is unchanged, and
++    // the settle only ever grows, so this can neither ratchet a count down nor oscillate.
++    static size_t decided_at = 0;
 +    if (g_steady_decided) {
-+        return g_steady_allow;
++        const size_t grew = cap_now > decided_at ? cap_now - decided_at : 0;
++        if (grew < (size_t) 512 << 20 && (decided_at == 0 || grew < decided_at / 20)) {
++            return g_steady_allow;
++        }
++        GGML_LOG_INFO("%s: arena settle: RE-OPENING the decision -- the arena offers %.1f MiB more than the "
++                      "drop that decided it (%.1f -> %.1f MiB); the gate is re-applied, growth only\n",
++                      __func__, (double) grew / 1048576.0, (double) decided_at / 1048576.0,
++                      (double) cap_now / 1048576.0);
++        g_steady_decided = false;
 +    }
 +    g_steady_allow = false;
 +    double ratio = 1e9;
@@ -15714,6 +16144,7 @@ index 000000000..f1c9aed32
 +        return false;
 +    }
 +    g_steady_decided = true;
++    decided_at = cap_now;
 +    std::vector<uint64_t> mass;
 +    uint64_t total   = 0;
 +    int64_t  k_sized = 0, k_target = 0;
@@ -15998,10 +16429,7 @@ index 000000000..f1c9aed32
 +        // device buffers are separate cudaMalloc allocations and are kept, so a
 +        // later re-size/re-arm can reuse them.
 +        ggml_cuda_slab_arena_free(device, t.arena, bytes);
-+        g_arena_bytes -= (int64_t) t.slots * (int64_t) t.expert_bytes;
-+        if (g_arena_bytes < 0) {
-+            g_arena_bytes = 0;
-+        }
++        arena_bytes_delta(device, (int64_t) t.slots, (int64_t) t.expert_bytes, -1);
 +        freed += bytes;
 +
 +        t.arena          = nullptr;
@@ -16056,7 +16484,7 @@ index 000000000..f1c9aed32
 +}
 +
 +
-+// wip/slab-ring-region: has the deferred arena sizing run?  The slab's H2D-ring hole must stay ARMED
++// wip/slab-ring-region: has the deferred arena sizing run?  The slab's staging region must stay ARMED
 +// through sizing (so the auto-sized arena never allocates its highest tables into the hole); a disarm
 +// before that makes the next arm evict those hot tables, and the cold re-arm corrupts a wide consumer.
 +bool moe_cache_is_sized() {
@@ -16481,6 +16909,9 @@ index 000000000..f1c9aed32
 +    g_key_to_id.emplace(key, id);
 +    g_sem_to_id.emplace(std::make_tuple(layer, sem_role((const ggml_tensor *) src0), device), id);
 +    bind_host_dev_locked(g_tables[id]);
++    // The host set only grows with registration, so this is where its mirror is refreshed -- O(tables) once per
++    // table at load, never on the per-drop path.
++    residency_host_refresh_locked(g_tables[id].device);
 +
 +    // An explicit `MOE_EXPERT_CACHE_SLOTS` is uniform and immediate (also what the self-test uses);
 +    // otherwise the arena is sized after the first (priming) pass, by `alloc_all_locked`.
@@ -16988,6 +17419,59 @@ index 000000000..f1c9aed32
 +// `width`/`stride_src`/`n_copies` describe the exact copy the caller asked for; a geometry mismatch
 +// declines and the caller falls back to the plain upload.  Returns true when the destination was
 +// filled and the caller's event recorded (the caller records `ev` after this returns).
++// wip/flash-next-prefill: `MOE_HOST_POOL_STAGE_MERGE_FLOOR` resolved for ONE device.  `auto` (the default) turns a
++// 16 MiB floor on only when the DEVICE's own calibrated link is at or above
++// `MOE_HOST_POOL_STAGE_MERGE_FLOOR_GBPS` (default 50), because the trade is a property of the link and not of the
++// model: over-fetching one expert costs `expert_bytes / bw` while the DMA issue it saves costs ~18 us, so merging
++// pays above ~50 GB/s and is neutral-to-negative below it.  Measured 2026-11-26 (Flash-Next, 89k, -ncmoe 48):
++// no merging 2513.7 t/s at 28.7 GB/s (x8) and 2492.3 at 51 GB/s (x16); a floor of 8-16 MiB reads 2470.1-2521.4 on
++// x8 (inside the spread) and 2521.4-2527.7 on x16 (+1.4 %, and the tightest arm measured).  Per DEVICE, so a
++// heterogeneous split gives each card the floor its own link justifies.
++static int64_t stage_merge_floor_bytes(int device) {
++    static const double mib_env = [] {
++        const char * e = getenv("MOE_HOST_POOL_STAGE_MERGE_FLOOR");
++        if (e == nullptr || e[0] == '\0') { return -1.0; }   // auto
++        return atof(e);                                      // 0 = off, N = explicit MiB
++    }();
++    static const double gbps_env = [] {
++        const char * e = getenv("MOE_HOST_POOL_STAGE_MERGE_FLOOR_GBPS");
++        const double v = e != nullptr ? atof(e) : 0.0;
++        return v > 0.0 ? v : 50.0;
++    }();
++    if (mib_env >= 0.0) {
++        return (int64_t) (mib_env * 1024.0 * 1024.0);
++    }
++    const float bw = ggml_cuda_device_h2d_gbps(device);
++    if (bw <= 0.0f) {
++        return 0;   // the link is not calibrated yet: no merging is the safe arm, retried on the next call
++    }
++    return bw >= (float) gbps_env ? (int64_t) (16.0 * 1024.0 * 1024.0) : 0;
++}
++
++// wip/flash-next-prefill: the fill FORM, derived from the DEVICE's own calibrated link when
++// `MOE_HOST_POOL_STAGE_BULK` is unset.  The two forms are not a free choice: the hybrid divides the table
++// into one copy-engine DMA per host run plus one kernel launch for the arena-resident experts, which wins
++// where a run's issue path is the cost (a slow link) and loses where the copy engine is fast enough that a
++// single whole-table DMA of the same bytes is cheaper than the extra launch.  Measured 2026-11-26
++// (Flash-Next GSQ-RCO-IQ3_XXS, 89 234-token prefill, `--host-experts pool -ub 8192`): x8 at 28.7 GB/s
++// hybrid 2440-2509 vs bulk 2343-2346, i.e. the hybrid is +4 %; x16 at 51-55 GB/s hybrid 2458 vs bulk
++// 2522, i.e. bulk is +2.6 % and the tightest arm on that box.  Same physical quantity as the merge floor
++// (`stage_merge_floor_bytes`), so it shares the threshold: above it the copy engine is not the bottleneck
++// and one DMA of the whole table is the right shape.  An uncalibrated link keeps the hybrid (the arm that
++// is never the worst of the two).
++static int stage_bulk_form(int device) {
++    const float bw = ggml_cuda_device_h2d_gbps(device);
++    static const float gbps = [] {
++        const char * e = getenv("MOE_HOST_POOL_STAGE_BULK_GBPS");
++        const double v = e != nullptr ? atof(e) : 0.0;
++        return (float) (v > 0.0 ? v : 50.0);
++    }();
++    if (bw <= 0.0f) {
++        return 2;   // not calibrated yet: the hybrid, the arm that is never the slower of the two
++    }
++    return bw >= gbps ? 1 : 2;
++}
++
 +bool moe_cache_stage_table(int device, const void * host_src, size_t offset, size_t width, size_t stride_src,
 +                           size_t n_copies, void * dst, void * compute_stream, void * copy_stream,
 +                           void * order_event) {
@@ -17101,6 +17585,14 @@ index 000000000..f1c9aed32
 +        return cudaGetLastError() == cudaSuccess;
 +    }
 +    g_stage_decline_nomatch++;
++    if (getenv("GGML_MOE_STAGE_DEBUG") != nullptr) {
++        static int n = 0;
++        if (n++ < 6) {
++            GGML_LOG_WARN("%s: no table matched dev=%d src=%p off=%zu width=%zu copies=%zu (tables=%zu) -> the "
++                          "bounce path serves this upload\n", __func__, device, host_src, offset, width,
++                          n_copies, g_tables.size());
++        }
++    }
 +    return false;
 +}
 +
@@ -17267,10 +17759,7 @@ index 000000000..f1c9aed32
 +        t.remap_cap    = 0;
 +        t.slots        = 0;
 +        t.arena_reserved = 0;
-+        g_arena_bytes -= (int64_t) old_slots * (int64_t) t.expert_bytes;
-+        if (g_arena_bytes < 0) {
-+            g_arena_bytes = 0;
-+        }
++        arena_bytes_delta(old_device, (int64_t) old_slots, (int64_t) t.expert_bytes, -1);
 +        {
 +            device_guard dg(old_device);
 +            // The arena and the heat mirrors bump for themselves; the remap and the routing staging are
@@ -18328,10 +18817,10 @@ index 000000000..f1c9aed32
 +    GGML_LOG_INFO("%s: VRAM budget: requested=%s MiB/device, free-clamped=%lld, arena alloc failures=%lld (fail-soft)\n",
 +                  __func__, budget_desc(), (long long) g_alloc_clamped, (long long) g_alloc_failed);
 +    // wip/arena-steady-sizing: the sizing pass samples the arena while the wide (prefill) compute view is
-+    // live, so it is clamped to `mapped - (narrow + ring + wide)` -- a figure that shrinks as `-ub` grows.
++    // live, so it is clamped to `mapped - (narrow + stage + wide)` -- a figure that shrinks as `-ub` grows.
 +    // The settle at each prefill -> decode drop recovers it, and these counters are what prove the settle ran.
 +    GGML_LOG_INFO("%s: arena settle: %lld layer(s) raised at a prefill -> decode drop; %lld drop(s) had nothing "
-+                  "to re-arm; prior gain %.2f pp vs the %.2f pp gate (%s); GPU arena %.1f MiB total now\n",
++                  "to re-arm; prior gain %.2f pp vs the %.2f pp gate (%s); GPU arena_resident %.1f MiB now\n",
 +                  __func__, (long long) g_steady_raised, (long long) g_steady_skipped,
 +                  g_steady_gain_pp, g_steady_min_gain_pp, g_steady_allow ? "taking the band" : "leaving the band",
 +                  (double) g_arena_bytes / (1024 * 1024));
@@ -18437,7 +18926,7 @@ index 000000000..f1c9aed32
 +}
 diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
 new file mode 100644
-index 000000000..86da99cb5
+index 000000000..f6e760c72
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/moe-expert-cache.h
 @@ -0,0 +1,384 @@
@@ -18679,7 +19168,7 @@ index 000000000..86da99cb5
 +
 +// wip/moe-heatmap-persistence (R2): device-side routing tally.  Called from the CUDA `mul_mat_id`
 +// dispatch (the OUTER entry, before the cache's slot-remap redirect), so the routing is counted even
-+// when the host copy path is bypassed by the H2D staging ring (`stage_consumed`) and even when the ids
++// when the host copy path is bypassed by the H2D staging transport (`stage_consumed`) and even when the ids
 +// are never read back.  `ids` is the raw routing on the device.  The PREFILL band is tallied exactly
 +// and, when `MOE_EXPERT_TRACE` is set, is also where the trace's PREFILL records come from; the DECODE
 +// band is tallied only for a fully-resident (identity) table and only SAMPLED
@@ -21619,7 +22108,7 @@ index 3c7e1c11b..c94af98d8 100644
      void unmap_weight(const llama_tensor_weight & w) const;
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 3c766cc75..42828be78 100644
+index 3c766cc75..3bfbc627d 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -956,6 +956,47 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
@@ -21781,7 +22270,7 @@ index 3c766cc75..42828be78 100644
 +    if (model == nullptr) {
 +        return;
 +    }
-+    // wip/slab-ring-region: the largest single host weight tensor sizes the slab's H2D-ring hole.  It is
++    // wip/slab-ring-region: the largest single host weight tensor sizes the slab's staging region.  It is
 +    // model-global (the same bound for every device), and it is known here (the model is fully loaded).
 +    const size_t max_host_table = model->max_host_weight_tensor_bytes();
 +    // Walk the HOST-EXPERT map, not `model->devices`.  The map is keyed by the real device that owns the

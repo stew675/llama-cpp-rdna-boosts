@@ -123,7 +123,7 @@ kernel.  **Do not re-add any of it** (§13, `benchmarks/2026-11-01-host-expert-d
 | `GGML_META_COMPUTE_HEADROOM` | `128` | diagnostic | Views **per static tensor** the meta backend's *first* compute-container context holds.  The container grows past it, so this is a first-context size, not a limit; a smaller value only makes it grow sooner (logged at DEBUG). |
 | `GGML_META_SS_SCRATCH` | **on** | kill-switch | The split-state pre-warm walk keeps its scratch in a reused per-thread `monotonic_buffer_resource` instead of allocating one heap node per visited tensor on every graph re-allocation.  Inert on the computed states.  `0` restores the heap containers. |
 | `GGML_STAGE_TRACE` | unset | diagnostic | Per-tensor trace of the staging path. |
-| `GGML_STAGE_META_REDIRECT` | off | diagnostic | Meta redirection instead of the explicit d2d completion. |
+| `GGML_STAGE_META_REDIRECT` | off | **A/B only — it is not a correct configuration** | Restores the Meta staging **redirect** (point the split's tensor at the staged slot) instead of copying the slot back into the tensor's real buffer.  A host-offloaded expert table's consumer does not read that tensor through `simple_tensor->data`, so the slot is ignored and the stale real buffer is used: measured on 2 cards (GSQ-IQ3_XXS, `-sm tensor -ub 4096`, ~3.7k-token prompt) the redirect reads `////` x1 at MTP acceptance 1.00 against coherent text at 3.88.  It exists only to reproduce that corruption; the copy is unconditional in the delivery. |
 | `GGML_STAGE_NO_RESTORE` | off | diagnostic | Skip the redirect restore (debug only — unsafe). |
 | `GGML_STAGE_GATHER_SCRATCH` | off | diagnostic | Force the gather scratch path. |
 | `GGML_SCHED_COPY_EVENT` | `per-copy` | kill-switch (value) | The cross-backend split-input copy is ordered on a **per-copy** event instead of the backend's shared per-device `copy_event`.  A queued HIP stream wait resolves against the latest record of its event, so a copy still in flight re-records the shared event and re-binds consumers already queued on it — independent copies serialize.  `shared` restores the single event.  Bit-exact and throughput-neutral on this box; the win is on a box where two cross-backend copies overlap. |
@@ -715,7 +715,7 @@ worth its arena" comparison must use.
 | variable | default | class | what it does |
 |---|---|---|---|
 | `MOE_EXPERT_CACHE_TABLES` | `0` (off) | **diagnostic** | At exit, one INFO line with the per-layer residency map (`L12 261/512`, `I` appended when a table of that layer is on the identity fast path) and one with this run's per-layer **slab-reclaim stand-downs** and **re-arms** (`L30x3 L31x3`).  The eviction and re-arm messages carry counts and bytes only, so a report that says "the same eviction sizes" can still hide a different *set*: read this first when comparing two runs of a host-expert shape, and change nothing until the two maps agree or the difference is explained.  Nothing is printed when the cache is off. |
-| `GGML_CUDA_SLAB_RING_MIB` | unset (auto) | tuning (pre-existing) | The whole-table H2D staging ring the slab reserves as a fixed hole above the narrow floor.  Since r362 it is **not reserved at all when the loader's host tier is the POOL** (`--host-experts pool`, or an `-lme` budget that resolves to the per-expert pool): that tier has no device-readable host master, so the default `GGML_SCHED_DEVGATHER` mode gathers a pool-backed table at every prefill width and the hole holds nothing for it.  An explicit value restores a hole of that size (the r361 behaviour is `GGML_CUDA_SLAB_RING_MIB=6144`), and an explicit `GGML_SCHED_DEVGATHER=0` also keeps it, because that arm really does stage.  Measured on the shape of issue #368: hole 6656 MiB -> work boundary 3264 -> 11776 MiB -> 8500 MiB / 51 tables stood down at every prefill, L1 prefill 1895 t/s / decode 34.18; without the hole, boundary 3328 MiB, no stand-down, 1958 / 34.94 (+3.4 % / +2.2 %) and the L2 revisit 728 -> 902 t/s.  **Since r366 the ring is NOT the slab's wide band**: a no-ring slab arms the band from the prefill pass itself, so declining the hole no longer moves the prefill transients outside the slab (that coupling was a defect, `INVARIANTS.md` r366); the hole's own measured effect is now the stand-down, not the band. |
+| `GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS` | `2` | tuning (pre-existing, renamed) | The cushion above the decode/verify band, in compute chunks.  **The variable that used to sit here, `GGML_CUDA_SLAB_RING_MIB`, is RETIRED (r369)**: the transport region is derived — one transport buffer × the pipeline depth (§31, [`ENVIRONMENT.md`](ENVIRONMENT.md) §31) — so no MiB knob can shrink it below what a buffer needs, and a leftover export is ignored.  The r362 record below still explains *why* the region reserves nothing for a pool-backed tier, which is unchanged.  Measured then on the shape of issue #368: hole 6656 MiB -> work boundary 3264 -> 11776 MiB -> 8500 MiB / 51 tables stood down at every prefill, L1 prefill 1895 t/s / decode 34.18; without the hole, boundary 3328 MiB, no stand-down, 1958 / 34.94 (+3.4 % / +2.2 %) and the L2 revisit 728 -> 902 t/s.  Since r366 a no-ring slab also arms the WIDE band from the prefill pass itself, so declining the region no longer moves the prefill transients outside the slab (`INVARIANTS.md` r366). |
 
 ## 29. The server's KV admission: the kill switch (block 16, r365)
 
@@ -745,6 +745,33 @@ off, so the variable and its measurements are in [`ENVIRONMENT.md`](ENVIRONMENT.
 makes the change observable is the existing `GGML_CUDA_GCDBG=1` (`ENVIRONMENT.md` §11): its `CUDAGC_MATMUL`
 line counts the `cublas` and `mmq` branches per process, so the switch's non-vacuity is `cublas` going to 0
 and `mmq` gaining those launches at `-ub 256`.
+
+---
+
+## 31. The staging pipeline and the transport region (blocks 09/10, r369)
+
+Everything here exists to answer "did the transport actually run, and which form did it take?" — a staging arm
+that silently declined reads the same text as one that ran, so the census is the evidence.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `GGML_SCHED_PIPELINE` | unset = on | **kill switch** | `0` = no pipeline at all: every host weight goes back to the serial whole-table upload (the 47 t/s / 12.3 s field path).  Use it to isolate the transport from a prefill change, never as a tuning choice. |
+| `GGML_SCHED_PIPELINE_BUFS` | unset = the residency rule | tuning override | 0–3 (0 = GATHER), clamped; `GGML_SCHED_STAGE_SLOTS` is the alias.  A user value wins over the rule and the rule's answer is then logged and ignored.  Pin it to make a depth arm reproducible. |
+| `GGML_SCHED_STAGE_SELECT` | unset = on | **kill switch** | `0` restores the pre-r369 rule ("the gather serves every pool-backed table at every prefill width") and leaves the exposure test unused.  `GGML_SCHED_STAGE_SELECT_DEBUG=1` prints the selector's inputs per split. |
+| `GGML_SCHED_STAGE_EXPOSE_US` | `38` | tuning | The crossover in µs/token.  Raise it to bias toward the gather, lower it to bias toward staging — the value is per link, so a different box has a different right answer. |
+| `GGML_CUDA_SLAB_TRANSPORT_FALLBACK` | off | **A/B only** | `1` lets a transport slot that the slab region cannot serve fall back to a plain `cudaMalloc`.  The delivery **refuses** instead (a slot outside the slab is VRAM the region can never give back and a path back to the serial upload); this arm exists to reproduce the pre-r369 behaviour, and every refusal is one WARN that names which of the two causes fired ("no region carved now" vs "the buffer is wider than `region / depth`"). |
+| `GGML_SCHED_DEVGATHER` | unset = pool-backed tables gather above the cache band, selector may overrule | controls (both tiers) | `0` = **never gather** (stage wherever a split can stage); `1`/`force` = the historical A/B arm (gather below the staging width gate and for a large table, in either host-expert mode, `2` internally).  These are the two controls on **both** tiers, so a tensor split is A/B-able exactly like a single device. |
+| `GGML_MOE_STAGE_DEBUG` | off | diagnostic | Prints the first few `no table matched` declines of the fill (device, source pointer, offset, width, copies) with the table count, for a fill that should have matched and did not — i.e. the difference between "the cache declined" and "the scheduler asked for the wrong table". |
+
+`MOE_EXPERT_PREFILL_IN_PLACE` is unchanged from r362: `0` is the exact-fallback A/B/ bisect arm for the take-over
+that serves a fully resident table from the arena instead of staging it (`scripts/gate-prefill-logits.sh --ab`).
+
+The censuses an arm must read: the `MoE expert cache` exit line prints `resident=<x> MiB total` against the host
+set and the transport's decided depth; the slab's stats line prints `transport=` (the carved region) beside
+`arena_region=` and `work=` — the three numbers the depth rule divides.  `overrun_deferred` and
+`absorbed_by_cushion` in the same line are the cushion's non-vacuity reading (§1.3).
+
+*The opt-in and tuning rows for this section are in [`ENVIRONMENT.md`](ENVIRONMENT.md) §31.*
 
 ---
 

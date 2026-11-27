@@ -3749,3 +3749,61 @@ so the deliverable part of it is an opt-in switch for the 129..511 band.
 **Record.**  `archive/work/issue-374-kquant/README.md` (all tables, both builds, every gate);
 `GREEDY-PURITY.md` §111; `patches/README.md` blocks 07/08/10 (r368 amendments); `ENVIRONMENT.md` §14
 (`-DGGML_HIP_RDNA4_Q5K_DENSE_VDR4`) and §30 (`GGML_CUDA_Q6K_MMQ`, opt-in); `DIAGNOSTIC.md` §30; GitHub issue #374.
+
+## r369 (2026-11-27, `WORKLOG.md` 261127.018) — the staging transport is a PIPELINE in a DERIVED slab region: the depth is a residency decision, the unit is one split input, and a cross-cutting layer is folded to the block whose text is its PREIMAGE (blocks 09/10/12/15, `archive/work/flash-next-prefill/`)
+
+1. **The transport region's size is DERIVED, so a MiB knob on it can only be wrong.**  It is `unit × depth`,
+   capped at 1/4 of the smallest staging device's VRAM, and both factors are owned elsewhere: the unit by the
+   context (`slab_set_stage_unit`) and the depth by the backend's transport authority (`slab_stage_slots`, i.e.
+   `ggml_backend_cuda_transport_bufs`).  `GGML_CUDA_SLAB_RING_MIB` named no resizable quantity left and could
+   only cap the region below what one buffer needs — retired, no tombstone.
+2. **The UNIT is one split input — the largest host-expert TENSOR per device**, never a layer's per-role sum.
+   The old sum over-carved by 1.3–2.1 GiB on every measured shape (122B 1686 vs 630 MiB per buffer, 35B-A3B 816
+   vs 272, Flash-Next GSQ 1137 vs 450), and that extra carve is arena the wide pass must EVICT and then REFILL
+   after the drop.  Text unchanged (`43d0b1f4629e` x3) and prefill neutral-to-better (35B +3.5 %).
+3. **The DEPTH is a RESIDENCY decision, taken ONCE**, not a free-VRAM decision: the buffers are a carve inside the
+   work band, so their cost is the decode hot set they take out of the arena, and free VRAM at scheduler
+   construction knows nothing about an arena sized later.  Table: 0 = GATHER (one buffer would leave the arena
+   below `GGML_CUDA_SLAB_MIN_ARENA_MIB`), 1 (two would), 2 (three would leave < 40 % of the host set), else 3.
+   0 is a real answer (a one-buffer pipeline cannot overlap).  A count that follows every arena re-size flaps
+   (measured: 1 on the priming pass, 3 once settled, 1 again, ~21 % per 1-buffer graph), so a later disagreement is
+   logged and IGNORED — **a decision that can be re-taken is not a decision**.
+4. **A cushion is not a guarantee, and the overrun counter is the tuning signal.**  The region's base is the band
+   plus N compute chunks (default 2), fixed for the run, so a band raise that stays under it costs no VA move
+   (`absorbed_by_cushion`); a raise past it defers to the correctness fallback (`overrun_deferred`).  A non-zero
+   `overrun_deferred` means N is too small for that shape — raise N, never remove the fallback.
+5. **An in-place consume is legal only ABOVE the graph-capture-safe width.**  A captured graph bakes the
+   consumer's input pointer, so `GGML_CUDA_GRAPH_MAX_TOKENS` is CLAMPED to 1..32 and the in-place path requires
+   more than that many rows: captured ⇒ ≤32 rows, in place ⇒ >32.  The pairing is the invariant; either half
+   alone is a use-after-free waiting for a capture.
+6. **There are TWO staging forms and the selector must accept both** — backend slots (the pipeline, in-place) and
+   the backend's own `stage_input` (the Meta backend of a `-sm tensor` split: per-device slots, filled on each
+   device's copy stream and COPIED into the split input, because the in-place redirect is measurably wrong for a
+   host-offloaded expert table — one layer destroyed).  Measured 2 cards 89k `-ub 8192`
+   (`-lme mirror --lazy-mode off`): staged +8.1 % at 40 % coverage, +3.4 % at 60 %, −2.1 % at 80 %, tie at ~100 %,
+   crossover ≈70 %.  **A structural refusal ("the gather owns that tier") is a maintainer decision, not a tuning
+   edit**: the transport stays selectable whatever the policy is.
+7. **Coverage is not the discriminator for stage-vs-gather; the EXPOSURE is.**  Flash-Next stages at 51 % while the
+   35B gathers at 56 %: the tie is the host bytes per token over the measured H2D link (~38 µs/token at 8.8 GB per
+   8192-token ubatch).  `GGML_SCHED_STAGE_EXPOSE_US` is that crossover and it is per device, so a link change moves
+   the answer.
+8. **A cross-cutting layer is folded to the block whose TEXT is its preimage, not to the block its commit message
+   names.**  Applying a tip-based hunk at an earlier rung either conflicts or, worse, silently pulls a LATER
+   block's wording backwards; the fold was `git apply` per hunk at the earliest rung whose tree still holds the
+   preimage, and every hunk landed (155/155, tree identical to the validated campaign tree).  Two consequences,
+   both by construction: **a positional-initializer row list belongs to the LAST block that writes that list**
+   (appending a row earlier reorders it against the rows later blocks add), and a hunk whose function a later block
+   rewrote belongs to that later block.  Blocks are layers and need not build alone (r332); the artifact is the
+   applied SET, so this is attribution, not integrity.
+9. **Two field defects this class keeps producing, both fixed here**: a fill issued BEFORE the slab had carved the
+   region (the first staged ubatch of a prefill fell back to the serial whole-table upload: 12.32 s / 47 t/s on a
+   239-token prompt, 338 t/s after), and buffers sized from the FIRST split set filled, so a graph whose sets
+   differ (231 vs 450 MiB) reallocated mid-graph and warned "this should not recur" on every short prompt.
+10. **The reproducible host-expert bench flags are `-lme mirror --lazy-mode off`.**  Per-arm spread is 0.1–0.5 %
+   with them and up to **25 %** on the pool tier with lazy reads on, which is enough to invert every arm of a
+   transport A/B; an A/B on the field shape must also pin `MOE_EXPERT_HEATMAP` (the reserve partition varies
+   between runs of the SAME commit).
+
+**Record.** `archive/work/flash-next-prefill/` (`RESULTS-session7.md` §6-§7, `REVIEW-squashed.md` §10-§12,
+`HANDOVER-session8.md`); `patches/README.md` blocks 09/10/12/15 (r369 amendments); `ENVIRONMENT.md` §1.3/§2/§31;
+`DIAGNOSTIC.md` §2/§28/§31; `TODO.md` #376-#379.

@@ -21,7 +21,7 @@ MODELDIR=/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS
 PORT=${PORT:-8033}
 SRC=${PROMPT:-$HERE/l1-90k.txt}
 if [ ! -s "$SRC" ]; then
-  for _ in $(seq 1 17); do cat "$HERE/../../prompts/prose-rdna-boosts.txt"; done > "$SRC"
+  for _ in $(seq 1 17); do cat "$HERE/../../../prompts/prose-rdna-boosts.txt"; done > "$SRC"
 fi
 
 # ~3.5 chars per token on this prose; the exact counts are whatever the server reports.

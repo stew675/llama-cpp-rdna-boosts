@@ -1,7 +1,16 @@
 # Flash-Next prefill — why do other engines reach 2900-3500 t/s where we reach 2100-2600?
 
-**Status: OPEN — a measured rewrite in the prototype; nothing in `patches/`, no `release.json` change, no fork
-push.**  The campaign is **squashed to one commit** (`SQUASHED-campaign-r368.patch`) and **code-reviewed**
+**Status: PROMOTED at r369 (2026-11-27) and ARCHIVED here.**  The staging transport ships as a cross-cutting
+layer over blocks **09/10/12/15** (each block's `patches/README.md` note says exactly which hunks landed there and
+why), `WORKLOG.md` **261127.018** is the promotion entry, and `INVARIANTS.md` **r369** carries the facts —
+including item 8, the attribution rule the fold was run by (a hunk goes to the block whose tree still holds its
+preimage, and a positional-initializer row list belongs to the LAST block that writes it).  The record is kept
+whole: the campaign's own numbers, reviews, handovers and harnesses are below, unchanged except that the
+harnesses' `../../` paths are now `../../../` (this directory is one level deeper than `wip/` was).  Follow-ups:
+`TODO` #385-#388; the tensor split's fill-ahead/in-place work is `wip/tensor-split-stage-overlap/`.
+
+**The status it was promoted from:** a measured rewrite in the prototype; nothing in `patches/`, no `release.json`
+change, no fork push.  The campaign is **squashed to one commit** (`SQUASHED-campaign-r368.patch`) and **code-reviewed**
 ([`REVIEW-squashed.md`](REVIEW-squashed.md), all findings fixed), which is the form it goes to promotion in.
 
 **A session starts at [`HANDOVER-session7.md`](HANDOVER-session7.md) — and session 7 has DONE it: the final

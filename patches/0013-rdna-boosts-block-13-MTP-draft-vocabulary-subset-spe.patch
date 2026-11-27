@@ -1,4 +1,4 @@
-From 851fa9619a4b68b33c35e1974f660ce96e5b41d0 Mon Sep 17 00:00:00 2001
+From 6128a6c8b613839fef58af872279a6da9b36aff1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 05:53:08 -0500
 Subject: [PATCH 13/18] rdna-boosts: block 13: MTP draft vocabulary subset
@@ -158,10 +158,10 @@ index 9e710d829..19ac017b5 100644
          // LLAMA_MTP_DRAFT_OP_OFFLOAD=0: keep the draft context's host-resident ops (e.g. the MTP
          // layer's experts under -otd exps=CPU) on the host instead of offloading them to the device
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index f229b12ec..85c5d02d8 100644
+index 84ea948d1..e1595bed5 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -339,6 +339,19 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+@@ -393,6 +393,19 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
      /* .slab_set_ring_cap    = */ nullptr,
      /* .slab_enabled         = */ nullptr,
      /* .slab_ring_slots      = */ nullptr,
@@ -181,7 +181,7 @@ index f229b12ec..85c5d02d8 100644
  };
  
  bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
-@@ -2526,6 +2539,59 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
+@@ -2580,6 +2593,59 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
      const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
      GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
  
@@ -254,10 +254,10 @@ index 3d083f6aa..76084218f 100644
          enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
          enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index eb26b297f..3d7886039 100644
+index f824aea06..0f18a282e 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -1189,6 +1189,22 @@ llama_context::llama_context(
+@@ -1198,6 +1198,22 @@ llama_context::llama_context(
              }
          }
  
@@ -280,7 +280,7 @@ index eb26b297f..3d7886039 100644
          sched_reserve();
  
          // wip/first-prefill-latency: reserve the wide prefill work region in the slab BEFORE the MoE
-@@ -4633,6 +4649,7 @@ llm_graph_params llama_context::graph_params(
+@@ -4642,6 +4658,7 @@ llm_graph_params llama_context::graph_params(
          /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
          /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
          /*.samplers    =*/ sampling.samplers,
@@ -288,7 +288,7 @@ index eb26b297f..3d7886039 100644
          /*.n_outputs   =*/ n_outputs,
          /*.cb          =*/ graph_get_cb(),
          /*.res         =*/ res,
-@@ -6506,6 +6523,7 @@ llama_context_params llama_context_default_params() {
+@@ -6515,6 +6532,7 @@ llama_context_params llama_context_default_params() {
          /*.n_outputs_max_per_seq       =*/ 1,
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
          /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
@@ -391,7 +391,7 @@ index 5acc46e4c..11a192c74 100644
  
      llm_graph_result * res;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 23f4ed906..7ec8ad341 100644
+index 12a01a81a..10758514b 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -23,6 +23,7 @@
@@ -572,7 +572,7 @@ index 23f4ed906..7ec8ad341 100644
      return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
  }
 diff --git a/src/llama-model.h b/src/llama-model.h
-index a98784082..84e7a3683 100644
+index 6847db3eb..c3c477b13 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -811,6 +811,21 @@ struct llama_rope_params {

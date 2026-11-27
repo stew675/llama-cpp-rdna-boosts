@@ -1,11 +1,12 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
-**Optional artifact, not part of the delivery.  Optional block `0100`; re-cut on `r367` and verified on `r353`.**
-r367 (18 official blocks `0000`-`0017` + temporary `0300`, default tree `2ff670ba83e5160abf16d20355aeded52cb744f0`, default tip `83b254bea`):
-applies strictly, sha256 `4093ef671432e8370f50955b719f0b084214b5fefc4c1da93f9602a3bab89227` (the sha moved with
-the exported commit id; the diff is unchanged -- r367 amends block 08's `mmvq.cu` verify-band predicate, none of
-this artifact's files), trees `9f9acf91fb8db391e3a80393108f09d61e33bb99` alone and
-`c5ad54d972c59c0717c8476647fd64d6621977d8` cumulative.  The optional-applied tree is now also **built** by
+**Optional artifact, not part of the delivery.  Optional block `0100`; PORTED onto `r369` (2026-11-27), verified on `r353`.**
+r369 (18 official blocks `0000`-`0017` + temporary `0300`, default tree `3518351ef19fef971683fdca1345ab5fcfa1c336`, default tip `2347ee8b3`):
+applies strictly after a **PORT** (see the r369 entry below -- it does NOT apply mechanically), sha256
+`4c318b23a1406f340b0eba49d88388ed4247f3358947d8293309582f1cc7a86d`, trees
+`659b380ddcda232be74377adbf9981ffabcfe981` alone and
+`83b34247b47c7f006717e792af2dccbaa91fedcd` cumulative.  (The r367 cut, superseded: default tree
+`2ff670ba83e5160abf16d20355aeded52cb744f0`, sha256 `4093ef67...`, trees `9f9acf91...` / `c5ad54d9...`.)  The optional-applied tree is now also **built** by
 `scripts/gate-optional-build.sh` (gate 47, added for issue #371) -- this artifact's own port verification was
 never a compile.
 The port verification and the numbers of record are the r353 run below, against the r353
@@ -32,7 +33,29 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `d7fec59339459519f47f45e7f9f8bda5ecc13521abd5ae54ec0d4d6fbb4b809f` (the r358 cut; every earlier cut is recorded below)
+  `4c318b23a1406f340b0eba49d88388ed4247f3358947d8293309582f1cc7a86d` (the r369 PORT; every earlier cut is
+  recorded below)
+* **r369 PORT (current)** — the artifact vs r369's staging pipeline.  r369 rewrote the very function this
+  artifact refactors (`ggml_backend_sched_compute_splits`: a per-split `compute_split(sched, split_id, st)` + a
+  driver, against r369's per-graph pipeline prologue / per-split consume / epilogue), so the re-cut was a **port**,
+  not a re-export: the pipeline's prologue and epilogue are now `pipe_begin()`/`pipe_end()`, the per-split pipeline
+  consume lives inside `compute_split` (whose cursor state is this artifact's per-lane `compute_state`), the pair
+  path runs each lane's prologue before its splits and its epilogue after them (both call sites), and the
+  pipeline's stageable-split list moved into the scheduler (`pipe_host`/`pipe_n_host`) because a pair has one
+  scheduler per lane.  **Two behaviour changes, both measured and both narrow**: the pipeline is DISABLED for a
+  pair (its slots are per BACKEND, and a pair shares every backend between its lanes, so two lanes cannot both own
+  slots 0..depth-1 -- one INFO line says so), and a **host-expert tier is refused by the arm gate**
+  (`LLAMA_PREFILL_LANES ignored (... host_experts = 1)`) because the pair **LIVELOCKS** there: 3 x R9700,
+  `-sm layer`, 35B-A3B Q8_0 `-ncmoe 40 -ub 2048`, lane 0 idles at 3 W while lanes 1/2 spin at 100 %/~90 W with no
+  progress.  That arm was never reachable in this artifact's own measurements and its record measures staging
+  there as a **14.6 % loss**, so nothing is given up.  Re-verified on this port (3 x R9700, gfx1201): default path
+  inert -- `-sm tensor` 4B Q8_0 text `b065f37593b3` for lanes unset/1/2; the reachable layout engages and still
+  wins -- `-sm layer -ts 1,1,1 -ot 'blk\.0\.attn_q\.weight=ROCm0' -b 2048 -ub 2048`, 35B-A3B Q8_0, 5256-token
+  prefill **5761.2 -> 6811.9 t/s (+18.2 %)** with `two-lane prefill enabled (LLAMA_PREFILL_LANES)`, greedy text
+  `e2dde701fc04` for lanes unset/2; the refused host-expert arm completes at `e2dde701fc04` too; and
+  `scripts/gate-prefill-logits.sh` on the optional-applied build reads **mean KLD 0.000000 / same-top-p 100.000 %**
+  (bit-inert on the default path).  `scripts/gate-optional-build.sh` (gate 47) builds the cumulative tree
+  `83b34247b`, and `validate-set.sh` is green.
 * **r366 re-cut verification (current)**: applies strictly at the r366 default tree `82afebd108d63b6220884d41080009561f0821e2` (18 official blocks `0000`-`0017` + temporary `0300`, default tip `489810652`), sha256 `423ce70fafd17535cbd3646139062bb93b80f84bb859b6866e241aeb5658f361` -- the sha moved because the exported commit id did, not the artifact's own diff: r366 amends block 10 (`ggml/src/ggml-cuda/ggml-cuda-slab.cu`, the slab's wide band is armed by the prefill pass rather than by the carved ring hole), which no file here touches, so the cut was re-exported against the new tree and applied with nothing to reconcile; producing tree `1d79094920a15fc324c6d998d8606c36c0175134` alone, and with the other optional artifact on top, the cumulative tree is `f54c5d78e853f312b34f0ab6c5bcd4004e500667`.  `validate-set.sh` check 8 re-verifies all three trees on every run; the r353 port verification below is still the numbers of record (the artifact's own code did not change).
 * **r365 re-cut verification**: applies strictly at the r365 default tree `21efb08247edc142c649d2dcda771abb73fee810` (18 official blocks `0000`-`0017` + temporary `0300`, default tip `7ad7f533c`), sha256 `6d9bc2a5b38d27e0fedba9ed2e147ba51ec260e2bf34831770f3487f77374b9b` -- the sha moved because the exported commit id did, not the artifact's own diff: r365 amends block 16 (`tools/server/server-{context,queue,slot-sched}.*`, the server's KV admission), which this artifact's server hunks now sit beside, so the cut was re-exported against the new tree and applied with nothing to reconcile; producing tree `3d7804c3db45487f9973a98bb5c52f193476d1bb` alone, and with the other optional artifact on top, the cumulative tree is `43ee504d461f63e663db7426e28273756bc00ee1`.  `validate-set.sh` check 8 re-verifies all three trees on every run; the r353 port verification below is still the numbers of record (the artifact's own code did not change).
 * **r360 re-cut verification (current)**: applies strictly at the r360 default tree `4674dd9f2e83894895d71b7e987a06d80fa70813` (default tip `3be8b9bd1` (the deterministic re-cut of the same tree); sha256 `33634cbcedf7c7ff5d19d6b70dd86517bb91f492a16542303ee7b44ffb7c9e57` -- the sha moved because the exported commit id did; r360 amends block 09, which owns `src/llama-context.cpp`, and this artifact edits that file too, so the cut was rebased and re-applied strictly), producing tree `831bc116a47559c4892b6f66f95fffbf869c76df`; with the other optional artifact on top, the cumulative tree is `8bd172df5d98e698a6868d645afa626cdfc6c19a`.
@@ -239,9 +262,10 @@ This matters more than the knob does, so it is measured, not assumed (3× R9700,
 | `-sm row` | **not usable at all on ROCm**: `llama_model_load: device ROCm0 does not support split buffers` (the r220 cut listed this as a reachable layout — it is an inference, not a measurement, and it is wrong for this backend) |
 | `-sm none` | one GPU backend, i.e. the `-sm tensor` case |
 
-The **expert tier is orthogonal to reachability**: `-ncmoe` / `--host-experts` changes nothing about which
-layouts arm the pair (`-sm layer -ot` still engages, and pairs), it changes whether the pair is *worth it* — on
-host-resident experts it wins at the default ubatch shape and loses at a wide one (*What it measures here*).
+| any layout, with a **host-expert tier** (`-ncmoe`, `-lme`, `--host-experts`) | **refused since the r369 port** — `ignored (... host_experts = 1)`.  The pair shares its backends between the lanes while the staging transport's slots are per BACKEND, and the pair **livelocks** on this tier (measured: lane 0 idle at 3 W, lanes 1/2 spinning at 100 %/~90 W, no progress).  This artifact's own record measures that arm as a **14.6 % loss**, so the single-lane path is what it always effectively was |
+
+The **expert tier was orthogonal to reachability** before r369 (it only changed whether the pair was *worth it*);
+since the port it is a hard refusal, for the reason in the table row above.
 
 The submitter's **dense** reference layout (`-sm layer -ts 1,0`, no `-ot`) is refused here for the same reason,
 so the +13.3 % PR #268 reported for it was not measured with this patch on this base.

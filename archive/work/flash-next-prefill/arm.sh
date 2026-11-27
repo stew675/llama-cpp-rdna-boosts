@@ -20,7 +20,7 @@ DIR="$RUNS/$TAG"; rm -rf "$DIR"; mkdir -p "$DIR"
 # The campaign's prompt: prompts/prose-rdna-boosts.txt x17 (89 182 tokens).  Generated, never committed.
 PROMPT=${PROMPT:-$HERE/l1-90k.txt}
 if [ ! -s "$PROMPT" ]; then
-  for _ in $(seq 1 17); do cat "$HERE/../../prompts/prose-rdna-boosts.txt"; done > "$PROMPT"
+  for _ in $(seq 1 17); do cat "$HERE/../../../prompts/prose-rdna-boosts.txt"; done > "$PROMPT"
 fi
 MODEL=${MODEL:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}
 export HIP_VISIBLE_DEVICES=${DEV:-0}

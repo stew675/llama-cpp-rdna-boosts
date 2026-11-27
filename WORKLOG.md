@@ -16,6 +16,136 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.019 (r369) -- `optional/0100` PORTED onto r369 (the pair path meets the staging pipeline), gate 47 + the prefill-logit gate green, and the pair's host-expert arm REFUSED after it livelocked
+
+**Why a port and not a re-cut.**  `0100` splits `ggml_backend_sched_compute_splits` into a per-split
+`ggml_backend_sched_compute_split(sched, split_id, st)` plus a driver so its pair path can drive a lane's splits
+one at a time; r369 rewrote that same function as the staging PIPELINE (a per-graph prologue, a per-split
+in-place consume, an epilogue).  A re-export cannot work: `git am -3` conflicts structurally in three files
+(`ggml-backend.cpp` 3 hunks, `ggml-cuda.cu` 1, `llama-context.cpp` 1).  The port keeps BOTH mechanisms:
+
+* the pipeline's prologue and epilogue are now `ggml_backend_sched_pipe_begin()` / `_pipe_end()`, and the
+  per-split pipeline consume lives inside `compute_split`, whose cursor state (`prev_backend_id`) is exactly this
+  artifact's per-lane `compute_state`;
+* the pair path runs each lane's prologue before its splits and its epilogue after them, in **both** call sites
+  (the interleaved loop and the "different split structures" fallback, which also gets
+  `sched_moe_register_tables` per lane so a lane's cache registration is not skipped);
+* the pipeline's stageable-split list moved from a stack array in the loop's function into the scheduler
+  (`pipe_host`/`pipe_n_host`, `GGML_SCHED_PIPE_SPLITS` = 512), because a pair has one scheduler per lane and the
+  list is per graph;
+* `copy_input` keeps the artifact's `input_id` + eager-copy early-out + `async_inputs` branch AND the campaign's
+  in-place pipeline consume plus the Meta `stage_ok` hand-off.
+
+**Two behaviour changes, both measured, both narrow.**
+
+1. **The pipeline is OFF for a pair** (one INFO line).  Its slots are per BACKEND (`stage_buffer`/`stage_upload`
+   take a slot index into that backend's array) while a pair shares every backend between its two lanes, so two
+   lanes cannot both own slots 0..depth-1: whichever prologue ran last re-sizes the slot the other lane is about
+   to fill, which aliases one buffer between the two lanes' in-place inputs.  The pair keeps the gather / the plain
+   whole-table upload -- which is what it effectively always had.
+2. **A HOST-EXPERT tier is refused by the arm gate** (`ignored (... host_experts = 1)`).  On this port that arm
+   **livelocks**: 3 x R9700, `-sm layer -ts 1,1,1 -ot blk\.0\.attn_q\.weight=ROCm0`, 35B-A3B Q8_0
+   `-ncmoe 40 -b 2048 -ub 2048` -- **lane 0 idles at 3 W while lanes 1/2 spin at 100 % / ~90 W** with no progress
+   (a spinning semaphore, not a slow arm; it had to be killed, and the kill left 30 GB of `gpucore.*.gpu` dumps in
+   the worktree that a `git add -A` swept into the first commit -- rewritten before anything was pushed).  That arm
+   is a **14.6 % LOSS** in this artifact's own record, so refusing it gives nothing up.  `TODO` #390.
+
+**Verified on the port** (3 x R9700 gfx1201, ROCm 10.2): default path **inert** -- `-sm tensor` 4B Q8_0 text
+`b065f37593b3` for lanes unset / 1 / 2; the reachable layout **engages and still wins** -- same `-sm layer -ts
+1,1,1 -ot` shape, 35B-A3B Q8_0, 5256-token prompt, **5761.2 -> 6811.9 t/s (+18.2 %**, the r329 record read
++18.6 %) with `two-lane prefill enabled (LLAMA_PREFILL_LANES)`, greedy text `e2dde701fc04` for lanes unset/2 (the
+same hash the r329 port verification recorded on this shape); the refused host-expert arm completes at
+`e2dde701fc04` with `ignored (n_gpu = 3, pipeline_parallel = 0, draft = 0, host_experts = 1)` and GPU faults
+clean; `scripts/gate-optional-build.sh` (gate 47) builds the cumulative tree `83b34247b` in 361 s; and
+`scripts/gate-prefill-logits.sh` on that optional build reads **mean KLD 0.000000 / same-top-p 100.000 %** --
+bit-inert on the default path, which is this artifact's own purity claim.  `scripts/validate-set.sh` is then fully
+green (19 default patches, both optional artifacts strict, trees `659b380dd` alone / `83b34247b` cumulative,
+file-set reconciliation 0 unexplained, the system-header check OK).
+
+**The release.**  `release.json` = `v18-919794500-r369` (tip `2347ee8b3`, tree `3518351ef`, optional 0100
+`4c318b23a…`/`659b380dd`, 0101 `0783b165c…`/`ea45996e4`); `TODO` #389 (the port) is CLOSED by this entry, and
+#390/#391 are opened by it (the pair's host-expert livelock; `beta/prefill-decode-arms` is deliberately NOT
+rebased onto r369 and is accepted broken for this release, the maintainer's decision).
+
+## 261127.018 (r369) -- flash-next-prefill is PROMOTED: the C fold reproduces the validated tree byte for byte, the set is re-cut as `v18-919794500-r369`, the MTP four-axis and the gfx1100/gfx1151 text arms are green -- and one optional artifact (`0100`) needs a PORT, so the tag waits
+
+**The C fold (the maintainer's decision of 2026-11-27).**  The campaign was a cross-cutting layer, so it was
+distributed to the blocks whose territory it touches, and the acceptance was ONE command: `git diff <new-tip>
+a666f8637` **empty** -- the promoted set must produce the validated tree byte for byte.  It does.
+
+* **The placement rule, and it is a rule rather than a taste:** a hunk goes to the block whose tree still holds its
+  PREIMAGE, i.e. the block that last wrote the text it edits (`git blame` at the tip, the handover's territory
+  table as the tie-break).  Every one of the campaign's **155 hunks** was applied by strict `git apply` at the
+  earliest rung that could hold it (39 -> block 09, 76 -> 10, 26 -> 12, 14 -> 15; 7 of them needed `-C1`), the
+  amended rung was `git commit --amend`ed with its subject kept, and the rest of the chain was rebased onto it
+  (09, then 10, then 12, then 15).  The chain is back to **19 commits with the same subjects** and the tip tree is
+  `3518351ef`, i.e. `git diff af7a57ba8 <new-tip>` is the campaign's own 18 files / +2627 / -907.
+* **Two deviations from the handover's table, both forced**: (a) the **positional-initializer row lists**
+  (`ggml_backend_i`'s trailing members, the CPU/RPC/Meta/CUDA iface rows, the missing `.gtt_store_arena_min`
+  rows) land in **block 15**, because theirs is the last block to write those lists -- appending a row earlier
+  reorders it against the rows blocks 12-15 add and the final list would differ; (b) the scheduler hunks whose
+  functions block 12 rewrote (`sched_input_gatherable`, the split sizing, `llama_context`'s reserve) land in
+  **block 12**, not 09.  `INVARIANTS.md` r369 item 8 records the rule.  Blocks are layers and need not build
+  alone (r332), so this is attribution, not integrity.
+* **Two resolution defects the acceptance caught and were fixed in the rung that owned them** (a duplicated
+  comment line in `ggml-backend.h` from a `theirs+ours` resolution at block 15, a dropped `}` in
+  `ggml-backend-meta.cpp` and a leftover `slab_ring_set` fragment in `ggml-backend.cpp` from block 12's) -- the
+  empty-diff acceptance did its job; nothing was hand-waved.
+
+**The cut.**  `scripts/make-patches.sh /tmp/cut 919794500 foldtip` -> 19 default patches (18 official + `0300`) +
+`rdna-boosts-all.patch`; a fresh canonical worktree at `919794500` + `scripts/apply-all.sh` -> tip
+**`2347ee8b3`**, tree **`3518351ef`** (= the campaign tree); `scripts/make-release.sh --release
+v18-919794500-r369` -> `release.json` (base unchanged, `tip`/`tree`/hashes refreshed, `n_blocks` 18,
+`n_temporary` 1, `n_default` 19).  `rdna-boosts-all.patch` was applied to a fresh base tree and wrote
+`3518351ef` too.  `scripts/check-rung-file-sets.py` reported **3 losses and no others**, each a deliberate
+mechanism change and each now a decision row in `patches/FILE-SET-RETIREMENTS.tsv`: `GGML_SCHED_STAGE_SLOTS` and
+`GGML_SCHED_STAGE_SLOTS_DEFAULT` (the compile-time slot count is gone; the *name* survives as the environment
+alias of `GGML_SCHED_PIPELINE_BUFS`) and `GGML_CUDA_SLAB_RING_FALLBACK` (renamed
+`GGML_CUDA_SLAB_TRANSPORT_FALLBACK`).  The whole set is accounted for.
+
+**The promotion ladder's last two items, run on this tree.**  *MTP four-axis* (`mtp4axis.sh`, 4 axes x
+{none, draft-mtp n-max 7} x {f16, q8_0}, 3 devices `-sm tensor`, `-n 3000`, greedy, base = `af7a57ba8` built in
+`/tmp/base-wt`, candidate = the campaign build): **all 8 axis/cache pairs byte-identical between base and
+candidate, and `none == draft-mtp` byte-identical inside every arm** (texts `218515b89b31` / `a87c4318b649` /
+`20ff19bc33b1` / `48067cb92646` on f16, `3a70dd34be92` / `a87c4318b649` / `79454d4a6696` / `1ffaf5d0c922` on
+q8_0); **pos-1 acceptance identical to three decimals** on every axis (f16 0.761 / 0.984 / 0.891 / 0.953, q8_0
+0.784 / 0.984 / 0.890 / 0.959, all far above the 0.45 criterion); MTP 1.9-4.4x plain on both builds.  The rate
+delta base->candidate is **-6.5 %..+0.3 %**, concentrated in the f16 arms that ran first in each sequence
+(the box is bimodal by 2-5 %; q8_0 is flat within +-1 %), which is the pattern the campaign's own records warn
+about and not a transport effect.  Note: `mtp4axis.sh`'s acceptance grep was **broken in the committed script**
+(unbalanced quotes: the pattern contained `[^"]` inside a `"` string, so the file did not even parse) -- it was
+repaired to capture `draft acceptance` and the `#acc rate/pos` pos-1 figure, and the candidate's rows were
+backfilled from its own `.err` logs.  *Remote sanity* (the maintainer's requirement): both boxes were already
+built from the campaign branch, whose tree is the cut tree (`3518351ef`), so the arm runs the CUT tree.  Qwen3.6
+35B-A3B Q8_0 `-ncmoe 30 -lme mirror --lazy-mode off --load-mode mmap -c 4096 -fa on -ub 2048`, `HD 0`, same seed,
+reference build vs candidate: **`fingon` (gfx1100) `4ac3a523160f` both, `halo` (gfx1151) `4ac3a523160f` both**,
+and halo's dense inert arm (Qwen3.5-4B Q8_0) **`b065f37593b3` both**; tails clean (`tailcheck.sh`), and
+`check-gpu-faults.sh` reads the kernel journal clean over the window on both boxes.
+
+**Docs.**  `ENVIRONMENT.md` / `DIAGNOSTIC.md` gained **§31** (the pipeline, the derived region/cushion/depth
+authority, the two staging forms, the measured 40/60/80/100 % curve) and the retired `GGML_CUDA_SLAB_RING_MIB` /
+`GGML_SCHED_STAGE_TABLE_REF_MB` moved to `ENVIRONMENT.md` §13 (`DIAGNOSTIC.md` §28 now names the derived region
+and the cushion instead); `MOE_HOST_POOL_STAGE_STANDDOWN` is documented nowhere, as instructed.
+`patches/README.md` carries the r369 amendment on blocks 09 and 10 (and short notes on 12 and 15 that say exactly
+which hunks landed there and why); `INVARIANTS.md` gained the r369 entry (10 items: the derived region, the unit,
+the depth decision, the cushion, the capture/consume pairing, the two staging forms with the tensor-split curve,
+exposure-not-coverage, the fold-attribution rule, the two field defects, the reproducible flags);
+`TODO.md` gained **#385-#389** (`gate-fused-probe-splits`'s `SPLITS_MAX` does not model a `-ncmoe` arm; the
+`MOE_EXPERT_TAKEOVER_FAULT` one-off abort; the exposure threshold's per-tier calibration; the tensor split's
+fill-ahead/in-place follow-up; and the `0100` port below).
+
+**Where it stopped: `optional/0100-two-lane-prefill` needs a PORT, so `validate-set.sh` check 8 is red and NOTHING
+IS TAGGED.**  `0101` (mixed K/V) re-applies STRICTLY on the r369 tree with nothing to reconcile.  `0100` does not:
+the artifact splits `ggml_backend_sched_compute_splits` into a per-split function for its two-lane pair path, and
+r369 rewrote that same function as the staging pipeline, so the artifact needs the kind of port r285 took -- a
+re-export cannot do it (three files conflict structurally).  That is a maintainer decision (port it now, or park
+it in `archive/work/` with the row as the re-entry), recorded as **`TODO` #389**; the release is otherwise
+complete and its `release.json` is written.  **Follow-up the same day (`WORKLOG.md` 261127.019): the port
+landed** (`0100` re-cut as a port onto the pipeline, gate 47 + the prefill-logit gate green, `validate-set.sh`
+fully green) and the tag follows from there.  The campaign's record moved to
+`archive/work/flash-next-prefill/` (with its harnesses' `../../` paths fixed for the deeper location) and
+`wip/CAMPAIGNS.md` carries the promotion note instead of the row -- no stub.
+
 ## 261127.017 (r368, `wip/`) -- flash-next-prefill: the promotion ladder is GREEN and STOPPED at the block fold -- the maintainer chose the C fold (split by territory) in a FRESH session
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push, no tag.  The campaign tip is

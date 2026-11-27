@@ -118,7 +118,7 @@ process), the carve never being released, and the deferred decode/verify compute
 ```sh
 # 1 GPU campaign arm (1 device, pool tier, 89k prompt, text hash + rate)
 cd wip/flash-next-prefill && ./arm.sh TAG MOE_EXPERT_HEATMAP=load NCMOE=47 NGEN=128
-python3 ../../scripts/extract-generated.py runs/TAG/run.log | tail -1     # expect 43d0b1f4629e
+python3 ../../../scripts/extract-generated.py runs/TAG/run.log | tail -1     # expect 43d0b1f4629e
 
 # interleaved, rotated A/B (never trust a single run: the staged arms swing 2-9 %)
 ./abba.sh SUITE 3 default 'gather:GGML_SCHED_STAGE_SELECT=0'

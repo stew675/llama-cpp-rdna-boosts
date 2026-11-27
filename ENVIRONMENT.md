@@ -136,7 +136,7 @@ experts from the host.
 | `GGML_CUDA_SLAB_HEADROOM_MIB` | `1408 + 128 x n_gpu` (1536 / 1664 / 1792 MiB) | tuning | How much stays free outside the slab when `slab_extend` reclaims the reserve the model did not need.  A **MiB value, not a boolean**; `0` disables the reclaim.  **Not slack**: it must cover every allocation made after that point, including ones that cannot be redirected, and it is also what `slab_extend` maps the arena's physical FROM, so spending it on anything fixed starves arena growth.  Not interchangeable with arena.  The MoE cache asks for at least `6144` when every cache table is unsplit and the tables span more than one device; an explicit value still wins.  **At the VRAM cliff, raise the headroom instead of dropping hipBLASLt.** |
 | `GGML_CUDA_POOL_MIN_FREE_MIB` | `512` when the cache holds host-expert tables, else `0` | tuning / kill-switch | The workspace pool's first attempt refuses like an OOM when it would leave less than this free, so its flush + retry runs.  The retry has no floor, so it never aborts.  `0` disables the floor. |
 | `GGML_CUDA_MIN_FREE_MIB` | unset / `0` = off | **opt-in budget** | A device-wide free-VRAM floor at the single allocation choke point: an allocation that would leave less free is refused like an OOM, so every fail-soft path above it still runs.  The knob for a card genuinely too small for the requested `-c` / `-ngl`, and the important one on Windows/WDDM, where an over-committing allocation is paged and a later access faults the device.  Inert while the slab is armed. |
-| `GGML_CUDA_SLAB_RING_MIB` | `6144` | tuning | MiB cap on the H2D staging-ring region the slab carves as a work sub-region (the auto estimate can come from a merged host tensor).  It lives between the narrow work floor and the wide work view, never in the arena, and is reclaimed on the prefill → decode drop.  `0` puts the ring back outside the slab.  Since r362 a POOL-backed host-expert tier reserves no hole at all; since r366 that also leaves the slab's WIDE band intact (the band is armed by the prefill pass, not by the hole), so `GGML_CUDA_SLAB_RING_MIB` no longer decides whether the prefill transients live inside the slab. |
+| `GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS` | `2` | tuning | The CUSHION above the decode/verify band, in compute chunks: the transport region's base sits this many chunks above the band, so a band raise that stays inside the cushion costs no VA move at all (`0` = no cushion).  A cushion, not a guarantee — a very long prompt can still want more band than it holds, and that case keeps the deferred raise as the correctness fallback; if the census's overrun counter is non-zero, *this* is the number to raise (not the presence of the fallback).  The region itself is DERIVED (one transport buffer × the depth, §31): there is no MiB knob, and the retired `GGML_CUDA_SLAB_RING_MIB` named no resizable quantity (§13). |
 | `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT` | `50` | tuning / kill-switch | Caps an **optional** raw allocation at this percentage of free VRAM.  With the H2D ring inside the slab this guards the **FA prefill staging arena** only.  A refusal is graceful (the staging falls back to the native K/V read) and is sometimes *faster*.  `0` restores the unbounded behaviour.  Inert unless the slab is active. |
 | `GGML_COMPUTE_BUFFER_CHUNK_MIB` | `256` | tuning | The compute buffer is allocated in whole chunks + one spare, so growth inside the chunk is free; `0` falls back to `GGML_COMPUTE_BUFFER_MARGIN_PCT`.  Applies only when the slab is in use — and since r139 only a ***live*** slab, per device (a declined slab must not keep chunking its streaming compute buffer). |
 | `GGML_CUDA_POOL_CACHE_MB` | unset / `0` = unlimited | **opt-in tuning** | Cap on the bytes of FREED buffers the **legacy** pool keeps cached; before a new device allocation, the pool frees them (never during graph capture).  Whole-cache flush, not largest-first eviction. |
@@ -150,10 +150,11 @@ experts from the host.
 
 | variable | default | class | what it does |
 |---|---|---|---|
-| `GGML_SCHED_STAGE_MIN_TOKENS` | `64` | tuning | Width gate floor; below it the copy loop's gather branch serves the input instead. |
-| `GGML_SCHED_STAGE_SLOTS` | unset | tuning | Ring slot count. |
-| `GGML_SCHED_STAGE_MAX_MB` | unset | tuning | Hard ring budget cap; `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT` (§1.3) also applies to a growth. |
-| `GGML_SCHED_STAGE_TABLE_REF_MB` | `0` | tuning | `0` = width-only gate; a positive value restores the old table-size scaling for A/B. |
+| `GGML_SCHED_PIPELINE` | unset = **on** | tuning | The staging transport itself: a 1–3 buffer PIPELINE whose buffers live in the slab's transport region, filled ahead of the compute that consumes them (§31).  `0` = no pipeline at all.  The kill switch's semantics are in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §31. |
+| `GGML_SCHED_PIPELINE_BUFS` | unset = the expert cache's residency rule (**0–3**; `GGML_SCHED_STAGE_SLOTS` is its alias) | tuning | The pipeline's **buffer count** — one number that the scheduler's depth, this backend's stage slots and the slab's transport region all read (through the `slab_stage_slots` device hook), so the region cannot be carved for fewer buffers than the pipeline uses.  **`0` is a real answer: GATHER** (no carve, no staging) for a shape whose arena cannot afford even one buffer.  Parsed in ONE place (the CUDA backend's transport authority); a user value is clamped to 1–3 and always wins. |
+| `GGML_SCHED_STAGE_EXPOSE_US` | `38` | tuning | The selector's crossover, in µs per token: the host bytes a staged ubatch would have to pull over the link, divided by the device's calibrated H2D bandwidth.  Above it the copy engine's overlap wins and the pipeline stages; below it the used-only gather wins.  Calibrated per device; a different link moves it (§31). |
+| `GGML_SCHED_STAGE_MIN_TOKENS` | calibrated from the H2D link (`1536` at 14.5 GB/s, floor `64`) | tuning | Width gate floor; below it the copy loop's gather branch serves the input instead (`0` = stage for every batch above the graph-capture-safe width). |
+| `GGML_SCHED_STAGE_MAX_MB` | unset | tuning | Hard per-slot budget cap; `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT` (§1.3) also applies to a growth. |
 | `GGML_SCHED_DEVGATHER` | **unset = pool-backed tables only** | tuning / A/B | Unset: a `--host-experts pool` table's routed `MUL_MAT_ID` is served by the device gather in the **prefill band**, everything else keeps whole-table staging.  `0` = kill switch.  `1`/`force` = the historical A/B arm for either host-expert mode (it costs a `pinned` master a large share of its prefill).  The decode band keeps the arena slot-remap read on purpose.  Prefill logits are bit-identical to staging. |
 | `MOE_GATHER_NSPLIT` | `32` | tuning / A/B | Chunks per expert in the MoE device gather (block count `n_experts * n_split`).  A prefill ubatch routes essentially every expert, so the copy is pipeline-limited at a small per-call volume.  `8` restores the pre-r325 launch; clamped 1–256. |
 | `GGML_META_SPLIT_COPY` | unset | tuning | Meta-backend split copy handling. |
@@ -415,6 +416,8 @@ rocBLAS call.
 | `GGML_CUDA_CONV_FUSION_MULTI` | **Retired**: the conv fusion is on for every device count, so the force-on knob has nothing to do.  Not read. |
 | `GGML_MOE_CACHE_INPLACE` | **Removed** with the device-remap path; the cache-aware staging (`GGML_MOE_CACHE_STAGE`, §2) is the only prefill residency path. |
 | `GGML_LF_DFLASH_DEV_GRAPH` | **Not read** — `LLAMA_DFLASH_DEV` always uses the in-graph store (§3). |
+| `GGML_CUDA_SLAB_RING_MIB` | **Removed** (r369): the staging region is DERIVED — one transport buffer's bytes (`slab_set_stage_unit`) × the depth (`slab_stage_slots`), capped at 1/4 of the smallest staging device's VRAM — so the knob named no resizable quantity and could only cap the region below what a buffer needs.  A leftover export is ignored; the region's size is in the startup census and in the slab's stats line (§31). |
+| `GGML_SCHED_STAGE_TABLE_REF_MB` | **Removed** (r369): with the staging transport a pipeline of 1–3 buffers in the slab, the old table-size scaling of the staging gate has nothing left to scale.  A leftover export is ignored. |
 
 ---
 
@@ -768,8 +771,10 @@ staging hole, because that tier gathers its routed tables at every prefill width
 nothing.  Without the hole the slab's work boundary stops 8.5 GiB lower, 51 expert tables stay resident through a
 `-ub 8192` prefill instead of standing down, and on the shape of GitHub issue #368 that is +3.4 % prefill and
 +2.2 % decode (the L2 revisit of the same conversation goes 728 -> 902 t/s because it no longer re-evicts).
-`GGML_CUDA_SLAB_RING_MIB` and `GGML_SCHED_DEVGATHER` still change it, and `MOE_EXPERT_CACHE_TABLES=1` prints which
-layers hold what.
+`GGML_SCHED_DEVGATHER` still changes it, and `MOE_EXPERT_CACHE_TABLES=1` prints which layers hold what.  Since
+**r369** the hole is *derived* rather than capped: the transport region is one transport buffer × the pipeline
+depth, so the old MiB knob (`GGML_CUDA_SLAB_RING_MIB`) was retired (§13) and its place is
+`GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS` (the cushion above the decode band, §1.3) plus the depth rule (§31).
 
 *The two knobs that change this, and the residency-map diagnostic, are in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §28.*
 
@@ -812,6 +817,59 @@ takes Q6_K first (`mmb_min_t` is 512), so the switch only reaches the 129..511 b
 
 Record: `archive/work/issue-374-kquant/README.md`; gate: `scripts/gate-prefill-logits.sh` at `--ub 256` (the
 band it reaches), which is a **family-switch** point rather than a rounding-level one.
+
+---
+
+## 31. The staging pipeline and the transport region (blocks 09/10, r369)
+
+Whole-table H2D staging of a routed host-expert table above the cache's decode band is a **PIPELINE of 1–3
+buffers**, not a slot ring: buffer *k* is filled on the copy stream while split *k-1* computes, the split consumes
+it **in place**, and its buffer is released the moment its compute is enqueued.  The buffers live in the slab's
+**transport region** — a carve inside the work band, above the decode/verify band plus a cushion and under the wide
+prefill view — so their real cost is the hot set they take out of the DECODE arena, which is why the count is
+chosen from the *settled* arena instead of from free VRAM at startup.
+
+Three consequences a consumer can see:
+
+* **The region is derived.**  `unit × depth`, capped at 1/4 of the smallest staging device's VRAM, where the unit
+  is the **largest host-expert TENSOR per device** (one scheduler split's input — not a layer's per-role sum, which
+  over-carved by 1.3–2.1 GiB on every measured shape) and the depth is the count below.  The buffers are released
+  at every prefill → decode transition and the carve is re-made when the next wide view is placed.
+* **The depth is a table, not a preference** (`ggml_cuda_moe_transport_decide`, run once when the arena settles):
+  one buffer would take the arena below `GGML_CUDA_SLAB_MIN_ARENA_MIB` → **0 buffers = GATHER**; two would →
+  **1**; three would leave < 40 % of the host set → **2**; else **3**.  Decided ONCE (a count that follows every
+  arena re-size flaps), reported as one INFO line with the numbers behind it, and overridable with
+  `GGML_SCHED_PIPELINE_BUFS`.
+* **Two staging forms, one selector.**  A backend with slots (`stage_buffer`/`stage_upload`/`stage_wait`) runs the
+  pipeline and consumes in place; the **Meta** backend of a `-sm tensor` split has only `stage_input`, so each
+  device's slot is filled on that device's copy stream and *copied* into the split input (the in-place redirect is
+  not correct for an offloaded expert table).  Both are eligible transports; which one serves a given ubatch is
+  the exposure test (`GGML_SCHED_STAGE_EXPOSE_US`), so no policy may hard-code "the gather owns that tier".
+
+The measured shape of it (2 cards `-sm tensor`, GSQ-IQ3_XXS 89k, `-ub 8192`, reproducible flags
+`-lme mirror --lazy-mode off`): staged beats gather by **+8.1 % at 40 % coverage** and +3.4 % at 60 %, loses 2.1 %
+at 80 % and ties at ~100 % — a crossover ~70 %, which is what the 38 µs rule predicts for that link.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `GGML_SCHED_PIPELINE` | unset = **on** | tuning | The pipeline.  `0` leaves every host weight to the serial whole-table upload (§31 of `DIAGNOSTIC.md`). |
+| `GGML_SCHED_PIPELINE_BUFS` | unset = the residency rule | tuning | The buffer count, 0–3 (0 = GATHER); `GGML_SCHED_STAGE_SLOTS` is the alias the released block documents.  A user value is clamped to 1–3 and wins over the rule. |
+| `GGML_SCHED_STAGE_SELECT` | unset = **on** | tuning | The stage-vs-gather selector at prefill width.  `0` restores the gather for every pool-backed table (`DIAGNOSTIC.md` §31). |
+| `GGML_SCHED_STAGE_EXPOSE_US` | `38` | tuning | The crossover in µs/token (host bytes the staged ubatch would pull ÷ the device's calibrated H2D bandwidth). |
+| `GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS` | `2` | tuning | The cushion above the decode/verify band, in compute chunks; `0` = no cushion. |
+| `MOE_HOST_POOL_STAGE_BULK` | unset = **derived** per device (bulk ≥ ~50 GB/s, else the hybrid) | tuning | The prefill fill's engine: `0` = the pre-patch paths (two-tier kernel, then the per-expert bounce), `1` = one copy-engine DMA of the whole table, `2` = the HYBRID (merged host runs by DMA + one kernel launch for the arena-resident experts). |
+| `MOE_HOST_POOL_STAGE_BULK_GBPS` | `50` | tuning | The link threshold the `auto` fill form uses (a copy engine above it, the hybrid below). |
+| `MOE_HOST_POOL_STAGE_MERGE_FLOOR` | `auto` (`16` MiB when the device's link ≥ `_GBPS`, else `0`) | tuning | The smallest host DMA worth issuing: shorter runs are lengthened by over-fetching neighbouring experts from the pool mirror (`0` = off, `N` = an explicit MiB floor).  A table boundary is the one exception. |
+| `MOE_HOST_POOL_STAGE_MERGE_FLOOR_GBPS` | `50` | tuning | The link threshold the merge floor's `auto` uses. |
+
+On a `-sm tensor` split the pipeline itself does **not** run (its fill-ahead and in-place consume need a per-split
+drain); the Meta `stage_input` transport is what the selector reaches, and it carries the depth/region/selector
+win.  The follow-up work (the drain overlap, then in-place) is `wip/tensor-split-stage-overlap/`.
+
+The numbers of record are in `benchmarks/` and the `WORKLOG.md` entries for r369; the design record is
+`archive/work/flash-next-prefill/`.
+
+*The kill switches, the A/B arms and the censuses for this section are in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §31.*
 
 ---
 

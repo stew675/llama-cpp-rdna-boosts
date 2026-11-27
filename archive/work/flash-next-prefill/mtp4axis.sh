@@ -16,13 +16,15 @@ for ct in "${CACHES[@]}"; do
     for spec in none mtp; do
       case "$spec" in none) S=(--spec-type none);; mtp) S=(--spec-type draft-mtp --spec-draft-n-max 7);; esac
       log="$OUT/$ct-$axis-$spec"
-      HIP_VISIBLE_DEVICES=0,1,2 "$BUILD/bin/llama-cli" -m "$M" "${S[@]}" -f "$HERE/../../prompts/$axis.txt" \
+      HIP_VISIBLE_DEVICES=0,1,2 "$BUILD/bin/llama-cli" -m "$M" "${S[@]}" -f "$HERE/../../../prompts/$axis.txt" \
         -n 3000 --seed 42 --temp 0 --single-turn --no-display-prompt --reasoning "$REA" \
         -c 32768 -b 2048 -ub 2048 -ctk "$ct" -ctv "$ct" -fa auto -ngl 99 -sm tensor -lv 4 \
         > "$log.out" 2> "$log.err"
       tps=$(grep -oE "eval time = .* [0-9.]+ tokens per second" "$log.err" | tail -1 | grep -oE "[0-9.]+ tokens per second" | cut -d' ' -f1)
-      acc=$(grep -oE "[0-9]+/[0-9]+\)|draft acceptance:? ?= ?[0-9.]+[^"]{0,48}" "$log.err" | tail -1 | tr -d "\n")
-      txt=$(python3 "$HERE/../../scripts/extract-generated.py" "$log.out" 2>/dev/null | tail -1)
+      va=$(grep -oE "draft acceptance = [0-9.]+" "$log.err" | tail -1 | grep -oE "[0-9.]+$")
+      p1=$(grep -oE "#acc rate/pos = \([0-9.]+" "$log.err" | tail -1 | grep -oE "[0-9.]+$")
+      acc="acc=${va:-none} pos1=${p1:-none}"
+      txt=$(python3 "$HERE/../../../scripts/extract-generated.py" "$log.out" 2>/dev/null | tail -1)
       printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ct" "$axis" "$spec" "${tps:-none}" "${acc:-none}" "${txt:-none}" >> "$OUT/summary.tsv"
       echo "  $ct $axis $spec: ${tps:-?} t/s  ${acc:-no-acc}  ${txt:-no-text}"
     done

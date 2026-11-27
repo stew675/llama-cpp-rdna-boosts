@@ -106,7 +106,7 @@ server is not using** (`PORT=8199`) — a field `runme` on 8033 will make the ha
 ```sh
 # 1. campaign arm: 89k prefill, 2 rotated cycles, greedy text hashed from the same run
 EXTRAENV="NCMOE=47 NGEN=128" ./abba.sh post-purge 2 default
-python3 ../../scripts/extract-generated.py runs/abba-post-purge/default-c1/run.log | tail -1
+python3 ../../../scripts/extract-generated.py runs/abba-post-purge/default-c1/run.log | tail -1
 #    expect: sha=43d0b1f4629e, prefill ~2450-2500 t/s (the box is bimodal by 2-5 %)
 
 # 2. the field sequence, three requests with different content (small -> long -> small)

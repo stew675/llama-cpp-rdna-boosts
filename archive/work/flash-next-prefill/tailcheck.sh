@@ -14,7 +14,7 @@ if grep -qE "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ [IWED] " "$LOG"; then
   echo "WARNING: this log carries -lv lines inside the token stream; the extracted span is NOT clean." >&2
   echo "         Re-run this arm with no VERBOSE for a text/coherence check." >&2
 fi
-TXT=$(python3 "$HERE/../../scripts/extract-generated.py" "$LOG" --text)
+TXT=$(python3 "$HERE/../../../scripts/extract-generated.py" "$LOG" --text)
 printf '%s' "$TXT" | tr -s '[:space:]' ' ' | tail -c "$N"
 echo
 printf '%s' "$TXT" | tail -c 400 | grep -qE "(.)\1{20,}" && echo "SUSPECT: a character repeated 20+ times in the tail"

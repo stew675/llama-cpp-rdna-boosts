@@ -1,4 +1,4 @@
-From 4d6f07d789581bfc2a1cd0ffb2c03ebed450de6b Mon Sep 17 00:00:00 2001
+From 36883899ca5db36018a63b841106cbbe619cda52 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Thu, 22 Oct 2026 07:24:50 -0500
 Subject: [PATCH 11/18] rdna-boosts: block 11: qwen4exp (model,
@@ -473,10 +473,10 @@ index 9270dd99a..109f30edc 100644
      // custom operators
  
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 700d6a029..41bcc4e35 100644
+index a919fd804..b402056f7 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -1581,6 +1581,40 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1635,6 +1635,40 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              case GGML_OP_FLASH_ATTN_EXT: {
                  split_state = handle_flash_attn_ext(src_ss);
              } break;
@@ -517,7 +517,7 @@ index 700d6a029..41bcc4e35 100644
              case GGML_OP_FLASH_ATTN_BACK: {
                  split_state = handle_generic(src_ss, /*scalar_only =*/ true);
              } break;
-@@ -1610,6 +1644,29 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1664,6 +1698,29 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              case GGML_OP_TOP_K_MASK: {
                  split_state = handle_generic(src_ss, /*scalar_only =*/ true);
              } break;
@@ -548,10 +548,10 @@ index 700d6a029..41bcc4e35 100644
                  split_state = handle_generic(src_ss, /*scalar_only =*/ false);
              } break;
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 9645c1100..e90593be6 100644
+index cf7a11bc0..e984de6fb 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -1643,6 +1643,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+@@ -1659,6 +1659,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
      // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
      allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
  
@@ -567,7 +567,7 @@ index 9645c1100..e90593be6 100644
      if (allow) {
          for (int i = 0; i < GGML_MAX_SRC; i++) {
              const struct ggml_tensor * src = tensor->src[i];
-@@ -3896,6 +3905,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
+@@ -4057,6 +4066,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
  bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
      switch (op) {
          case GGML_OP_FLASH_ATTN_EXT:
@@ -1298,10 +1298,10 @@ index 3a4fa0707..07c960329 100644
  void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 086c5db8e..f7d49b8dc 100644
+index aa523b6c7..453674ea6 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1765,6 +1765,7 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
+@@ -1770,6 +1770,7 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
  bool ggml_cuda_fusion_disabled();
  
  #define GGML_CUDA_HC_Q8_CNT 1024
@@ -1309,7 +1309,7 @@ index 086c5db8e..f7d49b8dc 100644
  #define GGML_CUDA_MOE_GLU_Q8_CNT 4096
  #define GGML_CUDA_MOE_RED_CNT 4096
  
-@@ -1856,6 +1857,11 @@ struct ggml_backend_cuda_context {
+@@ -1861,6 +1862,11 @@ struct ggml_backend_cuda_context {
      // hc_mix_bf16_up_collapse2 Q8_1 epilogue: per-group row counters, one slice per stream (zeroed once, the
      // kernel resets every counter it completes)
      int * hc_q8_cnt = nullptr;
@@ -1321,7 +1321,7 @@ index 086c5db8e..f7d49b8dc 100644
      int * moe_glu_q8_cnt = nullptr;
      int * moe_red_cnt = nullptr;
      // The packed FA KV-group bitmap (`flash_attn_mask_to_KV_blocks`) shared by the attention layers of ONE graph
-@@ -1922,6 +1928,15 @@ struct ggml_backend_cuda_context {
+@@ -1927,6 +1933,15 @@ struct ggml_backend_cuda_context {
          return hc_q8_cnt + curr_stream_no*GGML_CUDA_HC_Q8_CNT;
      }
  
@@ -1337,7 +1337,7 @@ index 086c5db8e..f7d49b8dc 100644
      // GLU -> Q8_1 (verify band): ggml_cuda_try_fuse sets these for the GLU node it is about to leave to the regular
      // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
      // matmul's Q8_1 activation into the quantize cache.  Reset on every try_fuse call, so they never outlive the node.
-@@ -2868,6 +2883,29 @@ static inline bool ggml_cuda_bf16_src1_cache_on() {
+@@ -2924,6 +2939,29 @@ static inline bool ggml_cuda_bf16_src1_cache_on() {
      return on;
  }
  
@@ -3280,7 +3280,7 @@ index 20e7052d2..d2c043ff2 100644
      // UNARY(sigmoid) -> MUL -> ADD with a per-row gate (GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0: off): one kernel
      if (const int n_sig_mul_add = ggml_cuda_sigmoid_mul_add_try_fuse(*cuda_ctx, cgraph, i)) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e2a9543a8..f8b129114 100644
+index e59100daf..0d3801920 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -29,6 +29,9 @@
@@ -3302,7 +3302,7 @@ index e2a9543a8..f8b129114 100644
  #include "ggml-cuda/set.cuh"
  #include "ggml-cuda/set-rows.cuh"
  #include "ggml-cuda/pad_reflect_1d.cuh"
-@@ -1633,6 +1638,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -1769,6 +1774,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
      if (hc_q8_cnt != nullptr) {
          CUDA_CHECK(cudaFree(hc_q8_cnt));
      }
@@ -3312,7 +3312,7 @@ index e2a9543a8..f8b129114 100644
      if (moe_glu_q8_cnt != nullptr) {
          CUDA_CHECK(cudaFree(moe_glu_q8_cnt));
      }
-@@ -4481,6 +4489,43 @@ struct cuda_gc_timer {
+@@ -4616,6 +4624,43 @@ struct cuda_gc_timer {
  
  // GGML_CUDA_BF16_SRC1_CACHE=0 disables the per-graph BF16 src1 reuse (bf16_src1_cache in common.cuh).
  
@@ -3356,7 +3356,7 @@ index e2a9543a8..f8b129114 100644
  template<ggml_type compute_type>
  
  static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-@@ -4587,6 +4632,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+@@ -4722,6 +4767,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
      if constexpr (compute_type == GGML_TYPE_BF16) {
          // reserved (and, on a miss, converted) above -- see the pool-order note there
          if (src1_bf16 != nullptr) {
@@ -3368,7 +3368,7 @@ index e2a9543a8..f8b129114 100644
              if (src1_bf16_new) {
                  const auto convert_func = traits::convert(src1->type);
                  GGML_ASSERT(convert_func != nullptr);
-@@ -5797,6 +5847,19 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -5932,6 +5982,19 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_FLASH_ATTN_EXT:
              ggml_cuda_flash_attn_ext(ctx, dst);
              break;
@@ -3388,7 +3388,7 @@ index e2a9543a8..f8b129114 100644
          case GGML_OP_CROSS_ENTROPY_LOSS:
              ggml_cuda_cross_entropy_loss(ctx, dst);
              break;
-@@ -5821,6 +5884,12 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
+@@ -5956,6 +6019,12 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
          case GGML_OP_DSV4_HC_POST:
              ggml_cuda_op_dsv4_hc_post(ctx, dst);
              break;
@@ -3401,7 +3401,7 @@ index e2a9543a8..f8b129114 100644
          case GGML_OP_RWKV_WKV7:
              ggml_cuda_op_rwkv_wkv7(ctx, dst);
              break;
-@@ -7504,12 +7573,152 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7664,12 +7733,152 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -3554,7 +3554,7 @@ index e2a9543a8..f8b129114 100644
      static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
  
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
-@@ -8957,8 +9166,33 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -9117,8 +9326,33 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
@@ -12054,7 +12054,7 @@ index c94af98d8..74379b025 100644
          // file-mapped.  An explicit `--lazy-mode off` overrides the mmap-backed buffer for
          // the tensors the arch marks TENSOR_READ_LAZY (the PLE / engram tables): without
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 661c6eff1..cce380945 100644
+index a7b1b32e2..5da672dd2 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -3478,10 +3478,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,

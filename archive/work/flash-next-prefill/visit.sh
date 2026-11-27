@@ -13,7 +13,7 @@ RUNS=${RUNS:-$HERE/runs}
 DIR="$RUNS/$TAG"; rm -rf "$DIR"; mkdir -p "$DIR"
 PROMPT=${PROMPT:-$HERE/l1-90k.txt}
 if [ ! -s "$PROMPT" ]; then
-  for _ in $(seq 1 17); do cat "$HERE/../../prompts/prose-rdna-boosts.txt"; done > "$PROMPT"
+  for _ in $(seq 1 17); do cat "$HERE/../../../prompts/prose-rdna-boosts.txt"; done > "$PROMPT"
 fi
 M=${MODEL:-/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}
 PORT=${PORT:-8099}

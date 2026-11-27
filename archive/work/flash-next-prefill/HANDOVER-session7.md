@@ -137,7 +137,7 @@ gather is that tier's transport (which is what ships).  **Whatever you do, keep 
 # 1. the campaign arm (1 GPU, GSQ-IQ3_XXS, 89k): text + rate.  Expect sha=43d0b1f4629e on EVERY cycle,
 #    prefill ~2485-2505 t/s (the box is bimodal by 2-5 %).
 EXTRAENV="NCMOE=47 NGEN=128" ./abba.sh s7-89k 2 default
-python3 ../../scripts/extract-generated.py runs/abba-s7-89k/default-c1/run.log | tail -1
+python3 ../../../scripts/extract-generated.py runs/abba-s7-89k/default-c1/run.log | tail -1
 
 # 2. the field sequence (small -> long -> small).  Expect: decision `3 -> 2`, staging `144 splits, 2 buffers of
 #    450.0 MiB`, band 1536 -> 1792 -> 2048 inside the cushion, `band_raise[absorbed_by_cushion=2

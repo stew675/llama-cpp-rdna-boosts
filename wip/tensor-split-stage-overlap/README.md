@@ -4,7 +4,7 @@
 maintainer's instruction, after an attempted drain overlap was **reverted for corrupting output**.  It exists so the
 investigation has a home that is not a landed change, and so the numbers and the root causes are not re-derived.
 
-It continues `wip/flash-next-prefill/` (the campaign that produced the staging pipeline and, on the maintainer's
+It continues `archive/work/flash-next-prefill/` (the campaign that produced the staging pipeline and, on the maintainer's
 decision, wired the Meta/tensor-split transport in).  Read first:
 [`../flash-next-prefill/REVIEW-squashed.md`](../flash-next-prefill/REVIEW-squashed.md) **§12** (the wiring and the
 measured curve) and [`../flash-next-prefill/RESULTS-session7.md`](../flash-next-prefill/RESULTS-session7.md) **§6**

@@ -2129,6 +2129,55 @@ stock-relative `llama-batched-bench -npl 1,4,8` arm.
 
 ## Block 09 — host-resident MoE: iface, scheduler, expert cache, staging rings
 
+> **r369 amendment (promotion of `archive/work/flash-next-prefill/`): the H2D staging transport is a PIPELINE, and the
+> scheduler now chooses between it and the gather by MEASUREMENT.**  Folded in from the campaign as one layer over
+> the blocks whose territory it touches (09 gets the scheduler, the cache engine and the iface; 10 the slab/region;
+> 12 the rest of the scheduler sweep and the CPU/RPC rows; 15 the iface row lists and the GTT prefill comments —
+> each of which is noted at its own block).  What this block now carries:
+>
+> * **The pipeline replaces the slot ring.**  One to three buffers, each sized once from the graph's largest
+>   host-weight set; buffer *k* is filled on the copy stream while split *k-1* computes, the split consumes it
+>   **in place**, and the buffer is released the moment its compute is enqueued (the event fires when the kernels
+>   have actually read it), so the fill for *k+3* goes into the same buffer.  `GGML_SCHED_PIPELINE` (=0 disables),
+>   `GGML_SCHED_PIPELINE_BUFS` 0-3 (`GGML_SCHED_STAGE_SLOTS` is the alias the released block documents; 0 =
+>   GATHER), and the depth is otherwise the expert cache's residency rule (below).  Names follow the mechanism
+>   throughout: `sched_pipe_*`/`pipe_*`, `stage_region`/`stage_used`/`stage_slots`/`stage_requested`, the
+>   `slab_stage_*` device hooks and `ggml_cuda_transport_bufs` (`staging ring` and `slab_ring_*` are gone from the
+>   code; the comments that still say "ring" are upstream/P4 history).
+> * **The stage-vs-gather SELECTOR** (`GGML_SCHED_STAGE_SELECT`, `GGML_SCHED_STAGE_EXPOSE_US`): above the cache's
+>   decode/verify band the transport is decided by the host EXPOSURE — the bytes the gather would pull over the
+>   link per token, against a calibrated 38 µs/token crossover (per device, from the measured H2D bandwidth) —
+>   rather than by a percentage of residency, which is not the discriminator (Flash-Next stages at 51 % while the
+>   35B gathers at 56 %).  `GGML_SCHED_DEVGATHER=0` (never gather) and `1`/`force` (the historical arm) stay as
+>   the two controls, and they act on **both** tiers.
+> * **The Meta (tensor-split) transport is reachable and selectable.**  The selector no longer refuses a backend
+>   without backend slots: a backend with `stage_input` is an eligible transport at the same depth/region
+>   authority.  Measured 2 cards `-sm tensor` (GSQ-IQ3_XXS 89k, `-ub 8192`, `-lme mirror --lazy-mode off`):
+>   **staged +8.1 % at 40 % coverage, +3.4 % at 60 %, −2.1 % at 80 %, tie at ~100 %**, crossover ≈70 % (the rule
+>   predicts ~78 %).  What that tier does NOT get yet is fill-ahead and the in-place consume — both structural
+>   (the Meta drain consumes every pending entry per `graph_compute`, and the in-place redirect is measurably
+>   wrong for an offloaded expert table) — and that is `wip/tensor-split-stage-overlap/`.  **The transport is
+>   selectable whatever the policy is: a future change that reintroduces "the gather owns that tier" is a
+>   maintainer decision, not a tuning edit.**
+> * **The cache's residency mirrors** (`moe_cache_resident_bytes`, `moe_cache_residency`, the `moe_cache_residency`
+>   iface member and the Meta sum over its children) are O(1) atomics maintained beside `g_arena_bytes`, because the
+>   selector needs a lock-free read (the cache calls INTO the slab with `g_mutex` held).  The one path that cleared
+>   `t.slots` without the accounting now calls it, and the exit census re-derives both mirrors and WARNs on drift.
+> * **`moe_cache_stage_ready` is RETIRED** (no tombstone): the pipeline's fill lands in place, so the D2D-era
+>   trade it encoded does not exist, and it had had no scheduler caller since the pipeline replaced
+>   `sched_stage_issue`.  `moe_cache_in_place` is RESTORED in the pipeline's split plan (all-or-nothing per split,
+>   like the gather) — without it a fully resident identity table re-copied 61 GiB per 3049-token prompt.
+> * **The fill's engine** (`MOE_HOST_POOL_STAGE_BULK`, `_MERGE_FLOOR`, both link-derived by default): a whole-table
+>   fill becomes merged host runs by copy-engine DMA plus one kernel launch for the arena-resident experts (the
+>   HYBRID), instead of a kernel walking 512 experts or the per-expert bounce.  Measured x8 28.7 GB/s hybrid
+>   2440-2509 vs bulk 2343-2346; x16 51-55 GB/s hybrid 2458 vs bulk 2522 (+2.6 %).
+>
+> Verified (session 7/8 of the campaign): `gate-prefill-logits` KLD 0.000000 / top-p 100 % on the dense canonical
+> and both host-expert shapes, `gate-host-pool` 59/59, `gate-kv-residency`, `gate-fused-probe-splits`,
+> `gate-moe-promise`, `check-shlib-symbols` (VMM and `GGML_HIP_NO_VMM=ON`), the four-axis MTP protocol on f16 and
+> q8_0 (8/8 pairs byte-identical, MTP 1.9-4.4x plain), and the remote text identity on gfx1100 and gfx1151.
+> `ENVIRONMENT.md` §31, `DIAGNOSTIC.md` §31, `INVARIANTS.md` r369.
+>
 > **r338 amendment: OPT-IN `-of tp-ffn-even` — an even FFN / shared-expert `-sm tensor` split — and the
 > `--optional-features` tag layer it is the first entry of** (contributor PR #342, `@briansp2020`).  The meta split
 > floors an FFN tensor's per-device share to granularity `lcm(blck_size,128)`, so a 640-wide expert set at **two**
@@ -2982,6 +3031,37 @@ next item) and the census to expect is `direct` ~= 0 with `properties_changed` i
 
 ## Block 10 — the slab, the fusion dispatcher, the async input ring (infrastructure)
 
+> **r369 amendment (promotion of `archive/work/flash-next-prefill/`): the slab's TRANSPORT REGION, its cushion and its depth
+> authority.**  The staging region is no longer a ring hole sized by a MiB cap: it is DERIVED as one transport
+> buffer × the pipeline depth, capped at 1/4 of the smallest staging device's VRAM, and it is CARVED per wide pass
+> and released at every prefill → decode transition.  This block now carries:
+>
+> * `ggml_cuda_slab.cu`: the region becomes a cushion-anchored carve (`GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS`,
+>   default 2 compute chunks above the decode/verify band), the base is FIXED for the run and a band raise inside
+>   the cushion moves nothing (`absorbed_by_cushion` / `overrun_deferred` in the stats line are the reading), the
+>   unit (`slab_set_stage_unit`) and the depth (`slab_stage_slots`) come from the context/backend rather than from
+>   a cap, `stage_candidate`/`transport_reset` own the carve and the bump cursor, and `GGML_CUDA_SLAB_RING_MIB` is
+>   RETIRED (it named no resizable quantity and could only cap the region below one buffer's need).
+> * `ggml-cuda-vmm.h`: the region's API (`arena_alloc_transient`, `stage_slot_capacity`, `transport_reset`,
+>   `stage_request`/`stage_region_bytes`).
+> * `common.cuh` / `ggml-cuda.cu`: the `h2d_stage_*` members and their hooks, the transport authority
+>   (`ggml_backend_cuda_transport_bufs[_set]`, the ONE environment parser), the residency rule
+>   (`ggml_cuda_moe_transport_decide`: 0 = GATHER when one buffer would take the arena below
+>   `GGML_CUDA_SLAB_MIN_ARENA_MIB`, 1 when two would, 2 when three would leave < 40 % of the host set, else 3 —
+>   decided ONCE), the refusal instead of an out-of-region `cudaMalloc`
+>   (`GGML_CUDA_SLAB_TRANSPORT_FALLBACK=1` is the A/B arm), and the **VMM pool's fail-soft growth** (a
+>   workspace-pool growth the driver refuses is an OOM that the fail-soft paths above it can handle, not a bare
+>   `CU_CHECK` abort) plus the wide-band block bookkeeping in the same pool (`free` must recognise a wide block
+>   BEFORE `pool_used` moves, the rule `ggml_cuda_pool_leg::free` already followed).
+> * `ggml/include/ggml-cuda.h`: `ggml_backend_cuda_transport_bufs[_set]` — the one number the scheduler's depth,
+>   this backend's slots and the region all read.
+>
+> The measured trade the depth table encodes is prefill overlap against eviction-during-prefill plus
+> refill-after-drop, not the final arena size (the region is a carve inside the work band).  122B-A10B at 15 %
+> coverage: gather 1030 t/s, forced 1 buffer 1031 (no overlap), 2 buffers 1186, 3 buffers 1274; the fourth branch
+> (35B-A3B Q8_0, 1 GPU) settles at 3 and reads 3210.  `ENVIRONMENT.md` §1.3/§31, `DIAGNOSTIC.md` §31,
+> `INVARIANTS.md` r369.
+>
 > **r368 amendment (issue #374): the host half of the dense Q5_K VDR-4 kernel.**  `mmvq-vecdot.cuh`'s
 > `get_vec_dot_q_cuda` case and `mmvq.cu`'s `get_vdr_mmvq_dense` give Q5_K the same dense treatment Q4_K had: the
 > VDR is `VDR_Q5_K_Q8_1_MMVQ_RDNA3_0` (4) and the dot product is `vec_dot_q5_K_q8_1_vdr4_dense` (block 07 has the
@@ -4486,6 +4566,12 @@ cannot tell the two arms apart).  Record: `archive/work/qsa-topk-regular/`.
 
 ## Block 12 — campaign remainder
 
+> **r369 note (promotion of `archive/work/flash-next-prefill/`):** the parts of the campaign whose preimage is *this* block's
+> text — the scheduler's exposure-selector sweep over `sched_input_gatherable`/`sched_stage_*`, the `llama_context`
+> transport sizing (unit = the largest host-expert TENSOR per device, with the constructor's `return` folded into a
+> skip), the `ggml-cpu.cpp`/`ggml-rpc.cpp` positional rows, and the cache's census wording.  The mechanism itself is
+> documented at block 09/10; nothing here is a separate feature.
+>
 > **r361 amendment (GitHub issue #366, `@mjohanning99`): THE S2 EXACT TOP-K FAST PATH NOW REPRODUCES A PENALTY
 > instead of standing down for one.**  `common_sampler_fast_topk_k()` returned 0 for any non-trivial penalties
 > sampler, so every profile with a presence / frequency / repeat penalty sampled from a FULL-vocabulary candidate
@@ -6318,6 +6404,14 @@ Concurrent 2-slot decode with the window active also passes (2 x 64 tokens), and
 
 ## Block 15 — the UMA GTT expert store: an APU's MoE expert set served from ONE registered region (`-lme` sizes it)
 
+> **r369 note (promotion of `archive/work/flash-next-prefill/`):** four things from the campaign land here because their
+> preimage is this block's text — the GTT preflight/`report_locked` comments that named the retired
+> `moe_cache_stage_ready` query, the residency-mirror drift check beside the GTT census, and the **positional
+> initializer row lists** (`.gtt_store_arena_min`, the `slab_stage_*` rows and the trailing `stage_release` /
+> `moe_cache_residency` rows in the CPU, RPC, Meta and CUDA ifaces).  The rows belong to the LAST block that writes
+> those lists, which is this one: appending a row earlier would reorder the list against the rows blocks 12-15 add,
+> and the final tree would differ from the validated one.  The mechanisms are block 09/10's.
+>
 > **r275 amendment (issue #306):** the RESOLVED-layout census's local was named `near`, which `<windows.h>` defines as
 > an empty macro -- a hard Windows HIP compile error at `moe-expert-cache.cu:2716/2718/2721`.  Renamed `near_mirror`
 > (no-op elsewhere).  The GTT prefill-stream debug line's `used_experts` is now `%lld` with an `int64_t` cast, and the
