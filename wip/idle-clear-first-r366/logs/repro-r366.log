@@ -1,0 +1,328 @@
+# repro-r366.log: LLAMA_SERVER_IDLE_CLEAR_FIRST on stock r366 (e10879b0b3) vs r366 + 0001. Flash-Next IQ3_XXS, 2x R9700, -sm tensor -c 262144 -b 2048 -ub 2048 -ctk q8_0 -ctv q8_0, no MTP.
+# Arm labels: r366 = stock e10879b0b3; pri366 b2474403a1 = r366 + 0001 (0001 differs from b2474403a1 only in a code comment and the commit message).
+# Part 1: -cram 10240, LLAMA_SERVER_LAZY_IDLE_SLOTS=0: S = stock, I = + 0001.
+### icf4 8:30 PM pri366 b2474403a1
+=== S 8:30 PM r366 -e LLAMA_SERVER_LAZY_IDLE_SLOTS=0
+   srv    load_model: initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'
+   ##### arm par: base 3140 entries
+   == par build A: wall 34.7 s
+      A done   34.7 s | ctx 120603, prefilled 120603 @  3508 t/s ( 34.4 s) | gen  16 @  60.8 t/s | sha b023d9b9
+   == par build B: wall 34.7 s
+      B done   34.7 s | ctx 120671, prefilled 120671 @  3534 t/s ( 34.1 s) | gen  16 @  60.8 t/s | sha b023d9b9
+   == par round 1 (both at once): wall 11.2 s
+      A done   11.2 s | ctx 122152, prefilled   3597 @   696 t/s (  5.2 s) | gen 256 @  49.3 t/s | sha e7639ac8
+      B done   11.0 s | ctx 122210, prefilled   3587 @   647 t/s (  5.5 s) | gen 230 @  49.6 t/s | sha 365b5229
+   == par round 2 (both at once): wall 9.6 s
+      A done    9.6 s | ctx 123697, prefilled   2228 @   720 t/s (  3.1 s) | gen 256 @  49.3 t/s | sha fa7bea9f
+      B done    9.6 s | ctx 123756, prefilled   2229 @   719 t/s (  3.1 s) | gen 256 @  49.3 t/s | sha 1ede2312
+   == par round 3 (both at once): wall 10.1 s
+      A done   10.1 s | ctx 125257, prefilled   2926 @   822 t/s (  3.6 s) | gen 256 @  49.2 t/s | sha dd75e387
+      B done   10.1 s | ctx 125302, prefilled   2229 @   625 t/s (  3.6 s) | gen 256 @  49.2 t/s | sha 5092682a
+   ##### arm par: 3 rounds total 30.9 s
+   ##### arm turn: base 3375 entries
+   == turn build A: wall 3.9 s
+      A done    3.9 s | ctx 129712, prefilled   5821 @  1988 t/s (  2.9 s) | gen  16 @  60.5 t/s | sha 906f1cce
+   == turn build B: wall 4.0 s
+      B done    4.0 s | ctx 129771, prefilled   5152 @  1634 t/s (  3.2 s) | gen  16 @  56.6 t/s | sha 906f1cce
+   == turn round 1 (both at once): wall 13.3 s
+      A done    6.7 s | ctx 131267, prefilled   3603 @  1623 t/s (  2.2 s) | gen 256 @  67.0 t/s | sha 6891efa8
+      B done   13.3 s | ctx 131324, prefilled   3601 @  1633 t/s (  2.2 s) | gen 256 @  66.8 t/s | sha e5dee0a5
+         log: srv   kv_admit_ok: KV admission: task 977 needs 131580 cells, 1 running slot(s) hold 131523 of 262144; deferred until a slot is released
+   == turn round 2 (both at once): wall 85.0 s
+      A done   42.9 s | ctx 132806, prefilled 132806 @  3476 t/s ( 38.2 s) | gen 256 @  67.2 t/s | sha 5f8224a6
+      B done   85.0 s | ctx 132881, prefilled 132881 @  3475 t/s ( 38.2 s) | gen 243 @  67.3 t/s | sha 022fff68
+         log: state_seq_set_data: error loading state: failed to restore kv cache
+         log: srv   kv_admit_ok: KV admission: task 1495 needs 133137 cells, 1 running slot(s) hold 133062 of 262144; deferred until a slot is released
+         log: state_seq_set_data: error loading state: failed to restore kv cache
+   == turn round 3 (both at once): wall 86.3 s
+      A done   43.2 s | ctx 134369, prefilled 134369 @  3444 t/s ( 39.0 s) | gen 256 @  67.1 t/s | sha 8fc249bb
+      B done   86.3 s | ctx 134435, prefilled 134435 @  3448 t/s ( 39.0 s) | gen 256 @  67.2 t/s | sha 5c0bbd8e
+         log: state_seq_set_data: error loading state: failed to restore kv cache
+         log: srv         alloc:  - making room for prompt cache entry, removing oldest entry (size = 3086.607 MiB)
+         log: srv   kv_admit_ok: KV admission: task 2126 needs 134691 cells, 1 running slot(s) hold 134625 of 262144; deferred until a slot is released
+         log: state_seq_set_data: error loading state: failed to restore kv cache
+   ##### arm turn: 3 rounds total 184.6 s
+   faults 0
+=== I 8:36 PM pri366 -e LLAMA_SERVER_LAZY_IDLE_SLOTS=0
+   srv    load_model: initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'
+   ##### arm par: base 3140 entries
+   == par build A: wall 34.8 s
+      A done   34.8 s | ctx 120603, prefilled 120603 @  3500 t/s ( 34.5 s) | gen  16 @  60.9 t/s | sha b023d9b9
+   == par build B: wall 34.7 s
+      B done   34.7 s | ctx 120671, prefilled 120671 @  3531 t/s ( 34.2 s) | gen  16 @  61.1 t/s | sha b023d9b9
+   == par round 1 (both at once): wall 11.4 s
+      A done   11.2 s | ctx 122152, prefilled   3597 @   702 t/s (  5.1 s) | gen 256 @  49.1 t/s | sha 5d457007
+      B done   11.4 s | ctx 122210, prefilled   3587 @   653 t/s (  5.5 s) | gen 256 @  50.2 t/s | sha 9fa9aee2
+   == par round 2 (both at once): wall 9.6 s
+      A done    9.6 s | ctx 123697, prefilled   2228 @   711 t/s (  3.1 s) | gen 256 @  49.4 t/s | sha 5242890a
+      B done    9.6 s | ctx 123756, prefilled   2229 @   710 t/s (  3.1 s) | gen 256 @  49.4 t/s | sha 46fa1015
+   == par round 3 (both at once): wall 10.2 s
+      A done   10.2 s | ctx 125257, prefilled   2243 @   625 t/s (  3.6 s) | gen 256 @  49.3 t/s | sha e400c763
+      B done   10.2 s | ctx 125302, prefilled   2912 @   810 t/s (  3.6 s) | gen 256 @  49.3 t/s | sha 3d7ca002
+   ##### arm par: 3 rounds total 31.3 s
+   ##### arm turn: base 3375 entries
+   == turn build A: wall 3.8 s
+      A done    3.8 s | ctx 129712, prefilled   5821 @  2050 t/s (  2.8 s) | gen  16 @  60.8 t/s | sha 906f1cce
+   == turn build B: wall 3.0 s
+      B done    3.0 s | ctx 129771, prefilled   5152 @  2415 t/s (  2.1 s) | gen  16 @  57.9 t/s | sha 906f1cce
+   == turn round 1 (both at once): wall 11.8 s
+      A done    5.9 s | ctx 131267, prefilled   3603 @  2421 t/s (  1.5 s) | gen 256 @  67.3 t/s | sha a6f616ef
+      B done   11.8 s | ctx 131324, prefilled   3601 @  2410 t/s (  1.5 s) | gen 256 @  67.6 t/s | sha 2500e424
+         log: srv   kv_admit_ok: KV admission: task 993 needs 131580 cells, 1 running slot(s) hold 131523 of 262144; deferred until a slot is released
+   == turn round 2 (both at once): wall 11.8 s
+      A done    5.9 s | ctx 132806, prefilled   3587 @  2473 t/s (  1.5 s) | gen 256 @  67.0 t/s | sha 44b8d9b1
+      B done   11.8 s | ctx 132881, prefilled   3605 @  2415 t/s (  1.5 s) | gen 256 @  67.5 t/s | sha 65a776a2
+         log: srv   kv_admit_ok: KV admission: task 1511 needs 133137 cells, 1 running slot(s) hold 133062 of 262144; deferred until a slot is released
+   == turn round 3 (both at once): wall 11.8 s
+      A done    5.9 s | ctx 134369, prefilled   3611 @  2463 t/s (  1.5 s) | gen 256 @  67.1 t/s | sha 76c53f25
+      B done   11.8 s | ctx 134435, prefilled   3602 @  2400 t/s (  1.5 s) | gen 256 @  67.5 t/s | sha c04553da
+         log: srv   kv_admit_ok: KV admission: task 2029 needs 134691 cells, 1 running slot(s) hold 134625 of 262144; deferred until a slot is released
+   ##### arm turn: 3 rounds total 35.4 s
+   faults 0
+### icf4 DONE 8:39 PM
+
+# Part 2: -cram 10240, stock default (lazy idle slots on): SD.
+### icf5 8:40 PM pri366 b2474403a1
+=== SD 8:40 PM r366 
+   srv    load_model: initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'
+   ##### arm par: base 3140 entries
+   == par build A: wall 34.7 s
+      A done   34.7 s | ctx 120603, prefilled 120603 @  3507 t/s ( 34.4 s) | gen  16 @  60.9 t/s | sha b023d9b9
+   == par build B: wall 36.5 s
+      B done   36.5 s | ctx 120671, prefilled 120671 @  3397 t/s ( 35.5 s) | gen  16 @  60.6 t/s | sha b023d9b9
+   == par round 1 (both at once): wall 11.7 s
+      A done   11.7 s | ctx 122152, prefilled   3597 @   749 t/s (  4.8 s) | gen 256 @  49.8 t/s | sha 5d457007
+      B done   11.7 s | ctx 122210, prefilled   3587 @   748 t/s (  4.8 s) | gen 256 @  49.7 t/s | sha 42f27a53
+         log: srv  try_clear_id: making room in the KV cache: saving and clearing idle slot 1 with 120686 tokens
+   == par round 2 (both at once): wall 10.2 s
+      A done   10.2 s | ctx 123697, prefilled   2911 @   815 t/s (  3.6 s) | gen 256 @  49.3 t/s | sha 33f034ba
+      B done   10.2 s | ctx 123756, prefilled   2229 @   625 t/s (  3.6 s) | gen 256 @  49.3 t/s | sha e00cf9be
+   == par round 3 (both at once): wall 10.2 s
+      A done   10.2 s | ctx 125257, prefilled   2926 @   827 t/s (  3.5 s) | gen 256 @  49.3 t/s | sha 6e2e198d
+      B done   10.2 s | ctx 125302, prefilled   2229 @   631 t/s (  3.5 s) | gen 256 @  49.3 t/s | sha 4674f4ba
+   ##### arm par: 3 rounds total 32.0 s
+   ##### arm turn: base 3375 entries
+   == turn build A: wall 3.6 s
+      A done    3.6 s | ctx 129712, prefilled   5138 @  1945 t/s (  2.6 s) | gen  16 @  60.9 t/s | sha 906f1cce
+   == turn build B: wall 3.8 s
+      B done    3.8 s | ctx 129771, prefilled   5835 @  2010 t/s (  2.9 s) | gen  16 @  57.2 t/s | sha 580e4d38
+   == turn round 1 (both at once): wall 13.3 s
+      A done    6.7 s | ctx 131267, prefilled   3603 @  1602 t/s (  2.2 s) | gen 256 @  66.6 t/s | sha 9149e91d
+      B done   13.3 s | ctx 131324, prefilled   3601 @  1633 t/s (  2.2 s) | gen 251 @  67.0 t/s | sha 573b1fd7
+         log: srv   kv_admit_ok: KV admission: task 977 needs 131580 cells, 1 running slot(s) hold 131523 of 262144; deferred until a slot is released
+   == turn round 2 (both at once): wall 11.9 s
+      A done    6.0 s | ctx 132806, prefilled   3587 @  2342 t/s (  1.5 s) | gen 256 @  67.0 t/s | sha 26a5625e
+      B done   11.9 s | ctx 132881, prefilled   3605 @  2450 t/s (  1.5 s) | gen 256 @  67.6 t/s | sha 2f774a4d
+         log: state_seq_set_data: error loading state: failed to restore kv cache
+         log: srv  try_clear_id: making room in the KV cache: saving and clearing idle slot 1 with 131574 tokens
+         log: slot prompt_load_: id  0 | task -1 | retrying the prompt cache restore
+         log: srv   kv_admit_ok: KV admission: task 1490 needs 133137 cells, 1 running slot(s) hold 133062 of 262144; deferred until a slot is released
+         log: state_seq_set_data: error loading state: failed to restore kv cache
+         log: srv  try_clear_id: making room in the KV cache: saving and clearing idle slot 0 with 133061 tokens
+         log: slot prompt_load_: id  2 | task -1 | retrying the prompt cache restore
+   == turn round 3 (both at once): wall 11.8 s
+      A done    6.0 s | ctx 134369, prefilled   3611 @  2396 t/s (  1.5 s) | gen 256 @  67.0 t/s | sha 95d098c2
+      B done   11.8 s | ctx 134435, prefilled   3602 @  2456 t/s (  1.5 s) | gen 256 @  67.5 t/s | sha fbbff87c
+         log: state_seq_set_data: error loading state: failed to restore kv cache
+         log: srv  try_clear_id: making room in the KV cache: saving and clearing idle slot 2 with 133136 tokens
+         log: slot prompt_load_: id  3 | task -1 | retrying the prompt cache restore
+         log: srv   kv_admit_ok: KV admission: task 2008 needs 134691 cells, 1 running slot(s) hold 134625 of 262144; deferred until a slot is released
+         log: state_seq_set_data: error loading state: failed to restore kv cache
+         log: srv  try_clear_id: making room in the KV cache: saving and clearing idle slot 3 with 134624 tokens
+         log: slot prompt_load_: id  1 | task -1 | retrying the prompt cache restore
+   ##### arm turn: 3 rounds total 37.0 s
+   faults 0
+### icf5 DONE 8:43 PM
+
+# Part 3: -cram 2048 (agent states exceed the prompt-cache limit): SD stock default, S stock lazy=0, I + 0001 lazy=0, I0 + 0001 lazy=0 + LLAMA_SERVER_IDLE_CLEAR_FIRST=0.
+### icf3 7:54 PM pri366 b2474403a1
+=== SD 7:54 PM r366 
+   srv    load_model: initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'
+   ##### arm par: base 3140 entries
+   == par build A: wall 34.4 s
+      A done   34.4 s | ctx 120603, prefilled 120603 @  3532 t/s ( 34.1 s) | gen  16 @  59.6 t/s | sha b023d9b9
+   == par build B: wall 36.3 s
+      B done   36.3 s | ctx 120671, prefilled 120671 @  3418 t/s ( 35.3 s) | gen  16 @  60.5 t/s | sha b023d9b9
+   == par round 1 (both at once): wall 12.5 s
+      A done   12.5 s | ctx 122152, prefilled   3597 @   750 t/s (  4.8 s) | gen 256 @  49.4 t/s | sha 5d457007
+      B done   12.5 s | ctx 122210, prefilled   3587 @   749 t/s (  4.8 s) | gen 256 @  49.4 t/s | sha 42f27a53
+         log: srv  try_clear_id: making room in the KV cache: saving and clearing idle slot 1 with 120686 tokens
+   == par round 2 (both at once): wall 67.5 s
+      A done   24.2 s | ctx 123697, prefilled   2911 @   541 t/s (  5.4 s) | gen 256 @  13.6 t/s | sha fa7bea9f
+      B done   67.5 s | ctx 123756, prefilled 123756 @  1966 t/s ( 63.0 s) | gen 256 @  66.6 t/s | sha 6094d840
+         log: srv         alloc:  - prompt state size 2283.899 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == par round 3 (both at once): wall 67.9 s
+      A done   22.8 s | ctx 125257, prefilled   2244 @   573 t/s (  3.9 s) | gen 256 @  13.6 t/s | sha 6e2e198d
+      B done   67.9 s | ctx 125302, prefilled 125302 @  1972 t/s ( 63.5 s) | gen 256 @  66.7 t/s | sha edcf01ee
+         log: srv         alloc:  - prompt state size 2080.483 MiB exceeds cache size limit 2048.000 MiB, skipping
+   ##### arm par: 3 rounds total 147.9 s
+   ##### arm turn: base 3375 entries
+   == turn build A: wall 3.1 s
+      A done    3.1 s | ctx 129712, prefilled   5138 @  1911 t/s (  2.7 s) | gen  16 @  58.3 t/s | sha 906f1cce
+         log: srv         alloc:  - prompt state size 2102.210 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn build B: wall 37.7 s
+      B done   37.7 s | ctx 129771, prefilled 129771 @  3481 t/s ( 37.3 s) | gen  16 @  60.0 t/s | sha 906f1cce
+         log: srv         alloc:  - prompt state size 3061.382 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn round 1 (both at once): wall 51.0 s
+      A done   43.9 s | ctx 131267, prefilled 131267 @  3341 t/s ( 39.3 s) | gen 256 @  67.2 t/s | sha ddf1e9eb
+      B done   51.0 s | ctx 131324, prefilled   3601 @  2626 t/s (  1.4 s) | gen 256 @  67.4 t/s | sha 134e1457
+         log: srv   kv_admit_ok: KV admission: task 1639 needs 131580 cells, 1 running slot(s) hold 131523 of 262144; deferred until a slot is released
+         log: srv  try_clear_id: making room in the KV cache: saving and clearing idle slot 3 with 131522 tokens
+         log: srv         alloc:  - prompt state size 2186.038 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn round 2 (both at once): wall 88.7 s
+      A done   44.4 s | ctx 132806, prefilled 132806 @  3337 t/s ( 39.8 s) | gen 256 @  67.1 t/s | sha 5f8224a6
+      B done   88.7 s | ctx 132881, prefilled 132881 @  3331 t/s ( 39.9 s) | gen 243 @  67.0 t/s | sha 022fff68
+         log: srv   kv_admit_ok: KV admission: task 2220 needs 133137 cells, 1 running slot(s) hold 133062 of 262144; deferred until a slot is released
+         log: srv  try_clear_id: making room in the KV cache: saving and clearing idle slot 2 with 131579 tokens
+         log: srv         alloc:  - prompt state size 2299.410 MiB exceeds cache size limit 2048.000 MiB, skipping
+         log: srv  try_clear_id: making room in the KV cache: saving and clearing idle slot 1 with 133061 tokens
+         log: srv         alloc:  - prompt state size 2207.666 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn round 3 (both at once): wall 90.1 s
+      A done   45.1 s | ctx 134369, prefilled 134369 @  3321 t/s ( 40.5 s) | gen 256 @  67.0 t/s | sha 8fc249bb
+      B done   90.1 s | ctx 134435, prefilled 134435 @  3322 t/s ( 40.5 s) | gen 256 @  67.1 t/s | sha 5c0bbd8e
+         log: srv   kv_admit_ok: KV admission: task 2851 needs 134691 cells, 1 running slot(s) hold 134625 of 262144; deferred until a slot is released
+         log: srv  try_clear_id: making room in the KV cache: saving and clearing idle slot 0 with 133123 tokens
+         log: srv         alloc:  - prompt state size 2208.537 MiB exceeds cache size limit 2048.000 MiB, skipping
+         log: srv  try_clear_id: making room in the KV cache: saving and clearing idle slot 3 with 134624 tokens
+         log: srv         alloc:  - prompt state size 2229.631 MiB exceeds cache size limit 2048.000 MiB, skipping
+   ##### arm turn: 3 rounds total 229.8 s
+   faults 0
+=== S 8:03 PM r366 -e LLAMA_SERVER_LAZY_IDLE_SLOTS=0
+   srv    load_model: initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'
+   ##### arm par: base 3140 entries
+   == par build A: wall 34.7 s
+      A done   34.7 s | ctx 120603, prefilled 120603 @  3506 t/s ( 34.4 s) | gen  16 @  60.8 t/s | sha b023d9b9
+   == par build B: wall 34.7 s
+      B done   34.7 s | ctx 120671, prefilled 120671 @  3535 t/s ( 34.1 s) | gen  16 @  60.7 t/s | sha b023d9b9
+   == par round 1 (both at once): wall 11.2 s
+      A done   11.2 s | ctx 122152, prefilled   3597 @   697 t/s (  5.2 s) | gen 256 @  49.2 t/s | sha e7639ac8
+      B done   11.1 s | ctx 122210, prefilled   3587 @   648 t/s (  5.5 s) | gen 230 @  49.5 t/s | sha 365b5229
+   == par round 2 (both at once): wall 66.5 s
+      A done   22.7 s | ctx 123697, prefilled   2228 @   565 t/s (  3.9 s) | gen 256 @  13.7 t/s | sha 192f8cac
+      B done   66.5 s | ctx 123756, prefilled 123756 @  1963 t/s ( 63.1 s) | gen 218 @  66.4 t/s | sha 85725447
+         log: srv         alloc:  - prompt state size 2283.534 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == par round 3 (both at once): wall 68.1 s
+      A done   22.9 s | ctx 125257, prefilled   2926 @   711 t/s (  4.1 s) | gen 256 @  13.7 t/s | sha 3f7b1910
+      B done   68.1 s | ctx 125302, prefilled 125302 @  1956 t/s ( 64.1 s) | gen 256 @  66.2 t/s | sha c96b6280
+         log: srv         alloc:  - prompt state size 2079.949 MiB exceeds cache size limit 2048.000 MiB, skipping
+   ##### arm par: 3 rounds total 145.8 s
+   ##### arm turn: base 3375 entries
+   == turn build A: wall 3.4 s
+      A done    3.4 s | ctx 129712, prefilled   5821 @  1937 t/s (  3.0 s) | gen  16 @  58.3 t/s | sha 580e4d38
+         log: srv         alloc:  - prompt state size 2102.210 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn build B: wall 37.7 s
+      B done   37.7 s | ctx 129771, prefilled 129771 @  3478 t/s ( 37.3 s) | gen  16 @  60.0 t/s | sha 906f1cce
+         log: srv         alloc:  - prompt state size 2948.810 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn round 1 (both at once): wall 83.2 s
+      A done   41.7 s | ctx 131267, prefilled 131267 @  3469 t/s ( 37.8 s) | gen 256 @  67.3 t/s | sha ddf1e9eb
+      B done   83.2 s | ctx 131324, prefilled 131324 @  3470 t/s ( 37.8 s) | gen 241 @  67.2 t/s | sha 1e980815
+         log: srv         alloc:  - prompt state size 2161.641 MiB exceeds cache size limit 2048.000 MiB, skipping
+         log: srv   kv_admit_ok: KV admission: task 1602 needs 131580 cells, 1 running slot(s) hold 131523 of 262144; deferred until a slot is released
+         log: srv         alloc:  - prompt state size 2186.038 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn round 2 (both at once): wall 83.9 s
+      A done   42.1 s | ctx 132806, prefilled 132806 @  3479 t/s ( 38.2 s) | gen 256 @  67.1 t/s | sha 5f8224a6
+      B done   83.9 s | ctx 132881, prefilled 132881 @  3477 t/s ( 38.2 s) | gen 243 @  67.2 t/s | sha 022fff68
+         log: srv         alloc:  - prompt state size 2186.628 MiB exceeds cache size limit 2048.000 MiB, skipping
+         log: srv   kv_admit_ok: KV admission: task 2231 needs 133137 cells, 1 running slot(s) hold 133062 of 262144; deferred until a slot is released
+         log: srv         alloc:  - prompt state size 2207.666 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn round 3 (both at once): wall 85.2 s
+      A done   42.6 s | ctx 134369, prefilled 134369 @  3470 t/s ( 38.7 s) | gen 256 @  67.1 t/s | sha 8fc249bb
+      B done   85.2 s | ctx 134435, prefilled 134435 @  3469 t/s ( 38.8 s) | gen 256 @  67.2 t/s | sha 5c0bbd8e
+         log: srv         alloc:  - prompt state size 2208.537 MiB exceeds cache size limit 2048.000 MiB, skipping
+         log: srv   kv_admit_ok: KV admission: task 2862 needs 134691 cells, 1 running slot(s) hold 134625 of 262144; deferred until a slot is released
+         log: srv         alloc:  - prompt state size 2229.631 MiB exceeds cache size limit 2048.000 MiB, skipping
+   ##### arm turn: 3 rounds total 252.3 s
+   faults 0
+=== I 8:12 PM pri366 -e LLAMA_SERVER_LAZY_IDLE_SLOTS=0
+   srv    load_model: initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'
+   ##### arm par: base 3140 entries
+   == par build A: wall 34.7 s
+      A done   34.7 s | ctx 120603, prefilled 120603 @  3502 t/s ( 34.4 s) | gen  16 @  60.9 t/s | sha b023d9b9
+   == par build B: wall 34.7 s
+      B done   34.7 s | ctx 120671, prefilled 120671 @  3533 t/s ( 34.2 s) | gen  16 @  60.8 t/s | sha b023d9b9
+   == par round 1 (both at once): wall 11.5 s
+      A done   11.2 s | ctx 122152, prefilled   3597 @   702 t/s (  5.1 s) | gen 256 @  49.0 t/s | sha 5d457007
+      B done   11.5 s | ctx 122210, prefilled   3587 @   653 t/s (  5.5 s) | gen 256 @  50.1 t/s | sha 9fa9aee2
+   == par round 2 (both at once): wall 66.4 s
+      A done   22.5 s | ctx 123697, prefilled   2228 @   580 t/s (  3.8 s) | gen 256 @  13.7 t/s | sha c406f111
+      B done   66.4 s | ctx 123756, prefilled 123756 @  1982 t/s ( 62.4 s) | gen 256 @  66.6 t/s | sha d7af1240
+         log: srv         alloc:  - prompt state size 2283.899 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == par round 3 (both at once): wall 67.3 s
+      A done   22.6 s | ctx 125257, prefilled   2243 @   578 t/s (  3.9 s) | gen 256 @  13.7 t/s | sha 6a1a3781
+      B done   67.3 s | ctx 125302, prefilled 125302 @  1980 t/s ( 63.3 s) | gen 256 @  66.8 t/s | sha c96b6280
+         log: srv         alloc:  - prompt state size 2080.483 MiB exceeds cache size limit 2048.000 MiB, skipping
+   ##### arm par: 3 rounds total 145.2 s
+   ##### arm turn: base 3375 entries
+   == turn build A: wall 3.3 s
+      A done    3.3 s | ctx 129712, prefilled   5821 @  1992 t/s (  2.9 s) | gen  16 @  59.3 t/s | sha 580e4d38
+         log: srv         alloc:  - prompt state size 2102.210 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn build B: wall 37.7 s
+      B done   37.7 s | ctx 129771, prefilled 129771 @  3474 t/s ( 37.4 s) | gen  16 @  60.1 t/s | sha 906f1cce
+         log: srv         alloc:  - prompt state size 2948.810 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn round 1 (both at once): wall 83.2 s
+      A done   41.7 s | ctx 131267, prefilled 131267 @  3467 t/s ( 37.9 s) | gen 256 @  67.3 t/s | sha ddf1e9eb
+      B done   83.2 s | ctx 131324, prefilled 131324 @  3468 t/s ( 37.9 s) | gen 241 @  67.4 t/s | sha 1e980815
+         log: srv         alloc:  - prompt state size 2161.641 MiB exceeds cache size limit 2048.000 MiB, skipping
+         log: srv   kv_admit_ok: KV admission: task 1656 needs 131580 cells, 1 running slot(s) hold 131523 of 262144; deferred until a slot is released
+         log: srv         alloc:  - prompt state size 2186.038 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn round 2 (both at once): wall 84.0 s
+      A done   42.1 s | ctx 132806, prefilled 132806 @  3476 t/s ( 38.2 s) | gen 256 @  67.2 t/s | sha 5f8224a6
+      B done   84.0 s | ctx 132881, prefilled 132881 @  3475 t/s ( 38.2 s) | gen 243 @  67.2 t/s | sha 022fff68
+         log: srv         alloc:  - prompt state size 2186.628 MiB exceeds cache size limit 2048.000 MiB, skipping
+         log: srv   kv_admit_ok: KV admission: task 2285 needs 133137 cells, 1 running slot(s) hold 133062 of 262144; deferred until a slot is released
+         log: srv         alloc:  - prompt state size 2207.666 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn round 3 (both at once): wall 85.3 s
+      A done   42.6 s | ctx 134369, prefilled 134369 @  3468 t/s ( 38.7 s) | gen 256 @  67.1 t/s | sha 8fc249bb
+      B done   85.3 s | ctx 134435, prefilled 134435 @  3467 t/s ( 38.8 s) | gen 256 @  67.2 t/s | sha 5c0bbd8e
+         log: srv         alloc:  - prompt state size 2208.537 MiB exceeds cache size limit 2048.000 MiB, skipping
+         log: srv   kv_admit_ok: KV admission: task 2916 needs 134691 cells, 1 running slot(s) hold 134625 of 262144; deferred until a slot is released
+         log: srv         alloc:  - prompt state size 2229.631 MiB exceeds cache size limit 2048.000 MiB, skipping
+   ##### arm turn: 3 rounds total 252.5 s
+   faults 0
+=== I0 8:21 PM pri366 -e LLAMA_SERVER_LAZY_IDLE_SLOTS=0 -e LLAMA_SERVER_IDLE_CLEAR_FIRST=0
+   srv    load_model: initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'true'
+   ##### arm par: base 3140 entries
+   == par build A: wall 34.7 s
+      A done   34.7 s | ctx 120603, prefilled 120603 @  3504 t/s ( 34.4 s) | gen  16 @  60.8 t/s | sha b023d9b9
+   == par build B: wall 34.7 s
+      B done   34.7 s | ctx 120671, prefilled 120671 @  3533 t/s ( 34.2 s) | gen  16 @  60.8 t/s | sha b023d9b9
+   == par round 1 (both at once): wall 11.2 s
+      A done   11.2 s | ctx 122152, prefilled   3597 @   697 t/s (  5.2 s) | gen 256 @  49.2 t/s | sha e7639ac8
+      B done   11.0 s | ctx 122210, prefilled   3587 @   649 t/s (  5.5 s) | gen 230 @  49.5 t/s | sha 365b5229
+   == par round 2 (both at once): wall 66.5 s
+      A done   22.7 s | ctx 123697, prefilled   2228 @   565 t/s (  3.9 s) | gen 256 @  13.7 t/s | sha 192f8cac
+      B done   66.5 s | ctx 123756, prefilled 123756 @  1962 t/s ( 63.1 s) | gen 218 @  66.3 t/s | sha 85725447
+         log: srv         alloc:  - prompt state size 2283.534 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == par round 3 (both at once): wall 68.1 s
+      A done   22.9 s | ctx 125257, prefilled   2926 @   710 t/s (  4.1 s) | gen 256 @  13.7 t/s | sha 3f7b1910
+      B done   68.1 s | ctx 125302, prefilled 125302 @  1954 t/s ( 64.1 s) | gen 256 @  66.7 t/s | sha c96b6280
+         log: srv         alloc:  - prompt state size 2079.949 MiB exceeds cache size limit 2048.000 MiB, skipping
+   ##### arm par: 3 rounds total 145.9 s
+   ##### arm turn: base 3375 entries
+   == turn build A: wall 3.4 s
+      A done    3.4 s | ctx 129712, prefilled   5821 @  1937 t/s (  3.0 s) | gen  16 @  58.3 t/s | sha 580e4d38
+         log: srv         alloc:  - prompt state size 2102.210 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn build B: wall 37.7 s
+      B done   37.7 s | ctx 129771, prefilled 129771 @  3473 t/s ( 37.4 s) | gen  16 @  60.1 t/s | sha 906f1cce
+         log: srv         alloc:  - prompt state size 2948.810 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn round 1 (both at once): wall 83.2 s
+      A done   41.7 s | ctx 131267, prefilled 131267 @  3467 t/s ( 37.9 s) | gen 256 @  67.3 t/s | sha ddf1e9eb
+      B done   83.2 s | ctx 131324, prefilled 131324 @  3468 t/s ( 37.9 s) | gen 241 @  67.4 t/s | sha 1e980815
+         log: srv         alloc:  - prompt state size 2161.641 MiB exceeds cache size limit 2048.000 MiB, skipping
+         log: srv   kv_admit_ok: KV admission: task 1602 needs 131580 cells, 1 running slot(s) hold 131523 of 262144; deferred until a slot is released
+         log: srv         alloc:  - prompt state size 2186.038 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn round 2 (both at once): wall 84.0 s
+      A done   42.1 s | ctx 132806, prefilled 132806 @  3474 t/s ( 38.2 s) | gen 256 @  67.2 t/s | sha 5f8224a6
+      B done   84.0 s | ctx 132881, prefilled 132881 @  3473 t/s ( 38.3 s) | gen 243 @  67.2 t/s | sha 022fff68
+         log: srv         alloc:  - prompt state size 2186.628 MiB exceeds cache size limit 2048.000 MiB, skipping
+         log: srv   kv_admit_ok: KV admission: task 2231 needs 133137 cells, 1 running slot(s) hold 133062 of 262144; deferred until a slot is released
+         log: srv         alloc:  - prompt state size 2207.666 MiB exceeds cache size limit 2048.000 MiB, skipping
+   == turn round 3 (both at once): wall 85.3 s
+      A done   42.7 s | ctx 134369, prefilled 134369 @  3467 t/s ( 38.8 s) | gen 256 @  67.2 t/s | sha 8fc249bb
+      B done   85.3 s | ctx 134435, prefilled 134435 @  3467 t/s ( 38.8 s) | gen 256 @  67.3 t/s | sha 5c0bbd8e
+         log: srv         alloc:  - prompt state size 2208.537 MiB exceeds cache size limit 2048.000 MiB, skipping
+         log: srv   kv_admit_ok: KV admission: task 2862 needs 134691 cells, 1 running slot(s) hold 134625 of 262144; deferred until a slot is released
+         log: srv         alloc:  - prompt state size 2229.631 MiB exceeds cache size limit 2048.000 MiB, skipping
+   ##### arm turn: 3 rounds total 252.5 s
+   faults 0
+### icf3 DONE 8:30 PM
