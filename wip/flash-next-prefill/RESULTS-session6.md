@@ -186,6 +186,19 @@ design; that is the arm, not a defect).
 
 So the knob really pins (a 18 % rate change), and the text is invariant across depths.
 
+**Test 5 (beyond the handover's ask) — the `-sm layer` arm, i.e. the path the review changed most.**  `-sm layer`
+keeps its stage slots **per backend**, which is what defect 1 was about, and no field arm in this campaign had ever
+run it with staging on.  Two R9700s, the 89k prompt, `-ncmoe 47`:
+
+| arm | what it shows |
+|---|---|
+| `-sm layer`, default arena | **100 % residency** (`transport buffers: 3 -> 3`, then `no transport region carved -- the expert cache already keeps the whole host set (18150.0 MiB)`) — the zero-carve rule fires and the arm correctly takes the **gather**, so it exercises no staging |
+| `-sm layer`, `MOE_EXPERT_CACHE_MIB=6144` (forces coverage below the set) | **stages**: `pipeline staging: 138 host-weight split(s), 2 buffer(s) of 450.0 MiB` and `2 buffer(s) released at the prefill -> decode transition`, **0** refusal / grow / drift / exhaustion lines, 1913.8 t/s |
+| the same arm on the **pre-review** build | text **`184dc307181b`**, identical to the post-review build; 1939.1 vs 1921.2 t/s (inside the spread) |
+
+So the per-backend path runs on real silicon (138 splits spread over two backends), it stages, it releases, and the
+review left the result unchanged.
+
 **The A/B that attributes the review (the part the handover did not ask for, and the reason its expected figures can
 be trusted):** the two `field-seq` arms were repeated on the **pre-review** tree (`git checkout 538391438`, rebuild,
 same commands, `runs/prereview-*`):
@@ -241,10 +254,12 @@ Identical to the MiB, and inside the box's 2-5 % spread on the rates.  **The rev
   gate (>= 64 tokens, the calibration floor).  A user who raises the capture limit past 64 could have a captured graph
   whose in-place pointer changes between graphs; the allocator's own `update_required` check is what keeps that
   answer correct today, not an invariant this transport states.  A block-note line, or an `INVARIANTS.md` entry.
-* **NEW: `-sm layer` staging is now handled per backend but unmeasured.**  The review's fix 1 is reasoned, not
-  gated: the field arms are 1 GPU and `-sm tensor`, and `-sm layer` with host-expert tables is a different split
-  (each device owns its layer's tables).  A `-sm layer` arm of `field-seq.sh` (2 cards, `-ncmoe`) belongs in the
-  promotion run.
+* ~~**NEW: `-sm layer` staging is per backend but unmeasured.**~~  **MEASURED this session** (§4, test 5): two
+  R9700s, `-ncmoe 47`, `-sm layer` with a capped arena stages 138 splits / 2 buffers, releases at the drop with no
+  refusal or drift, and reads the same text on the pre-review build (`184dc307181b`).  With the default arena the same
+  split is 100 % resident, so the zero-carve rule gives it the gather -- which is the correct arm, and means the
+  promotion run still owes a **`field-seq.sh` arm on a layer split whose arena cannot cover the set** (the two-slot,
+  `-lme`-budget shape), not just this 89k one.
 
 ## 8. For the next session
 

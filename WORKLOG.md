@@ -75,9 +75,14 @@ then the gates (`gate-prefill-logits` first, then host-pool, kv-residency, fused
 `check-shlib-symbols` + a `GGML_HIP_NO_VMM=ON` build, the MTP four axes); then the docs (`ENVIRONMENT.md` lines
 139/154/156/771, `DIAGNOSTIC.md` 718, `patches/README.md` 102/2616/5495, the `gate-uma-experts.sh` comment that still
 quotes `arena=`, plus `INVARIANTS.md` for the derived region, the cushion, the depth authority and the
-`resident=`/`arena_region=` naming).  Two new risks are recorded and not fixed: raising `GGML_CUDA_GRAPH_MAX_TOKENS`
-above 64 while staging is on is uncovered (the in-place consume is guarded at 16 + the 64-token width gate), and
-`-sm layer` staging is now handled per backend but **unmeasured** (the field arms are 1 GPU and `-sm tensor`).
+`resident=`/`arena_region=` naming).  Two new risks are recorded: raising `GGML_CUDA_GRAPH_MAX_TOKENS`
+above 64 while staging is on is uncovered (the in-place consume is guarded at 16 + the 64-token width gate), and the
+promotion run owes a `field-seq.sh` arm on a layer split whose arena cannot cover the host set.  **`-sm layer` itself
+was measured** (it is the path defect 1 changed): two R9700s, 89k, `-ncmoe 47` -- with the default arena the split is
+100 % resident, so the zero-carve rule gives it the gather (correct); with `MOE_EXPERT_CACHE_MIB=6144` it **stages**
+`138 host-weight split(s), 2 buffer(s)`, releases them across **both** backends at the drop, logs no refusal / grow /
+drift / exhaustion, and reads the text `184dc307181b` on the **pre-review** build too (1939.1 vs 1921.2 t/s, inside
+the spread).
 
 **State: ready for the maintainer's user test; nothing promoted.**  The promotion ladder starts with the block
 question and needs their explicit all-clear -- not "the gates are green".

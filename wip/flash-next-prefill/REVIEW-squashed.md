@@ -203,4 +203,6 @@ The pre-review tree (`538391438`) and the post-review tree were both built and b
 (`15 904.7 / 15 904.7 / 15 753.1`), on the transport decision (`3 -> 2`, `3412.5 -> 2275.0`), on the buffer size
 (`2 x 450.0 MiB`), on the band (`absorbed=2 overrun=0`) and on the 239-token request (`339.2 t/s`); the rates
 differ only inside the box's 2-5 % spread.  The four tests themselves are in
-[`RESULTS-session6.md`](RESULTS-session6.md) §4.
+[`RESULTS-session6.md`](RESULTS-session6.md) §4, which also carries a **`-sm layer` arm** (two cards, capped
+arena): it stages 138 host-weight splits over two backends, releases across both at the drop with no refusal, and
+reads the same text as the pre-review build — i.e. fix 1 is exercised on real silicon and changes no result.
