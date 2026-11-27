@@ -16,6 +16,48 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.004 (r368, `wip/`) -- flash-next-prefill: the review's four judgement calls decided and implemented, and the transport is renamed to the PIPELINE
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  The squashed prototype is
+`~/llama.cpp` branch `wip/prefill-slot-pingpong-squashed`, tip **`8ed2ead6f`**, patch
+`wip/flash-next-prefill/SQUASHED-campaign-r368.patch`; the review (and these decisions) are
+[`wip/flash-next-prefill/REVIEW-squashed.md`](wip/flash-next-prefill/REVIEW-squashed.md) §5.
+
+**J1 -- the override is clamped to 1..3.**  The ring's 4..16 sized the transport region for buffers nothing could
+use; the one authority every consumer reads now clamps to the pipeline's own range.
+
+**J2 -- the split list is 512, and it says so when it fills.**  Measured first, as asked: the deepest shapes here
+are **144** stageable splits (Flash-Next, 48 layers x 3 roles) and **120** (122B-A10B), i.e. 56 % of the old 256, and
+the cost of a split past the cap is the *exactly-unstaged* path this transport replaces -- its host weights take the
+plain whole-table upload on the compute stream and contribute nothing to the +17 %, silently.  The array is 2 KiB of
+stack in a frame that already held 1 KiB, so 512 costs nothing and one `WARN` now names the graph's split count if a
+shape ever fills it.
+
+**J3 -- quantified, then removed: the O(n^2) was never the pause.**  A temporary timer on the residency scan read
+**0.3 us per call**, **146 us cumulative** by the first drop and **197 us** across the whole three-request sequence,
+against **~170-990 ms** drop pauses (the first drop evicts 5.6 GiB and re-arms 144 tables; the second re-arms 78 in
+168 ms) -- 0.02 % of it, and ~2 ms per drop even at 1000 tables, so a hash map was never warranted.  It is also not
+needed: `covered` **is** the per-device resident figure `arena_bytes_delta` already keeps O(1) (capacity = sum(slots x
+expert_bytes) = the resident bytes) and the host total only changes when a table is REGISTERED (`g_tables` never
+shrinks), so the scan is gone and both mirrors are O(1) per change.
+
+**J4 -- PINGPONG -> PIPELINE, everywhere in this campaign.**  `GGML_SCHED_PINGPONG_BUFS` ->
+**`GGML_SCHED_PIPELINE_BUFS`** and `GGML_SCHED_PINGPONG` -> **`GGML_SCHED_PIPELINE`**, with the old spellings (and
+the deleted ring's `GGML_SCHED_STAGE_SLOTS`) kept as **deprecated aliases**; the internal names follow
+(`sched_pipe_*`, `pipe_*`), and every comment, log line and identifier in this campaign says "pipeline" -- one to
+three buffers is still one mechanism.  The three unrelated upstream uses of "ping-pong" (`fattn-common.cuh`,
+`ggml-hexagon`) are untouched, which is the scope the maintainer asked for.  The environment is now parsed in
+**one** place (the CUDA backend's transport authority) and the scheduler + the Meta backend read the answer through
+the existing `slab_ring_slots` device hook, so a rename cannot leave a layer on an old spelling -- and the free-VRAM
+rule is only a cap for a transport that is not slab-backed.  A finding fell out of this: the kill switch's comment
+claimed `GGML_SCHED_PINGPONG=0` "selects the ring for the A/B", but the ring was deleted in session 3 -- `0` means
+**no staged transport at all** (the serial whole-table upload), and the comment now says that.
+
+**Re-verified** after all four: 1 GPU 89k greedy `43d0b1f4629e` on every run (2456-2485 t/s); the field
+three-request sequence to the MiB (`3 -> 2`, region 3412.5 -> 2275.0 MiB, carves 2304, arena after each drop
+15 960.2 / 15 960.2 / 15 827.7 MiB, prefill 2224.6 t/s), and the selector now printing the band it used to drop --
+`exposed 30513.2 MiB / 8192 tok at 28.6 GB/s = 136.3 us/tok vs 38.0 -> STAGE (cache band 16 tok)`.
+
 ## 261127.003 (r368, `wip/`) -- flash-next-prefill squashed to ONE patch and code-reviewed; every finding fixed
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  The campaign's 21 commits are

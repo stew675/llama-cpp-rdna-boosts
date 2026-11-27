@@ -102,11 +102,20 @@ largest table, + 512 B) and the VRAM/4 cap, through a new `slab_set_ring_unit` h
 request as `unit x depth` in one place, and the depth has exactly one owner:
 `ggml_backend_cuda_transport_bufs()` (`ggml-cuda.h`), driven by the residency rule and **frozen** after its first
 decision (a count that follows every arena re-size flaps, and a 1-buffer graph costs ~21 %).  The generic layers
-keep no copy: the scheduler's ping-pong depth and the Meta backend's per-device ring depth both read it through
+keep no copy: the scheduler's pipeline depth and the Meta backend's per-device ring depth both read it through
 the **existing** generic `slab_ring_slots` device hook (the same number the region is carved for), and the
 scheduler re-derives its depth per graph execution because the decision lands after it was constructed.  A
 changed request also drops an **idle** carve, so the first prefill of a process uses the decided depth instead of
-the provisional one.  `GGML_SCHED_PINGPONG_BUFS` still pins the count for an A/B.
+the provisional one.  `GGML_SCHED_PIPELINE_BUFS` still pins the count for an A/B (the development name `GGML_SCHED_PINGPONG_BUFS`
+is kept as a deprecated alias).
+
+**Vocabulary (review J4, the maintainer's call):** these are the transport **PIPELINE**'s buffers, not a
+"ping-pong" -- one to three of them is still one mechanism, and the development name stopped describing it once
+three was possible.  `GGML_SCHED_PINGPONG_BUFS` → **`GGML_SCHED_PIPELINE_BUFS`** and `GGML_SCHED_PINGPONG` →
+**`GGML_SCHED_PIPELINE`** (both old spellings, plus the deleted ring's `GGML_SCHED_STAGE_SLOTS`, are **deprecated
+aliases**, read in ONE place -- the CUDA backend's transport authority, which the scheduler and the Meta backend
+consult through the existing `slab_ring_slots` device hook).  The internal names follow (`sched_pipe_*`, `pipe_*`),
+and the three unrelated upstream uses of "ping-pong" (`fattn-common.cuh`, `ggml-hexagon`) are untouched.
 
 **Measured** (field GSQ server, the three-request sequence, same build):
 
@@ -121,8 +130,8 @@ the provisional one.  `GGML_SCHED_PINGPONG_BUFS` still pins the count for an A/B
 So the third buffer's ~1.05-1.2 GiB goes back to the hot set during the prefill and the decode arena ends
 ~250 MiB larger, with no measurable prefill cost.  The campaign shape (1 GPU 89k) is **unchanged by design** -- it
 decides 3 (51.4 % residency) -- and reads `43d0b1f4629e` on all three cycles, 2483.8 t/s median (2493.7 before
-this change, 4.8 % spread).  Non-vacuity: `GGML_SCHED_PINGPONG_BUFS=1` on that shape still pins 1 buffer, prints
-`forced by GGML_SCHED_PINGPONG_BUFS` in the staging line and reads 2025 t/s -- i.e. the old free-VRAM default
+this change, 4.8 % spread).  Non-vacuity: `GGML_SCHED_PIPELINE_BUFS=1` on that shape still pins 1 buffer, prints
+`forced by GGML_SCHED_PIPELINE_BUFS` in the staging line and reads 2025 t/s -- i.e. the old free-VRAM default
 (3 there) is what the rule replaces, and the env escape hatch still works.
 
 One trap found while landing it, worth recording: the first version re-requested the region through
@@ -227,7 +236,7 @@ prototype-only), and the VMM pool's fail-soft growth into **block 10**.  `ENVIRO
 entries are owed at that point for `GGML_SCHED_STAGE_SELECT`, `GGML_SCHED_STAGE_EXPOSE_US`,
 `GGML_SCHED_STAGE_SELECT_DEBUG`, `GGML_CUDA_SLAB_TRANSPORT_MIB` (+ the deprecated `_RING_MIB`),
 `GGML_CUDA_SLAB_TRANSPORT_FALLBACK`, `MOE_HOST_POOL_STAGE_BULK_GBPS`, this session's
-`GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS`, **plus a re-statement of `GGML_SCHED_PINGPONG_BUFS`** (it is now an
+`GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS`, **plus `GGML_SCHED_PIPELINE_BUFS`** (+ its deprecated aliases `GGML_SCHED_PINGPONG_BUFS` / `GGML_SCHED_STAGE_SLOTS`; it is now an
 override of the residency rule, not of a free-VRAM rule) and of the "transport buffer"/"transport region" pair the
 buffer count now divides.  This session asked; it did not cut anything.
 

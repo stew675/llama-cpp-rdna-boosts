@@ -8,7 +8,7 @@ judgement calls left to the maintainer (one of which is now implemented, §5.1).
 
 | | |
 |---|---|
-| review target | `~/llama.cpp` branch `wip/prefill-slot-pingpong-squashed`, tip **`a6ede394b`** (one commit on `af7a57ba8`) |
+| review target | `~/llama.cpp` branch `wip/prefill-slot-pingpong-squashed`, tip **`8ed2ead6f`** (one commit on `af7a57ba8`) |
 | the same tree, pre-review, as a 21-commit chain | branch `wip/prefill-slot-pingpong-r368` (kept as history only) |
 | patch | [`SQUASHED-campaign-r368.patch`](SQUASHED-campaign-r368.patch) |
 
@@ -69,28 +69,29 @@ judgement calls left to the maintainer (one of which is now implemented, §5.1).
   use them too — the duplication that remains is `wide_account()`, identical in both pools by design (different
   private state).
 
-## 5. Judgement calls
+## 5. The four judgement calls — decided by the maintainer, implemented
 
-1. **The env clamp — DONE (1..3).** `ggml_backend_cuda_transport_bufs()` used to accept `GGML_SCHED_PINGPONG_BUFS`
-   (and the deprecated `GGML_SCHED_STAGE_SLOTS`) up to **16** — the deleted ring's range — while the ping-pong's
-   buffer arrays are `[4]` and its depth range is 1..3: a value of 4..16 sized the transport region for buffers
-   nothing could use, and the scheduler silently clamped to 3 (while the Meta ring clamped differently again). It
-   now clamps to 1..3 in one place, which is also what makes the Meta ring, the scheduler and the carve agree.
-2. **`pp_host[256]`** silently caps the list of stageable splits (the field shape had 144, an 8k-node graph split
-   more). Splits past the cap fall to the serial path with no line saying so. Cheap: log once when it overflows.
-3. `residency_refresh_locked()` walks every table on every `arena_bytes_delta()` — O(tables²) per stand-down /
-   re-arm (144 tables: trivial; 1024 tables: still trivial, but it is a scan inside the lock).
-4. Two places parse `GGML_SCHED_PINGPONG_BUFS` (the scheduler and the CUDA authority). They agree today because
-   both clamp the same way; with 1 above, they would still agree — a single parser would be better still.
+| | decision | what landed |
+|---|---|---|
+| **J1** | clamp 1..3; the ring's 4..16 is not kept | `ggml_backend_cuda_transport_bufs()` clamps the override to the pipeline's own 1..3, in the one authority every consumer reads. |
+| **J2** | *measured first*: how likely is 256, and what does the fallback cost? | **Measured ceilings**: Flash-Next 144 stageable splits (48 layers × 3 roles), 122B-A10B 120 — i.e. 56 % of the old 256. **The fallback's cost**: a split past the cap is not in the list, so `pipe_k = -1` and its host weights take the plain whole-table upload on the compute stream — *the exactly-unstaged path this transport replaces*, i.e. those layers contribute nothing to the +17 % and pay a synchronous copy. Silent before. **Raised to 512** (2 KiB of stack in a frame that already had 1 KiB) and it now logs once when it fills, naming the graph's split count. |
+| **J3** | *quantify it*: is the O(n²) the pause you see at a drop? | **No — it is 0.02 % of it.** Measured with a temporary timer on the scan: **0.3 µs per call**, **146 µs cumulative** by the first drop and **197 µs** across the whole three-request sequence, against drop pauses of **~170-990 ms** (the first drop evicts 5.6 GiB and re-arms 144 tables; the second re-arms 78 in 168 ms). At 1000 tables it would be ~2 ms per drop, so a hash map was never warranted — and it is not needed at all: **`covered` IS the per-device resident figure `arena_bytes_delta` already keeps O(1)** (capacity = Σ slots × expert_bytes = the resident bytes), and the host total only changes when a table is **registered** (`g_tables` never shrinks). The scan is gone; the mirrors are O(1) per change. |
+| **J4** | rename `GGML_SCHED_PINGPONG_BUFS` → `GGML_SCHED_PIPELINE_BUFS`, and "wherever you see PINGPONG, PIPELINE" | `GGML_SCHED_PIPELINE_BUFS` (+ `GGML_SCHED_PINGPONG_BUFS`, the development name, and `GGML_SCHED_STAGE_SLOTS`, the ring's, as **deprecated aliases**) and `GGML_SCHED_PINGPONG` → `GGML_SCHED_PIPELINE`; every "ping-pong" in this campaign's code, logs, comments and identifiers is now "pipeline" (`sched_pipe_*`, `pipe_*`); the three unrelated upstream uses (`fattn-common.cuh`, `ggml-hexagon`) are untouched. **One parser**: the environment is read only in the CUDA backend's transport authority — the scheduler and the Meta backend read the answer through the existing `slab_ring_slots` hook (so a rename cannot leave a layer on an old spelling), and the free-VRAM rule now only caps a transport that is not slab-backed. |
+
+One further finding fell out of J4: the kill switch's comment claimed `GGML_SCHED_PINGPONG=0` "selects the ring for
+the A/B" — the ring was deleted in session 3, so `0` means **no staged transport at all** (the serial whole-table
+upload). The comment now says that.
 
 ## 6. Re-verified after the review fixes
 
-* 1 GPU, GSQ-IQ3_XXS, 89k prefill, `-ncmoe 47`, greedy: **`43d0b1f4629e` on both cycles**, 2488.1 t/s median
-  (2483.8 before the review).
+* 1 GPU, GSQ-IQ3_XXS, 89k prefill, `-ncmoe 47`, greedy: **`43d0b1f4629e` on every cycle**, 2456-2485 t/s
+  (2483.8 before the review; the box's own 2-5 % spread).
 * The field three-request sequence (645 / 71 816 / 239 tok) reproduces the pre-review numbers **to the MiB**:
   `transport buffers: 3 -> 2` (arena 14 707.4 MiB = 35.9 % of 40 925.0; after 2 buffers 30.4 %, after 3 27.6 %),
   `the transport region request goes 3412.5 -> 2275.0 MiB`, carves `2304`, arena after each drop
-  `15 960.2 / 15 960.2 / 15 827.7` MiB, prefill 2224.6 t/s, `ping-pong staging: 144 split(s), 2 buffer(s)`.
+  `15 960.2 / 15 960.2 / 15 827.7` MiB, prefill 2224.6 t/s, `pipeline staging: 144 split(s), 2 buffer(s)`, and the
+  selector reading `exposed 30513.2 MiB / 8192 tok at 28.6 GB/s = 136.3 us/tok vs 38.0 -> STAGE (cache band 16 tok)`
+  (the band is printed — it was the dropped format argument).
 * Builds with no warning from any file this change touches (the remaining `-Wmissing-field-initializers` hits are
   two pre-existing delivery ifaces, `moe_cache_prefill_stream` on cpu/rpc and `gtt_store_arena_min` on cpu/rpc,
   which are not this campaign's).

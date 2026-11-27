@@ -1,39 +1,59 @@
-From a6ede394be912f5d4e8076e36b530760592cc5e3 Mon Sep 17 00:00:00 2001
+From 8ed2ead6f2f8ebcc1d6bc0d810f1315cbcabcf6a Mon Sep 17 00:00:00 2001
 From: stew675 <stew675@users.noreply.github.com>
 Date: Fri, 27 Nov 2026 07:29:39 -0600
 Subject: [PATCH] wip: flash-next-prefill, the whole campaign as ONE change
- (squashed, reviewed)
+ (squashed, reviewed, rename to PIPELINE)
 
 The campaign's 21 commits, squashed because the code churned a lot across five sessions and the diff is the only
 reviewable form.  Nothing in the delivery changes: this is the prototype tree on the r368 block set (base
 919794500, block tip af7a57ba8).
 
-What it does, in one paragraph: it replaces the slot-ring staging transport with a two/three-buffer PING-PONG
+What it does, in one paragraph: it replaces the slot-ring staging transport with a one-to-three-buffer PIPELINE
 (the maintainer's design) whose buffers live in the slab's transport region, makes that transport the default at
 prefill width behind a measured selector (host bytes the gather would pull per token vs 38 us), and fixes the
 class of defects that only a real server's SECOND prefill reaches (the bump cursor was never returned, the carve
 was never released, a decode/verify compute-band raise was deferred for ever).  The transport region is sized
-from one split's host-weight set, is re-carved per wide pass, and now sits on a cushion of N compute chunks above
-the decode/verify band so that band can grow without moving it -- and its DEPTH is chosen from the expert-cache
+from one split's host-weight set, is re-carved per wide pass, and sits on a cushion of N compute chunks above the
+decode/verify band so that band can grow without moving it -- and its DEPTH is chosen from the expert-cache
 residency once the arena settles, not from free VRAM at startup.  Around it: the hybrid/bulk fill for a tensor
 split, the merge-floor calibration to the device link, the arena settle re-opening when capacity grows, and the
 D1 probes kept default-off with their measurements.
 
-Reviewed as a squashed diff (wip/flash-next-prefill/REVIEW-squashed.md), and the review's findings are fixed in
-this commit: two format-string bugs (a dropped argument in the transport-decision line, a %zu fed an int in the
+Reviewed as a squashed diff (wip/flash-next-prefill/REVIEW-squashed.md) with every finding fixed in this commit:
+two format-string bugs (a dropped argument in the transport-decision line, a %zu fed an int in the
 transport-exhaustion WARN), a Meta iface entry that was default-initialised instead of declared, the dead
 free-VRAM start-up sizing (function + field + its contradictory comment) and the ring-era per-split width sizing
-(both helpers and the table-ref scaling they carried), a stale Meta slot default, the duplicated forward
-declaration comment, the duplicated Meta comment block, and five comments/log lines that described the deleted
-decision or predicted a number the code did not set.  One behavioural fix: the ping-pong now collects a split's
-stageable set BEFORE it touches the width gate, because that gate runs the one-off H2D calibration (a cudaMalloc
-probe that Windows does not get back, issue #97) and a dense or fully resident split must not ask for it.
-`GGML_SCHED_PINGPONG_BUFS`/`GGML_SCHED_STAGE_SLOTS` are clamped to the ping-pong's own 1..3 (the ring's 8/16 sized
-the region for buffers nothing could use).
+(both helpers and the table-ref scaling they carried), a stale Meta slot default, a duplicated forward
+declaration comment, and five comments/log lines that described the deleted decision or predicted a number the
+code did not set.  One behavioural fix: the pipeline now collects a split's stageable set BEFORE it touches the
+width gate, because that gate runs the one-off H2D calibration (a cudaMalloc probe that Windows does not get back,
+issue #97) and a dense or fully resident split must not ask for it.
 
-Verified after the review: 1 GPU 89k greedy text 43d0b1f4629e on every run (2 cycles, 2488.1 t/s median), and the
-field three-request sequence reproduces to the MiB -- decision `3 -> 2`, region 3412.5 -> 2275.0 MiB, carves 2304,
-arena after each drop 15 960.2 / 15 960.2 / 15 827.7 MiB, prefill 2224.6 t/s.
+The review's four judgement calls, decided by the maintainer and implemented here:
+
+  J1  the buffer-count override is clamped to the PIPELINE's own 1..3 (the ring's 8/16 sized the region for
+      buffers nothing could use).
+  J2  the per-graph split list is 512 entries (was 256) and says so once when it fills: past the cap those splits
+      take the serial upload -- the exactly-unstaged path this transport exists to replace -- and the old code was
+      silent about it.  Measured ceilings here: Flash-Next 144 (48 layers x 3 roles), 122B-A10B 120.
+  J3  the residency mirrors are O(1).  `covered` IS the per-device resident figure `arena_bytes_delta` already
+      keeps (capacity = sum(slots x expert_bytes) = the resident bytes), so it needs no mirror of its own, and the
+      host total only changes when a table is REGISTERED (`g_tables` never shrinks).  Measured before the change
+      with a temporary timer on the scan: 0.3 us per call, 146 us cumulative across the first drop and 197 us
+      across all three requests of the field sequence -- i.e. ~0.02 % of a drop's ~170-990 ms pause, so a hash map
+      was never warranted; the scan is simply gone.
+  J4  `GGML_SCHED_PINGPONG_BUFS` -> `GGML_SCHED_PIPELINE_BUFS` (deprecated aliases `GGML_SCHED_PINGPONG_BUFS`,
+      the development name, and `GGML_SCHED_STAGE_SLOTS`, the deleted ring's) and `GGML_SCHED_PINGPONG` ->
+      `GGML_SCHED_PIPELINE`; every "ping-pong" in this campaign's code, logs and identifiers is now "pipeline"
+      (`sched_pipe_*`, `pipe_*`).  The environment is parsed in ONE place (the CUDA backend's transport
+      authority): the scheduler and the Meta backend read the answer through the existing `slab_ring_slots` device
+      hook, so a rename cannot leave a layer on an old spelling.  The kill switch's comment now says what it does
+      (no staged transport at all -- the ring it used to select is deleted).
+
+Verified after all of it: 1 GPU 89k greedy text 43d0b1f4629e on every run (2456-2485 t/s), and the field
+three-request sequence reproduces to the MiB -- decision `3 -> 2`, region 3412.5 -> 2275.0 MiB, carves 2304,
+arena after each drop 15 960.2 / 15 960.2 / 15 827.7 MiB, prefill 2224.6 t/s, selector reading
+`exposed 30513.2 MiB / 8192 tok at 28.6 GB/s = 136.3 us/tok vs 38.0 -> STAGE (cache band 16 tok)`.
 ---
  ggml/include/ggml-backend.h                   |  12 +-
  ggml/include/ggml-cuda.h                      |  15 +
