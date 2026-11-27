@@ -21,7 +21,7 @@ for ct in "${CACHES[@]}"; do
         -c 32768 -b 2048 -ub 2048 -ctk "$ct" -ctv "$ct" -fa auto -ngl 99 -sm tensor -lv 4 \
         > "$log.out" 2> "$log.err"
       tps=$(grep -oE "eval time = .* [0-9.]+ tokens per second" "$log.err" | tail -1 | grep -oE "[0-9.]+ tokens per second" | cut -d' ' -f1)
-      acc=$(grep -oE "draft acceptance = [0-9.]+, mean len = [0-9.]+" "$log.err" | tail -1)
+      acc=$(grep -oE "[0-9]+/[0-9]+\)|draft acceptance:? ?= ?[0-9.]+[^"]{0,48}" "$log.err" | tail -1 | tr -d "\n")
       txt=$(python3 "$HERE/../../scripts/extract-generated.py" "$log.out" 2>/dev/null | tail -1)
       printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ct" "$axis" "$spec" "${tps:-none}" "${acc:-none}" "${txt:-none}" >> "$OUT/summary.tsv"
       echo "  $ct $axis $spec: ${tps:-?} t/s  ${acc:-no-acc}  ${txt:-no-text}"
