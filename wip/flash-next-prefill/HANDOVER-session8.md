@@ -31,6 +31,21 @@ territory they belong to** — and then the cut.  Nothing is tagged or pushed un
 | local MTP runs | **in flight / chained** (§2).  `runs/mtp4-cand/summary.tsv` (candidate) and `runs/mtp4-base/summary.tsv` (base, chained behind the candidate).  `mtp4axis.sh` is the runner |
 | `fingon` / `halo` | builds **in flight** (§6).  Both fetched over **HTTPS** (they have **no GitHub SSH key**): `git fetch https://github.com/stew675/llama.cpp.git rdna-boosts` and the same for the delivery repo |
 
+## 1b. DO NOT (while the MTP chains are in flight)
+
+* **Do not rebuild `~/llama.cpp/build-rocm` or `/tmp/base-wt/build-rocm-base`.  Do not run any other bench/arm.**
+  The four-axis runner launches `llama-cli` once per arm, so a rebuild mid-chain makes the remaining arms measure a
+  different binary and the gate is void.  The C fold is git-only and is safe to do meanwhile; the *cut* and any
+  rebuild it wants must wait for `pgrep -f mtp4axis` to be empty.
+* Read the verdict from `runs/mtp4-cand/summary.tsv` and `runs/mtp4-base/summary.tsv` once both are complete.
+  The runner **truncates its own summary at start**, so a short file means "still running", not "few rows" — check
+  `pgrep -f mtp4axis` first, and if the harness killed the chains, re-run `./mtp4axis.sh cand
+  ~/llama.cpp/build-rocm` then base (never both at once).
+* The candidate's **f16 cache is already complete and clean** (2026-11-27): `none` == `draft-mtp`, byte-identical on
+  all four axes — R `218515b89b31` 41.6 -> 80.1 t/s, K `a87c4318b649` 41.8 -> 176.4, P `20ff19bc33b1`
+  41.3 -> 120.0, C `48067cb92646` 42.4 -> 150.5.  The q8_0 cache was in flight; the base arm is chained behind the
+  base build.
+
 ## 2. What is already green (do not re-run)
 
 The ladder was run in session 7 on the candidate vs the delivery tip; every result is in `WORKLOG.md`
