@@ -16,6 +16,72 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.009 (r368, `wip/`) -- flash-next-prefill: the tombstone purge, the fresh review's four defects, and the four tests -- ready for the maintainer's user test
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push, nothing promoted.  Squashed
+prototype `~/llama.cpp` `wip/prefill-slot-pingpong-squashed`, tip **`60559e971`** (one commit on `af7a57ba8`); patch
+[`SQUASHED-campaign-r368.patch`](wip/flash-next-prefill/SQUASHED-campaign-r368.patch) **4062 lines / 18 files** (was
+4113 / 22); review [`REVIEW-squashed.md`](wip/flash-next-prefill/REVIEW-squashed.md) §7; numbers
+[`RESULTS-session6.md`](wip/flash-next-prefill/RESULTS-session6.md).
+
+**The purge.**  The two D1 probes are **deleted** -- `GGML_CUDA_REPEAT_VEC` (+`_DEBUG`, `k_repeat_f32_vec`, its
+dispatch) and `GGML_CUDA_FUSE_MOE_WEIGHT` (+`_DEBUG`, the broadcast-multiply kernel, the fusor, its `try_fuse` hook
+and `.cuh` declaration): both were default-OFF, and their value was the measured negative, which lives in
+`RESULTS-session3.md`.  `binbcast.cu`, `moe-weighted-reduction.{cu,cuh}` and `ggml-cuda-try-fuse.cu` are now identical
+to the base tree, which is the 22 -> 18 files.  Every "used to / retired in / gone with the ring / deleted before
+promotion" comment is gone, as are the `Review JN` / `session N` / `handover §N` / `RESULTS-sessionN.md` /
+`experiments/00NN` references in shipped source -- each sentence now states the current rule (several kept their
+measured numbers: that is what makes a threshold defensible).  `GGML_SCHED_PINGPONG_BUFS` (campaign-internal) is
+**dropped**, not aliased; `GGML_SCHED_STAGE_SLOTS` (documented in the released `ENVIRONMENT.md`) is kept as the one
+alias and the pin line names the new variable; `GGML_CUDA_SLAB_RING_FALLBACK` stays the alias of
+`GGML_CUDA_SLAB_TRANSPORT_FALLBACK`.  Internal `slab_ring_*`/`h2d_stage_*` identifiers are **kept** (the released
+block 09/10 vocabulary; every user-visible line and doc name already says *pipeline* / *transport region*).
+
+**Four defects the review found, all fixed in the same commit.**  (1) The prefill -> decode release and the fill's
+free-event wait assumed ONE backend: a `-sm layer` split keeps its stage slots **per backend** and need not fill a
+buffer with the split that consumes it, so the other devices' staging VRAM was never handed back at the drop and a
+re-used buffer index on another backend waited on an event never recorded for it (i.e. a fill could overwrite a block
+still being read).  The release now runs on every backend that implements the hook and the wait names the buffer's
+**previous owner**.  (2) `pipe_n_ent` was not cleared per graph: a graph that staged nothing kept the previous
+graph's entries, and the input copies are allocated from **one reused context buffer**, so a stale `dst` match would
+point an input into a buffer this graph never filled -- every entry is dropped before the fills now.  (3)
+`h2d_stage_release` called `arena_free` for a transport slot, which lives inside the work band: at a drop the
+boundary has shrunk, so that call handed **arena VA inside the transport region**; removed (the bump-cursor reset is
+the reclaim).  (4) The `transport buffer:` line printed depth and MiB in the wrong order and built a `char *` from a
+temporary `std::string`.  Also: `GGML_SCHED_STAGE=0` had stopped reaching the scheduler, so the documented kill
+switch acted only through the slab's zero-carve -- `pipe_on` is now cleared with it.
+
+**The four tests (handover §4) all pass.**  (1) Campaign arm, 1 GPU GSQ-IQ3_XXS 89k, 2 cycles: `43d0b1f4629e` on
+both, prefill **2503.6 / 2485.6** (median 2494.6).  (2) Field three-request sequence: decision `3 -> 2`, region
+**3412.5 -> 2275.0 MiB**, base **2048 = band 1536 + a 512 cushion**, band `1536 -> 1792 -> 2048` **inside** the
+cushion, buffers released at the drop, `band_raise[absorbed_by_cushion=2 overrun_deferred=0]`, **no**
+"residency mirrors drifted", **no** "pipeline buffer grows", **no** `h2d_stage_buffer` refusal; 645/71 816/239 tok at
+237.2 / **2176.1** / 154.8 t/s, arena after each drop 15 904.7 / 15 904.7 / 15 753.1 MiB.  (3) Short-prompt arm:
+**263.5** t/s (581 tok) and **339.2** t/s (239 tok), no refusal, no grow.  (4) `GGML_SCHED_PIPELINE_BUFS=1`:
+`pinned at 1 by GGML_SCHED_PIPELINE_BUFS (or an alias)`, 89k **2045.3** t/s against 2494.6 unpinned, text
+`43d0b1f4629e` -- the depth authority is not vacuous and does not move the text.
+
+**The review is behaviour-neutral, proved rather than argued**: the pre-review commit `538391438` was rebuilt and run
+through the same two `field-seq` arms, and reads **identical to the MiB** (arena 15 904.7 / 15 904.7 / 15 753.1,
+decision `3 -> 2`, `3412.5 -> 2275.0`, `2 x 450.0 MiB`, `absorbed=2 overrun=0`, 239-token request 339.2 t/s), with the
+rates inside the box's 2-5 % spread.  That A/B also settles two handover expectations that did not match: the
+`pipeline staging` buffer is **450.0** MiB, not 231.2 (231.2 was the first set filled, before session 5's own "size
+from the graph's largest set" fix), and the arena is 0.4 % below the session-5 record on **both** builds (the record
+was taken one change earlier, and the mechanism is unchanged: the exit `resident=` equals the third drop's arena).
+
+**Owed at promotion (all listed in `RESULTS-session6.md` §1/§6)**: the block decision first (selector + re-keyed
+zero-carve into block 09; the pipeline/region/cushion/depth into block 10; the VMM fail-soft growth into block 10);
+then the gates (`gate-prefill-logits` first, then host-pool, kv-residency, fused-probe-splits, moe-promise,
+`check-shlib-symbols` + a `GGML_HIP_NO_VMM=ON` build, the MTP four axes); then the docs (`ENVIRONMENT.md` lines
+139/154/156/771, `DIAGNOSTIC.md` 718, `patches/README.md` 102/2616/5495, the `gate-uma-experts.sh` comment that still
+quotes `arena=`, plus `INVARIANTS.md` for the derived region, the cushion, the depth authority and the
+`resident=`/`arena_region=` naming).  Two new risks are recorded and not fixed: raising `GGML_CUDA_GRAPH_MAX_TOKENS`
+above 64 while staging is on is uncovered (the in-place consume is guarded at 16 + the 64-token width gate), and
+`-sm layer` staging is now handled per backend but **unmeasured** (the field arms are 1 GPU and `-sm tensor`).
+
+**State: ready for the maintainer's user test; nothing promoted.**  The promotion ladder starts with the block
+question and needs their explicit all-clear -- not "the gates are green".
+
 ## 261127.008 (r368, `wip/`) -- flash-next-prefill: cold-start handover for session 6 (tombstone purge, fresh review, then STOP for the user test)
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  Squashed prototype

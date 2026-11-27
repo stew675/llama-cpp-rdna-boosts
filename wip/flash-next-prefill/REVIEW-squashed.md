@@ -1,15 +1,18 @@
 # Code review — `SQUASHED-campaign-r368.patch`
 
-The campaign as one diff: base `af7a57ba8` (r368 block tip) → `538391438`, i.e. `SQUASHED-campaign-r368.patch`
-(22 files).  **Every finding in §1-§3 is fixed in that same commit** (that is what the squash is for: the review's
-fixes are part of the change, not a follow-up on top of churn), and the tree was re-verified after them (§6).
-§4 is the checked-and-clean list — "I looked and it was fine" is the other half of a review — and §5 the
-judgement calls left to the maintainer (one of which is now implemented, §5.1).
+The campaign as one diff: base `af7a57ba8` (r368 block tip) → **`60559e971`**, i.e.
+`SQUASHED-campaign-r368.patch` (**4062 lines, 18 files**).  **Every finding in §1-§3 is fixed in that same commit**
+(that is what the squash is for: the review's fixes are part of the change, not a follow-up on top of churn), and
+the tree was re-verified after them (§6).  §4 is the checked-and-clean list — "I looked and it was fine" is the
+other half of a review — and §5 the judgement calls left to the maintainer (one of which is now implemented, §5.1).
+**§7 is the pre-promotion pass** (the "no tombstones for dead code" rule): four more defects, the D1 probes
+removed, the comment/log purge, and the A/B that proves the pass changed nothing measurable.
 
 | | |
 |---|---|
-| review target | `~/llama.cpp` branch `wip/prefill-slot-pingpong-squashed`, tip **`538391438`** (one commit on `af7a57ba8`) |
+| review target | `~/llama.cpp` branch `wip/prefill-slot-pingpong-squashed`, tip **`60559e971`** (one commit on `af7a57ba8`; it was `538391438` before §7's fixes) |
 | the same tree, pre-review, as a 21-commit chain | branch `wip/prefill-slot-pingpong-r368` (kept as history only) |
+| the pre-§7 squashed commit | `538391438` (still in the object store; rebuilt and re-run for the §7.5 A/B) |
 | patch | [`SQUASHED-campaign-r368.patch`](SQUASHED-campaign-r368.patch) |
 
 ## 1. Bugs (fixed)
@@ -125,3 +128,79 @@ unchanged (`43d0b1f4629e`, 2457 t/s).
 * Builds with no warning from any file this change touches (the remaining `-Wmissing-field-initializers` hits are
   two pre-existing delivery ifaces, `moe_cache_prefill_stream` on cpu/rpc and `gtt_store_arena_min` on cpu/rpc,
   which are not this campaign's).
+
+## 7. The pre-promotion pass (session 6): the tombstone rule, and four more defects
+
+The handover's extra rule for this pass: **no tombstones anywhere for dead code** — no comment explaining what
+something used to be, no empty function, no unused knob kept "as the record", no deprecated shim beyond a genuinely
+live alias.  The record for "why it is gone" is `WORKLOG.md` and this page.  Numbers, evidence and the before/after
+A/B: [`RESULTS-session6.md`](RESULTS-session6.md).
+
+### 7.1 Bugs (fixed in the same commit)
+
+| # | where | what |
+|---|---|---|
+| 15 | `ggml-backend.cpp`, the prefill -> decode release and `sched_pipe_issue`'s free-event wait | both assumed **one backend**.  A `-sm layer` split keeps its stage slots **per backend** and need not fill a buffer with the split that consumes it, so (a) the release freed only the first buffer's owner — the other devices' staging VRAM was never handed back at the drop — and (b) a fill that re-used a buffer index on another backend waited on an event that had never been recorded for it, i.e. it could overwrite a block still being read.  The release now runs on every backend that implements the hook (one synchronize each, slots `0..n-1`) and the wait names the buffer's **previous owner**. |
+| 16 | `ggml-backend.cpp`, `pipe_n_ent` | not cleared per graph.  A graph that staged **nothing** (all host splits gatherable — reachable once the arena has settled) left the previous graph's entries in place, and the input copies are allocated from `sched->ctx`, which is re-initialised over **one reused buffer** on every `split_graph` — so the same tensor address comes back and a stale `dst` match would point an input into a buffer this graph never filled.  Every entry is dropped at the top of each graph, before the fills. |
+| 17 | `common.cuh`, `h2d_stage_release` | it called `arena_free` for a **transport slot**, which lives inside the work band: below the boundary that call no-ops, but at the moment of a drop the boundary has shrunk to the narrow view and `off >= boundary`, so the slot's range was inserted into the **arena's** free list — arena VA handed out inside the transport region.  Removed; the region's bump cursor (which the release already resets) is the reclaim. |
+| 18 | `llama-context.cpp`, the `transport buffer:` line | printed `depth` and `MiB` in the wrong order (`at the current depth of 2275: 3 MiB`) and built a `char *` from a temporary `std::string` inside a ternary.  Rewritten — the field log now reads `(provisional: 3 buffer(s) of 1137 MiB = 3412 MiB)`. |
+| 19 | `ggml-backend.cpp`, `GGML_SCHED_STAGE=0` | the documented kill switch no longer reached the scheduler (`pipe_on` did not read it, so it acted only through the slab's zero-carve), and `stage_enabled` had become write-only apart from one warning.  `pipe_on` is now also cleared when `stage_enabled` is false. |
+
+### 7.2 Dead code (removed)
+
+| # | what | why it is dead |
+|---|---|---|
+| 20 | `GGML_CUDA_REPEAT_VEC` (+ `_DEBUG`), `k_repeat_f32_vec`, its dispatch in `ggml_cuda_op_repeat` (`binbcast.cu`) | default-OFF and UNPROVEN: at the widths it sees the op census shows no change, and the 89k REPEAT that costs 2622 ms is served by a fused window, not by that dispatch.  Its measurement is `RESULTS-session3.md` §11 — the record, not a kernel. |
+| 21 | `GGML_CUDA_FUSE_MOE_WEIGHT` (+ `_DEBUG`), `moe_weight_broadcast_kernel`, `ggml_cuda_moe_weight_broadcast_try_fuse`, its `ggml_cuda_try_fuse` hook and `.cuh` declaration | default-OFF and a measured **loss** (−4.4 %): `GGML_OP_MUL` is in-place-capable, so the unfused pair already writes the broadcast once and the fusion adds a redundant re-read plus a second live buffer.  `RESULTS-session3.md` §3.6/§11. |
+| 22 | `GGML_SCHED_PINGPONG_BUFS` | a campaign-internal development spelling nothing outside this tree ever set — an alias for it would be a shim with no user.  `GGML_SCHED_STAGE_SLOTS` **is** kept: the released `ENVIRONMENT.md` documents it, and the pin line names the new variable so a redefinition is visible. |
+| 23 | `GGML_CUDA_SLAB_RING_MIB` (documented) | already gone from the code (J4a); this pass verified a whole-tree grep has **no** mention of it or of `GGML_CUDA_SLAB_TRANSPORT_MIB`, and listed every docs line the promotion edit has to touch (`RESULTS-session6.md` §1). |
+
+`binbcast.cu`, `moe-weighted-reduction.{cu,cuh}` and `ggml-cuda-try-fuse.cu` are now identical to the base tree, so
+the patch drops from 22 files / 4113 lines to **18 / 4062**.
+
+### 7.3 Comments and logs (the tombstone purge itself)
+
+Every one of these was a comment about a thing that no longer exists, and each is now a statement of the current
+rule (several kept their measured numbers — that is what makes a threshold defensible, and it is not history):
+
+"the slot ring that used to live here … is GONE", "the ring's `sched_stage_issue` lived here: It is DELETED —
+nothing in this file may reintroduce a per-slot plan", "which is exactly how this shipped for one build", "this used
+to be deferred for ever", "the expert-count and gap-budget forms … are deleted before promotion" (they were already
+deleted, so the sentence described nothing), `the handover's §6.5`, `the handover's §2.1`, `RESULTS-session4.md §7.3`,
+`RESULTS-session5`, `RESULTS-session3.md §11` (kept in the *results* files, removed from source), `experiments/0020`,
+`Review J2/J3/J4`, `(session 3/4/5)`, "(the maintainer's change request)", `sched_stage_issue` (a function that no
+longer exists — still named by the `moe_cache_stage_ready` comment), and the "wip/flash-next-prefill D1" banners.
+The `GGML_CUDA_SLAB_RING_FALLBACK` alias comment now says what the alias is instead of "pre-session-4 spelling".
+
+Log lines re-read one by one against the code: `pipeline staging` (splits x buffers x size x where the number came
+from), the `stage_release` line, the two-cause `h2d_stage_buffer` refusal, the `band_raise[absorbed_by_cushion=
+overrun_deferred=]` census tail, the `transport buffers: N -> M` decision (its trailing bogus `%s ""` argument is
+gone, and the `%`-escaped thresholds print as before), and the census' `resident=` / `arena_region=` /
+`arena_resident=` split (the `gate-uma-experts.sh` comment that still quotes `arena=` is a docs nit for promotion).
+
+### 7.4 Re-checked and clean (again)
+
+* **Lock order.**  `ggml_cuda_slab_ring_candidate` holds `g_slab_mutex` and calls `moe_cache_residency`, and the
+  `SLAB_STATS` line calls `moe_cache_resident_bytes` under the same lock — both read **atomic mirrors** and take no
+  lock, so there is no inversion.  `ggml_cuda_slab_set_ring_region` now takes `g_slab_mutex` itself; every caller is
+  outside it (`slab_set_ring_cap`, `slab_set_ring_unit`, and `ggml_cuda_transport_region_request` from
+  `ggml_cuda_moe_transport_decide`, which holds the **cache's** mutex — cache -> slab, never the reverse).
+* **One authority per number.**  The depth: `ggml_backend_cuda_transport_bufs()` (one parser, aliases included).
+  The unit: `slab_set_ring_unit` from `llama_context`.  The cap: VRAM/4.  The scheduler and the Meta backend read the
+  depth through `slab_ring_slots` and parse nothing; `GGML_SCHED_STAGE`/`_STAGE_SELECT`/`_DEVGATHER` are read only
+  as predicate switches (the pre-existing duplication for `GGML_SCHED_STAGE`, in the zero-carve test and the
+  scheduler).
+* **`_locked` convention.**  `residency_audit_locked` is called from `report_locked` and takes nothing;
+  `moe_cache_residency` / `moe_cache_resident_bytes` are the public, lock-free entry points and say so.
+* **`wide_armed`-guarded VA moves** in the slab: the idle-carve drop in `set_ring_region`, the cushion base, the
+  deferred raise and the carve release all check it before moving anything.
+* **Format strings**: the build is clean — no `-Wformat`, no `-Wunused-*` in any file this change touches.
+
+### 7.5 The A/B that proves this pass changed no behaviour
+
+The pre-review tree (`538391438`) and the post-review tree were both built and both run through `field-seq.sh`
+(the three-request field sequence and the short-prompt arm): **identical to the MiB** on the arena
+(`15 904.7 / 15 904.7 / 15 753.1`), on the transport decision (`3 -> 2`, `3412.5 -> 2275.0`), on the buffer size
+(`2 x 450.0 MiB`), on the band (`absorbed=2 overrun=0`) and on the 239-token request (`339.2 t/s`); the rates
+differ only inside the box's 2-5 % spread.  The four tests themselves are in
+[`RESULTS-session6.md`](RESULTS-session6.md) §4.
