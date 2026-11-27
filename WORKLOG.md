@@ -16,6 +16,32 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261126.006 (r367, release cut) -- tagged, main and the fork pushed, the release assets published; the container images are OWED to the worker
+
+**The cut.**  `v18-919794500-r367` (annotated tag) = fork re-cut tip
+`83b254bea899bddf1424beef82f623a85b9d8ad2`, base `919794500`, base tree
+`916941663346eb86004bed77f74e90fcf9c43126`, default tree `2ff670ba83e5160abf16d20355aeded52cb744f0`, 18
+official + 1 temporary = 19 default blocks; optional `0100` alone `9f9acf91f` (sha `4093ef67...`, diff unchanged),
+`0101` alone `9357ca292` (sha `0783b165...`, **repaired**), cumulative `c5ad54d97` (both re-cut and applied
+STRICTLY on the new default tree).  The two changes are the issue fixes in 261126.005 (#373, block 08) and
+261126.004 (#371, the optional artifact + the new gate 47); the net `rdna-boosts-all.patch` moves by 9 lines.
+
+**The fork.**  `scripts/fork-refresh.sh --build --gates` re-cut `~/llama.cpp` from `patches/` (strict `git am`,
+19 commits), asserted `tip 83b254bea == release.json .tip` and the tree, built it, and the gates read
+`check-shlib-symbols.sh` **16/16**, the coherence arm (overridden to this box's 9B Q8_0 -- its 4B default is the
+primary box's, and that override is now named by the script instead of failing opaquely), and
+`gate-prefill-logits.sh` **0.000000 / 100.000 %** against the r366 base recorded on this ROCm line.  Pushed
+`--force-with-lease` to the **personal fork only** (the branch previously carried `489810652`); verified on the
+ref with `gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha`.
+
+**The images.**  Owed: the `radiance` worker polls for the tag and runs the tag's own
+`scripts/build-containers.sh --push --prune`; a push is not proof, so `scripts/build-containers.sh --verify-only`
+must read every tag resolving to this release (the #364 lesson) before this release is called finished.  Nothing
+was built on this box.
+
+**Record.**  The change and its measurements are 261126.005 (#373) and 261126.004 (#371); the regression class of
+#371 also added `scripts/gate-optional-build.sh` (gate 47) to the release ladder.
+
 ## 261126.005 (r367) -- issue #373: the RDNA3_0 verify band is back (the r353 re-cut had lost one boolean, and it is the gate five fusions and two newer verify paths share)
 
 **The report.**  `@mjohanning99` measured a reproducible 1-3 % MTP decode regression on gfx1100 from r353 on and
