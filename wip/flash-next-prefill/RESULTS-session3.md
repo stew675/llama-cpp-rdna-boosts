@@ -540,3 +540,32 @@ active (measured identical: 21 840.7 MiB, ~10 590 evictions, decode 47.9/48.1/48
 allocated from free VRAM rather than donated by the slab. Once the buffers are carved from the slab's wide phase
 (the follow-up above), the intended trade appears: prefill evicts (it is bandwidth-bound, not residency-bound) and
 decode gets the arena back.
+
+
+### 12.2 Can the prefill read the arena with NO copy? (where that idea actually lives)
+
+The maintainer's last question for this campaign: with the ping-pong buffers everything a routed op needs is
+VRAM-resident, so the **arena -> buffer hole fill** should be avoidable. Two ways to get there, and only one of
+them is reachable on this box:
+
+1. **Gather from two sources** (pp buffer for streamed experts + arena slots for residents) into the op's input.
+   That is still a copy, so the prize is only the one measured in §12: **132 GiB of VRAM->VRAM = 94 ms = 0.24 %**
+   of a 38.9 s run. Not the 2.3 %.
+2. **Read the arena in place** and fill only the *missing* experts into arena slots (evicting its own landing
+   slots, never a decode resident) — the real no-copy arm. **It is the GTT expert store's prefill path**
+   (`pf_in_place_locked`), gated on `g_gtt_arena`, which is set only for the UMA/APU tier:
+
+   > `g_gtt_arena = true; … "the GTT EXPERT STORE is this run's MoE arena: … the pageable model mapping as the
+   > fill source, and no in-place cold read"`
+
+   On a discrete `--host-experts pool` run `g_gtt_arena` is false, so `pf_in_place_locked` declines and **this
+   experiment cannot be run on the R9700 box**. The only no-copy arm available here is the **identity take-over**
+   (`device remap` in the census), which needs the whole table resident — not achievable at this shape on one
+   32 GB card (144 tables x 284 MiB ≈ 40 GB of experts).
+
+**So the "no-copy prefill" question is a GTT/UMA-box experiment** (Strix Halo / gfx1151, or an APU with `-lme`
+sized below the expert set), and it should be the first item of the follow-up session. Also recorded there, from
+the maintainer: the arena will not always re-grow into the VRAM the pp buffers hand back, because growing it
+exposes the hot set to eviction on the next prefill — a consequence of **table-granular** eviction (evicting by
+table of experts rather than by expert). That redesign is explicitly out of scope for this campaign and is a
+separate session.
