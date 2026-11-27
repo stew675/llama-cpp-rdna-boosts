@@ -206,3 +206,29 @@ differ only inside the box's 2-5 % spread.  The four tests themselves are in
 [`RESULTS-session6.md`](RESULTS-session6.md) §4, which also carries a **`-sm layer` arm** (two cards, capped
 arena): it stages 138 host-weight splits over two backends, releases across both at the drop with no refusal, and
 reads the same text as the pre-review build — i.e. fix 1 is exercised on real silicon and changes no result.
+
+## 8. The rework (after the maintainer's user test)
+
+Their test came back clean; the four judgements were: rename the internal `slab_ring_*` names to `slab_stage_*`, keep
+the truth over the handover's stale figures, re-cut the buffer-count table with a **0 = GATHER** branch (and cap the
+one unbounded knob), and dig into the 122B staged arm.  Numbers and the branch table:
+[`RESULTS-session6.md`](RESULTS-session6.md) §8.
+
+| # | what | why |
+|---|---|---|
+| 24 | **the transport region's UNIT was 2.5-3x too big** (a real over-carve) | `llama_context` published the per-LAYER sum of a layer's host expert tables, but a scheduler split stages ONE routed role: measured 122B 1686 vs 630 MiB per buffer, 35B-A3B 816 vs 272, Flash-Next GSQ 1137 vs 450 -- i.e. 1.3-2.1 GiB of arena carved for nothing on every shape.  The unit is now the largest host expert TENSOR per device (one split input) and `max_host_expert_layer_bytes()` is deleted with it.  A shape whose role-tensors really do share one split exceeds the per-buffer capacity and gets the audible `h2d_stage_buffer` refusal plus the serial upload for that split (correct, self-reporting; not seen on any of the five shapes measured). |
+| 25 | `GGML_CUDA_GRAPH_MAX_TOKENS` was **unbounded** | clamped to 1..32 (a higher value warns), and `SCHED_STAGE_CAPTURE_SAFE_TOKENS` moved 16 -> 32 so a captured graph (<= 32 rows) can never contain an in-place staged consume (> 32 tokens).  Each constant's comment names the other as the invariant. |
+| 26 | the buffer-count table | re-cut as the maintainer specified, with 0 as a real answer (the region request becomes 0 and the selector gathers).  All four branches are measured on real shapes; see §8.2 of the results. |
+| 27 | `slab_ring_*` -> `slab_stage_*` | the internal names now match the user-facing vocabulary (region/transport/pipeline/stage).  Mechanical; the `wip/slab-ring-region` provenance tags stay. |
+
+**The 122B question that started it** was two things stacked: (a) the rule decided **1 buffer** on a 15 %-coverage
+shape, and a one-buffer pipeline cannot overlap, so staged == gather (1031 vs 1030 measured) -- the "23 % regression";
+with 2 it reads 1190 (+16 %) and with 3, 1274.  (b) the unit over-carve made **every** depth cost 2.5-3x its arena,
+which is why depth 3 looked expensive and why the wide boundary sat ~2 GiB high (8832 = band 1536 + cushion 512 +
+region 3456 + wide 3328, arithmetically correct, ~2 GiB of it unnecessary).
+
+**Checked-and-clean after the rework.**  `43d0b1f4629e` on three 89k cycles (2 495.4 t/s median); the field sequence
+unchanged (decision 2, `144 x 2 x 450 MiB`, `band_raise[absorbed=2 overrun=0]`, no refusal/grow/drift, 2 157.4 t/s);
+35B-A3B 3 213.7 (+3.5 %); 122B 1 199/1 202 (neutral); the 89k staging census is the same 138 splits into 3 buffers of
+450 MiB with 2.5-3x less region.  Lock order unchanged (the new call into `ggml_cuda_slab_min_arena_mib()` is a
+read-only getter, and the region re-request still runs under the cache mutex only).

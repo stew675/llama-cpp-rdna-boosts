@@ -8,8 +8,8 @@ push, nothing promoted.
 
 | | |
 |---|---|
-| tip | **`60559e971`** (one commit, `af7a57ba8` + the whole campaign in its post-review form) |
-| the change as one patch | [`SQUASHED-campaign-r368.patch`](SQUASHED-campaign-r368.patch), **4062 lines, 18 files** (was 4113 / 22) |
+| tip | **`dfdb8296d`** (one commit, `af7a57ba8` + the whole campaign; `60559e971` before the rework in §8) |
+| the change as one patch | [`SQUASHED-campaign-r368.patch`](SQUASHED-campaign-r368.patch), **4947 lines, 18 files** (was 4113 / 22 before the review pass, 4062 after it) |
 | build | `~/llama.cpp/build-rocm` from that tip; clean, no warning from any file the change touches |
 | review | the tombstone rule applied; **4 defects found and fixed**, **~60 comment/log edits**, **2 D1 probes deleted**, the patch **−51 lines** net |
 | tests | all four of the handover's §4 arms pass; the review is **behaviour-neutral** (proved by rebuilding the pre-review tree and repeating two arms — §4) |
@@ -30,6 +30,7 @@ push, nothing promoted.
 | test 2 (field sequence) | decision `3 -> 2`, region **3412.5 -> 2275.0 MiB**, base **2048 = 1536 + 512**, band `1536 -> 1792 -> 2048` inside the cushion, release at the drop, `band_raise[absorbed=2 overrun=0]`, **no** drift/grow/refusal, prefill **2176.1 t/s** |
 | test 3 (short prompts) | **263.5 t/s** (581 tok) and **339.2 t/s** (239 tok), no refusal, no grow |
 | test 4 (depth pinned to 1) | `pinned at 1 by GGML_SCHED_PIPELINE_BUFS`, 89k **2045.3 t/s** (vs 2494.6 unpinned), text `43d0b1f4629e` |
+| the rework (§8) | `slab_ring_*` -> `slab_stage_*`; the buffer table re-cut with a **0 = GATHER** branch; the **unit was 2.5-3x too big** and is now the largest host expert TENSOR (region 2.5-3x smaller, arena +1.3-2.1 GiB during a prefill); `GGML_CUDA_GRAPH_MAX_TOKENS` capped at 32 |
 
 ## 1. The tombstone purge (handover §2)
 
@@ -249,11 +250,10 @@ Identical to the MiB, and inside the box's 2-5 % spread on the rates.  **The rev
   confirm.
 * `-ub` guidance for consumers: `-ub 8192` ~2682 t/s against ~1726 at `-ub 2048` on the field shape — a block-note
   line, not a defect.
-* **NEW: raising `GGML_CUDA_GRAPH_MAX_TOKENS` above 64 while staging is on is not covered.**  The in-place consume
-  is guarded by `SCHED_STAGE_CAPTURE_SAFE_TOKENS` (16, matching the *default* capture limit) and by the staging width
-  gate (>= 64 tokens, the calibration floor).  A user who raises the capture limit past 64 could have a captured graph
-  whose in-place pointer changes between graphs; the allocator's own `update_required` check is what keeps that
-  answer correct today, not an invariant this transport states.  A block-note line, or an `INVARIANTS.md` entry.
+* ~~**raising `GGML_CUDA_GRAPH_MAX_TOKENS` above 64 while staging is on is not covered.**~~  **CLOSED (§8):** the
+  variable is clamped to 1..32 and `SCHED_STAGE_CAPTURE_SAFE_TOKENS` moved to the same 32, so a captured graph
+  (<= 32 rows) can never contain an in-place staged consume (> 32 tokens).  An `INVARIANTS.md` entry is still owed
+  at promotion, because the pairing is what makes it true.
 * ~~**NEW: `-sm layer` staging is per backend but unmeasured.**~~  **MEASURED this session** (§4, test 5): two
   R9700s, `-ncmoe 47`, `-sm layer` with a capped arena stages 138 splits / 2 buffers, releases at the drop with no
   refusal or drift, and reads the same text on the pre-review build (`184dc307181b`).  With the default arena the same
@@ -261,7 +261,91 @@ Identical to the MiB, and inside the box's 2-5 % spread on the rates.  **The rev
   promotion run still owes a **`field-seq.sh` arm on a layer split whose arena cannot cover the set** (the two-slot,
   `-lme`-budget shape), not just this 89k one.
 
-## 8. For the next session
+## 8. The rework (the maintainer's calls, after their user test)
+
+Their user test came back clean ("no unexpected strangeness or log output, mostly pretty smooth") with four
+judgements, all implemented:
+
+**8.1 `slab_ring_*` -> `slab_stage_*`.**  Every internal name now matches the vocabulary the log lines and the docs
+already used: `ggml_backend_dev_slab_stage_region` / `_set_stage_cap` / `_set_stage_unit` / `_stage_slots` /
+`_stage_set`, `ggml_cuda_slab_stage_*`, `h2d_stage_cap_bytes`, and the slab members `stage_region` / `stage_used` /
+`stage_slots` / `stage_requested`.  The `wip/slab-ring-region` provenance tags stay (they name a campaign directory).
+
+**8.2 The buffer table is re-cut, and gains a 0.**  The maintainer's rule, with the slab's own minimum arena as the
+floor and the 40 % residency test kept for the third buffer only:
+
+```
+one buffer would take the arena below GGML_CUDA_SLAB_MIN_ARENA_MIB   ->  0 buffers = GATHER (no carve)
+two buffers would take the arena below it                            ->  1 buffer
+three buffers would leave < 40 % of the host set                     ->  2 buffers
+otherwise                                                           ->  3 buffers
+```
+
+0 is a real answer, not a fallback: the request becomes 0, the selector's "is a region carved?" test answers no and
+every host weight gathers.  **All four branches measured** (122B-A10B, 1686/630 MiB per buffer as noted in §8.3):
+
+| branch | how it was reached | decision log | prefill |
+|---|---|---|---|
+| 0 (gather) | `MOE_EXPERT_CACHE_MIB=3072` (arena 3 061 MiB, `left_after_1` 1 375 < 2 048) | `3 -> 0 (GATHER: the transport declines for this run)` | 933.4 t/s |
+| 1 | `MOE_EXPERT_CACHE_MIB=4096` (arena 3 936, `left_after_1` 2 250 ok, `left_after_2` 564 < 2 048) | `3 -> 1` | 1 029.0 |
+| 2 | the shape's own arena (8 527 MiB = 15.2 %) | `3 -> 2` | 1 199.1 |
+| 3 | 35B-A3B Q8_0, 1 GPU (arena 25 245 = 77.3 %) | `3 -> 3` | **3 213.7** |
+| 3 | Flash-Next IQ4_NL, **2 GPUs `-sm tensor`**, `-ncmoe 46 -lme mirror -lazy-mode on` (arena 43 799 = 73.2 %) | `3 -> 3` (the pipeline then declines on the Meta split, as designed) | 2 607.6 |
+
+(`GGML_CUDA_SLAB_MIN_ARENA_MIB` is **not** a usable probe for the low branches: it also moves the slab's *creation*
+floor, and at 6-7 GiB the cache is declined and the decision never runs.  Capping the arena is the honest lever.)
+
+The 122B is the shape that started this: at its own arena it decides **2** (1 199 t/s against the gather's 1 030, i.e.
+**+16 %** recovered from the ~23 % "regression"), and a forced 3 reads 1 274.
+
+**8.3 The latent defect: the UNIT was 2.5-3x too big.**  `llama_context` published the *per-layer sum* of a layer's
+host expert tables as "one buffer's bytes", but a scheduler split stages **one routed role**, so the region
+over-carved on every shape measured:
+
+| shape | published unit | the set the pipeline actually fills | region carved | region needed | arena withheld |
+|---|---|---|---|---|---|
+| 122B-A10B (depth 2) | 1 686 MiB | **630 MiB** | 3 456 | 1 280 | **2 176 MiB** |
+| 35B-A3B Q8_0 (depth 3) | 816 | **272** | 2 496 | 832 | **1 664 MiB** |
+| Flash-Next GSQ (depth 2) | 1 137 | **450** | 2 304 | 1 024 | **1 280 MiB** |
+
+That is also the answer to "why does the wide boundary read 8 832 MiB?": it is `2048` (band 1 536 + cushion 512) `+
+3456` (the region at the provisional depth 3) `+ 3328` (the wide prefill view) `= 8832` — correct *as a layout*
+(the wide view is work and sits above the region), but it sat ~2 GiB higher than the transport needed.
+
+**What it costs, and why it is not "the final arena size":** the region is a carve inside the work band, so during a
+prefill it is arena the wide pass has to **evict**, and the arena then **refills** after the drop before decode runs
+at its steady rate again.  Measured with the unit fixed (122B-A10B, 1 500 greedy tokens after an 89k prefill):
+
+| arm | prefill | decode | `fills` | `evictions` |
+|---|---|---|---|---|
+| gather | 939.0 | 18.5 | 108 432 | 94 678 |
+| 2 buffers (the rule) | 1 189.9 | 18.4 | 106 659 | 92 905 |
+| 3 buffers | **1 274.3** | 18.5 | 104 391 | 91 992 |
+
+So on this shape staging evicts **less** than the gather (it stops the per-expert gather hammering the arena), and
+decode is flat within 0.5 % — the eviction/refill cost is real but much smaller once the region is sized to what the
+transport actually moves.  The honest framing is recorded in the rule's comment.
+
+The unit is now the largest host expert **tensor** per device (one split input), and
+`max_host_expert_layer_bytes()` is deleted with it (no caller, and it was the over-statement).  A shape whose several
+role-tensors *do* share one split exceeds the per-buffer capacity and gets the audible `h2d_stage_buffer` refusal plus
+the serial upload for that split — correct, self-reporting, and not seen on any of the five shapes measured.
+Verification: `43d0b1f4629e` on **three** 89k cycles (2 495.4 t/s median), the field sequence unchanged (decision 2,
+`144 splits x 2 x 450 MiB`, `band_raise[absorbed=2 overrun=0]`, 0 refusal/grow/drift lines, 2 157.4 t/s), 35B
+3 213.7 (+3.5 % over the pre-fix 3 105.5), 122B neutral (1 199 / 1 202).
+
+**8.4 `GGML_CUDA_GRAPH_MAX_TOKENS` is capped.**  It was unbounded; it is now clamped to **1..32** (a higher value
+warns and is clamped), and `SCHED_STAGE_CAPTURE_SAFE_TOKENS` moved 16 -> 32 so the two are paired: a captured graph
+holds at most 32 rows and an in-place staged consume needs more than 32 tokens, so the two sets cannot overlap.  The
+comment on each constant says the other must move with it.
+
+**8.5 Recorded, not changed.**  The field shape's *scheduler reserve partition* varies between runs of the **same
+commit** with the heat prior (`3211 + 1536 + 1536 MiB` vs `3634 + 768 + 768`, arena 14 708 vs 14 308 MiB) — so an A/B
+on that shape must pin `MOE_EXPERT_HEATMAP` (the campaign's arms do; `field-seq.sh` does not, which is a small tool
+gap).  This is what made the field numbers move between builds before the rework and has nothing to do with the
+transport.
+
+## 9. For the next session
 
 * **Attributing a number to a review is a rebuild, not an argument**: `git checkout <pre-review sha>` +
   `cmake --build` (ccache makes it ~1 min) + the same arm gives the A/B above.  Do that before believing that a

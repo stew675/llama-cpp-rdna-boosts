@@ -2,11 +2,12 @@
 
 # HANDOVER — session 6: tombstone purge, fresh review, then STOP for the maintainer's user test
 
-> **DONE (session 6).**  The purge and the review are in [`REVIEW-squashed.md`](REVIEW-squashed.md) §7, the tests of
-> §4 below and their numbers in [`RESULTS-session6.md`](RESULTS-session6.md).  Tip **`60559e971`**, patch **4062
-> lines / 18 files**, all four tests pass, the review is behaviour-neutral against the pre-review build, and
-> **nothing is promoted**.  What is left is this page's §5, which starts with the block decision and needs the
-> maintainer's explicit all-clear — and first, their own user test.
+> **DONE (session 6) -- the user test passed and the follow-up rework is in.**  The purge and the review are in
+> [`REVIEW-squashed.md`](REVIEW-squashed.md) §7-§8, the tests of §4 below and the rework in
+> [`RESULTS-session6.md`](RESULTS-session6.md) (§8: `slab_stage_*`, the 0/1/2/3 buffer table, the over-carved unit
+> fixed, the graph-token cap).  Tip **`dfdb8296d`**, patch **4947 lines / 18 files**, all four tests pass, the review
+> is behaviour-neutral against the pre-review build, and **nothing is promoted**.  What is left is §5 below, which
+> starts with the block decision and needs the maintainer's explicit all-clear.
 
 **Read this, then [`REVIEW-squashed.md`](REVIEW-squashed.md) (the review that stands) and
 [`RESULTS-session5.md`](RESULTS-session5.md) (the measurements of record).  Sessions 1-4 are history; every dated

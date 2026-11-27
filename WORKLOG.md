@@ -16,6 +16,66 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.010 (r368, `wip/`) -- flash-next-prefill: the rework after the maintainer's user test (`slab_stage_*`, the 0/1/2/3 buffer table, the over-carved unit fixed, the graph-token cap)
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push, nothing promoted.  Squashed
+prototype `~/llama.cpp` `wip/prefill-slot-pingpong-squashed`, tip **`dfdb8296d`** (one commit on `af7a57ba8`); patch
+[`SQUASHED-campaign-r368.patch`](wip/flash-next-prefill/SQUASHED-campaign-r368.patch) **4947 lines / 18 files**;
+review [`REVIEW-squashed.md`](wip/flash-next-prefill/REVIEW-squashed.md) §8; numbers
+[`RESULTS-session6.md`](wip/flash-next-prefill/RESULTS-session6.md) §8.
+
+The user test came back clean ("no unexpected strangeness or log output, mostly pretty smooth").  Four judgements,
+all implemented.
+
+**1. `slab_ring_*` -> `slab_stage_*`.**  `ggml_backend_dev_slab_stage_region` / `_set_stage_cap` / `_set_stage_unit` /
+`_stage_slots` / `_stage_set`, `ggml_cuda_slab_stage_*`, `h2d_stage_cap_bytes`, and the slab members `stage_region` /
+`stage_used` / `stage_slots` / `stage_requested` -- the internal names now match the vocabulary every log line and doc
+entry already used (the `wip/slab-ring-region` provenance tags stay; they name a campaign directory).
+
+**2. The buffer table is re-cut and gains a 0** (the slab's own minimum arena is the floor, and the 40 % residency
+test now only cancels the THIRD buffer): one buffer would take the arena below `GGML_CUDA_SLAB_MIN_ARENA_MIB`
+(**2 GiB default**, not 4) -> **0 buffers = GATHER** (the region request becomes 0, the selector gathers); two buffers
+the same -> **1**; three buffers leaving < 40 % of the host set -> **2**; else **3**.  **All four branches measured**:
+122B with a 3 GiB arena cap -> 0 (933 t/s), 4 GiB cap -> 1 (1029), own arena -> 2 (**1199**), 35B-A3B Q8_0 1 GPU -> 3
+(**3214**), Flash-Next IQ4_NL 2-GPU `-sm tensor` -> 3 (2607, the pipeline then declining on the Meta split as
+designed).  `GGML_CUDA_SLAB_MIN_ARENA_MIB` is not a usable probe for the low branches (it also moves the slab's
+creation floor, and at 6-7 GiB the cache is declined and the decision never runs); capping the arena is the lever.
+
+**3. The 122B investigation found a real latent defect: the transport region's UNIT was 2.5-3x too big.**  The 122B's
+"~23 % regression" was two things stacked.  (a) The rule decided **1 buffer** on a 15 %-coverage shape, and a
+one-buffer pipeline cannot overlap: staged 1031 t/s against the gather's 1030 -- no win, but also no loss; with 2 it
+reads **1190 (+16 %)** and with 3, 1274.  (b) `llama_context` published the per-LAYER sum of a layer's host expert
+tables as "one buffer's bytes", while a scheduler split stages **one routed role** -- measured 122B 1686 vs 630 MiB per
+buffer, 35B-A3B 816 vs 272, Flash-Next GSQ 1137 vs 450 -- so the region over-carved by **1.3-2.1 GiB on every shape**.
+That is also the answer to the wide boundary reading 8832 MiB: `2048` (band 1536 + cushion 512) `+ 3456` (the region at
+the provisional depth 3) `+ 3328` (the wide prefill view) -- a correct *layout*, but ~2 GiB higher than the transport
+needed.  The unit is now the largest host expert **tensor** per device (one split input) and
+`max_host_expert_layer_bytes()` is deleted with it; a shape whose role-tensors really do share a split exceeds the
+per-buffer capacity and gets the audible `h2d_stage_buffer` refusal plus the serial upload (correct, self-reporting,
+not seen on any of the five shapes measured).  **Why the over-carve mattered, and what it is not:** the region is a
+carve inside the work band, so during a prefill it is arena the wide pass must EVICT, and the arena then REFILLS after
+the drop before decode runs at its steady rate -- it is not about the final arena size, which is unchanged after the
+drop.  Measured with the unit fixed (122B, 1500 greedy tokens after an 89k prefill): gather pp 939 / tg 18.5, fills
+108 432, evictions 94 678; 2 buffers 1190 / 18.4, 106 659, 92 905; 3 buffers 1274 / 18.5, 104 391, 91 992 -- on this
+shape staging evicts LESS than the gather (it stops the per-expert gather hammering the arena) and decode is flat
+within 0.5 %.  The nuance is recorded in the rule's own comment so it is not re-derived as "the final arena size".
+
+**4. `GGML_CUDA_GRAPH_MAX_TOKENS` is capped** (it was unbounded): clamped to 1..32 with a warning, and
+`SCHED_STAGE_CAPTURE_SAFE_TOKENS` moved 16 -> 32 so the two are paired -- a captured graph holds <= 32 rows and an
+in-place staged consume needs > 32 tokens, so the sets cannot overlap.  Each constant's comment names the other.
+
+**Verification:** `43d0b1f4629e` on **three** 89k cycles (2 495.4 t/s median, unchanged); the field sequence unchanged
+in every line (decision 2, `144 splits x 2 x 450 MiB`, `band_raise[absorbed_by_cushion=2 overrun_deferred=0]`, no
+residency-drift / grow / refusal lines, 2 157.4 t/s); 35B-A3B **3 213.7** (+3.5 % over the pre-fix 3 105.5); 122B
+neutral (1 199 / 1 202).  Recorded, not changed: the field shape's scheduler reserve partition varies between runs of
+the **same commit** with the heat prior (`3211+1536+1536` vs `3634+768+768` MiB), so an A/B on that shape must pin
+`MOE_EXPERT_HEATMAP=load` (the campaign's arms do; `field-seq.sh` does not -- a small tool gap).
+
+**State: still nothing promoted.**  The next step is the block decision, which is asked first (`AGENTS.md`): the
+selector + the re-keyed zero-carve rule into block 09; the pipeline, the region, the cushion and the depth authority
+into block 10; the VMM pool's fail-soft growth into block 10.  Then the gate ladder (prefill-logit KLD first) and the
+doc edits listed in `RESULTS-session6.md` §1/§6, plus an `INVARIANTS.md` entry for the capture/consume pairing.
+
 ## 261127.009 (r368, `wip/`) -- flash-next-prefill: the tombstone purge, the fresh review's four defects, and the four tests -- ready for the maintainer's user test
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push, nothing promoted.  Squashed
