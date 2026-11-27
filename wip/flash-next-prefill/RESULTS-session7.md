@@ -157,3 +157,81 @@ fill because the per-device region is never carved), and its decision is still t
 * The §3.1 decision (delete the Meta staged transport, or finish it) is still open — this session fixed nothing about
   it beyond the two layers the previous session had already fixed, and re-confirmed with the arm above that the
   default is unaffected either way.
+
+## 6. The tensor-split transport, WIRED IN and measured (the maintainer's instruction)
+
+The maintainer's call after §11: the ring's removal was deliberate and is not being revisited; the *pipeline* is the
+mechanism, it had simply never been wired to the Meta device, so it had never been compared with the gather.  Their
+instruction was to wire the support in, measure, then choose the policy — and to keep the support whatever the policy
+says, because policies move.  This section is that measurement.
+
+### 6.1 What was wired
+
+1. **The selector no longer encodes "the gather always wins on that tier".**  `sched_stage_exposure_decides` used to
+   return "keep the gather" for any backend without `stage_buffer`/`stage_upload`/`stage_wait` — i.e. structurally for
+   the Meta backend, before anything was measured.  It now asks only whether the backend can stage in **either** form
+   (backend slots, *or* its own `stage_input`) and lets the exposure test decide the transport.  The two forms are
+   documented as different transports (the slot form consumes in place; the `stage_input` form fills each device's slot
+   and copies it in), and the comment says explicitly why the choice must stay a number and not a structural refusal.
+2. **The depth and the region are the pipeline's, on both forms.**  The Meta ring's slot count is read from the same
+   `slab_stage_slots` authority (`ggml_backend_cuda_transport_bufs`, i.e. the residency decision or the user's
+   override), and the region request is the same `unit x depth` (the Meta device now forwards the region hooks, so
+   `llama_context`'s arming and its "is anything carved?" test see the children).  The observed decision lines on the
+   arms below: `transport buffers: 3 -> 2` at 40 %, `3 -> 3` at 60 %, with `720 / 270 / 450 MiB` per buffer as the
+   shape's split set dictates.
+3. **The region is really carved on a split now** — this is what the review's §10.3 fix bought.  Before it, the
+   carve was zeroed at a narrow placement and the ring was refused at every fill (the §9 finding); with it, the ring
+   stages, and the log says so: `transport: staging through Meta(ROCm0,ROCm1)'s per-device ring`.
+
+### 6.2 The measurement (2 cards `-sm tensor`, GSQ-IQ3_XXS, 89k prompt, `-ub 8192`)
+
+**Flags: the maintainer's reproducible configuration — `HOSTEXP=pinned LME=mirror LAZY=off`** (`-lme mirror
+--lazy-mode off`, default `--host-experts`), `NGEN=16`, `abba.sh` rotation, `MOE_EXPERT_CACHE_MIB` setting the arena
+(hence the coverage).  With that configuration the per-arm **spread is 0.1-0.5 %**; the same arms on the pool tier with
+`--lazy-mode on` spread up to 25 %, which is what the earlier "it is erratic" reading was.
+
+| coverage (settled arena) | staged (median) | gather (median) | winner |
+|---|---|---|---|
+| **40 %** (16 346 MiB) | **2869.8** (2855.8 / 2870.7 / 2869.8, n=3) | 2655.3 (2645.8 / 2657.5 / 2655.3, n=3) | **staged +8.1 %** |
+| **60 %** (24 539 MiB) | **3009.6** (3008.1 / 3011.1, n=2) | 2910.9 (2909.8 / 2912.0, n=2) | **staged +3.4 %** |
+| **80 %** (32 732 MiB) | 3100.0 (3098.1 / 3101.9, n=2) | **3164.7** (3162.6 / 3166.8, n=2) | gather +2.1 % |
+| **~100 %** (uncapped) | 3428.2 (single arm) | **3429.8** (3427.5 / 3432.2, n=2) | tie |
+
+`staged` = `GGML_SCHED_DEVGATHER=0` (force the staged transport, gather branch disabled); `gather` =
+`GGML_SCHED_DEVGATHER=2` (force the gather above the band).  The **policy arm** is the default (no knob), and it now
+follows the exposure rule on this tier: **STAGE at 40 % and 60 %** (`transport: exposed 24618.9 MiB / 8192 tok at 28.7
+GB/s = 109.9 us/tok vs 38.0 -> STAGE`, and `16386.0 MiB ... 73.1 us/tok -> STAGE`), **gather at 80 % and 100 %**
+(read `3429.8`/`3430.9` t/s, i.e. the gather's own number).
+
+**Read it as a curve**: the crossover on this 2-card shape sits between 60 % and 80 % coverage (≈70 %), and the
+exposure rule's own prediction for the set — the 38 us tie at ~78 % coverage, from §11.5 — lands within one arm of it.
+So the tensor-split transport obeys the same physics as the single-device one, and **the staging transport is worth
+8 % at the low-coverage end where a tensor split spends most of its time** on a model that does not fit the cards.
+
+### 6.3 The honest scope of "the pipeline" on this tier
+
+This is the per-device slot ring driven at the pipeline's depth, **not** the pipeline's full mechanism, and the
+difference is structural, not a shortcut:
+
+* **No fill-ahead.**  The `stage_input` form fills one split's set at its copy-input point.  The Meta drain
+  (`graph_compute`) consumes **every** pending entry and clears the list, so a scheduler-level prefetch (fill k+N at
+  split k) would be drained at split k's compute into the split-(k+N) input — correct data, but the device-to-device
+  copy would be issued N layers early on the compute stream instead of overlapping, i.e. it would serialize.  A real
+  fill-ahead needs a per-split drain plus a `stage_prefilled` flag on the split; that is the next step, and it is a
+  change to the Meta backend's staging lifecycle, not a policy.
+* **No in-place consume.**  The drain is a device-to-device copy because the redirect is **not correct** for an
+  offloaded expert table (its consumer does not read `simple_tensor->data`; measured: one layer destroyed, MTP acc
+  1.00 against 3.88 — `ggml_backend_meta_stage_input`'s comment keeps the receipt, `GGML_STAGE_META_REDIRECT=1` is
+  A/B only).  So the tensor split gets the pipeline's *depth and authority*, not its in-place consume; the in-place
+  win (the single-device +17 %) needs that redirect problem solved first.
+* **Consequence for expectations**: on one card the pipeline is +18 % over the gather and +2.6 % over the old
+  ring+lookahead; on a tensor split, today, the staged transport is +8.1 % at 40 % coverage — a real win, and not
+  yet the full pipeline.
+
+### 6.4 The support stays
+
+Whatever policy is chosen later (default stage-vs-gather, a threshold, or a per-tier rule), the Meta transport must
+stay **reachable and selectable**: the selector treats both staging forms as eligible, `GGML_SCHED_DEVGATHER=0|2`
+remain the two controls, and no configuration may encode "the gather always wins on that tier" again.  Removing it is
+a maintainer decision, recorded as such — which is why it is written here rather than left as a comment in a
+threshold.

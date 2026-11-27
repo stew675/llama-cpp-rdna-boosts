@@ -5,6 +5,12 @@
 #   usage: ./arm.sh TAG [ENV=V ...]
 #   env:   DEV=<gpu index>   UB=<8192>   NCMOE=<47> (host-expert layers; fewer = more layers resident)
 #          PROMPT=<file>   VERBOSE=<-lv 4 for a census arm>   EXTRA=<cli args>
+#          HOSTEXP=<pool>   --host-experts tier (`pinned`/`pool`); the maintainer's reproducible configuration
+#                           for a benchmark sweep is `HOSTEXP=pinned LME=mirror LAZY=off` (the field runme's
+#                           pair: a mirrored pinned master, everything resident, no on-demand reads)
+#          LME=<unset>      `-lme <auto|mirror|N>`; unset = do not pass it
+#          LAZY=<on>        `--lazy-mode on|off`; `off` keeps every tensor resident and is what makes a
+#                           sweep reproducible when the box is otherwise busy (no on-demand reads mid-run)
 #   out:   runs/TAG/run.log
 set -uo pipefail
 TAG=${1:?usage: arm.sh TAG [ENV=V ...]}; shift
@@ -27,7 +33,8 @@ export ROCBLAS_USE_HIPBLASLT=${ROCBLAS_USE_HIPBLASLT:-1}
 if [ $# -gt 0 ]; then export "$@"; fi
 "${LLAMA_CLI:-$HOME/llama.cpp/build-rocm/bin/llama-cli}" \
   -m "$MODEL" \
-  --fit off -ngl all --n-cpu-moe ${NCMOE:-47} --host-experts pool --load-mode auto --lazy-mode on \
+  --fit off -ngl all --n-cpu-moe ${NCMOE:-47} --host-experts ${HOSTEXP:-pool} --load-mode auto \
+  --lazy-mode ${LAZY:-on} ${LME:+-lme $LME} \
   -c 131072 -fa on -ctk q8_0 -ctv q8_0 -b ${UB:-8192} -ub ${UB:-8192} -t 8 --cache-ram 4096 ${EXTRA:-} \
   -f "$PROMPT" -n ${NGEN:-24} --temp 0 --seed 1 --no-display-prompt --single-turn ${VERBOSE:-} \
   > "$DIR/run.log" 2>&1

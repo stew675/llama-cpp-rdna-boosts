@@ -472,3 +472,49 @@ the right shape of the rule but too aggressive: on this link the boundary sits a
 falls as the link gets faster (a faster link needs *more* exposure to lose the gather).  On a **tensor split** the
 same per-device exposure applies, so the potential is real — and it is exactly the measurement this campaign never
 took, because the transport that would take it was unreachable (11.1).
+
+## 12. The Meta transport is WIRED IN and measured (the maintainer's decision, 2026-11-27)
+
+§11 established that the tensor-split transport had never been measured in this campaign.  The maintainer's decision
+was explicit: the ring's removal was deliberate and stays; the pipeline is the mechanism; wire it to the Meta device,
+measure it, and **keep the support whatever the policy turns out to be**, because policies move.  Done, in one
+commit; the numbers are `RESULTS-session7.md` §6.
+
+**The one behavioural change of substance:** `sched_stage_exposure_decides` no longer refuses staging for a backend
+without backend slots.  That guard encoded a *structural* conclusion ("the pipeline needs slots, therefore the gather
+owns this tier") that had never been tested against the transport those backends actually have, and it made the
+transport unselectable by any policy.  It now accepts either staging form:
+
+* backend slots (`stage_buffer`/`stage_upload`/`stage_wait`) — the pipeline, in-place consume;
+* the backend's own `stage_input` — per-device slots, filled on each device's copy stream and copied into the split
+  input (the redirect is not correct for an offloaded expert table, so it cannot consume in place).
+
+and leaves the transport to the exposure test.  The depth and the region on both forms come from the same authority
+(`slab_stage_slots` → `ggml_backend_cuda_transport_bufs`; `unit x depth`, capped), so the ring cannot drift from the
+pipeline; and the Meta device's hook forwarding (plus §10.3's carve fix) is what makes the per-device region actually
+carve.
+
+**Measured** (2 cards, `-sm tensor`, GSQ-IQ3_XXS 89k, `-ub 8192`, the maintainer's reproducible flags
+`-lme mirror --lazy-mode off`; per-arm spread 0.1-0.5 %):
+
+| coverage | staged | gather | winner |
+|---|---|---|---|
+| 40 % | **2869.8** | 2655.3 | **staged +8.1 %** |
+| 60 % | **3009.6** | 2910.9 | **staged +3.4 %** |
+| 80 % | 3100.0 | **3164.7** | gather +2.1 % |
+| ~100 % | 3428.2 | **3429.8** | tie |
+
+So the crossover is between 60 and 80 % coverage (≈70 %), one arm away from the exposure rule's own ~78 % prediction
+for this set — the tensor split obeys the same physics, and the staged transport is worth **8 %** at the low-coverage
+end.  The default (policy) arm follows the rule on this tier: STAGE at 40/60 %, gather at 80/100 %.
+
+**What the tensor split does NOT get yet, and why it is structural rather than a shortcut:** no fill-ahead (the Meta
+drain consumes every pending entry per `graph_compute`, so a prefetch would be drained early and serialize — a
+per-split drain plus a `stage_prefilled` split flag is the prerequisite) and no in-place consume (the redirect is
+measurably incorrect for a host-offloaded expert table).  The single-device in-place win therefore does not transfer
+until those two are solved; the depth/authority/selector win does, and it is the 8 %.
+
+**Retention rule, on the maintainer's instruction:** the Meta staging transport stays reachable and selectable in
+every future policy.  `GGML_SCHED_DEVGATHER=0|2` remain the two controls, the selector treats both forms as eligible,
+and a future change that reintroduces a structural refusal ("the gather owns this tier") is a maintainer decision,
+not a tuning edit.

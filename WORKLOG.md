@@ -16,6 +16,61 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.014 (r368, `wip/`) -- flash-next-prefill: the Meta (tensor-split) staging transport is WIRED IN and measured (+8.1 % at 40 % coverage); the support stays whatever the policy is
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push, nothing promoted, ladder still not
+started.  Squashed prototype `~/llama.cpp` `wip/prefill-slot-pingpong-squashed`, tip **`a666f8637`**; patch
+[`SQUASHED-campaign-r368.patch`](wip/flash-next-prefill/SQUASHED-campaign-r368.patch) **5327 lines / 18 files**;
+`REVIEW-squashed.md` **§12**, `RESULTS-session7.md` **§6**.
+
+**The maintainer's decision this implements**: the ring's removal was deliberate and is not being revisited; the
+pipeline is the mechanism; it had simply never been wired to the Meta device, so it had never been compared with the
+gather.  Wire it in, measure, then choose the policy -- and **keep the support whatever the policy turns out to be**,
+because policies move.
+
+**The one behavioural change.**  `sched_stage_exposure_decides` used to refuse staging for any backend without
+`stage_buffer`/`stage_upload`/`stage_wait` -- i.e. structurally for the Meta backend, before any measurement.  That
+guard encoded a conclusion the campaign had never tested against the transport such a backend actually has, and it
+made the transport unselectable by any policy.  It now accepts **either** staging form -- backend slots (the pipeline,
+in-place consume) **or** the backend's own `stage_input` (per-device slots, filled on each device's copy stream and
+copied into the split input, because the in-place redirect is measurably incorrect for an offloaded expert table) --
+and leaves the transport to the exposure test.  Both forms take depth and region from the same authority
+(`slab_stage_slots` -> `ggml_backend_cuda_transport_bufs`; `unit x depth`, capped), so the ring cannot drift from the
+pipeline; the Meta device's hook forwarding plus §10.3's carve fix is what makes the per-device region actually carve.
+
+**Measured**, 2 cards `-sm tensor`, GSQ-IQ3_XXS, 89k prompt, `-ub 8192`, `abba.sh` rotation, the maintainer's
+reproducible flags **`HOSTEXP=pinned LME=mirror LAZY=off`** (`-lme mirror --lazy-mode off`), `NGEN=16`:
+
+| coverage | staged (median) | gather (median) | winner |
+|---|---|---|---|
+| **40 %** (16 346 MiB) | **2869.8** (n=3) | 2655.3 (n=3) | **staged +8.1 %** |
+| **60 %** (24 539 MiB) | **3009.6** (n=2) | 2910.9 (n=2) | **staged +3.4 %** |
+| **80 %** (32 732 MiB) | 3100.0 (n=2) | **3164.7** (n=2) | gather +2.1 % |
+| **~100 %** | 3428.2 (1 arm) | **3429.8** (n=2) | tie |
+
+`staged` = `GGML_SCHED_DEVGATHER=0`, `gather` = `GGML_SCHED_DEVGATHER=2`; the **default** arm now follows the exposure
+rule on this tier (STAGE at 40/60 %, gather at 80/100 %, and it reads the gather's own number at 100 %).  Crossover
+~70 % coverage, one arm from the rule's ~78 % prediction for this set -- the tensor split obeys the same physics, and
+the staged transport is worth **8 %** at the low-coverage end, which is where a tensor split spends its time when the
+model does not fit the cards.
+
+**A methodology finding that explains the earlier variance**: with the maintainer's `-lme mirror --lazy-mode off` the
+per-arm spread is **0.1-0.5 %**; the same arms on the pool tier with `--lazy-mode on` spread up to **25 %** (2273.7 to
+2904.1 for one arm).  `wip/flash-next-prefill/arm.sh` now takes `HOSTEXP`, `LME` and `LAZY` so the reproducible
+configuration is first-class, and every future arm should use it unless it is measuring the tier itself.
+
+**What the tensor split does NOT get yet, and it is structural, not a shortcut**: no fill-ahead (the Meta drain
+consumes every pending entry per `graph_compute`, so a scheduler prefetch would be drained early and serialize -- a
+per-split drain plus a `stage_prefilled` split flag is the prerequisite) and no in-place consume (the redirect is
+measurably wrong for a host-offloaded expert table).  So the tensor split gets the pipeline's **depth, authority and
+selector**, and the 8 %, but not yet the single-device in-place win.  That is the next step and it is recorded as such.
+
+**Retention rule (the maintainer's instruction):** the Meta staging transport stays reachable and selectable in every
+future policy.  `GGML_SCHED_DEVGATHER=0|2` remain the two controls; the selector treats both staging forms as
+eligible; a future change that reintroduces a structural refusal ("the gather owns this tier") is a maintainer
+decision, not a tuning edit.  The docs owed at promotion gain one `INVARIANTS.md` entry for the tensor-split transport
+(its two forms, why the in-place consume is unavailable, and the measured curve) and one for the reproducibility flags.
+
 ## 261127.013 (r368, `wip/`) -- flash-next-prefill: retire `moe_cache_stage_ready`, and a CORRECTION -- the tensor-split "staged" arms measured the serial upload, not the ring
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push, nothing promoted, ladder still not
