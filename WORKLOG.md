@@ -16,6 +16,37 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261126.009 (r368, release cut) -- tagged, main and the fork pushed, the release assets published; the container images are OWED to the worker
+
+**The cut.**  `v18-919794500-r368` (annotated tag) = fork re-cut tip
+`af7a57ba8700f499fa6ca01d47470208deae8718`, base `919794500`, base tree
+`916941663346eb86004bed77f74e90fcf9c43126`, default tree `bc7898a2cfa2f5268160579a2933ed42f6168d76`, 18 official +
+1 temporary = 19 default blocks; optional `0100` alone `b9c1d2636` (sha unchanged), `0101` alone `0f27f0550` (sha
+unchanged, both applied STRICTLY on the new default tree), cumulative `914bf0853`.  The change is 261126.008 (#374:
+blocks 07/08/10); the optional artifacts' own patches did not move, only the trees they produce.
+
+**Gates on the final tree.**  `validate-set.sh` green (checks 1-10, incl. the system-header scan),
+`gate-optional-build.sh` **PASS** (gate 47, both artifacts, `all` target, tree 914bf0853), `check-gen-docs.sh` ok,
+`check-rung-file-sets.py` 0 loss / 0 gone / 0 shrunk (+4 defines, +1 env), `test-backend-ops test -o MUL_MAT`
+2753/2753, `test-logits-width-probe` PASS on three KV types, `gate-prefill-logits.sh` 0.000000 / 100.000 %.
+`fork-refresh.sh --build --gates` then re-cut `~/llama.cpp` from `patches/` (19 commits, strict `git am`), asserted
+tree `bc7898a2c` and `.tip af7a57ba8`, built it, and the gates read `check-shlib-symbols.sh` **16/16**, the
+coherence arm (overridden to this box's 9B Q8_0 via `COHERENCE_MODEL`) and the prefill-logit point.  Pushed
+`--force-with-lease` to the **personal fork only** (the branch previously carried `83b254bea`); verified on the ref
+with `gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` = `af7a57ba8`.
+
+**CI and assets.**  Tier-1 `Validate delivery set` green on `main` and on the tag, `Release patch set` green; the
+GitHub Release carries its four assets (`SHA256SUMS`, `patches.tar.gz`, `rdna-boosts-all.patch`, `release.json`).
+Issue #374 answered (with the r368 numbers and the note that its second finding was already covered above 512
+tokens by block 06's MMB tile) and closed.
+
+**The images.**  OWED: the `radiance` cron watcher picked the tag up at 20:40 and started its own
+`scripts/build-containers.sh --push --prune` for both ROCm lines (its log:
+`~/.cache/rdna-containers/build-v18-919794500-r368.log`), and the maintainer stopped the wait before it finished
+(69 % of the first line's compile at 21:10 after ~35 min, slower than r367's 22 min).  A push is not proof, so
+`scripts/build-containers.sh --verify-only` must read every tag resolving to this release before r368 is called
+finished (the #364 lesson).  Nothing was built on this box.
+
 ## 261126.008 (r368) -- issue #374: Q5_K gets the dense VDR-4 mmvq dot product Q4_K already had (blocks 07/08/10), and RDNA3_0's Q6_K prefill band turns out to be block 06's already
 
 **The report.**  `@mjohanning99` profiled two RDNA3 (gfx1100) gaps from a 7900 GRE in a `-sm tensor` split: (1)
