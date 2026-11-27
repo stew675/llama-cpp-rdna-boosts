@@ -25,7 +25,7 @@ detail is in `WORKLOG.md` (today's entries) and `archive/worklog/`.**
 | build | `~/llama.cpp/build-rocm` built from that tip (`llama-server`, `llama-cli`, `llama-perplexity`) |
 | the change as a patch | [`SQUASHED-campaign-r368.patch`](SQUASHED-campaign-r368.patch) (4113 lines) |
 | the 21-commit history | branch `wip/prefill-slot-pingpong-r368`, **history only** — never the review target |
-| delivery repo | `main` = **`6ddc45ce`**, pushed to `github.com:stew675/llama-cpp-rdna-boosts`; **nothing in `patches/` was touched** |
+| delivery repo | `main` = **`6ddc45ce`** plus this handover's own commit, pushed to `github.com:stew675/llama-cpp-rdna-boosts`; **nothing in `patches/` was touched** |
 | delivery | untouched: no block, no `release.json` change, no fork push |
 | box | idle, no `llama-server`, GPUs free |
 

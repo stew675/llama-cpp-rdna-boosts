@@ -1,21 +1,20 @@
 # Flash-Next prefill — why do other engines reach 2900-3500 t/s where we reach 2100-2600?
 
-**Status: OPEN — a measured rewrite in the prototype, nothing in `patches/`; the campaign is **squashed to
-one commit** (`SQUASHED-campaign-r368.patch`) and **code-reviewed** ([`REVIEW-squashed.md`](REVIEW-squashed.md),
-all findings fixed), which is the form it goes to promotion in.  **A new session starts at
-[`HANDOVER-session6.md`](HANDOVER-session6.md)**: purge the tombstones, re-review, run the quick tests, then STOP
-for the maintainer's user-level test — promotion only on their explicit all-clear.**  Otherwise pick it up from
-[`RESULTS-session5.md`](RESULTS-session5.md) (session 5: the `transport_base` cushion, the field verification,
-and the re-base onto **r368** — the campaign chain now sits on the current release) and
-[`HANDOVER-session5.md`](HANDOVER-session5.md) (the ask it answered; §4 of RESULTS-session5 is the promotion
-gate list that is still owed).  The promotion ask is in [`RESULTS-session4.md`](RESULTS-session4.md) §9 plus
-[`RESULTS-session5.md`](RESULTS-session5.md) §4.**  Read [`HANDOVER-session4.md`](HANDOVER-session4.md) first if you
-are picking this up, then [`RESULTS-session4.md`](RESULTS-session4.md) (session 4: the reporting audit, the
-tensor-split repair, and the transport selector that makes the **ping-pong the default at prefill width**:
-1 GPU 2108 → 2445 t/s, +16 %).  The narrative below (§1-§8) is the *scoping* record of session 1 and is kept for
-the competitor teardown and the hypothesis register; sessions 2-5 superseded its conclusions (see
-[`RESULTS-session2.md`](RESULTS-session2.md), [`RESULTS-session3.md`](RESULTS-session3.md) and
-[`RESULTS-session4.md`](RESULTS-session4.md)).
+**Status: OPEN — a measured rewrite in the prototype; nothing in `patches/`, no `release.json` change, no fork
+push.**  The campaign is **squashed to one commit** (`SQUASHED-campaign-r368.patch`) and **code-reviewed**
+([`REVIEW-squashed.md`](REVIEW-squashed.md), all findings fixed), which is the form it goes to promotion in.
+
+**A new session starts at [`HANDOVER-session6.md`](HANDOVER-session6.md)**, in this order: purge the tombstones
+(no dead-code remnants in the source, `ENVIRONMENT.md` or `DIAGNOSTIC.md`), a fresh code review, the quick tests,
+then **STOP** for the maintainer's user-level test — promotion (which begins with the block decision) only on
+their explicit all-clear.
+
+The history behind it: [`RESULTS-session5.md`](RESULTS-session5.md) (the `transport_base` cushion, the buffer
+count from the arena's residency, and the re-base onto **r368**), [`RESULTS-session4.md`](RESULTS-session4.md)
+(the reporting audit, the `-sm tensor` repair, and the transport selector that makes the staged pipeline the
+default at prefill width: 1 GPU 2108 → 2445 t/s, +16 %), and [`RESULTS-session3.md`](RESULTS-session3.md) /
+[`RESULTS-session2.md`](RESULTS-session2.md) before them.  §1-§8 below are the *scoping* record of session 1
+(the competitor teardown and the hypothesis register); later sessions superseded its conclusions.
 
 The question the campaign started from is not "can we win a few percent"; it is *what about our prefill
 architecture caps us ~35 % below engines that stream the same 40 GiB expert set over a slower link than ours*.
