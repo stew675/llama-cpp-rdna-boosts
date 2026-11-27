@@ -16,6 +16,37 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.021 (r370) -- the credit re-cut: 25 contributions that shipped without a trailer now carry theirs, all 19 block trees byte-identical, and `check-credit.sh --strict` is a release gate
+
+The policy landed at r369 (`CONTRIBUTORS.md`, the AGENTS.md section, `scripts/check-credit.sh`) and it immediately
+showed the debt: **25 of 31 rows** were credited in the register and in the block note but **not in the patch**, so a
+consumer applying `patches/` still saw one name per block.  This release pays it, and it pays it the only way that
+leaves the code alone:
+
+* **Message-only re-cut.**  `git filter-branch --msg-filter` over the canonical chain appended each block's trailers
+  from a table built out of `CONTRIBUTORS.md`: `Co-authored-by:` for code (`briansp2020`, `jstamagal`,
+  `RikshaDriver`, `d32768`, `slavap`, `overdoingism`), `Reported-by:` for a diagnosis (`DanoPTT`,
+  `hermeticvm`, `plchldr`, `xxyygt`, `tazmaniax`, `a-n-t-0`, `mjohanning99`) and `Suggested-by:` where the shipped
+  form is not the contributor's own diff (`Nyshone`).  The two optional artifacts got theirs too (`slavap` on `0100`,
+  `mjohanning99` on `0101`).
+  **The proof that nothing else moved:** the per-block tree lists of the r369 and r370 chains `diff` **empty** --
+  all 19 trees are identical, and both optional artifacts produce the same trees they did (`659b380dd`,
+  `ea45996e4`, cumulative `83b34247b`).  Only the patch sha256s and `.tip` changed, and the fresh re-cut from the new
+  patches reproduces **tip `4f9c32626` / tree `3518351ef`** exactly.
+* **The register now reads what the patches carry**: 1 `author` (block `0017`, `@overdoingism`), 24 `co-author`,
+  7 `reported`, 1 `suggested`, **0 `none`**.  Two rows were corrected while paying it (`#269` lands in `0009/0011/
+  0012/0014`; `issue #272` drove block `0002`'s `spec_draft_align_cache()`, not `0015`/`0012`; a report row names the
+  ONE block it drove, not every block in its neighbourhood).
+* **`scripts/check-credit.sh --strict` is now part of `validate-set.sh`**, so a contribution that lands without its
+  trailer fails the delivery validation.  The check itself grew a second direction while paying this (`Co-authored-by:`
+  → register row), which is how block `0013`'s three pre-existing co-authors (`Simon Teixidor`, `Laurent Zuijdwijk`,
+  `Martino B`) were found missing from the register and added.
+* `TODO` #392 is closed by this entry; `beta/prefill-decode-arms` remains the only unrebased artifact (`TODO` #391,
+  the maintainer's decision to accept it broken).
+
+No code, no gate, no tree changed: `validate-set.sh` is green (19 default patches, both optional strict, file-set
+reconciliation 0 unexplained, the credit check strict and clean).
+
 ## 261127.020 (r369) -- CORRECTION: the f16 MTP "regression" was box phase -- an A B B A of the two f16 arms reads the candidate within +-0.33 %, and the BASE arm's own drift is 1.02 %
 
 The four-axis protocol's single pass (261127.018) read the candidate **-2.4 % / -4.2 % / -6.5 %** on the f16 arms

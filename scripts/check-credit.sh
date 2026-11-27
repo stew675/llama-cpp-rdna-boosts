@@ -116,6 +116,22 @@ while IFS='|' read -r _ c_who c_what c_where c_ev c_credit _; do
     esac
 done < <(grep -E '^\| *\[?@' "$REG" || true)
 
+# ---------------------------------------------------------------- 2b. trailers -> rows
+# The other direction: a `Co-authored-by:` in a shipped patch must have a register row, or the register would be
+# missing exactly the people who already had credit (block 0013's three, for example, predate the register).
+for p in "$REPO_DIR"/patches/*.patch "$REPO_DIR"/optional/*/01[0-9][0-9]-*.patch; do
+    [ -f "$p" ] || continue
+    while IFS= read -r trailer; do
+        who=$(printf '%s' "$trailer" | sed -e 's/^Co-authored-by: //' -e 's/ <.*$//')
+        [ -n "$who" ] || continue
+        checked=$((checked + 1))
+        if ! grep -qiF -- "$who" <(grep -oE '^\| \[[^]]+\]|^\| [A-Z][^|]{2,}' "$REG" | sed 's/^| //;s/^\[//;s/\].*//') &&
+           ! grep -qiF -- "$who" "$REG"; then
+            bad "$(basename "$p") credits \"$who\" with Co-authored-by: but CONTRIBUTORS.md has no row for them"
+        fi
+    done < <(grep -E '^Co-authored-by: ' "$p" || true)
+done
+
 # ---------------------------------------------------------------- 3. verdict
 note "check-credit: $checked handle(s) in patches/README.md covered, $row_no row(s) examined, $debt debt row(s)"
 if [ "$STRICT" -eq 1 ] && [ "$debt" -gt 0 ]; then

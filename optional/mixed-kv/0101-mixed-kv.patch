@@ -1,9 +1,10 @@
-From 971f417e9a799667c90123481d91d5f9927e0ed1 Mon Sep 17 00:00:00 2001
+From a7b110a9ab12944f381dcfb256d8b4fa8e63d965 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 21 Nov 2026 18:16:14 -0600
 Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types (optional: NOT
  in the default apply)
 
+Co-authored-by: mjohanning99 <3389797+mjohanning99@users.noreply.github.com>
 ---
  ggml/src/ggml-cuda/fattn-rdna.cuh             | 34 +++++++-
  ggml/src/ggml-cuda/fattn-tile.cu              | 24 ++++++
@@ -487,10 +488,10 @@ index 64dcacf05..7b4bf9077 100755
      for type_v in TYPES_KV:
          with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 65ad2af70..8ed81061b 100644
+index ccc050969..4298d3d1d 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -6667,9 +6667,28 @@ llama_context * llama_init_from_model(
+@@ -6676,9 +6676,28 @@ llama_context * llama_init_from_model(
      // split/flash-attention one - assumes type_k == type_v, so a mixed configuration is rejected
      // rather than accepted as a slow-but-valid one.  Both types default to f16, so only an explicit
      // --cache-type-k (or --cache-type-v) can trigger this.

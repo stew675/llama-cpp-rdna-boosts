@@ -274,11 +274,11 @@ bash "$REPO_DIR/scripts/check-windows-portability.sh" --root "$src" --diff-from 
   || fail "Windows portability scan failed (see above)"
 
 # Credit (AGENTS.md, "Credit for external contributions"): every handle a block note names must be registered in
-# CONTRIBUTORS.md, and every claimed credit form must really be in that block's patch.  Non-strict: the rows whose
-# credit is still `none`/`reported` are the recorded debt (TODO #392 pays it at the next message re-cut), and a
-# release must not go red for a trailer it never carried.
+# CONTRIBUTORS.md, and every claimed credit form must really be in that block's patch.  STRICT since r370, when the
+# message-only re-cut paid the accumulated trailer debt (all 19 block trees unchanged): a contribution that lands
+# without its trailer now fails the delivery validation, which is the point of the policy.
 echo "==> checking the credit register against the shipped patches"
-bash "$REPO_DIR/scripts/check-credit.sh" \
+bash "$REPO_DIR/scripts/check-credit.sh" --strict \
   || fail "credit check failed (see above): AGENTS.md, Credit for external contributions / CONTRIBUTORS.md"
 
 # 9. The re-base file-set reconciliation (TODO #358, INVARIANTS r331).  This is the only check that can
