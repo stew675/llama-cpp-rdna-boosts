@@ -16,6 +16,22 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261126.007 (r367) -- the container images verified 23/23 by the worker; the release is finished
+
+The `radiance` worker picked the tag up on its next poll, ran that tag's own `scripts/build-containers.sh --push
+--prune` off-host for both ROCm lines, and then `scripts/build-containers.sh --verify-only` read **all 23 tags
+resolve and every moving tag carries this release**: the 10.2 line at `server`/`rocm`/`latest`
+`sha256:6f8b3c4105a1`, `light` `1154f239a028`, `full` `80222bd7b1c4`; the 7.14.1 line at `server`/`rocm`
+`ebe010efc828`, `light` `ef8289354a24`, `full` `c021bca8cf81`.  That is the check issue #364 exists for (r354-r358
+published nothing and only the worker's log knew), and it is the step that turns 261126.006's OWED line into a
+verified one.  Nothing was built on this box.
+
+**Release state.**  `v18-919794500-r367` (tag on `main`), fork `rdna-boosts` at
+`83b254bea899bddf1424beef82f623a85b9d8ad2` (verified on the ref), tier-1 CI green on `main` and on the tag, the
+GitHub Release carrying its four assets (`SHA256SUMS`, `patches.tar.gz`, `rdna-boosts-all.patch`,
+`release.json`), and both reporter issues (#371, #373) answered and closed.  The work is recorded in 261126.004,
+261126.005 and 261126.006.
+
 ## 261126.006 (r367, release cut) -- tagged, main and the fork pushed, the release assets published; the container images are OWED to the worker
 
 **The cut.**  `v18-919794500-r367` (annotated tag) = fork re-cut tip
