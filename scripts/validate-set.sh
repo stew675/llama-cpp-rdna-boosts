@@ -273,6 +273,14 @@ echo "==> scanning the files the delivery adds for Windows-hostile POSIX calls"
 bash "$REPO_DIR/scripts/check-windows-portability.sh" --root "$src" --diff-from "HEAD~$n_default" \
   || fail "Windows portability scan failed (see above)"
 
+# Credit (AGENTS.md, "Credit for external contributions"): every handle a block note names must be registered in
+# CONTRIBUTORS.md, and every claimed credit form must really be in that block's patch.  Non-strict: the rows whose
+# credit is still `none`/`reported` are the recorded debt (TODO #392 pays it at the next message re-cut), and a
+# release must not go red for a trailer it never carried.
+echo "==> checking the credit register against the shipped patches"
+bash "$REPO_DIR/scripts/check-credit.sh" \
+  || fail "credit check failed (see above): AGENTS.md, Credit for external contributions / CONTRIBUTORS.md"
+
 # 9. The re-base file-set reconciliation (TODO #358, INVARIANTS r331).  This is the only check that can
 # see a block that landed FEWER FILES than the patch it replaces -- a missing file's hunks inside other
 # files compile fine, so neither this script's apply nor any build notices.  It compares the delivery's
