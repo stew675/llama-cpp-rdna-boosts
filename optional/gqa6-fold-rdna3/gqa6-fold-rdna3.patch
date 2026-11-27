@@ -1,0 +1,1433 @@
+From efc78d4384e14f6711f065eb7f904f8a27ef5e15 Mon Sep 17 00:00:00 2001
+From: Yuriy Kapoyko <yury.kapoyko@gmail.com>
+Date: Fri, 27 Nov 2026 14:09:29 +0300
+Subject: [PATCH] ggml cuda: isolate optional padded GQA-6 tile fold
+
+Place the six real query heads of the supported GQA-6/head-256/native-Q8_0
+geometry in one padded eight-column tile block (ncols1 1, ncols2 8), reducing
+three logical KV traversals per query row to one. Padded columns receive zero
+Q and are never stored; padding-only warps still join cooperative K/V loads
+and barriers but skip KQ/softmax/VKQ arithmetic.
+
+The fold lives in a dedicated self-contained kernel TU
+(fattn-tile-gqa6-fold.cuh + one generated instance). Ordinary tile
+instantiations carry no fold template parameter and compile to baseline
+device code byte-identically; shared changes are host-only (force_split
+plumbing compiled out via if constexpr, dispatch + census). This removes the
+ordinary-kernel codegen perturbation that exposed intermittent gfx1102
+BF16/D=96 corruption, and the template-parameter conflict with optional 0101.
+
+Optional and default OFF: GGML_HIP_FA_TILE_GQA6_FOLD=1 opts in (read once per
+process), gated to GGML_CUDA_CC_IS_RDNA3_0. A one-shot INFO census at -lv 4
+proves the folded arm launched. Adds head-256/GQA-6 coverage: inert boundary
+widths 9..16, deep KV 32768, and the derived-mask form.
+
+Assisted-by: Qwen4-Max
+---
+ ggml/src/ggml-cuda/fattn-common.cuh           |   10 +-
+ ggml/src/ggml-cuda/fattn-tile-gqa6-fold.cuh   | 1221 +++++++++++++++++
+ ggml/src/ggml-cuda/fattn-tile.cuh             |   37 +
+ .../fattn-tile-gqa6-fold-dkq256-dv256-q8_0.cu |    7 +
+ .../template-instances/generate_cu_files.py   |   13 +
+ tests/test-backend-ops.cpp                    |   22 +
+ 6 files changed, 1307 insertions(+), 3 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/fattn-tile-gqa6-fold.cuh
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-gqa6-fold-dkq256-dv256-q8_0.cu
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index e6687996b..8643e6e1c 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1783,7 +1783,7 @@ static __global__ void flash_attn_q_to_half2(
+     }
+ }
+ 
+-template <int DV, int ncols1, int ncols2>
++template <int DV, int ncols1, int ncols2, bool force_split = false>
+ void launch_fattn(
+     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
+     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
+@@ -1792,7 +1792,9 @@ void launch_fattn(
+     // wip/fa-stage-chunking (TODO #114): the driven kernel supports the per-row PARTIAL contract, so
+     // GGML_CUDA_FA_STAGE_CHUNK may launch this op one KV chunk at a time.  Only the MMA prefill kernel
+     // passes true (the tile/vec kernels keep their single whole-prefix launch).
+-    const bool can_chunk = false
++    const bool can_chunk = false,
++    // Used only when force_split is true; ordinary launches compile this override out.
++    const int forced_parallel_blocks = 0
+ ) {
+     constexpr int ncols = ncols1 * ncols2;
+ 
+@@ -2450,7 +2452,9 @@ void launch_fattn(
+             const char * e = getenv("GGML_CUDA_FA_SPLIT_CONST");
+             return e == nullptr || atoi(e) != 0;
+         }();
+-        if (decode_verify_band && split_const) {
++        if constexpr (force_split) {
++            parallel_blocks = std::min(forced_parallel_blocks, ntiles_KV);
++        } else if (decode_verify_band && split_const) {
+             // one full wave is the saturation point the search would reach at any depth past it
+             parallel_blocks = std::min(pick_parallel_blocks(blocks_per_wave), ntiles_KV);
+         } else {
+diff --git a/ggml/src/ggml-cuda/fattn-tile-gqa6-fold.cuh b/ggml/src/ggml-cuda/fattn-tile-gqa6-fold.cuh
+new file mode 100644
+index 000000000..06a69027f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/fattn-tile-gqa6-fold.cuh
+@@ -0,0 +1,1221 @@
++#pragma once
++// Isolated padded GQA-6 RDNA3 tile flash-attention fold (optional, default OFF).
++//
++// The ordinary fattn-tile.cuh kernels and launchers are unmodified baseline. This header defines its
++// OWN fold kernel + iter variants + launcher (renamed copies of the validated fold logic), so no shared
++// template parameter or call site is touched and ordinary instantiations stay binary-identical to
++// baseline. Compiled only in the dedicated HIP-only TU fattn-tile-gqa6-fold-dkq256-dv256-q8_0.cu;
++// dispatch is gated by RDNA3 (GGML_CUDA_CC_IS_RDNA3_0) + GGML_HIP_FA_TILE_GQA6_FOLD (default OFF).
++#include "fattn-tile.cuh"
++
++#if defined(GGML_USE_HIP)
++
++// Reproduce the ordinary launcher's split-KV choice for the unfolded reference geometry.
++static inline int ggml_cuda_fattn_tile_gqa6_pick_parallel_blocks(
++        const int max_blocks_per_sm, const int nsm, const int ntiles_dst_eff, const int ntiles_KV) {
++    const int blocks_per_wave = nsm * max_blocks_per_sm;
++    const auto pick_parallel_blocks = [&](const int limit) {
++        int pb = std::min(max_blocks_per_sm, limit);
++        int nwaves_best = 0;
++        int efficiency_percent_best = 0;
++        for (int parallel_blocks_test = pb; parallel_blocks_test <= limit; ++parallel_blocks_test) {
++            const int nblocks_total = ntiles_dst_eff * parallel_blocks_test;
++            const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
++            const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
++            if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
++                break;
++            }
++            if (efficiency_percent > efficiency_percent_best) {
++                nwaves_best = nwaves;
++                efficiency_percent_best = efficiency_percent;
++                pb = parallel_blocks_test;
++            }
++        }
++        return pb;
++    };
++    static const bool split_const = [] {
++        const char * e = getenv("GGML_CUDA_FA_SPLIT_CONST");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    const int limit = split_const ? blocks_per_wave : ntiles_KV;
++    return std::min(pick_parallel_blocks(limit), ntiles_KV);
++}
++
++// Function that performs a single iteration in for the KQ matrix multiplication:
++template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
++    bool use_logit_softcap, bool oob_check, ggml_type type_KV, bool fold_gqa6, typename T_Q, typename T_KV, typename T_KV_tmp>
++static __device__ __forceinline__ void flash_attn_tile_gqa6_fold_iter_KQ(
++        const half2 * __restrict__ Qg_base, // Q as half2 in global memory (see launch_fattn), or nullptr
++        const int   * __restrict__ q_row,   // per Q column of this warp: row index into Qg_base
++        T_Q        * const Q_tmp,
++        const T_KV * const __restrict__ K_h2,
++        T_KV_tmp   * const KV_tmp,
++        const int stride_K2,
++        const int k_VKQ_0,
++        const int k_VKQ_sup,
++        const int k_KQ_0,
++        float * KQ_acc,
++        const fattn_kv_native_t kv_q8,
++        const bool warp_valid) {
++    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
++    constexpr int cpy_ne = cpy_nb / 4;
++
++    constexpr int ncols = ncols1*ncols2;
++    constexpr int cpw   = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
++    constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
++
++    // Issue #30 item 2: this must test the same set the native dequant loaders support, i.e. the
++    // kernels' compile-time K/V type, not a hand-written list -- when this tested only q8_0/q4_0,
++    // the q4_1/q5_0/q5_1/iq4_nl instantiations took the F16 branch and read a staging buffer that
++    // need_f16_K == false had left unwritten (NaN in the KQ dot product).
++    if constexpr (ggml_cuda_fattn_native_type_from_kernel<type_KV>() != FATTN_KV_NATIVE_NONE) {
++        // V4: read and dequantize the raw quantized cache rows instead of an F16 staging copy.
++        flash_attn_tile_load_tile_native<type_KV, warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
++            (kv_q8.K + int64_t(k_VKQ_0)*kv_q8.stride_K, KV_tmp, kv_q8.stride_K, k_KQ_0, k_VKQ_sup);
++    } else {
++        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
++            (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
++    }
++    __syncthreads();
++
++    // Padded warps still participate in the cooperative loads and barriers.
++    if constexpr (fold_gqa6) {
++        if (!warp_valid) {
++            if (k_KQ_0 + nbatch_K < DKQ) {
++                __syncthreads();
++            }
++            return;
++        }
++    }
++
++#ifdef FAST_FP16_AVAILABLE
++    // BF16 K/V keeps packed BF16 registers and uses v_dot2_f32_bf16; F16 K/V uses the half2 (FAST) path.
++    constexpr bool use_bf16 = ggml_cuda_fattn_tile_use_bf16<T_KV>();
++    using T_fast = std::conditional_t<use_bf16, nv_bfloat162, half2>;
++    static_assert((nbatch_K/2) % cpy_ne == 0, "bad nbatch_K");
++
++    // Wide kernels read Q from global memory (Qg_base, see launch_fattn). Each Q row is the same for
++    // every lane of a warp, so those loads are served from one cache line per wave instead of going
++    // through the LDS, which the K reads already saturate (RDNA2: removing them measured +30% on the
++    // 512-column kernel). Narrow kernels keep the original loop over Q_tmp: they are bound by
++    // streaming K/V and the extra cached reads cost them more than the LDS reads did.
++    constexpr bool q_global = GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols1*ncols2 >= 64;
++    if constexpr (q_global) {
++        constexpr int nsteps = (nbatch_K/2) / cpy_ne;
++        constexpr int nrows  = nbatch_fa/(np*warp_size);
++#pragma unroll
++        for (int step = 0; step < nsteps; ++step) {
++            const int k_KQ_1 = step*cpy_ne;
++            __align__(16) half2 K_k[nrows][cpy_ne];
++            __align__(16) half2 Q_k[cpw][cpy_ne];
++#pragma unroll
++            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
++                const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
++                ggml_cuda_memcpy_1<cpy_nb>(&K_k[i_KQ_0/(np*warp_size)], &KV_tmp[i_KQ*(nbatch_K/2 + cpy_ne) + k_KQ_1]);
++            }
++#pragma unroll
++            for (int jc0 = 0; jc0 < cpw; ++jc0) {
++                ggml_cuda_memcpy_1<cpy_nb>(&Q_k[jc0], &Qg_base[(int64_t) q_row[jc0]*(DKQ/2) + k_KQ_0/2 + k_KQ_1]);
++            }
++#pragma unroll
++            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
++#pragma unroll
++                for (int jc0 = 0; jc0 < cpw; ++jc0) {
++#pragma unroll
++                    for (int k = 0; k < cpy_ne; ++k) {
++                        ggml_cuda_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
++                    }
++                }
++            }
++        }
++    } else {
++#pragma unroll
++        for (int k_KQ_1 = 0; k_KQ_1 < nbatch_K/2; k_KQ_1 += cpy_ne) {
++            __align__(16) T_fast K_k[nbatch_fa/(np*warp_size)][cpy_ne];
++            __align__(16) T_fast Q_k[cpw][cpy_ne];
++#pragma unroll
++            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
++                const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
++                ggml_cuda_memcpy_1<cpy_nb>(&K_k[i_KQ_0/(np*warp_size)], &KV_tmp[i_KQ*(nbatch_K/2 + cpy_ne) + k_KQ_1]);
++            }
++#pragma unroll
++            for (int jc0 = 0; jc0 < cpw; ++jc0) {
++                const int jc = jc0 + (threadIdx.y / np)*cpw;
++                ggml_cuda_memcpy_1<cpy_nb>(&Q_k[jc0], &Q_tmp[jc*(DKQ/2) + k_KQ_0/2 + k_KQ_1]);
++            }
++#pragma unroll
++            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
++#pragma unroll
++                for (int jc0 = 0; jc0 < cpw; ++jc0) {
++#pragma unroll
++                    for (int k = 0; k < cpy_ne; ++k) {
++                        ggml_cuda_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
++                    }
++                }
++            }
++        }
++    }
++#else
++    static_assert(nbatch_K % cpy_ne == 0, "bad nbatch_K");
++#pragma unroll
++    for (int k_KQ_1 = 0; k_KQ_1 < nbatch_K; k_KQ_1 += cpy_ne) {
++        __align__(16) float K_k[nbatch_fa/(np*warp_size)][cpy_ne];
++        __align__(16) float Q_k[cpw][cpy_ne];
++
++#pragma unroll
++        for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
++            const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
++
++            ggml_cuda_memcpy_1<cpy_nb>(&K_k[i_KQ_0/(np*warp_size)], &KV_tmp[i_KQ*(nbatch_K   + cpy_ne) + k_KQ_1]);
++        }
++#pragma unroll
++        for (int jc0 = 0; jc0 < cpw; ++jc0) {
++            const int jc = jc0 + (threadIdx.y / np)*cpw;
++
++            ggml_cuda_memcpy_1<cpy_nb>(&Q_k[jc0], &Q_tmp[jc* DKQ    + k_KQ_0   + k_KQ_1]);
++        }
++
++#pragma unroll
++        for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
++#pragma unroll
++            for (int jc0 = 0; jc0 < cpw; ++jc0) {
++#pragma unroll
++                for (int k = 0; k < cpy_ne; ++k) {
++                    ggml_cuda_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
++                }
++            }
++        }
++    }
++#endif // FAST_FP16_AVAILABLE
++
++    if (k_KQ_0 + nbatch_K < DKQ) {
++        __syncthreads(); // Sync not needed on last iteration.
++    }
++}
++
++// Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
++template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
++    bool use_logit_softcap, bool oob_check, ggml_type type_KV, bool fold_gqa6, typename T_Q, typename T_KV, typename T_KQ, typename T_acc, typename T_KV_tmp>
++static __device__ __forceinline__ void flash_attn_tile_gqa6_fold_iter(
++        const half2 * __restrict__ Qg_base,
++        const int   * __restrict__ q_row,
++        T_Q       * const Q_tmp,
++        const T_KV * const __restrict__ K_h2,
++        const T_KV * const __restrict__ V_h2,
++        const half  * const __restrict__ mask,
++        const uint3 ne01,
++        const float logit_softcap,
++        const float slope,
++        T_KQ      * const KQ,
++        T_KV_tmp  * const KV_tmp,
++        const int stride_K2,
++        const int stride_V2,
++        const int stride_mask,
++        const kq_derived_t derived,
++        float * const KQ_max,
++        float * const KQ_sum,
++        T_acc * const VKQ,
++        const int k_VKQ_0,
++        const int k_VKQ_max,
++        const int col_Q_0,
++        const fattn_kv_native_t kv_q8,
++        const bool warp_valid) {
++    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
++    constexpr int cpy_ne = cpy_nb / 4;
++
++    constexpr int ncols      = ncols1*ncols2;
++    constexpr int ncols2_eff = fold_gqa6 ? 6 : ncols2;
++    constexpr int cpw        = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
++    constexpr int np         = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
++
++    constexpr int DVp = (DV + 2*warp_size - 1) & ~(2*warp_size - 1); // DV padded to multiple of 2*warp_size.
++
++    // KQ_cs == KQ chunk size, number of KQ values in j direction to store as one contiguous chunk in memory.
++    // KQ is originally 2D but uses a Z-shaped 3D memory pattern like KQ[ncols/KQ_cs][DVp][KQ_cs].
++#ifdef FAST_FP16_AVAILABLE
++    // BF16 K/V keeps packed BF16 registers and uses v_dot2_f32_bf16; F16 K/V uses the half2 (FAST) path.
++    constexpr bool use_bf16 = ggml_cuda_fattn_tile_use_bf16<T_KV>();
++    // The packed BF16 PV reads the P pair (two rows) as two 16-byte chunks, so KQ_cs matches the F16 kernel.
++    constexpr int KQ_cs = cpw < 2*cpy_ne ? cpw : 2*cpy_ne;
++#else
++    constexpr bool use_bf16 = false;
++    constexpr int KQ_cs = cpw < 1*cpy_ne ? cpw : 1*cpy_ne;
++#endif // FAST_FP16_AVAILABLE
++    static_assert(cpw % KQ_cs == 0, "bad KQ_cs");
++    const int k_VKQ_sup = k_VKQ_max - k_VKQ_0; // k supremum, only smaller k values have valid KV data
++
++    float KQ_max_new[cpw];
++#pragma unroll
++    for (int jc0 = 0; jc0 < cpw; ++jc0) {
++        KQ_max_new[jc0] = KQ_max[jc0];
++    }
++
++    // Match the unfolded kernel's F16 rounding order: round V*P first, then compute
++    // old_VKQ*scale + product with one FMA for the first two accumulator chunks.
++    constexpr bool fold_defer_rescale = fold_gqa6 && std::is_same_v<T_acc, half2>;
++    static_assert(!fold_gqa6 || cpw == 1, "bad folded GQA-6 columns per warp");
++    static_assert(!fold_defer_rescale || (DVp/2)/warp_size >= 2, "bad folded GQA-6 accumulator count");
++    [[maybe_unused]] float fold_KQ_max_scale = 1.0f;
++
++    float KQ_acc[nbatch_fa/(np*warp_size) * cpw] = {0.0f}; // Accumulators for KQ matrix multiplication.
++
++    // KQ = K @ Q matrix multiplication:
++    constexpr int nbatch_K_last = DKQ % nbatch_K;
++#pragma unroll
++    for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
++        flash_attn_tile_gqa6_fold_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV, fold_gqa6>(
++            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, kv_q8, warp_valid);
++    }
++    if (nbatch_K_last > 0) {
++        constexpr int k_KQ_0 = DKQ - nbatch_K_last;
++        flash_attn_tile_gqa6_fold_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check, type_KV, fold_gqa6>(
++            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, kv_q8, warp_valid);
++    }
++
++    // Apply logit softcap + mask, update KQ_max:
++#pragma unroll
++    for (int jc0 = 0; jc0 < cpw; ++jc0) {
++        if constexpr (fold_gqa6) {
++            if (!warp_valid) {
++                break;
++            }
++        }
++        const int j = fastmodulo(col_Q_0 + (jc0 + (threadIdx.y / np)*cpw)/ncols2_eff, ne01);
++
++        // V3 derived kq mask: cell values are derived instead of read from the packed mask, and the
++        // choice is made ONCE per query row rather than once per cell.  Testing it inside the unrolled
++        // KV loop (the first cut of this) cost ~0.5-0.8 % of tile decode at depth on gfx1201/gfx1100:
++        // the per-iteration test makes the compiler rematerialize `derived` out of the parameter space
++        // instead of keeping it in registers, and this kernel is register-bound by design.  Hoisting
++        // it leaves the packed path's code generation as it was, so decode pays nothing.
++        if (derived.cell_pos != nullptr) {
++            // The query token's visibility window, constant across the i loop below.  An empty or
++            // foreign cell carries the INT32_MIN sentinel, which is below every tok_lo, so it falls
++            // out of the compare and becomes -INFINITY exactly like the packed entry would.  The
++            // slope factor is skipped: the derived form is rejected for ALiBi (kq_mask_derivable()),
++            // so slope == 1 here.
++            const int tok_lo_j = derived.tok_lo[j];
++            const int tok_hi_j = derived.tok_hi[j];
++
++#pragma unroll
++            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
++                const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
++
++#if defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
++                // Without the v_dot2_f32_f16 instruction there is a higher risk of numerical overflow in the KQ calculation.
++                // Therefore, scale down Q values and apply the inverse scale the FP32 KQ values afterwards again.
++                KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0] *= 4.0f;
++#endif // defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
++
++                if (use_logit_softcap) {
++                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = logit_softcap * tanhf(KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0]);
++                }
++
++                if (!oob_check || i_KQ < k_VKQ_sup) {
++                    const int cell_p = derived.cell_pos[k_VKQ_0 + i_KQ];
++
++                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] +=
++                        (cell_p >= tok_lo_j && cell_p <= tok_hi_j) ? 0.0f : -INFINITY;
++
++                    KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] + FATTN_KQ_MAX_OFFSET);
++                }
++            }
++        } else {
++#pragma unroll
++            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
++                const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
++
++#if defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
++                // Without the v_dot2_f32_f16 instruction there is a higher risk of numerical overflow in the KQ calculation.
++                // Therefore, scale down Q values and apply the inverse scale the FP32 KQ values afterwards again.
++                KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0] *= 4.0f;
++#endif // defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
++
++                if (use_logit_softcap) {
++                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = logit_softcap * tanhf(KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0]);
++                }
++
++                if (!oob_check || i_KQ < k_VKQ_sup) {
++                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
++                        slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
++
++                    KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] + FATTN_KQ_MAX_OFFSET);
++                }
++            }
++        }
++
++        KQ_max_new[jc0] = warp_reduce_max<warp_size>(KQ_max_new[jc0]);
++    }
++
++    if constexpr (np == 1) {
++        __syncthreads();
++    } else {
++        static_assert(cpw == 1, "bad cpw");
++        __shared__ float KQ_max_new_shared[nwarps];
++        if (threadIdx.x == 0) {
++            KQ_max_new_shared[threadIdx.y] = KQ_max_new[0];
++        }
++        __syncthreads();
++        KQ_max_new[0] = KQ_max_new_shared[(threadIdx.y & ~(np-1)) + threadIdx.x % np];
++        KQ_max_new[0] = warp_reduce_max<np>(KQ_max_new[0]);
++    }
++
++    // Calculate KQ softmax, write to shared KQ buffer, re-scale VKQ accumulators:
++#pragma unroll
++    for (int jc0 = 0; jc0 < cpw; jc0 += KQ_cs) {
++        if constexpr (fold_gqa6) {
++            if (!warp_valid) {
++                break;
++            }
++        }
++#ifdef FAST_FP16_AVAILABLE
++        using T_KQ_tmp = std::conditional_t<use_bf16, float, half>;
++#else
++        using T_KQ_tmp = float;
++#endif // FAST_FP16_AVAILABLE
++        __align__(16) T_KQ_tmp tmp[nbatch_fa/(np*warp_size)][KQ_cs];
++
++#pragma unroll
++        for (int jc1 = 0; jc1 < KQ_cs; ++jc1) {
++            const int jc = jc0 + jc1;
++
++            const float KQ_max_scale = expf(KQ_max[jc] - KQ_max_new[jc]);
++            KQ_max[jc] = KQ_max_new[jc];
++            if constexpr (fold_defer_rescale) {
++                fold_KQ_max_scale = KQ_max_scale;
++            }
++
++            float KQ_sum_add = 0.0f;
++#pragma unroll
++            for (int i0 = 0; i0 < nbatch_fa; i0 += np*warp_size) {
++                const float val = !oob_check || i0 + (threadIdx.y % np)*warp_size + threadIdx.x < static_cast<uint32_t>(k_VKQ_sup) ?
++                    expf(KQ_acc[(i0/(np*warp_size))*cpw + jc] - KQ_max[jc]) : 0.0f;
++                KQ_sum_add += val;
++                tmp[i0/(np*warp_size)][jc1] = val;
++            }
++            KQ_sum[jc] = KQ_sum[jc]*KQ_max_scale + KQ_sum_add;
++
++            if constexpr (fold_defer_rescale) {
++                flash_attn_tile_rescale_VKQ(&VKQ[jc*((DVp/2)/warp_size) + 2], KQ_max_scale, (DVp/2)/warp_size - 2);
++            } else {
++                flash_attn_tile_rescale_VKQ(&VKQ[jc*((DVp/2)/warp_size)], KQ_max_scale, (DVp/2)/warp_size);
++            }
++        }
++
++#pragma unroll
++        for (int i0 = 0; i0 < nbatch_fa; i0 += np*warp_size) {
++            const int i = i0 + (threadIdx.y % np)*warp_size + threadIdx.x;
++
++            if constexpr (use_bf16) {
++                __align__(16) nv_bfloat16 tmp_bf[KQ_cs];
++#pragma unroll
++                for (int j = 0; j < KQ_cs; ++j) {
++                    tmp_bf[j] = __float2bfloat16(tmp[i0/(np*warp_size)][j]);
++                }
++                ggml_cuda_memcpy_1<KQ_cs*sizeof(nv_bfloat16)>(
++                    KQ + (jc0/KQ_cs + (threadIdx.y / np)*(cpw/KQ_cs))*(nbatch_fa*KQ_cs) + i*KQ_cs,
++                    tmp_bf);
++            } else {
++                ggml_cuda_memcpy_1<sizeof(tmp[0])>(
++                    KQ + (jc0/KQ_cs + (threadIdx.y / np)*(cpw/KQ_cs))*(nbatch_fa*KQ_cs) + i*KQ_cs,
++                    tmp[i0/(np*warp_size)]);
++            }
++        }
++    }
++
++    // VKQ = V @ KQ matrix multiplication:
++    static_assert(DV <= DKQ, "bad DV");
++    static_assert(DV % nbatch_K == 0 || (nbatch_K % 3 == 0 && DV % (nbatch_K*2/3) == 0), "bad nbatch_K");
++    constexpr int nbatch_V = (DV % nbatch_K == 0 ? nbatch_K : nbatch_K*2/3) * nbatch_fa / DV; // Number of V columns that fit in SRAM for K.
++    static_assert(nbatch_fa % nbatch_V == 0, "bad nbatch_V");
++    static_assert(nbatch_V % np == 0, "bad nbatch_V");
++#pragma unroll
++    for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
++        if constexpr (ggml_cuda_fattn_native_type_from_kernel<type_KV>() != FATTN_KV_NATIVE_NONE) {
++            flash_attn_tile_load_tile_native<type_KV, warp_size, nwarps, nbatch_V, DV, 0, oob_check>
++                (kv_q8.V + int64_t(k_VKQ_0 + k0)*kv_q8.stride_V, KV_tmp, kv_q8.stride_V, 0, k_VKQ_sup - k0);
++        } else {
++            flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
++                (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
++        }
++        __syncthreads();
++
++        if constexpr (use_bf16) {
++            // Packed BF16 PV: P rounded to BF16, V rows paired across consecutive KV rows via
++            // v_perm_b32, one v_dot2_f32_bf16 per head pair with FP32 accumulation.
++            // The two-row pairing assumes np == 1; np > 1 would process overlapping row ranges.
++            static_assert(np == 1, "bad np for packed bf16 PV");
++            static_assert(nbatch_V % 2 == 0, "bad nbatch_V for packed bf16 PV");
++#pragma unroll
++            for (int k1 = 0; k1 < nbatch_V; k1 += 2) {
++                if constexpr (fold_gqa6) {
++                    if (!warp_valid) {
++                        break;
++                    }
++                }
++                __align__(16) nv_bfloat162 V_k0[(DVp/2)/warp_size];
++                __align__(16) nv_bfloat162 V_k1[(DVp/2)/warp_size];
++                __align__(16) nv_bfloat162 KQ_k[cpw];
++
++                constexpr int cpy_ne_D = cpy_ne/2 < (DVp/2)/warp_size ? cpy_ne/2 : (DVp/2)/warp_size;
++#pragma unroll
++                for (int i0 = 0; i0 < DVp/2; i0 += warp_size*cpy_ne_D) {
++                    ggml_cuda_memcpy_1<cpy_ne_D*4>(
++                        &V_k0[i0/warp_size], &KV_tmp[(k1 + threadIdx.y % np)*(DV/2) + i0 + threadIdx.x*cpy_ne_D]);
++                    ggml_cuda_memcpy_1<cpy_ne_D*4>(
++                        &V_k1[i0/warp_size], &KV_tmp[(k1 + 1 + threadIdx.y % np)*(DV/2) + i0 + threadIdx.x*cpy_ne_D]);
++                }
++#pragma unroll
++                for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; jc_VKQ_0 += KQ_cs) {
++                    const int jc_KQ = jc_VKQ_0/KQ_cs + (threadIdx.y / np)*(cpw/KQ_cs);
++
++                    __align__(16) nv_bfloat16 tmp0[KQ_cs];
++                    __align__(16) nv_bfloat16 tmp1[KQ_cs];
++                    ggml_cuda_memcpy_1<KQ_cs*sizeof(nv_bfloat16)>(
++                        &tmp0[0], KQ + jc_KQ*(nbatch_fa*KQ_cs) + (k0 + k1 + threadIdx.y % np)*KQ_cs);
++                    ggml_cuda_memcpy_1<KQ_cs*sizeof(nv_bfloat16)>(
++                        &tmp1[0], KQ + jc_KQ*(nbatch_fa*KQ_cs) + (k0 + k1 + 1 + threadIdx.y % np)*KQ_cs);
++#pragma unroll
++                    for (int jc_VKQ_1 = 0; jc_VKQ_1 < KQ_cs; ++jc_VKQ_1) {
++                        KQ_k[jc_VKQ_0+jc_VKQ_1] = ggml_cuda_cast<nv_bfloat162>(
++                            make_float2(__bfloat162float(tmp0[jc_VKQ_1]), __bfloat162float(tmp1[jc_VKQ_1])));
++                    }
++                }
++
++                // Masked KV rows have P == +0.0 for every query column this warp
++                // accumulates. On gfx11 the packed v_dot2_f32_bf16 PV instruction
++                // accumulates +0.0 x V inexactly, leaking the content of a masked
++                // (e.g. freed) KV cell into VKQ. Zero this warp's own V register
++                // copies for those rows so the products are +0.0 x +0.0; other
++                // warps' columns keep their own (live) V copies.
++                bool row_dead0 = true;
++                bool row_dead1 = true;
++#pragma unroll
++                for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
++                    const nv_bfloat162 p = KQ_k[jc_VKQ_0];
++                    if (__bfloat162float(p.x) != 0.0f) { row_dead0 = false; }
++                    if (__bfloat162float(p.y) != 0.0f) { row_dead1 = false; }
++                }
++                if (row_dead0) {
++#pragma unroll
++                    for (int i0 = 0; i0 < (DVp/2)/warp_size; ++i0) {
++                        V_k0[i0] = ggml_cuda_cast<nv_bfloat162>(make_float2(0.0f, 0.0f));
++                    }
++                }
++                if (row_dead1) {
++#pragma unroll
++                    for (int i0 = 0; i0 < (DVp/2)/warp_size; ++i0) {
++                        V_k1[i0] = ggml_cuda_cast<nv_bfloat162>(make_float2(0.0f, 0.0f));
++                    }
++                }
++
++#pragma unroll
++                for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
++                    const nv_bfloat162 v_perm0 = ggml_cuda_bf16_perm_ll(V_k0[i0/warp_size], V_k1[i0/warp_size]);
++                    const nv_bfloat162 v_perm1 = ggml_cuda_bf16_perm_hh(V_k0[i0/warp_size], V_k1[i0/warp_size]);
++#pragma unroll
++                    for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
++                        ggml_cuda_mad(VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].x, v_perm0, KQ_k[jc_VKQ_0]);
++                        ggml_cuda_mad(VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].y, v_perm1, KQ_k[jc_VKQ_0]);
++                    }
++                }
++            }
++        } else
++#ifdef FAST_FP16_AVAILABLE
++        {
++#pragma unroll
++        for (int k1 = 0; k1 < nbatch_V; k1 += np) {
++            if constexpr (fold_gqa6) {
++                if (!warp_valid) {
++                    break;
++                }
++            }
++            __align__(16) half2 V_k[(DVp/2)/warp_size];
++            __align__(16) half2 KQ_k[cpw];
++
++            constexpr int cpy_ne_D = cpy_ne/2 < (DVp/2)/warp_size ? cpy_ne/2 : (DVp/2)/warp_size;
++#pragma unroll
++            for (int i0 = 0; i0 < DVp/2; i0 += warp_size*cpy_ne_D) {
++                ggml_cuda_memcpy_1<cpy_ne_D*4>(&V_k[i0/warp_size], &KV_tmp[(k1 + threadIdx.y % np)*(DV/2) + i0 + threadIdx.x*cpy_ne_D]);
++            }
++#pragma unroll
++            for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; jc_VKQ_0 += KQ_cs) {
++                const int jc_KQ = jc_VKQ_0/KQ_cs + (threadIdx.y / np)*(cpw/KQ_cs);
++
++                __align__(16) half tmp[KQ_cs];
++                ggml_cuda_memcpy_1<KQ_cs*sizeof(half)>(
++                    &tmp, KQ + jc_KQ*(nbatch_fa*KQ_cs) + (k0 + k1 + threadIdx.y % np)*KQ_cs);
++#pragma unroll
++                for (int jc_VKQ_1 = 0; jc_VKQ_1 < KQ_cs; ++jc_VKQ_1) {
++                    KQ_k[jc_VKQ_0+jc_VKQ_1] = __half2half2(tmp[jc_VKQ_1]);
++                }
++            }
++
++#pragma unroll
++            for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
++#pragma unroll
++                for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
++                    if constexpr (fold_gqa6) {
++                        half2 & VKQ_ij = VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size];
++                        if (k0 == 0 && k1 == 0 && i0/warp_size < 2) {
++                            const half2 scale_h2 = make_half2(fold_KQ_max_scale, fold_KQ_max_scale);
++                            const half2 product = __hmul2(V_k[i0/warp_size], KQ_k[jc_VKQ_0]);
++                            VKQ_ij = __hfma2(VKQ_ij, scale_h2, product);
++                        } else {
++                            VKQ_ij += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
++                        }
++                    } else {
++                        VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size] += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
++                    }
++                }
++            }
++        }
++        }
++#else
++        {
++#pragma unroll
++        for (int k1 = 0; k1 < nbatch_V; k1 += np) {
++            if constexpr (fold_gqa6) {
++                if (!warp_valid) {
++                    break;
++                }
++            }
++            __align__(16) float2 V_k[(DVp/2)/warp_size];
++            __align__(16) float  KQ_k[cpw];
++
++            constexpr int cpy_ne_D = cpy_ne < DVp/warp_size ? cpy_ne : DVp/warp_size;
++#pragma unroll
++            for (int i0 = 0; i0 < DVp; i0 += warp_size*cpy_ne_D) {
++                ggml_cuda_memcpy_1<cpy_ne_D*4>(&V_k[i0/(2*warp_size)], &KV_tmp[(k1 + threadIdx.y % np)*DV + i0 + threadIdx.x*cpy_ne_D]);
++            }
++#pragma unroll
++            for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; jc_VKQ_0 += KQ_cs) {
++                const int jc_KQ = jc_VKQ_0/KQ_cs + (threadIdx.y / np)*(cpw/KQ_cs);
++
++                ggml_cuda_memcpy_1<KQ_cs*sizeof(float)>(
++                    &KQ_k[jc_VKQ_0], KQ + jc_KQ*(nbatch_fa*KQ_cs) + (k0 + k1 + threadIdx.y % np)*KQ_cs);
++            }
++
++#pragma unroll
++            for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
++#pragma unroll
++                for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
++                    VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].x += V_k[i0/warp_size].x*KQ_k[jc_VKQ_0];
++                    VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].y += V_k[i0/warp_size].y*KQ_k[jc_VKQ_0];
++                }
++            }
++        }
++        }
++#endif // FAST_FP16_AVAILABLE
++
++        __syncthreads();
++    }
++}
++
++#ifdef __clang__
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wpass-failed"
++#endif // __clang__
++template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, ggml_type type_KV, bool fold_gqa6 = false> // D == head size
++__launch_bounds__(fold_gqa6 ? 256 : ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2),
++                       ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
++static __global__ void flash_attn_tile_gqa6_fold(
++        const char * Q_ptr,
++        [[maybe_unused]] const char * Q_h2_ptr,
++        const char * K_ptr,
++        const char * V_ptr,
++        const char * mask_ptr,
++        const char * sinks_ptr,
++        const int  * KV_max_ptr,
++        const int  * KV_rows_ptr,
++        const uint32_t * kq_blocks_ptr,
++        float      * dst_ptr,
++        float2     * dst_meta_ptr,
++        const float scale,
++        const float max_bias,
++        const float m0,
++        const float m1,
++        const uint32_t n_head_log2,
++        const float logit_softcap,
++        const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
++                            const int32_t nb01, const int32_t nb02, const int32_t nb03,
++        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
++                            const int32_t nb11, const int32_t nb12, const int64_t nb13,
++                            const int32_t nb21, const int32_t nb22, const int64_t nb23,
++                            const int32_t ne31, const int32_t ne32, const int32_t ne33,
++                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
++                            // V3 derived kq mask (ggml_flash_attn_ext_add_kq_derived): the compact
++                            // per-cell visibility state, read instead of the packed mask when present.
++                            const int * cell_pos_ptr, const int * tok_lo_ptr, const int * tok_hi_ptr,
++                            const int, const int,
++                            // wip/fa-stage-chunking (TODO #114): the per-row partial contract is
++                            // MMA-prefill only; the tile kernel keeps its single whole-prefix launch.
++                            float2 *, const int) {
++#ifdef FLASH_ATTN_AVAILABLE
++    const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
++    const char * GGML_CUDA_RESTRICT K        = K_ptr;
++    const char * GGML_CUDA_RESTRICT V        = V_ptr;
++    const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
++    const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
++    // Fully-masked KV-group bitmap (issue #48): batch-wide on the derived path (mask == nullptr),
++    // per query tile on the packed path.  See launch_fattn.
++    const kq_derived_t derived = { cell_pos_ptr, tok_lo_ptr, tok_hi_ptr };
++    const uint32_t * GGML_CUDA_RESTRICT kq_blocks = kq_blocks_ptr;
++    const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
++    float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
++    float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
++    GGML_UNUSED(KV_rows_ptr);
++
++    // Skip unused kernel variants for faster compilation:
++
++    if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))) {
++        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, kq_blocks, dst, dst_meta, scale,
++            max_bias, m0, m1, n_head_log2, logit_softcap, derived,
++            ne00, ne01, ne02, ne03,
++                  nb01, nb02, nb03,
++            ne10, ne11, ne12, ne13,
++                  nb11, nb12, nb13,
++                  nb21, nb22, nb23,
++                  ne31, ne32, ne33,
++                  nb31, nb32, nb33);
++        NO_DEVICE_CODE;
++        return;
++    }
++
++    static_assert(ggml_cuda_fattn_tile_get_config(DKQ, DV, ncols1*ncols2) != 0, "kernel config not defined");
++
++    static_assert(!fold_gqa6 || (DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 8 && type_KV == GGML_TYPE_Q8_0),
++        "invalid padded GQA-6 tile geometry");
++
++    constexpr int ncols      = ncols1*ncols2;
++    constexpr int ncols2_eff = fold_gqa6 ? 6 : ncols2;
++    constexpr int ncols1_eff = fold_gqa6 ? 1 : ncols1;
++    constexpr int warp_size  = 32;
++    // Eight warps give each of the six real heads its own warp (cpw=1), matching the
++    // unfolded per-head KQ layout. Keep this in sync with __launch_bounds__ and the host launcher.
++    constexpr int nwarps    = (fold_gqa6 ? 256 :
++        ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2)) / warp_size;
++    constexpr int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2);
++    // Match the unfolded ncols2=2 K/V tiling, including nbatch_V=8 and its split-KV reduction geometry.
++    constexpr int nbatch_K  = fold_gqa6 ? 64 : ggml_cuda_fattn_tile_get_nbatch_K(DKQ, DV, ncols1*ncols2);
++
++    // In this kernel Q, K, V are matrices while i, j, k are matrix indices.
++
++    // Native K/V rows for the quantized path (V4 + issue #30 item 2, elided for every other type).  The
++    // tile kernel reads bf16 natively through its own type_KV, so it never needs the bf16 arm here.
++    constexpr int kv_native_self = ggml_cuda_fattn_native_type_from_kernel<type_KV>();
++    constexpr bool kv_is_native  = kv_native_self != FATTN_KV_NATIVE_NONE;
++
++    const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
++
++    int sequence, head0;
++    if constexpr (fold_gqa6) {
++        // The launcher maps one padded eight-column block to each six-head GQA group.
++        sequence = blockIdx.z / ne12;
++        head0    = (blockIdx.z - sequence*ne12)*6;
++    } else {
++        sequence = blockIdx.z / (ne02/ncols2);
++        head0    = blockIdx.z*ncols2 - sequence*ne02; // == blockIdx.z % (ne02/ncols2)
++    }
++
++    const int col_Q_0 = blockIdx.x * ncols1_eff; // Index of the first Q column for this CUDA block to work on.
++    const float * Q_f  = (const float *) (Q + nb03*sequence + nb02* head0);
++    using T_KV = std::conditional_t<type_KV == GGML_TYPE_BF16, nv_bfloat162, half2>;
++    const T_KV * K_h2 = (const T_KV *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
++    const T_KV * V_h2 = (const T_KV *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
++    const fattn_kv_native_t kv_q8 = {
++        kv_is_native ? K + nb13*sequence + nb12*(head0 / gqa_ratio) : nullptr,
++        kv_is_native ? V + nb23*sequence + nb22*(head0 / gqa_ratio) : nullptr,
++        nb11, nb21,
++        kv_native_self,
++        kv_native_self,
++    };
++
++    const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33) + nb32*(head0 % ne32)) : nullptr;
++
++    const int stride_K2   = nb11 / sizeof(half2);
++    const int stride_V2   = nb21 / sizeof(half2);
++    const int stride_mask = nb31 / sizeof(half);
++
++    const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, head0, n_head_log2, m0, m1) : 1.0f;
++
++    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
++    constexpr int cpy_ne = cpy_nb / 4;
++
++    constexpr int cpw = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp.
++    constexpr int np  = nwarps > ncols ? nwarps/ncols : 1; // Number of parallel warps per Q column.
++    static_assert(cpw == 1 || np == 1, "bad cpw / np");
++    static_assert(!fold_gqa6 || (nwarps == 8 && cpw == 1), "bad folded GQA-6 geometry");
++    static_assert(nbatch_fa % (np*warp_size) == 0, "nbatch_fa % (np*warp_size) != 0");
++
++    constexpr int DKQp = (DKQ + 2*warp_size - 1) & ~(2*warp_size - 1); // DKQ padded to multiple of 2*warp_size.
++    constexpr int DVp  = (DV  + 2*warp_size - 1) & ~(2*warp_size - 1); // DV  padded to multiple of 2*warp_size.
++
++    // Q_tmp == SRAM buffer to hold Q data for the entire lifetime of the kernel.
++    // KV_tmp == SRAM buffer to hold fragments of K/V data while iterating over ne11.
++    //     KV_tmp is padded to avoid memory conflicts for K (cpy_ne) and OOB accesses for V (DVp-DV).
++    // KQ == SRAM buffer to hold KQ fragments between KQ and VKQ matrix multiplications.
++    // VKQ == Accumulators in registers for the final VKQ result.
++#ifdef FAST_FP16_AVAILABLE
++    // Native BF16 tiles with FP32 math need v_dot2_f32_bf16 (RDNA3+, device pass only).
++    constexpr bool use_bf16 = ggml_cuda_fattn_tile_use_bf16<T_KV>();
++    // Wide kernels with Q from global (q_global) leave Q_tmp unused: keep a 2-element stub so the
++    // LDS that K/V/KQ need is not taken by Q (RDNA2 has 64 KB LDS per WGP).
++    constexpr int Q_tmp_count   = (GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 64) ? 2 : ncols*DKQ/2;
++    constexpr int KV_tmp_stride = nbatch_K/2 + cpy_ne;
++    constexpr int KV_tmp_count  = nbatch_fa*KV_tmp_stride + DVp-DV;
++    constexpr int KQ_count      = ncols*nbatch_fa;
++    constexpr int VKQ_count     = cpw * ((DVp/2)/warp_size);
++    using T_Q   = std::conditional_t<use_bf16, nv_bfloat162, half2>;
++    using T_KVt = T_Q;
++    using T_KQ  = std::conditional_t<use_bf16, nv_bfloat16, half>;
++    using T_acc = std::conditional_t<use_bf16, float2, half2>;
++#else
++    constexpr bool use_bf16 = false;
++    constexpr int Q_tmp_count   = ncols*DKQ;
++    constexpr int KV_tmp_stride = nbatch_K + cpy_ne;
++    constexpr int KV_tmp_count  = nbatch_fa*KV_tmp_stride + DVp-DV;
++    constexpr int KQ_count      = ncols*nbatch_fa;
++    constexpr int VKQ_count     = cpw * (DVp/warp_size);
++    using T_Q   = float;
++    using T_KVt = float;
++    using T_KQ  = float;
++    using T_acc = float2;
++#endif // FAST_FP16_AVAILABLE
++
++    __shared__ T_Q   Q_tmp[Q_tmp_count];
++    __shared__ T_KVt KV_tmp[KV_tmp_count];
++    __shared__ T_KQ  KQ[KQ_count];
++    __align__(16) T_acc VKQ[VKQ_count] = {{0.0f, 0.0f}};
++
++    float KQ_max[cpw];
++#pragma unroll
++    for (int j0 = 0; j0 < ncols; j0 += nwarps) {
++        KQ_max[j0/nwarps] = -FLT_MAX/2.0f;
++    }
++    float KQ_sum[cpw] = {0.0f};
++
++    ggml_cuda_pdl_sync();
++
++    // The folded geometry has one query row and six valid heads; columns 6 and 7 are padding.
++    auto col_valid = [&] __device__ (const int jc) -> bool {
++        if constexpr (fold_gqa6) {
++            return jc < 6;
++        } else {
++            return true;
++        }
++    };
++    const int jc_warp_0 = (threadIdx.y / np) * cpw;
++    const bool warp_valid = !fold_gqa6 || jc_warp_0 < 6;
++
++#ifdef FAST_FP16_AVAILABLE
++    // Q comes pre-converted from Q_h2 (see launch_fattn) for the wide kernels, where the reads amortize
++    // over many columns and the LDS traffic they replace is the limiter. The narrow decode kernels are
++    // bound by streaming K/V and the extra cached reads cost them more than the LDS reads did.
++    constexpr bool q_global = GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 64;
++#else
++    constexpr bool q_global = false;
++#endif // FAST_FP16_AVAILABLE
++    const half2 * Qg_base = nullptr;
++    [[maybe_unused]] int q_row[cpw];
++    if constexpr (q_global) {
++        Qg_base = (const half2 *) Q_h2_ptr + ((int64_t) sequence*ne02 + head0)*ne01.z*(DKQ/2);
++#pragma unroll
++        for (int jc0 = 0; jc0 < cpw; ++jc0) {
++            const int jc  = jc0 + (threadIdx.y / np)*cpw;
++            const int row = !col_valid(jc) ? 0 :
++                (jc % ncols2_eff)*ne01.z + (int) fastmodulo(col_Q_0 + jc / ncols2_eff, ne01);
++            // the row is the same for every lane of the warp; make that visible to the compiler so
++            // the loads in the KQ loop are issued once per wave
++#ifdef GGML_USE_HIP
++            q_row[jc0] = __builtin_amdgcn_readfirstlane(row);
++#else
++            q_row[jc0] = ggml_cuda_shfl(row, 0);
++#endif // GGML_USE_HIP
++        }
++    }
++
++    // Load Q data, convert to FP16 if fast:
++    if constexpr (!q_global) {
++    for (int jc0 = 0; jc0 < cpw; ++jc0) {
++        const int jc = jc0 + (threadIdx.y / np)*cpw;
++
++        const int j = jc / ncols2_eff;
++        const int c = jc % ncols2_eff;
++
++        constexpr int cpy_ne_D = cpy_ne < DKQp/warp_size ? cpy_ne : DKQp/warp_size;
++
++#pragma unroll
++        for (int i0 = 0; i0 < DKQp; i0 += np*warp_size*cpy_ne_D) {
++            if (i0 + np*warp_size*cpy_ne_D <= DKQ || i0 + (threadIdx.y % np)*(warp_size*cpy_ne_D) + threadIdx.x*cpy_ne_D < DKQ) {
++                __align__(16) float tmp_f[cpy_ne_D] = {0.0f};
++                if (col_valid(jc)) {
++                    ggml_cuda_memcpy_1<sizeof(tmp_f)>
++                        (tmp_f, &Q_f[c*(nb02/sizeof(float)) + fastmodulo(col_Q_0 + j, ne01)*(nb01/sizeof(float))
++                                     + i0 + (threadIdx.y % np)*(warp_size*cpy_ne_D) + threadIdx.x*cpy_ne_D]);
++                }
++
++#pragma unroll
++                for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
++                    tmp_f[i1] *= scale;
++                }
++
++#ifdef FAST_FP16_AVAILABLE
++                if constexpr (use_bf16) {
++                    __align__(16) nv_bfloat162 tmp_bf[cpy_ne_D/2];
++#pragma unroll
++                    for (int i1 = 0; i1 < cpy_ne_D; i1 += 2) {
++                        tmp_bf[i1/2] = ggml_cuda_cast<nv_bfloat162>(make_float2(tmp_f[i1 + 0], tmp_f[i1 + 1]));
++                    }
++                    ggml_cuda_memcpy_1<sizeof(tmp_bf)>(
++                        &Q_tmp[jc*(DKQ/2) + i0/2 + (threadIdx.y % np)*(warp_size*cpy_ne_D/2) + threadIdx.x*(cpy_ne_D/2)],
++                        tmp_bf);
++                } else {
++                    __align__(16) half2 tmp_h2[cpy_ne_D/2];
++#pragma unroll
++                    for (int i1 = 0; i1 < cpy_ne_D; i1 += 2) {
++                        tmp_h2[i1/2] = make_half2(tmp_f[i1 + 0], tmp_f[i1 + 1]);
++#if !defined(V_DOT2_F32_F16_AVAILABLE)
++                        // Without the v_dot2_f32_f16 instruction there is a higher risk of numerical overflow in the KQ calculation.
++                        // Therefore, scale down Q values and apply the inverse scale the FP32 KQ values afterwards again.
++                        tmp_h2[i1/2] *= make_half2(0.25f, 0.25f);
++#endif // !defined(V_DOT2_F32_F16_AVAILABLE)
++                    }
++                    ggml_cuda_memcpy_1<sizeof(tmp_h2)>(
++                        &Q_tmp[jc*(DKQ/2) + i0/2 + (threadIdx.y % np)*(warp_size*cpy_ne_D/2) + threadIdx.x*(cpy_ne_D/2)],
++                        tmp_h2);
++                }
++#else
++                {
++                    ggml_cuda_memcpy_1<sizeof(tmp_f)>(
++                        &Q_tmp[jc*DKQ + i0 + (threadIdx.y % np)*(warp_size*cpy_ne_D) + threadIdx.x*cpy_ne_D],
++                        tmp_f);
++                }
++#endif // FAST_FP16_AVAILABLE
++            }
++        }
++    }
++    }
++
++    __syncthreads();
++
++    // Main loop over KV cache:
++    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
++
++    // Fully-masked KV-group bitmap (issue #48): batch-wide on the derived path (mask == nullptr),
++    // per (stream, query tile) on the packed path (one query tile per block, blockIdx.x).
++    const uint32_t * kq_blocks_tile = kq_blocks;
++    if (kq_blocks != nullptr && mask != nullptr) {
++        const int kq_words_per_tile = ((ne11/FATTN_KQ_STRIDE) + 31)/32;
++        kq_blocks_tile = kq_blocks + int64_t(sequence*gridDim.x + blockIdx.x)*kq_words_per_tile;
++    }
++
++    if (ncols2 == 1) {
++        // Branch with out-of-bounds checks.
++        int k_VKQ_0 = blockIdx.y*nbatch_fa;
++        while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
++            const int k_VKQ_0_cur = k_VKQ_0;
++            k_VKQ_0 += gridDim.y*nbatch_fa;
++            if (kq_blocks != nullptr && fattn_kq_group_masked(kq_blocks_tile, k_VKQ_0_cur/nbatch_fa, nbatch_fa)) {
++                continue;
++            }
++            constexpr bool oob_check = false;
++            flash_attn_tile_gqa6_fold_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV, fold_gqa6>
++                (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
++                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0_cur, k_VKQ_max, col_Q_0, kv_q8,
++                warp_valid);
++        }
++        if (k_VKQ_0 < k_VKQ_max &&
++                !(kq_blocks != nullptr && fattn_kq_group_masked(kq_blocks_tile, k_VKQ_0/nbatch_fa, nbatch_fa))) {
++            constexpr bool oob_check = true;
++            flash_attn_tile_gqa6_fold_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV, fold_gqa6>
++                (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
++                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8,
++                warp_valid);
++        }
++    } else {
++        // Branch without out-of-bounds checks.  The last tile may extend past k_VKQ_max, where the
++        // unchecked loads would read up to nbatch_fa - 1 rows past the KV data.  In a real model that
++        // stays inside the KV cache tensor's slack, but an exact-size operand (test-backend-ops) can
++        // reach the neighbouring allocation.  On RDNA2 the last tile therefore takes the checked form
++        // (zero-fills the tail rows and keeps them out of the softmax; the ncols2 == 1 branch has
++        // always checked its tail).  The checked form used to run for the whole loop and spilled
++        // registers on gfx1030, which is why this branch avoided it -- as a single tail tile its cost
++        // is measured in TODO 72.  Every other target keeps this branch as it was.
++        for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
++            if (kq_blocks != nullptr && fattn_kq_group_masked(kq_blocks_tile, k_VKQ_0/nbatch_fa, nbatch_fa)) {
++                continue;
++            }
++#if defined(RDNA2)
++            if (k_VKQ_0 + nbatch_fa > k_VKQ_max) {
++                constexpr bool oob_check_tail = true;
++                flash_attn_tile_gqa6_fold_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check_tail, type_KV, fold_gqa6>
++                    (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
++                    stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8,
++                    warp_valid);
++                continue;
++            }
++#endif // defined(RDNA2)
++            constexpr bool oob_check = false;
++            flash_attn_tile_gqa6_fold_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV, fold_gqa6>
++                (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
++                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8,
++                warp_valid);
++        }
++    }
++
++#pragma unroll
++    for (int jc0 = 0; jc0 < cpw; ++jc0) {
++        KQ_sum[jc0] = warp_reduce_sum<warp_size>(KQ_sum[jc0]);
++    }
++
++    if constexpr (np > 1) {
++        static_assert(cpw == 1, "bad cpw");
++        static_assert(nbatch_fa*nbatch_K >= nwarps*DVp, "KV_tmp too small");
++
++#ifdef FAST_FP16_AVAILABLE
++        using T_VKQ_combine = std::conditional_t<use_bf16, float, half2>;
++#else
++        using T_VKQ_combine = float;
++#endif // FAST_FP16_AVAILABLE
++        T_VKQ_combine * VKQ_combine = (T_VKQ_combine *) KV_tmp;
++        float * KQ_sum_combine = (float *) Q_tmp;
++
++        if (threadIdx.y % np != 0) {
++#ifdef FAST_FP16_AVAILABLE
++            if constexpr (!use_bf16) {
++                constexpr int cpy_ne_D = cpy_ne < (DVp/2)/warp_size ? cpy_ne : (DVp/2)/warp_size;
++#pragma unroll
++                for (int i0 = 0; i0 < DVp/2; i0 += warp_size*cpy_ne_D) {
++                    ggml_cuda_memcpy_1<cpy_ne_D*4>(&VKQ_combine[threadIdx.y*(DVp/2) + i0 + threadIdx.x*cpy_ne_D], &VKQ[i0/warp_size]);
++                }
++            } else
++#endif // FAST_FP16_AVAILABLE
++            {
++                constexpr int cpy_ne_D = cpy_ne < DVp/warp_size ? cpy_ne : DVp/warp_size;
++#pragma unroll
++                for (int i0 = 0; i0 < DVp; i0 += warp_size*cpy_ne_D) {
++                    ggml_cuda_memcpy_1<cpy_ne_D*4>(
++                        &VKQ_combine[threadIdx.y*DVp + i0 + threadIdx.x*cpy_ne_D], ((const float *) VKQ) + i0/warp_size);
++                }
++            }
++
++            if (threadIdx.x == 0) {
++                KQ_sum_combine[threadIdx.y] = KQ_sum[0];
++            }
++
++            return;
++        }
++
++        __syncthreads();
++
++#pragma unroll
++        for (int ip = 1; ip < np; ++ip) {
++#ifdef FAST_FP16_AVAILABLE
++            if constexpr (!use_bf16) {
++                constexpr int cpy_ne_D = cpy_ne < (DVp/2)/warp_size ? cpy_ne : (DVp/2)/warp_size;
++#pragma unroll
++                for (int i0 = 0; i0 < DVp/2; i0 += warp_size*cpy_ne_D) {
++                    __align__(16) half2 tmp[cpy_ne_D];
++                    ggml_cuda_memcpy_1<cpy_ne_D*4>(tmp, &VKQ_combine[(threadIdx.y + ip)*(DVp/2) + i0 + threadIdx.x*cpy_ne_D]);
++#pragma unroll
++                    for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
++                        VKQ[i0/warp_size + i1] += tmp[i1];
++                    }
++                }
++            } else
++#endif // FAST_FP16_AVAILABLE
++            {
++                constexpr int cpy_ne_D = cpy_ne < DVp/warp_size ? cpy_ne : DVp/warp_size;
++#pragma unroll
++                for (int i0 = 0; i0 < DVp; i0 += warp_size*cpy_ne_D) {
++                    __align__(16) float tmp[cpy_ne_D];
++                    ggml_cuda_memcpy_1<cpy_ne_D*4>(tmp, &VKQ_combine[(threadIdx.y + ip)*DVp + i0 + threadIdx.x*cpy_ne_D]);
++#pragma unroll
++                    for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
++                        ((float *)VKQ)[i0/warp_size + i1] += tmp[i1];
++                    }
++                }
++            }
++
++            KQ_sum[0] += KQ_sum_combine[threadIdx.y + ip];
++        }
++    }
++
++    // Attention sink: adjust KQ max and sum only for the first of all parallel blocks:
++    if (sinks && blockIdx.y == 0) {
++#pragma unroll
++        for (int jc0 = 0; jc0 < cpw; ++jc0) {
++            const int jc = jc0 + (threadIdx.y/np)*cpw;
++            if constexpr (fold_gqa6) {
++                if (!col_valid(jc)) {
++                    continue;
++                }
++            }
++            const float sink = ((const float *) sinks)[head0 + jc % ncols2_eff];
++
++            float KQ_max_new_j = fmaxf(KQ_max[jc0], sink);
++            const float KQ_max_scale = expf(KQ_max[jc0] - KQ_max_new_j);
++            KQ_max[jc0] = KQ_max_new_j;
++
++            const float val = expf(sink - KQ_max[jc0]);
++            KQ_sum[jc0] = KQ_sum[jc0]*KQ_max_scale + val;
++
++            flash_attn_tile_rescale_VKQ(&VKQ[jc0*((DVp/2)/warp_size)], KQ_max_scale, (DVp/2)/warp_size);
++        }
++    }
++
++    // Write back results:
++#pragma unroll
++    for (int jc0 = 0; jc0 < cpw; ++jc0) {
++        const int jc = jc0 + (threadIdx.y/np)*cpw;
++
++        const int j = jc / ncols2_eff;
++        const int c = jc % ncols2_eff;
++
++        if constexpr (fold_gqa6) {
++            if (!col_valid(jc)) {
++                continue;
++            }
++        }
++        if (ncols1 > 1 && col_Q_0 + j >= int(ne01.z)) {
++            return;
++        }
++
++        const float scale = gridDim.y == 1 ? 1.0f/KQ_sum[jc0] : 1.0f;
++
++        const int j_dst_unrolled = ((sequence*int(ne01.z) + col_Q_0 + j)*ne02 + head0 + c)*gridDim.y + blockIdx.y;
++
++#ifdef FAST_FP16_AVAILABLE
++        if constexpr (!use_bf16) {
++            constexpr int cpy_ne_D = cpy_ne/2 < (DVp/2)/warp_size ? cpy_ne/2 : (DVp/2)/warp_size;
++#pragma unroll
++            for (int i0 = 0; i0 < DVp/2; i0 += warp_size*cpy_ne_D) {
++                __align__(16) float2 tmp[cpy_ne_D];
++#pragma unroll
++                for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
++                    tmp[i1] = __half22float2(VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size + i1]);
++                    tmp[i1].x *= scale;
++                    tmp[i1].y *= scale;
++                }
++                if (i0 + warp_size*cpy_ne_D <= DV/2 || i0 + threadIdx.x*cpy_ne_D < DV/2) {
++                    ggml_cuda_memcpy_1<sizeof(tmp)>(&dst[j_dst_unrolled*DV + 2*i0 + threadIdx.x*(2*cpy_ne_D)], tmp);
++                }
++            }
++        } else
++#endif // FAST_FP16_AVAILABLE
++        {
++            constexpr int cpy_ne_D = cpy_ne < DVp/warp_size ? cpy_ne : DVp/warp_size;
++#pragma unroll
++            for (int i0 = 0; i0 < DVp; i0 += warp_size*cpy_ne_D) {
++                if (i0 + warp_size*cpy_ne_D <= DV || i0 + threadIdx.x*cpy_ne_D < DV) {
++#pragma unroll
++                    for (int i1 = 0; i1 < cpy_ne_D/2; ++i1) {
++                        VKQ[jc0*((DVp/2)/warp_size) + i0/(2*warp_size) + i1].x *= scale;
++                        VKQ[jc0*((DVp/2)/warp_size) + i0/(2*warp_size) + i1].y *= scale;
++                    }
++                    ggml_cuda_memcpy_1<cpy_ne_D*4>(
++                        &dst[j_dst_unrolled*DV + i0 + threadIdx.x*cpy_ne_D],
++                        &VKQ[jc0*((DVp/2)/warp_size) + i0/(2*warp_size)]);
++                }
++            }
++        }
++
++        if (gridDim.y != 1 && threadIdx.x == 0) {
++            dst_meta[j_dst_unrolled] = make_float2(KQ_max[jc0], KQ_sum[jc0]);
++        }
++    }
++#else
++    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale, max_bias, m0, m1, n_head_log2, logit_softcap, kq_blocks_ptr, cell_pos_ptr, tok_lo_ptr, tok_hi_ptr,
++        ne00, ne01, ne02, ne03,
++              nb01, nb02, nb03,
++        ne10, ne11, ne12, ne13,
++              nb11, nb12, nb13,
++              nb21, nb22, nb23,
++              ne31, ne32, ne33,
++              nb31, nb32, nb33);
++    NO_DEVICE_CODE;
++#endif // FLASH_ATTN_AVAILABLE
++}
++#ifdef __clang__
++#pragma clang diagnostic pop
++#endif // __clang__
++
++
++// Fold launcher: one padded eight-column block per six-head GQA group (n_q <= 8). Forces the unfolded
++// ncols2=2 reference kernel's split-KV parallel_blocks so the fold keeps the existing per-head reduction
++// geometry (raw OFF/ON bit-identity). The unfolded reference is the ordinary baseline kernel.
++template <bool use_logit_softcap>
++static void launch_fattn_tile_gqa6_fold(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * Q = dst->src[0];
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * V = dst->src[2];
++
++    constexpr int DKQ = 256;
++    constexpr int DV = 256;
++    constexpr int ncols2 = 8;
++    constexpr ggml_type type_KV = GGML_TYPE_Q8_0;
++
++    const bool need_f16_K = K->type != type_KV;
++    const bool need_f16_V = V->type != type_KV;
++
++    constexpr int kv_native_tile = type_KV == GGML_TYPE_BF16 ? FATTN_KV_NATIVE_BF16 :
++                                   ggml_cuda_fattn_native_type_from_kernel<type_KV>();
++
++    const int id        = ggml_cuda_get_device();
++    const int cc        = ggml_cuda_info().devices[id].cc;
++    const int warp_size = 32;
++
++    constexpr size_t nbytes_shared = 0;
++
++    constexpr int cols_per_block = ncols2; // 8: six real heads + two padding columns, one warp each
++    const int nwarps    = 256 / warp_size;
++    const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
++    fattn_kernel_t fattn_kernel = flash_attn_tile_gqa6_fold<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, true>;
++
++    constexpr int unfolded_ncols2 = 2;
++    fattn_kernel_t unfolded_kernel =
++        flash_attn_tile<DKQ, DV, 1, unfolded_ncols2, use_logit_softcap, type_KV>;
++    const int unfolded_nwarps =
++        ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, unfolded_ncols2, cc) / warp_size;
++    const int unfolded_nbatch_fa =
++        ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, unfolded_ncols2, cc);
++
++    int unfolded_max_blocks_per_sm = 1;
++    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
++        &unfolded_max_blocks_per_sm, unfolded_kernel, unfolded_nwarps*warp_size, nbytes_shared));
++    GGML_ASSERT(unfolded_max_blocks_per_sm > 0);
++
++    const int nsm = ggml_cuda_info().devices[id].nsm;
++    const int gqa_ratio = Q->ne[2] / K->ne[2];
++    const int unfolded_ntiles_z_gqa = (gqa_ratio + unfolded_ncols2 - 1) / unfolded_ncols2;
++    const int unfolded_ntiles_dst_eff = unfolded_ntiles_z_gqa * K->ne[2] * Q->ne[3];
++    // Pre-existing: K->ne[1] here, not the kv_rows-aware n_kv_cols launch_fattn uses for ntiles_KV.
++    // Masked at the default GGML_CUDA_FA_SPLIT_CONST=1 (search limit = blocks_per_wave, then clamped to
++    // the real kv_rows-aware ntiles_KV); only SPLIT_CONST=0 with kv_rows->ne[0] != K->ne[1] could diverge
++    // from the unfolded reference. The fold's bit-identity was validated for the standard GQA-6 path.
++    const int unfolded_ntiles_KV = (K->ne[1] + unfolded_nbatch_fa - 1) / unfolded_nbatch_fa;
++    const int force_parallel_blocks = ggml_cuda_fattn_tile_gqa6_pick_parallel_blocks(
++        unfolded_max_blocks_per_sm, nsm, unfolded_ntiles_dst_eff, unfolded_ntiles_KV);
++
++    launch_fattn<DV, cols_per_block/ncols2, ncols2, true>
++        (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
++        need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
++        /*q_h2*/ GGML_CUDA_CC_IS_RDNA2(cc) && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 64,
++        /*can_chunk*/ false, force_parallel_blocks);
++}
++
++// The only folded instantiation lives in fattn-tile-gqa6-fold-dkq256-dv256-q8_0.cu.
++template <bool use_logit_softcap>
++void ggml_cuda_flash_attn_ext_tile_gqa6_fold_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    launch_fattn_tile_gqa6_fold<use_logit_softcap>(ctx, dst);
++}
++
++#define DECL_FATTN_TILE_GQA6_FOLD_CASE()                                  \
++    template void ggml_cuda_flash_attn_ext_tile_gqa6_fold_case<false>     \
++        (ggml_backend_cuda_context & ctx, ggml_tensor * dst);             \
++    template void ggml_cuda_flash_attn_ext_tile_gqa6_fold_case<true >     \
++        (ggml_backend_cuda_context & ctx, ggml_tensor * dst)
++
++
++#endif // defined(GGML_USE_HIP)
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index e0778c76b..c402927ab 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -1775,6 +1775,32 @@ static __global__ void flash_attn_tile(
+ #pragma clang diagnostic pop
+ #endif // __clang__
+ 
++// The padded GQA-6 fold is isolated in fattn-tile-gqa6-fold.cuh, compiled only in the dedicated
++// HIP-only TU fattn-tile-gqa6-fold-dkq256-dv256-q8_0.cu. The ordinary tile kernels and launchers above
++// are unmodified baseline; only this host dispatch references the fold, gated by RDNA3 + an env opt-in
++// (GGML_HIP_FA_TILE_GQA6_FOLD, default OFF).
++template <bool use_logit_softcap>
++void ggml_cuda_flash_attn_ext_tile_gqa6_fold_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++extern template void ggml_cuda_flash_attn_ext_tile_gqa6_fold_case<false>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++extern template void ggml_cuda_flash_attn_ext_tile_gqa6_fold_case<true >(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++static inline bool ggml_cuda_fattn_tile_gqa6_fold_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("GGML_HIP_FA_TILE_GQA6_FOLD");
++        return env != nullptr && atoi(env) != 0;
++    }();
++    return enabled;
++}
++
++static inline void ggml_cuda_fattn_tile_gqa6_fold_census(const int cc, const int n_q) {
++    static const bool logged = [cc, n_q] {
++        GGML_LOG_INFO("%s: padded GQA-6 tile fold ON (cc 0x%x, n_q %d, ncols1 1 / ncols2 8)\n", __func__, cc, n_q);
++        return true;
++    }();
++    (void) logged;
++}
++
+ template <int DKQ, int DV, int ncols2, bool use_logit_softcap, ggml_type type_KV>
+ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * Q = dst->src[0];
+@@ -1951,6 +1977,17 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+     // D=128 decode was re-reading the KV cache 4x for it.  The cap is lifted (r334, PR #338 -> folded
+     // into block 05), so RDNA2 takes the same ncols2 the rest of the archs do.
+ 
++#ifdef GGML_USE_HIP
++    if constexpr (DKQ == 256 && DV == 256 && type_KV == GGML_TYPE_Q8_0) {
++        if (GGML_CUDA_CC_IS_RDNA3_0(device_cc) && ggml_cuda_fattn_tile_gqa6_fold_enabled() && use_gqa_opt &&
++                Q->ne[1] <= 8 && gqa_ratio == 6) {
++            ggml_cuda_fattn_tile_gqa6_fold_census(device_cc, Q->ne[1]);
++            ggml_cuda_flash_attn_ext_tile_gqa6_fold_case<use_logit_softcap>(ctx, dst);
++            return;
++        }
++    }
++#endif // GGML_USE_HIP
++
+     if constexpr (DKQ == 320) {
+         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
+         // On AMD, simply use that GQA ratio with 32 columns / block since we always have enough SRAM.
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-gqa6-fold-dkq256-dv256-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-gqa6-fold-dkq256-dv256-q8_0.cu
+new file mode 100644
+index 000000000..b3d060f70
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-gqa6-fold-dkq256-dv256-q8_0.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile-gqa6-fold.cuh"
++
++#if defined(GGML_USE_HIP)
++DECL_FATTN_TILE_GQA6_FOLD_CASE();
++#endif // defined(GGML_USE_HIP)
+diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+index 64dcacf05..b36a8cc54 100755
+--- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
++++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+@@ -17,6 +17,15 @@ SOURCE_FATTN_TILE = """// This file has been autogenerated by generate_cu_files.
+ DECL_FATTN_TILE_CASE_TYPE({head_size_kq}, {head_size_v}, {type_kv});
+ """
+ 
++SOURCE_FATTN_TILE_GQA6_FOLD = """// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile-gqa6-fold.cuh"
++
++#if defined(GGML_USE_HIP)
++DECL_FATTN_TILE_GQA6_FOLD_CASE();
++#endif // defined(GGML_USE_HIP)
++"""
++
+ SOURCE_FATTN_VEC = """// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+ 
+ #include "../fattn-vec.cuh"
+@@ -104,6 +113,10 @@ for head_size_kq in HEAD_SIZES_KQ:
+         with open(f"fattn-tile-instance-dkq{head_size_kq}-dv{head_size_v}-{get_short_name(type_kv)}.cu", "w") as f:
+             f.write(SOURCE_FATTN_TILE.format(head_size_kq=head_size_kq, head_size_v=head_size_v, type_kv=type_kv))
+ 
++# The padded GQA-6 kernel has a dedicated translation unit so no existing tile instantiation contains its code.
++with open("fattn-tile-gqa6-fold-dkq256-dv256-q8_0.cu", "w") as f:
++    f.write(SOURCE_FATTN_TILE_GQA6_FOLD)
++
+ for type_k in TYPES_KV:
+     for type_v in TYPES_KV:
+         with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8bab1a9d7..93e5ce901 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11549,6 +11549,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             }
+         }
+     }
++    // Head-256 GQA-6 covers the padded tile fold at widths 1..8, its inert boundary at widths 9..16,
++    // a deep KV cache, and the derived-mask form used by dense qwen35 models.
++    for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
++        for (int64_t nh : { 8, 4 }) {
++            for (int kv : { 512, 1024, 4096 }) {
++                for (int nb : { 1, 2, 4, 5, 8, 9, 16 }) {
++                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
++                                                                    type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, false, false, kv == 4096));
++                }
++            }
++            for (int nb : { 1, 4, 8 }) {
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32,
++                                                                type_KV, type_KV));
++            }
++            for (int kv : { 512, 4096 }) {
++                for (int nb : { 1, 8 }) {
++                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
++                                                                    type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, true));
++                }
++            }
++        }
++    }
+     // the band itself: a 32768-cell cache is past the auto gate's crossover for every ratio in the class, and bf16
+     // is the band's third native K/V type (`GGML_HIP_FA_BAND_WMMA_H128=0` runs these through the tile kernel)
+     for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+-- 
+2.43.0
+
