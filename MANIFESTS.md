@@ -112,7 +112,7 @@ cheap:
 |---|---|---|---|
 | 1 | `.github/workflows/validate.yml` (hosted, no GPU) | `validate-set.sh`: strict apply on a fresh tarball, tree/count, per-artifact sha256, the Windows path + portability lints, a conflict-marker/subject scan of every block tree, and the file-set reconciliation when the clone has the previous release's tag | every push and PR, ~20 s |
 | 2 | `radiance` (`scripts/validate-gpu.sh`, cron every 30 min) | re-applies the set at `origin/main` from scratch, **reconciles every block against the release it replaces**, builds the **whole applied tree once**, the seven op oracles, then `gate-prefill-logits.sh` (records a base on a fresh box, compares after) | every new `origin/main` commit, unattended |
-| 3 | a GPU box, by hand | the release flow: `all` build, coherence, MTP Protocol A, arch sweeps, the generated-docs drift check (`scripts/check-gen-docs.sh`, r329) | before a tag |
+| 3 | a GPU box, by hand | the release flow: `all` build, coherence, MTP Protocol A, arch sweeps, the generated-docs drift check (`scripts/check-gen-docs.sh`, r329) and the optional-artifact build (`scripts/gate-optional-build.sh`, gate 47, r367) | before a tag |
 
 Tier 2 exists because almost every block is a CUDA/HIP kernel change and a hosted runner has no ROCm, so
 tier 1 cannot compile any of it.  It is the automation behind "a re-base is a decode AND prefill change"
