@@ -16,6 +16,27 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.008 (r368, `wip/`) -- flash-next-prefill: cold-start handover for session 6 (tombstone purge, fresh review, then STOP for the user test)
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  Squashed prototype
+`~/llama.cpp` `wip/prefill-slot-pingpong-squashed`, tip **`538391438`**; handover
+[`wip/flash-next-prefill/HANDOVER-session6.md`](wip/flash-next-prefill/HANDOVER-session6.md).
+
+The session ran long, so it closes with an ordered handover rather than more work in flight.  The next session's
+order is fixed: (1) squash anything outstanding and do a **fresh code review whose extra rule is "no tombstones for
+dead code"** -- source, `ENVIRONMENT.md` and `DIAGNOSTIC.md` alike (no comments explaining what something used to
+be, no empty functions, no unused knobs kept as "the record"; the record is the WORKLOG and the review), with §2
+listing the known candidates (`GGML_CUDA_SLAB_TRANSPORT_MIB`'s doc entries, the session 1-4 env spellings, the
+default-off D1 probes, the `h2d_stage_*`/`slab_ring_*` internal names); (2) the quick tests in §4, with expected
+hashes, log lines and arena figures; (3) **STOP and hand over to the maintainer for user-level testing**; (4)
+promotion **only on their explicit all-clear** -- and that starts with the block decision, which is always asked.
+
+It also carries the traps this campaign paid for (the `--amend`-takes-the-index trap that cost a push, the
+SIGTERM-resistant hung server whose leftover VRAM fakes an OOM, the three lock-order deadlocks, "one prefill per
+process is not a test", the sampled-decode non-evidence, the field `runme`s' `LD_LIBRARY_PATH`, and the box's 2-5 %
+bimodality) and the still-open measurement risks (the 122B staged arm ~23 % behind the deleted ring, the 38 µs
+threshold's x16 confirm, the `-ub` guidance).
+
 ## 261127.007 (r368, `wip/`) -- flash-next-prefill: the end-user test's two field defects fixed, and `GGML_CUDA_SLAB_TRANSPORT_MIB` retired
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  Squashed prototype
