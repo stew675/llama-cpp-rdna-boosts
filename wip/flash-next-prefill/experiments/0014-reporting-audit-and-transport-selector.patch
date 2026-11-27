@@ -1,0 +1,1464 @@
+From b209da8cdac62419a1c6495abf79323e6961e14a Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 23:26:40 -0600
+Subject: [PATCH] wip: reporting audit + a measured transport selector (the
+ ping-pong becomes the default at prefill width)
+
+Session 4 of the flash-next-prefill campaign (wip/flash-next-prefill/HANDOVER-session4.md).
+
+REPORTING AUDIT (the maintainer's ask): every printed arena number now says which of the four
+kinds it is.  SLAB_STATS gains arena_region= (mapped - boundary, an EXTENT), arena_resident=
+(the same figure the MoE census calls resident=), transport= / transport_used= (the slab CARVE and
+its USAGE, renamed from ring=) and SLAB_INIT prints transport_req=.  The MoE census' 'arena=' was
+RESIDENT bytes and is now 'resident= ... total'; the fill census' 'arena=' was BYTES COPIED from the
+arena and is now 'arena_copies=' (with 'host_copies=' and 'H2D % of filled'); 'prefill cache staging'
+is 'prefill fills'.  Every field is defined in one comment block at the log site.  The transport
+region is now sized from what the ping-pong holds (N x the largest host-weight SPLIT SET, a new
+llama_model::max_host_expert_layer_bytes) instead of the deleted ring's throughput knee: 6618 MiB ->
+3412 MiB on the 89k Flash-Next shape, and the freed band is visible (+3.2 GiB of arena region during
+the prefill, 25 GiB of fills served from the arena instead of the host; same text, same rate).
+Env renames with deprecated aliases: GGML_CUDA_SLAB_TRANSPORT_MIB (was _RING_MIB) and
+GGML_CUDA_SLAB_TRANSPORT_FALLBACK.
+
+TENSOR SPLIT FIXES (2 and 3 cards could not run this shape at all):
+ * the VMM workspace pool aborted on a failed growth ('HipVMM Failure: out of memory'); on a refused
+   cuMemCreate it now takes the scratch from the slab's wide band (fail-soft, the optional-transient
+   rule) and names the sizes if there is no band either.  This was the -sm tensor 2-card blocker at
+   BOTH transports (gather and staged).
+ * the scheduler ping-pong is declined on a Meta backend (a split IS the whole graph there and the
+   slot API does not exist) instead of calling a NULL stage_buffer: SIGSEGV -> the split uses its own
+   per-device ring via stage_input.
+
+TRANSPORT SELECTOR: sched_stage_exposure_decides() stages a pool-backed host table at prefill width
+when the bytes the device gather would pull over the link per token clear a threshold, and keeps the
+gather when the set is resident.  Threshold 38 us/token from a measured sweep (coverage 30 / 45 / 56 %
+on 35B-A3B Q8_0 + Flash-Next at 51 %; the tie is 8.8 GB / 8192 tok at 28.7 GB/s).  The slab's
+zero-carve rule is re-keyed to the same measurement (carve only when the cache cannot keep the set),
+because a zero-carve slab refuses every fill and dropped the arm to 338 t/s.
+
+Measured (89k prompt, heat prior pinned, same seed, 3 rotated cycles where quoted): 1 GPU 2108 -> 2445
+(+16 %, text 43d0b1f4629e); 2-card tensor split (0,2) 3419 with the gather (unchanged, +13 % over the
+split's staged arm); 3-card tensor 3201 (unchanged); 2-card layer split 2475 (unchanged); 122B-A10B
+1 GPU 961 -> 1036 (+7.8 %, text c3f4da781f01).  GGML_SCHED_STAGE_SELECT=0 restores the pre-session
+rule; GGML_SCHED_STAGE_EXPOSE_US tunes the threshold.
+---
+ ggml/include/ggml-backend.h            |   4 +-
+ ggml/src/ggml-backend-impl.h           |  11 +-
+ ggml/src/ggml-backend-meta.cpp         |  24 +++
+ ggml/src/ggml-backend.cpp              | 123 +++++++++++-
+ ggml/src/ggml-cuda/common.cuh          |  25 ++-
+ ggml/src/ggml-cuda/ggml-cuda-slab.cu   |  70 +++++--
+ ggml/src/ggml-cuda/ggml-cuda-vmm.h     |   2 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu        | 262 +++++++++++++++++++++----
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 199 ++++++++++++-------
+ ggml/src/ggml-cuda/moe-expert-cache.h  |  13 ++
+ src/llama-context.cpp                  |  33 +++-
+ src/llama-model.cpp                    |  57 ++++++
+ src/llama-model.h                      |   7 +
+ 13 files changed, 684 insertions(+), 146 deletions(-)
+
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index b031d1b77..cf57601f5 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -165,10 +165,10 @@ extern "C" {
+ 
+     // wip/slab-ring-region (issue #164): set the H2D staging-ring auto-size cap (bytes), computed by
+     // `llama_context` from the ubatch and the host-expert device count.  Call before the slab is created.
+-    // No-op for a backend without a slab.  `GGML_CUDA_SLAB_RING_MIB` overrides it per GPU.
++    // No-op for a backend without a slab.  `GGML_CUDA_SLAB_TRANSPORT_MIB` overrides it per GPU.
+     GGML_API void                  ggml_backend_dev_slab_set_ring_cap(ggml_backend_dev_t dev, size_t bytes);
+     // issue #164: whether this device's movable-boundary slab is enabled (armed for a host-expert model).
+-    // The ring sizing warns about a too-small `GGML_CUDA_SLAB_RING_MIB` only when the slab will use it.
++    // The ring sizing warns about a too-small `GGML_CUDA_SLAB_TRANSPORT_MIB` only when the slab will use it.
+     GGML_API bool                  ggml_backend_dev_slab_enabled(ggml_backend_dev_t dev);
+     // issue #164: the backend's H2D staging-ring depth (slots the ring region is divided into), or 0 when
+     // the backend has no ring.  The context sizes the ring region so one staged table fits per slot.
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index 7c659868a..8f3308cdb 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -320,6 +320,15 @@ extern "C" {
+         // Answers per (table, device); NULL = unknown/false.
+         bool (*moe_cache_pool_backed)(ggml_backend_t backend, const struct ggml_tensor * weight);
+ 
++        // (optional) wip/flash-next-prefill (session 4): how much of this backend's host-resident expert set
++        // the device could actually KEEP (`covered` = slots the arena/cache can hold, `host` = one copy of
++        // the set), in bytes.  The transport selector needs one number: the bytes the device gather would
++        // have to pull over the link per prefill ubatch, `(host - covered)`.  It is the same figure the MoE
++        // census prints as "arena <x> MiB of <y> MiB host experts (<z>% residency)".  A backend that never
++        // caches reports covered = 0 (a pinned master: every byte is a host read, so the staging path wins).
++        // NULL = unknown, and the selector keeps the gather.
++        void (*moe_cache_residency)(ggml_backend_t backend, int64_t * covered, int64_t * host);
++
+         // (optional) r220: `cpy_tensor_async` WITHOUT the internal destination-stream wait.  The copy is issued
+         // on the SOURCE stream and `ev` (a caller-owned event) is recorded there right behind it; the caller
+         // orders the consumer itself with `ggml_backend_event_wait(dst, ev)`.  Why this exists: a queued
+@@ -542,7 +551,7 @@ extern "C" {
+         void (*slab_set_ring_cap)(ggml_backend_dev_t dev, size_t bytes);
+ 
+         // (optional) issue #164: whether this device's movable-boundary slab is enabled.  `llama_context`
+-        // consults it before warning about a too-small `GGML_CUDA_SLAB_RING_MIB`.  Appended like the fields
++        // consults it before warning about a too-small `GGML_CUDA_SLAB_TRANSPORT_MIB`.  Appended like the fields
+         // above.
+         bool (*slab_enabled)(ggml_backend_dev_t dev);
+ 
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index b71bc089e..0af7d6a14 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -5085,6 +5085,29 @@ static bool ggml_backend_meta_moe_cache_pool_backed(ggml_backend_t backend, cons
+     return false;
+ }
+ 
++// wip/flash-next-prefill (session 4): the transport selector's input, summed over the children.  A tensor split
++// keeps each device's shard in that device's own arena, so the per-device sums are the aggregate coverage --
++// and the exposure the selector computes from them is the bytes the whole split would pull over N links.
++static void ggml_backend_meta_moe_cache_residency(ggml_backend_t backend, int64_t * covered, int64_t * host) {
++    GGML_ASSERT(ggml_backend_is_meta(backend));
++    if (covered != nullptr) { *covered = 0; }
++    if (host != nullptr)    { *host    = 0; }
++    const size_t n = ggml_backend_meta_n_backends(backend);
++    int64_t cov = 0, all = 0;
++    for (size_t j = 0; j < n; j++) {
++        ggml_backend_t simple = ggml_backend_meta_simple_backend(backend, j);
++        if (simple == nullptr || simple->iface.moe_cache_residency == nullptr) {
++            continue;
++        }
++        int64_t c = 0, h = 0;
++        simple->iface.moe_cache_residency(simple, &c, &h);
++        cov += c;
++        all += h;
++    }
++    if (covered != nullptr) { *covered = cov; }
++    if (host != nullptr)    { *host    = all; }
++}
++
+ static bool ggml_backend_meta_moe_cache_gather(ggml_backend_t backend, const struct ggml_tensor * weight,
+         const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids,
+         size_t slice_off, int split_axis) {
+@@ -5236,6 +5259,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+     /* .moe_cache_gather        = */ ggml_backend_meta_moe_cache_gather,
+     /* .moe_cache_remap         = */ ggml_backend_meta_moe_cache_remap,
+     /* .moe_cache_pool_backed   = */ ggml_backend_meta_moe_cache_pool_backed,
++    /* .moe_cache_residency     = */ ggml_backend_meta_moe_cache_residency,
+     /* .cpy_tensor_async_nowait = */ nullptr,
+     /* .moe_cache_pending      = */ ggml_backend_meta_moe_cache_pending,
+     /* .moe_cache_register     = */ ggml_backend_meta_moe_cache_register,
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index e4a353ab7..1e4c41701 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2812,6 +2812,8 @@ static constexpr int64_t SCHED_STAGE_CAPTURE_SAFE_TOKENS = 16;
+ // forward declaration (defined below) for the ping-pong helpers that need it.
+ // forward declarations for the ping-pong helpers below (both are defined further down, next to the ring).
+ static bool sched_stage_is_host_weight(const struct ggml_tensor * input);
++static bool sched_stage_exposure_decides(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
++                                         ggml_backend_t backend);
+ static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
+                                    const struct ggml_tensor * input, const struct ggml_tensor * input_cpy);
+ static int64_t sched_stage_min_tokens(ggml_backend_sched_t sched);
+@@ -2926,6 +2928,13 @@ static bool sched_pp_issue(ggml_backend_sched_t sched, struct ggml_backend_sched
+     const int n = sched_pp_split_set(sched, split, &need);
+     sched->pp_n_ent[buf] = 0;
+     if (n <= 0) {
++        if (getenv("GGML_SCHED_STAGE_SELECT_DEBUG") != nullptr) {
++            static int warned = 0;
++            if (warned++ < 4) {
++                GGML_LOG_WARN("%s: ping-pong: split %d has no stageable host-weight set (n=%d, need=%zu) -> "
++                              "serial path\n", __func__, split->backend_id, n, need);
++            }
++        }
+         return false;
+     }
+     if (n > (int) (sizeof(sched->pp_ent[0]) / sizeof(sched->pp_ent[0][0]))) {
+@@ -2948,6 +2957,13 @@ static bool sched_pp_issue(ggml_backend_sched_t sched, struct ggml_backend_sched
+     backend->iface.stage_wait(backend, sched_stage_ev(sched, split->backend_id, buf, false));
+     void * base = backend->iface.stage_buffer(backend, buf, sched->pp_size);
+     if (base == NULL) {
++        if (getenv("GGML_SCHED_STAGE_SELECT_DEBUG") != nullptr) {
++            static int warned = 0;
++            if (warned++ < 4) {
++                GGML_LOG_WARN("%s: ping-pong: stage_buffer(%d, %.1f MiB) returned NULL -> the split takes the "
++                              "serial path\n", __func__, buf, (double) sched->pp_size / 1048576.0);
++            }
++        }
+         return false;
+     }
+     sched->pp_base[buf]    = base;
+@@ -3006,10 +3022,19 @@ static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backe
+         }
+         // PREFILL BAND ONLY.  At or below the cache's decode/verify band the routed op is served from the
+         // ARENA (the slot-remap read), and taking it over with the gather costs an order of magnitude:
+-        // measured on the 3-GPU pool arm, decode fell to 1.2-4.1 t/s against 22-47 with staging.  Above the
+-        // band the op is streamed (prefill) and staging is the slow path -- the case this rule exists for.
++        // measured on the 3-GPU pool arm, decode fell to 1.2-4.1 t/s against 22-47 with staging.
++        // wip/flash-next-prefill (session 4): ABOVE the band the transport is no longer "gather always" --
++        // it is decided by the measured host-exposure test (`sched_stage_exposure_decides`), which stages
++        // when the gather's per-token host read is large enough to be worth the copy engine's overlap and
++        // keeps the gather when the set is resident (its costless case) or the profile is unknown.
+         const int64_t band = sched_moe_cache_band(split_backend);
+-        return band > 0 && sched_stage_batch_tokens(split) > band;
++        if (band > 0 && sched_stage_batch_tokens(split) <= band) {
++            return false;   // the decode/verify arm, unchanged
++        }
++        if (sched_stage_exposure_decides(sched, split, split_backend)) {
++            return false;   // stage at this prefill width
++        }
++        return true;        // gather
+     }
+     // mode 2 (`GGML_SCHED_DEVGATHER=1|force`): the historical A/B arm -- gather below the staging width
+     // gate and for a large table, in either host-expert mode.
+@@ -3029,6 +3054,68 @@ static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backe
+     return false;
+ }
+ 
++// wip/flash-next-prefill (session 4): STAGE vs GATHER at prefill width, decided from the ONE quantity that
++// separated every measured arm -- the host bytes the device gather would have to pull over the link per
++// token.  Measured 2026-11-26, one card on Gen5 x8 (28.7 GB/s), 89k prompt, `-ub 8192`, 3 rotated cycles
++// per arm, coverage = what the expert cache can keep of the host set:
++//
++//   shape             host set   coverage   exposed = (1-cov) x set   gather   staged   winner
++//   35B-A3B Q8_0       16.3 GB      30 %          11.2 GB / ub        2807.7   2943.9   staged +4.9 %
++//   35B-A3B Q8_0       16.3 GB      45 %           8.8 GB / ub        2966.7   2961.7   TIE
++//   35B-A3B Q8_0       16.3 GB      56 %           7.0 GB / ub        3072.5   2956.3   gather +3.9 %
++//   Flash-Next GSQ     40.0 GB      51 %          16.5 GB / ub        2105     2509     staged +19 %
++//   Flash-Next, 2 dev  (tensor)    100 %           ~0                 3419     3029     gather +13 %
++//   Flash-Next, 3 dev  (tensor)    100 %           ~0                 3205     3144     gather +1.9 %
++//
++// So COVERAGE alone is not the predicate (Flash-Next stages at 51 % while the 35B gathers at 56 %); the
++// exposure is.  The tie sits at 8.8 GB per 8192-token ubatch = 1.07 MB/token, which at this link is
++// ~38 us/token -- the point where a compute-stream host read stops being hideable behind the split, so the
++// copy engine's overlap (ping-pong buffers here, the split's own per-device ring under `-sm tensor`) wins
++// above it and the gather's used-only, copy-free read wins below it.  `GGML_SCHED_STAGE_EXPOSE_US` tunes the
++// threshold; `GGML_SCHED_STAGE_SELECT=0` restores the pre-session rule (gather every pool-backed table).
++static bool sched_stage_exposure_decides(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
++                                         ggml_backend_t backend) {
++    static const bool on = [] {
++        const char * e = GGML_ENV_STR("GGML_SCHED_STAGE_SELECT");
++        return e == nullptr || e[0] == '\0' || atoi(e) != 0;
++    }();
++    static const double thr_us = [] {
++        const char * e = GGML_ENV_STR("GGML_SCHED_STAGE_EXPOSE_US");
++        const double v = e != nullptr ? atof(e) : 0.0;
++        return v > 0.0 ? v : 38.0;
++    }();
++    if (!on || backend->iface.moe_cache_residency == nullptr) {
++        return false;   // no selector, or the backend cannot say: keep the gather
++    }
++    if (backend->iface.stage_buffer == nullptr && backend->iface.stage_input == nullptr) {
++        return false;   // nothing to stage WITH: the gather is all there is
++    }
++    int64_t covered = 0, host_bytes = 0;
++    backend->iface.moe_cache_residency(backend, &covered, &host_bytes);
++    const int64_t tok = sched_stage_batch_tokens(split);
++    if (tok <= 0 || host_bytes <= covered) {
++        return false;   // fully resident (or nothing to read): the gather fetches nothing
++    }
++    const double exposed = (double) (host_bytes - covered);
++    float bw = 0.0f;
++    if (backend->iface.stage_h2d_gbps != nullptr) {
++        bw = backend->iface.stage_h2d_gbps(backend);
++    }
++    if (bw <= 0.0f) {
++        return true;    // link uncalibrated: the host read is real, the overlap is free -> stage
++    }
++    const double us_per_tok = exposed / (double) tok / ((double) bw * 1.0e9) * 1.0e6;
++    if (getenv("GGML_SCHED_STAGE_SELECT_DEBUG") != nullptr) {
++        static int64_t n_logged = 0;
++        if (n_logged++ < 400) {
++            GGML_LOG_INFO("%s: transport: exposed %.1f MiB / %lld tok at %.1f GB/s = %.1f us/tok vs %.1f -> %s\n",
++                          __func__, exposed / (1024.0 * 1024.0), (long long) tok, (double) bw, us_per_tok,
++                          thr_us, us_per_tok >= thr_us ? "STAGE" : "gather", (int) sched_moe_cache_band(backend));
++        }
++    }
++    return us_per_tok >= thr_us;
++}
++
+ static bool sched_stage_is_host_weight(const struct ggml_tensor * input) {
+     return input->buffer != NULL &&
+            ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+@@ -3739,6 +3826,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     int  pp_host[256];
+     int  pp_n_host = 0;
+     int  pp_k      = -1;   // this split's index in pp_host, or -1
++    if (getenv("GGML_SCHED_STAGE_SELECT_DEBUG") != nullptr) {
++        static int64_t n = 0;
++        if (n++ < 12) {
++            GGML_LOG_WARN("%s: pp_on=%d pp_n_buf=%d n_splits=%d min_tokens=%lld\n", __func__,
++                          (int) sched->pp_on, sched->pp_n_buf, sched->n_splits,
++                          (long long) sched_stage_min_tokens(sched));
++        }
++    }
+     if (sched->pp_on) {
+         for (int i = 0; i < sched->n_splits && pp_n_host < (int) (sizeof(pp_host) / sizeof(pp_host[0])); i++) {
+             if (sched_pp_split_set(sched, &splits[i], NULL) > 0) {
+@@ -3999,6 +4094,28 @@ ggml_backend_sched_t ggml_backend_sched_new(
+         // default.  It is two buffers, each sized once to the largest split's host-weight set, one fill in flight,
+         // consumed in place -- GGML_SCHED_PINGPONG=0 selects the ring for the A/B.
+         sched->pp_on = sched_pp_on();
++        // wip/flash-next-prefill (session 4): the ping-pong's buffers are BACKEND SLOTS (`stage_buffer` +
++        // `stage_upload` + `stage_wait`), an interface only a single-device backend implements.  A `-sm tensor`
++        // split is served by the META backend, which stages per DEVICE through `stage_input` instead, so the
++        // ping-pong must DECLINE there rather than call a NULL slot function (measured 2026-11-26: a 2-card
++        // `-sm tensor` arm with `GGML_SCHED_DEVGATHER=0` took a SIGSEGV inside `sched_pp_issue`; the split now
++        // falls through to the delivery's whole-split upload, which is the transport session 3 measured
++        // 2967-3141 t/s with).  A backend that stages nothing at all (CPU) is not a reason to decline.
++        if (sched->pp_on) {
++            for (int b = 0; b < sched->n_backends; b++) {
++                const ggml_backend_i * i = &sched->backends[b]->iface;
++                if (i->stage_buffer == NULL && i->stage_input == NULL) {
++                    continue;
++                }
++                if (i->stage_buffer == NULL || i->stage_upload == NULL || i->stage_wait == NULL) {
++                    sched->pp_on = false;
++                    GGML_LOG_INFO("%s: ping-pong staging off: %s stages per device (`stage_input`), and the "
++                                  "ping-pong needs backend slots -- a split uses the whole-split upload\n",
++                                  __func__, ggml_backend_name(sched->backends[b]));
++                    break;
++                }
++            }
++        }
+         sched->pp_size = 0;
+         sched->pp_cur  = 0;
+         // Fixed for the process lifetime (see sched_pp_choose_bufs): 1 / 2 / 3 by the device's FREE VRAM here.
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 05306653d..f87a01993 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1699,11 +1699,11 @@ static inline bool ggml_cuda_slab_stats_on() {
+     return on;
+ }
+ // wip/slab-transient-absorption (F5, step 0): the ring hole was REQUESTED for this model (an operator can
+-// still disable it with GGML_CUDA_SLAB_RING_MIB=0, which keeps the pre-slab cudaMalloc ring).  When it was
++// still disable it with GGML_CUDA_SLAB_TRANSPORT_MIB=0, which keeps the pre-slab cudaMalloc ring).  When it was
+ // requested but could not be carved, a ring shortfall must not silently fall back outside the slab.
+ bool   ggml_cuda_slab_ring_requested();
+ 
+-// wip/slab-ring-region (issue #164): the H2D staging-ring cap (bytes).  `GGML_CUDA_SLAB_RING_MIB` is a
++// wip/slab-ring-region (issue #164): the H2D staging-ring cap (bytes).  `GGML_CUDA_SLAB_TRANSPORT_MIB` is a
+ // verbatim per-GPU override; otherwise `llama_context` auto-sizes it from the ubatch and the host-expert
+ // device count and calls `ggml_cuda_h2d_ring_cap_set` before the slab is created.
+ size_t ggml_cuda_h2d_ring_cap_bytes();
+@@ -2347,11 +2347,17 @@ struct ggml_backend_cuda_context {
+     // Worst-case bytes the auto-sized ring can grow to for a model whose largest host-resident weight
+     // tensor is `max_table` bytes (one table per slot).  Used by the --fit / no-alloc bound, since the
+     // ring lives outside the compute-graph reserve.
++    // wip/flash-next-prefill (session 4, the reporting audit): capped by the transport region's own cap
++    // (`ggml_cuda_h2d_ring_cap_bytes`).  The region CANNOT exceed it (`h2d_stage_region_bytes` min's the two),
++    // and `max_table` can be a 27 GiB MERGED host tensor, so the uncapped bound was a number nothing could
++    // ever allocate.  Capping here makes the --fit term, the region request and the buffers agree.
+     static size_t h2d_stage_bound(size_t max_table) {
+         if (max_table == 0) {
+             return 0;
+         }
+-        return (size_t) h2d_stage_slots() * (max_table + 512);
++        const size_t bound = (size_t) h2d_stage_slots() * (max_table + 512);
++        const size_t cap   = ggml_cuda_h2d_ring_cap_bytes();
++        return cap > 0 && bound > cap ? cap : bound;
+     }
+ 
+     // wip/slab-ring-region: bytes the slab should reserve for the ring.  The auto budget is the same
+@@ -2373,7 +2379,7 @@ struct ggml_backend_cuda_context {
+         // `max_table` comes from `llama_model::max_host_weight_tensor_bytes()`, which can be a MERGED host
+         // tensor (every layer/expert in one) far larger than one staged table -- measured 27 GiB on
+         // Qwen3.8-Flash-Next where the largest staged slice is 270 MiB.  Cap the auto hole so it stays
+-        // proportional to a real table (GGML_CUDA_SLAB_RING_MIB); a staged request larger than a slot falls
++        // proportional to a real table (GGML_CUDA_SLAB_TRANSPORT_MIB); a staged request larger than a slot falls
+         // back to cudaMalloc, the pre-change path.  An explicit GGML_SCHED_STAGE_MAX_MB still wins.
+         // wip/slab-ring-region (issue #164): the cap is the explicit per-GPU override when set, else the
+         // context's auto-size (1800/n + ub/(1.7 n^2) MiB, capped at 1/4 of the smallest staging device's
+@@ -2497,11 +2503,14 @@ struct ggml_backend_cuda_context {
+     // failed; a growth there either fails (and the caller takes the serial path anyway) or eats the reserve
+     // FA staging / hipBLASLt / the pool need -- the abort-or-silently-corrupt mode the slab exists to
+     // prevent.  It also left a block OUTSIDE the slab that the ring could never give back (a slot only
+-    // migrates on a later growth).  `GGML_CUDA_SLAB_RING_FALLBACK=1` restores the pre-step-0 cudaMalloc
+-    // fallback for A/B and bisection; `GGML_CUDA_SLAB_RING_MIB=0` disables the hole entirely (pre-slab).
++    // migrates on a later growth).  `GGML_CUDA_SLAB_TRANSPORT_FALLBACK=1` restores the pre-step-0 cudaMalloc
++    // fallback for A/B and bisection; `GGML_CUDA_SLAB_TRANSPORT_MIB=0` disables the hole entirely (pre-slab).
+     static bool h2d_stage_slab_fallback() {
+         static const bool on = [] {
+-            const char * e = getenv("GGML_CUDA_SLAB_RING_FALLBACK");
++            const char * e = getenv("GGML_CUDA_SLAB_TRANSPORT_FALLBACK");
++            if (e == nullptr) {
++                e = getenv("GGML_CUDA_SLAB_RING_FALLBACK");   // deprecated alias (pre-session-4 spelling)
++            }
+             return e != nullptr && atoi(e) != 0;
+         }();
+         return on;
+@@ -2580,7 +2589,7 @@ struct ggml_backend_cuda_context {
+                     GGML_LOG_WARN("%s: device %d: the H2D staging ring is slab-only here and a %zu MiB slot "
+                                   "does not fit the reserved hole (even per-slot capacity %zu MiB); staging is "
+                                   "refused for this pass and the scheduler falls back.  Raise "
+-                                  "GGML_CUDA_SLAB_RING_MIB or set GGML_CUDA_SLAB_RING_FALLBACK=1 to restore "
++                                  "GGML_CUDA_SLAB_TRANSPORT_MIB or set GGML_CUDA_SLAB_TRANSPORT_FALLBACK=1 to restore "
+                                   "the cudaMalloc fallback.\n",
+                                   __func__, device, new_size >> 20,
+                                   ggml_cuda_slab_ring_slot_capacity(device) >> 20);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index 922b42553..e3c71ec13 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -296,14 +296,37 @@ void ggml_cuda_slab_set_ring_region(size_t bytes) {
+ // wip/slab-ring-region / first-prefill-latency: the chunk-aligned ring region to CARVE from the current
+ // request (0 when there is no room -- the ring then stays on the cudaMalloc path).  Used only at the point
+ // the region is actually carved into the work layout.  Caller holds `g_slab_mutex`.
+-static size_t ggml_cuda_slab_ring_candidate(const ggml_cuda_slab & s, size_t narrow_floor) {
++static size_t ggml_cuda_slab_ring_candidate(const ggml_cuda_slab & s, size_t narrow_floor, int device) {
+     size_t ring = g_slab_ring_region_bytes;
+-    if (ring > 0) {
+-        ring = ggml_cuda_slab_up(ring, s.chunk);
+-        if (narrow_floor + ring + s.chunk > s.mapped) {
+-            ring = 0;   // no room for a meaningful region: leave the ring on the cudaMalloc path
++    if (ring == 0) {
++        return 0;
++    }
++    // wip/flash-next-prefill (session 4): carve only when the cache CANNOT keep the whole host expert set.
++    // The transport selector decides per prefill width from `(host - covered)`; the region is what makes
++    // staging possible at all (`stage_buffer` -> `arena_alloc_transient` refuses a zero-carve slab), and the
++    // carve itself is a cost: it sits above the narrow floor, so the wide (prefill) view must be placed above
++    // it and the arena loses that band (r362: +2.5 % prefill / +2.5 % decode on the gather arm, 51 tables
++    // stood down per prefill).  Measured on a 2-card `-sm tensor` split, where each device's arena covers its
++    // own shard completely: carving anyway cost **3419 -> 3060 t/s** (-10 %) for a region the selector then
++    // never used.  The cache is sized before the slab init, so this is a measurement, not a guess -- and it is
++    // the SAME number the selector reads, so the two decisions cannot disagree in the expensive direction.
++    {
++        int64_t covered = 0, host = 0;
++        if (moe_cache_residency(device, &covered, &host) && host > 0 && covered >= host) {
++            static bool logged = false;
++            if (!logged) {
++                logged = true;
++                GGML_LOG_INFO("%s: dev=%d: no transport region carved -- the expert cache already keeps the "
++                              "whole host set (%.1f MiB), so the gather has no host read to hide\n",
++                              __func__, device, (double) host / 1048576.0);
++            }
++            return 0;
+         }
+     }
++    ring = ggml_cuda_slab_up(ring, s.chunk);
++    if (narrow_floor + ring + s.chunk > s.mapped) {
++        ring = 0;   // no room for a meaningful region: leave the staging path a cudaMalloc slot
++    }
+     return ring;
+ }
+ 
+@@ -366,7 +389,7 @@ void ggml_cuda_slab_set_narrow_floor(int device, size_t bytes) {
+         return;
+     }
+     s.narrow_floor = nf;
+-    s.ring_region = ggml_cuda_slab_ring_candidate(s, nf);
++    s.ring_region = ggml_cuda_slab_ring_candidate(s, nf, device);
+     s.ring_slots  = ggml_backend_cuda_context::h2d_stage_slots();
+     s.ring_used   = 0;
+ }
+@@ -934,7 +957,7 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+                        "%s (%.0f MiB), but only %.0f MiB is available after the %zu MiB reserve (free %.0f MiB of "
+                        "%.0f MiB total).  Not using the slab; the experts will STREAM from the host (the stock "
+                        "-ncmoe path).  Knobs, largest term first: MOE_EXPERT_CACHE_MIB / "
+-                       "GGML_CUDA_SLAB_MIN_ARENA_MIB lower the floor, GGML_CUDA_SLAB_RING_MIB lowers or "
++                       "GGML_CUDA_SLAB_MIN_ARENA_MIB lower the floor, GGML_CUDA_SLAB_TRANSPORT_MIB lowers or "
+                        "disables the H2D-ring hole, and GGML_CUDA_SLAB_RESERVE_MIB lowers the reserve if it "
+                        "is larger than the weights/KV need.\n",
+                        __func__, device, (double) w / (1024 * 1024), (double) min_arena / (1024 * 1024),
+@@ -982,14 +1005,15 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+     s.inited = true;
+     // TEMP diagnostic (wip/moe-verify-fusions): the full layout accounting.
+     GGML_LOG_WARN("SLAB_INIT dev=%d free=%.2f GiB reserve=%.2f GiB headroom=%.2f GiB aux=%.2f GiB "
+-                  "size(VA)=%.2f GiB mapped=%.2f GiB boundary=%.2f GiB va_spare=%.2f GiB chunk=%.1f MiB ring_req=%.2f GiB\n",
++                  "size(VA)=%.2f GiB mapped=%.2f GiB boundary=%.2f GiB va_spare=%.2f GiB chunk=%.1f MiB "
++                  "transport_req=%.2f GiB\n",
+                   device, (double) free_b/(1ull<<30), (double) ggml_cuda_slab_reserve_bytes(total_b)/(1ull<<30),
+                   (double) ggml_cuda_slab_headroom_bytes()/(1ull<<30), (double) g_slab_aux_reserve_bytes/(1ull<<30),
+                   (double) s.size/(1ull<<30), (double) s.mapped/(1ull<<30), (double) s.boundary/(1ull<<30),
+                   (double) (s.size - s.mapped)/(1ull<<30), (double) s.chunk/(1024*1024),
+                   (double) g_slab_ring_region_bytes/(1ull<<30));
+     GGML_LOG_WARN("%s: device %d: slab %.2f GiB (chunk %.1f MiB): work %.2f GiB + arena %.2f GiB "
+-                  "(%.2f GiB reserve, %.2f GiB VA spare for `ggml_cuda_slab_extend`; ring region %s)\n",
++                  "(%.2f GiB reserve, %.2f GiB VA spare for `ggml_cuda_slab_extend`; transport region %s)\n",
+                   __func__, device, (double) s.mapped / (1ull << 30), (double) s.chunk / (1024 * 1024),
+                   (double) s.boundary / (1ull << 30), (double) (s.mapped - s.boundary) / (1ull << 30),
+                   (double) ggml_cuda_slab_reserve_bytes(total_b) / (1ull << 30),
+@@ -1312,7 +1336,7 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+         // reserve; `work_needs` still floors the boundary at the wide need meanwhile.
+         if (s.narrow_floor == 0 && need < s.boundary) {
+             s.narrow_floor = ggml_cuda_slab_up(need, s.chunk);
+-            s.ring_region = ggml_cuda_slab_ring_candidate(s, s.narrow_floor);
++            s.ring_region = ggml_cuda_slab_ring_candidate(s, s.narrow_floor, device);
+             s.ring_slots  = ggml_backend_cuda_context::h2d_stage_slots();
+             s.ring_used   = 0;
+         }
+@@ -1352,7 +1376,7 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+             // cannot correct it afterwards because the ring's VA is frozen once it holds blocks.  Here no
+             // wide view is live and the ring is idle, so moving its base is safe.
+             s.narrow_floor = ggml_cuda_slab_up(need, s.chunk);
+-            s.ring_region  = ggml_cuda_slab_ring_candidate(s, s.narrow_floor);
++            s.ring_region  = ggml_cuda_slab_ring_candidate(s, s.narrow_floor, device);
+             s.ring_slots   = ggml_backend_cuda_context::h2d_stage_slots();
+             s.ring_used    = 0;
+             s.wide_armed   = false;
+@@ -1596,7 +1620,7 @@ size_t ggml_cuda_slab_ring_region(int device) {
+ 
+ // wip/slab-transient-absorption (F5, step 0): was the ring hole requested for this model?  Distinct from
+ // `ring_region > 0` (which is the CARVE): a requested-but-not-carved hole must refuse the ring fallback,
+-// while `GGML_CUDA_SLAB_RING_MIB=0` (requested == false) keeps the pre-slab cudaMalloc ring.
++// while `GGML_CUDA_SLAB_TRANSPORT_MIB=0` (requested == false) keeps the pre-slab cudaMalloc ring.
+ bool ggml_cuda_slab_ring_requested() {
+     return g_slab_ring_region_bytes > 0;
+ }
+@@ -1630,8 +1654,21 @@ static void ggml_cuda_slab_log_stats_locked(int device, const char * tag) {
+         (void) cudaGetLastError();
+     }
+     ggml_cuda_free_min_sample(device, free_b);
++    // wip/flash-next-prefill, session 4: EVERY field here is one of four kinds of number, and the audit's
++    // whole point is that they were called by two names.  Read them as:
++    //   mapped      the slab's MAPPED extent (grows/shrinks as the arena is mapped and released)
++    //   narrow      the always-resident decode/verify floor (a CARVE)
++    //   transport   the ping-pong's reserved region (a CARVE; 0 = not carved)
++    //   transport_used  bytes of that carve the transport buffers actually hold (USAGE)
++    //   work        the movable boundary, i.e. where `mapped`'s work part ends (a CARVE)
++    //   arena_region    mapped - boundary: the arena's REGION (an extent, NOT residency)
++    //   arena_resident  the expert bytes actually resident (USAGE; the census prints the same figure)
++    //   pool/pool_wide   the workspace pool's bytes (USAGE, from the pool's own accounting)
++    // `arena=` used to mean arena_region here and arena_resident in the MoE census, which is exactly how a
++    // resident figure and a region extent got compared to each other.  Renamed 2026-11-26 (campaign session 4).
+     GGML_LOG_WARN("SLAB_STATS %s dev=%d slab=%d free=%.1f MiB free_min=%.1f MiB total=%.1f MiB mapped=%.1f MiB "
+-                  "work=%.1f MiB (narrow=%.1f ring=%.1f wide_aux=%.1f narrow2=%.1f) arena=%.1f MiB "
++                  "work=%.1f MiB (narrow=%.1f transport=%.1f transport_used=%.1f wide_aux=%.1f narrow2=%.1f) "
++                  "arena_region=%.1f MiB arena_resident=%.1f MiB "
+                   "pool=%.1f MiB pool_wide=%.1f MiB/%zu refused=%.1f MiB outside_max=%.1f MiB "
+                   "outside_failed=%.1f MiB headroom_cfg=%.1f MiB aux_cfg=%.1f MiB "
+                   "wide[n_pop=%zu hole=%zu inval=%zu rebase=%zu aux_refused=%zu]\n",
+@@ -1639,8 +1676,13 @@ static void ggml_cuda_slab_log_stats_locked(int device, const char * tag) {
+                   (double) free_b / 1048576.0, (double) ggml_cuda_free_min_bytes(device) / 1048576.0,
+                   (double) total_b / 1048576.0, (double) mapped / 1048576.0,
+                   (double) boundary / 1048576.0, (double) narrow_floor / 1048576.0,
+-                  (double) ring / 1048576.0, (double) aux / 1048576.0, (double) narrow2 / 1048576.0,
++                  (double) ring / 1048576.0, (double) s.ring_used / 1048576.0,
++                  (double) aux / 1048576.0, (double) narrow2 / 1048576.0,
+                   (double) arena / 1048576.0,
++                  // arena_resident: the EXPERT bytes resident -- the same figure the MoE census calls
++                  // `resident=`.  Lock-free by construction (`moe_cache_resident_bytes` reads an atomic
++                  // mirror), because the cache's own mutex is held ABOVE the slab's in the other direction.
++                  (double) moe_cache_resident_bytes(device) / 1048576.0,
+                   (double) ggml_cuda_pool_mapped_bytes(device) / 1048576.0,
+                   (double) ggml_cuda_pool_wide_bytes(device) / 1048576.0,
+                   ggml_cuda_pool_wide_blocks(device),
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm.h b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+index 7570a3b06..a91e6444e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm.h
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+@@ -89,7 +89,7 @@ size_t ggml_cuda_slab_ring_slot_capacity(int device);
+ size_t ggml_cuda_slab_ring_region(int device);
+ // wip/slab-transient-absorption (F5, step 0): was the ring hole REQUESTED for this model?  The ring
+ // fallback is refused only when it was (an operator can still leave the ring outside the slab with
+-// GGML_CUDA_SLAB_RING_MIB=0, which is the pre-slab behaviour).
++// GGML_CUDA_SLAB_TRANSPORT_MIB=0, which is the pre-slab behaviour).
+ bool   ggml_cuda_slab_ring_requested();
+ // wip/slab-transient-absorption: the WIDE-PHASE auxiliary region (the FA prefill staging arena's home).
+ // Bump-allocates above the live work boundary while the wide view is armed; released with the ring on the
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 19179b609..170f1a7a2 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -940,6 +940,34 @@ void ggml_cuda_pool_wide_refused_reset(int device) {
+     g_pool_wide_refused[device].store(0, std::memory_order_relaxed);
+ }
+ 
++// wip/slab-transient-absorption (step 2b): the WIDE-PHASE pool redirect's shared policy.  Both pools use it
++// (see `ggml_cuda_pool_leg` and `ggml_cuda_pool_vmm`).
++static bool ggml_cuda_pool_wide_enabled() {
++    // Kill switch / A-B knob (default ON; set to 0 to keep every pool allocation outside the slab).
++    static const bool on = [] {
++        const char * e = getenv("GGML_CUDA_POOL_WIDE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return on;
++}
++
++static bool ggml_cuda_pool_wide_debug() {
++    static const bool on = getenv("GGML_CUDA_POOL_WIDE_DEBUG") != nullptr;
++    return on;
++}
++
++static size_t ggml_cuda_pool_wide_min_bytes() {
++    // The band rounds a block up to the slab unit (the VMM granularity, 2 MiB here), so a tiny
++    // allocation would cost a whole unit of the band.  Only sizes at or above one unit are worth
++    // redirecting; the many small prefill scratch blocks stay in the pool.
++    static const size_t v = [] {
++        const char * e = getenv("GGML_CUDA_POOL_WIDE_MIN_MIB");
++        const long long mb = e ? atoll(e) : 1;
++        return (size_t) (mb > 0 ? mb : 1) << 20;
++    }();
++    return v;
++}
++
+ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+     static const int MAX_BUFFERS = 256;
+     // wip/slab-transient-absorption (step 2b): concurrent wide-band blocks one pool can hold.  The band
+@@ -989,31 +1017,6 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+         return prev;
+     }
+ 
+-    static bool wide_enabled() {
+-        // Kill switch / A-B knob (default ON; set to 0 to keep every pool allocation outside the slab).
+-        static const bool on = [] {
+-            const char * e = getenv("GGML_CUDA_POOL_WIDE");
+-            return e == nullptr || atoi(e) != 0;
+-        }();
+-        return on;
+-    }
+-
+-    static bool wide_debug() {
+-        static const bool on = getenv("GGML_CUDA_POOL_WIDE_DEBUG") != nullptr;
+-        return on;
+-    }
+-
+-    static size_t wide_min_bytes() {
+-        // The band rounds a block up to the slab unit (the VMM granularity, 2 MiB here), so a tiny
+-        // allocation would cost a whole unit of the band.  Only sizes at or above one unit are worth
+-        // redirecting; the many small prefill scratch blocks stay in the pool.
+-        static const size_t v = [] {
+-            const char * e = getenv("GGML_CUDA_POOL_WIDE_MIN_MIB");
+-            const long long mb = e ? atoll(e) : 1;
+-            return (size_t) (mb > 0 ? mb : 1) << 20;
+-        }();
+-        return v;
+-    }
+ 
+     void wide_account(int delta_blocks, long long delta_bytes) {
+         if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+@@ -1094,8 +1097,8 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+         // unit), the kill switch, an active graph capture (a captured graph's pointers must stay valid
+         // forever, which a reclaimed band cannot promise) and the band's own availability (slab live AND
+         // wide view armed).
+-        const bool wide_large = size >= wide_min_bytes();
+-        const bool wide_ok    = wide_routing && wide_large && wide_enabled() &&
++        const bool wide_large = size >= ggml_cuda_pool_wide_min_bytes();
++        const bool wide_ok    = wide_routing && wide_large && ggml_cuda_pool_wide_enabled() &&
+                                 !ggml_cuda_graph_capture_active();
+         if (wide_ok && ggml_cuda_slab_wide_available(device)) {
+             size_t gen = 0;
+@@ -1112,7 +1115,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+                     wide_blocks[n_wide].gen  = gen;
+                     n_wide++;
+                     wide_account(+1, (long long) size);
+-                    if (wide_debug()) {
++                    if (ggml_cuda_pool_wide_debug()) {
+                         GGML_LOG_WARN("%s pool[%d]: wide-band alloc %.3f MiB -> %p (live %d)\n",
+                                       __func__, device, (double) size / 1048576.0, p, n_wide);
+                     }
+@@ -1126,10 +1129,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+                 ggml_cuda_slab_wide_aux_free(device, p, size);
+             }
+         }
+-        if (wide_debug() && size >= ((size_t) 1 << 20)) {
++        if (ggml_cuda_pool_wide_debug() && size >= ((size_t) 1 << 20)) {
+             GGML_LOG_WARN("%s pool[%d]: OUTSIDE %.3f MiB (routing=%d enabled=%d capture=%d armed=%d "
+                           "pinned=%d small=%d)\n", __func__, device, (double) size / 1048576.0,
+-                          (int) wide_routing, (int) wide_enabled(), (int) ggml_cuda_graph_capture_active(),
++                          (int) wide_routing, (int) ggml_cuda_pool_wide_enabled(), (int) ggml_cuda_graph_capture_active(),
+                           (int) ggml_cuda_slab_wide_available(device), (int) !wide_routing,
+                           (int) !wide_large);
+         }
+@@ -1250,7 +1253,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+             wide_blocks[i] = wide_blocks[n_wide];
+             wide_blocks[n_wide] = {};
+             wide_account(-1, -(int64_t) size_b);
+-            if (wide_debug()) {
++            if (ggml_cuda_pool_wide_debug()) {
+                 GGML_LOG_WARN("%s pool[%d]: wide-band free  %.3f MiB <- %p (live %d, gen %zu/%zu)\n",
+                               __func__, device, (double) size_b / 1048576.0, ptr, n_wide, gen,
+                               ggml_cuda_slab_wide_aux_gen(device));
+@@ -1331,6 +1334,80 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+ #if defined(GGML_USE_HIP)
+     std::vector<std::pair<CUdeviceptr, size_t>> mappings;
+ #endif
++    // wip/flash-next-prefill (session 4): the WIDE-PHASE redirect, which this pool DID NOT HAVE.  The legacy
++    // pool has served its large prefill temporaries from the slab's wide band since wip/slab-transient-
++    // absorption, and the comment above `ggml_cuda_pool_leg::alloc` states the design consequence ("the
++    // workspace pool's large temporaries now live in the slab") -- but on a VMM build (the default on
++    // gfx1201) `new_pool_for_device` returns THIS pool, so every large temporary came out of the slab
++    // headroom instead and became permanent pool high-water.  Measured consequence (2026-11-26, Flash-Next
++    // GSQ-RCO-IQ3_XXS, `-sm tensor -dev ROCm0,ROCm1 -ncmoe 47 --host-experts pool`, `-ub 8192`): free VRAM at
++    // the wide arm 1201/1211 MiB, this pool at 108 MiB and asking for a 225 MiB scratch, 192 MiB free on the
++    // card -> `HipVMM Failure: out of memory` and exit 134, on BOTH transports (the gather arm too), i.e. a
++    // 2-card tensor split could not run this shape at all.  `GGML_CUDA_SLAB_RESERVE_MIB=4096` worked around it
++    // (3028 t/s) by withholding 2.5 GiB more from the arena -- the alternative to fixing it here.
++    bool wide_routing = true;
++    static const int MAX_WIDE = 64;
++    struct ggml_cuda_wide_block {
++        void * ptr  = nullptr;
++        size_t size = 0;   // the REQUESTED size, i.e. what `free` is handed back
++        size_t gen  = 0;   // the band generation the block was served in (stale detection)
++    };
++    ggml_cuda_wide_block wide_blocks[MAX_WIDE];
++    int n_wide = 0;
++
++    bool set_wide_routing(bool on) override {
++        const bool prev = wide_routing;
++        wide_routing = on;
++        return prev;
++    }
++
++    // wip/flash-next-prefill (session 4): serve `size` from the slab's wide band, bookkeeping it so `free`
++    // recognises it.  Returns nullptr when the band cannot take it (not armed, pinned off, small, a capture is
++    // active, or the band is full) -- the caller then reports/aborts as it did before.
++    // `force` ignores the size floor: it is used on the GROWTH-FAILURE path, where any block at all is
++    // better than aborting a correct run -- a 128 B scratch still needs a whole VMM granularity (2 MiB) of
++    // backing, and with the card 54 MiB from full that create is what failed (measured 2026-11-26 on the
++    // 2-card staged arm: the run completed its generation and died on the first decode step's pool growth).
++    void * wide_try_alloc(size_t size, size_t * actual_size, bool force = false) {
++        if (!wide_routing || (!force && size < ggml_cuda_pool_wide_min_bytes()) ||
++            !ggml_cuda_pool_wide_enabled() || ggml_cuda_graph_capture_active() || n_wide >= MAX_WIDE ||
++            !ggml_cuda_slab_wide_available(device)) {
++            return nullptr;
++        }
++        size_t gen = 0;
++        void * p = ggml_cuda_slab_wide_aux_alloc(device, size, &gen);
++        if (p == nullptr) {
++            if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
++                g_pool_wide_refused[device].fetch_add(size, std::memory_order_relaxed);
++            }
++            return nullptr;
++        }
++        wide_blocks[n_wide].ptr  = p;
++        wide_blocks[n_wide].size = size;
++        wide_blocks[n_wide].gen  = gen;
++        n_wide++;
++        wide_account(+1, (long long) size);
++        if (ggml_cuda_pool_wide_debug()) {
++            GGML_LOG_WARN("%s pool[%d]: wide-band alloc %.3f MiB -> %p (live %d, the pool could not grow)\n",
++                          __func__, device, (double) size / 1048576.0, p, n_wide);
++        }
++        *actual_size = size;
++        return p;
++    }
++
++    void wide_account(int delta_blocks, long long delta_bytes) {
++        if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++            return;
++        }
++        if (delta_blocks > 0) {
++            g_pool_wide_blocks[device].fetch_add((size_t) delta_blocks, std::memory_order_relaxed);
++        } else if (delta_blocks < 0) {
++            g_pool_wide_blocks[device].fetch_sub((size_t) -delta_blocks, std::memory_order_relaxed);
++        }
++        if (delta_bytes != 0) {
++            g_pool_wide_bytes[device].fetch_add((size_t) delta_bytes, std::memory_order_relaxed);
++        }
++    }
+ 
+     explicit ggml_cuda_pool_vmm(int device) :
+         device(device),
+@@ -1375,7 +1452,35 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+             prop.location.id = physical_device;
+             CUmemGenericAllocationHandle handle;
+-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
++            // wip/flash-next-prefill (session 4): a workspace-pool growth that the driver refuses is a VRAM
++            // exhaustion, and it used to be a hard abort (`HipVMM Failure: out of memory`, exit 134).  That is
++            // what made a 2-card `-sm tensor` host-expert arm unrunnable: the arm is correct and fast, it just
++            // asked for its scratch when the card was 192 MiB from full.  A failed transient must be FAIL-SOFT
++            // (`MANIFESTS.md`, the optional-transient rule), so the scratch is taken from the slab's wide band
++            // -- the region a prefill already claims -- while that band is armed; if there is no band either,
++            // abort with the sizes (the bare driver string named none of them).
++            const hipError_t cerr = cuMemCreate(&handle, reserve_size, &prop, 0);
++            if (cerr != hipSuccess) {
++                (void) cudaGetLastError();
++                void * band = wide_try_alloc(size, actual_size, /*force=*/true);
++                if (band != nullptr) {
++                    return band;
++                }
++                size_t free_b = 0, total_b = 0;
++                CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
++                GGML_ABORT("HipVMM Failure: out of memory\n"
++                           "  the workspace pool on device %d cannot grow by %.1f MiB "
++                           "(pool already %.1f MiB of %.1f MiB VA, this request %.1f MiB)\n"
++                           "  device %d has %.1f MiB free of %.1f MiB, and the slab's wide band has no room "
++                           "either (armed=%d, routing=%d)\n"
++                           "  (%s)\n",
++                           device, (double) reserve_size / 1048576.0,
++                           (double) pool_size / 1048576.0, (double) CUDA_POOL_VMM_MAX_SIZE / 1048576.0,
++                           (double) size / 1048576.0,
++                           device, (double) free_b / 1048576.0, (double) total_b / 1048576.0,
++                           (int) ggml_cuda_slab_wide_available(device), (int) wide_routing,
++                           hipGetErrorString(cerr));
++            }
+ 
+             // reserve virtual address space (if not already reserved)
+             if (pool_addr == 0) {
+@@ -1482,6 +1587,37 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+         printf("cuda pool[%d]: freed %llu bytes at %llx\n", device, (unsigned long long) size, ptr);
+ #endif
+ 
++        // wip/flash-next-prefill (session 4): a wide-band block was never part of the bump stack, so it must be
++        // recognised BEFORE `pool_used` moves -- the same rule `ggml_cuda_pool_leg::free` follows.
++        for (int i = 0; i < n_wide; i++) {
++            if (wide_blocks[i].ptr != ptr) {
++                continue;
++            }
++            const size_t size_b = wide_blocks[i].size;
++            const size_t gen    = wide_blocks[i].gen;
++            n_wide--;
++            wide_blocks[i] = wide_blocks[n_wide];
++            wide_blocks[n_wide] = {};
++            wide_account(-1, -(long long) size_b);
++            if (ggml_cuda_pool_wide_debug()) {
++                GGML_LOG_WARN("%s pool[%d]: wide-band free  %.3f MiB <- %p (live %d, gen %zu/%zu)\n",
++                              __func__, device, (double) size_b / 1048576.0, ptr, n_wide, gen,
++                              ggml_cuda_slab_wide_aux_gen(device));
++            }
++            if (gen != ggml_cuda_slab_wide_aux_gen(device)) {
++                static bool warned = false;
++                if (!warned) {
++                    warned = true;
++                    GGML_LOG_WARN(GGML_CUDA_NAME " pool[%d]: freeing a wide-band block (%.2f MiB) from a dead "
++                                  "generation: a pool allocation outlived the prefill band\n",
++                                  device, (double) size / 1048576.0);
++                }
++                return;
++            }
++            ggml_cuda_slab_wide_aux_free(device, ptr, size_b);
++            return;
++        }
++
+         pool_used -= size;
+ 
+         // all deallocations must be in reverse order of the allocations.
+@@ -2821,7 +2957,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer_usage(gg
+             if (ggml_cuda_slab_cache_unusable(buft_ctx->device)) {
+                 moe_cache_disable_streaming("the movable-boundary slab cannot hold the work buffers plus the "
+                                             "minimum MoE cache on this device (MOE_EXPERT_CACHE_MIB / "
+-                                            "GGML_CUDA_SLAB_MIN_ARENA_MIB set the floor, GGML_CUDA_SLAB_RING_MIB "
++                                            "GGML_CUDA_SLAB_MIN_ARENA_MIB set the floor, GGML_CUDA_SLAB_TRANSPORT_MIB "
+                                             "the H2D-ring hole); lower GGML_CUDA_SLAB_RESERVE_MIB if the reserve "
+                                             "is too large");
+             } else if (ggml_cuda_slab_configured() && ggml_cuda_slab_declined(buft_ctx->device)) {
+@@ -2847,7 +2983,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer_usage(gg
+                                    "model but could not be created (%s).  Disabling the MoE expert cache and "
+                                    "streaming the experts from the host; the run is correct but slower.  "
+                                    "Workarounds: free VRAM / lower GGML_CUDA_SLAB_RESERVE_MIB (or "
+-                                   "GGML_CUDA_SLAB_RING_MIB, MOE_EXPERT_CACHE_MIB), or set "
++                                   "GGML_CUDA_SLAB_TRANSPORT_MIB, MOE_EXPERT_CACHE_MIB), or set "
+                                    "GGML_CUDA_SLAB=0 to silently take the plain path.  If this is unexpected, "
+                                    "please report the reproduction at "
+                                    "https://github.com/stew675/llama-cpp-rdna-boosts/issues\n",
+@@ -10944,6 +11080,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+ 
+ 
+ static bool ggml_backend_cuda_moe_cache_pool_backed(ggml_backend_t backend, const struct ggml_tensor * weight);
++static void ggml_backend_cuda_moe_cache_residency(ggml_backend_t backend, int64_t * covered, int64_t * host);
+ 
+ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .get_name                = */ ggml_backend_cuda_get_name,
+@@ -10975,6 +11112,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
+     /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
+     /* .moe_cache_pool_backed   = */ ggml_backend_cuda_moe_cache_pool_backed,
++    /* .moe_cache_residency     = */ ggml_backend_cuda_moe_cache_residency,
+     /* .cpy_tensor_async_nowait = */ ggml_backend_cuda_cpy_tensor_async_nowait,
+     /* .moe_cache_pending      = */ ggml_backend_cuda_moe_cache_pending,
+     /* .moe_cache_register     = */ ggml_backend_cuda_moe_cache_register,
+@@ -11960,15 +12098,28 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
+     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
+ }
+ 
+-// wip/slab-ring-region (issue #164): the H2D staging-ring cap.  `GGML_CUDA_SLAB_RING_MIB` is a verbatim
+-// per-GPU override; otherwise the context auto-sizes it (`slab_set_ring_cap`) from the ubatch and the
+-// host-expert device count.  `g_ring_max_table` is stashed by the preflight so the recompute has the model
+-// bound the cap clamps against.  6144 MiB is the fallback for a consumer that never auto-sizes.
++// wip/slab-ring-region (issue #164): the transport region's cap.  `GGML_CUDA_SLAB_TRANSPORT_MIB` is a verbatim
++// per-GPU override; otherwise the context auto-sizes it (`slab_set_ring_cap`) from the ping-pong's buffer
++// count and the largest host-weight split set.  `g_ring_max_table` is stashed by the preflight so the recompute
++// has the model bound the cap clamps against.  6144 MiB is the fallback for a consumer that never auto-sizes.
++//
++// wip/flash-next-prefill (session 4): RENAMED -- the ring is gone, so the name is now the TRANSPORT region
++// (the slab carve that holds the ping-pong buffers).  `GGML_CUDA_SLAB_RING_MIB` is kept as a DEPRECATED alias
++// (same value, same precedence) so an existing script or a bisect arm keeps working; nothing new should set it.
+ static size_t g_h2d_ring_cap_bytes = 0;
+ static size_t g_ring_max_table    = 0;
+ 
++// The explicit override, whichever spelling set it (new name first), or nullptr.
++static const char * h2d_transport_mib_env() {
++    const char * e = getenv("GGML_CUDA_SLAB_TRANSPORT_MIB");
++    if (e == nullptr) {
++        e = getenv("GGML_CUDA_SLAB_RING_MIB");   // deprecated alias (pre-session-4 spelling)
++    }
++    return e;
++}
++
+ size_t ggml_cuda_h2d_ring_cap_bytes() {
+-    const char * e = getenv("GGML_CUDA_SLAB_RING_MIB");
++    const char * e = h2d_transport_mib_env();
+     if (e != nullptr) {
+         return (size_t) atoll(e) << 20;
+     }
+@@ -11993,13 +12144,29 @@ void ggml_cuda_h2d_ring_cap_set(size_t bytes) {
+ // 89199-token prompt): hole 6656 MiB -> boundary 3264 -> 11776 MiB, 8500 MiB / 51 tables stood down at
+ // every prefill plus their 54-table re-arm at the drop, 1895.4 t/s prefill / 34.18 t/s decode; without the
+ // hole the boundary stays at 3328 MiB, no table stands down, and the same run reads 1942.7 / 35.00 t/s
+-// (+2.5 % / +2.5 %).  `GGML_CUDA_SLAB_RING_MIB=<MiB>` (an explicit ring size) wins over this rule, and an
++// (+2.5 % / +2.5 %).  `GGML_CUDA_SLAB_TRANSPORT_MIB=<MiB>` (an explicit ring size) wins over this rule, and an
+ // explicit `GGML_SCHED_DEVGATHER=0` (staging) keeps the hole, because that arm really does stage.
+ static size_t slab_ring_region_bytes(size_t max_host_table) {
+-    if (getenv("GGML_CUDA_SLAB_RING_MIB") == nullptr && moe_cache_host_pool_requested()) {
++    if (h2d_transport_mib_env() == nullptr && moe_cache_host_pool_requested()) {
++        // wip/flash-next-prefill (session 4, the handover's §6.5): the ZERO-CARVE rule, RE-KEYED.  It used to
++        // key on `GGML_SCHED_DEVGATHER`: "the device gather is the transport, and a gathered pool table never
++        // stages, so do not carve".  That stopped being the whole story when the scheduler gained a transport
++        // SELECTOR (`sched_stage_exposure_decides`): with selector mode 1 it STAGES a pool-backed table at
++        // prefill width whenever the host exposure justifies it -- and in a zero-carve slab every one of those
++        // fills is refused by `ggml_cuda_slab_arena_alloc_transient` (`ring_region == 0`), so each split fell
++        // to the scheduler's SERIAL whole-table upload.  Measured 2026-11-26 (89k Flash-Next, 1 GPU x8,
++        // `-ub 8192`): 2045 t/s with the selector on a carved slab vs **338 t/s** with it zero-carved, the
++        // latter showing `transport=0.0` at the wide arm and `prefill fills: ok=2` (the rest went through the
++        // per-expert pinned bounce).  The predicate is now the honest one: carve unless staging is disabled
++        // outright (`GGML_SCHED_STAGE=0`) or the selector is off AND the gather owns the tier
++        // (`GGML_SCHED_STAGE_SELECT=0` + mode 1), which is the arm the r362 numbers were measured on.
++        const char * stage_env = getenv("GGML_SCHED_STAGE");
++        const char * select_env = getenv("GGML_SCHED_STAGE_SELECT");
++        const bool staging_disabled = stage_env != nullptr && atoi(stage_env) == 0;
++        const bool selector_off = select_env != nullptr && select_env[0] != '\0' && atoi(select_env) == 0;
+         const char * dg = getenv("GGML_SCHED_DEVGATHER");
+         const bool gathers_pool_tables = dg == nullptr || dg[0] == '\0' || atoi(dg) == 1;
+-        if (gathers_pool_tables) {
++        if (staging_disabled || (selector_off && gathers_pool_tables)) {
+             return 0;
+         }
+     }
+@@ -12068,6 +12235,17 @@ static bool ggml_backend_cuda_moe_cache_pool_backed(ggml_backend_t backend, cons
+     return moe_cache_table_is_pool(weight, ctx->device);
+ }
+ 
++// wip/flash-next-prefill (session 4): the transport selector's input (see the iface comment).
++static void ggml_backend_cuda_moe_cache_residency(ggml_backend_t backend, int64_t * covered, int64_t * host) {
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    if (covered != nullptr) { *covered = 0; }
++    if (host != nullptr)    { *host    = 0; }
++    if (ctx == nullptr) {
++        return;
++    }
++    (void) moe_cache_residency(ctx->device, covered, host);
++}
++
+ static void ggml_backend_cuda_device_moe_cache_forget(ggml_backend_dev_t dev) {
+     // r143: the model that registered this device's host-expert tables is being freed (`llama_model_free`).
+     // Drop them before its host masters go: the deferred arena sizing fills EVERY registered table, so a
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index f35f0d4f1..13faa30b7 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -722,6 +722,35 @@ int64_t                             g_min_mib    = 0;      // auto: decline the
+ int                                 g_min_res_pct= 0;      // auto: decline the arena below this percent of the host experts
+ int                                 g_slots_hint = 0;    // 0 => derive from budget
+ int64_t                             g_arena_bytes= 0;
++// wip/flash-next-prefill (session 4): a lock-free mirror of `g_arena_bytes`, i.e. the RESIDENT expert bytes,
++// PER DEVICE.  The slab's stats line is per device and the cache calls into the slab with `g_mutex` held, so
++// the slab must not take `g_mutex` back (`moe_cache_resident_bytes`).  Every mutation of `g_arena_bytes` syncs
++// the mirror for its own device; the total is the sum, which on a tensor split is NOT the device's residency
++// (each device holds a shard) -- the single `g_arena_bytes` cannot answer that, which is why the mirror is an
++// array and why the census' `resident=` is process-wide while the slab's is per device.
++static int64_t                      g_arena_dev_bytes[GGML_CUDA_MAX_DEVICES] = {};
++static std::atomic<int64_t>         g_arena_dev_bytes_mirror[GGML_CUDA_MAX_DEVICES];
++static inline void                  arena_bytes_changed(int device) {
++    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
++        g_arena_dev_bytes_mirror[device].store(g_arena_dev_bytes[device], std::memory_order_relaxed);
++    }
++}
++// One table's residency moved: keep the total (the census' figure) and this device's share (the slab's) in
++// step, and clamp both at 0.  Callers hold `g_mutex`.
++static inline void arena_bytes_delta(int device, int64_t slots, int64_t expert_bytes, int sign) {
++    const int64_t d = slots * expert_bytes * (int64_t) sign;
++    g_arena_bytes += d;
++    if (g_arena_bytes < 0) {
++        g_arena_bytes = 0;
++    }
++    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
++        g_arena_dev_bytes[device] += d;
++        if (g_arena_dev_bytes[device] < 0) {
++            g_arena_dev_bytes[device] = 0;
++        }
++    }
++    arena_bytes_changed(device);
++}
+ // wip/apu-expert-gtt P3: how many times a table handed its arena BACK (the GTT store's `release`).  A
+ // steady-state residency arm must show 0: a slot is reused, never returned, and a non-zero count means
+ // the table set was re-sized under a live graph (the state the tier must not reach).
+@@ -6453,10 +6482,7 @@ static void free_table_buffers_locked(table_t & t) {
+     free_heat_dev_locked(t);   // folds the prefill tally into `heat` before the mirror goes away
+     (void) cudaGetLastError();   // fail soft: a bad free must not abort a run
+ 
+-    g_arena_bytes -= (int64_t) t.slots * (int64_t) t.expert_bytes;
+-    if (g_arena_bytes < 0) {
+-        g_arena_bytes = 0;
+-    }
++    arena_bytes_delta(t.device, (int64_t) t.slots, (int64_t) t.expert_bytes, -1);
+     t.slots          = 0;
+     t.allocated      = false;
+     t.identity       = false;
+@@ -6697,7 +6723,7 @@ void alloc_table_locked(table_t & t, int slots) {
+     pool_rerank_from_heat_locked(t);
+     // Account the count ACTUALLY allocated (`slots`/`t.slots`), not the requested `arena_slots`: on a
+     // shrunk table the two differ and the old `arena_slots` accounting over-reported the arena.
+-    g_arena_bytes += (int64_t) slots * t.expert_bytes;
++    arena_bytes_delta(t.device, (int64_t) slots, (int64_t) t.expert_bytes, +1);
+ }
+ 
+ // Set when the sizing runs with host-expert tables: the workspace pool then keeps a free-VRAM floor
+@@ -7828,6 +7854,41 @@ void moe_cache_set_extra_reserve(int device, size_t bytes) {
+                   __func__, (double) bytes / (1024 * 1024));
+ }
+ 
++// wip/flash-next-prefill (session 4): the RESIDENT expert bytes, lock-free.  Defined OUTSIDE the file's
++// anonymous namespace (it is a public entry point declared in moe-expert-cache.h) and it reads the atomic
++// mirror the cache keeps beside `g_arena_bytes`, so the slab may call it while holding `g_slab_mutex` without
++// inverting the cache->slab lock order.
++int64_t moe_cache_resident_bytes(int device) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return 0;
++    }
++    return g_arena_dev_bytes_mirror[device].load(std::memory_order_relaxed);
++}
++
++bool moe_cache_residency(int device, int64_t * covered, int64_t * host) {
++    if (covered != nullptr) { *covered = 0; }
++    if (host != nullptr)    { *host    = 0; }
++    if (!g_enabled) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(g_mutex);
++    int64_t cov = 0, all = 0;
++    for (const table_t & t : g_tables) {
++        if (t.device != device || t.n_experts <= 0 || t.expert_bytes == 0) {
++            continue;
++        }
++        // Capacity, not current occupancy: the selector asks "could the device keep this set", which is
++        // what decides how many bytes come over the link in the steady state.
++        if (t.slots > 0) {
++            cov += (int64_t) t.slots * (int64_t) t.expert_bytes;
++        }
++        all += (int64_t) t.n_experts * (int64_t) t.expert_bytes;
++    }
++    if (covered != nullptr) { *covered = cov; }
++    if (host != nullptr)    { *host    = all; }
++    return all > 0;
++}
++
+ bool moe_cache_get_stats(int64_t * hits, int64_t * misses, int64_t * arena_bytes) {    // Per-turn accounting for the server: aggregate the same counters `moe_cache_report` prints, so a
+     // caller can snapshot before/after a turn and log the delta.  The counters are process-global (the
+     // arena is one per-device cache shared by every slot), so with concurrent slots a delta is the
+@@ -7926,10 +7987,7 @@ static void stand_down_table_locked(table_t & t, int idx) {
+     t.slot_dirty   = true;
+     t.slot_expert.clear();
+     t.expert_slot.clear();
+-    g_arena_bytes -= (int64_t) old_slots * (int64_t) t.expert_bytes;
+-    if (g_arena_bytes < 0) {
+-        g_arena_bytes = 0;
+-    }
++    arena_bytes_delta(old_device, (int64_t) old_slots, (int64_t) t.expert_bytes, -1);
+     if (old_device >= 0) {
+         moe_cache_sync_devices_locked();   // no kernel that reads this arena may still be in flight
+         device_guard dg(old_device);
+@@ -8852,10 +8910,7 @@ size_t moe_cache_evict_slab_range(int device, void * lo, void * hi) {
+         // device buffers are separate cudaMalloc allocations and are kept, so a
+         // later re-size/re-arm can reuse them.
+         ggml_cuda_slab_arena_free(device, t.arena, bytes);
+-        g_arena_bytes -= (int64_t) t.slots * (int64_t) t.expert_bytes;
+-        if (g_arena_bytes < 0) {
+-            g_arena_bytes = 0;
+-        }
++        arena_bytes_delta(device, (int64_t) t.slots, (int64_t) t.expert_bytes, -1);
+         freed += bytes;
+ 
+         t.arena          = nullptr;
+@@ -10566,6 +10621,30 @@ static int64_t stage_merge_floor_bytes(int device) {
+     return bw >= (float) gbps_env ? (int64_t) (16.0 * 1024.0 * 1024.0) : 0;
+ }
+ 
++// wip/flash-next-prefill: the fill FORM, derived from the DEVICE's own calibrated link when
++// `MOE_HOST_POOL_STAGE_BULK` is unset.  The two forms are not a free choice: the hybrid divides the table
++// into one copy-engine DMA per host run plus one kernel launch for the arena-resident experts, which wins
++// where a run's issue path is the cost (a slow link) and loses where the copy engine is fast enough that a
++// single whole-table DMA of the same bytes is cheaper than the extra launch.  Measured 2026-11-26
++// (Flash-Next GSQ-RCO-IQ3_XXS, 89 234-token prefill, `--host-experts pool -ub 8192`): x8 at 28.7 GB/s
++// hybrid 2440-2509 vs bulk 2343-2346, i.e. the hybrid is +4 %; x16 at 51-55 GB/s hybrid 2458 vs bulk
++// 2522, i.e. bulk is +2.6 % and the tightest arm on that box.  Same physical quantity as the merge floor
++// (`stage_merge_floor_bytes`), so it shares the threshold: above it the copy engine is not the bottleneck
++// and one DMA of the whole table is the right shape.  An uncalibrated link keeps the hybrid (the arm that
++// is never the worst of the two).
++static int stage_bulk_form(int device) {
++    const float bw = ggml_cuda_device_h2d_gbps(device);
++    static const float gbps = [] {
++        const char * e = getenv("MOE_HOST_POOL_STAGE_BULK_GBPS");
++        const double v = e != nullptr ? atof(e) : 0.0;
++        return (float) (v > 0.0 ? v : 50.0);
++    }();
++    if (bw <= 0.0f) {
++        return 2;   // not calibrated yet: the hybrid, the arm that is never the slower of the two
++    }
++    return bw >= gbps ? 1 : 2;
++}
++
+ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, size_t width, size_t stride_src,
+                            size_t n_copies, void * dst, void * compute_stream, void * copy_stream,
+                            void * order_event) {
+@@ -10575,10 +10654,12 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+     }
+     static uint64_t ordered_seq[GGML_CUDA_MAX_DEVICES] = {};
+     std::lock_guard<std::mutex> lock(g_mutex);
++    bool matched = false;
+     for (table_t & t : g_tables) {
+         if (t.device != device || t.host != host_src || t.src_off != offset) {
+             continue;
+         }
++        matched = true;
+         if (t.n_experts <= 0 || t.host == nullptr) {
+             g_stage_decline_usable++;
+             stage_decline_note(t, "the cache holds no expert count/master for it");
+@@ -10667,7 +10748,9 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+             // t/s against the gather's 2117).  `MOE_HOST_POOL_STAGE_BULK=0` is the kill switch.
+             // `MOE_HOST_POOL_STAGE_BULK`: 0 = the pre-patch paths (two-tier kernel, then the bounce),
+             // 1 = one DMA of the whole table, 2 = THE HYBRID (default): merged host runs by copy-engine DMA
+-            // plus ONE kernel launch for the arena-resident experts.
++            // plus ONE kernel launch for the arena-resident experts.  UNSET = DERIVED per device from the
++            // calibrated H2D link (`stage_bulk_form`: bulk above ~50 GB/s, the hybrid below), which is the
++            // arm each box actually measured.  See the table in `stage_bulk_form`'s comment.
+             //
+             // The hybrid is the shape asked for from the start of the slab/arena work: each engine does the half
+             // it is good at.  A copy engine reaches the link (~28 GB/s here) but needs long runs to amortise its
+@@ -10677,24 +10760,14 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+             // is deliberately OVER-FETCHED from the pool (which mirrors every expert) to lengthen its
+             // neighbouring run -- and the ARENA side is one kernel launch, which never crosses PCIe.
+             // `MOE_HOST_POOL_STAGE_MERGE=<n>` (default 1 = coalesce only, no over-fetch).
+-            static const int stage_bulk = [] {
++            static const int stage_bulk_env = [] {
+                 const char * e = getenv("MOE_HOST_POOL_STAGE_BULK");
+-                return e == nullptr || e[0] == '\0' ? 2 : atoi(e);
+-            }();
+-            static const int stage_merge = [] {
+-                const char * e = getenv("MOE_HOST_POOL_STAGE_MERGE");
+-                const int v = e != nullptr ? atoi(e) : 1;
+-                return v < 1 ? 1 : v;
++                return e == nullptr || e[0] == '\0' ? -1 : atoi(e);
+             }();
+-            // `MOE_HOST_POOL_STAGE_MERGE_BYTES=<MiB>`: the same policy in BYTES, which is the currency the trade
+-            // is really denominated in.  A resident gap splits one host DMA into two, so the gap costs a DMA issue
+-            // (plus the short-run rate penalty) and merging it costs the gap's bytes at the link rate.  Merge while
+-            // `gap_bytes / bw < issue_cost`, i.e. while the gap is SMALLER than `bw * issue_cost` -- a threshold that
+-            // is a property of the LINK (and of the DEVICE's own link, which matters on a heterogeneous split), not
+-            // of the model's expert size.  The expert count above is only a proxy for it, and a different GGUF moves
+-            // it: the same `MERGE=4` is 2.2 MiB of Flash-Next expert and 3.5 MiB of a 122B-A10B expert.  Measured
+-            // 2026-11-26: the break-even gap is ~0.5 MiB/device at 28.7 GB/s (x8) and ~1-2 MiB at 51 GB/s (x16),
+-            // which is exactly why a fixed expert count loses on one box and wins on the other.
++            const int stage_bulk = stage_bulk_env >= 0 ? stage_bulk_env : stage_bulk_form(device);
++            // The expert-count and gap-budget over-fetch forms were MEASUREMENTS, not candidates (session 3
++            // §3.6): both are deleted before promotion.  Only the RUN FLOOR (`..._MERGE_FLOOR`) survives,
++            // because it is the one form whose threshold is derivable from the link itself.
+             // `MOE_HOST_POOL_STAGE_MERGE_FLOOR=<MiB>`: **no host DMA smaller than this** (a table boundary is the one
+             // exception -- there is nothing to absorb there).  This is the policy the transport wants: the copy
+             // engine's penalty is a function of the DMA's own size (measured here: 0.65 MiB copies reach 41 GB/s,
+@@ -10704,12 +10777,6 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+             // resident region that leaves a small host run is fixed here and left alone there.  Per DEVICE, since
+             // each device has its own link.
+             const int64_t stage_merge_floor = stage_merge_floor_bytes(device);
+-            static const int64_t stage_merge_bytes = [] {
+-                const char * e = getenv("MOE_HOST_POOL_STAGE_MERGE_BYTES");
+-                if (e == nullptr || e[0] == '\0') { return (int64_t) 0; }
+-                const double mib = atof(e);   // fractional: the x8 break-even gap is ~0.5 MiB
+-                return mib > 0.0 ? (int64_t) (mib * 1024.0 * 1024.0) : (int64_t) 0;
+-            }();
+             // Copy-engine geometry for a staged table.  ONE 2-D copy per coalesced run covers all three
+             // shapes the ring stages, because the destination is always packed in expert order:
+             //   unsplit whole table / pinned master : rows_per = 1,    bytes = expert_bytes, src pitch = host_bytes
+@@ -10771,27 +10838,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+                             from_host[(size_t) e] = 0;
+                         }
+                     }
+-                    // Over-fetch across SHORT resident runs, so a host run is not split for the sake of one or
+-                    // two resident experts (the pool has them too, so the merge needs no second source and no
+-                    // patch pass): the boundary resident experts simply come from the host as well.
+-                    if (stage_merge > 1 || stage_merge_bytes > 0) {
+-                        for (int e = 0; e < ne; ) {
+-                            if (from_host[(size_t) e]) { e++; continue; }
+-                            int e2 = e;
+-                            while (e2 < ne && !from_host[(size_t) e2]) { e2++; }
+-                            const int64_t gap_bytes = (int64_t) (e2 - e) * (int64_t) t.expert_bytes;
+-                            const bool  merge_gap = (e2 - e) < stage_merge ||
+-                                                    (stage_merge_bytes > 0 && gap_bytes <= stage_merge_bytes);
+-                            if (e > 0 && from_host[(size_t) e - 1] && e2 < ne && from_host[(size_t) e2] && merge_gap) {
+-                                for (int k = e; k < e2; k++) {
+-                                    prs_new[(size_t) k]   = -1;
+-                                    from_host[(size_t) k] = 1;
+-                                    g_stage_overfetch_experts++;
+-                                }
+-                            }
+-                            e = e2;
+-                        }
+-                    }
++                    // Over-fetch across SHORT resident runs is the RUN FLOOR's job (below): the expert-count
++                    // and gap-budget forms were measured and are gone (see the note above `stage_merge_floor`).
+                     // The RUN FLOOR: grow every host run smaller than `stage_merge_floor` by absorbing its adjacent
+                     // arena-resident experts (the shorter side first, so the over-fetch is minimal) until the run
+                     // reaches the floor, hits a table boundary, or has nothing left to absorb.  A pass may join two
+@@ -11101,6 +11149,14 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+         return cudaGetLastError() == cudaSuccess;
+     }
+     g_stage_decline_nomatch++;
++    if (getenv("GGML_MOE_STAGE_DEBUG") != nullptr) {
++        static int n = 0;
++        if (n++ < 6) {
++            GGML_LOG_WARN("%s: no table matched dev=%d src=%p off=%zu width=%zu copies=%zu (tables=%zu) -> the "
++                          "bounce path serves this upload\n", __func__, device, host_src, offset, width,
++                          n_copies, g_tables.size());
++        }
++    }
+     return false;
+ }
+ 
+@@ -12456,10 +12512,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
+         t.remap_cap    = 0;
+         t.slots        = 0;
+         t.arena_reserved = 0;
+-        g_arena_bytes -= (int64_t) old_slots * (int64_t) t.expert_bytes;
+-        if (g_arena_bytes < 0) {
+-            g_arena_bytes = 0;
+-        }
++        arena_bytes_delta(old_device, (int64_t) old_slots, (int64_t) t.expert_bytes, -1);
+         {
+             device_guard dg(old_device);
+             // The arena and the heat mirrors bump for themselves; the remap and the routing staging are
+@@ -13563,9 +13616,16 @@ static void report_locked() {
+     const int     * dev_tables = g_report_snap.dev_tables;
+     const int64_t total = hits + misses;
+     const double h = total > 0 ? (double) hits / (double) total : 0.0;
+-    GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
++    GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, "
++                  "resident=%.1f MiB total (budget %s MiB/device)\n",
+                   __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
+                   n_tables, n_slots, (double) arena_b / (1024 * 1024), budget_desc());
++    // wip/flash-next-prefill (session 4, the reporting audit): the field above was `arena=` and it is the
++    // RESIDENT expert bytes (`sum(slots * expert_bytes)`), not the arena's REGION.  The slab's own stats line
++    // had an `arena=` that WAS the region (mapped - boundary), so the two numbers were compared to each other
++    // as if they named the same thing -- and at the wide arm they do not (23 488 MiB region against 21 183 MiB
++    // resident on the 89k Flash-Next shape).  `resident=` here, `arena_region=` there, `arena_resident=` on
++    // both.
+     // r362 (issue #368): WHICH tables, not just how many.  The eviction and re-arm messages carry counts and
+     // bytes, so two runs whose numbers agree on `h`/`evictions` can still hold different LAYERS -- which is
+     // exactly the state a residency-dependent report cannot otherwise name.  `MOE_EXPERT_CACHE_TABLES=1`
+@@ -13983,22 +14043,23 @@ static void report_locked() {
+             snprintf(buf, sizeof(buf), ", +%zu more (see the per-table lines below)", named.size() - 12);
+             tables += buf;
+         }
+-        GGML_LOG_WARN("%s: prefill staging declined %zu of %zu host table(s): %s%s.  Affected: %s.  They are "
+-                      "served by the scheduler's own whole-table upload instead (not staged, so their bytes "
+-                      "are missing from the staging census above); a stood-down one is re-armed at the "
++        GGML_LOG_WARN("%s: prefill fill declined %zu of %zu host table(s): %s%s.  Affected: %s.  They are "
++                      "served by the scheduler's own whole-table upload instead (not filled, so their bytes "
++                      "are missing from the fill census above); a stood-down one is re-armed at the "
+                       "compute-buffer drop, so this is a prefill-only state\n",
+                       __func__, g_stage_declined.size(), g_tables.size(),
+                       same_why ? first_why : "several reasons --", same_why ? "" : " each listed per table below",
+                       tables.c_str());
+         for (const stage_decline_t & d : g_stage_declined) {
+-            GGML_LOG_INFO("%s: prefill staging declined: layer=%d role=%s dev=%d: %s\n", __func__, d.layer,
++            GGML_LOG_INFO("%s: prefill fill declined: layer=%d role=%s dev=%d: %s\n", __func__, d.layer,
+                           d.role.c_str(), d.device, d.why.c_str());
+         }
+     }
+     if (g_stage_ok + g_stage_decline_geom + g_stage_decline_usable + g_stage_decline_nomatch > 0) {
+         const double total = (double) g_stage_arena_bytes + (double) g_stage_host_bytes;
+-        GGML_LOG_INFO("%s: prefill cache staging: ok=%lld geom_decline=%lld unusable=%lld nomatch=%lld "
+-                      "unsized=%lld (the priming pass); arena=%.1f MiB host=%.1f MiB (H2D %.1f%% of staged); "
++        GGML_LOG_INFO("%s: prefill fills: ok=%lld geom_decline=%lld unusable=%lld nomatch=%lld "
++                      "unsized=%lld (the priming pass); arena_copies=%.1f MiB host_copies=%.1f MiB "
++                      "(H2D %.1f%% of filled); "
+                       "BULK %lld calls %.1f MiB, %lld host DMAs (%lld over-fetched experts); PRS rebuilds=%lld\n",
+                       __func__, (long long) g_stage_ok, (long long) g_stage_decline_geom,
+                       (long long) g_stage_decline_usable, (long long) g_stage_decline_nomatch,
+@@ -14084,7 +14145,7 @@ static void report_locked() {
+     // live, so it is clamped to `mapped - (narrow + ring + wide)` -- a figure that shrinks as `-ub` grows.
+     // The settle at each prefill -> decode drop recovers it, and these counters are what prove the settle ran.
+     GGML_LOG_INFO("%s: arena settle: %lld layer(s) raised at a prefill -> decode drop; %lld drop(s) had nothing "
+-                  "to re-arm; prior gain %.2f pp vs the %.2f pp gate (%s); GPU arena %.1f MiB total now\n",
++                  "to re-arm; prior gain %.2f pp vs the %.2f pp gate (%s); GPU arena_resident %.1f MiB now\n",
+                   __func__, (long long) g_steady_raised, (long long) g_steady_skipped,
+                   g_steady_gain_pp, g_steady_min_gain_pp, g_steady_allow ? "taking the band" : "leaving the band",
+                   (double) g_arena_bytes / (1024 * 1024));
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.h b/ggml/src/ggml-cuda/moe-expert-cache.h
+index 86e6fca07..c6bb38d7a 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.h
++++ b/ggml/src/ggml-cuda/moe-expert-cache.h
+@@ -128,6 +128,19 @@ void moe_cache_set_extra_reserve(int device, size_t bytes);
+ // whole-process activity during the turn.
+ bool moe_cache_get_stats(int64_t * hits, int64_t * misses, int64_t * arena_bytes);
+ 
++// wip/flash-next-prefill (session 4): the RESIDENT expert bytes, lock-free, for the slab's own stats line.
++// `moe_cache_get_stats` gives the same figure but takes the cache mutex, and the cache calls INTO the slab
++// with that mutex held, so a slab->cache take would invert the order.  This reads an atomic mirror that the
++// cache maintains beside `g_arena_bytes`, so it is safe under `g_slab_mutex` and never blocks.
++int64_t moe_cache_resident_bytes(int device);
++
++// wip/flash-next-prefill (session 4): the transport selector's input -- how much of `device`'s host-resident
++// expert set the cache can KEEP (`covered`) against one copy of that set (`host`), in bytes.  This is the
++// figure the census prints as "arena <covered> MiB of <host> MiB host experts (<pct>% residency)", and the
++// selector uses `(host - covered)` as the bytes the device gather would pull over the link per prefill
++// ubatch.  False when the cache holds no tables for the device (a pinned master: covered = host = 0).
++bool moe_cache_residency(int device, int64_t * covered, int64_t * host);
++
+ // r143: the model that registered this device's host-resident expert tables is going away
+ // (`llama_model_free`), so drop them BEFORE its host masters are freed.  The cache is process-global and
+ // its deferred arena sizing fills every registered table, so a table whose master was freed is a
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 65ad2af70..b8add5cb2 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1129,12 +1129,15 @@ llama_context::llama_context(
+         // ~1.5 GiB, n=3 ub8192 <1 GiB -- i.e. the per-device need scales with 1/n (slices shrink) and
+         // 1/n^2 (each device feeds a smaller share of the prefill).  1800/n + ub/(1.7 n^2) fits those.
+         // Capped at 1/4 of the smallest staging device's VRAM so it scales down on a small card, and the
+-        // ring is one global region, so the smallest cap wins.  `GGML_CUDA_SLAB_RING_MIB` is a verbatim
++        // ring is one global region, so the smallest cap wins.  `GGML_CUDA_SLAB_TRANSPORT_MIB` is a verbatim
+         // per-GPU override and always wins.  Runs before `sched_reserve`, i.e. before the slab exists.
+-        // issue #164: `GGML_CUDA_SLAB_RING_MIB` is a verbatim per-GPU override and always wins, but a value
++        // issue #164: `GGML_CUDA_SLAB_TRANSPORT_MIB` is a verbatim per-GPU override and always wins, but a value
+         // below the slice floor makes the H2D staging fall back to a cudaMalloc buffer -- which the
+         // optional-allocation cap may then refuse -- so say so (non-fatal: the override is still honoured).
+-        const char * ring_env = getenv("GGML_CUDA_SLAB_RING_MIB");
++        const char * ring_env = getenv("GGML_CUDA_SLAB_TRANSPORT_MIB");
++        if (ring_env == nullptr) {
++            ring_env = getenv("GGML_CUDA_SLAB_RING_MIB");   // deprecated alias (same value, same precedence)
++        }
+         // Only the target context actually streams host-resident expert tables through the H2D staging
+         // ring, so only it may size the ring.  The MTP draft context is built against the same model
+         // (`moe_host_expert_bytes` is non-empty) but its weights are fully resident and it never stages a
+@@ -1167,8 +1170,20 @@ llama_context::llama_context(
+             if (ring_env == nullptr) {
+                 const double n_stage = (double) model.moe_host_expert_bytes.size();
+                 if (n_stage > 0.0) {
+-                    size_t ring_bytes = (size_t) ((1800.0 / n_stage +
+-                            (double) cparams.n_ubatch / (1.7 * n_stage * n_stage)) * 1024.0 * 1024.0);
++                    // wip/flash-next-prefill (session 4, the sizing audit): size the transport region from what
++                    // the PING-PONG actually holds -- `n_slots` buffers, each ONE split's host-weight set --
++                    // instead of the throughput knee that was derived for the deleted 8-slot ring.  The old
++                    // formula (1800/n + ub/(1.7 n^2)) reads 6618 MiB on the 89k Flash-Next shape where the
++                    // buffers hold 3 x 1137.5 = 3412.5 MiB, so ~3.2 GiB of the work band was reserved for
++                    // nothing and the arena could not have it (measured: 51 tables stood down at every prefill,
++                    // r362).  `slice_floor` (one TABLE per slot) stays as a FLOOR: a set can never be smaller
++                    // than its largest member, and it is also what a model that reports no per-layer mapping
++                    // gets.  `GGML_CUDA_SLAB_TRANSPORT_MIB` still wins verbatim (see the branch below).
++                    size_t ring_bytes = n_slots * (slice + 512);
++                    const size_t layer_set = model.max_host_expert_layer_bytes();
++                    if (layer_set > 0) {
++                        ring_bytes = n_slots * (layer_set + 512);
++                    }
+                     if (slice_floor > ring_bytes) {
+                         ring_bytes = slice_floor;
+                     }
+@@ -1184,11 +1199,17 @@ llama_context::llama_context(
+                         ring_bytes = std::min(ring_bytes, vram_cap);
+                     }
+                     ggml_backend_dev_slab_set_ring_cap(stage_dev, ring_bytes);
++                    // Say WHERE the number comes from: the transport region is a carve the user cannot see in
++                    // the fit report, so the line names the buffers, the set and the floor (session 4).
++                    LLAMA_LOG_INFO("%s: transport region: %zu MiB = %zu buffer(s) x (largest host-weight split "
++                            "set %zu MiB + 512 B); one-table floor %zu MiB, VRAM/4 cap %s\n",
++                            __func__, ring_bytes >> 20, n_slots, layer_set >> 20, slice_floor >> 20,
++                            vram_cap == (size_t) -1 ? "n/a" : (std::to_string(vram_cap >> 20) + " MiB").c_str());
+                 }
+             } else if (slab_enabled && slice_floor > 0) {
+                 const size_t env_bytes = (size_t) atoll(ring_env) << 20;
+                 if (env_bytes < slice_floor) {
+-                    LLAMA_LOG_ERROR("%s: GGML_CUDA_SLAB_RING_MIB=%zu MiB is below the H2D staging slice floor of "
++                    LLAMA_LOG_ERROR("%s: GGML_CUDA_SLAB_TRANSPORT_MIB=%zu MiB is below the H2D staging slice floor of "
+                             "%zu MiB (%zu slots x (%zu MiB largest per-device expert slice + 512 B)); the H2D "
+                             "staging ring falls back to a cudaMalloc buffer, which the optional-allocation cap "
+                             "may refuse, so a large prefill can stream at roughly half speed.  Raise it to at "
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index d6cd012f4..dffaf4836 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2898,6 +2898,63 @@ size_t llama_model::max_host_expert_slice_bytes() const {
+     return max_slice;
+ }
+ 
++// wip/flash-next-prefill (session 4, the sizing audit): the largest host-weight SET a scheduler split
++// carries.  A split is a contiguous run of the graph on one backend, which on a host-expert MoE is one
++// layer's routed tables, so its set size is the per-layer SUM of the host-resident expert tables (per device
++// on a tensor split, exactly like `max_host_expert_slice_bytes`).  The transport buffer is sized to this set,
++// not to one table: measured on the 89k Flash-Next shape the largest table is 450 MiB while the largest set
++// is 1137.5 MiB (gate/up/down of the widest layer), and a region sized from the table alone under-carves by
++// 2.5x the real need.
++//
++// `--fit` and the slab's transport region both read this (llama-context.cpp's ring auto-size), so the three
++// numbers that used to disagree -- the fit's `h2d_stage_bound`, the context's knee cap and the buffers' own
++// `pp_size` -- have one source.
++size_t llama_model::max_host_expert_layer_bytes() const {
++    const size_t n_devs = get_split_state_ud.n_devices;
++    const bool   split  = n_devs > 1 && n_devs <= GGML_BACKEND_META_MAX_DEVICES && get_split_state_ud.model != nullptr;
++    // key: (layer, device); value: the layer's host expert bytes on that device.  A layer with no host
++    // tables is absent (it is resident), which is what we want -- only a staged set costs a buffer.
++    std::map<std::pair<int, size_t>, size_t> by_layer_dev;
++    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
++        ggml_context * c = ctx.get();
++        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
++            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
++                continue;
++            }
++            if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++                continue;
++            }
++            const std::string name = t->name;
++            if (name.find("exps") == std::string::npos) {
++                continue;
++            }
++            int layer = -1;
++            if (sscanf(name.c_str(), "blk.%d.", &layer) != 1 || layer < 0) {
++                continue;   // not a layer's expert table (a fused/merged host tensor): not a split set member
++            }
++            if (split) {
++                const ggml_backend_meta_split_state ss =
++                        llama_meta_device_get_split_state(t, const_cast<void *>(static_cast<const void *>(&get_split_state_ud)));
++                for (size_t d = 0; d < n_devs; d++) {
++                    const size_t b = ggml_backend_meta_split_dev_bytes(t, &ss, n_devs, d);
++                    if (b > 0) {
++                        by_layer_dev[{layer, d}] += b;
++                    }
++                }
++            } else {
++                by_layer_dev[{layer, 0}] += ggml_nbytes(t);
++            }
++        }
++    }
++    size_t max_set = 0;
++    for (const auto & kv : by_layer_dev) {
++        if (kv.second > max_set) {
++            max_set = kv.second;
++        }
++    }
++    return max_set;
++}
++
+ // TODO #124: keep this in step with the split-state callback's own MIRRORED rule for `cache_k_*`/`cache_v_*`
+ // (`llama_meta_device_get_split_state`, above): HRM_TEXT replicates every cache tensor, and dsv4
+ // (DEEPSEEK4/41, or DFLASH with the hyper-connection state) mirrors the KV cache and its state tensors.
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 0bbb1b585..8a4de1fa2 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -1064,6 +1064,13 @@ struct llama_model {
+     // slot has to hold, and the split is not necessarily even (it is granularity-rounded).
+     size_t max_host_expert_slice_bytes() const;
+ 
++    // wip/flash-next-prefill (session 4, the sizing audit): the largest HOST-WEIGHT SET one scheduler split
++    // carries -- i.e. per layer, the sum of that layer's host-resident expert tables (per device on a tensor
++    // split).  This is the transport's real unit: the ping-pong buffer holds one split set, so the region's
++    // need is `buffers x (this + 512)`, where `max_host_expert_slice_bytes` (one TABLE) under-sizes it by the
++    // number of routed roles a layer has (3 on a qwen4exp MoE: gate/up/down).
++    size_t max_host_expert_layer_bytes() const;
++
+     // TODO #124: true when a tensor split MIRRORS this model's KV cache on every device instead of sharding
+     // it along the KV-head axis -- the same rule the split-state callback applies to `cache_k_*`/`cache_v_*`
+     // (dsv4-in-DFLASH / DEEPSEEK4 / DEEPSEEK41, and HRM_TEXT which mirrors every cache tensor).  A mirrored
+-- 
+2.56.1
+

@@ -1,0 +1,235 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+index 600f09c39..1cd0e44ab 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+@@ -165,17 +165,21 @@ void ggml_backend_cuda_stage_d2d(ggml_backend_t backend, void * dst, const void
+     CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+ }
+ 
+-float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
+-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+-    ggml_cuda_set_device(cuda_ctx->device);
++// The per-device H2D calibration cache.  File scope (not function statics) so the read-only peek below can share
++// it: a link-dependent policy asks "what does THIS device's link measure" without ever forcing the 512 MiB probe.
++static float g_h2d_bw[GGML_CUDA_MAX_DEVICES];
++static bool  g_h2d_done[GGML_CUDA_MAX_DEVICES] = {};
++
++static float cuda_h2d_gbps(int dev) {
++    ggml_cuda_set_device(dev);
+ 
+     // One-off H2D bandwidth calibration (issue #50 WIP), cached per device.  Sized past the Infinity
+     // Cache (a 64 MiB probe reads ~25 GB/s on a x4 link because the L3 serves it).  Timed with a
+     // synchronous copy so it needs no event API (this toolchain does not alias cudaEventCreate /
+     // cudaEventElapsedTime).
+-    static float bw[GGML_CUDA_MAX_DEVICES];
+-    static bool  done[GGML_CUDA_MAX_DEVICES] = {};
+-    const int dev = cuda_ctx->device;
++    float * bw   = g_h2d_bw;
++    bool  * done = g_h2d_done;
++    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) { return 0.0f; }
+     if (done[dev]) {
+         return bw[dev];
+     }
+@@ -230,6 +234,20 @@ float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
+     return bw[dev];
+ }
+ 
++float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    return cuda_h2d_gbps(cuda_ctx->device);
++}
++
++// Read-only accessor for callers without a backend handle (the expert cache).  It never forces the probe: an
++// uncalibrated device reads 0.0, which a caller must treat as "unknown" rather than as a slow link.
++float ggml_cuda_device_h2d_gbps(int device) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || !g_h2d_done[device]) {
++        return 0.0f;
++    }
++    return g_h2d_bw[device];
++}
++
+ bool ggml_backend_cuda_moe_cache_update(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis, const struct ggml_backend_moe_slice * slices, int n_slices) {
+     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_cuda_set_device(ctx->device);   // issue #294: the scheduler leaves another split's device current
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
+index ec0efe1f4..ec812050e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
++++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
+@@ -16,6 +16,10 @@ bool   ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const vo
+ void   ggml_backend_cuda_stage_wait(ggml_backend_t backend, ggml_backend_event_t ev);
+ void   ggml_backend_cuda_stage_d2d(ggml_backend_t backend, void * dst, const void * src, size_t size);
+ float  ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend);
++// wip/flash-next-prefill: the same per-device H2D calibration, reachable from the expert cache (which has no
++// backend handle) so a link-dependent policy can read the DEVICE's own link.  Returns the cached value once the
++// scheduler has calibrated; 0.0 when it has not run yet (callers must treat 0 as "unknown", not "slow").
++float  ggml_cuda_device_h2d_gbps(int device);
+ bool   ggml_backend_cuda_moe_cache_update(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis, const struct ggml_backend_moe_slice * slices, int n_slices);
+ bool   ggml_backend_cuda_moe_cache_take_over(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, int64_t n_tok);
+ bool   ggml_backend_cuda_moe_cache_in_place(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, int64_t n_tok);
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 3063017ec..f35f0d4f1 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -1,6 +1,7 @@
+ // wip/moe-expert-cache — Phase 1a foundation.  See moe-expert-cache.h for the contract.
+ 
+ #include "moe-expert-cache.h"
++#include "ggml-cuda-moe-cache-hooks.cuh"   // wip/flash-next-prefill: ggml_cuda_device_h2d_gbps()
+ #include "gtt-expert-store.cuh"
+ #include "ggml-cuda-vmm.h"
+ 
+@@ -10536,6 +10537,35 @@ static void stage_decline_note(table_t & t, const char * why) {
+ // `width`/`stride_src`/`n_copies` describe the exact copy the caller asked for; a geometry mismatch
+ // declines and the caller falls back to the plain upload.  Returns true when the destination was
+ // filled and the caller's event recorded (the caller records `ev` after this returns).
++// wip/flash-next-prefill: `MOE_HOST_POOL_STAGE_MERGE_FLOOR` resolved for ONE device.  `auto` (the default) turns a
++// 16 MiB floor on only when the DEVICE's own calibrated link is at or above
++// `MOE_HOST_POOL_STAGE_MERGE_FLOOR_GBPS` (default 50), because the trade is a property of the link and not of the
++// model: over-fetching one expert costs `expert_bytes / bw` while the DMA issue it saves costs ~18 us, so merging
++// pays above ~50 GB/s and is neutral-to-negative below it.  Measured 2026-11-26 (Flash-Next, 89k, -ncmoe 48):
++// no merging 2513.7 t/s at 28.7 GB/s (x8) and 2492.3 at 51 GB/s (x16); a floor of 8-16 MiB reads 2470.1-2521.4 on
++// x8 (inside the spread) and 2521.4-2527.7 on x16 (+1.4 %, and the tightest arm measured).  Per DEVICE, so a
++// heterogeneous split gives each card the floor its own link justifies.
++static int64_t stage_merge_floor_bytes(int device) {
++    static const double mib_env = [] {
++        const char * e = getenv("MOE_HOST_POOL_STAGE_MERGE_FLOOR");
++        if (e == nullptr || e[0] == '\0') { return -1.0; }   // auto
++        return atof(e);                                      // 0 = off, N = explicit MiB
++    }();
++    static const double gbps_env = [] {
++        const char * e = getenv("MOE_HOST_POOL_STAGE_MERGE_FLOOR_GBPS");
++        const double v = e != nullptr ? atof(e) : 0.0;
++        return v > 0.0 ? v : 50.0;
++    }();
++    if (mib_env >= 0.0) {
++        return (int64_t) (mib_env * 1024.0 * 1024.0);
++    }
++    const float bw = ggml_cuda_device_h2d_gbps(device);
++    if (bw <= 0.0f) {
++        return 0;   // the link is not calibrated yet: no merging is the safe arm, retried on the next call
++    }
++    return bw >= (float) gbps_env ? (int64_t) (16.0 * 1024.0 * 1024.0) : 0;
++}
++
+ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, size_t width, size_t stride_src,
+                            size_t n_copies, void * dst, void * compute_stream, void * copy_stream,
+                            void * order_event) {
+@@ -10656,32 +10686,30 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+                 const int v = e != nullptr ? atoi(e) : 1;
+                 return v < 1 ? 1 : v;
+             }();
+-            // wip/flash-next-prefill DIAGNOSTIC (remove before promotion): why did the bulk/hybrid fill decline
+-            // this table's geometry?  Printed once per distinct destination per process, at `-lv 4`.
+-            if (stage_bulk > 0 && pool != nullptr) {
+-                static std::vector<const void *> diag_seen;
+-                bool fresh = true;
+-                for (const void * p : diag_seen) { if (p == (const void *) dst) { fresh = false; break; } }
+-                if (fresh && diag_seen.size() < 8) {
+-                    diag_seen.push_back((const void *) dst);
+-                    bool mir = pool->slot_expert.size() >= (size_t) t.n_experts &&
+-                               pool->slot_state.size() >= (size_t) t.n_experts;
+-                    int mir_bad = -1;
+-                    if (mir) {
+-                        for (int e = 0; e < t.n_experts; e++) {
+-                            if (pool->slot_expert[(size_t) e] != e || pool->slot_state[(size_t) e] != 1) { mir_bad = e; break; }
+-                        }
+-                    }
+-                    GGML_LOG_INFO("%s: bulk-decline diag: nc=%zu do2d=%d width=%zu stride_src=%zu off=%lld | "
+-                                  "t.expert=%lld t.host=%lld n_experts=%d split_axis=%d host_pitch=%lld | "
+-                                  "pool.host=%lld pool.slots=%d pool.base_dev=%p failed=%d mirror_bad=%d\n",
+-                                  __func__, n_copies, (int) do2d, width, stride_src, (long long) offset,
+-                                  (long long) t.expert_bytes, (long long) t.host_bytes, t.n_experts,
+-                                  t.split_axis, (long long) t.host_pitch,
+-                                  (long long) pool->host_bytes, pool->slots, (const void *) pool->base_dev,
+-                                  (int) pool->failed, mir_bad);
+-                }
+-            }
++            // `MOE_HOST_POOL_STAGE_MERGE_BYTES=<MiB>`: the same policy in BYTES, which is the currency the trade
++            // is really denominated in.  A resident gap splits one host DMA into two, so the gap costs a DMA issue
++            // (plus the short-run rate penalty) and merging it costs the gap's bytes at the link rate.  Merge while
++            // `gap_bytes / bw < issue_cost`, i.e. while the gap is SMALLER than `bw * issue_cost` -- a threshold that
++            // is a property of the LINK (and of the DEVICE's own link, which matters on a heterogeneous split), not
++            // of the model's expert size.  The expert count above is only a proxy for it, and a different GGUF moves
++            // it: the same `MERGE=4` is 2.2 MiB of Flash-Next expert and 3.5 MiB of a 122B-A10B expert.  Measured
++            // 2026-11-26: the break-even gap is ~0.5 MiB/device at 28.7 GB/s (x8) and ~1-2 MiB at 51 GB/s (x16),
++            // which is exactly why a fixed expert count loses on one box and wins on the other.
++            // `MOE_HOST_POOL_STAGE_MERGE_FLOOR=<MiB>`: **no host DMA smaller than this** (a table boundary is the one
++            // exception -- there is nothing to absorb there).  This is the policy the transport wants: the copy
++            // engine's penalty is a function of the DMA's own size (measured here: 0.65 MiB copies reach 41 GB/s,
++            // 2.87 MiB runs 48, one 333 MiB copy 55.8), so a host run that a lone arena-resident expert split into
++            // two sub-floor pieces should absorb that expert from the pool mirror instead -- the mirror has every
++            // expert, so the over-fetch needs no second source.  NOT a gap budget (`..._MERGE_BYTES`): a big
++            // resident region that leaves a small host run is fixed here and left alone there.  Per DEVICE, since
++            // each device has its own link.
++            const int64_t stage_merge_floor = stage_merge_floor_bytes(device);
++            static const int64_t stage_merge_bytes = [] {
++                const char * e = getenv("MOE_HOST_POOL_STAGE_MERGE_BYTES");
++                if (e == nullptr || e[0] == '\0') { return (int64_t) 0; }
++                const double mib = atof(e);   // fractional: the x8 break-even gap is ~0.5 MiB
++                return mib > 0.0 ? (int64_t) (mib * 1024.0 * 1024.0) : (int64_t) 0;
++            }();
+             // Copy-engine geometry for a staged table.  ONE 2-D copy per coalesced run covers all three
+             // shapes the ring stages, because the destination is always packed in expert order:
+             //   unsplit whole table / pinned master : rows_per = 1,    bytes = expert_bytes, src pitch = host_bytes
+@@ -10746,13 +10774,15 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+                     // Over-fetch across SHORT resident runs, so a host run is not split for the sake of one or
+                     // two resident experts (the pool has them too, so the merge needs no second source and no
+                     // patch pass): the boundary resident experts simply come from the host as well.
+-                    if (stage_merge > 1) {
++                    if (stage_merge > 1 || stage_merge_bytes > 0) {
+                         for (int e = 0; e < ne; ) {
+                             if (from_host[(size_t) e]) { e++; continue; }
+                             int e2 = e;
+                             while (e2 < ne && !from_host[(size_t) e2]) { e2++; }
+-                            if (e > 0 && from_host[(size_t) e - 1] && e2 < ne && from_host[(size_t) e2] &&
+-                                (e2 - e) < stage_merge) {
++                            const int64_t gap_bytes = (int64_t) (e2 - e) * (int64_t) t.expert_bytes;
++                            const bool  merge_gap = (e2 - e) < stage_merge ||
++                                                    (stage_merge_bytes > 0 && gap_bytes <= stage_merge_bytes);
++                            if (e > 0 && from_host[(size_t) e - 1] && e2 < ne && from_host[(size_t) e2] && merge_gap) {
+                                 for (int k = e; k < e2; k++) {
+                                     prs_new[(size_t) k]   = -1;
+                                     from_host[(size_t) k] = 1;
+@@ -10762,6 +10792,42 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+                             e = e2;
+                         }
+                     }
++                    // The RUN FLOOR: grow every host run smaller than `stage_merge_floor` by absorbing its adjacent
++                    // arena-resident experts (the shorter side first, so the over-fetch is minimal) until the run
++                    // reaches the floor, hits a table boundary, or has nothing left to absorb.  A pass may join two
++                    // runs, so relabel from the top; `ne` passes bound it.
++                    for (int pass = 0; stage_merge_floor > 0 && pass < ne; pass++) {
++                        bool grew = false;
++                        for (int e = 0; e < ne && !grew; ) {
++                            if (!from_host[(size_t) e]) { e++; continue; }
++                            int e2 = e;
++                            while (e2 < ne && from_host[(size_t) e2]) { e2++; }
++                            if ((int64_t) (e2 - e) * (int64_t) t.expert_bytes >= stage_merge_floor) { e = e2; continue; }
++                            int nl = 0, nr = 0;
++                            while (e - 1 - nl >= 0 && !from_host[(size_t) (e - 1 - nl)]) { nl++; }
++                            while (e2 + nr < ne && !from_host[(size_t) (e2 + nr)]) { nr++; }
++                            if (nl == 0 && nr == 0) { e = e2; continue; }   // a table boundary: the only legal short run
++                            if (nl > 0 && (nr == 0 || nl <= nr)) {
++                                from_host[(size_t) e - 1] = 1;
++                                prs_new[(size_t) e - 1]   = -1;
++                            } else {
++                                from_host[(size_t) e2] = 1;
++                                prs_new[(size_t) e2]   = -1;
++                            }
++                            g_stage_overfetch_experts++;
++                            grew = true;
++                        }
++                        if (!grew) { break; }
++                    }
++                    // Account the ARENA side before the host runs are issued: these experts are served by the
++                    // kernel launch below (VRAM -> VRAM) and never touch PCIe.  Without this the hybrid's staged
++                    // line reads `arena=0.0 MiB ... (H2D 100.0% of staged)`, which is not a measurement of the
++                    // transport at all -- it is a census that only the two-tier path used to increment.
++                    {
++                        int64_t n_arena = 0;
++                        for (int e = 0; e < ne; e++) { if (prs_new[(size_t) e] >= 0) { n_arena++; } }
++                        g_stage_arena_bytes += n_arena * (int64_t) t.expert_bytes;
++                    }
+                     // (a) the host side: one 2-D DMA per coalesced run, straight out of the pinned mirror
+                     bool ok = true;
+                     int  n_runs = 0;

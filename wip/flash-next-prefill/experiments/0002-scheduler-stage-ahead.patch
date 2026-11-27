@@ -1,0 +1,155 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 9fef9f14a..4c63a8cde 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1588,8 +1588,17 @@ struct ggml_backend_sched {
+     bool stage_enabled;
+     int  stage_slot_next;
+     int  stage_n_slots;
+-    int  stage_consumed_n;
+-    bool stage_split_ok; // this split passed the enable + width gates (a backend-owned `stage_input` reads it)
++    // wip/flash-next-prefill: the ring LOOKAHEAD.  These were scalars and the issue/drain pair always belonged
++    // to the SAME split (`sched_stage_issue(split)` then that split's input copy waits on it), so a transfer
++    // could only ever hide behind the previous split's compute.  A routed-MoE split's own compute is SHORTER
++    // than its own table transfer, so nothing hid it: measured 2026-11-26 on the Flash-Next pool tier, ~6.4 s
++    // of an 89k prefill was still in no op at all with a one-DMA-per-table fill.  Now the plan for the split
++    // being DRAINED lives in buffer `stage_cur` and `sched_stage_issue` writes the NEXT split's plan into the
++    // other one, so its transfer is in flight while the current split runs.  `GGML_SCHED_STAGE_AHEAD=0`
++    // restores the same-split issue/drain (A/B and bisection).
++    int  stage_consumed_n[2];
++    bool stage_split_ok[2]; // this split passed the enable + width gates (a backend-owned `stage_input` reads it)
++    int  stage_cur;         // which buffer holds the plan of the split being drained
+     // wip/moe-expert-cache (B2): device-side expert gather for an offloaded `MUL_MAT_ID` upload whose
+     // width did not qualify for the staging ring.  GGML_SCHED_DEVGATHER=0 opts out.
+     int  devgather_mode;   // 0 = off, 1 = pool-backed tables only (default), 2 = force (A/B)
+@@ -1598,7 +1607,7 @@ struct ggml_backend_sched {
+         size_t size;
+         int    slot;
+         int    backend_id;
+-    } stage_consumed[GGML_SCHED_STAGE_SLOTS];
++    } stage_consumed[2][GGML_SCHED_STAGE_SLOTS];
+     struct ggml_backend_event * stage_done_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_STAGE_SLOTS];
+     struct ggml_backend_event * stage_free_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_STAGE_SLOTS];
+ 
+@@ -3003,9 +3012,9 @@ static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backe
+ // whole-tensor staging moves the device's entire shard every ubatch.  The ring path already prefers the
+ // gather for a routed expert table (`sched_input_gatherable` in `sched_stage_issue`); the meta
+ // backend's `stage_input` path defers routed expert tables to the gather there too.
+-static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split) {
+-    sched->stage_consumed_n = 0;
+-    sched->stage_split_ok = false;
++static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, int plan_buf) {
++    sched->stage_consumed_n[plan_buf] = 0;
++    sched->stage_split_ok[plan_buf]  = false;
+     if (!sched->stage_enabled || split->n_inputs == 0) {
+         return;
+     }
+@@ -3043,7 +3052,7 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+     // inputs: a merged routed-MoE split carries one big expert weight plus dozens of tiny view/ids
+     // inputs (measured 31 inputs on qwen4exp), so comparing the raw `n_inputs` to the ring slots
+     // skipped staging for the whole split and left its 450 MiB weight to the serial host path.
+-    sched->stage_split_ok = true;
++    sched->stage_split_ok[plan_buf] = true;
+     ggml_backend_t backend = sched->backends[split->backend_id];
+     int n_host_inputs = 0;
+     for (int i = 0; i < split->n_inputs; i++) {
+@@ -3135,15 +3144,16 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+         backend->iface.stage_upload(backend, buf, plan[k].input->data, size,
+                                     sched_stage_ev(sched, split->backend_id, slot, true));
+ 
+-        sched->stage_consumed[sched->stage_consumed_n].dst        = plan[k].input_cpy;
+-        sched->stage_consumed[sched->stage_consumed_n].size       = size;
+-        sched->stage_consumed[sched->stage_consumed_n].slot       = slot;
+-        sched->stage_consumed[sched->stage_consumed_n].backend_id = split->backend_id;
+-        sched->stage_consumed_n++;
++        const int c = sched->stage_consumed_n[plan_buf]++;
++        sched->stage_consumed[plan_buf][c].dst        = plan[k].input_cpy;
++        sched->stage_consumed[plan_buf][c].size       = size;
++        sched->stage_consumed[plan_buf][c].slot       = slot;
++        sched->stage_consumed[plan_buf][c].backend_id = split->backend_id;
+     }
+     sched->stage_slot_next = (slot_first + n_plan) % sched->stage_n_slots;
+     GGML_LOG_DEBUG("%s: batch_tokens=%lld n_inputs=%d staged=%d\n",
+-                   __func__, (long long) sched_stage_batch_tokens(split), split->n_inputs, sched->stage_consumed_n);
++                   __func__, (long long) sched_stage_batch_tokens(split), split->n_inputs,
++                   sched->stage_consumed_n[plan_buf]);
+ }
+ 
+ // r35 (default ON; this was the r33 opt-in A/B candidate).  A split input that is (a view of) a user
+@@ -3268,16 +3278,17 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         // stream, so this stays ordered after the previous split's compute.
+         {
+             int stage_k = -1;
+-            for (int k = 0; k < sched->stage_consumed_n; k++) {
+-                if (sched->stage_consumed[k].dst == input_cpy) {
++            const int stage_buf = sched->stage_cur;
++            for (int k = 0; k < sched->stage_consumed_n[stage_buf]; k++) {
++                if (sched->stage_consumed[stage_buf][k].dst == input_cpy) {
+                     stage_k = k;
+                     break;
+                 }
+             }
+             if (stage_k >= 0) {
+-                const int    b    = sched->stage_consumed[stage_k].backend_id;
+-                const int    slot = sched->stage_consumed[stage_k].slot;
+-                const size_t size = sched->stage_consumed[stage_k].size;
++                const int    b    = sched->stage_consumed[stage_buf][stage_k].backend_id;
++                const int    slot = sched->stage_consumed[stage_buf][stage_k].slot;
++                const size_t size = sched->stage_consumed[stage_buf][stage_k].size;
+                 ggml_backend_event_t done_ev = sched_stage_ev(sched, b, slot, true);
+                 ggml_backend_event_wait(split_backend, done_ev);
+                 // copy the slot into the real split input, then free it (GGML_SCHED_STAGE_MODE retired)
+@@ -3293,7 +3304,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         // not read this tensor's `data` (the meta backend, where the upload is spliced across
+         // devices) stages the input itself and takes over the ordering.  `callback_eval`
+         // splits one split into several compute calls, which this hand-off does not model.
+-        if (sched->stage_split_ok && sched->callback_eval == NULL &&
++        if (sched->stage_split_ok[sched->stage_cur] && sched->callback_eval == NULL &&
+             split_backend->iface.stage_input != NULL && sched_stage_is_host_weight(input)) {
+             // Above the staging width gate (`sched_stage_min_tokens`) whole-shard staging
+             // beats the device gather (the campaign's own A/B: Q4_K_M ub8192 staging 5283 vs
+@@ -3732,12 +3743,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     int prev_backend_id = -1;
+     ggml_backend_sched_copy_state st;
+ 
++    // wip/flash-next-prefill: `GGML_SCHED_STAGE_AHEAD` (default 1) issues split N+1's staging into the ring
++    // BEFORE split N computes, so the transfer is in flight under a split that has work to do.  `0` restores
++    // the historical same-split issue-then-drain.  Only ONE split of lookahead is used: the ring's slots are
++    // round-robin, and the drain of split N frees the buffer that split N-1 used, so an issue for N+1 always
++    // targets a plan that is no longer live.
++    static const int stage_ahead = [] {
++        const char * e = GGML_ENV_STR("GGML_SCHED_STAGE_AHEAD");
++        return e != nullptr ? atoi(e) : 1;
++    }();
++    if (stage_ahead > 0) {
++        sched->stage_cur = 0;
++        sched_stage_issue(sched, &splits[0], 0);
++    }
++
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
+-        sched_stage_issue(sched, split);
++        if (stage_ahead > 0) {
++            sched->stage_cur = split_id & 1;   // the plan this split's input loop drains
++        } else {
++            sched->stage_cur = 0;
++            sched_stage_issue(sched, split, 0);
++        }
+ 
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+@@ -3769,6 +3799,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        if (stage_ahead > 0 && split_id + 1 < sched->n_splits) {
++            // its transfer now runs on the copy stream while this split computes
++            sched_stage_issue(sched, &splits[split_id + 1], (split_id + 1) & 1);
++        }
++
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {

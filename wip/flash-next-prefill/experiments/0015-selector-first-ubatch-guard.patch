@@ -1,0 +1,78 @@
+From 5bc12ac67cb142a130f2a8425ae52aad85465516 Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 23:39:02 -0600
+Subject: [PATCH] wip: the transport selector keeps the GATHER for the FIRST
+ wide ubatch
+
+Measured on the same 51 %-coverage shape with a 5218-token prompt (one ubatch at -b 8192 -ub 8192, 3
+rotated cycles): gather 1597.1 t/s / 50.2 decode, staging every wide ubatch 1266.2 / 48.3, staging from
+the second wide ubatch 1488.6 / 49.2 -- text identical (ae6016a1b986) in all three.  The first wide ubatch
+pays the whole fill with no previous split's compute to hide it behind, and the carve has already cost the
+arena 3.4 GiB, so the guard halves the loss but does not remove the remaining -7 % (the carve the gather
+arm does not need; recorded as the selector's known trade).
+
+89k prompt unchanged: 2491.1 vs the gather's 2118.7 (+17.6 %, 3 cycles, text 43d0b1f4629e).
+---
+ ggml/src/ggml-backend.cpp | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 1e4c41701..f3228c46b 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1598,6 +1598,13 @@ struct ggml_backend_sched {
+     int     pp_n_buf;                            // 1..3, fixed for the process
+     double  pp_free_gib;                         // the free-VRAM figure the count was chosen from
+     bool    pp_held;                             // the buffers are currently allocated (released at decode)
++    // wip/flash-next-prefill (session 4): has a PREVIOUS graph been a wide (prefill) one?  The selector needs
++    // it because the FIRST wide ubatch pays the whole fill with nothing to overlap it (measured 2026-11-26, a
++    // 5 218-token prompt, one ubatch: staged 1266 t/s against the gather's 1612, decode 48.3 against 50.2),
++    // while an 89k prompt (11 ubatches) reads 2445 against 2108.  So the first wide graph keeps the gather and
++    // the staged transport takes over from the second -- the cost of the measured short-prompt regression.
++    bool    pp_wide_prev;                        // a wide graph has already been executed
++    bool    pp_wide_cur;                         // ... and this one is wide
+     struct pp_ent { struct ggml_tensor * dst; size_t off; size_t size; } pp_ent[4][64];
+     bool    stage_enabled;
+     // wip/moe-expert-cache: device-side expert gather for offloaded `MUL_MAT_ID` uploads (0 = off, 1 = pool-backed
+@@ -3096,6 +3103,12 @@ static bool sched_stage_exposure_decides(ggml_backend_sched_t sched, struct ggml
+     if (tok <= 0 || host_bytes <= covered) {
+         return false;   // fully resident (or nothing to read): the gather fetches nothing
+     }
++    if (sched_stage_min_tokens(sched) > 0 && tok >= sched_stage_min_tokens(sched)) {
++        sched->pp_wide_cur = true;   // this graph is a wide (prefill) one
++    }
++    if (!sched->pp_wide_prev) {
++        return false;   // the first wide ubatch has nothing to overlap the fill with: gather this one
++    }
+     const double exposed = (double) (host_bytes - covered);
+     float bw = 0.0f;
+     if (backend->iface.stage_h2d_gbps != nullptr) {
+@@ -3814,6 +3827,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     struct ggml_backend_sched_split * splits = sched->splits;
+ 
+     sched_moe_register_tables(sched, splits);
++    sched->pp_wide_cur = false;
+ 
+     int prev_backend_id = -1;
+     ggml_backend_sched_copy_state st;
+@@ -4002,6 +4016,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         prev_backend_id = split_backend_id;
+     }
+ 
++        sched->pp_wide_prev = sched->pp_wide_prev || sched->pp_wide_cur;
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+@@ -4120,6 +4136,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
+         sched->pp_cur  = 0;
+         // Fixed for the process lifetime (see sched_pp_choose_bufs): 1 / 2 / 3 by the device's FREE VRAM here.
+         sched->pp_free_gib = sched_pp_startup_free_gib(sched);
++        sched->pp_wide_prev = false;
++        sched->pp_wide_cur  = false;
+         sched->pp_n_buf    = sched_pp_choose_bufs(sched);
+         sched->pp_held     = false;
+         for (int i = 0; i < 4; i++) {
+-- 
+2.56.1
+

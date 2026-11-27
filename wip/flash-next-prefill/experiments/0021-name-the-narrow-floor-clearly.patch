@@ -1,0 +1,58 @@
+From 7af09a6368e0c5c92fb5e16b7a4fe2b1250985f1 Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 05:38:18 -0600
+Subject: [PATCH] wip: say what the deferred raise IS -- the decode/verify
+ compute band, not the buffers
+
+Asked about the field log's "narrow floor raise to 1792.0 MiB ignored":  nothing about the transport buffers
+is being raised.  `narrow_floor` is the size of the ALWAYS-RESIDENT decode/verify COMPUTE band at the bottom
+of the slab; the transport region sits immediately above it, so growing that band moves the region's base
+(+256 MiB in the log) and can only be done while nothing holds a region block.  "ring in use" was only ever
+the reason it could not be applied immediately.
+
+The messages now name it that way:
+  "the DECODE/VERIFY compute band (narrow floor) needs 2048.0 MiB, raised from 1792.0 MiB -- DEFERRED because
+   2304.0 MiB of the transport region (3456.0 MiB, the ping-pong buffers) is live and the region sits directly
+   above that band, so its base cannot move.  Applied at the next idle window ..."
+  "... decode/verify compute band (narrow floor) applied from the deferred raise: 1792.0 -> 2048.0 MiB ..."
+
+No behaviour change; the arena still recovers to 15977.7 MiB after each drop on that runme.
+---
+ ggml/src/ggml-cuda/ggml-cuda-slab.cu | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index 889d1cdb8..147117c6a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -391,10 +391,12 @@ void ggml_cuda_slab_set_narrow_floor(int device, size_t bytes) {
+         if (nf > s.narrow_floor_pending) {
+             s.narrow_floor_pending = nf;
+         }
+-        GGML_LOG_WARN("%s: device %d: narrow floor raise to %.1f MiB DEFERRED (ring in use: %.1f MiB of %.1f MiB, "
+-                      "floor %.1f MiB); it is applied at the next idle-ring narrow view\n",
+-                      __func__, device, (double) nf / (1ull << 20), (double) s.ring_used / (1ull << 20),
+-                      (double) s.ring_region / (1ull << 20), (double) s.narrow_floor / (1ull << 20));
++        GGML_LOG_WARN("%s: device %d: the DECODE/VERIFY compute band (narrow floor) needs %.1f MiB, raised from "
++                      "%.1f MiB -- DEFERRED because %.1f MiB of the transport region (%.1f MiB, the ping-pong "
++                      "buffers) is live and the region sits directly above that band, so its base cannot move.  "
++                      "Applied at the next idle window (nothing staged, prefill band disarmed).\n",
++                      __func__, device, (double) nf / (1ull << 20), (double) s.narrow_floor / (1ull << 20),
++                      (double) s.ring_used / (1ull << 20), (double) s.ring_region / (1ull << 20));
+         return;
+     }
+     s.narrow_floor = nf;
+@@ -1409,8 +1411,8 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+             // is idle here -- no block is live and the wide pass is disarmed -- so its VA may move, which is
+             // what the floor needs.  Applying it here is what lets the NEXT drop return the band the decode
+             // view actually needs instead of the sizing estimate.
+-            GGML_LOG_INFO("%s: dev=%d: narrow floor applied from the deferred raise: %.1f -> %.1f MiB "
+-                          "(ring idle, wide pass disarmed)\n", __func__, device,
++            GGML_LOG_INFO("%s: dev=%d: decode/verify compute band (narrow floor) applied from the deferred "
++                          "raise: %.1f -> %.1f MiB (transport region idle, prefill band disarmed)\n", __func__, device,
+                           (double) s.narrow_floor / 1048576.0, (double) s.narrow_floor_pending / 1048576.0);
+             s.narrow_floor = s.narrow_floor_pending;
+             s.narrow_floor_pending = 0;
+-- 
+2.56.1
+

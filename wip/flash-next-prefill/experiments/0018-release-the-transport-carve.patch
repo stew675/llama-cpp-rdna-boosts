@@ -1,0 +1,71 @@
+From b77d6bc9584d4ed4860d214ca199c329edb66331 Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 05:08:24 -0600
+Subject: [PATCH] wip: release the transport region's CARVE at the prefill ->
+ decode transition
+
+Field question: "why should I lose the transport carve permanently?  the ping-pong buffers are only
+needed during prefill."  They are: the scheduler releases the BUFFERS at every drop, but the carve
+(s.ring_region) was only ever recomputed at a narrow-floor pin, so the region's slots x (largest split
+set) stayed reserved for the life of the run -- 3456 MiB withheld from the arena's expert residency on
+the field GSQ shape, which is exactly the 16112 -> ~12700 MiB the user measured.  The comment at the
+disarm already claimed it hands the region back; it did not.
+
+Now: a NARROW view placed with the wide pass disarmed and no slot live releases the carve (that is the
+only window where the VA may move), and the next WIDE view re-carves it (the same deterministic value)
+just before its offset is computed.
+
+Verified: 1-GPU GSQ 89k 2496.9 t/s, text 43d0b1f4629e (neutral); the field runme's three-request sequence
+logs the release once per transition, zero staging refusals, and transport=0 in the decode window.
+
+It does NOT yet become expert residency, and that is the settle policy, not the carve: the per-layer slot
+count is settled ONCE at the first drop (demand-gated at >= 1.0 pp marginal prior gain, r292) and is
+sticky, so later drops report "0 layer(s) settled UP" and re-arm the stood-down tables to their existing
+counts.  Measured here: first drop settles to 23108 slots (arena 14707 -> 16112 MiB), the 70k drop
+re-arms to 15978 and never grows despite the 3456 MiB released at 0.11.755 s.  Harvesting it means
+re-evaluating the settle at every drop, which is the r292 trade (an eagerly taken band cost -44 %
+prefill for 0.44 pp on a 2-device split) and is the maintainer's call, not a gate outcome.
+---
+ ggml/src/ggml-cuda/ggml-cuda-slab.cu | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index 485ce62a7..d7d917f1f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -1386,6 +1386,32 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+         // contribution is `base_off + up(need)` (a narrow view at base 0, a wide view above the ring), so
+         // the multiset stores that directly and a view placed before the narrow floor existed cannot
+         // inflate the floor after the fact.
++        // wip/flash-next-prefill (session 4, the field question "shouldn't the transport buffers be dropped?"):
++        // YES -- and until now the CARVE was not.  The scheduler releases the buffers at every prefill -> decode
++        // transition (`h2d_stage_release` -> `ggml_cuda_slab_transport_reset` for the bump cursor), and the wide
++        // view is dropped, so at the point a NARROW view is placed with the wide pass disarmed NOTHING holds the
++        // region -- yet `s.ring_region` stayed at its value for the life of the run, permanently witholding
++        // `slots x (largest split set)` (3 456 MiB on the field GSQ shape) from the arena's expert residency.
++        // Release it here, which is the only window where the VA may move: the next WIDE view is placed below,
++        // at `narrow_floor + ring_region`, so it is re-carved (the same deterministic value) just before that
++        // placement.  Measured effect and verification: RESULTS-session4.md §7.3.
++        if (narrow && !s.ring_requested && s.ring_used == 0 && s.ring_region > 0) {
++            static bool released = false;
++            if (!released) {
++                released = true;
++                GGML_LOG_INFO("%s: dev=%d: transport region released at the prefill -> decode transition "
++                              "(%.1f MiB back to the arena; it is re-carved before the next wide view is "
++                              "placed)\n", __func__, device, (double) s.ring_region / 1048576.0);
++            }
++            s.ring_region = 0;
++        }
++        // ... and re-carve it for a WIDE view, before its offset is computed (nothing holds the region here:
++        // the buffers were released at the drop and the previous wide view is gone).
++        if (!narrow && s.narrow_floor > 0 && s.ring_region == 0 && s.ring_requested) {
++            s.ring_region = ggml_cuda_slab_ring_candidate(s, s.narrow_floor, device);
++            s.ring_slots  = ggml_backend_cuda_context::h2d_stage_slots();
++            s.ring_used   = 0;
++        }
+         ret_off = narrow ? 0 : ggml_cuda_slab_wide_place(s);
+         // TEMP diagnostic (wip/moe-verify-fusions): show the base offset each compute buffer gets.
+         if (ggml_cuda_work_alloc_debug()) {
+-- 
+2.56.1
+

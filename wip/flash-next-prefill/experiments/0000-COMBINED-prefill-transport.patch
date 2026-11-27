@@ -1,0 +1,456 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 9fef9f14a..dd3149e8a 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1588,8 +1588,17 @@ struct ggml_backend_sched {
+     bool stage_enabled;
+     int  stage_slot_next;
+     int  stage_n_slots;
+-    int  stage_consumed_n;
+-    bool stage_split_ok; // this split passed the enable + width gates (a backend-owned `stage_input` reads it)
++    // wip/flash-next-prefill: the ring LOOKAHEAD.  These were scalars and the issue/drain pair always belonged
++    // to the SAME split (`sched_stage_issue(split)` then that split's input copy waits on it), so a transfer
++    // could only ever hide behind the previous split's compute.  A routed-MoE split's own compute is SHORTER
++    // than its own table transfer, so nothing hid it: measured 2026-11-26 on the Flash-Next pool tier, ~6.4 s
++    // of an 89k prefill was still in no op at all with a one-DMA-per-table fill.  Now the plan for the split
++    // being DRAINED lives in buffer `stage_cur` and `sched_stage_issue` writes the NEXT split's plan into the
++    // other one, so its transfer is in flight while the current split runs.  `GGML_SCHED_STAGE_AHEAD=0`
++    // restores the same-split issue/drain (A/B and bisection).
++    int  stage_consumed_n[2];
++    bool stage_split_ok[2]; // this split passed the enable + width gates (a backend-owned `stage_input` reads it)
++    int  stage_cur;         // which buffer holds the plan of the split being drained
+     // wip/moe-expert-cache (B2): device-side expert gather for an offloaded `MUL_MAT_ID` upload whose
+     // width did not qualify for the staging ring.  GGML_SCHED_DEVGATHER=0 opts out.
+     int  devgather_mode;   // 0 = off, 1 = pool-backed tables only (default), 2 = force (A/B)
+@@ -1598,7 +1607,7 @@ struct ggml_backend_sched {
+         size_t size;
+         int    slot;
+         int    backend_id;
+-    } stage_consumed[GGML_SCHED_STAGE_SLOTS];
++    } stage_consumed[2][GGML_SCHED_STAGE_SLOTS];
+     struct ggml_backend_event * stage_done_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_STAGE_SLOTS];
+     struct ggml_backend_event * stage_free_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_STAGE_SLOTS];
+ 
+@@ -2798,6 +2807,21 @@ static ggml_backend_event_t sched_stage_ev(ggml_backend_sched_t sched, int backe
+     return *pev;
+ }
+ 
++// wip/flash-next-prefill (the ping-pong the slab/arena work was asked for): a staged host weight is consumed
++// IN THE RING SLOT instead of being copied into the graph-allocated split input first.  That is the retired
++// r250 "redirect" form, and it is safe HERE for a reason r250 did not have: such a split is a multi-token
++// prefill split, and a multi-token graph is never captured (`GGML_CUDA_GRAPH_MAX_TOKENS` is 16), so no captured
++// graph can bake the input pointer in.  It removes the whole ring -> input D2D (~41 GB/ubatch on the COMPUTE
++// stream at this shape) and with it the last thing that kept the fill from being a pure ping-pong.
++// `GGML_SCHED_STAGE_REDIRECT=0` restores the copy (A/B and bisection).
++static bool sched_stage_redirect(void) {
++    static const bool on = [] {
++        const char * e = GGML_ENV_STR("GGML_SCHED_STAGE_REDIRECT");
++        return e == nullptr || e[0] == '\0' || atoi(e) != 0;
++    }();
++    return on;
++}
++
+ static bool sched_stage_is_host_weight(const struct ggml_tensor * input) {
+     return input->buffer != NULL &&
+            ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+@@ -3003,9 +3027,9 @@ static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backe
+ // whole-tensor staging moves the device's entire shard every ubatch.  The ring path already prefers the
+ // gather for a routed expert table (`sched_input_gatherable` in `sched_stage_issue`); the meta
+ // backend's `stage_input` path defers routed expert tables to the gather there too.
+-static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split) {
+-    sched->stage_consumed_n = 0;
+-    sched->stage_split_ok = false;
++static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, int plan_buf) {
++    sched->stage_consumed_n[plan_buf] = 0;
++    sched->stage_split_ok[plan_buf]  = false;
+     if (!sched->stage_enabled || split->n_inputs == 0) {
+         return;
+     }
+@@ -3043,7 +3067,7 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+     // inputs: a merged routed-MoE split carries one big expert weight plus dozens of tiny view/ids
+     // inputs (measured 31 inputs on qwen4exp), so comparing the raw `n_inputs` to the ring slots
+     // skipped staging for the whole split and left its 450 MiB weight to the serial host path.
+-    sched->stage_split_ok = true;
++    sched->stage_split_ok[plan_buf] = true;
+     ggml_backend_t backend = sched->backends[split->backend_id];
+     int n_host_inputs = 0;
+     for (int i = 0; i < split->n_inputs; i++) {
+@@ -3135,15 +3159,16 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
+         backend->iface.stage_upload(backend, buf, plan[k].input->data, size,
+                                     sched_stage_ev(sched, split->backend_id, slot, true));
+ 
+-        sched->stage_consumed[sched->stage_consumed_n].dst        = plan[k].input_cpy;
+-        sched->stage_consumed[sched->stage_consumed_n].size       = size;
+-        sched->stage_consumed[sched->stage_consumed_n].slot       = slot;
+-        sched->stage_consumed[sched->stage_consumed_n].backend_id = split->backend_id;
+-        sched->stage_consumed_n++;
++        const int c = sched->stage_consumed_n[plan_buf]++;
++        sched->stage_consumed[plan_buf][c].dst        = plan[k].input_cpy;
++        sched->stage_consumed[plan_buf][c].size       = size;
++        sched->stage_consumed[plan_buf][c].slot       = slot;
++        sched->stage_consumed[plan_buf][c].backend_id = split->backend_id;
+     }
+     sched->stage_slot_next = (slot_first + n_plan) % sched->stage_n_slots;
+     GGML_LOG_DEBUG("%s: batch_tokens=%lld n_inputs=%d staged=%d\n",
+-                   __func__, (long long) sched_stage_batch_tokens(split), split->n_inputs, sched->stage_consumed_n);
++                   __func__, (long long) sched_stage_batch_tokens(split), split->n_inputs,
++                   sched->stage_consumed_n[plan_buf]);
+ }
+ 
+ // r35 (default ON; this was the r33 opt-in A/B candidate).  A split input that is (a view of) a user
+@@ -3268,21 +3293,29 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         // stream, so this stays ordered after the previous split's compute.
+         {
+             int stage_k = -1;
+-            for (int k = 0; k < sched->stage_consumed_n; k++) {
+-                if (sched->stage_consumed[k].dst == input_cpy) {
++            const int stage_buf = sched->stage_cur;
++            for (int k = 0; k < sched->stage_consumed_n[stage_buf]; k++) {
++                if (sched->stage_consumed[stage_buf][k].dst == input_cpy) {
+                     stage_k = k;
+                     break;
+                 }
+             }
+             if (stage_k >= 0) {
+-                const int    b    = sched->stage_consumed[stage_k].backend_id;
+-                const int    slot = sched->stage_consumed[stage_k].slot;
+-                const size_t size = sched->stage_consumed[stage_k].size;
++                const int    b    = sched->stage_consumed[stage_buf][stage_k].backend_id;
++                const int    slot = sched->stage_consumed[stage_buf][stage_k].slot;
++                const size_t size = sched->stage_consumed[stage_buf][stage_k].size;
+                 ggml_backend_event_t done_ev = sched_stage_ev(sched, b, slot, true);
+                 ggml_backend_event_wait(split_backend, done_ev);
+-                // copy the slot into the real split input, then free it (GGML_SCHED_STAGE_MODE retired)
+-                ggml_backend_event_t free_ev = sched_stage_ev(sched, b, slot, false);
+                 void * buf = split_backend->iface.stage_buffer(split_backend, slot, size);
++                if (sched_stage_redirect() && buf != NULL) {
++                    // consume the ring slot in place: no copy into the graph-allocated input.  The slot is freed
++                    // by `ggml_backend_sched_compute_splits` AFTER this split's compute is enqueued, so it stays
++                    // valid for exactly as long as the consumer needs it (the ping-pong's other half).
++                    input_cpy->data = buf;
++                    return;
++                }
++                // copy the slot into the real split input, then free it
++                ggml_backend_event_t free_ev = sched_stage_ev(sched, b, slot, false);
+                 split_backend->iface.stage_d2d(split_backend, input_cpy->data, buf, size);
+                 ggml_backend_event_record(free_ev, split_backend);
+                 return;
+@@ -3293,7 +3326,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         // not read this tensor's `data` (the meta backend, where the upload is spliced across
+         // devices) stages the input itself and takes over the ordering.  `callback_eval`
+         // splits one split into several compute calls, which this hand-off does not model.
+-        if (sched->stage_split_ok && sched->callback_eval == NULL &&
++        if (sched->stage_split_ok[sched->stage_cur] && sched->callback_eval == NULL &&
+             split_backend->iface.stage_input != NULL && sched_stage_is_host_weight(input)) {
+             // Above the staging width gate (`sched_stage_min_tokens`) whole-shard staging
+             // beats the device gather (the campaign's own A/B: Q4_K_M ub8192 staging 5283 vs
+@@ -3732,12 +3765,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     int prev_backend_id = -1;
+     ggml_backend_sched_copy_state st;
+ 
++    // wip/flash-next-prefill: `GGML_SCHED_STAGE_AHEAD` (default 1) issues split N+1's staging into the ring
++    // BEFORE split N computes, so the transfer is in flight under a split that has work to do.  `0` restores
++    // the historical same-split issue-then-drain.  Only ONE split of lookahead is used: the ring's slots are
++    // round-robin, and the drain of split N frees the buffer that split N-1 used, so an issue for N+1 always
++    // targets a plan that is no longer live.
++    static const int stage_ahead = [] {
++        const char * e = GGML_ENV_STR("GGML_SCHED_STAGE_AHEAD");
++        return e != nullptr ? atoi(e) : 1;
++    }();
++    if (stage_ahead > 0) {
++        sched->stage_cur = 0;
++        sched_stage_issue(sched, &splits[0], 0);
++    }
++
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
+-        sched_stage_issue(sched, split);
++        if (stage_ahead > 0) {
++            sched->stage_cur = split_id & 1;   // the plan this split's input loop drains
++        } else {
++            sched->stage_cur = 0;
++            sched_stage_issue(sched, split, 0);
++        }
+ 
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+@@ -3769,6 +3821,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        if (stage_ahead > 0 && split_id + 1 < sched->n_splits) {
++            // its transfer now runs on the copy stream while this split computes
++            sched_stage_issue(sched, &splits[split_id + 1], (split_id + 1) & 1);
++        }
++
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+@@ -3808,6 +3865,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        // wip/flash-next-prefill (the ping-pong): release this split's ring slots now that its compute is
++        // ENQUEUED -- the event fires when the kernels have actually read them, which is exactly the lifetime
++        // a redirect-mode slot needs (in copy mode this only frees a slot a little later than before).
++        if (sched_stage_redirect()) {
++            for (int k = 0; k < sched->stage_consumed_n[sched->stage_cur]; k++) {
++                const int b    = sched->stage_consumed[sched->stage_cur][k].backend_id;
++                const int slot = sched->stage_consumed[sched->stage_cur][k].slot;
++                ggml_backend_event_record(sched_stage_ev(sched, b, slot, false), split_backend);
++            }
++        }
++
+         // record the event of this split
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 72fadf225..2ddba52fc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -9623,6 +9623,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                          (long long) node->src[1]->ne[1]);
+                 key += buf;
+             }
++            // wip/flash-next-prefill: a broadcast/repeat is otherwise the ONLY large item in the op budget
++            // whose size a census cannot show, and its cost is a function of the tensor it MATERIALISES.
++            if ((node->op == GGML_OP_REPEAT || node->op == GGML_OP_CONT) && node->src[0] != nullptr) {
++                char buf[96];
++                snprintf(buf, sizeof(buf), " [%lldx%lldx%lldx%lld f%d]",
++                         (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1],
++                         (long long) node->src[0]->ne[2], (long long) node->src[0]->ne[3],
++                         (int) node->type);
++                key += buf;
++            }
+             op_ms[key] += ms;
+             op_cnt[key]++;
+             op_ms_total[key] += ms;
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 407f9855f..f0e125570 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -806,6 +806,13 @@ bool                                g_cold_uva        = false;  // MOE_EXPERT_CA
+ bool                                g_stage_cache     = true;
+ // Prefill staging accounting (per call = per table per ubatch).
+ int64_t                             g_stage_ok        = 0;
++// wip/flash-next-prefill: of `g_stage_ok`, the calls served by ONE copy-engine DMA out of the pool's covering
++// mirror instead of the staging kernel (or the per-expert bounce).
++int64_t                             g_stage_bulk_calls = 0;
++int64_t                             g_stage_bulk_bytes = 0;
++int64_t                             g_stage_bulk_runs  = 0;   // host DMAs issued by the current fill
++int64_t                             g_stage_bulk_runs_total = 0;
++int64_t                             g_stage_overfetch_experts = 0;
+ // Gather accounting (wip/host-pool-speed mechanism (b)): `calls` = gather invocations that returned true,
+ // `pool` = of those, the ones served from a POOL-backed table (the new third source), `miss_fills` = routed
+ // experts that were in neither tier and were copied into the destination before the kernel.
+@@ -9167,8 +9174,25 @@ bool moe_cache_stage_ready(const struct ggml_tensor * weight, int device) {
+     if (!g_sized) {
+         return false;
+     }
+-    for (const table_t & t : g_tables) {
++    // wip/flash-next-prefill: a POOL-BACKED master does not need the ARENA to be staged.  The pinned pool is
++    // its source (`moe_cache_stage_table`'s pool branch fills the ring slot from the arena where the table is
++    // resident and from the pool everywhere else), so an arena stand-down is not a reason to refuse staging.
++    // It used to be, and the refusal is per SPLIT (`sched_stage_issue` returns for the whole split on the
++    // first table that answers false), so every stood-down layer's split fell to the scheduler's pageable
++    // per-table bounce instead: one host memcpy + one sub-MiB H2D PER EXPERT, under a bounded pinned ring.
++    // Measured 2026-11-26 (Flash-Next IQ3_XXS, `--host-experts pool -ub 8192`, 89 234-token prefill): 174 GB
++    // of a run's 420 GB took that bounce, and the host could not keep the GPU fed (36 % of the prefill was in
++    // no op at all, against 24 % for the gather).  `MOE_HOST_POOL_STAGE_STANDDOWN=0` restores the refusal.
++    static const bool standdown_stage = [] {
++        const char * e = getenv("MOE_HOST_POOL_STAGE_STANDDOWN");
++        return e == nullptr || e[0] == '\0' || atoi(e) != 0;
++    }();
++    for (table_t & t : g_tables) {
+         if (t.device == device && t.host == (const void *) weight->data) {
++            if (!t.host_pinned && standdown_stage) {
++                const host_pool_t * p = table_pool_locked(t);
++                return p != nullptr && !p->failed && p->base_dev != nullptr && p->slots > 0;
++            }
+             return t.arena != nullptr && t.slots > 0;
+         }
+     }
+@@ -10598,6 +10622,164 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
+         if (!t.host_pinned) {
+             host_pool_t * pool = table_pool_locked(t);
+             cudaError_t   err  = cudaSuccess;
++            // wip/flash-next-prefill: the BULK fill.  A covering mirror is laid out `slot == expert`
++            // (`pool_fill_mirror_locked`: "the file layout IS the slot layout"), so a whole table is ONE
++            // contiguous run of the pool -- and the pool is `cudaHostAlloc(portable|mapped)`, so that run is
++            // device-readable (`base_dev`).  One copy-engine DMA then fills the ring slot in expert order,
++            // byte-for-byte what the staging kernel produces, instead of a kernel (or, worse, the bounce
++            // path's per-expert host memcpy) walking 512 experts of it.  Only the SOURCE of the bytes and the
++            // engine change, so every consumer is unchanged.
++            //
++            // Measured 2026-11-26 (Flash-Next GSQ-RCO-IQ3_XXS, `--host-experts pool -ub 8192`, 89 234-token
++            // prefill, 1 x R9700 at 28.7 GB/s): the prefill transport is 24 % of the wall as a compute-stream
++            // gather and ~36 % as the per-expert bounce, while a copy-engine bulk upload of the same table set
++            // is almost entirely hidden behind the split's compute (`MOE_EXPERT_CACHE_MIB=0` reads 2329-2482
++            // t/s against the gather's 2117).  `MOE_HOST_POOL_STAGE_BULK=0` is the kill switch.
++            // `MOE_HOST_POOL_STAGE_BULK`: 0 = the pre-patch paths (two-tier kernel, then the bounce),
++            // 1 = one DMA of the whole table, 2 = THE HYBRID (default): merged host runs by copy-engine DMA
++            // plus ONE kernel launch for the arena-resident experts.
++            //
++            // The hybrid is the shape asked for from the start of the slab/arena work: each engine does the half
++            // it is good at.  A copy engine reaches the link (~28 GB/s here) but needs long runs to amortise its
++            // issue path; a kernel is the opposite (one launch, but ~10 GB/s on the `cudaHostAlloc`-mapped pool,
++            // measured).  So the HOST side becomes a handful of run DMAs -- adjacent non-resident experts are
++            // coalesced into one transfer, and a resident run shorter than `MOE_HOST_POOL_STAGE_MERGE` experts
++            // is deliberately OVER-FETCHED from the pool (which mirrors every expert) to lengthen its
++            // neighbouring run -- and the ARENA side is one kernel launch, which never crosses PCIe.
++            // `MOE_HOST_POOL_STAGE_MERGE=<n>` (default 1 = coalesce only, no over-fetch).
++            static const int stage_bulk = [] {
++                const char * e = getenv("MOE_HOST_POOL_STAGE_BULK");
++                return e == nullptr || e[0] == '\0' ? 2 : atoi(e);
++            }();
++            static const int stage_merge = [] {
++                const char * e = getenv("MOE_HOST_POOL_STAGE_MERGE");
++                const int v = e != nullptr ? atoi(e) : 1;
++                return v < 1 ? 1 : v;
++            }();
++            if (stage_bulk > 0 && n_copies == 1 && pool != nullptr && !pool->failed &&
++                pool->base_dev != nullptr && pool->slots >= t.n_experts &&
++                pool->host_bytes == t.expert_bytes && pool->slot_expert.size() >= (size_t) t.n_experts &&
++                pool->slot_state.size() >= (size_t) t.n_experts) {
++                // The mirror invariant: slot `e` holds expert `e` and is resident.  Anything else (a partial
++                // pool, a heat-ranked layout, an in-flight retire) keeps the kernel path below, which encodes
++                // both tiers.  A full-coverage mirror never demotes or retires a slot (the arena exchange is
++                // INERT for it), so an in-flight DMA cannot be overtaken by a fill.
++                bool mirror = true;
++                for (int e = 0; e < t.n_experts; e++) {
++                    if (pool->slot_expert[(size_t) e] != e || pool->slot_state[(size_t) e] != 1) {
++                        mirror = false;
++                        break;
++                    }
++                }
++                if (mirror && stage_bulk == 1) {
++                    const size_t span = (size_t) t.n_experts * pool->host_bytes;
++                    const size_t n    = width < span ? width : span;   // the caller's MMQ tail pad stays as it was
++                    err = cudaMemcpyAsync(dst, pool->base_dev, n, cudaMemcpyHostToDevice,
++                                          (cudaStream_t) copy_stream);
++                    if (err == cudaSuccess) {
++                        g_stage_ok++;
++                        g_stage_host_bytes += (int64_t) n;
++                        g_stage_bulk_calls++;
++                        g_stage_bulk_bytes += (int64_t) n;
++                        return true;
++                    }
++                    (void) cudaGetLastError();
++                    err = cudaSuccess;
++                }
++                // ---- THE HYBRID.  Whole-table geometry only (a strided slice keeps the two-tier kernel):
++                // the destination is the table in expert order, a host run is contiguous in the pool mirror,
++                // and an arena-resident expert is copied from its slot by the kernel below.
++                if (mirror && stage_bulk >= 2 && !do2d && t.expert_bytes == pool->host_bytes) {
++                    const int            ne  = t.n_experts;
++                    std::vector<int32_t> prs_new((size_t) ne, -1);   // arena slot, or -1 = not the kernel's job
++                    std::vector<uint8_t> from_host((size_t) ne, 1);
++                    for (int e = 0; e < ne; e++) {
++                        const auto hit = t.expert_slot.find(e);
++                        if (hit != t.expert_slot.end() && hit->second >= 0 && hit->second < t.slots) {
++                            prs_new[(size_t) e]   = hit->second;
++                            from_host[(size_t) e] = 0;
++                        }
++                    }
++                    // Over-fetch across SHORT resident runs, so a host run is not split for the sake of one or
++                    // two resident experts (the pool has them too, so the merge needs no second source and no
++                    // patch pass): the boundary resident experts simply come from the host as well.
++                    if (stage_merge > 1) {
++                        for (int e = 0; e < ne; ) {
++                            if (from_host[(size_t) e]) { e++; continue; }
++                            int e2 = e;
++                            while (e2 < ne && !from_host[(size_t) e2]) { e2++; }
++                            if (e > 0 && from_host[(size_t) e - 1] && e2 < ne && from_host[(size_t) e2] &&
++                                (e2 - e) < stage_merge) {
++                                for (int k = e; k < e2; k++) {
++                                    prs_new[(size_t) k]   = -1;
++                                    from_host[(size_t) k] = 1;
++                                    g_stage_overfetch_experts++;
++                                }
++                            }
++                            e = e2;
++                        }
++                    }
++                    // (a) the host side: one DMA per coalesced run, straight out of the pinned mirror
++                    bool ok = true;
++                    int  n_runs = 0;
++                    for (int e = 0; e < ne && ok; ) {
++                        if (!from_host[(size_t) e]) { e++; continue; }
++                        int e2 = e;
++                        while (e2 < ne && from_host[(size_t) e2]) { e2++; }
++                        const size_t nb = (size_t) (e2 - e) * t.expert_bytes;
++                        ok = cudaMemcpyAsync((char *) dst + (size_t) e * t.expert_bytes,
++                                             (const char *) pool->base_dev + (size_t) e * pool->host_bytes,
++                                             nb, cudaMemcpyHostToDevice, (cudaStream_t) copy_stream) == cudaSuccess;
++                        if (ok) {
++                            g_stage_host_bytes += (int64_t) nb;
++                            g_stage_bulk_bytes += (int64_t) nb;
++                            g_stage_bulk_runs  += 1;
++                            n_runs++;
++                        }
++                        e = e2;
++                    }
++                    if (!ok) {
++                        (void) cudaGetLastError();
++                        err = cudaSuccess;   // fall through to the two-tier kernel (a partial fill is harmless:
++                                             // it re-copies every expert from its own tier)
++                    } else {
++                        // (b) the arena side: ONE launch, no PCIe.  Every non-arena entry is `-1`, which
++                        // `skip_miss` makes a no-op -- the host runs above already wrote those.
++                        if (t.prs_dev == nullptr || t.prs_n != ne) {
++                            if (t.prs_dev != nullptr) { (void) cudaFree(t.prs_dev); t.prs_dev = nullptr; }
++                            if (cudaMalloc((void **) &t.prs_dev, (size_t) ne * sizeof(int32_t)) != cudaSuccess) {
++                                (void) cudaGetLastError();
++                                t.prs_dev = nullptr;
++                                return false;   // let the caller fall back to the plain upload
++                            }
++                            t.prs_n = ne;
++                        }
++                        t.prs_host.assign(prs_new.begin(), prs_new.end());
++                        t.prs_gen   = g_write_seq.load();
++                        t.prs_arena = (void *) t.arena;
++                        t.prs_slots = t.slots;
++                        if (cudaMemcpyAsync(t.prs_dev, prs_new.data(), (size_t) ne * sizeof(int32_t),
++                                            cudaMemcpyHostToDevice, (cudaStream_t) copy_stream) != cudaSuccess) {
++                            (void) cudaGetLastError();
++                            return false;
++                        }
++                        if (ne > 0) {
++                            moe_cache_stage_kernel<<<ne, 256, 0, (cudaStream_t) copy_stream>>>(
++                                (char *) dst, (const char *) t.arena, (const char *) t.host_dev, t.prs_dev,
++                                t.slots, (int64_t) t.expert_bytes, (int64_t) t.host_bytes, 0,
++                                0, 0, 0, 0, nullptr, 0, /*skip_miss*/ 1);
++                            if (cudaGetLastError() != cudaSuccess) {
++                                (void) cudaGetLastError();
++                                return false;
++                            }
++                        }
++                        g_stage_ok++;
++                        g_stage_bulk_calls++;
++                        g_stage_bulk_runs_total += n_runs;
++                        return true;
++                    }
++                }
++            }
+             {
+                 const int64_t resident = (int64_t) t.expert_slot.size();
+                 g_stage_ok++;
+@@ -13704,12 +13886,14 @@ static void report_locked() {
+         const double total = (double) g_stage_arena_bytes + (double) g_stage_host_bytes;
+         GGML_LOG_INFO("%s: prefill cache staging: ok=%lld geom_decline=%lld unusable=%lld nomatch=%lld "
+                       "unsized=%lld (the priming pass); arena=%.1f MiB host=%.1f MiB (H2D %.1f%% of staged); "
+-                      "PRS rebuilds=%lld\n",
++                      "BULK %lld calls %.1f MiB, %lld host DMAs (%lld over-fetched experts); PRS rebuilds=%lld\n",
+                       __func__, (long long) g_stage_ok, (long long) g_stage_decline_geom,
+                       (long long) g_stage_decline_usable, (long long) g_stage_decline_nomatch,
+                       (long long) g_stage_decline_unsized,
+                       (double) g_stage_arena_bytes / (1024 * 1024), (double) g_stage_host_bytes / (1024 * 1024),
+                       total > 0 ? 100.0 * (double) g_stage_host_bytes / total : 0.0,
++                      (long long) g_stage_bulk_calls, (double) g_stage_bulk_bytes / (1024 * 1024),
++                      (long long) g_stage_bulk_runs_total, (long long) g_stage_overfetch_experts,
+                       (long long) g_prs_rebuilds);
+     }
+     if (g_stage_span_reads + g_stage_span_fallback > 0) {

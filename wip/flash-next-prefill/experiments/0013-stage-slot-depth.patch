@@ -1,0 +1,29 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index e9fa76601..05306653d 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -2389,13 +2389,19 @@ struct ggml_backend_cuda_context {
+         return bound;
+     }
+ 
+-    // Effective ring depth, GGML_SCHED_STAGE_SLOTS (default 8, clamped to H2D_STAGE_SLOTS).  The
+-    // scheduler uses the same variable for its own round-robin; the backend needs it only to size the
+-    // auto budget below.
++    // The STAGE depth: how many buffer-sized slots this backend keeps.  It is the PING-PONG's buffer count
++    // (`GGML_SCHED_PINGPONG_BUFS`, default 3), because the slot ring is gone -- the scheduler no longer has a
++    // round-robin and nothing needs eight slots.  This used to read `GGML_SCHED_STAGE_SLOTS` (default 8), which
++    // sized BOTH this array and the slab's stage region for eight buffers: 8 x (largest table + 512) = 6656 MiB
++    // carved for a ~3.4 GiB need on the 89k Flash-Next shape.  `GGML_SCHED_STAGE_SLOTS` is still honoured as a
++    // deprecated alias (A/B and bisection).
+     static int h2d_stage_slots() {
+         static const int n = []() {
+-            const char * e = getenv("GGML_SCHED_STAGE_SLOTS");
+-            int v = e ? atoi(e) : 8;
++            const char * e = getenv("GGML_SCHED_PINGPONG_BUFS");
++            if (e == nullptr || e[0] == '\0') {
++                e = getenv("GGML_SCHED_STAGE_SLOTS");   // deprecated alias
++            }
++            int v = e ? atoi(e) : 3;
+             if (v < 1) v = 1;
+             if (v > H2D_STAGE_SLOTS) v = H2D_STAGE_SLOTS;
+             return v;

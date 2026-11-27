@@ -1,0 +1,94 @@
+From 01637122aa69d02542737fcb8e369a084d6035fd Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 05:37:05 -0600
+Subject: [PATCH] wip: keep a deferred narrow-floor raise and apply it in the
+ idle-ring window
+
+The field log (~/no-recover.md) shows the mechanism behind "the arena does not recover after the drop":
+`set_narrow_floor: narrow floor raise to 1792.0 MiB ignored (ring in use: 2304.0 MiB of 3456.0 MiB,
+floor 1536.0 MiB); the band is learned from the next idle-ring narrow view instead` -- six times -- and
+that window never comes, because a prefill precedes every drop and the transport ring is held across the
+whole prefill.  So the floor stayed at the sizing estimate (1536 instead of 1792/2048), each drop returned
+less band than the decode view needs, and the re-arm had to shrink WHOLE layers: `layer 20 re-armed
+uniformly at 2 slots (the sizing pass had 212)`, `11 -> 4`, `12/13 -> 3-4`, arena 16 111.8 -> 11 329.6 MiB,
+and only 13 268.6 back on the next request.
+
+The raise is now KEPT (narrow_floor_pending) and applied in the idle-ring window that experiments/0018
+created (a narrow view with the wide pass disarmed and no slot live, where the region's VA may move).
+
+Measured on that runme, same three-request sequence (618 / 68 491 / 209 tokens):
+  arena after each drop:  16 111.8 -> 15 977.7 -> 15 977.7 MiB   (field log: 16 111.8 -> 11 329.6 -> 13 268.6)
+  tiny-slot re-arms (`layer 20 -> 2 slots`): gone; the floor reaches 1792
+  prefill 243 / 2184 / 136 t/s, decode 96.6 / 78.4 t/s
+Campaign arm unchanged: 1 GPU 89k 2502.8 t/s, text 43d0b1f4629e.  check-shlib-symbols 16/16.
+
+Remaining: a 2048 MiB raise (the two-slot MTP verify width) is still recorded as DEFERRED and not applied
+in this run -- the arena is unaffected here (floor 1792 suffices) but it is the same class of one-way door
+and should be closed next.
+---
+ ggml/src/ggml-cuda/ggml-cuda-slab.cu | 35 +++++++++++++++++++++++-----
+ 1 file changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index d7d917f1f..889d1cdb8 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -221,6 +221,9 @@ struct ggml_cuda_slab {
+                                                 //  such a view above the ring even when its buffer is no
+                                                 //  wider than the narrow floor (see the classification there)
+     size_t                   ring_used    = 0;  // bump cursor within the ring region
++    // wip/flash-next-prefill (session 4): a narrow-floor raise that arrived while the transport ring was
++    // in use, kept until the first window where the ring is idle (see `ggml_cuda_slab_set_narrow_floor`).
++    size_t                   narrow_floor_pending = 0;
+     int                      ring_slots   = 0;  // slots the ring region was sized for (capacity = region/slots)
+     std::multiset<size_t>    work_needs;        // REQUESTED size of every live work view -- the floor the
+                                                 //  boundary may shrink to (see `work_alloc`)
+@@ -378,12 +381,18 @@ void ggml_cuda_slab_set_narrow_floor(int device, size_t bytes) {
+         return;   // not a raise: nothing to apply and nothing to report
+     }
+     if (s.ring_used > 0) {
+-        // The ring holds blocks, so its VA must not move.  The floor is only an estimate at this point;
+-        // `work_alloc` raises it from the real graph the next time a narrow view is placed while the ring
+-        // is idle, so this is not fatal -- but a raise that arrives here means the estimate was too low, and
+-        // that is worth knowing (it is what kept the field's decode views above the ring).
+-        GGML_LOG_WARN("%s: device %d: narrow floor raise to %.1f MiB ignored (ring in use: %.1f MiB of %.1f MiB, "
+-                      "floor %.1f MiB); the band is learned from the next idle-ring narrow view instead\n",
++        // The ring holds blocks, so its VA must not move RIGHT NOW.  This used to drop the raise and promise
++        // that "the band is learned from the next idle-ring narrow view instead" -- measured on the field GSQ
++        // server, that window never comes (a prefill precedes every drop, and the ring is held across the whole
++        // prefill), so the floor stayed at the sizing estimate (1536 instead of 1792/2048), each drop returned
++        // less band, and the re-arm had to shrink whole layers to 2-4 slots: arena 16 111.8 -> 11 329.6 MiB and
++        // only 13 268.6 back on the next request.  KEEP the raise and apply it in the idle-ring window
++        // `work_alloc` now has (it releases the transport carve there).
++        if (nf > s.narrow_floor_pending) {
++            s.narrow_floor_pending = nf;
++        }
++        GGML_LOG_WARN("%s: device %d: narrow floor raise to %.1f MiB DEFERRED (ring in use: %.1f MiB of %.1f MiB, "
++                      "floor %.1f MiB); it is applied at the next idle-ring narrow view\n",
+                       __func__, device, (double) nf / (1ull << 20), (double) s.ring_used / (1ull << 20),
+                       (double) s.ring_region / (1ull << 20), (double) s.narrow_floor / (1ull << 20));
+         return;
+@@ -1395,6 +1404,20 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+         // Release it here, which is the only window where the VA may move: the next WIDE view is placed below,
+         // at `narrow_floor + ring_region`, so it is re-carved (the same deterministic value) just before that
+         // placement.  Measured effect and verification: RESULTS-session4.md §7.3.
++        if (narrow && !s.ring_requested && s.ring_used == 0 && s.narrow_floor_pending > s.narrow_floor) {
++            // A raise that arrived while the ring was in use (see `ggml_cuda_slab_set_narrow_floor`).  The ring
++            // is idle here -- no block is live and the wide pass is disarmed -- so its VA may move, which is
++            // what the floor needs.  Applying it here is what lets the NEXT drop return the band the decode
++            // view actually needs instead of the sizing estimate.
++            GGML_LOG_INFO("%s: dev=%d: narrow floor applied from the deferred raise: %.1f -> %.1f MiB "
++                          "(ring idle, wide pass disarmed)\n", __func__, device,
++                          (double) s.narrow_floor / 1048576.0, (double) s.narrow_floor_pending / 1048576.0);
++            s.narrow_floor = s.narrow_floor_pending;
++            s.narrow_floor_pending = 0;
++            s.ring_region = ggml_cuda_slab_ring_candidate(s, s.narrow_floor, device);
++            s.ring_slots  = ggml_backend_cuda_context::h2d_stage_slots();
++            s.ring_used   = 0;
++        }
+         if (narrow && !s.ring_requested && s.ring_used == 0 && s.ring_region > 0) {
+             static bool released = false;
+             if (!released) {
+-- 
+2.56.1
+

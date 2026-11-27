@@ -1,0 +1,367 @@
+From 10dfd836db8dd98a3094da09c0e1bd2739d41012 Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 06:08:46 -0600
+Subject: [PATCH] wip: the transport region's BASE is a CUSHION -- N compute
+ chunks above the decode/verify band
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The field log (~/no-recover.md) proved the one-way door: `narrow_floor` (the always-resident
+decode/verify COMPUTE band) is corrected upward by the context after the fit probe, but the transport
+region sits directly above it, so a raise can only be applied while nothing holds a region block -- and on
+a server a prefill precedes every drop, so it was deferred indefinitely (floor stuck at 1536, layers cut
+to 2-4 slots, arena 16 112 -> 11 330 MiB, only 13 268 back on the next request).
+
+The maintainer's fix, as specified in HANDOVER-session5 §2.1: `transport_base = narrow_floor + N x
+GGML_COMPUTE_BUFFER_CHUNK_MIB` at the first carve, FIXED for the run, region at `transport_base`.  A raise
+that keeps `narrow_floor <= transport_base` is applied IMMEDIATELY with no VA move; only a raise past it
+keeps the deferred path (experiments/0020), which is the CORRECTNESS fallback, not the policy.  The quantum
+is the COMPUTE chunk, not a magic 256/512: a raise is always a whole number of them, and the field shape
+needed exactly two (1536 -> 1792 -> 2048), which is where N = 2 comes from.
+
+It is a cushion, not a guarantee, and the handover is instrumented so the next session can tell whether it
+is the right size instead of guessing: a distinct WARN when a raise EXCEEDS the headroom ("raise to X MiB
+exceeds the transport_base headroom by Y MiB -> deferred"), a per-run counter of that event, and both
+counters plus `transport_base=`/`headroom=` in every SLAB_STATS census (including context-exit).
+
+  band_raise[absorbed_by_cushion=2 overrun_deferred=0]     <-- the new knobs in the exit census
+  GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS=2 (default; 0 = the pre-cushion layout)
+
+Measured.  1 GPU, GSQ-IQ3_XXS 89k prefill, 3 rotated cycles, text 43d0b1f4629e on every arm:
+  prefill 2504.8 t/s (cushion) vs 2496.3 (headroom 0) -- neutral, +0.3 % inside the 2-3 % bimodal noise
+  decode  37.5 vs 37.4 t/s; arena at the wide-drop 14976 vs 15232 MiB region (the 2-chunk cushion)
+The field runme, three requests (645 / 71 816 / 239 tok), same build, headroom 0 vs 2:
+  headroom 0 (the pre-cushion layout): arena after each drop 16 111.8 -> 15 977.7 -> 15 977.7 MiB, and the
+    2048 MiB raise (the two-slot MTP verify width) reads `exceeds the transport_base headroom by 256.0 MiB ->
+    deferred` TWICE and is never applied -- session 4's numbers reproduced exactly (overrun_deferred=2)
+  cushion:  16 049.9 -> 15 879.7 -> 15 576.0 MiB, band 1536 -> 1792 -> 2048 with absorbed_by_cushion=2,
+    overrun_deferred=0, and the last drop's difference against the control is exactly the +256 MiB band the
+    decode view needs (arena_region 13 184 vs 13 440; the cushion itself costs NOTHING once the band has
+    grown into it).  Prefill 2214.2 vs 2215.5 t/s on the long request.  The cost is the dead band before the
+    band learns its size: 512 MiB during the first (645-token) prefill, 256 during the second.
+Campaign arm text unchanged; check-shlib-symbols 16/16.
+---
+ ggml/src/ggml-cuda/ggml-cuda-slab.cu | 202 ++++++++++++++++++++++-----
+ 1 file changed, 166 insertions(+), 36 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index 147117c6a..742e2f704 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -224,6 +224,19 @@ struct ggml_cuda_slab {
+     // wip/flash-next-prefill (session 4): a narrow-floor raise that arrived while the transport ring was
+     // in use, kept until the first window where the ring is idle (see `ggml_cuda_slab_set_narrow_floor`).
+     size_t                   narrow_floor_pending = 0;
++    // wip/flash-next-prefill (session 5, the maintainer's cushion): the transport region's BASE offset,
++    // held `GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS` compute chunks above the decode/verify band.  The
++    // region sits directly above that band, so without a cushion a band raise moves the region's VA and
++    // can only be applied while nothing holds a region block -- measured on the field GSQ server, that
++    // window never came: the floor stayed at the sizing estimate, every drop returned less band than the
++    // decode view needs, and whole layers were cut to 2-4 slots (RESULTS-session4.md §7.5).  With the
++    // cushion a raise that fits UNDER the base is applied immediately and moves nothing.
++    // Established at the first carve and FIXED for the run; re-based only when the band grows past it
++    // (the deferred path, applied at the idle window -- the correctness fallback).  0 = not established
++    // (`narrow_floor` is then the base, i.e. the pre-cushion layout).
++    size_t                   transport_base = 0;
++    size_t                   band_raise_n   = 0;  // band raises the cushion absorbed without a VA move
++    size_t                   band_overrun_n = 0;  // band raises that EXCEEDED the cushion (deferred)
+     int                      ring_slots   = 0;  // slots the ring region was sized for (capacity = region/slots)
+     std::multiset<size_t>    work_needs;        // REQUESTED size of every live work view -- the floor the
+                                                 //  boundary may shrink to (see `work_alloc`)
+@@ -296,10 +309,72 @@ void ggml_cuda_slab_set_ring_region(size_t bytes) {
+     g_slab_ring_region_bytes = bytes;
+ }
+ 
++// wip/flash-next-prefill (session 5): the unit a decode/verify COMPUTE-band raise actually moves in -- the
++// compute buffer's own chunk (`GGML_COMPUTE_BUFFER_CHUNK_MIB`, the unit `ggml_vbuffer_chunk_alloc_size`
++// rounds a compute buffer to).  The transport region's headroom is denominated in THESE, never in a magic
++// 256/512 MiB: a raise is always a whole number of chunks.
++static size_t ggml_cuda_slab_compute_chunk_bytes() {
++    static const size_t cchunk = []() {
++        const char * e = getenv("GGML_COMPUTE_BUFFER_CHUNK_MIB");
++        return (size_t) (e ? atoll(e) : 256) << 20;
++    }();
++    return cchunk;
++}
++
++// wip/flash-next-prefill (session 5): the transport region's headroom CUSHION, in compute chunks
++// (`GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS`, default 2; 0 restores the pre-cushion layout).  It is a
++// CUSHION, not a guarantee: a very long prompt can still want more band than it holds, and that case keeps
++// the deferred path as the CORRECTNESS fallback (the handover's `experiments/0020` window).  The default is
++// the smallest cushion that covers the observed case -- the field shape needed exactly two chunks,
++// 1536 -> 1792 -> 2048 MiB -- and if the overrun counter in the census is non-zero, N is too small for that
++// shape, which is the number to tune (not the presence of the fallback).
++static size_t ggml_cuda_slab_headroom_chunks() {
++    static const size_t n = []() {
++        const char * e = getenv("GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS");
++        return (size_t) (e ? atoll(e) : 2);
++    }();
++    return n;
++}
++
++// The transport region's base offset: the narrow floor plus the cushion, FIXED for the run once
++// established.  Every reader goes through this one value -- `arena_alloc_transient` (the region's blocks),
++// the wide placement and the seed floor -- because the region's VA must not move under a live block.
++static size_t ggml_cuda_slab_transport_base(const ggml_cuda_slab & s) {
++    if (s.narrow_floor == 0) {
++        return 0;
++    }
++    return s.transport_base > s.narrow_floor ? s.transport_base : s.narrow_floor;
++}
++
++// Establish (or re-base) the transport region's base for a band of `narrow_floor` bytes: the floor plus N
++// compute chunks, clamped to what the mapping can actually hold (never its last slab chunk, which the wide
++// view and a usable arena need).  A base that already covers the band is KEPT, so raising the band inside
++// the cushion moves nothing; only a raise past the base re-derives it, and that may only happen in a window
++// where no region block and no wide view is live (`ggml_cuda_slab_set_narrow_floor` defers otherwise).
++// Caller holds `g_slab_mutex`.
++static void ggml_cuda_slab_transport_base_establish(ggml_cuda_slab & s, size_t narrow_floor) {
++    if (narrow_floor == 0 || s.transport_base >= narrow_floor) {
++        return;
++    }
++    const size_t cchunk = ggml_cuda_slab_compute_chunk_bytes();
++    // `room` is what the mapping has above the band with one slab chunk left for the wide view/arena.
++    const size_t room = s.mapped > narrow_floor + s.chunk ? s.mapped - narrow_floor - s.chunk : 0;
++    size_t headroom = ggml_cuda_slab_headroom_chunks() * cchunk;
++    if (cchunk > 0 && headroom > room) {
++        headroom = room / cchunk * cchunk;   // whole chunks only; 0 when none fit
++    }
++    const size_t base = ggml_cuda_slab_up(narrow_floor + headroom, s.chunk);
++    s.transport_base = base + s.chunk <= s.mapped ? base : narrow_floor;
++}
++
+ // wip/slab-ring-region / first-prefill-latency: the chunk-aligned ring region to CARVE from the current
+ // request (0 when there is no room -- the ring then stays on the cudaMalloc path).  Used only at the point
+ // the region is actually carved into the work layout.  Caller holds `g_slab_mutex`.
+-static size_t ggml_cuda_slab_ring_candidate(const ggml_cuda_slab & s, size_t narrow_floor, int device) {
++//
++// session 5: `s` is mutable because carving is also where the transport region's BASE is established -- the
++// two are one layout decision (`ggml_cuda_slab_transport_base_establish`), and the room test below must use
++// the base, not the floor, or the cushion is not accounted for and the region overlaps the wide view.
++static size_t ggml_cuda_slab_ring_candidate(ggml_cuda_slab & s, size_t narrow_floor, int device) {
+     size_t ring = g_slab_ring_region_bytes;
+     if (ring == 0) {
+         return 0;
+@@ -327,22 +402,38 @@ static size_t ggml_cuda_slab_ring_candidate(const ggml_cuda_slab & s, size_t nar
+         }
+     }
+     ring = ggml_cuda_slab_up(ring, s.chunk);
+-    if (narrow_floor + ring + s.chunk > s.mapped) {
+-        ring = 0;   // no room for a meaningful region: leave the staging path a cudaMalloc slot
++    // The region lives at the transport BASE (floor + cushion), so the cushion is part of this layout test.
++    {
++        const size_t base_before = ggml_cuda_slab_transport_base(s);
++        ggml_cuda_slab_transport_base_establish(s, narrow_floor);
++        const size_t base = ggml_cuda_slab_transport_base(s);
++        if (base != base_before) {
++            GGML_LOG_INFO("%s: dev=%d: transport region base %.1f MiB = decode/verify band %.1f MiB + a "
++                          "%.1f MiB headroom cushion (%zu x %.0f MiB compute chunks); a band raise that fits "
++                          "under the base moves nothing\n",
++                          __func__, device, (double) base / 1048576.0, (double) narrow_floor / 1048576.0,
++                          (double) (base - narrow_floor) / 1048576.0, ggml_cuda_slab_headroom_chunks(),
++                          (double) ggml_cuda_slab_compute_chunk_bytes() / 1048576.0);
++        }
++        if (base + ring + s.chunk > s.mapped) {
++            ring = 0;   // no room for a meaningful region: leave the staging path a cudaMalloc slot
++        }
+     }
+     return ring;
+ }
+ 
+-// The base offset of the wide (prefill) view: narrow = [0, narrow_floor), ring = [narrow_floor,
+-// narrow_floor + ring_region), wide = [narrow_floor + ring_region, boundary), arena = [boundary, mapped).
++// The base offset of the wide (prefill) view: narrow = [0, `narrow_floor`, which may grow into the
++// cushion), cushion = [`narrow_floor`, `transport_base`), transport = [`transport_base`, `transport_base`
++// + `ring_region`), wide = [`transport_base` + `ring_region`, boundary), arena = [boundary, mapped).
+ //
+ // `s.ring_region` is the region the slab ACTUALLY reserved.  `g_slab_ring_region_bytes` is only the
+ // current REQUEST and is re-armed after the carve (the context applies its auto-size cap): using it here
+ // moves the wide view below the carved ring and the wide compute buffer overwrites the H2D staging ring
+ // (measured r74: ring carved 1216 MiB, request re-armed to 975 MiB -> wide placed at 1792 instead of 1984,
+-// a GPU VM fault in `k_get_rows_float` on the 35B-A3B + MTP path).  Placement must follow the carve.
++// a GPU VM fault in `k_get_rows_float` on the 35B-A3B + MTP path).  Placement must follow the carve -- and
++// the region's BASE is `ggml_cuda_slab_transport_base()`, never `narrow_floor` directly (session 5).
+ static size_t ggml_cuda_slab_wide_offset(const ggml_cuda_slab & s) {
+-    return s.narrow_floor + s.ring_region;
++    return ggml_cuda_slab_transport_base(s) + s.ring_region;
+ }
+ 
+ // The base offset the WIDE (prefill) view is actually PLACED at.  With a carved ring region it sits above
+@@ -369,10 +460,7 @@ void ggml_cuda_slab_set_narrow_floor(int device, size_t bytes) {
+     // `GGML_COMPUTE_BUFFER_CHUNK_MIB` units plus one spare unit (`ggml_vbuffer_chunk_alloc_size`).  Apply
+     // the same formula so the pinned floor matches the size the first narrow reserve will actually request
+     // (otherwise the floor is a chunk short and that reserve is misclassified as wide).
+-    static const size_t cchunk = []() {
+-        const char * e = getenv("GGML_COMPUTE_BUFFER_CHUNK_MIB");
+-        return (size_t) (e ? atoll(e) : 256) << 20;
+-    }();
++    const size_t cchunk = ggml_cuda_slab_compute_chunk_bytes();
+     size_t nf = ggml_cuda_slab_up(bytes, s.chunk);
+     if (cchunk > 0) {
+         nf = ggml_cuda_slab_up(bytes, cchunk) + cchunk;
+@@ -380,25 +468,48 @@ void ggml_cuda_slab_set_narrow_floor(int device, size_t bytes) {
+     if (nf <= s.narrow_floor) {
+         return;   // not a raise: nothing to apply and nothing to report
+     }
+-    if (s.ring_used > 0) {
+-        // The ring holds blocks, so its VA must not move RIGHT NOW.  This used to drop the raise and promise
+-        // that "the band is learned from the next idle-ring narrow view instead" -- measured on the field GSQ
+-        // server, that window never comes (a prefill precedes every drop, and the ring is held across the whole
+-        // prefill), so the floor stayed at the sizing estimate (1536 instead of 1792/2048), each drop returned
+-        // less band, and the re-arm had to shrink whole layers to 2-4 slots: arena 16 111.8 -> 11 329.6 MiB and
+-        // only 13 268.6 back on the next request.  KEEP the raise and apply it in the idle-ring window
+-        // `work_alloc` now has (it releases the transport carve there).
++    // wip/flash-next-prefill (session 5, the cushion): the transport region sits at `transport_base`
++    // (band + cushion), so a raise that stays UNDER that base costs no VA move at all and is applied right
++    // here -- even while the region holds the ping-pong buffers, which is exactly the case that used to be
++    // deferred for ever.  Measured on the field GSQ server: the band grows 1536 -> 1792 -> 2048 MiB across
++    // the first two requests, and with a 2-chunk cushion every one of those raises landed immediately.
++    const size_t tbase = ggml_cuda_slab_transport_base(s);
++    if (nf <= tbase) {
++        s.band_raise_n++;
++        GGML_LOG_INFO("%s: dev=%d: decode/verify compute band (narrow floor) raised %.1f -> %.1f MiB, inside "
++                      "the transport region's headroom cushion (base %.1f MiB, %.1f MiB of cushion left); the "
++                      "region's VA does not move, so this needs no idle window\n",
++                      __func__, device, (double) s.narrow_floor / 1048576.0, (double) nf / 1048576.0,
++                      (double) tbase / 1048576.0, (double) (tbase - nf) / 1048576.0);
++        s.narrow_floor = nf;
++        return;
++    }
++    if (s.ring_used > 0 || s.wide_armed) {
++        // The region's base (and, for a live wide view, the view itself) must not move RIGHT NOW.  This used
++        // to drop the raise and promise that "the band is learned from the next idle-ring narrow view
++        // instead" -- measured on the field GSQ server, that window never comes (a prefill precedes every
++        // drop, and the ring is held across the whole prefill), so the floor stayed at the sizing estimate
++        // (1536 instead of 1792/2048), each drop returned less band, and the re-arm had to shrink whole layers
++        // to 2-4 slots: arena 16 111.8 -> 11 329.6 MiB and only 13 268.6 back on the next request.  KEEP the
++        // raise and apply it in the idle-ring window `work_alloc` now has (it releases the transport carve
++        // there), where it also RE-BASES the cushion.
+         if (nf > s.narrow_floor_pending) {
+             s.narrow_floor_pending = nf;
+         }
+-        GGML_LOG_WARN("%s: device %d: the DECODE/VERIFY compute band (narrow floor) needs %.1f MiB, raised from "
+-                      "%.1f MiB -- DEFERRED because %.1f MiB of the transport region (%.1f MiB, the ping-pong "
+-                      "buffers) is live and the region sits directly above that band, so its base cannot move.  "
+-                      "Applied at the next idle window (nothing staged, prefill band disarmed).\n",
+-                      __func__, device, (double) nf / (1ull << 20), (double) s.narrow_floor / (1ull << 20),
+-                      (double) s.ring_used / (1ull << 20), (double) s.ring_region / (1ull << 20));
++        s.band_overrun_n++;
++        GGML_LOG_WARN("%s: device %d: narrow floor raise to %.1f MiB exceeds the transport_base headroom by "
++                      "%.1f MiB -> deferred (base %.1f MiB = band %.1f + a %.1f MiB cushion; %.1f MiB of the "
++                      "%.1f MiB region is live%s).  Applied at the next idle window (nothing staged, prefill "
++                      "band disarmed).  If this counter keeps climbing, the cushion is too small for this "
++                      "shape -- that is the number to tune, the fallback stays.\n",
++                      __func__, device, (double) nf / 1048576.0, (double) (nf - tbase) / 1048576.0,
++                      (double) tbase / 1048576.0, (double) s.narrow_floor / 1048576.0,
++                      (double) (tbase - s.narrow_floor) / 1048576.0, (double) s.ring_used / 1048576.0,
++                      (double) s.ring_region / 1048576.0, s.wide_armed ? ", and the prefill band is armed" : "");
+         return;
+     }
++    // Nothing holds the region and no wide view is live, so the VA may move: apply the raise and re-derive
++    // the base (which stays put whenever the cushion already covers the new band).
+     s.narrow_floor = nf;
+     s.ring_region = ggml_cuda_slab_ring_candidate(s, nf, device);
+     s.ring_slots  = ggml_backend_cuda_context::h2d_stage_slots();
+@@ -1004,6 +1115,9 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
+     s.ring_region  = 0;
+     s.wide_armed   = false;
+     s.ring_used    = 0;
++    s.transport_base = 0;  // the region's base is established at the first carve (floor + cushion)
++    s.band_raise_n   = 0;
++    s.band_overrun_n = 0;
+     s.wide_aux_off  = 0;
+     s.wide_aux_size = 0;
+     s.wide_aux_gen  = 0;
+@@ -1385,11 +1499,19 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+             // reserve that is not necessarily the widest narrow layout (the `n_rs_batch` probe measures
+             // 1792 MiB where the MTP decode/verify graph needs 2304), and `ggml_cuda_slab_set_narrow_floor`
+             // cannot correct it afterwards because the ring's VA is frozen once it holds blocks.  Here no
+-            // wide view is live and the ring is idle, so moving its base is safe.
+-            s.narrow_floor = ggml_cuda_slab_up(need, s.chunk);
+-            s.ring_region  = ggml_cuda_slab_ring_candidate(s, s.narrow_floor, device);
+-            s.ring_slots   = ggml_backend_cuda_context::h2d_stage_slots();
+-            s.ring_used    = 0;
++            // wide view is live and the ring is idle, so moving its base is safe -- and with the cushion
++            // (session 5) a raise that fits UNDER the transport base moves nothing at all, so it neither
++            // re-carves the region nor resets the cursor.
++            const size_t nf = ggml_cuda_slab_up(need, s.chunk);
++            const bool   absorbed = nf <= ggml_cuda_slab_transport_base(s);
++            s.narrow_floor = nf;
++            if (absorbed) {
++                s.band_raise_n++;
++            } else {
++                s.ring_region  = ggml_cuda_slab_ring_candidate(s, s.narrow_floor, device);
++                s.ring_slots   = ggml_backend_cuda_context::h2d_stage_slots();
++                s.ring_used    = 0;
++            }
+             s.wide_armed   = false;
+         }
+ 
+@@ -1410,9 +1532,11 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+             // A raise that arrived while the ring was in use (see `ggml_cuda_slab_set_narrow_floor`).  The ring
+             // is idle here -- no block is live and the wide pass is disarmed -- so its VA may move, which is
+             // what the floor needs.  Applying it here is what lets the NEXT drop return the band the decode
+-            // view actually needs instead of the sizing estimate.
++            // view actually needs instead of the sizing estimate.  This is the OVERRUN path (a raise past the
++            // cushion), so the re-carve below re-bases the region: floor + a fresh cushion.
+             GGML_LOG_INFO("%s: dev=%d: decode/verify compute band (narrow floor) applied from the deferred "
+-                          "raise: %.1f -> %.1f MiB (transport region idle, prefill band disarmed)\n", __func__, device,
++                          "raise: %.1f -> %.1f MiB (transport region idle, prefill band disarmed; the region "
++                          "is re-based above the new band)\n", __func__, device,
+                           (double) s.narrow_floor / 1048576.0, (double) s.narrow_floor_pending / 1048576.0);
+             s.narrow_floor = s.narrow_floor_pending;
+             s.narrow_floor_pending = 0;
+@@ -1694,6 +1818,8 @@ static void ggml_cuda_slab_log_stats_locked(int device, const char * tag) {
+     const size_t arena        = s.mapped > s.boundary ? s.mapped - s.boundary : 0;
+     const size_t narrow_floor = s.narrow_floor;
+     const size_t ring         = s.ring_region;
++    const size_t tbase        = ggml_cuda_slab_transport_base(s);
++    const size_t headroom     = tbase > narrow_floor ? tbase - narrow_floor : 0;
+     const size_t narrow2      = s.narrow2_floor;
+     const size_t aux          = s.wide_aux_size;
+     const bool   inited       = s.inited;
+@@ -1718,16 +1844,19 @@ static void ggml_cuda_slab_log_stats_locked(int device, const char * tag) {
+     // `arena=` used to mean arena_region here and arena_resident in the MoE census, which is exactly how a
+     // resident figure and a region extent got compared to each other.  Renamed 2026-11-26 (campaign session 4).
+     GGML_LOG_WARN("SLAB_STATS %s dev=%d slab=%d free=%.1f MiB free_min=%.1f MiB total=%.1f MiB mapped=%.1f MiB "
+-                  "work=%.1f MiB (narrow=%.1f transport=%.1f transport_used=%.1f wide_aux=%.1f narrow2=%.1f) "
++                  "work=%.1f MiB (narrow=%.1f transport=%.1f transport_used=%.1f transport_base=%.1f headroom=%.1f "
++                  "wide_aux=%.1f narrow2=%.1f) "
+                   "arena_region=%.1f MiB arena_resident=%.1f MiB "
+                   "pool=%.1f MiB pool_wide=%.1f MiB/%zu refused=%.1f MiB outside_max=%.1f MiB "
+                   "outside_failed=%.1f MiB headroom_cfg=%.1f MiB aux_cfg=%.1f MiB "
+-                  "wide[n_pop=%zu hole=%zu inval=%zu rebase=%zu aux_refused=%zu]\n",
++                  "wide[n_pop=%zu hole=%zu inval=%zu rebase=%zu aux_refused=%zu] "
++                  "band_raise[absorbed_by_cushion=%zu overrun_deferred=%zu]\n",
+                   tag, device, (int) inited,
+                   (double) free_b / 1048576.0, (double) ggml_cuda_free_min_bytes(device) / 1048576.0,
+                   (double) total_b / 1048576.0, (double) mapped / 1048576.0,
+                   (double) boundary / 1048576.0, (double) narrow_floor / 1048576.0,
+                   (double) ring / 1048576.0, (double) s.ring_used / 1048576.0,
++                  (double) tbase / 1048576.0, (double) headroom / 1048576.0,
+                   (double) aux / 1048576.0, (double) narrow2 / 1048576.0,
+                   (double) arena / 1048576.0,
+                   // arena_resident: the EXPERT bytes resident -- the same figure the MoE census calls
+@@ -1742,7 +1871,8 @@ static void ggml_cuda_slab_log_stats_locked(int device, const char * tag) {
+                   (double) ggml_cuda_outside_fail_max_bytes(device) / 1048576.0,
+                   (double) ggml_cuda_slab_headroom_bytes() / 1048576.0,
+                   (double) g_slab_aux_reserve_bytes / 1048576.0,
+-                  s.wide_n_pop, s.wide_n_hole, s.wide_n_inval, s.wide_n_rebase, s.wide_aux_denied_n);
++                  s.wide_n_pop, s.wide_n_hole, s.wide_n_inval, s.wide_n_rebase, s.wide_aux_denied_n,
++                  s.band_raise_n, s.band_overrun_n);
+ }
+ 
+ void ggml_cuda_slab_log_stats(int device, const char * tag) {
+@@ -1796,7 +1926,7 @@ void * ggml_cuda_slab_arena_alloc_transient(int device, size_t size) {
+         }
+         return nullptr;
+     }
+-    void * p = (void *) (uintptr_t) ((char *) s.base + s.narrow_floor + s.ring_used);
++    void * p = (void *) (uintptr_t) ((char *) s.base + ggml_cuda_slab_transport_base(s) + s.ring_used);
+     s.ring_used += want;
+     return p;
+ }
+-- 
+2.56.1
+

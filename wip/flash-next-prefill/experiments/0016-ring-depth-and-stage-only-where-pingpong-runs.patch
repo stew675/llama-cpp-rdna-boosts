@@ -1,0 +1,177 @@
+From 61246e1fbf460665ee752189828319d250167610 Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 03:58:46 -0600
+Subject: [PATCH] wip: fix the field regression -- one ring depth, and stage
+ ONLY where the ping-pong can run
+
+Reported from a user-experience run of the field runme (Flash-Next IQ4_NL, 2 cards, -sm tensor,
+--n-cpu-moe 48 pool tier, -ub 2048): the server's prompts stalled ~20 s with the GPUs idle and the
+prefill crawled.  Two defects, both mine, both from session 4.
+
+1. RING DEPTH MISMATCH.  The Meta (tensor-split) backend's per-device ring still defaulted to 8 slots
+   (the deleted scheduler ring's depth, GGML_SCHED_STAGE_SLOTS) while session 4 sized the slab's
+   transport region from the ping-pong's 3.  ggml_backend_meta_stage_input reserves EVERY device's slot
+   before it uploads anything, so slots 3..7 failing made it refuse the whole input: every split fell to
+   the scheduler's SERIAL pageable upload (CPU, GPUs idle).  The depth is now the same number the region
+   is sized from (GGML_SCHED_PINGPONG_BUFS, default 3; GGML_SCHED_STAGE_SLOTS is the deprecated alias).
+   Also moved; the selector's coverage query is lock-free (it ran under g_mutex on a per-input path).
+
+2. THE SELECTOR STAGED WHERE THE PING-PONG CANNOT RUN.  A -sm tensor split is served by the Meta backend,
+   whose staged path is its own ring -- a different transport that measures BEHIND the gather in every
+   arm (3029 vs 3419 t/s at 100 % coverage).  The selector now keeps the gather unless the backend has
+   the slot API (stage_buffer/stage_upload/stage_wait).  A pinned master is unaffected (mode 1 stages it
+   before the selector is consulted).
+
+Measured on the reported shape, 20k-token prompt: 370-385 t/s -> 1726 t/s at their -ub 2048 (2682 at
+-ub 8192 with the gather).  1 GPU 89k unchanged at 2392.6 / text 43d0b1f4629e; 2-card GSQ 3367.3.
+check-shlib-symbols.sh 16/16 (it caught a real undefined symbol in the first cut of fix 1).
+---
+ ggml/src/ggml-backend-meta.cpp         | 21 ++++++++---
+ ggml/src/ggml-backend.cpp              | 12 ++++++
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 51 ++++++++++++++++++--------
+ 3 files changed, 63 insertions(+), 21 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 0af7d6a14..5d8e56e09 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -3212,12 +3212,23 @@ struct ggml_backend_meta_context {
+         }
+         name += ")";
+ 
+-        // op-offload H2D staging (issue #50 WIP): the slot count mirrors the single-device ring, so
+-        // GGML_SCHED_STAGE_SLOTS means the same depth on both paths (the ring itself lives in each
+-        // simple backend's context and is bounded by its own GGML_SCHED_STAGE_MAX_MB).
++        // op-offload H2D staging (issue #50 WIP): the slot count must be the SAME number the slab sizes the
++        // transport region from, because the region is `depth x (largest staged set + 512)` and a slot that
++        // does not fit makes the WHOLE input decline (`ggml_backend_meta_stage_input` reserves every device's
++        // slot before it uploads anything, so a partial ring is never used).  That is `h2d_stage_slots()`:
++        // `GGML_SCHED_PINGPONG_BUFS` (default 3), with `GGML_SCHED_STAGE_SLOTS` as the deprecated alias.
++        //
++        // This defaulted to 8 (the deleted scheduler ring's depth) while the region was sized from the old
++        // through-knee formula, which was big enough to hide the mismatch.  Session 4 sized the region from the
++        // ping-pong's real need (3 buffers), and then 5 of these 8 slots could never be allocated: every staged
++        // input fell back to the scheduler's SERIAL pageable upload.  Measured (the field runme's shape --
++        // 2 devices `-sm tensor`, `-ncmoe 48` pinned master, `-ub 2048`): startup ... and any prompt stalled
++        // ~20 s with the GPUs idle.  Same depth as the scheduler, one number, no drift.
+         {
+-            const char * slots_env = GGML_ENV_STR("GGML_SCHED_STAGE_SLOTS");
+-            stage_n_slots = slots_env != nullptr ? atoi(slots_env) : 8;
++            const char * pp_env   = GGML_ENV_STR("GGML_SCHED_PINGPONG_BUFS");
++            const char * slot_env = GGML_ENV_STR("GGML_SCHED_STAGE_SLOTS");   // deprecated alias
++            const char * slots_env = (pp_env != nullptr && pp_env[0] != '\0') ? pp_env : slot_env;
++            stage_n_slots = slots_env != nullptr ? atoi(slots_env) : 3;
+             if (stage_n_slots < 1) {
+                 stage_n_slots = 1;
+             }
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index f3228c46b..441afef03 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -3097,6 +3097,18 @@ static bool sched_stage_exposure_decides(ggml_backend_sched_t sched, struct ggml
+     if (backend->iface.stage_buffer == nullptr && backend->iface.stage_input == nullptr) {
+         return false;   // nothing to stage WITH: the gather is all there is
+     }
++    // STAGE ONLY WHERE THE PING-PONG CAN RUN.  A `-sm tensor` split is served by the META backend, which has
++    // no backend-slot API -- its staged path is its own per-device ring (`stage_input`), a different transport
++    // that has measured BEHIND the gather in every arm: 3029 vs 3419 t/s at 100 % coverage on two cards 3,
++    // and catastrophic once the arena cannot cover the set -- the field runme's shape (2 cards `-sm tensor`,
++    // pool tier, 77.5 % coverage, `-ub 2048`) read 370-385 t/s staged against **2682** with the gather on a
++    // 20k-token prompt.  The ping-pong's win (the 1-device +17 %) is what this selector exists for, and it
++    // needs `stage_buffer`/`stage_upload`/`stage_wait`, so a backend without them keeps the gather.  A PINNED
++    // master never reaches here (mode 1 returns `false` for it above: the gather costs it ~47 % at two devices).
++    if (backend->iface.stage_buffer == nullptr || backend->iface.stage_upload == nullptr ||
++        backend->iface.stage_wait == nullptr) {
++        return false;
++    }
+     int64_t covered = 0, host_bytes = 0;
+     backend->iface.moe_cache_residency(backend, &covered, &host_bytes);
+     const int64_t tok = sched_stage_batch_tokens(split);
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 13faa30b7..43df95d42 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -730,6 +730,13 @@ int64_t                             g_arena_bytes= 0;
+ // array and why the census' `resident=` is process-wide while the slab's is per device.
+ static int64_t                      g_arena_dev_bytes[GGML_CUDA_MAX_DEVICES] = {};
+ static std::atomic<int64_t>         g_arena_dev_bytes_mirror[GGML_CUDA_MAX_DEVICES];
++// wip/flash-next-prefill (session 4): the transport selector's input, mirrored lock-free for the same reason
++// as the residency figure -- it is read once per host-weight input of every split, and `g_mutex` is held for
++// whole-table fills, so taking it in that path would stall the fill pipeline.  Both are refreshed whenever the
++// capacity changes (`arena_bytes_delta`, i.e. every slot-count change: sizing, settle, stand-down, re-arm).
++static std::atomic<int64_t>         g_res_covered_mirror[GGML_CUDA_MAX_DEVICES];
++static std::atomic<int64_t>         g_res_host_mirror[GGML_CUDA_MAX_DEVICES];
++static void residency_refresh_locked(int device);
+ static inline void                  arena_bytes_changed(int device) {
+     if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
+         g_arena_dev_bytes_mirror[device].store(g_arena_dev_bytes[device], std::memory_order_relaxed);
+@@ -750,6 +757,7 @@ static inline void arena_bytes_delta(int device, int64_t slots, int64_t expert_b
+         }
+     }
+     arena_bytes_changed(device);
++    residency_refresh_locked(device);
+ }
+ // wip/apu-expert-gtt P3: how many times a table handed its arena BACK (the GTT store's `release`).  A
+ // steady-state residency arm must show 0: a slot is reused, never returned, and a non-zero count means
+@@ -7469,6 +7477,26 @@ void alloc_all_locked() {
+     }
+ }
+ 
++// Recompute one device's coverage (`covered` = the capacity the arena can keep, `host` = one copy of the set)
++// and publish it to the lock-free mirrors the transport selector reads.  Caller holds `g_mutex`.
++static void residency_refresh_locked(int device) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return;
++    }
++    int64_t cov = 0, all = 0;
++    for (const table_t & t : g_tables) {
++        if (t.device != device || t.n_experts <= 0 || t.expert_bytes == 0) {
++            continue;
++        }
++        if (t.slots > 0) {
++            cov += (int64_t) t.slots * (int64_t) t.expert_bytes;
++        }
++        all += (int64_t) t.n_experts * (int64_t) t.expert_bytes;
++    }
++    g_res_covered_mirror[device].store(cov, std::memory_order_relaxed);
++    g_res_host_mirror[device].store(all, std::memory_order_relaxed);
++}
++
+ } // namespace
+ 
+ // issue #327: END of a staging pass.  Every promise a hook made during this pass has either been honoured by
+@@ -7866,24 +7894,15 @@ int64_t moe_cache_resident_bytes(int device) {
+ }
+ 
+ bool moe_cache_residency(int device, int64_t * covered, int64_t * host) {
+-    if (covered != nullptr) { *covered = 0; }
+-    if (host != nullptr)    { *host    = 0; }
+-    if (!g_enabled) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        if (covered != nullptr) { *covered = 0; }
++        if (host != nullptr)    { *host    = 0; }
+         return false;
+     }
+-    std::lock_guard<std::mutex> lock(g_mutex);
+-    int64_t cov = 0, all = 0;
+-    for (const table_t & t : g_tables) {
+-        if (t.device != device || t.n_experts <= 0 || t.expert_bytes == 0) {
+-            continue;
+-        }
+-        // Capacity, not current occupancy: the selector asks "could the device keep this set", which is
+-        // what decides how many bytes come over the link in the steady state.
+-        if (t.slots > 0) {
+-            cov += (int64_t) t.slots * (int64_t) t.expert_bytes;
+-        }
+-        all += (int64_t) t.n_experts * (int64_t) t.expert_bytes;
+-    }
++    const int64_t cov = g_res_covered_mirror[device].load(std::memory_order_relaxed);
++    const int64_t all = g_res_host_mirror[device].load(std::memory_order_relaxed);
++    // Capacity, not current occupancy: the selector asks "could the device keep this set", which is what
++    // decides how many bytes come over the link in the steady state.  Lock-free -- see the mirrors' comment.
+     if (covered != nullptr) { *covered = cov; }
+     if (host != nullptr)    { *host    = all; }
+     return all > 0;
+-- 
+2.56.1
+

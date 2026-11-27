@@ -1,0 +1,141 @@
+From 4606fc4386724b9a32916a7d069f954e36523def Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 04:41:23 -0600
+Subject: [PATCH] wip: give the transport region's bump cursor back -- the
+ SECOND prefill in a process was streaming
+
+Field report: "the H2D staging ring is slab-only here and a 450 MiB slot does not fit the reserved hole
+(even per-slot capacity 1152 MiB)" plus slow performance.  The region is a BUMP allocator (ring_used) and
+ggml_cuda_slab_arena_free returns early for off < s.boundary ("already reassigned to the work pool") --
+which is exactly where a transport slot lives, inside the work band.  So the region handed out
+(slots x per-slot capacity) ONCE per carve: the first prefill of a process consumed all 3456 MiB and every
+later prefill was refused and fell back to the scheduler's SERIAL upload.  Nothing reclaimed it short of a
+re-carve (set_narrow_floor / a narrow band-learn), which may not happen again in a run.
+
+Fix: ggml_cuda_slab_transport_reset(device) sets ring_used = 0, called from the backend's stage-slot
+bookkeeping ONLY when h2d_stage_total == 0 (no slot live), so no block can still be read; a wide prefill
+graph is never CUDA-graph captured and nothing stages at a decode width, so no captured graph holds a
+region pointer.  The exhaustion WARN now names the cursor ("N of M MiB in use, this slot wants X").
+
+Measured on the field runme (Flash-Next IQ4_NL, 2 cards -sm tensor, --n-cpu-moe 48 pool tier, -ub 2048),
+server, 26k-token prompts: request 1 2606 t/s, request 4 (a DIFFERENT 26k prompt) 2897 t/s, zero
+refusals; before the fix the same shape read 547 t/s (618 tok) / 1780 t/s (26k).  1 GPU 89k unchanged:
+2332.5 t/s, text 43d0b1f4629e.
+
+NOTE for the record: every campaign arm so far ran ONE prefill per process, so this class (anything that has
+to survive "the second prefill") was outside what the campaign tested.  The server is the shape that finds it.
+---
+ ggml/src/ggml-cuda/common.cuh        | 12 ++++++++++
+ ggml/src/ggml-cuda/ggml-cuda-slab.cu | 35 +++++++++++++++++++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda-vmm.h   |  5 ++++
+ 3 files changed, 51 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index f87a01993..b9c4cf149 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1683,6 +1683,10 @@ bool ggml_cuda_slab_active(int device);
+ // it exists, falling back to cudaMalloc otherwise.
+ void * ggml_cuda_slab_arena_alloc_transient(int device, size_t size);
+ void   ggml_cuda_slab_arena_free(int device, void * ptr, size_t size);   // wip/flash-next-prefill: stage release
++// wip/flash-next-prefill (session 4): reset the transport region's bump cursor; call ONLY when no stage slot is
++// live.  A slot block sits inside the work band, which `arena_free` cannot reclaim, so this is what makes the
++// region reusable across the many prefills one server process issues.
++void   ggml_cuda_slab_transport_reset(int device);
+ size_t ggml_cuda_slab_ring_slot_capacity(int device);
+ void   ggml_cuda_slab_ring_set(int device, bool arm);
+ // wip/slab-transient-absorption: the wide-phase auxiliary region (the FA prefill staging arena's home),
+@@ -2536,6 +2540,13 @@ struct ggml_backend_cuda_context {
+         h2d_stage[slot]          = nullptr;
+         h2d_stage_size[slot]     = 0;
+         h2d_stage_slab[slot]     = false;
++        // wip/flash-next-prefill (session 4): with the LAST slot released, hand the region's bump cursor back
++        // so the NEXT prefill in this process can use it -- a slot block is inside the work band, which
++        // `arena_free` cannot reclaim (see `ggml_cuda_slab_transport_reset`).  Without this, a server's second
++        // prefill finds the region exhausted and silently streams from the host.
++        if (h2d_stage_total == 0) {
++            ggml_cuda_slab_transport_reset(device);
++        }
+     }
+ 
+     void * h2d_stage_buffer(int slot, size_t size) {
+@@ -2662,6 +2673,7 @@ struct ggml_backend_cuda_context {
+             h2d_scratch_size = 0;
+         }
+         h2d_stage_total = 0;
++        ggml_cuda_slab_transport_reset(device);
+     }
+ 
+     // Pinned host staging for a *gathered* upload (wip/tensor-split-expert-split): a split device's
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-slab.cu b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+index e3c71ec13..485ce62a7 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-slab.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-slab.cu
+@@ -1699,6 +1699,27 @@ void ggml_cuda_slab_log_stats(int device, const char * tag) {
+     ggml_cuda_slab_log_stats_locked(device, tag);
+ }
+ 
++// wip/flash-next-prefill (session 4, the field report): give the transport region's BUMP CURSOR back.
++//
++// The region is a bump allocator (`ring_used`), and `ggml_cuda_slab_arena_free` cannot reclaim a block that
++// lives INSIDE the work band -- it returns early for `off < s.boundary` ("already reassigned to the work
++// pool"), which is exactly where a transport slot sits.  So without this the region hands out its slots ONCE
++// per carve: the first prefill allocates `slots x per-slot capacity` = the whole region, and every later
++// prefill is refused ("the H2D staging ring is slab-only here and a 450 MiB slot does not fit the reserved
++// hole (even per-slot capacity 1152 MiB)") and falls back to the scheduler's serial upload.  A server issues
++// many prefills per process, so a campaign that only ever measured one prefill per process never saw it.
++//
++// The caller (the backend's stage-slot bookkeeping) calls this only when NO slot is live, so this cannot
++// reclaim a block something still reads; a wide prefill graph is never CUDA-graph captured, and nothing
++// stages at a decode width (the staging width gate), so no captured graph can hold a region pointer.
++void ggml_cuda_slab_transport_reset(int device) {
++    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_slab_mutex);
++    g_slabs[device].ring_used = 0;
++}
++
+ void * ggml_cuda_slab_arena_alloc_transient(int device, size_t size) {
+     if (size == 0) {
+         return nullptr;
+@@ -1710,7 +1731,19 @@ void * ggml_cuda_slab_arena_alloc_transient(int device, size_t size) {
+     }
+     const size_t want = ggml_cuda_slab_up(size, s.unit);
+     if (s.ring_used + want > s.ring_region) {
+-        return nullptr;   // region exhausted (sized for `ring_slots` full-capacity slots, so unexpected)
++        // Region exhausted.  `want` is one slot's per-slot capacity, so this means every slot the region was
++        // sized for is still accounted for -- either genuinely live (a bug in the caller's release) or left
++        // over from a previous pass before `transport_reset` existed.  Say which, so the next reader does not
++        // have to guess.
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            GGML_LOG_WARN("%s: dev=%d: transport region exhausted: %.1f of %.1f MiB in use, this slot wants "
++                          "%.1f MiB (slots=%zu).  The scheduler falls back to its SERIAL upload (slow) for this "
++                          "pass.\n", __func__, device, (double) s.ring_used / 1048576.0,
++                          (double) s.ring_region / 1048576.0, (double) want / 1048576.0, s.ring_slots);
++        }
++        return nullptr;
+     }
+     void * p = (void *) (uintptr_t) ((char *) s.base + s.narrow_floor + s.ring_used);
+     s.ring_used += want;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-vmm.h b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+index a91e6444e..c56bce67e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-vmm.h
++++ b/ggml/src/ggml-cuda/ggml-cuda-vmm.h
+@@ -103,6 +103,11 @@ bool   ggml_cuda_slab_wide_available(int device);
+ size_t ggml_cuda_slab_wide_aux_gen(int device);
+ // One-line steady-state layout + transient accounting, gated on GGML_CUDA_SLAB_STATS (diagnostic only).
+ void   ggml_cuda_slab_log_stats(int device, const char * tag);
++
++// wip/flash-next-prefill (session 4): reset the transport region's bump cursor.  Call ONLY when no stage slot
++// is live (the backend's `h2d_stage_total == 0`): `ggml_cuda_slab_arena_free` cannot reclaim a block inside the
++// work band, so this is how the region becomes reusable across prefills in one process.
++void   ggml_cuda_slab_transport_reset(int device);
+ // wip/slab-transient-absorption: physical retained by the VMM workspace pool on this device (diagnostic).
+ size_t ggml_cuda_pool_mapped_bytes(int device);
+ // Largest single allocation made through `ggml_cuda_device_malloc` AFTER the slab became active, per
+-- 
+2.56.1
+

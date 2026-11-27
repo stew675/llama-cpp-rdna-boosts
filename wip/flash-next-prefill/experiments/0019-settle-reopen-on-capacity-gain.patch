@@ -1,0 +1,90 @@
+From e203410b9588b0fb94adeb8954dc025ca66a4961 Mon Sep 17 00:00:00 2001
+From: stew675 <stew675@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 05:22:41 -0600
+Subject: [PATCH] wip: let the arena settle RE-OPEN when the capacity has grown
+ (growth only, same gate)
+
+The decision was latched for the run, so a band that became free AFTER it could never be harvested: the
+transport carve returned at every drop, a second sequence going idle, or a later prefill needing a smaller
+wide view than the one that latched it.  Re-open when the capacity has grown >= 512 MiB (or 5 %) since the
+decision, re-apply the same 1.0 pp marginal-mass gate, and keep the settle grow-only, so it can neither
+ratchet a count down nor oscillate.  On the field GSQ runme this is INERT (arena_total is steady across
+drops), kept as a correctness property.
+
+Measurement note (and a retraction): an earlier, sloppy arm suggested taking the band eagerly was 20 %
+slower.  That was an artefact -- the two arms decoded DIFFERENT text (temperature 0.7, no seed) with
+draft-mtp enabled, so decode t/s moved with draft acceptance, and on this shape the gate is ENABLED anyway
+(gain 4.8 pp >= 1.0 pp) so both arms had the same arena.  Redone properly -- same seed, greedy, 2000
+generated tokens, two interleaved cycles after a 70k prefill:
+
+  default (gate 1.0 pp)                  70.47 / 70.58 t/s
+  MOE_EXPERT_CACHE_STEADY_MIN_GAIN_PP=0  70.49 / 70.63 t/s
+  arena after the drop, both arms:       16102.6 MiB (identical)
+
+So the gate makes no difference on this shape, and nothing measured says the ~3.5 GiB between the tables'
+16.1 GiB and the 18.6 GiB cap is worth taking (or costs anything).  Use same-seed greedy and >= 2000 tokens
+for any decode-residency arm on a draft-mtp config; short sampled decodes are not evidence.
+---
+ ggml/src/ggml-cuda/moe-expert-cache.cu | 38 +++++++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/moe-expert-cache.cu b/ggml/src/ggml-cuda/moe-expert-cache.cu
+index 43df95d42..234173149 100644
+--- a/ggml/src/ggml-cuda/moe-expert-cache.cu
++++ b/ggml/src/ggml-cuda/moe-expert-cache.cu
+@@ -8560,8 +8560,43 @@ static size_t g_settle_probe_avail = 0;
+ // tokens against +7.9 % at -ub 16384, where the same growth is 4.4 GiB.  Judge the marginal coverage, not
+ // full residency.
+ static bool settle_decide_locked() {
++    // The capacity this decision would be judged against: the smallest arena the slab currently offers,
++    // across the devices that sized.  Recomputed every call so a LATER drop that offers MORE room can
++    // re-open the decision (see the `decided_at` block below).
++    size_t cap_now = 0;
++    {
++        bool any = false;
++        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
++            if (g_size_avail[d] == 0) {
++                continue;
++            }
++            const size_t cap = ggml_cuda_slab_arena_total(d);
++            const size_t a   = cap > g_size_hold[d] ? cap - g_size_hold[d] : 0;
++            if (!any || a < cap_now) {
++                cap_now = a;
++                any = true;
++            }
++        }
++    }
++    // wip/flash-next-prefill (session 4, the field report): the decision used to be latched for the run
++    // (`g_steady_decided`), so a band that became free AFTER it could never be harvested -- the 3456 MiB the
++    // transport carve now returns at every prefill -> decode transition, a second sequence going idle, or a
++    // later prefill that needs a smaller wide view than the one that latched it.  Measured on the field GSQ
++    // shape: the first drop settles 14 707 -> 16 112 MiB and every later drop re-arms at that count
++    // ("0 layer(s) settled UP") even when it offers 3.4 GiB more room.  Re-open the decision when the
++    // capacity has GROWN by at least 512 MiB (or 5 %) since it was taken; the gate below is unchanged, and
++    // the settle only ever grows, so this can neither ratchet a count down nor oscillate.
++    static size_t decided_at = 0;
+     if (g_steady_decided) {
+-        return g_steady_allow;
++        const size_t grew = cap_now > decided_at ? cap_now - decided_at : 0;
++        if (grew < (size_t) 512 << 20 && (decided_at == 0 || grew < decided_at / 20)) {
++            return g_steady_allow;
++        }
++        GGML_LOG_INFO("%s: arena settle: RE-OPENING the decision -- the arena offers %.1f MiB more than the "
++                      "drop that decided it (%.1f -> %.1f MiB); the gate is re-applied, growth only\n",
++                      __func__, (double) grew / 1048576.0, (double) decided_at / 1048576.0,
++                      (double) cap_now / 1048576.0);
++        g_steady_decided = false;
+     }
+     g_steady_allow = false;
+     double ratio = 1e9;
+@@ -8595,6 +8630,7 @@ static bool settle_decide_locked() {
+         return false;
+     }
+     g_steady_decided = true;
++    decided_at = cap_now;
+     std::vector<uint64_t> mass;
+     uint64_t total   = 0;
+     int64_t  k_sized = 0, k_target = 0;
+-- 
+2.56.1
+

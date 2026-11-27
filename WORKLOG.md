@@ -16,6 +16,172 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.001 (r368, `wip/`) -- flash-next-prefill session 5: the `transport_base` cushion closes the last field defect, and the campaign chain is re-based onto r368
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  The prototype is `~/llama.cpp`
+`wip/prefill-slot-pingpong-r368`, tip `d57f4a837` (the r366 chain rebased onto the r368 block set), exported as
+`wip/flash-next-prefill/experiments/0022-transport-base-headroom-cushion.patch`; the record is
+[`wip/flash-next-prefill/RESULTS-session5.md`](wip/flash-next-prefill/RESULTS-session5.md).
+
+**The cushion (the maintainer's proposal, implemented as specified).**  The transport region now sits
+`narrow_floor + N x GGML_COMPUTE_BUFFER_CHUNK_MIB` above the decode/verify COMPUTE band (`transport_base`), FIXED
+for the run, instead of directly on top of it.  A band raise that stays under that base is applied **immediately
+with no VA move** -- even while the region holds the ping-pong buffers, which is the case that used to be deferred
+for ever -- and only a raise past the base keeps `experiments/0020`'s deferred path, which is now explicitly the
+CORRECTNESS fallback rather than the policy.  The quantum is the compute chunk (a raise is always whole chunks of
+`GGML_COMPUTE_BUFFER_CHUNK_MIB`), and `N = 2` is the smallest cushion that covers the observed case (the field
+shape needed exactly two: 1536 -> 1792 -> 2048 MiB).  It is a cushion, not a guarantee: a distinct WARN says
+`raise to X MiB exceeds the transport_base headroom by Y MiB -> deferred`, a per-run counter counts it, and both
+`transport_base=`/`headroom=` and `band_raise[absorbed_by_cushion=N overrun_deferred=M]` print in every
+`SLAB_STATS` (context-exit included), so the next session tunes `N` from a number instead of guessing.
+`GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS` (default 2, `0` = the pre-cushion layout) is the knob and the A/B
+control.  Three readers moved to the base (`arena_alloc_transient`, the wide/seed placement via `wide_offset`,
+`set_narrow_floor`), and the raise now also defers when a WIDE view is live, which the pre-cushion code would have
+moved under a live prefill view.
+
+**Measured.**  1 GPU GSQ 89k, 3 rotated cycles, text `43d0b1f4629e` on every arm: **2493.7 t/s (cushion) vs
+2437.4 (`=0`)** on the re-based chain (2504.8 vs 2496.3 before the re-base) -- neutral inside the box's 2-3 %
+spread, decode 37.2 vs 37.6.  The field `runme` three-request sequence (new tool `wip/flash-next-prefill/field-seq.sh`;
+645 / 71 816 / 239 tokens), headroom 0 vs 2 on the same build: arena after each drop **16 111.8 -> 15 977.7 ->
+15 977.7 MiB with `=0`** (session 4's numbers reproduced exactly, and the 2048 MiB two-slot-MTP-verify raise
+deferred TWICE -- the handover's §2.2 item) against **16 049.9 -> 15 879.7 -> 15 576.0 MiB with the cushion**,
+band 1536 -> 1792 -> **2048**, `absorbed_by_cushion=2 overrun_deferred=0`.  The last drop's 402 MiB is the +256 MiB
+band the decode view needs plus the layout that follows it, not a loss: at that drop the region's base IS the band
+(headroom 0), i.e. the cushion costs nothing once the band has grown into it.  The cost is the dead band before the
+band learns its size -- 512 MiB of `work` during the first prefill, 256 during the second -- and it does not show up
+in the prefill rate (2214.2 vs 2215.5 t/s on the long request).
+
+**The re-base.**  The delivery advanced **r367** (issue #373's RDNA3_0 verify band, blocks 08/09, and the optional
+`0101` repair) and **r368** (issue #374's dense Q5_K VDR-4, blocks 07/08/10) while the campaign ran, so the
+prototype's r366 base was two releases stale.  `git rebase --onto origin/rdna-boosts 489810652` replayed the
+campaign's 21 commits with **zero conflicts** (the campaign owns the transport/slab/scheduler layer, r367/r368 own
+the kernel/dispatch layer; the one shared file, `ggml-cuda-slab.cu`, only in disjoint regions), and the re-based
+build reproduces the text hash, the neutral prefill and the field sequence to the MiB.  `check-shlib-symbols.sh`
+16/16.
+
+**Still owed** (RESULTS-session5 §4): the promotion gate ladder -- the prefill-logit KLD first, since it is the one
+that can still say no on a changed prefill transport -- then host-pool / kv-residency / probe-splits / moe-promise,
+the `GGML_HIP_NO_VMM=ON` build, and the MTP four-axis; plus the two open measurement questions from session 4 (the
+122B staged arm ~23 % behind the deleted ring, and the 38 us threshold's x16 confirm).  Promotion is a **block
+decision** and was ASKED, not taken: the candidates are still the selector + re-keyed zero-carve rule into block 09,
+the ping-pong replacing the ring, and the VMM pool's fail-soft growth into block 10, now with
+`GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS` added to the `ENVIRONMENT.md` entries that ship with them.
+
+## 261126.010 (r366, `wip/`) -- flash-next-prefill session 4: the reporting audit, the `-sm tensor` repair, and a measured transport selector that makes the ping-pong the default at prefill width
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  The prototype is `~/llama.cpp`
+`wip/prefill-slot-pingpong` tip `b209da8cd`, one commit, exported as
+`wip/flash-next-prefill/experiments/0014-reporting-audit-and-transport-selector.patch` (against `86ff5f9ce`); the
+record is [`wip/flash-next-prefill/RESULTS-session4.md`](wip/flash-next-prefill/RESULTS-session4.md).
+
+**The audit (the handover's ask).**  Every arena number the delivery prints is now named by KIND: `SLAB_STATS`'s
+`arena=` was the arena REGION (`mapped - boundary`) while the MoE census' `arena=` was RESIDENT expert bytes
+(`sum(slots x expert_bytes)`) -- 23 488 vs 21 183 MiB on the same wide arm, which is why they looked like one
+figure moving the wrong way.  Now `arena_region=` + `arena_resident=` (per device, lock-free) and
+`resident= ... total` (process-wide) in the census; `ring=` -> `transport=` + `transport_used=`;
+`prefill cache staging: arena=` (BYTES COPIED) -> `prefill fills: arena_copies=` + `host_copies=`.  All of it is
+defined in one comment at the log site and tabulated by when it is sampled.  The transport region is now sized
+from the ping-pong's real unit (`llama_model::max_host_expert_layer_bytes`, a new model helper) instead of the
+deleted ring's knee: **6618 -> 3412 MiB**; the freed band shows up as +3.2 GiB of arena region during the
+prefill and 25 GiB of fills served from VRAM instead of the link (`H2D` 70.3 -> 64.4 %), with identical text and
+rate.  `--fit` was measured too and cannot disagree with the carve because it does not model it (the h2d term is
+0 when the slab is enabled); `GGML_CUDA_SLAB_RING_MIB`/`_RING_FALLBACK` are renamed to `_TRANSPORT_MIB`/
+`_TRANSPORT_FALLBACK` with the old spellings kept as deprecated aliases.
+
+**`-sm tensor` on 2 and 3 cards did not run at all at `86ff5f9ce`**, at either transport, and both causes were
+delivery-level defects, not campaign code: (1) `ggml_cuda_pool_vmm::alloc` `CU_CHECK`-ed a refused `cuMemCreate`,
+so a workspace-pool growth that the driver declined was `HipVMM Failure: out of memory` + **exit 134** -- the
+wide-band redirect every other transient relies on existed only on the LEGACY pool, and `new_pool_for_device`
+returns the VMM pool on gfx1201; it now takes the scratch from the slab's wide band (bookkept, generation-checked)
+and only aborts when there is no band either, naming the sizes.  (2) `sched_pp_issue` called a NULL
+`stage_buffer` on the META backend (`SIGSEGV`): a split IS the whole graph there and the slot API does not exist,
+so the ping-pong now declines at construction and the split keeps its own per-device ring.  Fixed rates: **3419
+t/s (gather) / 3029 (split's staged arm) on cards 0+2, 3201 / 3144 at three devices**, text identical.
+
+**The selector.**  A 3-cycle coverage sweep on one card (35B-A3B Q8_0 at 30/45/56 % coverage + Flash-Next at 51 %)
+showed coverage alone is NOT the predicate (Flash-Next stages at 51 % while the 35B gathers at 56 %); the
+discriminator is the host bytes the device gather would pull per token -- the tie is 8.8 GB / 8192 tokens at
+28.7 GB/s = **1.07 MB/token = ~38 us/token**, which is where a compute-stream host read stops hiding behind the
+split while copy-engine fills still do.  `sched_stage_exposure_decides()` (default ON,
+`GGML_SCHED_STAGE_EXPOSE_US=38`, `GGML_SCHED_STAGE_SELECT=0` restores the old rule) stages above it and gathers
+below, reading the cache's coverage through a new `moe_cache_residency` iface hook.  Measured with 3 rotated
+cycles: **1 GPU 2108.4 -> 2444.8 t/s (+16 %)**, 122B-A10B 1 GPU 960.6 -> 1035.5 (+7.8 %), 2-dev tensor/layer and
+3-dev tensor unchanged (the selector keeps their gather, which is their best arm).  The slab's **zero-carve rule
+is re-keyed** from `GGML_SCHED_DEVGATHER` to that same measurement (`covered < host`), because a zero-carve slab
+refuses every fill: the arm read **338 t/s** against 2045 with the selector staging into it, and carving when the
+selector picks the gather cost 3419 -> 3060 on the split.
+
+**Then a real user-experience run of the field `runme`** (Flash-Next IQ4_NL, 2 cards, `-sm tensor`, `--n-cpu-moe 48`
+pool tier, `-ub 2048`) found a **regression this session introduced**, two defects: (a) the Meta backend's
+per-device ring still defaulted to **8 slots** while the new region sizing held **3**, and because
+`ggml_backend_meta_stage_input` reserves every device's slot before uploading, slots 3-7 failing made it refuse the
+WHOLE input -- every split fell to the scheduler's serial pageable upload (CPU, GPUs idle); the depth is now the
+one number the region is sized from.  (b) the selector staged where the ping-pong **cannot** run: a `-sm tensor`
+split's staged path is Meta's own ring, which measures behind the gather in every arm -- on that shape a 20k
+prompt read **2682 t/s with the gather**, 370-385 with the selector staging, and **1726** after the fix at their
+`-ub 2048` (2682 at `-ub 8192`).  The selector now keeps the gather unless the backend has the slot API.  1 GPU
+unchanged (2392.6 / `43d0b1f4629e`), 2-card GSQ unchanged (3367.3), `check-shlib-symbols.sh` 16/16 (it caught a
+real undefined symbol in the first cut of the depth fix).  The startup slowness in that report was a leftover
+server instance holding 67 GB and both GPUs, not a code path (the same flags load in 20 s; raw device 3.2 GB/s
+O_DIRECT / 6.2 GB/s buffered).
+
+**A third field finding, and the most general one**: the transport region is a bump allocator
+(`ring_used`) and `ggml_cuda_slab_arena_free` cannot reclaim a block that lives INSIDE the work band (it returns
+early for `off < boundary`) -- which is exactly where a transport slot sits.  So the region handed out its
+`slots x per-slot capacity` **once per carve**: the first prefill of a process consumed all 3456 MiB and every
+LATER prefill was refused ("the H2D staging ring is slab-only here and a 450 MiB slot does not fit the reserved
+hole") and fell back to the scheduler's serial upload.  `ggml_cuda_slab_transport_reset()` now returns the cursor
+when no slot is live.  Measured on the reporting `runme` (2 cards, `-sm tensor`, pool tier, `-ub 2048`), server,
+26k prompts: request 1 **2606 t/s** and a later, different 26k prompt **2897 t/s**, zero refusals (before: 1780
+and a refused/serial pass).  **The campaign's own testing gap this exposes**: every arm in sessions 1-4 ran ONE
+prefill per process, so any defect that only appears on "the second prefill" was invisible; a future arm on this
+transport must send two prompts with different content.
+
+**And a fourth**: the transport region's BUFFERS are released at every prefill -> decode transition but its CARVE was
+not (`s.ring_region` was only recomputed at a narrow-floor pin), so `slots x largest split set` -- **3456 MiB** on the
+field GSQ shape -- stayed withheld from the arena for the life of the run.  A narrow view placed with the wide pass
+disarmed and no slot live now releases the carve and the next wide view re-carves it (same deterministic value).
+Neutral on the 1-GPU 89k arm (2496.9 t/s, text `43d0b1f4629e`), zero staging refusals across a three-request server
+sequence.  **The freed band is still not claimed by the expert tables**: the per-layer slot count is settled once at
+the first drop (demand-gated at 1.0 pp, r292) and is sticky, so later drops report `0 layer(s) settled UP`.  Harvesting
+it means re-evaluating the settle at every drop -- the r292 trade (an eagerly taken band cost -44 % prefill for 0.44 pp
+on a 2-device split) -- which is a policy decision for the maintainer, not taken here.
+
+**And the policy question that closed it out**: is the band the settle declines worth harvesting on a 1-device
+shape at `-ub 8192`?  The settle's gate is NOT device-count specific (its r292 table is a marginal-prior-mass test:
+the splits fail at 0.44/0.14 pp, the 1-device field shapes pass and win); on this shape it fires once
+(14 707 -> 16 112 MiB, 41 layers settled UP) and is ENABLED, so `MIN_GAIN_PP=0` cannot change anything -- measured
+with the proper arm (same seed, greedy, 2 000 tokens, 2 interleaved cycles after a 70k prefill): **70.47/70.58 vs
+70.49/70.63 t/s and arena 16 102.6 MiB in BOTH arms**.  An earlier arm claimed a 20 % difference; that was an
+artefact of sampled, unseeded text on a `draft-mtp` config (decode t/s tracks draft acceptance) and is retracted
+here and in RESULTS-session4.md §7.4, which now also carries the methodology rule: same seed, greedy, >= 2 000
+tokens, interleaved, and report the arena after the drop with the rate.  `experiments/0019` lets the decision
+RE-OPEN when the capacity genuinely grows (>= 512 MiB, growth only, same gate) -- inert here (`arena_total` is
+steady at 18 624 MiB across drops), kept as a correctness property.  Also corrected: the 0018 carve release is
+hygiene, not the source of the missing ~3.5 GiB -- `arena_total` already counted the region; the tables land under
+the cap because of the settle's slot target.
+
+**Session 4 closes with a cold-start handover** ([`wip/flash-next-prefill/HANDOVER-session5.md`](wip/flash-next-prefill/HANDOVER-session5.md),
+prototype tip `7af09a636`, `experiments/0014`-`0021`): state, the five field defects and their fixes, the promotion gate
+list that is still owed (the prefill-logit KLD is the one that can still say no; the VMM fix needs a
+`GGML_HIP_NO_VMM=ON` build too), the `ENVIRONMENT.md`/`DIAGNOSTIC.md` entries that ship with the selector, and the
+maintainer's agreed-but-not-implemented proposal to place the transport region `N x compute-chunk` (512 MiB) ABOVE the
+narrow band so that band can grow without moving it.
+
+Text identical on four shapes (`43d0b1f4629e` 1 GPU / `e6fb96a8cda2` 2-dev tensor / `a5d2fad1af0f` 3-dev /
+`c3f4da781f01` 122B).  Final 3-cycle medians, 89k prompt: **default 2491.1 vs gather 2118.7 (+17.6 %)**, spreads
+0.6 % / 0.1 %.
+
+**One shape does not improve, and it is recorded rather than smoothed over**: a **single-ubatch prompt**
+(5218 tokens at `-b 8192 -ub 8192`, 3 cycles) reads gather 1597.1 / staging 1266.2 / staging-from-the-second-wide-
+ubatch 1488.6, text identical -- the first wide ubatch has no previous split to hide the fill behind and the
+carve has already cost the arena 3.4 GiB.  The selector now requires a previous wide graph (which halves the
+loss) and the remaining -7 % is the carve the gather arm does not need.  **Still owed before anything ships**:
+the prefill-logit KLD point, the MTP four-axis, the x16 re-check of the 38 us threshold, and one shape where the
+ping-pong reads ~23 % behind the deleted ring (122B staged 1035 vs 1346 in session 3 at the same gather
+baseline).  Promotion is a **block decision** and is NOT taken here: the candidates are the selector + re-keyed
+carve into block 09 and the VMM pool fail-soft into block 10.
+
 ## 261126.009 (r368, release cut) -- tagged, main and the fork pushed, the release assets published; the container images are OWED to the worker
 
 **The cut.**  `v18-919794500-r368` (annotated tag) = fork re-cut tip
