@@ -1,6 +1,6 @@
 # Code review — `SQUASHED-campaign-r368.patch`
 
-The campaign as one diff: base `af7a57ba8` (r368 block tip) → `253e2630e`, i.e. `SQUASHED-campaign-r368.patch`
+The campaign as one diff: base `af7a57ba8` (r368 block tip) → `538391438`, i.e. `SQUASHED-campaign-r368.patch`
 (22 files).  **Every finding in §1-§3 is fixed in that same commit** (that is what the squash is for: the review's
 fixes are part of the change, not a follow-up on top of churn), and the tree was re-verified after them (§6).
 §4 is the checked-and-clean list — "I looked and it was fine" is the other half of a review — and §5 the
@@ -8,7 +8,7 @@ judgement calls left to the maintainer (one of which is now implemented, §5.1).
 
 | | |
 |---|---|
-| review target | `~/llama.cpp` branch `wip/prefill-slot-pingpong-squashed`, tip **`253e2630e`** (one commit on `af7a57ba8`) |
+| review target | `~/llama.cpp` branch `wip/prefill-slot-pingpong-squashed`, tip **`538391438`** (one commit on `af7a57ba8`) |
 | the same tree, pre-review, as a 21-commit chain | branch `wip/prefill-slot-pingpong-r368` (kept as history only) |
 | patch | [`SQUASHED-campaign-r368.patch`](SQUASHED-campaign-r368.patch) |
 
@@ -86,11 +86,28 @@ the file's `_locked` convention.
 | **J1** | clamp 1..3; the ring's 4..16 is not kept | `ggml_backend_cuda_transport_bufs()` clamps the override to the pipeline's own 1..3, in the one authority every consumer reads. |
 | **J2** | *measured first*: how likely is 256, and what does the fallback cost? | **Measured ceilings**: Flash-Next 144 stageable splits (48 layers × 3 roles), 122B-A10B 120 — i.e. 56 % of the old 256. **The fallback's cost**: a split past the cap is not in the list, so `pipe_k = -1` and its host weights take the plain whole-table upload on the compute stream — *the exactly-unstaged path this transport replaces*, i.e. those layers contribute nothing to the +17 % and pay a synchronous copy. Silent before. **Raised to 512** (2 KiB of stack in a frame that already had 1 KiB) and it now logs once when it fills, naming the graph's split count. |
 | **J3** | *quantify it*: is the O(n²) the pause you see at a drop? | **No — it is 0.02 % of it.** Measured with a temporary timer on the scan: **0.3 µs per call**, **146 µs cumulative** by the first drop and **197 µs** across the whole three-request sequence, against drop pauses of **~170-990 ms** (the first drop evicts 5.6 GiB and re-arms 144 tables; the second re-arms 78 in 168 ms). At 1000 tables it would be ~2 ms per drop, so a hash map was never warranted — and it is not needed at all: **`covered` IS the per-device resident figure `arena_bytes_delta` already keeps O(1)** (capacity = Σ slots × expert_bytes = the resident bytes), and the host total only changes when a table is **registered** (`g_tables` never shrinks). The scan is gone; the mirrors are O(1) per change.  **It did double as a safety net**, though, and that came out of the maintainer's follow-up: every `t.slots` write is paired with `arena_bytes_delta` except `moe_cache_shrink_arena()` (caller-less today, kept for a future pressure release), where the scan re-derived `covered` from `t.slots` and so papered over the omission (it never fixed `g_arena_bytes`, which was already over-counted there). That path now calls the delta, and the **exit census re-derives both mirrors from the table set and warns on drift** (`residency_audit_locked`), so the invariant is checkable instead of trusted -- O(n) only when someone asks for the census. |
-| **J4** | rename `GGML_SCHED_PINGPONG_BUFS` → `GGML_SCHED_PIPELINE_BUFS`, and "wherever you see PINGPONG, PIPELINE" | `GGML_SCHED_PIPELINE_BUFS` (+ `GGML_SCHED_PINGPONG_BUFS`, the development name, and `GGML_SCHED_STAGE_SLOTS`, the ring's, as **deprecated aliases**) and `GGML_SCHED_PINGPONG` → `GGML_SCHED_PIPELINE`; every "ping-pong" in this campaign's code, logs, comments and identifiers is now "pipeline" (`sched_pipe_*`, `pipe_*`); the three unrelated upstream uses (`fattn-common.cuh`, `ggml-hexagon`) are untouched. **One parser**: the environment is read only in the CUDA backend's transport authority — the scheduler and the Meta backend read the answer through the existing `slab_ring_slots` hook (so a rename cannot leave a layer on an old spelling), and the free-VRAM rule now only caps a transport that is not slab-backed. |
+| **J4a** | `GGML_CUDA_SLAB_TRANSPORT_MIB` retired entirely | the region is one buffer × the depth, so the knob named no resizable quantity: all it could do was cap the region below what a buffer needs, which makes every staged split fall back to the serial upload. Removed from the code, its alias too, and **no tombstone is left in the source** — the retirement lives in the record, not in comments (the maintainer's call). Promotion owes the `ENVIRONMENT.md`/`DIAGNOSTIC.md` edits that drop the entry. |
+| **J4b** | rename `GGML_SCHED_PINGPONG_BUFS` → `GGML_SCHED_PIPELINE_BUFS`, and "wherever you see PINGPONG, PIPELINE" | `GGML_SCHED_PIPELINE_BUFS` (+ `GGML_SCHED_PINGPONG_BUFS`, the development name, and `GGML_SCHED_STAGE_SLOTS`, the ring's, as **deprecated aliases**) and `GGML_SCHED_PINGPONG` → `GGML_SCHED_PIPELINE`; every "ping-pong" in this campaign's code, logs, comments and identifiers is now "pipeline" (`sched_pipe_*`, `pipe_*`); the three unrelated upstream uses (`fattn-common.cuh`, `ggml-hexagon`) are untouched. **One parser**: the environment is read only in the CUDA backend's transport authority — the scheduler and the Meta backend read the answer through the existing `slab_ring_slots` hook (so a rename cannot leave a layer on an old spelling), and the free-VRAM rule now only caps a transport that is not slab-backed. |
 
 One further finding fell out of J4: the kill switch's comment claimed `GGML_SCHED_PINGPONG=0` "selects the ring for
 the A/B" — the ring was deleted in session 3, so `0` means **no staged transport at all** (the serial whole-table
 upload). The comment now says that.
+
+### Two field defects the end-user test found (fixed)
+
+The maintainer's final server test on the field `runme` hit a **9-12 s first prompt** and a log line that talked
+about a "ring" being grown. Both were real, and neither was the deleted ring:
+
+| what the log said | what it was |
+|---|---|
+| `h2d_stage_buffer: … the H2D staging ring is slab-only here and a 231 MiB slot does not fit the reserved hole (even per-slot capacity 0 MiB); staging is refused for this pass` | a fill was issued **before the slab had carved the transport region** (the carve is released at every prefill → decode transition and re-made when the wide compute view is placed). The pass therefore took the **serial whole-table upload** — 40 GB through the pageable path — which on a single-ubatch prompt IS the whole prefill: measured **12.32 s / 47 t/s**. |
+| `sched_pipe_issue: pipeline buffer grows 231.2 -> 450.0 MiB (… this should not recur)` | the buffers were sized from the **first** split set filled; a graph's sets are not uniform (231 MiB vs 450 MiB here), so it reallocated mid-graph and the message claimed it would not recur — on every short prefill. |
+
+Fixes: the selector now **asks whether a region is carved and GATHERS when it is not** (the next ubatch stages once
+the wide view's placement has carved the band — which is also the arm that wins for a single-ubatch prompt), and the
+buffers are **sized once from the graph's largest set**. Measured after: the same 239-token prompt reads
+**338 t/s** (was 24.5), a 581-token one 255 t/s, the refusal and the grow are gone from the log, and the 89k arm is
+unchanged (`43d0b1f4629e`, 2457 t/s).
 
 ## 6. Re-verified after the review fixes
 

@@ -16,6 +16,35 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.007 (r368, `wip/`) -- flash-next-prefill: the end-user test's two field defects fixed, and `GGML_CUDA_SLAB_TRANSPORT_MIB` retired
+
+**Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  Squashed prototype
+`~/llama.cpp` `wip/prefill-slot-pingpong-squashed`, tip **`538391438`**; record
+[`wip/flash-next-prefill/REVIEW-squashed.md`](wip/flash-next-prefill/REVIEW-squashed.md) §5 (the field defects)
+and §5 (J4a).
+
+**The maintainer's server test found two defects, both real, neither the deleted ring.**  (1) A fill was issued
+**before** the slab had carved the transport region -- the carve is released at every prefill -> decode transition
+and re-made when the wide compute view is placed -- so the first staged ubatch was refused (`h2d_stage_buffer: ...
+per-slot capacity 0 MiB`) and the pass took the **serial whole-table upload**: 40 GB through the pageable path,
+which on a single-ubatch prompt is the whole prefill (measured 12.32 s / 47 t/s).  (2) The pipeline buffers were
+sized from the **first** split set filled, so a graph whose sets differ (231 MiB against 450 MiB on that shape)
+reallocated mid-graph and logged "this should not recur" on every short prefill.  Fixes: the selector asks whether a
+region is carved and **gathers when it is not** (the next ubatch stages once the wide view's placement has carved
+the band, and the gather is the better arm for a single ubatch anyway), and the buffers are sized once from the
+graph's largest set.  Measured after: 239-token prompt **338 t/s** (was 24.5), 581-token 255 t/s, no refusal and no
+grow in the log, 89k arm unchanged (`43d0b1f4629e`, 2457 t/s).
+
+**`GGML_CUDA_SLAB_TRANSPORT_MIB` is retired entirely** (the maintainer's decision, after the question "precisely
+WHAT buffer is it even referring to?"): the region is `one buffer x the pipeline's depth`, so the knob named no
+resizable quantity -- all it could do was cap the region below what a buffer needs, which makes every staged split
+fall back to the serial upload.  Removed from the code and from its alias (`GGML_CUDA_SLAB_RING_MIB`), and **no
+tombstone is left in the source**: a dead-code comment explaining how something is gone is still dead code taking up
+room (the maintainer's call) -- the retirement lives in this entry and in the review.  The depth knob is
+`GGML_SCHED_PIPELINE_BUFS`; the cap is the context's VRAM/4.  **Promotion owes the doc edits**: `ENVIRONMENT.md` /
+`DIAGNOSTIC.md` must drop the variable's entry (and its alias), and `patches/README.md`'s block note should say the
+transport region is derived rather than sized.
+
 ## 261127.006 (r368, `wip/`) -- the campaign docs pushed, and a process trap recorded: `git commit --amend` commits the INDEX, not the tree
 
 **Nothing in the delivery changed** -- no block, no `release.json`, no fork push.  `main` pushed to
