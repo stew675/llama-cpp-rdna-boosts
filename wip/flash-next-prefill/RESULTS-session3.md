@@ -508,3 +508,35 @@ moment, and never changes.
 * **staging, in the ring sense, is already gone**; what remains is the *fill* (`moe_cache_stage_table`'s hybrid:
   coalesced mirror runs + the arena-side kernel), which stays because it is the only thing that knows which
   experts are arena-resident.
+
+
+### 12.1 The memory model, and the decode transition
+
+The buffers **sit where the ring's slots sat** (the backend's stage buffers), the count is fixed at startup from
+free VRAM, and they are **released at the prefill -> decode transition** so the slab gets the VRAM back
+(`experiments/0011`). Three things had to be fixed to make that correct:
+
+1. **The transition trigger is WIDTH, not the presence of host weights.** Every graph -- decode steps included --
+   still carries the routed expert table as a host-weight input, so "no host-weight splits" never happens. The
+   staging width gate is the same predicate that decides whether a split is staged at all, so "no split in this
+   graph is wide enough to stage" *is* decode-only. Verified: `3 buffer(s) released at the prefill -> decode
+   transition (4 tokens <= the 64-token staging gate)`.
+2. **The ping-pong must honour that gate too.** My first version did not, so it staged the whole table at DECODE
+   widths as well: generation **36.5 t/s against the ring's 48.4**. With the gate applied: **48.4 vs 48.2** --
+   parity, and the release then fires on the same predicate.
+3. **A `stage_release` hook** (appended to the backend iface, so the other backends' positional initializers stay
+   valid) returns a slot to wherever it came from: the slab's ring hole via `ggml_cuda_slab_arena_free`, or the
+   allocator. The scheduler synchronises the backend first, so no fill can be in flight.
+
+**What is still missing for the full model**: releasing the buffers returns VRAM to *free* memory, but the ARENA
+does not re-grow into it -- measured arena is 21 840.7 MiB before and after the release. Growing the arena on the
+prefill -> decode hand-back is the slab's settle/re-arm path (`TODO` #42 territory: the cache sizes itself once and
+a stood-down table is re-armed at the transition), so that is where the last part of "the slab stays maximal for
+decode" belongs. The decode numbers are already at parity with the ring, so the remaining work is about the arena
+*getting bigger* during decode, not about decode being slowed.
+
+Also recorded: the pp buffers on this box do **not** move the arena or the eviction count while the wide phase is
+active (measured identical: 21 840.7 MiB, ~10 590 evictions, decode 47.9/48.1/48.0 for ring/2/3), because they are
+allocated from free VRAM rather than donated by the slab. Once the buffers are carved from the slab's wide phase
+(the follow-up above), the intended trade appears: prefill evicts (it is bandwidth-bound, not residency-bound) and
+decode gets the arena back.

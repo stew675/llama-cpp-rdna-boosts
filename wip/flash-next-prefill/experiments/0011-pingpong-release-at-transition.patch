@@ -1,0 +1,195 @@
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index d0bf5b3f2..7c659868a 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -386,6 +386,13 @@ extern "C" {
+         bool (*moe_cache_prefill_stream)(ggml_backend_t backend, const struct ggml_tensor * weight,
+                                          const struct ggml_tensor * weight_cpy, const void * used,
+                                          int64_t n_expert, int64_t n_tok);
++
++        // wip/flash-next-prefill: release a staging slot's memory back to where it came from (the slab's transient
++        // wide band, the slab's reserved ring hole, or the allocator).  The scheduler calls it at the prefill ->
++        // decode transition -- a graph with no host-weight staging at all -- so the ping-pong buffers hand their
++        // VRAM back to the slab, and therefore to the ARENA, for decode-only operation.  APPENDED so the other
++        // backends' positional initializers stay valid (NULL = the backend keeps its slots, the ring's behaviour).
++        void (*stage_release)(ggml_backend_t backend, int slot);
+     };
+ 
+     struct ggml_backend {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index d6a87939f..3fb9ebfbf 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1603,7 +1603,8 @@ struct ggml_backend_sched {
+     // shipping path until this replaces it).
+     bool    pp_on;
+     // (the buffer COUNT is fixed once, at construction: see sched_pp_choose_bufs)
+-    double  pp_free_gib;                         // the free-VRAM figure the count was chosen from                        // pick 1..3 from free VRAM (default) or honour the env
++    double  pp_free_gib;                         // the free-VRAM figure the count was chosen from
++    bool    pp_held;                             // the buffers are currently allocated (released at decode)                        // pick 1..3 from free VRAM (default) or honour the env
+     int     pp_n_buf;                            // 2 (default) or 3/4: how many sets may be in flight
+     size_t  pp_size;                             // bytes per buffer (the largest set seen, grown once)
+     void *  pp_base[4];                          // the buffers (backend slot buffers, index 0..n-1)
+@@ -2850,6 +2851,8 @@ static bool sched_stage_redirect(void) {
+ static bool sched_stage_is_host_weight(const struct ggml_tensor * input);
+ static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
+                                    const struct ggml_tensor * input, const struct ggml_tensor * input_cpy);
++static int64_t sched_stage_min_tokens(ggml_backend_sched_t sched);
++static int64_t sched_stage_batch_tokens(const struct ggml_backend_sched_split * split);
+ 
+ // wip/flash-next-prefill: the ping-pong (default) vs the slot ring (A/B).
+ static bool sched_pp_on(void) {
+@@ -2915,6 +2918,14 @@ static int sched_pp_choose_bufs(ggml_backend_sched_t sched) {
+ static int sched_pp_split_set(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
+                               size_t * bytes) {
+     int n = 0;
++    // THE SAME WIDTH GATE the ring path applies: below it, whole-tensor staging cannot hide behind the split's
++    // compute and the used-expert pruning / the arena serve the op instead.  Without this the ping-pong staged
++    // the whole table at DECODE widths too (measured: generation 27.1 t/s against 48.4 for the ring).
++    const int64_t min_tokens = sched_stage_min_tokens(sched);
++    if (min_tokens > 0 && sched_stage_batch_tokens(split) < min_tokens) {
++        if (bytes != NULL) { *bytes = 0; }
++        return 0;
++    }
+     size_t total = 0;
+     for (int i = 0; i < split->n_inputs; i++) {
+         struct ggml_tensor * input = split->inputs[i];
+@@ -3000,6 +3011,7 @@ static bool sched_pp_issue(ggml_backend_sched_t sched, struct ggml_backend_sched
+         off += (size + 255u) & ~(size_t) 255u;
+     }
+     sched->pp_n_ent[buf] = k;
++    sched->pp_held       = true;
+     return k > 0;
+ }
+ 
+@@ -4005,6 +4017,40 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+         sched->pp_cur = 0;
++        // THE PREFILL -> DECODE TRANSITION, keyed on WIDTH (not on the presence of host weights: every graph,
++        // decode steps included, still carries the routed expert table as a host-weight input).  The staging width
++        // gate is the same predicate that decides whether a split is staged at all, so "no split in this graph is
++        // wide enough to stage" IS the decode-only case.  Give the buffers back to the slab there, so the arena can
++        // take their VRAM; the next prefill graph re-creates them from `pp_size`, which is remembered.
++        if (sched->pp_held) {
++            int64_t widest = 0;
++            for (int i = 0; i < sched->n_splits; i++) {
++                const int64_t t = sched_stage_batch_tokens(&splits[i]);
++                if (t > widest) { widest = t; }
++            }
++            const bool narrow = widest > 0 && widest <= sched_stage_min_tokens(sched);
++            if (narrow) {
++                ggml_backend_t be_rel = sched->backends[sched->pp_backend[0]];
++                if (be_rel != NULL && be_rel->iface.stage_release != NULL) {
++                    ggml_backend_synchronize(be_rel);   // nothing may be in flight when the VRAM is handed back
++                    for (int b = 0; b < sched->pp_n_buf; b++) {
++                        be_rel->iface.stage_release(be_rel, b);
++                        sched->pp_base[b]  = NULL;
++                        sched->pp_n_ent[b] = 0;
++                    }
++                    sched->pp_held = false;
++                    static bool rel_logged = false;
++                    if (!rel_logged) {
++                        rel_logged = true;
++                        GGML_LOG_INFO("%s: ping-pong staging: %d buffer(s) released at the prefill -> decode "
++                                      "transition (%lld tokens <= the %lld-token staging gate); the slab gets the "
++                                      "VRAM back for the arena\n", __func__, sched->pp_n_buf,
++                                      (long long) widest, (long long) sched_stage_min_tokens(sched));
++                    }
++                }
++                pp_n_host = 0;   // nothing to stage at this width
++            }
++        }
+         // fill every buffer with its first set: with N buffers that is the first N host splits, so split 0 can
+         // compute while the other N-1 sets stream in (N = 2 is the ping-pong, N = 3 adds the extra stage you
+         // asked for: the fill for k+2 is still running while k+1 computes).
+@@ -4257,6 +4303,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
+         // Fixed for the process lifetime (see sched_pp_choose_bufs): 1 / 2 / 3 by the device's FREE VRAM here.
+         sched->pp_free_gib = sched_pp_startup_free_gib(sched);
+         sched->pp_n_buf    = sched_pp_choose_bufs(sched);
++        sched->pp_held     = false;
+         for (int i = 0; i < 4; i++) {
+             sched->pp_n_ent[i]   = 0;
+             sched->pp_base[i]    = NULL;
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 7400abbe2..e9fa76601 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1682,6 +1682,7 @@ bool ggml_cuda_slab_active(int device);
+ // ggml-cuda-vmm.h, which this header does not include).  `h2d_stage_buffer` serves a slot from the hole when
+ // it exists, falling back to cudaMalloc otherwise.
+ void * ggml_cuda_slab_arena_alloc_transient(int device, size_t size);
++void   ggml_cuda_slab_arena_free(int device, void * ptr, size_t size);   // wip/flash-next-prefill: stage release
+ size_t ggml_cuda_slab_ring_slot_capacity(int device);
+ void   ggml_cuda_slab_ring_set(int device, bool arm);
+ // wip/slab-transient-absorption: the wide-phase auxiliary region (the FA prefill staging arena's home),
+@@ -2500,6 +2501,28 @@ struct ggml_backend_cuda_context {
+         return on;
+     }
+ 
++    // wip/flash-next-prefill: drop a slot's memory back to wherever it came from.  Called by the scheduler when a
++    // graph carries no host-weight staging at all (decode-only), i.e. at the prefill -> decode transition, so the
++    // VRAM returns to the slab and the arena can take it.  A wide-aux block is only freed while its band
++    // generation still matches: the slab itself may already have reclaimed the band with the wide compute buffer,
++    // and a second free would be a use-after-free of the slab's own accounting.
++    void h2d_stage_release(int slot) {
++        GGML_ASSERT(slot >= 0 && slot < H2D_STAGE_SLOTS);
++        if (h2d_stage[slot] == nullptr) {
++            return;
++        }
++        if (h2d_stage_slab[slot]) {
++            ggml_cuda_slab_arena_free(device, h2d_stage[slot], h2d_stage_size[slot]);
++        } else {
++            ggml_cuda_graph_mem_freed(device);
++            CUDA_CHECK(cudaFree(h2d_stage[slot]));
++        }
++        h2d_stage_total -= h2d_stage_size[slot];
++        h2d_stage[slot]          = nullptr;
++        h2d_stage_size[slot]     = 0;
++        h2d_stage_slab[slot]     = false;
++    }
++
+     void * h2d_stage_buffer(int slot, size_t size) {
+         GGML_ASSERT(slot >= 0 && slot < H2D_STAGE_SLOTS);
+         if (size > h2d_stage_size[slot]) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+index 1cd0e44ab..12dc0a480 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cu
+@@ -15,6 +15,12 @@
+ #include <cstdint>
+ #include <cstring>
+ 
++void ggml_backend_cuda_stage_release(ggml_backend_t backend, int slot) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    cuda_ctx->h2d_stage_release(slot);
++}
++
+ void * ggml_backend_cuda_stage_buffer(ggml_backend_t backend, int slot, size_t size) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+     ggml_cuda_set_device(cuda_ctx->device);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
+index ec812050e..9c58ae08c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
++++ b/ggml/src/ggml-cuda/ggml-cuda-moe-cache-hooks.cuh
+@@ -11,6 +11,7 @@
+ #include <cstdint>
+ 
+ void * ggml_backend_cuda_stage_buffer(ggml_backend_t backend, int slot, size_t size);
++void   ggml_backend_cuda_stage_release(ggml_backend_t backend, int slot);
+ void   ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, const void * data, size_t size, ggml_backend_event_t ev);
+ bool   ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const void * src, size_t offset, size_t width, size_t stride_src, size_t n_copies, ggml_backend_event_t ev, bool src_pinned);
+ void   ggml_backend_cuda_stage_wait(ggml_backend_t backend, ggml_backend_event_t ev);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 2ddba52fc..19179b609 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -10981,6 +10981,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .moe_cache_stage_ready  = */ ggml_backend_cuda_moe_cache_stage_ready,
+     /* .moe_cache_in_place     = */ ggml_backend_cuda_moe_cache_in_place,
+     /* .moe_cache_prefill_stream = */ ggml_backend_cuda_moe_cache_prefill_stream,
++    /* .stage_release           = */ ggml_backend_cuda_stage_release,
+ };
+ 
+ static ggml_guid_t ggml_backend_cuda_guid() {
