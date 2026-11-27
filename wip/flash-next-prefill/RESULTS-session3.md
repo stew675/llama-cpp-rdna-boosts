@@ -569,3 +569,43 @@ the maintainer: the arena will not always re-grow into the VRAM the pp buffers h
 exposes the hot set to eviction on the next prefill — a consequence of **table-granular** eviction (evicting by
 table of experts rather than by expert). That redesign is explicitly out of scope for this campaign and is a
 separate session.
+
+
+## 13. The ring is REMOVED (maintainer's decision), and what that cost
+
+`experiments/0012`. The slot ring, its lookahead (`GGML_SCHED_STAGE_AHEAD`), its slot count
+(`GGML_SCHED_STAGE_SLOTS`), its per-slot plan arrays and the redirect-vs-copy drain are **deleted**. The ping-pong
+is the only staged transport. Rationale (the maintainer's): the ring's throughput advantage sat inside the staged
+arms' own 5-9 % variance, while its slot bookkeeping is what produced the corruption class this campaign chased
+for two months.
+
+| build | 89k prefill median (3 rotated cycles) | spread | text |
+|---|---:|---:|---|
+| ring + lookahead | 2446.1 | 1.0 % | `43d0b1f4629e` |
+| **ping-pong only (ring deleted)** | **2509.1** | 2.5 % | `43d0b1f4629e` |
+
+So the removal did not cost anything measurable — the median is *higher* (inside the two builds' spreads) and the
+text is byte-identical. What went with it: ~300 lines of scheduler bookkeeping, the per-slot event table, and the
+`GGML_SCHED_STAGE_SLOTS` / `_AHEAD` knobs.
+
+## 14. Decode, arena and the buffer count at a 2000-token generation
+
+Protocol: 5 246-token prompt, `NGEN=2000` (long enough for the expert cache to stabilise), `--lazy-mode off` (PLE
+resident, so no page-in term), heat prior pinned, `-ncmoe 48`, two runs each alternating:
+
+| arm | decode | arena | slots | fills / evictions | buffers |
+|---|---:|---:|---:|---|---|
+| pp2 | 50.0 / 50.2 | 21 840.7 MiB | 39 684 | 97 648 / 24 151 | 231.2 MiB x2 |
+| pp3 | 49.7 / 50.1 | 21 840.7 MiB | 39 684 | 97 648 / 24 151 | 450.0 MiB x3 |
+
+**Decode is identical and the arena is NOT larger with pp2** -- same size, same slot count, bit-identical
+fill/eviction counters. The reason is ordering, not physics:
+
+1. the arena is sized at init, **before the pp buffers are allocated**, so the third buffer costs free VRAM and
+   never arena;
+2. the release at the prefill -> decode transition hands the VRAM back but the arena is **not re-grown into it**
+   (the table-granular eviction problem, out of scope for this campaign).
+
+To make the buffer count a real memory decision, either **commit the buffers at construction** (allocate/announce
+them to the slab before the cache sizes itself, so the arena sizes with 3 x set already spoken for), or re-grow the
+arena on the hand-back once eviction is expert-granular. Both are follow-ups, not this campaign.
