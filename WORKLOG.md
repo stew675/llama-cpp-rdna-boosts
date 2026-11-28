@@ -16,6 +16,42 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261128.005 (r376, release cut) -- tagged, main and the fork pushed, the assets published, the images queued on the worker
+
+**The cut.**  `v18-919794500-r376` (annotated tag, pushed) = fork re-cut tip
+`1cb8a186628ccb75e053d6aa09e8edc87307e8ca`, tree `223fbb80b1f2340b9bac698f5da8820d29d8f8f8` (recorded in
+`release.json`), 19 default patches (18 official + temporary `0300`), 2 optional artifacts, optional tree
+`9ee987063680ec8c8c15f806d6519e64e6f26725`.  The tree was derived three times independently -- the working chain,
+`scripts/fork-refresh.sh` and the `validate-set.sh` throwaway tarball -- and all three agree; the fork branch
+carries the recorded tip (`gh api repos/stew675/llama.cpp/branches/rdna-boosts` -> `1cb8a1866`).
+
+**Gate ladder run for this cut** (gfx1100, r376 tree; gfx1201 on `soar` for the cross-arch arms):
+
+| gate | result |
+|---|---|
+| `validate-set.sh` | GREEN -- strict apply, both optional orders (alone + cumulative), Windows lints, credit (43 handles / 38 rows / 0 debt), file-set reconciliation (0 loss, 2 new files, 1 new env), system headers |
+| `fork-refresh.sh --build --gates` | tree/tip match, `all` build, 16/16 shared libraries resolve, coherence + prefill-logit gates PASS |
+| `gate-gqa6-fold.sh` (new, gate 50) | PASS on gfx1100 (census 1/0, text `ebd02a60725c`/`ca199dcf8218`, off arm `-0.000000 / 100.000 %`, fold arm the same) and on gfx1201 (refusal: census 0 both arms, text `2245b10c2cde` single-device and `0f612e3cad2e` 3-GPU tensor, both KLD arms `-0.000000 / 100.000 %`), fault scan clean |
+| `gate-optional-build.sh` (gate 47) | PASS (tree `9ee987063`, `all` target) |
+| `gate-mixed-kv.sh` (on that build) | PASS, 14 checks, 2 refusal arms SKIPPED (no Ling model on this box) |
+| `check-offline-tests.sh` (gate 49) | PASS on `soar` (4 environment-exempt tests, as at r374) |
+| `check-shlib-symbols.sh` / `check-gen-docs.sh` | 16/16 resolve / docs in sync |
+| coherence vs the r375 build | 9B Q8_0 `37b826ac5e2a`, 27B Q4_K_M `ddd04dc91b87`, 27B IQ3_S q8_0 with the fold ON `ca199dcf8218` -- all identical; the Ornith-35B-A3B IQ4_XS arm moves only through the block-06 row (`7a5911eefc77` -> `8d25aa669cfd`), and `MMB_ROUTED=1` reads `0.000001 / 100.000 %` against the r375 base |
+| RDNA4 non-regression | r376 build vs the r375 base on gfx1201: default, `TILE_GQA6_FOLD=1` and `MMB_ROUTED=1` all `-0.000000 / 100.000 %`; `FLASH_ATTN_EXT` 7581/7581 with the fold on |
+
+**Fixed during the cut, not deferred:** the new gate's arm C compared the caller's `~/llama.cpp` build with
+itself instead of the build under test (it now exports `LLAMA_PPL=$BUILD_DIR/bin/llama-perplexity` and prints
+it) -- on `soar`, where that checkout is the previous release, the arm had read a meaningless 0.000000; and
+`gate-gqa6-fold.sh` picked the first 27B GGUF, which can be a Q8_0 no single card holds, so it now prefers the
+delivery's IQ3_S test quant and names the text log when an arm produces nothing.  `gate-optional-build.sh` warns
+when the GPU target is not on the box, because a build for an absent target compiles fine and then aborts every
+gate run with "device kernel image is invalid" -- which is exactly what cost an hour of this session.
+
+**Images.**  The `radiance` watcher (cron, every 10 min) had `r375` as `last-built` at the time of the cut; it
+picks the new tag up on its next poll and runs that tag's `build-containers.sh --push --prune`.  A release is
+only finished when `scripts/build-containers.sh --verify-only` says every tag RESOLVES -- see the entry above
+the index for that verdict.
+
 ## 261128.004 (r376) -- PR #362 promoted: the padded GQA-6 tile fold is block 05, default ON; issue #385's MMB routed row is block 06; release v18-919794500-r376
 
 **Contribution.**  `@kapojko`'s **PR #362** (padded GQA-6 tile flash-attention fold) was rejected as submitted on
