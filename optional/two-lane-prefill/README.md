@@ -1,8 +1,12 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
 **Optional artifact, not part of the delivery.  Optional block `0100`; PORTED onto `r369` (2026-11-27), verified on `r353`.**
-r369 (18 official blocks `0000`-`0017` + temporary `0300`, default tree `3518351ef19fef971683fdca1345ab5fcfa1c336`, default tip `2347ee8b3`):
-applies strictly after a **PORT** (see the r369 entry below -- it does NOT apply mechanically), sha256
+r372 (18 official blocks `0000`-`0017` + temporary `0300`, default tree `7c1728b37d8b914724e62156559eddf0301c062c`, default tip `5e844cbc6`):
+applies strictly on the r369 port, **nothing to reconcile** -- r372 amends block 05 (`ggml/src/ggml-cuda/fattn*.{cu,cuh}`), none of this artifact's eight files, so its own diff and export are untouched and the sha256 is **unchanged** at
+`ce21bccde08257b3f3e536141651ad63a8d22fd84ef52eeabb5d50f16c40e032`; producing tree
+`bcdf4dfbc57ca5d1520a6b20ceb7d2983b83b3b3` alone and `d74527df00cb751fdf695ef3d7be38346c485f87` cumulative, and
+`scripts/gate-optional-build.sh` (gate 47) **PASS** on the cumulative tree (`all` target, 212 s).  (r369, superseded: default tree `3518351ef19fef971683fdca1345ab5fcfa1c336`, default tip `2347ee8b3`:
+applies strictly after a **PORT** -- it does NOT apply mechanically, see the r369 entry below), sha256
 `4c318b23a1406f340b0eba49d88388ed4247f3358947d8293309582f1cc7a86d`, trees
 `659b380ddcda232be74377adbf9981ffabcfe981` alone and
 `83b34247b47c7f006717e792af2dccbaa91fedcd` cumulative.  (The r367 cut, superseded: default tree

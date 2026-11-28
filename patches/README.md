@@ -1283,6 +1283,35 @@ almost all of them `template-instances/*.cu`.
 
 **Contents.**
 
+* **Prefill attention under a tensor split pads no GQA lane, and RDNA3_0's head-256 prefill streams Q from LDS
+  (r372, GitHub issue #381; the RDNA3 half is upstream PR ggml-org/llama.cpp#31746 by `@ravel7524`).**  Two
+  independent fixes to head-256 prefill attention, each useless alone on the reporter's mixed
+  RX 9070 + RX 7900 GRE pair because the faster card waited for the slower one after every layer.
+  (1) **RDNA4 keeps the stock AMD `ncols2` rule when the GQA group divides.**  The split-aware rule (r285) is
+  blind to the GQA ratio: with `gqa_ratio` 6 it picks `ncols2 = 8` and **pads the group of 6 to 8**, so a
+  quarter of the prefill KQ/VKQ work is padding (at `-ub 1024`, 256 blocks of 64 columns per launch instead of
+  192).  The stock AMD rule divides the group (`ncols2 = 2`) and pads nothing.  PP4096 on this 27B head-256
+  GQA-6 model: 2 x R9700 `-sm tensor` q8_0 **+1.1 / +5.7 / +7.0 %** at depth 0 / 32768 / 81920, 3 x R9700 f16
+  (the split-aware rule's own tuning configuration) **+1.7 / +6.2 / +6.6 %**, and **+9.0 %** at the r285
+  `pp150000` point itself (1086.5 vs 996.7 t/s) — the September measurement that introduced the rule is now
+  inverted, so the rule is kept only as the A/B arm.  Neutral where the group already divides (4B head-256
+  gqa 4, 35B-A3B head-128 gqa 4, Gemma4-31B head-512 gqa 2), neutral for decode (the band owns it), and inert
+  on a single device (no tensor-parallel hint, so the switch is never consulted).
+  (2) **RDNA3_0 (gfx1100/gfx1101/gfx1102) head 256 with 2-4 Q heads per KV head** takes upstream #31746: Q
+  streamed from shared memory, one K batch and one V batch per iteration, and a `__builtin_amdgcn_sched_barrier`
+  after each WMMA (otherwise the compiler hoists the next batch's operand loads and the kernel spills — 720
+  VGPRs / 1312 B scratch, the call 10.16 ms; with Q in LDS, 30 / 128 B and 6.98 ms).  RDNA3_5 keeps its own
+  Strix Halo row: it was tuned separately and the PR does not measure it.  gfx1100 (RX 7900 XTX, 27B Q4_K_M,
+  q8_0 KV, ABBA): **neutral at depth 0, +6.3 % at 32768, +11.3 % at 81920**; `FLASH_ATTN_EXT` `hsk=256`
+  906/906.  Both halves are purity-checked with the instrument that fits: the RDNA4 switch moves the Q-row
+  blocking and (through `ntiles_x` → `blocks_per_wave` → `pick_parallel_blocks`) the number of partial KV
+  blocks, so its prefill-logit point reads **0.000542 / 98.81 %** (q8_0) and **0.000529 / 98.92 %** (f16)
+  against a same-kernel `-ub 256` control of **0.000581 / 98.83 %** and **0.000580 / 98.86 %** on the spot —
+  the model's ordinary summation-order sensitivity — with same-seed greedy text identical on both KV types;
+  the RDNA3_0 row reads **0.000051 / 99.71 %** on gfx1100 against a **0.005210 / 95.9 %** same-kernel control
+  (100x tighter), which moves that box's f16 greedy text at a 1818-token prompt (a near-tie inside 5e-5, not
+  a different arithmetic).  Kill switch: `GGML_CUDA_FA_RDNA4_GQA_STOCK=0` (`DIAGNOSTIC.md` §33).
+
 * **The RDNA2 caps are LIFTED (r334, contributor PR #338).**  `launch_fattn_tile_switch_ncols1()`'s four
   `cols_per_block` caps (D=512 <= 8, D=128 <= 8, D=576 <= 16, D=256 MHA <= 8) and
   `switch_ncols2()`'s `rdna_cap_ncols2` (D=128 <= 2) were r76 workarounds for wide-column kernels whose

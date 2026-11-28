@@ -8,8 +8,21 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `0783b165c67d497c1d8db7160b3557cec0f3b41c2fa4c27338804f0dbf0f70d3` (the r367 cut; every earlier cut is recorded below)
-* **r367 re-cut verification (current)**: applies strictly at the r367 default tree `2ff670ba83e5160abf16d20355aeded52cb744f0`
+  `ba75c00cdd3c0e0e2efd49c52c3e384f2783686f797f4eddce6aa72544eccf4c` (the current cut; every earlier cut is
+  recorded below)
+* **r372 re-cut verification (current)**: applies strictly at the r372 default tree
+  `7c1728b37d8b914724e62156559eddf0301c062c` (18 official blocks `0000`-`0017` + temporary `0300`, default tip
+  `5e844cbc6`), sha256
+  `ba75c00cdd3c0e0e2efd49c52c3e384f2783686f797f4eddce6aa72544eccf4c` -- **unchanged**, unlike a re-cut: r372
+  amends block 05, which owns `ggml/src/ggml-cuda/fattn.cu` (one of this artifact's ten files), but the only
+  hunk in that file is in `ggml_cuda_flash_attn_ext_get_alloc_size`, while r372's change is in
+  `switch_ncols2`'s RDNA4 tensor-split rule, so the patch's own diff and export are untouched and it needed no
+  rebase; producing tree `8bacc3b7c30c61cd3a5fae5dec4428a9bfd68a97` alone, and with the other optional artifact
+  on top, the cumulative tree is `d74527df00cb751fdf695ef3d7be38346c485f87`.  `scripts/gate-optional-build.sh`
+  (gate 47) **PASS** on the cumulative tree (`all` target, 212 s).  `validate-set.sh` check 8 re-verifies all
+  three trees on every run; the r353 port verification below is still the numbers of record (the artifact's
+  own code did not change).
+* **r367 re-cut verification (superseded by r372)**: applies strictly at the r367 default tree `2ff670ba83e5160abf16d20355aeded52cb744f0`
   (18 official blocks `0000`-`0017` + temporary `0300`, default tip `83b254bea`), sha256
   `0783b165c67d497c1d8db7160b3557cec0f3b41c2fa4c27338804f0dbf0f70d3` -- **this cut also repairs the artifact's own
   content** (GitHub issue #371): r360's rebase had inserted `ggml_cuda_fattn_tile_type_V` between

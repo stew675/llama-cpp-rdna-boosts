@@ -43,9 +43,9 @@ both side files are now accounted for and are no longer carried here:
 | sha256 | `9154d2e624ef398c6dde6a55f70a549b127436aade21153b517eaff9b23556e5` |
 | size | 42 files, **+3320/−770** |
 | contains | the two-arm server, PLUS STEP 16 (the compute-buffer drop fence, `llama_context_set_drop_boundary()`), the pair's per-(thread, device) host stream (`ggml_cuda_host_stream()`) and the r369 port (`llama_context_disable_staged_transport()`) |
-| cut against | `release.json` base `919794500`, default tree **`bdb1d2e7e1fb8fdb2aaaf816fffa7e84ed359336`** (r371) |
-| **applied tree** | **`cf1604253077a665f0a7798a12cca47255159c51`** (release tree + this patch; what `apply-all.sh --include-beta` prints, and what a strict `git am` of this one file produces) |
-| commit apply-all makes | `de2a81d1b` (deterministic: `apply-all.sh` pins the committer identity and stamps the date from the author date) |
+| cut against | `release.json` base `919794500`, default tree **`7c1728b37d8b914724e62156559eddf0301c062c`** (r372) |
+| **applied tree** | **`c82d54c781eb5d00f8a9a3c5630666b29e0c3b3d`** (release tree + this patch; what `apply-all.sh --include-beta` prints, and what a strict `git am` of this one file produces) |
+| commit apply-all makes | `70ae64a9a` (deterministic: `apply-all.sh` pins the committer identity and stamps the date from the author date) |
 | options | `--prefill-decode-arms` / `--no-prefill-decode-arms` (`LLAMA_ARG_PREFILL_DECODE_ARMS`), `--prefill-decode-arms-mode off\|on\|auto` (`LLAMA_ARG_PREFILL_DECODE_ARMS_MODE`) — **both default OFF** |
 | campaign record | `wip/prefill-decode-arms-v2/` (`DESIGN.md`, `RUNS.md`, `HANDOVER.md`, `gates/`, `baseline/`) |
 
@@ -55,15 +55,17 @@ both side files are now accounted for and are no longer carried here:
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 919794500
 bash <delivery>/scripts/apply-all.sh --include-beta .
-#   18 delivery blocks + 1 temporary (r371: tip d869945d7, tree bdb1d2e7e), then ONE beta candidate patch:
+#   18 delivery blocks + 1 temporary (r372: tip 5e844cbc6, tree 7c1728b37), then ONE beta candidate patch:
 #     prefill-decode-arms.patch     (block 17: the two-arm server + STEP 16's drop fence + the r369 port)
-#   applied tree: cf1604253077a665f0a7798a12cca47255159c51
+#   applied tree: c82d54c781eb5d00f8a9a3c5630666b29e0c3b3d
 ```
 
-**Verified on this box**, reading tree **`cf1604253`**: the tester path (`apply-all.sh --include-beta .` from
-`919794500` on the r371 set, which prints ONE applied beta patch and the tree) and a strict `git am` of this one
-file onto the applied delivery set both produce `cf1604253` exactly.  The patch applies **strictly** (no `-3`
-fallback), which is the contract a re-cut owes.
+**Verified on this box**, reading tree **`c82d54c78`**: the tester path (`apply-all.sh --include-beta .` from
+`919794500` on the r372 set, which prints ONE applied beta patch and the tree) and a strict `git am` of this one
+file onto the applied delivery set both produce `c82d54c78` exactly.  The patch applies **strictly** (no `-3`
+fallback), which is the contract a re-cut owes.  It was verified at `cf1604253` (the r369-port cut) and re-verified
+at `c82d54c78` when r372 moved the default tree (block 05's prefill-attention amendment): the candidate's own files
+are untouched by that block, so the re-verification was an apply + tree check, not a re-run of the campaign.
 
 ## The r369 port: the staged transport is not shareable, so the pair takes the plain one
 

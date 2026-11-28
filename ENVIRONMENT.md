@@ -887,6 +887,23 @@ Details: `benchmarks/2026-11-27-shexp-down-epilogue-rounding.md`; rule: `GREEDY-
 
 ---
 
+## 33. Prefill attention's GQA blocking under a tensor split (block 05, r372)
+
+Nothing to opt in to or tune: the wider `ncols2` that a tensor split used to prefer was padding a GQA group
+that does not divide by 8 (a gqa of 6 ran 6 real lanes and 2 zeroed ones), so a quarter of the head-256
+prefill KQ/VKQ work was wasted and a per-GPU bandwidth rationale was buying it.  The stock AMD divisor rule
+is the default again for RDNA4, and the head-256 RDNA3_0 row that ships beside it (Q from LDS, one K/V batch
+per iteration) is a config-table row like the Strix Halo and head-512 rows, so it has no switch either.  The
+kill switch for the first (`GGML_CUDA_FA_RDNA4_GQA_STOCK=0`) is in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §33.
+
+Measured on the delivery's own configurations: 2 x R9700 `-sm tensor` q8_0 **+1.1 / +5.7 / +7.0 %** prefill at
+depth 0 / 32768 / 81920, 3 x R9700 f16 **+1.7 / +6.2 / +6.6 %**, and **+9.0 %** at the r285 `pp150000` point;
+neutral on a 4B head-256 gqa-4, a 35B-A3B head-128 gqa-4 and a Gemma4-31B head-512 gqa-2 model, on decode, and
+on a single device; gfx1100 head-256 prefill (the RDNA3_0 row) **+6.3 % at 32768 and +11.3 % at 81920**.  Details:
+`patches/README.md` block 05; rules: `INVARIANTS.md` r372.
+
+---
+
 ## Maintaining this file
 
 The tables are derived from the code, so re-derive rather than trust them after a block change:

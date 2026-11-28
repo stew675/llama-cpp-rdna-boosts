@@ -3931,3 +3931,58 @@ of this artifact.  Six things worth keeping (they apply to any second scheduler 
 **Record.** `beta/prefill-decode-arms/README.md` (*The r369 port*), `BETA-TESTING.md`;
 `scripts/gate-arms-spec.sh` (both log forms, `DEVS3`/`DEVS2`); `WORKLOG.md` 261127.023; `TODO` #391 (closed),
 #387 (evidence), #390 (the same constraint for the two-lane artifact).
+
+## r372 (2026-11-27, `WORKLOG.md` 261127.024) — a split-aware `ncols2` that is blind to the GQA ratio pads a quarter of head-256 prefill attention, and the r285 measurement that chose it is now inverted (block 05, GitHub issue #381)
+
+The prefill MMA dispatch (`switch_ncols2()`) picks how many Q heads of one GQA group share a K/V tile read.  On
+RDNA4 under a tensor split the delivery took the split-aware rule (r285: `gqa_ratio > 4 -> ncols2 = 8`, on the
+argument that a tensor-split attention is per-GPU bandwidth-bound and wants fewer K/V re-reads).  That argument
+never looked at the GQA group: with `gqa_ratio` 6 it runs 8 lanes of which 2 are zeroed, so **a quarter of the
+prefill KQ/VKQ work is padding** (at `-ub 1024`, 256 blocks of 64 columns per launch where the divisor rule needs
+192).  Four things worth keeping.
+
+1. **The padded lane is not free and it is not the same trade as "fewer re-reads".**  The stock AMD rule divides
+   the group (`6 -> ncols2 = 2`, 32 Q rows per block) and pads nothing.  Measured on the delivery's own 27B
+   head-256 GQA-6 model (`pp4096`, `-ub 1024`, r2, two alternating rounds per arm): 2 x R9700 `-sm tensor` q8_0
+   **+1.1 / +5.7 / +7.0 %** at depth 0 / 32768 / 81920; 3 x R9700 f16 (the split-aware rule's own tuning
+   configuration) **+1.7 / +6.2 / +6.6 %**; and at the r285 `pp150000` point itself, `1086.5` vs `996.7` t/s
+   (**+9.0 %**).  The gain grows with depth because attention's share does — the same shape the reporter measured
+   on a mixed RX 9070 + RX 7900 GRE pair (+4.7 % at 32k, +7.2 % at 82k), where each fix alone was invisible
+   because the faster card waited for the slower one.
+2. **A tuning measurement is a property of the tree it was taken on, not of the rule.**  r285's own table read
+   `1219.9` (generic, `ncols2 = 8`) against `1152.3` (AMD rule) at 3-GPU pp150000 — today the same point reads
+   `996.7` vs `1086.5`, i.e. the ranking inverted over two months of block work (derived kq mask, native K/V,
+   the staging transport).  Re-measure a default-on tuning choice against the current tree before trusting the
+   comment that records why it was chosen; and keep the loser reachable as an A/B arm
+   (`GGML_CUDA_FA_RDNA4_GQA_STOCK=0`) rather than deleting it.
+3. **Where the group already divides the change is inert, and that is the check that it is the padding and not
+   the Q blocking.**  4B head-256 gqa 4 (`+0.2 %` at d81920), 35B-A3B head-128 gqa 4 (`+0.0 %`), Gemma4-31B
+   head-512 gqa 2 (`0.0 %`): all neutral, because `ncols2 = 8` divides those groups and both rules agree.
+4. **A prefill `ncols1` change is NOT bit-identical, even at constant `ncols`.**  `np` (the per-warp KV-row
+   partition) depends on `ncols` alone, so the per-column reduction looks untouched — but `ntiles_x =
+   ceil(n_q/ncols1)` feeds `blocks_per_wave`, which feeds `pick_parallel_blocks()`, so the number of partial KV
+   blocks `P` moves and `flash_attn_combine_results` adds a different number of partials.  The instrument is the
+   prefill-logit gate's `--family-switch` mode, which prints the same-kernel `-ub 256` control measured on the
+   spot: **0.000542 / 98.81 %** (q8_0) and **0.000529 / 98.92 %** (f16) against a control of **0.000581 /
+   98.83 %** and **0.000580 / 98.86 %** — the change is the model's ordinary summation-order sensitivity.
+   Same-seed greedy text is identical on both KV types (399 chars, sha `10a82b5559a9`), which is why a text arm
+   alone would have "passed" this without saying anything.
+5. **gfx1100's head-256 prefill streams Q from LDS (upstream PR ggml-org/llama.cpp#31746).**  RDNA3 WMMA operands
+   are mirrored, so Q in registers spills 720 VGPRs / 1312 B scratch for head 256 and Q in LDS with one K and
+   one V batch per iteration (plus a `__builtin_amdgcn_sched_barrier` after each WMMA, or the compiler hoists the
+   next batch's loads) spills 30 / 128 B: the call 10.16 -> 6.98 ms, and end to end **neutral at depth 0, +6.3 %
+   at 32768, +11.3 % at 81920** (gfx1100, 27B Q4_K_M, q8_0 KV, ABBA, `FLASH_ATTN_EXT hsk=256 906/906`).  It is
+   gated to RDNA3_0: RDNA3_5 keeps its own Strix Halo row, which the PR does not measure.  Numerics: **0.000051 /
+   99.71 %** against a same-kernel control of **0.005210 / 95.9 %** — 100x tighter than a reordering the delivery
+   already accepts — yet that box's f16 greedy text moves deterministically at a 1818-token prompt (482 chars
+   `6e2f7d2de955` -> 414 chars `0a644af79489`; the q8_0 arm is unchanged).  A near-tie inside a 5e-5 KLD is
+   still a text move: quote the KLD point and the control beside the hash, or the hash reads like a defect.
+6. **A preserved-mtime copy of a header into a built tree leaves the dependents stale, and the build says so
+   quietly.**  `rsync -a` of a modified `fattn-mma-f16.cuh` onto a tree whose objects were built after the
+   source's own mtime rebuilt **1 object instead of 420** (`fattn.cu.o` only), so the first candidate arm was
+   the baseline binary and read a flat 0.0 % everywhere.  `touch` the copied files (or copy without `-a`); a
+   candidate arm that measures *exactly* the same as the baseline is a build-plumbing question before it is a
+   result.
+
+**Record.** `patches/README.md` block 05; `DIAGNOSTIC.md`/`ENVIRONMENT.md` §33; `CONTRIBUTORS.md` (`@mjohanning99`
+issue #381, `@ravel7524` upstream #31746, both `co-author`); `WORKLOG.md` 261127.024.

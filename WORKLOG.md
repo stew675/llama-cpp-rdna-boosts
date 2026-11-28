@@ -16,6 +16,97 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.024 (r372) -- issue #381: a tensor split's head-256 prefill attention padded a quarter of the GQA group. RDNA4 takes the stock divisor `ncols2`, gfx1100 takes upstream #31746's Q-from-LDS row, and the r285 measurement that chose the split-aware rule is now inverted
+
+`@mjohanning99` reported (issue #381) that a mixed RX 9070 (gfx1201) + RX 7900 GRE (gfx1100) `-sm tensor` pair
+gains prefill from **two** independent fixes and from neither alone, because the faster card waits for the slower
+one after every layer: **RDNA3_0** spills head-256 WMMA registers (upstream PR
+[ggml-org/llama.cpp#31746](https://github.com/ggml-org/llama.cpp/pull/31746) streams Q from LDS: 720 VGPRs /
+1312 B scratch -> 30 / 128 B), and **RDNA4** under a tensor split runs
+`flash_attn_ext_f16<256,256,8,8>`, which **pads a GQA group of 6 to 8** so a quarter of its prefill KQ/VKQ work is
+padding (256 blocks of 64 columns per launch at `-ub 1024` instead of 192).  Reported: +4.7 % prefill at depth
+32768 and +7.2 % at 81920 at no quality cost, perplexity 6.0002 against 6.0090, KLD at the level of a ubatch change.
+
+**Reproduced on this box before touching anything.**  `Qwen3.8-27B-Q8_0` is the reporter's own architecture
+(`qwen35`, 65 layers of which 16 full-attention, head 256, 24/4 heads = a GQA group of 6) and reproduces the
+padding case exactly: 2 x R9700 `-sm tensor`, q8_0 KV, `pp4096 -ub 1024`, two alternating rounds per arm, read
+**2536.9** (split-aware) against **2509.7** t/s (divisor rule) at depth 0, **1852.7 / 1752.3** at 32768 and
+**1295.5 / 1211.1** at 81920 -- +1.1 / +5.7 / +7.0 %.  The RDNA4 half therefore needs no mixed pair to show
+itself; the mixed pair showed it *first* only because a homogeneous pair's slow card is the same card.
+
+**So both halves are in block 05 (the FA kernel family), default-on, with the trim the fleet needs.**
+
+* **RDNA4: the stock AMD divisor rule, not the split-aware one** (`GGML_CUDA_FA_RDNA4_GQA_STOCK=0` restores it).
+  The split-aware rule was r285's answer to "a tensor-split attention is per-GPU bandwidth-bound, prefer fewer
+  K/V re-reads", and it never looked at the GQA group.  On this tree it is **inverted**: at r285's own tuning
+  point (3 devices, f16, `Q4_K_XL`, `pp150000`, `-ub 512`) it now reads **996.7** against the divisor rule's
+  **1086.5 t/s (+9.0 %)** where September measured 1219.9 against 1152.3 for the same pair of rules.  Two months
+  of block work (derived kq mask, native K/V, the staging transport) moved the balance, so the rule is kept as
+  the A/B arm and the comment that explained it now says so.  3 x R9700 f16 `pp4096`: **+1.7 / +6.2 / +6.6 %** at
+  depth 0 / 32768 / 81920.  **Neutral where the group already divides** -- 4B head-256 gqa 4 (+0.2 % at 81920),
+  35B-A3B head-128 gqa 4 (0.0 % at 0 and 81920), Gemma4-31B head-512 gqa 2 (0.0 %) -- which is the check that it
+  is the padding and not the Q blocking.  Decode is untouched (tg128 34.40 vs 34.54 on 2 devices; the band owns
+  it) and a **single device is inert by construction**: the tensor-parallel hint is false, so the switch is never
+  consulted (1489.8/1482.7 at d0 and 1016.8/1025.3 at d32768 = noise).
+* **RDNA3_0 (gfx1100/gfx1101/gfx1102): upstream #31746's row** -- Q streamed from shared memory, one K batch and
+  one V batch per iteration, and a `__builtin_amdgcn_sched_barrier` after each WMMA (without it the compiler
+  hoists the next batch's operand loads and the row spills again).  Gated to RDNA3_0: **RDNA3_5 keeps its own
+  Strix Halo row**, which that PR does not measure.  Measured on `fingon` (RX 7900 XTX, 27B Q4_K_M, q8_0 KV,
+  `pp4096 -ub 1024`, ABBA over two alternating rounds): **1225.1 -> 1225.8** t/s at depth 0 (neutral),
+  **863.6 -> 918.0 (+6.3 %)** at 32768, **604.1 -> 672.2 (+11.3 %)** at 81920; `FLASH_ATTN_EXT` `hsk=256`
+  **906/906**.
+
+**Purity: the instrument is the KLD point with a same-kernel control, because neither half is bit-identical.**
+The RDNA4 switch keeps `ncols` (64) and therefore the per-column KV partition `np`, but it moves the Q-row blocking
+`ncols1 = 64/ncols2` and through `ntiles_x = ceil(n_q/ncols1)` -> `blocks_per_wave` -> `pick_parallel_blocks()` the
+number of partial KV blocks `P`, so the online-softmax combine adds a different number of partials.  The RDNA3_0
+row changes `nbatch_fa` (64 -> 32, the online-softmax batching) and stages Q in LDS.  `--family-switch` mode
+prints the control on the spot, and both halves come out at the level of an accepted reordering:
+
+| arm | mean KLD | same top-p | same-kernel `-ub 256` control |
+|---|---|---|---|
+| 3 x gfx1201 `-sm tensor`, q8_0 | 0.000542 | 98.814 % | 0.000581 / 98.833 % |
+| 3 x gfx1201 `-sm tensor`, f16 | 0.000529 | 98.922 % | 0.000580 / 98.863 % |
+| gfx1100, f16 (the #31746 row) | **0.000051** | 99.706 % | 0.005210 / 95.900 % |
+| canonical 1-device `layer` point | 0.000000 | 100.000 % | — (inert) |
+
+Same-seed greedy text is **identical** between the arms on 3 devices for both KV types (399 chars, sha
+`10a82b5559a9`), on 2 devices (short prompt, sha `f6f8f576d4f3`), and at a **verify width of 9**
+(`--spec-draft-n-max 8`, 536 chars, sha `efad2aa9a83e`) -- the one width band that reaches the mma dispatch on a
+tensor split.  On **gfx1100 the f16 greedy text does move** (482 chars `6e2f7d2de955` -> 414 chars
+`0a644af79489`, deterministic on each build, the q8_0 arm unchanged): that is a near-tie inside a 5.1e-5 KLD,
+100x tighter than the `-ub 512`/`-ub 256` control that reads 95.9 % same-top-p on the same point, so it is
+recorded as a reference move rather than argued away.  `gate-spec-purity.sh` (issue #330's gate) is **PASS**: plain
+== `draft-mtp` on q8_0 and bf16, all four axes, and the width probe's boundary arm worst maxdiff **0**.
+
+**The rest of the ladder.**  One `all` build of the applied tip on this box (green) and on `fingon`
+(gfx1100, green); `validate-set.sh` green (strict apply, tree, optional artifacts, Windows scan, credit check);
+`check-rung-file-sets.py` **OK, 0 unexplained, 2 new** (the env var and its define); `check-gen-docs.sh` **OK**;
+`gate-optional-build.sh` (gate 47) **PASS** -- `0101-mixed-kv` patches `fattn.cu` in
+`get_alloc_size` while this change is in `switch_ncols2`, so it applied strictly with nothing to reconcile and
+the cumulative optional tree builds (212 s); `check-gpu-faults.sh` clean over the session window.  Not run, with
+the reason: the MTP four-axis *rate* protocol (this change reaches no decode path -- the band returns before
+`switch_ncols2`, tg128 is flat and gate-spec-purity's four purity axes pass) and `gate-mixed-kv.sh` (an optional
+artifact's own tile-kernel gate; nothing in the tile kernel, the mixed `type_V` list or the band predicate moved).
+
+**Two findings of the session that are not the change, both fixed or recorded here.**  (a) `rsync -a` preserves
+mtime, so copying the edited header onto a tree whose objects were built *later* rebuilt **1 object instead of
+420** (only `fattn.cu.o`) and the first "candidate" arm was the baseline binary reading a flat 0.0 % everywhere --
+`touch` after a copy, and treat "exactly the same" as a build-plumbing question first (`INVARIANTS.md` r372.6).
+(b) `beta/prefill-decode-arms/README.md` + `BETA-TESTING.md` and the two `optional/` READMEs record the default
+tree their patch was cut against, so this release's tree move owes their rows: the beta artifact re-verifies
+**strictly** at the r372 tree (applied tree `c82d54c78`, commit `70ae64a9a`, unchanged patch) and both optional
+artifacts apply with **sha256 unchanged**.  While refreshing them, `optional/mixed-kv/README.md`'s "current cut"
+sha256 was found stale since r367 (`0783b165...` against the shipped `ba75c00c...`); corrected.
+
+**The re-cut.**  Block 05's commit carries both halves (`git commit --amend` + a replay of the thirteen blocks
+above it with `--committer-date-is-author-date`, so the chain stays a pure function of the patches: a fresh
+`apply-all.sh` reproduces **tip `5e844cbc6`** and tree **`7c1728b37`** on both other boxes).  Only block 05's tree
+moves; the other eighteen blocks' trees are byte-identical and only their exported `From <sha>` line changed.
+Credit: the RDNA3 half is upstream PR #31746 by `@ravel7524` (co-author in the patch, a `CONTRIBUTORS.md` row and
+the block note) and the RDNA4 switch plus the whole diagnosis is `@mjohanning99`'s (co-author, as "Marvin
+Johanning", plus a row); `release.json` is `v18-919794500-r372`.
+
 ## 261127.023 (r371-wip, beta artifact) -- `beta/prefill-decode-arms` PORTED onto r369: the staged transport is backend state booked per scheduler, so the pair takes the plain one (and is 33 % faster for it), the selector needed to be told, and the port's gate was still parsing the WITHDRAWN block 17
 
 `TODO` #391 was the maintainer's decision (2026-11-27) to accept the two-arm server broken for the r369 release and

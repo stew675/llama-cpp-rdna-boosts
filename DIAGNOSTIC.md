@@ -792,6 +792,33 @@ KLD at the delivery's own point prints `0.000000`, so a text or KLD arm cannot d
 *The opt-in and tuning rows for this section are in [`ENVIRONMENT.md`](ENVIRONMENT.md) §32 (there are none: this
 section is a kill switch and a census, never a supported configuration).*
 
+---
+
+## 33. Prefill attention's GQA blocking under a tensor split (block 05, r372)
+
+`switch_ncols2()` picks how many Q heads of one GQA group share a K/V tile read.  Under a tensor split RDNA4
+used the split-aware rule (r285: `gqa_ratio > 4 -> ncols2 = 8`), which pads the group when it does not divide
+(a gqa of 6 runs 6 real lanes and 2 zeroed ones, so a quarter of the prefill KQ/VKQ work is padding).  It now
+takes the stock AMD divisor rule whenever that divides, and this is the switch that restores the old rule for
+an A/B or a bisect.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `GGML_CUDA_FA_RDNA4_GQA_STOCK` | unset = the divisor rule (`ncols2` divides the group) | **kill switch / A/B** | `0` restores the split-aware rule (r285: wider `ncols2` under a tensor split, fewer K/V re-reads, padded lanes).  RDNA3_0 already took the divisor rule before this section existed; RDNA3_5 keeps the split-aware behaviour under either value.  It changes nothing on a single device: the tensor-parallel hint is false, so the switch is never consulted. |
+
+**What an arm has to read.**  This is a **dispatch** change, not a kernel: the kernel, its config row and the
+instrument are all unchanged, so there is no census to add and no text oracle (a prefill `ncols1` change moves
+the partial-KV-block count, so the arms are not bit-identical).  The instrument is the prefill-logit gate's
+`--family-switch` mode with `--ab "GGML_CUDA_FA_RDNA4_GQA_STOCK=0"`, which prints the same-kernel `-ub 256`
+control measured on the spot: r372 reads 0.000542 / 98.81 % (q8_0) and 0.000529 / 98.92 % (f16) against a
+control of 0.000581 / 98.83 % and 0.000580 / 98.86 %.  A bare text arm is vacuous here: the arms read
+byte-identical greedy text (399 chars, sha `10a82b5559a9` on both KV types) because the divergence is
+rounding-level.
+
+*There is nothing to opt in to or tune for this section: the RDNA3_0 head-256 row it ships beside has no
+switch either (it is a config-table row, like the Strix Halo and head-512 rows).  [`ENVIRONMENT.md`](ENVIRONMENT.md)
+§33 has the pointer.*
+
 ## Maintaining this file
 
 The same recipe as [`ENVIRONMENT.md`](ENVIRONMENT.md) → *Maintaining this file* derives the names; this file is
