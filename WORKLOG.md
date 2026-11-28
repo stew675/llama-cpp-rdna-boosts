@@ -205,3 +205,10 @@ No image build ran on the primary box.
 `.github/workflows/release.yml` and had been wrong since r356 (blocks `0016`/`0017` shipped while every release note
 said otherwise); it is DERIVED from `n_blocks` now, and this tag's published body was corrected by hand to
 `0000-0017`.  Found while reading the r375 release page.
+
+**And one wording nit in r375's own code comment, for the next cut** (not worth a revision on its own):
+`ggml-backend.cpp`'s measured-rule note says "a ratio near 1 on RDMA-class links and on the x8 box, against ~9 on
+the reporter's PCIe 3.0 x16 box".  "RDMA-class" is the wrong term for a PCIe link and the ~9 is INFERRED from his
+gather being 38 % faster, not measured; the honest form is "a ratio near 1 on our PCIe5 links ... against a value
+well above 2 (his gather wins by 38 %, so the fill must move several times what it reads)".  `INVARIANTS.md` and
+`ENVIRONMENT.md` already say it that way.
