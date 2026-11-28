@@ -40,7 +40,9 @@ four arms (4B Q8_0 1 GPU and 3-GPU tensor `7e6229b260f6`, 27B UD-Q6_K_XL `da2e2d
 `461ca8cd0e88`, 27B `draft-mtp` `f2f9f9a596b7`).  The flag-on arm was measured in the scratch tree, whose tree
 is **the same `976fd14dcd`**: `test-backend-ops -o MUL_MAT -p type_a=q6_K` 71/71 with the same max error as
 VDR 2, wikitext PPL 6.9346 both arms chunk for chunk, MTP acceptance 0.49755 -> 0.50825, and the kernel /
-batched tables in 261128.008.
+batched tables in 261128.008.  Gate **49 (`check-offline-tests.sh`) was NOT triggered**: it applies to a runtime
+policy that replaces an upstream one, or an option added/reordered in `common/arg.cpp`, and this change is a
+build-time preprocessor guard with no argument surface.
 
 **CI and assets.**  Tier-1 `Validate delivery set` green on `main` and on the tag, `Release patch set` green;
 the GitHub Release carries its four assets (`SHA256SUMS`, `patches.tar.gz`, `rdna-boosts-all.patch`,
@@ -49,7 +51,10 @@ the GitHub Release carries its four assets (`SHA256SUMS`, `patches.tar.gz`, `rdn
 
 **The images.**  OWED: the `radiance` cron watcher picks the new tag up on its next poll and runs that tag's own
 `scripts/build-containers.sh --push --prune` for both ROCm lines.  A push is not proof (issue #364), so this
-entry is closed by `scripts/build-containers.sh --verify-only` reading every tag resolving to this release.
+entry is closed by `scripts/build-containers.sh --verify-only` reading every tag resolving to this release.  The
+wait here was stopped on the maintainer's instruction (the worker needs roughly another hour for the two lines);
+`--verify-only` read **8 missing / 15 of 23 present**, and all eight missing are this release's tags -- that is
+the open obligation, not a passing check.
 
 ## 261128.008 (r378) -- contributor PR #386 promoted into blocks 07 + 10: the dense Q6_K VDR-4 dot product, the third RDNA4 build-time opt-in
 
