@@ -16,6 +16,55 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261128.012 (r379-wip) -- PR #375 is HELD, not rejected: its fix is measured (4-6x) and it patches the copy where the DESTINATION is the defect, so the work moves to `wip/state-stage-per-device/`
+
+**Why.**  Contributor PR [#375](https://github.com/stew675/llama-cpp-rdna-boosts/pull/375) (`wip/rows-gather-r366`,
+`@briansp2020`) is two patches against r366 that keep r364's "no 2-D D2H into pinned memory another device owns"
+rule: `0001` makes a queued row-block read of >= 64 rows one 2-D copy **on the destination's owner** and a device
+gather + chunked 1-D D2H + `cudaLaunchHostFunc` scatter elsewhere, and `0002` runs a state copy larger than
+`LLAMA_STATE_ASYNC_MAX_MIB` through the batched path in rounds instead of the plain per-tensor copy.  Assessed on
+`v18-919794500-r378` (gfx1201 / ROCm 10.2, the x8 pair, Flash-Next GSQ-RCO IQ3_XXS, `-sm tensor -c 65536
+--cache-ram 8192`, 4 slots, `-lv 4`, `LLAMA_STATE_TIMING=1`), with the probe harness in
+`wip/state-stage-per-device/probe/` and the arms in its `logs/arms-2026-11-28.txt`.
+
+**Both halves were measured, and they split.**  r378's pathology reproduces and is worse here than reported: a
+226.5 MiB state (4 290 tokens) saves in **428.7 / 505.1 / 375.8 ms**, because the column-split KV read enqueues
+**313 ms** of per-row `hipMemcpyAsync` (109 pieces, ~236 k submissions) while the SAME save's mirrored state
+(112.6 MiB, 73 pieces, a TIGHT destination) enqueues in **0.4 ms**.  `0001` drops the save to **82.0 / 96.8 /
+39.3 ms** and "A again" from 1 093 to 688 ms, with the reply shas identical in every arm; the kill switch
+(`GGML_CUDA_ROWS_ASYNC_GATHER=0`) reproduces r378 exactly (431.8 / 493.9 / 374.4 ms).  `gate-state-pipe.sh` PASSes
+on it in both window modes (pipe **18.8 ms = 0.45x** the synchronous arm, `KV_WINDOW=4096` **23.4 ms = 0.54x**), and
+`check-gpu-faults.sh` reads clean on every arm.  **`0002` is a regression**: a 566 MiB state (17 189 tokens) reads
+**84.6 / 88.3 / 77.4 ms** on r378 and **147.6 / 90.6 / 102.4 ms** with the rounds -- the above-cap path already
+stages per chunk at ~7.5 GiB/s, so the rounds add the batched path's pinned-stage copy to a path that was faster,
+which is the same conclusion r173 reached when it declined this exact half (`archive/work/prompt-cache-save-bands/`).
+Their own build's "2 GB saves 17-20 s -> 172-377 ms" is `0001`, and `0002` is what *put* those states on the
+pathological path in the first place.
+
+**Why it is held rather than folded in.**  The submission patches the *copy*; the copy is strided only because the
+*destination* is one device's allocation.  `llama_context::state_stage()` and `output_host_buft()`
+(`llama-context.cpp:5801`/`:4282`) both allocate from **simple device 0's** pinned type, so every device of a split
+reads into one device's buffer at that buffer's row pitch, which is what makes a 2-D D2H (and its peer grant) even
+possible -- the class r362, r364 and this PR each paid for inside the copy in turn.  The maintainer's read is that
+r369's success came from giving every copy a **destination its issuing device owns**, and that the same guarantee
+applied here removes the 2-D form, the grant, the owner query, the per-stream pair and the host callback at once.
+Also answered while deciding it: r369's *pipeline* does not transfer to a D2H whose consumer is the host (a ring
+would still need a drain point at slot reuse and for the tail), but its **destination ownership** does -- that is the
+campaign.  The owner-2D arm's value was measured too: gather-only reads 89.8 / 101.0 / 34.6 ms against 82.0 / 96.8 /
+39.3 with both arms, i.e. **nil**, so a fallback can keep r364 literally true.
+
+**The decision.**  PR #375 is **held, not rejected** (a reply on the PR says so and names what a re-cut needs):
+`wip/state-stage-per-device/` is the campaign to do it once at the right layer (`README.md` = the design, the plan in
+six gated steps and the promotion ladder; `PR375-ASSESSMENT.md` = the submission claim by claim; `held-pr375/` = the
+two patches unmodified with their sha256; `probe/` = the harness).  **If the campaign fails, the fallback is `0001`
+as a block-14 amendment** with the owner-2D arm deleted and the scatter's error path declining instead of aborting;
+`0002` ships in no form.
+
+**Record.**  `wip/state-stage-per-device/` (+ its `wip/CAMPAIGNS.md` row), `INVARIANTS.md` r379-wip, the reply on
+PR #375.  **No delivery change**: `patches/`, `release.json`, the gates and the tag set are untouched, no rebuild or
+release was owed, and the credit register owes nothing because nothing ships (the submitter's earlier promotions are
+already recorded).
+
 ## 261128.011 -- PR #383 (the fair-share rotation restart) is REJECTED as superseded by r373, and issue #384's verify-band report is assessed: its 9-row boundary is confirmed, its per-type claim is not
 
 **Why.**  Two contributor reports on the same question (may the same tokens produce the same values in one server) were

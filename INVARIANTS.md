@@ -4238,3 +4238,32 @@ fallback's new meaning) and `DIAGNOSTIC.md` §28 (`MOE_EXPERT_CACHE_TABLES` is r
      cannot be judged from one pair -- repeat the pair and take the per-arm minimum (or report the spread).**  The
      same class explains the Q6_K table's single-sample `n=512` rows (`2560x512x6144` +3.4 %, `5120x512x17408`
      +0.3 %): the conclusion ("n >= 128 inert") holds, those deltas do not.
+
+* **r379-wip (2026-11-28, `WORKLOG.md` 261128.012) -- a state save's shape is set by its DESTINATION, and r378
+  pays for that shape in copy submissions.**  Measured while assessing PR #375 on `v18-919794500-r378`, gfx1201 /
+  ROCm 10.2, x8 pair (`HIP_VISIBLE_DEVICES=0,2`), Flash-Next GSQ-RCO IQ3_XXS, `-sm tensor -c 65536 --cache-ram
+  8192`, 4 slots, `LLAMA_STATE_TIMING=1`:
+  1. **The enqueue, not the link, is the wall time.**  In ONE save the mirrored recurrent/GDN state (73 pieces,
+     112.6 MiB, destination **tight**) enqueues in **0.4 ms** and copies at 4.7 GiB/s, while the column-split KV
+     (109 pieces, 226.5 MiB, destination **strided** into device 0's stage) enqueues in **313 ms** and copies at
+     3.1 GiB/s.  The 313 ms is queued per-row `hipMemcpyAsync` submissions, of order 10^5 for this size (4 290 rows
+     against ~109 pieces, ~0.7 us each) from
+     `ggml_cuda_rows_to_host`'s per-row loop; the stride comes from `llama_context::state_stage()` and
+     `output_host_buft()` allocating **simple device 0's** pinned type (`llama-context.cpp:5801`, `:4282`), so every
+     device of a split reads into one device's allocation at that allocation's pitch.  Whole save: **428.7 / 505.1 /
+     375.8 ms** for a 226.5 MiB state on r378 -- the same class is present with the GATE's own model (35B-A3B
+     UD-Q4_K_M, 2 GPU `-sm tensor`, `-ncmoe 10`, `-c 16384`: a 165.3 MiB read enqueues at 305-318 ms).
+  2. **The tight form is one `cudaMemcpyAsync` per piece** (`ggml-cuda.cu:3926`) and needs no grant, which is the
+     whole reason `wip/state-stage-per-device/` exists.  A per-device destination makes EVERY state read tight, and
+     retires the 2-D D2H (and with it the r364 refusal class) *by construction* rather than by policy.
+  3. **Above `LLAMA_STATE_ASYNC_MAX_MIB` the plain per-tensor path is already fast: 84.6 / 88.3 / 77.4 ms for a
+     566 MiB state (~7.5 GiB/s)** -- it stages per chunk.  So a "large states are slow" reading of a 2 GB save is
+     about the per-row async read, not about the size: any change that routes above-cap states onto the batched path
+     (PR #375's `0002`, the r173-declined bands) pays an extra pinned-stage copy on a path that was already faster
+     (measured here: **147.6 / 90.6 / 102.4 ms**, i.e. a regression).
+  4. **`gate-state-pipe.sh`'s 3x bound does not see this class**: r378 passes it at **1.53x** the synchronous arm
+     (64.7 vs 42.2 ms).  The ratio is the number to keep -- PR #375's first patch reads **0.45x** (18.8 ms) and
+     **0.54x** with `KV_WINDOW=4096`, both PASS, text byte-identical on all four arms in both runs.
+  5. **r369's destination guarantee is what removed the old ring's occasional refusals, and it is the part that
+     transfers here**: its slots are VRAM staging for a compute consumer, so the *pipeline* does not transfer to a
+     D2H whose consumer is the host (a ring there still needs a drain point at ring reuse and for the tail).

@@ -1,0 +1,241 @@
+# PR #375 assessment — the measured arms, extracted from the per-arm server logs (2026-11-28, gfx1201, ROCm 10.2)
+#
+# Flash-Next GSQ-RCO IQ3_XXS, HIP_VISIBLE_DEVICES=0,2 (the x8 pair), -sm tensor -ngl 99 -c 65536 -t 8
+# --cache-ram 8192 -fa auto -lv 4.  'A' is the state that is saved; 'A again' restores it.
+# 'state get:' lines are LLAMA_STATE_TIMING=1.  r378 base = fork tip d4dd34a93.
+
+================================================================
+## r378-short
+
+  A        wall  3264.7 ms | prompt  4290 tok  2781.6 ms | sha 05b1745d26b4
+  B        wall  3241.3 ms | prompt  5016 tok  2320.1 ms | sha e87d5320af4b
+  A again  wall  1092.9 ms | prompt     4 tok    53.5 ms | sha 05b1745d26b4
+  B again  wall   967.8 ms | prompt     4 tok    51.4 ms | sha e87d5320af4b
+  --- server:
+  0.24.497.349 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.89 ms, copy+wait 30.97 ms (3.5 GiB/s), total 31.87 ms
+  0.24.779.233 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.69 ms, copy+wait 23.98 ms (4.6 GiB/s), total 24.67 ms
+  0.25.755.125 I state get: 109 pieces, 226.5 MiB in 8 group(s): enqueue 313.15 ms, copy+wait 71.39 ms (3.1 GiB/s), total 384.54 ms
+  0.25.755.130 I slot  prompt_save: id  0 | task -1 | prompt cache save took 428.67 ms
+  0.25.755.139 I srv  update_promp: prompt cache update took 428.68 ms
+  0.27.781.193 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.47 ms, copy+wait 23.53 ms (4.7 GiB/s), total 24.00 ms
+  0.28.032.001 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.41 ms, copy+wait 21.20 ms (5.2 GiB/s), total 21.62 ms
+  0.29.072.930 I state get: 109 pieces, 245.6 MiB in 8 group(s): enqueue 372.49 ms, copy+wait 77.53 ms (3.1 GiB/s), total 450.02 ms
+  0.29.072.935 I slot  prompt_save: id  0 | task -1 | prompt cache save took 505.11 ms
+  0.29.115.303 I state set: 109 pieces, 226.5 MiB in 8 group(s): pack+enqueue 35.67 ms
+  0.29.121.217 I srv  update_promp: prompt cache update took 553.40 ms
+  0.29.130.538 I state set: 73 pieces, 112.6 MiB in 8 group(s): pack+enqueue 8.74 ms
+  0.30.036.637 I state get: 109 pieces, 226.5 MiB in 8 group(s): enqueue 300.61 ms, copy+wait 74.85 ms (3.0 GiB/s), total 375.46 ms
+  0.30.036.642 I slot  prompt_save: id  0 | task -1 | prompt cache save took 375.82 ms
+  0.30.081.826 I state set: 109 pieces, 245.6 MiB in 8 group(s): pack+enqueue 39.00 ms
+  0.30.088.177 I srv  update_promp: prompt cache update took 427.36 ms
+  0.30.097.060 I state set: 73 pieces, 112.6 MiB in 8 group(s): pack+enqueue 8.21 ms
+
+================================================================
+## r378-long
+
+  A        wall  8739.5 ms | prompt 17189 tok  8220.6 ms | sha d8c673720c8f
+  B        wall  8691.8 ms | prompt 18224 tok  8084.3 ms | sha 71914eda98d2
+  A again  wall   752.1 ms | prompt     4 tok    68.2 ms | sha d8c673720c8f
+  B again  wall   724.3 ms | prompt     4 tok    58.5 ms | sha 71914eda98d2
+  --- server:
+  0.29.955.627 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.76 ms, copy+wait 23.15 ms (4.7 GiB/s), total 23.91 ms
+  0.30.236.873 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.65 ms, copy+wait 21.52 ms (5.1 GiB/s), total 22.16 ms
+  0.30.903.594 I slot  prompt_save: id  0 | task -1 | prompt cache save took 84.63 ms
+  0.30.903.607 I srv  update_promp: prompt cache update took 84.65 ms
+  0.38.674.939 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.42 ms, copy+wait 20.84 ms (5.3 GiB/s), total 21.26 ms
+  0.38.942.156 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.41 ms, copy+wait 21.36 ms (5.1 GiB/s), total 21.77 ms
+  0.39.601.562 I slot  prompt_save: id  0 | task -1 | prompt cache save took 88.29 ms
+  0.39.672.882 I srv  update_promp: prompt cache update took 159.62 ms
+  0.39.687.888 I state set: 73 pieces, 112.6 MiB in 8 group(s): pack+enqueue 13.28 ms
+  0.40.340.200 I slot  prompt_save: id  0 | task -1 | prompt cache save took 77.35 ms
+  0.40.413.908 I srv  update_promp: prompt cache update took 151.06 ms
+  0.40.428.809 I state set: 73 pieces, 112.6 MiB in 8 group(s): pack+enqueue 13.08 ms
+
+================================================================
+## r378-gate-shape-35B
+
+  A        wall  1287.4 ms | prompt  5246 tok 1272.625 ms | sha 5feceb66ffc8
+  B        wall   609.5 ms | prompt   533 tok  202.913 ms | sha e3b0c44298fc
+  C        wall   776.2 ms | prompt    10 tok   72.866 ms | sha b4ce96073d2d
+  A        wall    24.6 ms | prompt     4 tok   19.679 ms | sha 5feceb66ffc8
+  B        wall   391.1 ms | prompt     4 tok   23.585 ms | sha e3b0c44298fc
+  C        wall   731.9 ms | prompt    10 tok   46.188 ms | sha b4ce96073d2d
+  A        wall    33.0 ms | prompt     4 tok   28.185 ms | sha 5feceb66ffc8
+  B        wall   388.9 ms | prompt     4 tok   22.599 ms | sha e3b0c44298fc
+  C        wall   734.3 ms | prompt    10 tok    46.84 ms | sha b4ce96073d2d
+  --- server:
+  0.11.002.817 I srv  update_promp: prompt cache update took 0.01 ms
+  0.11.049.776 I state get: 60 pieces, 62.8 MiB in 8 group(s): enqueue 0.49 ms, copy+wait 8.54 ms (7.2 GiB/s), total 9.03 ms
+  0.11.178.071 I state get: 80 pieces, 63.0 MiB in 8 group(s): enqueue 0.85 ms, copy+wait 8.53 ms (7.2 GiB/s), total 9.38 ms
+  0.11.178.074 I slot  prompt_save: id  0 | task -1 | prompt cache save took 9.48 ms
+  0.11.178.078 I srv  update_promp: prompt cache update took 9.49 ms
+  0.12.296.935 I state get: 60 pieces, 62.8 MiB in 8 group(s): enqueue 0.47 ms, copy+wait 7.90 ms (7.8 GiB/s), total 8.37 ms
+  0.12.413.823 I state get: 60 pieces, 62.8 MiB in 8 group(s): enqueue 0.26 ms, copy+wait 8.12 ms (7.6 GiB/s), total 8.38 ms
+  0.12.857.486 I state get: 80 pieces, 165.3 MiB in 8 group(s): enqueue 317.92 ms, copy+wait 55.69 ms (2.9 GiB/s), total 373.61 ms
+  0.12.857.490 I slot  prompt_save: id  0 | task -1 | prompt cache save took 404.87 ms
+  0.12.857.498 I srv  update_promp: prompt cache update took 404.88 ms
+  0.12.908.777 I state get: 60 pieces, 62.8 MiB in 8 group(s): enqueue 0.63 ms, copy+wait 7.84 ms (7.8 GiB/s), total 8.47 ms
+  0.13.028.373 I state get: 60 pieces, 62.8 MiB in 8 group(s): enqueue 0.25 ms, copy+wait 8.23 ms (7.5 GiB/s), total 8.48 ms
+  0.13.112.833 I state get: 80 pieces, 73.2 MiB in 8 group(s): enqueue 10.46 ms, copy+wait 34.43 ms (2.1 GiB/s), total 44.89 ms
+  0.13.112.835 I slot  prompt_save: id  0 | task -1 | prompt cache save took 46.97 ms
+  0.13.132.270 I state set: 80 pieces, 165.3 MiB in 8 group(s): pack+enqueue 18.66 ms
+  0.13.132.809 I srv  update_promp: prompt cache update took 66.95 ms
+  0.13.141.703 I state get: 60 pieces, 62.8 MiB in 8 group(s): enqueue 0.25 ms, copy+wait 8.51 ms (7.2 GiB/s), total 8.77 ms
+  0.13.179.021 I state get: 60 pieces, 62.8 MiB in 8 group(s): enqueue 0.25 ms, copy+wait 8.36 ms (7.3 GiB/s), total 8.62 ms
+  0.13.844.883 I state set: 60 pieces, 62.8 MiB in 8 group(s): pack+enqueue 3.11 ms
+  0.14.224.228 I state get: 80 pieces, 165.3 MiB in 8 group(s): enqueue 305.16 ms, copy+wait 55.85 ms (2.9 GiB/s), total 361.01 ms
+  0.14.224.232 I slot  prompt_save: id  0 | task -1 | prompt cache save took 361.19 ms
+  0.14.228.672 I state set: 80 pieces, 73.2 MiB in 8 group(s): pack+enqueue 3.89 ms
+  0.14.228.901 I srv  update_promp: prompt cache update took 365.86 ms
+  0.14.231.766 I state set: 60 pieces, 62.8 MiB in 8 group(s): pack+enqueue 2.80 ms
+  0.14.295.620 I state get: 80 pieces, 73.2 MiB in 8 group(s): enqueue 10.15 ms, copy+wait 28.08 ms (2.5 GiB/s), total 38.23 ms
+  0.14.295.623 I slot  prompt_save: id  0 | task -1 | prompt cache save took 38.28 ms
+  0.14.310.304 I state set: 80 pieces, 165.3 MiB in 8 group(s): pack+enqueue 13.96 ms
+  0.14.310.832 I srv  update_promp: prompt cache update took 53.49 ms
+  0.14.314.344 I state get: 60 pieces, 62.8 MiB in 8 group(s): enqueue 0.25 ms, copy+wait 3.19 ms (19.2 GiB/s), total 3.44 ms
+  0.14.340.970 I state get: 60 pieces, 62.8 MiB in 8 group(s): enqueue 0.24 ms, copy+wait 3.05 ms (20.1 GiB/s), total 3.29 ms
+  0.14.992.458 I state set: 60 pieces, 62.8 MiB in 8 group(s): pack+enqueue 3.04 ms
+  0.15.379.209 I state get: 80 pieces, 165.3 MiB in 8 group(s): enqueue 305.12 ms, copy+wait 54.86 ms (2.9 GiB/s), total 359.99 ms
+  0.15.379.214 I slot  prompt_save: id  0 | task -1 | prompt cache save took 360.16 ms
+  0.15.383.764 I state set: 80 pieces, 73.2 MiB in 8 group(s): pack+enqueue 3.95 ms
+  0.15.383.985 I srv  update_promp: prompt cache update took 364.93 ms
+  0.15.386.893 I state set: 60 pieces, 62.8 MiB in 8 group(s): pack+enqueue 2.84 ms
+  0.15.450.106 I state get: 80 pieces, 73.2 MiB in 8 group(s): enqueue 10.23 ms, copy+wait 28.09 ms (2.5 GiB/s), total 38.32 ms
+  0.15.450.108 I slot  prompt_save: id  0 | task -1 | prompt cache save took 38.38 ms
+  0.15.464.763 I state set: 80 pieces, 165.3 MiB in 8 group(s): pack+enqueue 13.94 ms
+  0.15.465.298 I srv  update_promp: prompt cache update took 53.57 ms
+  0.15.468.682 I state get: 60 pieces, 62.8 MiB in 8 group(s): enqueue 0.25 ms, copy+wait 3.07 ms (20.0 GiB/s), total 3.32 ms
+  0.15.496.534 I state get: 60 pieces, 62.8 MiB in 8 group(s): enqueue 0.25 ms, copy+wait 2.96 ms (20.7 GiB/s), total 3.21 ms
+
+================================================================
+## pr0001-short
+
+  A        wall  3268.7 ms | prompt  4290 tok  2780.6 ms | sha 05b1745d26b4
+  B        wall  2904.9 ms | prompt  5016 tok  2327.9 ms | sha e87d5320af4b
+  A again  wall   687.3 ms | prompt     4 tok    53.5 ms | sha 05b1745d26b4
+  B again  wall   629.9 ms | prompt     4 tok    50.5 ms | sha e87d5320af4b
+  --- server:
+  0.24.515.763 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.85 ms, copy+wait 24.46 ms (4.5 GiB/s), total 25.31 ms
+  0.24.793.814 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.69 ms, copy+wait 19.88 ms (5.5 GiB/s), total 20.57 ms
+  0.25.427.005 I state get: 109 pieces, 226.5 MiB in 8 group(s): enqueue 4.57 ms, copy+wait 34.30 ms (6.4 GiB/s), total 38.88 ms
+  0.25.427.010 I slot  prompt_save: id  0 | task -1 | prompt cache save took 81.95 ms
+  0.25.427.021 I srv  update_promp: prompt cache update took 81.96 ms
+  0.27.461.810 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.45 ms, copy+wait 21.36 ms (5.1 GiB/s), total 21.82 ms
+  0.27.712.660 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.41 ms, copy+wait 21.18 ms (5.2 GiB/s), total 21.59 ms
+  0.28.346.655 I state get: 109 pieces, 245.6 MiB in 8 group(s): enqueue 1.29 ms, copy+wait 42.51 ms (5.6 GiB/s), total 43.80 ms
+  0.28.346.660 I slot  prompt_save: id  0 | task -1 | prompt cache save took 96.83 ms
+  0.28.386.339 I state set: 109 pieces, 226.5 MiB in 8 group(s): pack+enqueue 33.46 ms
+  0.28.392.478 I srv  update_promp: prompt cache update took 142.65 ms
+  0.28.400.502 I state set: 73 pieces, 112.6 MiB in 8 group(s): pack+enqueue 7.49 ms
+  0.28.976.557 I state get: 109 pieces, 226.5 MiB in 8 group(s): enqueue 0.62 ms, copy+wait 38.37 ms (5.8 GiB/s), total 38.99 ms
+  0.28.976.562 I slot  prompt_save: id  0 | task -1 | prompt cache save took 39.34 ms
+  0.29.020.953 I state set: 109 pieces, 245.6 MiB in 8 group(s): pack+enqueue 38.23 ms
+  0.29.025.192 I srv  update_promp: prompt cache update took 87.97 ms
+  0.29.033.516 I state set: 73 pieces, 112.6 MiB in 8 group(s): pack+enqueue 7.72 ms
+
+================================================================
+## pr0001-short-killswitch
+
+  A        wall  3266.2 ms | prompt  4290 tok  2777.9 ms | sha 05b1745d26b4
+  B        wall  3251.3 ms | prompt  5016 tok  2324.9 ms | sha e87d5320af4b
+  A again  wall  1079.5 ms | prompt     4 tok    53.5 ms | sha 05b1745d26b4
+  B again  wall   957.2 ms | prompt     4 tok    49.1 ms | sha e87d5320af4b
+  --- server:
+  0.25.754.872 I slot  prompt_save: id  0 | task -1 | prompt cache save took 431.75 ms
+  0.25.754.886 I srv  update_promp: prompt cache update took 431.77 ms
+  0.29.068.163 I slot  prompt_save: id  0 | task -1 | prompt cache save took 493.88 ms
+  0.29.111.265 I srv  update_promp: prompt cache update took 537.00 ms
+  0.30.028.009 I slot  prompt_save: id  0 | task -1 | prompt cache save took 374.39 ms
+  0.30.079.256 I srv  update_promp: prompt cache update took 425.65 ms
+
+================================================================
+## pr0001-short-gatheronly
+
+  A        wall  3257.3 ms | prompt  4290 tok  2764.1 ms | sha 05b1745d26b4
+  B        wall  2886.8 ms | prompt  5016 tok  2296.4 ms | sha e87d5320af4b
+  A again  wall   686.2 ms | prompt     4 tok    52.0 ms | sha 05b1745d26b4
+  B again  wall   621.3 ms | prompt     4 tok    45.9 ms | sha e87d5320af4b
+  --- server:
+  0.24.427.282 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.75 ms, copy+wait 27.97 ms (3.9 GiB/s), total 28.73 ms
+  0.24.706.873 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.70 ms, copy+wait 24.34 ms (4.5 GiB/s), total 25.04 ms
+  0.25.351.833 I state get: 109 pieces, 226.5 MiB in 8 group(s): enqueue 7.75 ms, copy+wait 36.03 ms (6.1 GiB/s), total 43.78 ms
+  0.25.351.838 I slot  prompt_save: id  0 | task -1 | prompt cache save took 89.82 ms
+  0.25.351.853 I srv  update_promp: prompt cache update took 89.84 ms
+  0.27.357.710 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.43 ms, copy+wait 23.25 ms (4.7 GiB/s), total 23.68 ms
+  0.27.608.664 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.42 ms, copy+wait 22.24 ms (4.9 GiB/s), total 22.66 ms
+  0.28.249.844 I state get: 109 pieces, 245.6 MiB in 8 group(s): enqueue 1.49 ms, copy+wait 45.06 ms (5.3 GiB/s), total 46.55 ms
+  0.28.249.850 I slot  prompt_save: id  0 | task -1 | prompt cache save took 100.97 ms
+  0.28.283.274 I state set: 109 pieces, 226.5 MiB in 8 group(s): pack+enqueue 27.44 ms
+  0.28.290.108 I srv  update_promp: prompt cache update took 141.23 ms
+  0.28.298.120 I state set: 73 pieces, 112.6 MiB in 8 group(s): pack+enqueue 7.44 ms
+  0.28.869.953 I state get: 109 pieces, 226.5 MiB in 8 group(s): enqueue 0.63 ms, copy+wait 33.59 ms (6.6 GiB/s), total 34.22 ms
+  0.28.869.957 I slot  prompt_save: id  0 | task -1 | prompt cache save took 34.58 ms
+  0.28.917.259 I state set: 109 pieces, 245.6 MiB in 8 group(s): pack+enqueue 40.41 ms
+  0.28.922.050 I srv  update_promp: prompt cache update took 86.68 ms
+  0.28.929.834 I state set: 73 pieces, 112.6 MiB in 8 group(s): pack+enqueue 7.21 ms
+
+================================================================
+## pr0001-long
+
+  A        wall  8743.7 ms | prompt 17189 tok  8227.3 ms | sha d8c673720c8f
+  B        wall  8712.8 ms | prompt 18224 tok  8106.6 ms | sha 71914eda98d2
+  A again  wall   758.4 ms | prompt     4 tok    69.0 ms | sha d8c673720c8f
+  B again  wall   719.6 ms | prompt     4 tok    53.2 ms | sha 71914eda98d2
+  --- server:
+  0.30.902.847 I slot  prompt_save: id  0 | task -1 | prompt cache save took 83.95 ms
+  0.30.902.858 I srv  update_promp: prompt cache update took 83.97 ms
+  0.39.626.387 I slot  prompt_save: id  0 | task -1 | prompt cache save took 93.62 ms
+  0.39.697.966 I srv  update_promp: prompt cache update took 165.21 ms
+  0.40.366.323 I slot  prompt_save: id  0 | task -1 | prompt cache save took 77.22 ms
+  0.40.440.279 I srv  update_promp: prompt cache update took 151.18 ms
+
+================================================================
+## pr0001+0002-short
+
+  A        wall  3243.8 ms | prompt  4290 tok  2754.3 ms | sha 05b1745d26b4
+  B        wall  2896.8 ms | prompt  5016 tok  2310.9 ms | sha e87d5320af4b
+  A again  wall   688.2 ms | prompt     4 tok    52.3 ms | sha 05b1745d26b4
+  B again  wall   623.5 ms | prompt     4 tok    51.2 ms | sha e87d5320af4b
+  --- server:
+  0.25.410.051 I slot  prompt_save: id  0 | task -1 | prompt cache save took 86.63 ms
+  0.25.410.064 I srv  update_promp: prompt cache update took 86.65 ms
+  0.28.318.832 I slot  prompt_save: id  0 | task -1 | prompt cache save took 98.17 ms
+  0.28.362.961 I srv  update_promp: prompt cache update took 142.31 ms
+  0.28.941.635 I slot  prompt_save: id  0 | task -1 | prompt cache save took 32.77 ms
+  0.28.990.861 I srv  update_promp: prompt cache update took 82.01 ms
+
+================================================================
+## pr0001+0002-long
+
+  A        wall  8730.3 ms | prompt 17189 tok  8210.7 ms | sha d8c673720c8f
+  B        wall  8754.9 ms | prompt 18224 tok  8074.5 ms | sha 71914eda98d2
+  A again  wall   814.3 ms | prompt     4 tok    63.1 ms | sha d8c673720c8f
+  B again  wall   819.9 ms | prompt     4 tok    54.4 ms | sha 71914eda98d2
+  --- server:
+  0.29.955.391 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.97 ms, copy+wait 23.95 ms (4.6 GiB/s), total 24.92 ms
+  0.30.234.562 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.65 ms, copy+wait 21.32 ms (5.2 GiB/s), total 21.97 ms
+  0.30.918.871 I state get: 15 pieces, 252.2 MiB in 8 group(s): enqueue 3.35 ms, copy+wait 47.55 ms (5.2 GiB/s), total 50.90 ms
+  0.30.960.469 I state get: 79 pieces, 254.9 MiB in 8 group(s): enqueue 1.34 ms, copy+wait 40.24 ms (6.2 GiB/s), total 41.58 ms
+  0.30.972.328 I state get: 15 pieces, 59.4 MiB in 8 group(s): enqueue 0.15 ms, copy+wait 11.70 ms (5.0 GiB/s), total 11.85 ms
+  0.30.972.335 I slot  prompt_save: id  0 | task -1 | prompt cache save took 156.22 ms
+  0.30.972.346 I srv  update_promp: prompt cache update took 156.23 ms
+  0.38.739.226 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.43 ms, copy+wait 24.11 ms (4.6 GiB/s), total 24.54 ms
+  0.39.002.428 I state get: 73 pieces, 112.6 MiB in 8 group(s): enqueue 0.44 ms, copy+wait 20.33 ms (5.4 GiB/s), total 20.77 ms
+  0.39.618.920 I state get: 14 pieces, 249.6 MiB in 8 group(s): enqueue 0.29 ms, copy+wait 39.82 ms (6.1 GiB/s), total 40.11 ms
+  0.39.655.312 I state get: 71 pieces, 254.8 MiB in 8 group(s): enqueue 0.69 ms, copy+wait 35.69 ms (7.0 GiB/s), total 36.38 ms
+  0.39.671.901 I state get: 24 pieces, 89.5 MiB in 8 group(s): enqueue 0.20 ms, copy+wait 16.38 ms (5.3 GiB/s), total 16.58 ms
+  0.39.671.906 I slot  prompt_save: id  0 | task -1 | prompt cache save took 98.69 ms
+  0.39.754.089 I state set: 15 pieces, 252.2 MiB in 8 group(s): pack+enqueue 67.32 ms
+  0.39.791.389 I state set: 79 pieces, 254.9 MiB in 8 group(s): pack+enqueue 34.85 ms
+  0.39.800.070 I state set: 15 pieces, 59.4 MiB in 8 group(s): pack+enqueue 3.79 ms
+  0.39.804.881 I srv  update_promp: prompt cache update took 231.67 ms
+  0.39.815.276 I state set: 73 pieces, 112.6 MiB in 8 group(s): pack+enqueue 8.68 ms
+  0.40.436.369 I state get: 15 pieces, 252.2 MiB in 8 group(s): enqueue 0.13 ms, copy+wait 49.35 ms (5.0 GiB/s), total 49.48 ms
+  0.40.477.584 I state get: 79 pieces, 254.9 MiB in 8 group(s): enqueue 0.72 ms, copy+wait 40.48 ms (6.2 GiB/s), total 41.20 ms
+  0.40.485.032 I state get: 15 pieces, 59.4 MiB in 8 group(s): enqueue 0.11 ms, copy+wait 7.33 ms (7.9 GiB/s), total 7.44 ms
+  0.40.485.037 I slot  prompt_save: id  0 | task -1 | prompt cache save took 99.42 ms
+  0.40.576.046 I state set: 14 pieces, 249.6 MiB in 8 group(s): pack+enqueue 77.51 ms
+  0.40.613.245 I state set: 71 pieces, 254.8 MiB in 8 group(s): pack+enqueue 34.55 ms
+  0.40.629.739 I state set: 24 pieces, 89.5 MiB in 8 group(s): pack+enqueue 10.70 ms
+  0.40.633.905 I srv  update_promp: prompt cache update took 248.29 ms
+  0.40.644.680 I state set: 73 pieces, 112.6 MiB in 8 group(s): pack+enqueue 9.00 ms
