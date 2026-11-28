@@ -27,12 +27,12 @@ git checkout 919794500
 bash "$DELIVERY/scripts/apply-all.sh" --include-beta .
 ```
 
-It must print `Applied tip: 786bdfecd (...)`, then apply `beta/prefill-decode-arms/prefill-decode-arms.patch` (ONE
+It must print `Applied tip: d869945d7 (...)`, then apply `beta/prefill-decode-arms/prefill-decode-arms.patch` (ONE
 patch), then:
 
 ```
-      release.json tree: 27db9bfd4ef7f41c7df60f704410de28863beac3
-      applied tree:      c1d50b664e8f95e93590135074d8aca7595b30c5   (ONE beta patch: block 17 + the drop fence)
+      release.json tree: bdb1d2e7e1fb8fdb2aaaf816fffa7e84ed359336
+      applied tree:      cf1604253077a665f0a7798a12cca47255159c51   (ONE beta patch: block 17 + the r369 port)
 ```
 
 **If the applied tree is different, stop and report it** — do not proceed (the patch was cut against exactly that
@@ -91,6 +91,16 @@ the decode arm is generating: N step(s), M handover(s), widest batch W slot(s)
 
 It needs the server at `-lv 4`; the pair-ON arm often reads differently from pair-OFF in ways that are **not**
 defects (step counts, handovers), so hash and census are two separate runs if you want both from one binary.
+
+Since the r369 port the pair-ON log also carries one line worth reporting verbatim:
+
+```
+two-arm server: the staged host-weight transport is off for both arms (...)
+```
+
+That is the port, not a warning: r369's staging pipeline is backend state that two concurrent arms cannot share
+(`README.md` → *The r369 port*).  If your box is a **multi-device `-sm tensor`** split, this arm is the one that
+tells us whether the disarm also covers the Meta backend's per-device ring — report that line and the applied tree.
 
 ### A3 — a drafter ON the pair (only if you have an MTP/`draft-mtp` capable model)
 

@@ -4,15 +4,17 @@
 **borrows** it (`llama_context_params::ctx_memory`, so `llama_get_memory(ctx_dec) == llama_get_memory(ctx_tgt)`),
 and **nothing is copied between them**.
 
-> **Status (2026-11-24): beta candidate, replacing the withdrawn artifact.**
+> **Status (2026-11-27): beta candidate, replacing the withdrawn artifact, PORTED onto r369.**
 >
-> **r369 (2026-11-27): NOT REBASED — known-broken on the current release, deliberately.**  The patch is cut against
-> the r368 default tree, and r369 promoted a cross-cutting layer over blocks 09/10/12/15 that rewrote
-> `ggml_backend_sched_compute_splits` (the staging pipeline), which is the function this candidate's pair path
-> drives.  The maintainer's decision is to accept it broken for the r369 release and port it in a later session —
-> it is `--include-beta` only, so no delivery consumer sees it.  Re-entry is `TODO` #391: the same port
-> `optional/0100` got at r369 (pipeline prologue/per-split/epilogue vs the pair path), plus its own
-> `gate-arms-spec.sh` / `gate-draft-ctx.sh`.
+> **r369's staging pipeline: PORTED (`TODO` #391, closed).**  The previous cut was made against the r368 default
+> tree and r369 promoted a cross-cutting transport layer over blocks 09/10/12/15, so it stopped applying.  The
+> rebase is mechanical; **the port is the transport decision** — r369's staged transport is BACKEND state booked
+> per scheduler, so a pair cannot share it and both arms now take the plain whole-table/gather transport
+> (`llama_context_disable_staged_transport()` → `ggml_backend_sched_disable_staged_transport()`).  It is also
+> faster there (see *The r369 port* below).  Cut against base `919794500` + the r371 default tree, applied tree
+> **`cf1604253`**; `scripts/gate-arms-spec.sh` (purity 21/21, four-axis 9/9, conc 4/4) and
+> `scripts/gate-draft-ctx.sh` (11/11) are green on the merged tree, on a **single-device** box — the 3-device
+> `-sm tensor` shapes are unreachable here (see *Verified* below).
 > This directory used to hold the *previous* design for block 17 (withdrawn at r352).  The maintainer's decision of
 > 2026-11-24 is that this work **replaces it in its entirety**, and that on promotion it becomes **delivery block
 > 17 as ONE self-contained patch-BLOCK** (here: two files, the block plus the delivery-level STEP 15 fix it carries) — a modification to the lower-numbered blocks (it edits files blocks 12/15 own,
@@ -38,11 +40,12 @@ both side files are now accounted for and are no longer carried here:
 | | |
 |---|---|
 | patch (block 17, the whole candidate) | `prefill-decode-arms.patch` — cut against the current `release.json` tree |
-| sha256 | `4ba17090a1808f2159db1532d2e9e563ec94d643e27fd35a897052cf2a137ca5` |
-| size | 45 files, **+3379/−766** |
-| contains | the two-arm server, PLUS STEP 16 (the compute-buffer drop fence, `llama_context_set_drop_boundary()`) and the pair's per-(thread, device) host stream (`ggml_cuda_host_stream()`) |
-| cut against | `release.json` base `919794500`, default tree **`981f4ab89de3d0372509831b10e5734e7d6b70b8`** (r364) |
-| **applied tree** | **`c1d50b664e8f95e93590135074d8aca7595b30c5`** (release tree + this patch; identical to the three-file form's tree, so the artifact's own gates read the same numbers) |
+| sha256 | `9154d2e624ef398c6dde6a55f70a549b127436aade21153b517eaff9b23556e5` |
+| size | 42 files, **+3320/−770** |
+| contains | the two-arm server, PLUS STEP 16 (the compute-buffer drop fence, `llama_context_set_drop_boundary()`), the pair's per-(thread, device) host stream (`ggml_cuda_host_stream()`) and the r369 port (`llama_context_disable_staged_transport()`) |
+| cut against | `release.json` base `919794500`, default tree **`bdb1d2e7e1fb8fdb2aaaf816fffa7e84ed359336`** (r371) |
+| **applied tree** | **`cf1604253077a665f0a7798a12cca47255159c51`** (release tree + this patch; what `apply-all.sh --include-beta` prints, and what a strict `git am` of this one file produces) |
+| commit apply-all makes | `de2a81d1b` (deterministic: `apply-all.sh` pins the committer identity and stamps the date from the author date) |
 | options | `--prefill-decode-arms` / `--no-prefill-decode-arms` (`LLAMA_ARG_PREFILL_DECODE_ARMS`), `--prefill-decode-arms-mode off\|on\|auto` (`LLAMA_ARG_PREFILL_DECODE_ARMS_MODE`) — **both default OFF** |
 | campaign record | `wip/prefill-decode-arms-v2/` (`DESIGN.md`, `RUNS.md`, `HANDOVER.md`, `gates/`, `baseline/`) |
 
@@ -52,17 +55,89 @@ both side files are now accounted for and are no longer carried here:
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 919794500
 bash <delivery>/scripts/apply-all.sh --include-beta .
-#   18 delivery blocks + 1 temporary (r364: tip 786bdfecd, tree 981f4ab89), then ONE beta candidate patch:
-#     prefill-decode-arms.patch     (block 17: the two-arm server + STEP 16's drop fence + the host stream)
-#   applied tree: c1d50b664e8f95e93590135074d8aca7595b30c5
+#   18 delivery blocks + 1 temporary (r371: tip d869945d7, tree bdb1d2e7e), then ONE beta candidate patch:
+#     prefill-decode-arms.patch     (block 17: the two-arm server + STEP 16's drop fence + the r369 port)
+#   applied tree: cf1604253077a665f0a7798a12cca47255159c51
 ```
 
-**Verified on this box**, reading tree **`c1d50b664`**: the tester path (`apply-all.sh --include-beta .` from
-`919794500` on the r364 set, which prints ONE applied beta patch and the tree), and a fresh clone at the same base
-re-applied from scratch — both produce `c1d50b664` exactly.  That tree is byte-identical to the one the previous
-three-file form produced, which is the check that the squash changed no code: only the *stream token* inside the
-2-D read helper differs from the delivery's copy (`ggml_cuda_host_stream()` here, `cudaStreamPerThread` in
-`patches/`, because the host stream is pair machinery).
+**Verified on this box**, reading tree **`cf1604253`**: the tester path (`apply-all.sh --include-beta .` from
+`919794500` on the r371 set, which prints ONE applied beta patch and the tree) and a strict `git am` of this one
+file onto the applied delivery set both produce `cf1604253` exactly.  The patch applies **strictly** (no `-3`
+fallback), which is the contract a re-cut owes.
+
+## The r369 port: the staged transport is not shareable, so the pair takes the plain one
+
+r369 promoted the H2D staging transport as a cross-cutting layer (blocks 09/10/12/15): a 1-3 buffer **pipeline** in a
+slab-carved **transport region**, a per-split **in-place consume**, a release at every prefill → decode transition,
+and a **Meta backend per-device ring** (`stage_input`) for a `-sm tensor` split.  Every one of those is **backend**
+state, while its bookkeeping is **per scheduler**:
+
+* the slots (`stage_buffer`/`stage_upload`/`stage_wait`) are one set of `0..depth-1` **per backend**, and the
+  region they are carved from is one carve per device whose `stage_region`/`wide_armed`/`stage_used` live on the
+  **slab**, shared by every scheduler on it;
+* the prologue sizes the slots, the per-split consume redirects `input_cpy->data` **in place**, and the transition
+  hands the buffers back to the slab — all decided by the scheduler that happens to be running.
+
+Two contexts that compute on two threads over one backend set therefore alias one slot (the second prologue
+re-sizes the slot the first is about to read) and race one release (one arm hands the region back underneath the
+other arm's live wide view — the state the release path's own comment calls unreachable: *"nothing may be in
+flight when the VRAM is handed back"*).  The `optional/two-lane-prefill` port hit the same wall from the other side
+(its lanes livelocked on a host-expert tier, `TODO` #390).
+
+**The port.**  Both arms are put on the plain transport by the server, once, right after the pair is created:
+
+```c
+llama_context_disable_staged_transport(ctx_tgt);   // prefill arm
+llama_context_disable_staged_transport(ctx_dec);   // decode arm
+```
+
+which reaches `ggml_backend_sched_disable_staged_transport()` — clears `pipe_on`/`stage_enabled`, marks the
+scheduler `no_staged_transport`, and is inherited by any scheduler the context creates later
+(`sched_alt_select`).  The single-context server never calls it, so the delivery's own transport is untouched.
+
+**The selector must know, not just the pipeline bits.**  With nothing able to stage, the exposure rule's answer
+"stage" silently means the **serial whole-table upload** — the worst of the three transports — because the pipeline
+is what makes "stage" staged.  The `no_staged_transport` flag makes it answer "gather", which is what it already
+answers for a graph whose transport region is not carved yet.  Measured on the pair's own host-expert arm
+(35B-A3B Q8_0, `-ncmoe 40 -ub 2048`, one 5246-token prompt, gfx1201, `MOE_EXPERT_HEATMAP=load`):
+
+| pair ON, one request | prefill | decode | arena hit |
+|---|---|---|---|
+| r369 default (pipeline, 3 buffers of 272 MiB) | 2888 t/s | 71.0 t/s | 0.915 |
+| plain transport (this port) | **3855-4157 t/s** | 71-85 t/s | 0.915-0.978 |
+| plain transport + the selector still answering "stage" (i.e. without the flag) | 1436 t/s | 70.8 t/s | 0.915 |
+
+So the disarm is not a sacrifice on this shape: a staged fill copies the **whole** routed table per split per
+ubatch (~31 GB per ubatch at 117 splits) while the arena already holds 83 % of it, and the gather/serial choice is
+what the plain transport decides per split.  (The same trade is recorded for `optional/two-lane-prefill`; the
+campaign measured the host-expert pair arm as a 14.6 % loss to staging at `-ub 2048`.)
+
+**Two things the port deliberately does NOT do.**  (1) It does not release the pipeline slots: the transport is
+armed by a graph that runs *during* the context's own reserve (the H2D calibration probe fills the pipeline), so a
+release there runs against a slab whose wide view and narrow floor were already placed around the region — it
+turned a 4157 t/s run into a **523 t/s** one.  Nothing leaks: the region is published and carved for every
+host-expert context whether or not the pipeline runs.  (2) It does not keep the pipeline on the prefill arm alone.
+That is *probably* safe (the decode arm never reaches the staging width gate, so it never fills a slot), but it is
+a behavioural argument one width change can break, and it measures slower here anyway.  If a pair ever wants the
+staged transport back, the requirement is per-arm **ownership** first — a lane offset on the slot index (depth ≤ 2
+each), exactly what `TODO` #390 records for the two-lane artifact.
+
+**Does r369's mechanism give this candidate a NEW opportunity?**  The honest answer is: not this one, and the
+reason is worth recording, because the intuition (a decode arm's routed expert set is *known*, so a double-buffered
+region could hold it) does not survive the dependency chain.  The pipeline overlaps the fill of set *k+1* with the
+compute of set *k*, and a decode step's routed ids for layer *L* only exist **after** layer *L*'s router has run, so
+there is nothing to fill ahead *within* a step — the pipeline's granularity (one whole routed role per split) is
+also the wrong size for a decode step (a handful of experts).  What the pair could use is the region as a
+**prefill-proof hot set** for the decode arm, filled from the persisted heatmap prior (which, unlike the routing, IS
+known ahead) and consumed as a read-only working set the wide pass cannot evict; that needs the fill-ahead work
+`TODO` #388 scopes for the tensor split, and it is a new mechanism rather than the current pipeline.  Recorded in
+`INVARIANTS.md` (r371-wip) so it is not re-derived.
+
+**What it does for `TODO` #378** (the corruption under heavy concurrent load): the pair no longer shares the staged
+transport, so the slot-aliasing and the release race are gone **by construction** — they were a plausible
+mechanism for a two-arm-only corruption that no sequential gate could see.  #378 stays open (the maintainer's
+corruption run predates this and the pair's own suspect was never localised), but this is the first change that
+removes a whole candidate class rather than adding one.
 
 ## KNOWN OPEN DEFECT — this candidate is NOT bug free
 
@@ -289,6 +364,29 @@ This artifact is **outside** the delivery's gate contract: `scripts/validate-set
   `gate-draft-ctx.sh` (11 checks), `gate-moe-promise.sh`, `gate-node-budget.sh`, `gate-graph-replay-width.sh`,
   `gate-ckpt-reuse.sh` — plus the whole-set `all` build and a clean kernel-journal fault scan;
 * `check-gen-docs.sh` on the applied tree (the patch carries the regenerated `tools/server/README.md` rows).
+
+### Verified on the r369 port (2026-11-27, tree `cf1604253`)
+
+**The box this was run on has ONE discrete device** (`radix`: one R9700/gfx1201 + the gfx1036 iGPU), so every arm
+below is single-device.  The two `-sm tensor` realities the artifact was designed around — the Meta backend's
+`stage_input` ring and a 3-device split — are **not reachable here**, and `gate-arms-spec.sh`'s shapes were run with
+its new `DEVS3=0 DEVS2=0` device override (same checks, one backend).  That gap is real and is an item in
+`TODO` #391's wake: run the gate on the three-GPU box when one is available.
+
+| arm | result |
+|---|---|
+| `scripts/gate-arms-spec.sh purity --skip-conc` (`DEVS3=0 DEVS2=0`) | **21/21 PASS** — three shapes f16/q8_0/f16, `pair+mtp == pair+none == single+mtp == single+none` byte-identical cold (hashes `73bad5e2634a 38169dcc3325 f978d4f9353d`, `987061ddedd2 c3bf1df7aa1d f978d4f9353d`), the adaptive arm equal too, drafting 191/191, mean accepted 3.98, the decode arm sized `NP*(n_max+1)` = 12/12, GPU faults clean |
+| `scripts/gate-arms-spec.sh four-axis` | **9/9 PASS** (R/P/C/K, `pair+mtp == pair+none` on every axis, acceptance 351-382 rounds) |
+| `scripts/gate-arms-spec.sh conc` | **4/4 PASS** (3 concurrent requests, drafts while several slots are active, no abort) |
+| `scripts/gate-draft-ctx.sh` | **11/11 PASS** (external MTP head: own KV geometry, text equal to plain, rate 0.814) — the merge's `ctx_other` adoption rule is intact |
+| default path inert (pair OFF) | 4B Q8_0 `llama-cli` text identical to the r371 delivery build (`7e6229b260f6`); the pair's own shapes unchanged |
+| host-expert pair arm | 35B-A3B Q8_0 `-ncmoe 40 -ub 2048` starts, the decode arm generates (census line), 0 `arena alloc failed`, text reproducible across fresh processes, faults clean |
+
+`gate-arms-spec.sh` itself needed two fixes to mean anything here, both beta-only (they parse the *withdrawn*
+block 17's log wording and FAIL a working pair): `spec_stats` now also reads the v2 slot-timing form
+(`draft acceptance = R (N accepted / M generated), mean len = x`), the sizing/thread-up checks accept
+`decode arm 0x.. with N/N` and `decode arm started (own batch of N rows)`, and `DEVS3`/`DEVS2` were added (their
+defaults are unchanged, so the three-GPU box runs exactly what it ran before).
 
 A change in flight during a beta test still owes the gate for what it touched (`MANIFESTS.md` → *Release gates*,
 and `AGENTS.md` → "Pick the gate for what you changed").

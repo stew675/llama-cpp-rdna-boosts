@@ -16,6 +16,75 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.023 (r371-wip, beta artifact) -- `beta/prefill-decode-arms` PORTED onto r369: the staged transport is backend state booked per scheduler, so the pair takes the plain one (and is 33 % faster for it), the selector needed to be told, and the port's gate was still parsing the WITHDRAWN block 17
+
+`TODO` #391 was the maintainer's decision (2026-11-27) to accept the two-arm server broken for the r369 release and
+port it later: the artifact was cut against the r368 tree and r369 rewrote the function its pair path drives.  The
+rebase is mechanical — the patch now applies **strictly** onto the r371 default tree (`bdb1d2e7e`) and produces
+applied tree **`cf1604253`** (42 files, +3320/−770; `apply-all.sh --include-beta` makes commit `de2a81d1b`) — and
+two of the three merge conflicts are the rename r369 and the artifact both made (`slab_narrow2_*` -> `slab_aux_*`
+here, -> the "transport region" vocabulary there).  **The port is the transport decision, and it is a property of
+r369's design, not of this artifact:**
+
+* **r369's staged transport cannot be shared.**  Its slots are per BACKEND (`stage_buffer`/`stage_upload`/
+  `stage_wait`, one set of `0..depth-1`), the transport REGION they are carved from is one carve per device whose
+  `stage_region`/`wide_armed`/`stage_used` live on the **slab**, and the Meta backend's `stage_input` ring is the
+  same shape — while the prologue that sizes a slot, the in-place consume and the prefill -> decode release are all
+  booked **per scheduler**.  Two arms on one backend set therefore alias one slot and race one release (the state
+  the release path's own comment calls unreachable).  Both arms now take the plain transport:
+  `llama_context_disable_staged_transport()` -> `ggml_backend_sched_disable_staged_transport()`, inherited by any
+  scheduler the context creates later; the single-context server is untouched, so the delivery's transport is
+  unchanged.
+* **The transport SELECTOR had to be told, and that is where the port's real content is.**  Disarming the pipeline
+  alone left `sched_stage_exposure_decides()` still answering "stage", which with nothing able to stage means the
+  **serial whole-table upload**: measured **1436 t/s** against **3855-4157** for the gather on the pair's own
+  host-expert arm (35B-A3B Q8_0 `-ncmoe 40 -ub 2048`, 5246-token prompt, gfx1201).  A `no_staged_transport` flag on
+  the scheduler makes the selector answer "gather" — the same answer it already gives for a graph whose region is
+  not carved.
+* **It is faster than keeping the pipeline, which is what makes the port a win rather than a sacrifice:** the same
+  arm reads **2888 t/s prefill / 71.0 t/s decode** on the r369 default (3 buffers of 272 MiB) against
+  **3855-4157 / 71-85** on the plain transport, because a staged fill copies the whole routed table per split per
+  ubatch (~31 GB per ubatch at 117 splits) while the arena holds 83 % of it.  That is the trade
+  `optional/two-lane-prefill` recorded (a 14.6 % loss to staging there, `TODO` #390), now measured on the pair.
+* **Two things the first attempt taught, both kept as comments in the code:** releasing the pipeline's slots from
+  the disarm is WRONG — the transport is armed by a graph that runs during the context's own reserve (the H2D
+  calibration probe), so the release ran against a slab whose wide view and floor were already placed around the
+  region and turned 4157 t/s into **523**; and `pipe_wide_prev` is not the lever (the selector re-arms it on the
+  next graph) — the monotone flag is.
+
+**The gate was stale, and that is its own finding.**  `scripts/gate-arms-spec.sh` (beta-only since r352) still
+parsed the **withdrawn** block 17's log wording — `statistics draft-mtp: #gen/#acc`, `decode ctx n_batch = ...`,
+`decode arm: thread up` — so on the v2 candidate all three non-vacuity checks read FAIL and the gate reported
+`1/4` on a pair that reproduces the delivery's text.  It now accepts **both** forms (a stale artifact is caught by
+its behaviour, not its wording) and its two shapes take device lists (`DEVS3`/`DEVS2`, defaults `0,1,2`/`0,2`
+unchanged) so a single-device box can run them at all.
+
+**Verified (tree `cf1604253`, `radix`: ONE R9700/gfx1201 + the gfx1036 iGPU, so every arm is single-device):**
+`gate-arms-spec.sh purity` **21/21** with `DEVS3=0 DEVS2=0` — `pair+mtp == pair+none == single+mtp == single+none`
+byte-identical cold on f16, q8_0 and the second f16 shape (`73bad5e2634a 38169dcc3325 f978d4f9353d`,
+`987061ddedd2 c3bf1df7aa1d f978d4f9353d`), the adaptive arm equal, drafting 191/191 with mean accepted 3.98, the
+decode arm sized `NP*(n_max+1)` = 12/12; `four-axis` **9/9**; `conc` **4/4**; `gate-draft-ctx.sh` **11/11** (the
+merge's `ctx_other` adoption rule is intact — external MTP head, own KV geometry, text equal to plain, rate 0.814);
+the default path inert (4B Q8_0 `llama-cli` text identical to the r371 delivery build, `7e6229b260f6`); the
+host-expert pair arm starts, generates on the decode arm, 0 `arena alloc failed`, text reproducible across fresh
+processes; `check-gpu-faults.sh --since 19:15` clean over the whole session.  **NOT run: the 3-device `-sm tensor`
+shapes and the Meta `stage_input` ring** (unreachable on this box) — the one gap, recorded in the README and left
+on #391's wake for the three-GPU box.
+
+**Findings for the delivery (reported, not acted on):** the same arm shows the r369 exposure rule choosing staging
+where it costs 33-39 % (`TODO` #387's territory — evidence added to that row), the selector answering "stage" when
+no staged transport is reachable (a second, smaller defect in the same function), and the transport decision **not
+being reproducible run to run** with identical flags and an identical slab/arena layout (4157 t/s once, 1436 later):
+the `moe_cache_residency` report the selector divides can arrive before or after the host pool's mirror
+registration, flipping its early-out.  Any transport A/B on a host-expert tier must therefore print the selector's
+own verdict per run (`GGML_SCHED_STAGE_SELECT_DEBUG=1`).  Nothing in the delivery changes here: `patches/`,
+`release.json` and `rdna-boosts-all.patch` are untouched, and a beta artifact is outside the release-gate contract.
+
+**Record.** `beta/prefill-decode-arms/README.md` (*The r369 port*, the new sha256
+`9154d2e624ef398c6dde6a55f70a549b127436aade21153b517eaff9b23556e5` and applied tree `cf1604253`), `BETA-TESTING.md`,
+`scripts/gate-arms-spec.sh`, `INVARIANTS.md` r371-wip, `TODO` #391 (CLOSED) / #387 (evidence).  Beta artifact, so no
+release revision is consumed and no release is cut.
+
 ## 261127.022 (r371) -- issue #377: the shared-expert down epilogue contracted its product, so it rounded once where the chain rounds three; the fix is mechanism, the gate is the ISA, and the census that did not exist now does
 
 @overdoingism reported (issue #377) that `shexp_down_gated_q8_0`'s epilogue -- `__fmul_rn(sum_down, gate_sig) +

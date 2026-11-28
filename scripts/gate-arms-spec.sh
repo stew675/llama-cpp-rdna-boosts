@@ -39,7 +39,11 @@
 # with `invalid kernel file` (AGENTS.md, Verify).  The default is the x8 pair `0,2` and all three `0,1,2`.
 #
 # Usage: ./gate-arms-spec.sh [purity|four-axis|conc|all] [--quick] [--skip-four-axis] [--skip-conc] [--keep]
-# Env:   LLAMA_SERVER, MODEL, NP, CTX, N, N_AXIS, PORT, LV
+# Env:   LLAMA_SERVER, MODEL, NP, CTX, N, N_AXIS, PORT, LV, DEVS3, DEVS2
+#        DEVS3/DEVS2 are the device lists of the two shapes (default `0,1,2` and `0,2`, this box's three R9700s).
+#        A box with ONE discrete device runs the same checks with `DEVS3=0 DEVS2=0`: `-sm tensor` degenerates to
+#        one backend, so the shape keeps its cold-prefill/one-request-per-slot structure and loses only the
+#        multi-device split (say so when reporting -- the Meta `stage_input` transport is NOT reached then).
 # Exit:  0 = pass, 1 = fail, 2 = usage/prerequisite error.
 set -uo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -68,6 +72,8 @@ PORT="${PORT:-18140}"
 LV="${LV:-4}"
 NMAX="${NMAX:-3}"            # --spec-draft-n-max (the protocol's default for the fast arm)
 BATCH="${BATCH:-2048}"
+DEVS3="${DEVS3:-0,1,2}"      # the 3-device shape's devices (the box's three R9700s; `DEVS3=0` on a 1-GPU box)
+DEVS2="${DEVS2:-0,2}"        # the 2-device shape's devices (the x8 pair)
 
 [ -x "$LLAMA_SERVER" ] || { echo "ERROR: no llama-server at $LLAMA_SERVER" >&2; exit 2; }
 [ -f "$MODEL" ] || { echo "ERROR: model not found: $MODEL" >&2; exit 2; }
@@ -164,15 +170,20 @@ spec_stats() {
     python3 - "$1" <<'PY'
 import re, sys
 txt = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-best = None
+gen = acc = mean = None
+# the WITHDRAWN block 17 printed `statistics draft-mtp: ... #gen drafts = N, #acc drafts = M ... #mean acc len = x`
 for m in re.finditer(r"statistics\s+draft-mtp(?:-adaptive)?:.*?#gen drafts =\s*(\d+),\s*"
                      r"#acc drafts =\s*(\d+).*?#mean acc len = ([\d.]+)", txt):
-    best = m
-if best is None:
+    gen, acc, mean = m.group(1), m.group(2), m.group(3)
+# ... and the v2 candidate (beta/prefill-decode-arms) prints the SLOT timing form, once per request:
+#   `draft acceptance = 0.59804 (   61 accepted /   102 generated), mean len =  2.79`
+# `#gen` is what the drafter produced and `#acc` what survived the verify, so the fields map one to one.
+for m in re.finditer(r"draft acceptance =\s*[\d.]+\s*\(\s*(\d+) accepted /\s*(\d+) generated\),\s*"
+                     r"mean len =\s*([\d.]+)", txt):
+    acc, gen, mean = m.group(1), m.group(2), m.group(3)
+if gen is None or acc is None or mean is None:
     sys.exit(1)
-g, a, mean = best.group(1), best.group(2), best.group(3)
-if (int(a), float(mean)) < (0, 0.0):
-    sys.exit(1)
+g, a = gen, acc
 print(g, a, mean)
 PY
 }
@@ -252,9 +263,15 @@ shape_arm() { # shape_arm <label> <devices> <kvtype> <prompt-a> <prompt-b> <prom
         hard 0 "$label: no speculative statistics line in the pair's log (the arm proved nothing)"
     fi
     local want=$(( NP * (NMAX + 1) ))
-    hard "$(grep -qE "decode ctx n_batch = $want / n_ubatch = $want" "$KEEPOUT/${label}_pair_mtp.log" && echo 1 || echo 0)" \
+    # The v2 candidate announces the arms once: `two-arm server: prefill arm <p> with n_batch/n_ubatch A/B, decode
+    # arm <p> with C/D; ONE memory <m> (the decode arm borrows it, nothing is copied)`.  The WITHDRAWN block 17
+    # printed `decode ctx n_batch = ... / n_ubatch = ...`; both forms are accepted so a stale artifact is caught by
+    # its BEHAVIOUR and not by its wording.
+    hard "$(grep -qE "decode (ctx n_batch = $want / n_ubatch = $want|arm 0x[0-9a-f]+ with $want/$want)" \
+             "$KEEPOUT/${label}_pair_mtp.log" && echo 1 || echo 0)" \
          "$label: the decode arm was sized for the verify width (n_batch = NP*(n_max+1) = $want)"
-    hard "$(grep -q 'decode arm: thread up' "$KEEPOUT/${label}_pair_mtp.log" && echo 1 || echo 0)" \
+    hard "$(grep -qE 'decode arm (thread up|started \(own batch of [0-9]+ rows\))' \
+             "$KEEPOUT/${label}_pair_mtp.log" && echo 1 || echo 0)" \
          "$label: the pair really started (decode arm thread up, not a fallback)"
     hard "$(grep -qE 'failed to process the speculative batch|a speculative decoder is not supported' \
              "$KEEPOUT/${label}_pair_mtp.log" && echo 0 || echo 1)" \
@@ -271,16 +288,16 @@ if [ "$MODE" = "purity" ] || [ "$MODE" = "all" ]; then
     PC="$REPO_DIR/prompts/recall.txt"
 
     if [ "$QUICK" = 1 ]; then
-        shape_arm q3 0,1,2 f16 "$PA" "$PB" "$PC" 1
+        shape_arm q3 "$DEVS3" f16 "$PA" "$PB" "$PC" 1
     else
-        shape_arm q3  0,1,2  f16    "$PA" "$PB" "$PC" 1
-        shape_arm q3q 0,1,2  q8_0   "$PA" "$PB" "$PC"
-        shape_arm q2  0,2    f16    "$PA" "$PB" "$PC"
+        shape_arm q3  "$DEVS3" f16  "$PA" "$PB" "$PC" 1
+        shape_arm q3q "$DEVS3" q8_0 "$PA" "$PB" "$PC"
+        shape_arm q2  "$DEVS2" f16  "$PA" "$PB" "$PC"
     fi
 
     # the adaptive depth controller: same text, a different per-round width
-    note "adaptive: --spec-type draft-mtp-adaptive on the 3-device f16 shape"
-    run_arm ad_pair_mtp 0,1,2 "$N" "$PA" "$PB" "$PC" -- \
+    note "adaptive: --spec-type draft-mtp-adaptive on the f16 shape"
+    run_arm ad_pair_mtp "$DEVS3" "$N" "$PA" "$PB" "$PC" -- \
         --prefill-decode-arms --spec-type draft-mtp-adaptive --spec-draft-n-max "$NMAX"
     ad=$(sha_list ad_pair_mtp)
     note "text  pair+adaptive: $ad"
@@ -301,9 +318,9 @@ if { [ "$MODE" = "four-axis" ] || [ "$MODE" = "all" ]; } && [ "$SKIP_FOUR_AXIS" 
     echo "    R = reasoning (reasoning on), P = prose, C = code, K = recall -- as benchmarks/mtp-adaptive-methodology.md"
     axis_purity() { # axis_purity <axis> <prompt> <reasoning>
         local ax=$1 pr=$2 rea=$3
-        run_arm "ax_${ax}_mtp"  0,1,2 "$N_AXIS" "$pr" -- --prefill-decode-arms --spec-type draft-mtp \
+        run_arm "ax_${ax}_mtp"  "$DEVS3" "$N_AXIS" "$pr" -- --prefill-decode-arms --spec-type draft-mtp \
             --spec-draft-n-max "$NMAX" --reasoning "$rea" || { hard 0 "axis $ax: an arm failed to run"; return 1; }
-        run_arm "ax_${ax}_none" 0,1,2 "$N_AXIS" "$pr" -- --prefill-decode-arms --spec-type none \
+        run_arm "ax_${ax}_none" "$DEVS3" "$N_AXIS" "$pr" -- --prefill-decode-arms --spec-type none \
             --reasoning "$rea" || { hard 0 "axis $ax: an arm failed to run"; return 1; }
         local m n
         m=$(sha_list "ax_${ax}_mtp"); n=$(sha_list "ax_${ax}_none")
@@ -340,7 +357,7 @@ PY
     CNC_TOK="${CNC_TOK:-600}"
     conc_arm() { # conc_arm <tag> <args...>
         local tag=$1; shift
-        start_server "$tag" 0,1,2 "$@" || { hard 0 "conc: $tag failed to start"; return 1; }
+        start_server "$tag" "$DEVS3" "$@" || { hard 0 "conc: $tag failed to start"; return 1; }
         local -a pids=()
         local s
         for s in $(seq 0 $((NP-1))); do

@@ -1020,10 +1020,15 @@ in CI.  The model-level gates are manual:
     its own `n_draft + 1` rows).  The gate is three-way and refuses to be vacuous: **A** `pair + draft-mtp` ==
     `pair + none` == `single-context + draft-mtp` byte for byte, one fresh process per arm and one **cold** prefill
     per request, on 3 devices f16 / 3 devices q8_0 / 2 devices f16 (the `deep` arm adds `single + none` as a
-    fourth), with three distinct prompts so no slot reuses another's cells; **B** the mechanism is really on --
-    the log must read `decode ctx n_batch = NP*(n_max+1)` (a 1-row decode arm means the verify width was never
-    configured), `decode arm: thread up` (not a single-context fallback), `#acc drafts > 0` with a mean accepted
-    length > 1.2, and no `failed to process the speculative batch`; **C** `draft-mtp-adaptive` reads the same
+    fourth; the device lists are `DEVS3`/`DEVS2` so a box with one discrete device can run the same checks --
+    `-sm tensor` then degenerates to one backend and the Meta `stage_input` path is NOT reached, which the result
+    must say), with three distinct prompts so no slot reuses another's cells; **B** the mechanism is really on --
+    the log must read `decode ctx n_batch = NP*(n_max+1)` OR the v2 candidate's `decode arm 0x.. with
+    NP*(n_max+1)/NP*(n_max+1)` equivalent (a 1-row decode arm means the verify width was never configured),
+    `decode arm: thread up` OR `decode arm started (own batch of N rows)` (not a single-context fallback),
+    `#acc drafts > 0` with a mean accepted length > 1.2, and no `failed to process the speculative batch` (both
+    forms, because the beta artifact's log wording moved and a gate that parses only the WITHDRAWN block 17's form
+    fails a working pair -- `INVARIANTS.md` r371-wip); **C** `draft-mtp-adaptive` reads the same
     hashes; **D** the MTP protocol's four axes on the pair (R with reasoning on, P/C/K off) read one text per axis
     with acceptance not collapsed; **E** a concurrency arm (NP requests in flight) completes with content, drafts,
     and shows no abort/assert -- **stress only, not a text oracle** (§63: a co-batched shape is not one);

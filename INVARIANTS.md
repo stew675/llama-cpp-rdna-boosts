@@ -3868,3 +3868,66 @@ box's ±2 % band); the change adds two scalar instructions to a `threadIdx.x == 
 **Record.** `scripts/gate-shexp-down-gate.sh` (MANIFESTS gate 48); `benchmarks/2026-11-27-shexp-down-epilogue-rounding.md`;
 `GREEDY-PURITY.md` §112; `DIAGNOSTIC.md` §32; `patches/README.md` block 08 (r371); `WORKLOG.md` 261127.022;
 issue #377 (@overdoingism).
+
+## r371-wip (2026-11-27, `WORKLOG.md` 261127.023, beta artifact) — r369's staged transport is BACKEND state booked per SCHEDULER, so two concurrent contexts cannot share it; and a decode step's routed ids cannot be filled ahead (`beta/prefill-decode-arms` port, `TODO` #391)
+
+`beta/prefill-decode-arms` (the two-arm server: one `llama_memory_i`, two `llama_context`s computing on two
+threads) was cut against the r368 tree and stopped applying at r369, which promoted the H2D staging transport.  The
+rebase is mechanical; the port is the transport decision, and the reason is a property of r369's design rather than
+of this artifact.  Six things worth keeping (they apply to any second scheduler on one backend set, e.g.
+`optional/two-lane-prefill`).
+
+1. **The staged transport's state is per BACKEND, its bookkeeping is per SCHEDULER.**  The pipeline's slots are one
+   set of `0..depth-1` per backend (`stage_buffer`/`stage_upload`/`stage_wait`); the transport REGION they are
+   carved from is one carve per device whose `stage_region`/`wide_armed`/`stage_used` live on the **slab**, not the
+   scheduler; the Meta backend's per-device ring (`stage_input`) is the same shape.  But the prologue that sizes a
+   slot, the per-split consume that redirects `input_cpy->data` **in place**, and the prefill -> decode release that
+   hands the buffers back are all decided by whichever scheduler is running.  Two of them alias one buffer (the
+   second prologue re-sizes the slot the first is about to read) and race one release (one arm returns the region
+   to the slab underneath the other's live wide view — the state the release path's own comment calls unreachable).
+   **So a context that computes concurrently with another context of the same model must not use it**:
+   `ggml_backend_sched_disable_staged_transport()` (through `llama_context_disable_staged_transport()`, inherited by
+   any scheduler the context creates later via `sched_alt_select`).  The single-context server is untouched.
+2. **The transport SELECTOR needs to know, not only the pipeline bits.**  `sched_stage_exposure_decides()` chooses
+   between the gather and **staging**; with nothing able to stage, its "stage" answer silently means the SERIAL
+   whole-table upload.  Measured on the pair's own host-expert arm (35B-A3B Q8_0 `-ncmoe 40 -ub 2048`, 5246-token
+   prompt, gfx1201): **1436 t/s** with the selector still answering "stage" against **3855-4157 t/s** when it
+   answers "gather" (a `no_staged_transport` flag on the scheduler, which is what the disarm sets).  A flag that
+   disables a transport must reach every decision that SELECTS that transport, or the change is a slowdown that
+   looks like a null result.
+3. **Do not release the pipeline's slots from a post-construction disarm.**  The transport is armed by a graph that
+   runs DURING the context's own reserve (the H2D calibration probe fills the pipeline), so a release at that point
+   runs against a slab whose wide view and narrow floor were already placed around the region: it turned a
+   4157 t/s run into **523 t/s**.  Nothing leaks by leaving the carve alone — the transport region is published and
+   carved for every host-expert context whether or not the pipeline runs — so a disarm should clear the USE, not
+   reclaim the VA.
+4. **The pipeline gives a decode arm nothing to fill ahead — the dependency chain forbids it.**  The mechanism
+   overlaps the fill of set *k+1* with the compute of set *k*, and a decode step's routed ids for layer *L* exist
+   only after layer *L*'s router has run, so there is no future set to fill within a step; the granularity is also
+   wrong (one whole routed role per split vs a handful of experts per token).  The one thing the pair could use the
+   region for is a **prefill-proof hot set**: filled from the persisted heatmap prior (which, unlike the routing, IS
+   known ahead) and read as an eviction-proof working set for the decode arm.  That is a new mechanism on top of the
+   fill-ahead work `TODO` #388 scopes, not the current pipeline — do not re-derive it as "just enable staging on the
+   decode arm".
+5. **The staging/pipeline is not automatically the faster transport on a pool-backed tier.**  On the pair's
+   35B-A3B Q8_0 `-ncmoe 40 -ub 2048` arm the r369 default (3 buffers of 272 MiB) read **2888 t/s prefill / 71.0
+   t/s decode** against **3855-4157 / 71-85** for the plain transport, because a staged fill copies the whole
+   routed table per split per ubatch (~31 GB per ubatch at 117 splits) while the arena already holds 83 % of it.
+   The same shape's EXPOSURE decision is also **not reproducible run to run** on this box (`GGML_SCHED_PIPELINE=0`
+   read 4157 t/s once and 1436 t/s later, with identical flags and an identical slab/arena layout): the
+   `moe_cache_residency` report the selector divides can arrive before or after the host pool's mirror
+   registration, which flips its early-out between "fully resident -> gather" and "exposed -> stage".  **So an A/B
+   of the transport on a host-expert tier must report the selector's own verdict (`GGML_SCHED_STAGE_SELECT_DEBUG=1`)
+   per run**, or the numbers are comparing two transports without saying which.  Evidence added to `TODO` #387.
+6. **A beta gate that parses an artifact's log wording goes stale with the artifact, and then fails a working
+   build.**  `scripts/gate-arms-spec.sh` searched the WITHDRAWN block 17's lines (`statistics draft-mtp: #gen
+   drafts ...`, `decode ctx n_batch = ...`, `decode arm: thread up`); the v2 candidate prints
+   `draft acceptance = R (N accepted / M generated), mean len = x`, `decode arm 0x.. with N/N` and
+   `decode arm started (own batch of N rows)`, so all three non-vacuity checks read FAIL on a pair that reproduces
+   the delivery's text 21/21.  Accept BOTH forms (the old one is the evidence that a stale artifact is caught by
+   behaviour, not wording), and give the shapes a device override (`DEVS3`/`DEVS2`) so a single-GPU box can run
+   them at all — the Meta `stage_input` arms then go unexercised, which must be SAID in the result.
+
+**Record.** `beta/prefill-decode-arms/README.md` (*The r369 port*), `BETA-TESTING.md`;
+`scripts/gate-arms-spec.sh` (both log forms, `DEVS3`/`DEVS2`); `WORKLOG.md` 261127.023; `TODO` #391 (closed),
+#387 (evidence), #390 (the same constraint for the two-lane artifact).
