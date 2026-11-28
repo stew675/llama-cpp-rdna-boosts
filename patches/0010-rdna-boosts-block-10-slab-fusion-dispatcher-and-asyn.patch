@@ -1,4 +1,4 @@
-From 9ad9339e402f94c9353ee855392eed29b3c6152b Mon Sep 17 00:00:00 2001
+From fa519d54e29c15c798dad831741c71f200a3e301 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sun, 8 Nov 2026 07:16:53 -0600
 Subject: [PATCH 10/18] rdna-boosts: block 10: slab, fusion dispatcher and
@@ -169,10 +169,19 @@ Co-Authored-By: overdoingism <overdoingism@users.noreply.github.com>
   so a pool tier keeps staging nothing.  Text byte-identical (`c9da1e69a0b5` on the shape above,
   `461ca8cd0e88` on 35B-A3B Q8_0 with and without a ring); measured 2107 t/s prefill / 32.5 t/s decode
   against 2075 / 30.7 for r365's default and 1982 / 27.3 for the `GGML_CUDA_SLAB_RING_MIB=6144` layout.
+- r374 (GitHub issue #382): the two offline ctests that still encoded upstream's mixed-K/V rule now follow this
+  block's same-type policy, so `ctest -R '^(test-kv-cache|test-fp8-kv)$'` reads green on a plain CPU-only tree,
+  exactly as it does on upstream b12597.  tests/test-kv-cache.cpp expects the general diagnostic ("models require
+  the same K and V cache types") for EVERY mixed pair, because that check runs before the per-architecture one;
+  the per-architecture FP8 message is asserted for the same-type pair only.  tests/test-fp8.cpp's attention
+  numerics keep the both-FP8 arm alone: a mixed pair can no longer reach `llama_init_from_model`, while the
+  per-side scaling of a mixed pair stays covered at the cache level by test-kv-cache's shared-cache block.
+  Test-only: no runtime policy moves.
 Co-authored-by: briansp2020 <bsp2020@gmail.com>
 Co-authored-by: jstamagal <jstamagal@users.noreply.github.com>
 Suggested-by: Nyshone <Nyshone@users.noreply.github.com>
 Reported-by: DanoPTT <DanoPTT@users.noreply.github.com>
+Reported-by: autopeasant <autopeasant@users.noreply.github.com>
 ---
  ggml/include/ggml-alloc.h                     |   13 +
  ggml/include/ggml-cuda.h                      |   14 +
@@ -260,10 +269,12 @@ Reported-by: DanoPTT <DanoPTT@users.noreply.github.com>
  src/llama-model.cpp                           |   88 +-
  src/llama-model.h                             |    7 +-
  tests/test-backend-ops.cpp                    |   69 +-
+ tests/test-fp8.cpp                            |    5 +-
  tests/test-fusion-gate-beta-multiseq.cpp      |  321 +
+ tests/test-kv-cache.cpp                       |    9 +-
  tests/test-logits-width-probe.cpp             |  234 +-
  tools/server/server-context.cpp               |   30 +-
- 89 files changed, 19294 insertions(+), 5826 deletions(-)
+ 91 files changed, 19304 insertions(+), 5830 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv-store.cuh
  create mode 100644 ggml/src/ggml-cuda/ggml-cuda-arena.cu
@@ -29727,6 +29738,22 @@ index c4c7699a8..0aec64f09 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1, 1, false, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 1, false, true));
+diff --git a/tests/test-fp8.cpp b/tests/test-fp8.cpp
+index dfd8ac541..c2913d219 100644
+--- a/tests/test-fp8.cpp
++++ b/tests/test-fp8.cpp
+@@ -316,7 +316,10 @@ static void check_fp8_attention(llama_model * model, bool offload_kqv = true) {
+             LOG("FP8 attention: tensor split requires flash attention, skipping disabled cases\n");
+             continue;
+         }
+-        for (int scaled : { 1, 2, 3 }) {
++        // rdna-boosts: K and V cache types must match (llama_init_from_model refuses a mixed pair
++        // outright), so only the both-FP8 arm is reachable through the context here; the per-side
++        // scaling of a mixed pair stays covered at the cache level by test-kv-cache.
++        for (int scaled : { 3 }) {
+             const float sk = scaled & 1 ? 0.03125f : 1.0f;
+             const float sv = scaled & 2 ? 0.125f : 1.0f;
+             ggml_backend_tensor_set(k_scale, &sk, 0, sizeof(sk));
 diff --git a/tests/test-fusion-gate-beta-multiseq.cpp b/tests/test-fusion-gate-beta-multiseq.cpp
 new file mode 100644
 index 000000000..69c0e1420
@@ -30054,6 +30081,27 @@ index 000000000..69c0e1420
 +    printf("PASS\n");
 +    return 0;
 +}
+diff --git a/tests/test-kv-cache.cpp b/tests/test-kv-cache.cpp
+index 4b48387b9..9a427749c 100644
+--- a/tests/test-kv-cache.cpp
++++ b/tests/test-kv-cache.cpp
+@@ -54,10 +54,13 @@ int main() {
+                     errors.clear();
+                     llama_context * ctx = llama_init_from_model(model.get(), params);
+                     GGML_ASSERT(ctx == nullptr);
+-                    if (type_k == type_v || (!model->hparams.is_mla() && arch != LLM_ARCH_DEEPSEEK4 && arch != LLM_ARCH_DEEPSEEK41)) {
+-                        GGML_ASSERT(errors.find("FP8 cache is not supported for architecture") != std::string::npos);
++                    if (type_k != type_v) {
++                        // rdna-boosts: every model requires the same K and V cache types, and that check
++                        // runs before the per-architecture one, so a mixed pair reports this diagnostic
++                        // on every architecture instead of only on MLA / DeepSeek4.
++                        GGML_ASSERT(errors.find("models require the same K and V cache types") != std::string::npos);
+                     } else {
+-                        GGML_ASSERT(errors.find("model does not support different K") != std::string::npos);
++                        GGML_ASSERT(errors.find("FP8 cache is not supported for architecture") != std::string::npos);
+                     }
+                 }
+             }
 diff --git a/tests/test-logits-width-probe.cpp b/tests/test-logits-width-probe.cpp
 index 4b117dbe3..5b1e3702c 100644
 --- a/tests/test-logits-width-probe.cpp

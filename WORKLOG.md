@@ -16,6 +16,89 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.027 (r374) -- issue #382: the delivery's K/V policy broke two upstream ctests, and the sweep that fixed them found two more -- four failures, three blocks, and no gate could see any of them
+
+`@autopeasant` ran `ctest -R '^(test-kv-cache|test-fp8-kv)$'` on a CPU-only build
+(`-DLLAMA_BUILD_TESTS=ON -DGGML_HIP=OFF -DGGML_CUDA=OFF`) of `v18-919794500-r368` and on clean upstream `b12597`
+(`919794500`): green upstream, two failures here.  **Reproduced exactly** on a CPU-only build of the r373 tree:
+`test-kv-cache` aborts at `tests/test-kv-cache.cpp:60` (it looks for upstream's "model does not support different
+K"), `test-fp8-kv` at `tests/test-fp8.cpp:397` (`GGML_ASSERT(lctx)`, with the log line "models require the same K
+and V cache types, got K=f8_e4m3 and V=f16").  Both are block 10's own policy -- the delivery refuses a MIXED K/V
+pair for every model, with its own diagnostic, before the per-architecture FP8 check -- so the tests, not the
+runtime, were wrong.  **The reporter is right that this is a test-side fix**: no runtime policy moves.
+
+**The full suite found two more, and both are real delivery defects.**  The first whole-suite run on the delivery
+tree (80 ctests, with the reporter's two already green) read **6** failures: this box's four missing packages
+(`test-tokenizers-ggml-vocabs` needs git-lfs and gets pointer blobs, `test-jinja-py` needs `jinja2`,
+`test-conversion-fp8`/`test-kv-cache-scales` need `torch`) and the two below.  After the fixes it reads 4, and the
+74-test suite on upstream `b12597` reads the SAME 4 -- so the finished sweep is a parity check, and the two
+delivery failures were hiding behind the first abort:
+
+* **`test-llama-context` -- block 12: a zero-length device-state piece is not a copy.**  Once `test-kv-cache` got
+  past its first assertion, its second block (the shared-cache scaling) aborted in
+  `llama_io_read_device::~llama_io_read_device()` -> `ggml_backend_tensor_copy` -> `ggml_are_same_layout`.  The
+  restore walks pieces by byte cursor and hands each to the backend as its ROOT tensor plus an offset; a cache
+  tensor that holds nothing (`minimax-01-moe`'s `cache_r_l0` has no width on the test's shape) produces src/dst
+  pieces of 0 bytes, so the direct-copy branch compared an EMPTY 1-D staging tensor against an EMPTY 2-D root and
+  aborted on a copy of nothing.  `test-llama-context` alone reproduces it serially (`cp_h_s`/`cp_d_s`,
+  `case_seq_cp_scatter`), and it is what the second half of the reporter's `test-kv-cache` failure would have hit
+  next.  The piece is skipped; the byte cursor still advances, so the walk is unchanged.
+* **`test-arg-parser` -- block 14: an abbreviation pair is ordered shortest-first.**  `--kv-attendance-pool,
+  --kv-region-pool` was longest-first; the test requires `args.front()` to be no longer than `args.back()` (the
+  order the help printer assumes, which is why upstream reads `--ctk, --cache-type-k`).  Reordered, so the three
+  GENERATED READMEs now print `--kv-region-pool, --kv-attendance-pool` and the regeneration is folded into block 16
+  (the last OFFICIAL block that touches `common/arg.cpp`); `check-gen-docs.sh` green at the tip.
+* **And block 14's window plan read the model's device plan for nothing.**  `llama_model::dev_layer()` is populated
+  by a weight LOAD, so a DEFAULT cache (no window, no pool) reading `dev_layer(0)` for the spill budget -- a
+  windowless cache has no tail to spill and `spill_reserve(dev, 0)` was a no-op -- aborted a model built without a
+  device assignment (`std::out_of_range`), which is exactly the synthetic model `test-kv-cache` builds.  The same
+  applied to the per-layer pool `dev_layer(il)`, which ran outside the pool branch.  All three lookups follow the
+  request now (window `w != 0`, budget/reserve `n_tail != 0`, pool: pool mode only) and are inert on every real
+  run: an engaged window or pool always has a loaded model's device plan.
+
+**So the class gets an instrument (gate 49).**  `scripts/check-offline-tests.sh` applies the default set at
+`release.json.base` in a throwaway clone (strict `git am`), configures a CPU-only test build, builds once and runs
+`ctest`; the delivery's own four tests (`test-kv-cache`, `test-fp8-kv`, `test-arg-parser`, `test-llama-context`)
+are NEVER exempt, and the only exemptions are the four box-package tests above, reported per run and required
+under `--strict`.  `--build-dir` reuses an existing build (~1 min); the full path is one ~6-10 min CPU build.
+`--help`, `scripts/README.md` and `MANIFESTS.md` gate 49 carry the contract; `AGENTS.md`'s gate-picker gained the row
+("a runtime policy that replaces an upstream one, or an option added/reordered").  Verdict on the release tree:
+**`OFFLINE_TESTS=PASS` (80 tests, 4 environment-exempt, 0 blocking)**.
+
+**Delivery mechanics.**  Blocks `0010` (the two offline tests, test-only), `0012` (the zero-length piece),
+`0014` (the device lookups, the option order, the pool WARN that named the never-existent
+`--no-kv-attendance-pool`) and `0016` (the regenerated docs) are amended -- no new block, no renumbering.  The
+block 10 commit carries `Reported-by: autopeasant <autopeasant@users.noreply.github.com>` and a `CONTRIBUTORS.md`
+row (`reported`), so the credit travels in the patch.  `release.json` moves to `v18-919794500-r374`: default tree
+`760fa359026d1ce33cf22be3377311b95877bfa8`, tip `f5f7a8e25`; the OPTIONAL artifacts are re-cut against the new
+default tree -- both are MECHANICAL (`0100` sha256 `dbfd8cac...` alone `9022b74d8`, `0101` sha256 `4f9a7609...`
+alone `449dc292d`; cumulative `b9bda9362`; `src/llama-context.cpp` is in both artifacts' file sets but r374's
+hunks do not touch theirs, so `git am` applied them strictly and only `From`/index/hunk line numbers moved).
+
+**Gates.**  `validate-set.sh` GREEN (19 default patches, 580 files / 190 defines / 604 envs / 14 options
+reconciled against r372 with 0 unexplained, the 524-file Windows-portability scan, the credit register 40 handles /
+0 debt, the system-header scan); `check-gen-docs.sh` OK at the tip; `check-shlib-symbols.sh` 16/16;
+`check-offline-tests.sh` PASS (above); coherence on the 4B 3-GPU `-sm tensor` arm reads the SAME text on the r373
+build and this one (**404 chars sha=85c420a00252** -- the r373 build was rebuilt from `pre-r374` for the comparison);
+`gate-kv-residency.sh --window-only` **PASS 10/10** (`wres`/`wspill` text identical to `wref`, `wres` 0 flips and
+100 % resident share, `wspill` 16 flips and 64 MiB pinned-host, both fit-placement hints, journal clean) and the
+pool section **PASS** (`pref`/`pres`/`plegacy` all `d7ad33fde207`, prompt rate 442.67 -> 426.97 t/s, `bad 0`,
+50 150 claims / 216 resolves / 88.94 % hits, the derived 4 104-page pool against an 8 192-page cache, draft
+acceptance identical `65/46`, and the multi-device `-sm layer` section `pmres == pres`, `bad 0`, 87.90 % hits
+over two per-device counter blocks); `gate-optional-build.sh` (gate 47) PASS on the cumulative optional tree
+`b9bda9362` (the `all` target, 12 s on a warm ccache after the r374 default-tree rebuild); `gate-mixed-kv.sh` on
+that build **14/14** (`FLASH_ATTN_EXT` 7493/7493 in the default, `KV_MIXED=0` and `KV_NATIVE=0` arms, width purity
+for q8_0/q8_0 and the three pairs at `-sm tensor`, four text arms, both refusals, journal clean);
+`check-gpu-faults.sh` clean across the gate logs.  **The new check's own negative control**: the same
+`check-offline-tests.sh --build-dir` run against a CPU-only build of the pre-r374 tree (`pre-r374`, the r373 code)
+exits 1 with exactly `test-arg-parser`, `test-fp8-kv`, `test-kv-cache`, `test-llama-context` blocking and the four
+package tests exempt -- the gate can reject the defect it was added for.
+
+**Record.** `INVARIANTS.md` r374; `patches/README.md` blocks 10/12/14/16 (the r374 amendments and the block-index
+rows for 10/12/14/16); `MANIFESTS.md` gate 49; `scripts/check-offline-tests.sh` + `scripts/README.md` +
+`AGENTS.md` (the gate-picker row); `CONTRIBUTORS.md` (`@autopeasant`, issue #382, `reported`);
+`optional/{two-lane-prefill,mixed-kv}/README.md` (the r374 re-cut).
+
 ## 261127.026 (r373) -- the max-min prompt share divided the RUNNING budget, not the pass's: two prompting slots got 1365 + 682 of a 2048 window instead of 1024 + 1024 (block 16, contributor PR #376)
 
 `@briansp2020` submitted (`wip/share-budget-r366`) a one-line patch and a careful analysis: every pass of

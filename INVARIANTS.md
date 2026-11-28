@@ -4021,3 +4021,48 @@ per-step:
 
 **Record.** `patches/README.md` block 16 (the r373 amendment); `MANIFESTS.md` gate 16; `scripts/gate-prefill-fairness.py`
 (`share_split()` / `measure_share()`); `archive/work/share-budget-r366/`; `CONTRIBUTORS.md` (`@briansp2020`).
+
+## r374 (2026-11-27, `WORKLOG.md` 261127.027) — a runtime POLICY that replaces an upstream one owes that upstream's OFFLINE ctests, and three "inert" guards were not: a device plan read for nothing, a zero-length state copy, an abbreviation pair ordered longest-first (blocks 10/12/14/16, GitHub issue #382)
+
+The reporter ran `ctest -R '^(test-kv-cache|test-fp8-kv)$'` on a CPU-only build of `v18-919794500-r368` and on clean
+upstream `b12597` (`919794500`): green upstream, two failures here.  Both named the same root cause -- block 10
+refuses a mixed K/V pair for every model -- but the full suite found **four** failures, and every one of them is a
+class no existing gate can see (a build compiles, the ROCm gates run models, `validate-set.sh` checks patches).
+
+1. **A policy change owes the offline test alignment in the SAME block.**  Block 10's diagnostic replaced upstream's
+   MLA-only "model does not support different K" with a general "models require the same K and V cache types", and
+   the check now runs BEFORE the per-architecture FP8 one, so `tests/test-kv-cache.cpp` must assert the general
+   message for every mixed pair and the FP8 message only for the same-type pair; `tests/test-fp8.cpp`'s attention
+   numerics can only reach the both-FP8 arm (a mixed pair no longer reaches `llama_init_from_model`, while its
+   per-side scaling stays covered at the cache level by test-kv-cache's shared-cache block).  Nothing about the
+   runtime changed.  `scripts/check-offline-tests.sh` (gate 48) is the instrument: the default set applied at
+   `release.json.base`, a CPU-only test build, then `ctest`; the delivery's own four tests are never exempt.
+2. **`llama_model::dev_layer()` is populated by a weight LOAD, so a cache-level feature may read it only when the
+   feature is ENGAGED.**  Block 14's window plan read `dev_layer(0)` for the spill budget on EVERY cache (a
+   windowless one has no tail to spill, and `spill_reserve(dev, 0)` was a no-op), and its per-layer `dev_layer(il)`
+   ran outside the pool branch: a default cache over a model built without a device assignment aborted with
+   `std::out_of_range` from `llama_model::dev_layer` -- the synthetic models `tests/test-kv-cache.cpp` constructs.
+   The lookups follow the request now (window: `w != 0`; budget/reserve: `n_tail != 0`; pool: pool mode only).
+3. **A zero-length device-state piece is not a copy.**  Block 12's restore walks pieces by byte cursor and hands a
+   piece to the backend as its ROOT tensor plus an offset; a cache tensor that holds nothing (`minimax-01-moe`'s
+   `cache_r_l0` has no width on `test-llama-context`'s shape) gives a 0-byte piece on both sides, so the direct-copy
+   branch compared an empty 1-D staging view against an empty 2-D root and `ggml_are_same_layout` aborted -- on a
+   copy of nothing, from `test-llama-context`'s `case_seq_cp_scatter`.  `nbytes == 0` on both sides is NOT evidence
+   of a matching layout.
+4. **An abbreviation pair is ordered SHORTEST FIRST, and the generated docs print that order.**  `test-arg-parser`
+   requires `args.front()` to be no longer than `args.back()` (the help printer assumes the first is the
+   abbreviation), which is why `--ctk, --cache-type-k` reads as it does; block 14's `{"--kv-attendance-pool",
+   "--kv-region-pool"}` was longest-first.  The fix moves the order, so the three generated READMEs print
+   `--kv-region-pool, --kv-attendance-pool` and a regeneration is owed -- folded into the last OFFICIAL block that
+   touches `common/arg.cpp` (block 16 here), never the temporary `0300`.  A message-only fix is not enough: the
+   docs ARE the option table, and `scripts/check-gen-docs.sh` is what says so.
+5. **The suite's remaining failures are the BOX's, not the delivery's, and the check must name them.**  On this box
+   `test-tokenizers-ggml-vocabs` (git-lfs absent: the cloned files are pointer blobs, "invalid magic 'vers'"),
+   `test-jinja-py` (no `jinja2`), `test-conversion-fp8` and `test-kv-cache-scales` (no `torch`) fail identically on
+   upstream `b12597` and on the delivery -- 80 tests, the same four, both trees.  Exempting them by NAME (reported,
+   never silently dropped; `--strict` requires them) is what keeps the check honest: a check that cannot fail is
+   not a check, and one that fails on a missing python package gets ignored.
+
+**Record.** `patches/README.md` blocks 10/12/14/16 (the r374 amendments and the block-index rows); `MANIFESTS.md`
+gate 48; `scripts/check-offline-tests.sh`; `CONTRIBUTORS.md` (`@autopeasant`, issue #382, `reported`); `AGENTS.md`
+(*Verify*) and `scripts/README.md` (the new check).

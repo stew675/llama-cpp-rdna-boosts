@@ -12,7 +12,7 @@ index e38485ca0..688639a72 100644
      fit.h
      file-lock.cpp
 diff --git a/common/arg.cpp b/common/arg.cpp
-index a63823767..dedf56bf4 100644
+index a63823767..b37b5b0e4 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -341,9 +341,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -91,7 +91,7 @@ index a63823767..dedf56bf4 100644
 +        }
 +    ).set_env("LLAMA_ARG_KV_WINDOW"));
 +    add_opt(common_arg(
-+        {"--kv-attendance-pool", "--kv-region-pool"}, "[on|off]",
++        {"--kv-region-pool", "--kv-attendance-pool"}, "[on|off]",
 +        string_format("take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: %s).  The KV's "
 +                      "AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of "
 +                      "indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is "
@@ -100914,7 +100914,7 @@ index e6f4be6a2..3875c56f9 100644
  private:
      void clear();
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ea41283f9..ccc050969 100644
+index ea41283f9..b34f383b7 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,12 +1,19 @@
@@ -104030,7 +104030,7 @@ index ea41283f9..ccc050969 100644
              while (src_pos < total) {
                  const auto & src_t = mbuf_cur.cpy[src_j];
                  const auto & dst_t = mbuf.org[dst_i];
-@@ -3712,16 +5691,14 @@ public:
+@@ -3712,16 +5691,21 @@ public:
  
                  const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
  
@@ -104039,9 +104039,7 @@ index ea41283f9..ccc050969 100644
 +                // state per row (measured 4.5 ms vs 0.15 ms for 2 MiB)
                  GGML_ASSERT(n_copy % ggml_type_size(src_t->type) == 0);
 -                const int64_t n_el = n_copy / ggml_type_size(src_t->type) * ggml_blck_size(src_t->type);
-+                ggml_tensor * dst_root     = dst_t->view_src != nullptr ? dst_t->view_src : dst_t;
-+                const size_t  dst_root_off = dst_t->view_src != nullptr ? dst_t->view_offs : 0;
- 
+-
 -                auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
 -                ggml_backend_view_init(src_v);
 -                auto * dst_v = ggml_view_1d(ctx_scratch, dst_t, n_el, dst_off);
@@ -104049,11 +104047,21 @@ index ea41283f9..ccc050969 100644
 -
 -                chunk_srcs.push_back(src_v);
 -                chunk_dsts.push_back(dst_v);
-+                jobs.push_back({ src_t, dst_root, src_off, dst_root_off + dst_off, n_copy });
++                ggml_tensor * dst_root     = dst_t->view_src != nullptr ? dst_t->view_src : dst_t;
++                const size_t  dst_root_off = dst_t->view_src != nullptr ? dst_t->view_offs : 0;
++
++                // a zero-length piece is nothing to copy: an empty cache tensor (a recurrent state with no
++                // width, say) yields src/dst pieces of 0 bytes, and `dst_root` is the tensor the read view came
++                // from -- so an empty pair can carry two different (empty) layouts and the copy's layout check
++                // fails on a copy of zero bytes (test-llama-context's cp_*_s on minimax-01-moe).  The walk still
++                // advances past it below, which is what keeps the cursor honest.
++                if (n_copy != 0) {
++                    jobs.push_back({ src_t, dst_root, src_off, dst_root_off + dst_off, n_copy });
++                }
  
                  src_pos += n_copy;
                  dst_pos += n_copy;
-@@ -3745,7 +5722,27 @@ public:
+@@ -3745,7 +5729,27 @@ public:
                  GGML_ASSERT(ggml_nbytes(mbuf.org[i]) == 0);
              }
  
@@ -104082,7 +104090,7 @@ index ea41283f9..ccc050969 100644
  
              ggml_free(ctx_scratch);
          }
-@@ -3791,8 +5788,72 @@ private:
+@@ -3791,8 +5795,72 @@ private:
      std::vector<read_info> rinfos;
  
      const llama_memory_buffers & mbufs;
@@ -104155,7 +104163,7 @@ index ea41283f9..ccc050969 100644
  size_t llama_context::state_get_size() {
      llama_io_write_dummy io(false);
      try {
-@@ -3804,7 +5865,7 @@ size_t llama_context::state_get_size() {
+@@ -3804,7 +5872,7 @@ size_t llama_context::state_get_size() {
  }
  
  size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
@@ -104164,7 +104172,7 @@ index ea41283f9..ccc050969 100644
      try {
          return state_write_data(io);
      } catch (const std::exception & err) {
-@@ -3814,7 +5875,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+@@ -3814,7 +5882,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
  }
  
  size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
@@ -104173,7 +104181,7 @@ index ea41283f9..ccc050969 100644
      try {
          return state_read_data(io);
      } catch (const std::exception & err) {
-@@ -3842,9 +5903,9 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
+@@ -3842,9 +5910,9 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
  size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
      std::unique_ptr<llama_io_write_i> io;
      if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
@@ -104185,7 +104193,7 @@ index ea41283f9..ccc050969 100644
      }
  
      try {
-@@ -3862,7 +5923,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+@@ -3862,7 +5930,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
      std::unique_ptr<llama_io_read_i> io;
      if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
          // create a temporary io to read the magic and the src seq_id
@@ -104194,7 +104202,7 @@ index ea41283f9..ccc050969 100644
  
          uint32_t magic_read;
          io->read(&magic_read, sizeof(magic_read));
-@@ -3875,9 +5936,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+@@ -3875,9 +5943,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
  
          GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
  
@@ -104206,7 +104214,7 @@ index ea41283f9..ccc050969 100644
      }
  
      try {
-@@ -4124,6 +6185,59 @@ void llama_context::perf_reset() {
+@@ -4124,6 +6192,59 @@ void llama_context::perf_reset() {
      // note: the reallocation counters are not reset - they track the lifetime totals for this context
  }
  
@@ -104266,7 +104274,7 @@ index ea41283f9..ccc050969 100644
  llama_memory_breakdown llama_context::memory_breakdown() const {
      std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
      for (const auto & [buft, size] : model.memory_breakdown()) {
-@@ -4134,22 +6248,39 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
+@@ -4134,22 +6255,39 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
              ret[buft].context += size;
          }
      }
@@ -104308,7 +104316,7 @@ index ea41283f9..ccc050969 100644
          }
      }
      return ret;
-@@ -4175,12 +6306,12 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter
+@@ -4175,12 +6313,12 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter
      ggml_set_param(tensor);
  }
  
@@ -104325,7 +104333,7 @@ index ea41283f9..ccc050969 100644
      GGML_ASSERT(n_batch                    % n_ubatch == 0);
  
      if (cparams.flash_attn) {
-@@ -4210,22 +6341,22 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
+@@ -4210,22 +6348,22 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
      void * param_filter_ud              = lopt_params.param_filter_ud;
  
    //llama_set_param(model->tok_embd,        param_filter, param_filter_ud); // FIXME
@@ -104364,7 +104372,7 @@ index ea41283f9..ccc050969 100644
          for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
              llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
          }
-@@ -4299,12 +6430,15 @@ void llama_context::opt_epoch_iter(
+@@ -4299,12 +6437,15 @@ void llama_context::opt_epoch_iter(
                  break;
              }
  
@@ -104381,7 +104389,7 @@ index ea41283f9..ccc050969 100644
              res->reset();
  
              auto * gf = model.build_graph(gparams);
-@@ -4335,7 +6469,6 @@ void llama_context::opt_epoch_iter(
+@@ -4335,7 +6476,6 @@ void llama_context::opt_epoch_iter(
                      ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                  }
              }
@@ -104389,7 +104397,7 @@ index ea41283f9..ccc050969 100644
              ggml_opt_eval(opt_ctx, result);
              if (callback) {
                  callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
-@@ -4404,10 +6537,12 @@ llama_context_params llama_context_default_params() {
+@@ -4404,10 +6544,12 @@ llama_context_params llama_context_default_params() {
          /*.n_ubatch                    =*/ 512,
          /*.n_seq_max                   =*/ 1,
          /*.n_rs_seq                    =*/ 0,
@@ -104402,7 +104410,7 @@ index ea41283f9..ccc050969 100644
          /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
          /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
          /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
-@@ -4434,14 +6569,39 @@ llama_context_params llama_context_default_params() {
+@@ -4434,14 +6576,39 @@ llama_context_params llama_context_default_params() {
          /*.op_offload                  =*/ true,
          /*.swa_full                    =*/ true,
          /*.kv_unified                  =*/ false,
@@ -104442,7 +104450,7 @@ index ea41283f9..ccc050969 100644
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
-@@ -4465,7 +6625,7 @@ llama_context * llama_init_from_model(
+@@ -4465,7 +6632,7 @@ llama_context * llama_init_from_model(
          params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
      }
  
@@ -104451,7 +104459,7 @@ index ea41283f9..ccc050969 100644
          if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
              LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
              params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-@@ -4477,10 +6637,49 @@ llama_context * llama_init_from_model(
+@@ -4477,10 +6644,49 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }
@@ -104503,7 +104511,7 @@ index ea41283f9..ccc050969 100644
          return nullptr;
      }
  
-@@ -4582,7 +6781,16 @@ llama_context * llama_init_from_model(
+@@ -4582,7 +6788,16 @@ llama_context * llama_init_from_model(
  
          return ctx;
      } catch (const std::exception & err) {
@@ -104521,7 +104529,7 @@ index ea41283f9..ccc050969 100644
      }
  
      return nullptr;
-@@ -4705,6 +6913,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
+@@ -4705,6 +6920,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
      return ctx->get_embeddings_seq(seq_id);
  }
  
@@ -104532,7 +104540,7 @@ index ea41283f9..ccc050969 100644
  void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
      ctx->set_embeddings_nextn(value, masked);
  }
-@@ -5165,6 +7377,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+@@ -5165,6 +7384,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
      return ctx->memory_breakdown();
  }
  
@@ -106044,7 +106052,7 @@ index 65aba2af7..715743ebf 100644
  
      void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index fbe422a27..f37767617 100644
+index fbe422a27..24b9f20c6 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -18,6 +18,435 @@ static bool ggml_is_power_of_2(int n) {
@@ -106532,7 +106540,7 @@ index fbe422a27..f37767617 100644
      attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
      other(static_cast<llama_kv_cache *>(mem_other)),
      v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
-@@ -162,6 +619,325 @@ llama_kv_cache::llama_kv_cache(
+@@ -162,6 +619,334 @@ llama_kv_cache::llama_kv_cache(
  
      const bool is_mla = hparams.is_mla();
  
@@ -106550,10 +106558,14 @@ index fbe422a27..f37767617 100644
 +        // the real devices: the window is the SAME window there (one region per child, every child at the same
 +        // `cells`, committed at its own cell stride -- see `ggml_backend_meta_kv_region_buft`).  Capability is
 +        // therefore "this device, or every child of this Meta device, answers" (TODO #124).
-+        const ggml_backend_dev_t kv_dev  = model.dev_layer(0);
++        // The lookups follow the REQUEST: a cache that asks for no window (every default cache) has no device
++        // plan to read, and `dev_layer` is populated by a real weight load, so asking it here aborted a default
++        // cache built without one (the synthetic models in tests/test-kv-cache.cpp).
++        const ggml_backend_dev_t kv_dev  = w != 0 ? model.dev_layer(0) : nullptr;
 +        const bool               kv_meta = kv_dev != nullptr && ggml_backend_dev_is_meta(kv_dev);
-+        const bool region_capable = !kv_meta ? llama_kv_region_dev_reg(kv_dev) != nullptr
-+                                             : ggml_backend_meta_kv_region_buft(kv_dev, 1) != nullptr;
++        const bool region_capable = kv_dev != nullptr &&
++                (!kv_meta ? llama_kv_region_dev_reg(kv_dev) != nullptr
++                          : ggml_backend_meta_kv_region_buft(kv_dev, 1) != nullptr);
 +        // A MIRRORED cache (every device holds the whole thing) is declined: `n_devices x W x cell` of VRAM for
 +        // one window, and the pinned-spill plan below is per logical cache -- it would under-book the spill by
 +        // the device count and the run-time pinned-RAM ceiling would then refuse a mapping mid-run.
@@ -106640,7 +106652,12 @@ index fbe422a27..f37767617 100644
 +        }
 +        size_t spill_cap_bytes = 0;   // > 0 when the RAM budget clamped the window
 +        size_t w_eff = w;
-+        if (uniform) {
++        // The budget and the reserve are the SPILL's, so they are read only when there is a tail to spill.
++        // Reading them unconditionally asked the model for `dev_layer(0)` on a cache that has no window at
++        // all -- which is every cache by default -- and that lookup throws on a model built without a device
++        // assignment (the synthetic models tests/test-kv-cache.cpp constructs), so a windowless cache used to
++        // abort off-device instead of doing nothing.
++        if (uniform && n_tail != 0) {
 +            // A3/item 3: the spill is PINNED, non-swappable RAM, so the window is clamped UP (fewer spilled
 +            // cells) until the worst case -- every tail cell of the context -- fits the RAM budget the
 +            // backend's `LLAMA_KV_SPILL_RAM_PCT` ceiling allows.  This is the creation-time decision; the
@@ -106715,7 +106732,7 @@ index fbe422a27..f37767617 100644
 +            // spellings (`auto`, a numeric size) are accepted, but the size is the system's now -- say so.
 +            LLAMA_LOG_WARN("%s: attendance pool: %s is accepted for compatibility and IGNORED -- the pool is "
 +                           "sized by the system (one decode band of the indexer working set).  Use "
-+                           "--kv-attendance-pool / --no-kv-attendance-pool\n", __func__,
++                           "--kv-attendance-pool on / off\n", __func__,
 +                           kv_pool_cells < 0 ? "'auto'" : "a numeric size");
 +        }
 +        if (req != 0) {
@@ -106858,7 +106875,7 @@ index fbe422a27..f37767617 100644
      for (uint32_t il = 0; il < n_layer; il++) {
          if (!hparams.has_kv(il)) {
              LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
-@@ -218,6 +994,40 @@ llama_kv_cache::llama_kv_cache(
+@@ -218,6 +1003,40 @@ llama_kv_cache::llama_kv_cache(
              buft = ggml_backend_dev_buffer_type(dev);
  
              dev_name = ggml_backend_dev_name(dev);
@@ -106899,7 +106916,7 @@ index fbe422a27..f37767617 100644
          }
  
          LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
-@@ -227,11 +1037,31 @@ llama_kv_cache::llama_kv_cache(
+@@ -227,11 +1046,34 @@ llama_kv_cache::llama_kv_cache(
              throw std::runtime_error("failed to create ggml context for kv cache");
          }
  
@@ -106907,7 +106924,10 @@ index fbe422a27..f37767617 100644
 +        // MIRROR -- every existing path (the writers, the state I/O, the shift, `get_k`/`get_v`) then works on
 +        // it unchanged, which is exactly the point of making the mirror authoritative.  The pool is a separate
 +        // device allocation in the ordinary device buffer.
-+        ggml_backend_dev_t dev_layer = model.dev_layer(il);
++        // The layer's device is read only when the pool is actually on: `dev_layer` exists only for a fully
++        // loaded model, and a DEFAULT cache (no pool) has no reason to look it up -- it used to abort a cache
++        // built from a model without a device assignment (tests/test-kv-cache.cpp's synthetic models).
++        ggml_backend_dev_t dev_layer = kv_pool_page != 0 ? model.dev_layer(il) : nullptr;
 +
 +        ggml_context * ctx_kv = ctx;
 +        if (kv_pool_page != 0) {
@@ -106934,7 +106954,7 @@ index fbe422a27..f37767617 100644
  
          has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
          has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
-@@ -240,13 +1070,50 @@ llama_kv_cache::llama_kv_cache(
+@@ -240,13 +1082,50 @@ llama_kv_cache::llama_kv_cache(
          std::vector<ggml_tensor *> v_stream;
  
          for (uint32_t s = 0; s < n_stream; ++s) {
@@ -106987,7 +107007,7 @@ index fbe422a27..f37767617 100644
      }
  
      if (reuse) {
-@@ -280,6 +1147,29 @@ llama_kv_cache::llama_kv_cache(
+@@ -280,6 +1159,29 @@ llama_kv_cache::llama_kv_cache(
          LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
      }
  
@@ -107017,7 +107037,7 @@ index fbe422a27..f37767617 100644
      {
          const size_t memory_size_k = size_k_bytes();
          const size_t memory_size_v = size_v_bytes();
-@@ -427,10 +1317,15 @@ void llama_kv_cache::clear(bool data) {
+@@ -427,10 +1329,15 @@ void llama_kv_cache::clear(bool data) {
          v_heads[s] = 0;
      }
  
@@ -107033,7 +107053,7 @@ index fbe422a27..f37767617 100644
      }
  }
  
-@@ -455,12 +1350,41 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -455,12 +1362,41 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
          auto & cells = v_cells[seq_to_stream[seq_id]];
          auto & head  = v_heads[seq_to_stream[seq_id]];
  
@@ -107076,7 +107096,7 @@ index fbe422a27..f37767617 100644
      } else {
          // match any sequence
          for (uint32_t s = 0; s < n_stream; ++s) {
-@@ -469,7 +1393,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -469,7 +1405,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
  
              uint32_t new_head = cells.size();
  
@@ -107086,7 +107106,7 @@ index fbe422a27..f37767617 100644
                  if (!cells.pos_in(i, p0, p1)) {
                      continue;
                  }
-@@ -486,6 +1411,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -486,6 +1423,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                  head = new_head;
              }
          }
@@ -107097,7 +107117,7 @@ index fbe422a27..f37767617 100644
      }
  
      return true;
-@@ -500,6 +1429,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
+@@ -500,6 +1441,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
      GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
      GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
  
@@ -107108,7 +107128,7 @@ index fbe422a27..f37767617 100644
      const auto s0 = seq_to_stream[seq_id_src];
      const auto s1 = seq_to_stream[seq_id_dst];
  
-@@ -604,12 +1537,320 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+@@ -604,12 +1549,320 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
          }
      }
  
@@ -107429,7 +107449,7 @@ index fbe422a27..f37767617 100644
  void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
      // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
      if (other) {
-@@ -726,8 +1967,48 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
+@@ -726,8 +1979,48 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
  }
  
  std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
@@ -107479,7 +107499,7 @@ index fbe422a27..f37767617 100644
      for (const auto & [buft, size] : attn_rot_bufs.memory_breakdown()) {
          ret[buft] += size;
      }
-@@ -735,6 +2016,36 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
+@@ -735,6 +2028,36 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown()
      return ret;
  }
  
@@ -107516,7 +107536,7 @@ index fbe422a27..f37767617 100644
  llama_memory_context_ptr llama_kv_cache::init_batch(
              llama_batch_allocr & balloc,
              uint32_t n_ubatch,
-@@ -785,6 +2096,19 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
+@@ -785,6 +2108,19 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool
  llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
      llama_kv_cache::slot_info_vec_t res;
  
@@ -107536,7 +107556,7 @@ index fbe422a27..f37767617 100644
      struct state_t {
          slot_info sinfo; // slot info for the ubatch
  
-@@ -1037,93 +2361,167 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
+@@ -1037,93 +2373,167 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
  
          uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
  
@@ -107754,7 +107774,7 @@ index fbe422a27..f37767617 100644
      }
  
      assert(res.s1 >= res.s0);
-@@ -1233,6 +2631,183 @@ bool llama_kv_cache::get_can_shift() const {
+@@ -1233,6 +2643,183 @@ bool llama_kv_cache::get_can_shift() const {
      return true;
  }
  
@@ -107938,7 +107958,7 @@ index fbe422a27..f37767617 100644
  uint32_t llama_kv_cache::get_size() const {
      const auto & cells = v_cells[seq_to_stream[0]];
  
-@@ -1294,17 +2869,84 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
+@@ -1294,17 +2881,84 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
      return seq_to_stream[seq_id];
  }
  
@@ -108025,7 +108045,7 @@ index fbe422a27..f37767617 100644
      }
  
      return result;
-@@ -1606,6 +3248,25 @@ std::vector<ggml_tensor *> llama_kv_cache::get_k_rot() const {
+@@ -1606,6 +3260,25 @@ std::vector<ggml_tensor *> llama_kv_cache::get_k_rot() const {
      return res;
  }
  
@@ -108051,7 +108071,7 @@ index fbe422a27..f37767617 100644
  std::vector<ggml_tensor *> llama_kv_cache::get_v_rot() const {
      std::vector<ggml_tensor *> res(hparams.n_layer_all, nullptr);
      for (const auto & [il, idx] : map_layer_ids) {
-@@ -1664,6 +3325,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+@@ -1664,6 +3337,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
  }
  
  void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
@@ -108061,7 +108081,7 @@ index fbe422a27..f37767617 100644
      GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
  
      int32_t * data = (int32_t *) dst->data;
-@@ -1977,6 +3641,271 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const
+@@ -1977,6 +3653,271 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const
      }
  }
  
@@ -108333,7 +108353,7 @@ index fbe422a27..f37767617 100644
  void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
      const int64_t n_tokens = ubatch->n_tokens;
  
-@@ -2858,6 +4787,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
+@@ -2858,6 +4799,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
          }
      }
  
@@ -108343,7 +108363,7 @@ index fbe422a27..f37767617 100644
      return true;
  }
  
-@@ -3032,9 +4964,15 @@ bool llama_kv_cache_context::apply() {
+@@ -3032,9 +4976,15 @@ bool llama_kv_cache_context::apply() {
      }
  
      kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
@@ -108360,7 +108380,7 @@ index fbe422a27..f37767617 100644
      return true;
  }
  
-@@ -3120,6 +5058,16 @@ void llama_kv_cache_context::set_input_attn_mask(const llm_attn_mask & attn_mask
+@@ -3120,6 +5070,16 @@ void llama_kv_cache_context::set_input_attn_mask(const llm_attn_mask & attn_mask
      kv->set_input_attn_mask(attn_mask, ubatch, causal_attn);
  }
  
@@ -120914,6 +120934,22 @@ index ed617939d..47abcb3c7 100644
          },
          /* .device  = */ NULL,
          /* .context = */ NULL,
+diff --git a/tests/test-fp8.cpp b/tests/test-fp8.cpp
+index dfd8ac541..c2913d219 100644
+--- a/tests/test-fp8.cpp
++++ b/tests/test-fp8.cpp
+@@ -316,7 +316,10 @@ static void check_fp8_attention(llama_model * model, bool offload_kqv = true) {
+             LOG("FP8 attention: tensor split requires flash attention, skipping disabled cases\n");
+             continue;
+         }
+-        for (int scaled : { 1, 2, 3 }) {
++        // rdna-boosts: K and V cache types must match (llama_init_from_model refuses a mixed pair
++        // outright), so only the both-FP8 arm is reachable through the context here; the per-side
++        // scaling of a mixed pair stays covered at the cache level by test-kv-cache.
++        for (int scaled : { 3 }) {
+             const float sk = scaled & 1 ? 0.03125f : 1.0f;
+             const float sv = scaled & 2 ? 0.125f : 1.0f;
+             ggml_backend_tensor_set(k_scale, &sk, 0, sizeof(sk));
 diff --git a/tests/test-fusion-gate-beta-multiseq.cpp b/tests/test-fusion-gate-beta-multiseq.cpp
 new file mode 100644
 index 000000000..69c0e1420
@@ -121241,6 +121277,27 @@ index 000000000..69c0e1420
 +    printf("PASS\n");
 +    return 0;
 +}
+diff --git a/tests/test-kv-cache.cpp b/tests/test-kv-cache.cpp
+index 4b48387b9..9a427749c 100644
+--- a/tests/test-kv-cache.cpp
++++ b/tests/test-kv-cache.cpp
+@@ -54,10 +54,13 @@ int main() {
+                     errors.clear();
+                     llama_context * ctx = llama_init_from_model(model.get(), params);
+                     GGML_ASSERT(ctx == nullptr);
+-                    if (type_k == type_v || (!model->hparams.is_mla() && arch != LLM_ARCH_DEEPSEEK4 && arch != LLM_ARCH_DEEPSEEK41)) {
+-                        GGML_ASSERT(errors.find("FP8 cache is not supported for architecture") != std::string::npos);
++                    if (type_k != type_v) {
++                        // rdna-boosts: every model requires the same K and V cache types, and that check
++                        // runs before the per-architecture one, so a mixed pair reports this diagnostic
++                        // on every architecture instead of only on MLA / DeepSeek4.
++                        GGML_ASSERT(errors.find("models require the same K and V cache types") != std::string::npos);
+                     } else {
+-                        GGML_ASSERT(errors.find("model does not support different K") != std::string::npos);
++                        GGML_ASSERT(errors.find("FP8 cache is not supported for architecture") != std::string::npos);
+                     }
+                 }
+             }
 diff --git a/tests/test-lazy-reader.cpp b/tests/test-lazy-reader.cpp
 new file mode 100644
 index 000000000..f4fd3f599
@@ -122954,7 +123011,7 @@ index 000000000..a5ae0bc64
 +    return 0;
 +}
 diff --git a/tools/cli/README.md b/tools/cli/README.md
-index 1dc83ee81..237b00861 100644
+index 1dc83ee81..97e505f97 100644
 --- a/tools/cli/README.md
 +++ b/tools/cli/README.md
 @@ -13,6 +13,7 @@
@@ -122970,7 +123027,7 @@ index 1dc83ee81..237b00861 100644
  | `--keep N` | number of tokens to keep from the initial prompt (default: 0, -1 = all) |
  | `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
 +| `--kv-window [auto\|N]` | the RESIDENT WINDOW of the attention KV, in cells: 'auto', '0' (off: fully resident), or N cells (default: 0).  The newest N cells stay in VRAM and everything older moves to pinned system RAM inside the SAME reservation -- one copy, no page table, no kernel change.  LOSSLESS and model-agnostic: nothing is dropped, a spilled cell is just read over the PCIe link, and that read costs decode in proportion to the depth past the window -- a window at or above the run depth costs nothing.  'auto' is sized by --fit; without --fit the cache declines it and says so.  OFF by default: a placement this consequential is an opt-in.  NOT the attendance pool (which keeps a device CACHE of a host-authoritative copy) and NOT the draft window (which TRUNCATES the drafter's cache).  LLAMA_KV_RESIDENT_CELLS is this option's deprecated alias<br/>(env: LLAMA_ARG_KV_WINDOW) |
-+| `--kv-attendance-pool, --kv-region-pool [on\|off]` | take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: off).  The KV's AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated GPU, and while the resident window is active -- the two are ALTERNATIVES for the same bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 % of pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is accepted for compatibility and IGNORED<br/>(env: LLAMA_ARG_KV_REGION_POOL) |
++| `--kv-region-pool, --kv-attendance-pool [on\|off]` | take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: off).  The KV's AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated GPU, and while the resident window is active -- the two are ALTERNATIVES for the same bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 % of pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is accepted for compatibility and IGNORED<br/>(env: LLAMA_ARG_KV_REGION_POOL) |
  | `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
  | `-p, --prompt PROMPT` | prompt to start generation with; for system message, use -sys |
  | `--perf, --no-perf` | whether to enable internal libllama performance timings (default: false)<br/>(env: LLAMA_ARG_PERF) |
@@ -123060,7 +123117,7 @@ index 92c86614f..dc69ffa15 100644
      llama_numa_init(params.numa);
  
 diff --git a/tools/completion/README.md b/tools/completion/README.md
-index cc6aae3d0..5c141a81c 100644
+index cc6aae3d0..317f9ea49 100644
 --- a/tools/completion/README.md
 +++ b/tools/completion/README.md
 @@ -96,6 +96,7 @@ llama-completion.exe -m models\gemma-1.1-7b-it.Q4_K_M.gguf --ignore-eos -n -1
@@ -123076,7 +123133,7 @@ index cc6aae3d0..5c141a81c 100644
  | `--keep N` | number of tokens to keep from the initial prompt (default: 0, -1 = all) |
  | `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
 +| `--kv-window [auto\|N]` | the RESIDENT WINDOW of the attention KV, in cells: 'auto', '0' (off: fully resident), or N cells (default: 0).  The newest N cells stay in VRAM and everything older moves to pinned system RAM inside the SAME reservation -- one copy, no page table, no kernel change.  LOSSLESS and model-agnostic: nothing is dropped, a spilled cell is just read over the PCIe link, and that read costs decode in proportion to the depth past the window -- a window at or above the run depth costs nothing.  'auto' is sized by --fit; without --fit the cache declines it and says so.  OFF by default: a placement this consequential is an opt-in.  NOT the attendance pool (which keeps a device CACHE of a host-authoritative copy) and NOT the draft window (which TRUNCATES the drafter's cache).  LLAMA_KV_RESIDENT_CELLS is this option's deprecated alias<br/>(env: LLAMA_ARG_KV_WINDOW) |
-+| `--kv-attendance-pool, --kv-region-pool [on\|off]` | take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: off).  The KV's AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated GPU, and while the resident window is active -- the two are ALTERNATIVES for the same bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 % of pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is accepted for compatibility and IGNORED<br/>(env: LLAMA_ARG_KV_REGION_POOL) |
++| `--kv-region-pool, --kv-attendance-pool [on\|off]` | take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: off).  The KV's AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated GPU, and while the resident window is active -- the two are ALTERNATIVES for the same bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 % of pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is accepted for compatibility and IGNORED<br/>(env: LLAMA_ARG_KV_REGION_POOL) |
  | `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
  | `-p, --prompt PROMPT` | prompt to start generation with; for system message, use -sys |
  | `--perf, --no-perf` | whether to enable internal libllama performance timings (default: false)<br/>(env: LLAMA_ARG_PERF) |
@@ -123516,7 +123573,7 @@ index 1ddd73ce8..ab2d1243a 100644
          fields.emplace_back("t/s");
  
 diff --git a/tools/server/README.md b/tools/server/README.md
-index 1f6553389..f5b262254 100644
+index 1f6553389..f341443fa 100644
 --- a/tools/server/README.md
 +++ b/tools/server/README.md
 @@ -34,6 +34,7 @@ For the full list of features, please refer to [server's changelog](https://gith
@@ -123532,7 +123589,7 @@ index 1f6553389..f5b262254 100644
  | `--keep N` | number of tokens to keep from the initial prompt (default: 0, -1 = all) |
  | `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
 +| `--kv-window [auto\|N]` | the RESIDENT WINDOW of the attention KV, in cells: 'auto', '0' (off: fully resident), or N cells (default: 0).  The newest N cells stay in VRAM and everything older moves to pinned system RAM inside the SAME reservation -- one copy, no page table, no kernel change.  LOSSLESS and model-agnostic: nothing is dropped, a spilled cell is just read over the PCIe link, and that read costs decode in proportion to the depth past the window -- a window at or above the run depth costs nothing.  'auto' is sized by --fit; without --fit the cache declines it and says so.  OFF by default: a placement this consequential is an opt-in.  NOT the attendance pool (which keeps a device CACHE of a host-authoritative copy) and NOT the draft window (which TRUNCATES the drafter's cache).  LLAMA_KV_RESIDENT_CELLS is this option's deprecated alias<br/>(env: LLAMA_ARG_KV_WINDOW) |
-+| `--kv-attendance-pool, --kv-region-pool [on\|off]` | take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: off).  The KV's AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated GPU, and while the resident window is active -- the two are ALTERNATIVES for the same bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 % of pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is accepted for compatibility and IGNORED<br/>(env: LLAMA_ARG_KV_REGION_POOL) |
++| `--kv-region-pool, --kv-attendance-pool [on\|off]` | take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: off).  The KV's AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated GPU, and while the resident window is active -- the two are ALTERNATIVES for the same bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 % of pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is accepted for compatibility and IGNORED<br/>(env: LLAMA_ARG_KV_REGION_POOL) |
  | `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
  | `--perf, --no-perf` | whether to enable internal libllama performance timings (default: false)<br/>(env: LLAMA_ARG_PERF) |
  | `-e, --escape, --no-escape` | whether to process escapes sequences (\n, \r, \t, \', \", \\) (default: true) |

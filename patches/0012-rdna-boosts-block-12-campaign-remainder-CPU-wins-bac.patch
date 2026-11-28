@@ -1,4 +1,4 @@
-From 119edd003c304558c37c3aa8554448bd0291338d Mon Sep 17 00:00:00 2001
+From dd8343b6ed788ddc2b585b8205380d69d35a073f Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 11 Nov 2026 12:06:03 -0600
 Subject: [PATCH 12/18] rdna-boosts: block 12: campaign remainder (CPU wins,
@@ -133,6 +133,14 @@ ggml file is touched and every backend runs it.  Gate: scripts/gate-fast-topk-pe
 Co-authored-by: briansp2020 <bsp2020@gmail.com>
 Co-authored-by: overdoingism <overdoingism@users.noreply.github.com>
 Co-authored-by: slavap <slavap@users.noreply.github.com>
+- r374 (GitHub issue #382's offline-test sweep): the device state RESTORE no longer hands the backend a
+  zero-length copy.  An empty cache tensor -- minimax-01's recurrent `cache_r_l0` has no width on that shape --
+  produces src/dst pieces of 0 bytes, and since the read side expresses a piece as `dst_root` (the tensor the
+  view came from) the direct-copy branch matched an empty 1-D staging tensor against an empty 2-D root: a
+  `ggml_are_same_layout` abort on a copy of nothing, in test-llama-context's `cp_h_s`/`cp_d_s`
+  (`case_seq_cp_scatter`, a scattered sequence range).  The piece is skipped and the byte cursor still advances
+  past it, so the chunking walk is unchanged.  Inert on any non-empty piece, i.e. on every state a model
+  actually carries.
 Reported-by: mjohanning99 <3389797+mjohanning99@users.noreply.github.com>
 ---
  common/arg.cpp                                |   32 +-
@@ -167,7 +175,7 @@ Reported-by: mjohanning99 <3389797+mjohanning99@users.noreply.github.com>
  include/llama.h                               |   40 +-
  src/llama-batch.cpp                           |   11 +-
  src/llama-batch.h                             |    6 +-
- src/llama-context.cpp                         | 1245 +++-
+ src/llama-context.cpp                         | 1254 +++-
  src/llama-context.h                           |   63 +-
  src/llama-cparams.h                           |    5 -
  src/llama-ext.h                               |   32 +-
@@ -204,7 +212,7 @@ Reported-by: mjohanning99 <3389797+mjohanning99@users.noreply.github.com>
  tools/server/server-slot-sched.cpp            |  114 +-
  tools/server/server-slot-sched.h              |   14 +
  .../tests/unit/test_kv_keep_only_active.py    |   60 +-
- 69 files changed, 11374 insertions(+), 1401 deletions(-)
+ 69 files changed, 11382 insertions(+), 1402 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index f36b39cf0..ebd7320eb 100644
@@ -11758,7 +11766,7 @@ index e6f4be6a2..3875c56f9 100644
  private:
      void clear();
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 2ed3c6ca6..f824aea06 100644
+index 2ed3c6ca6..69985454c 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,3 +1,6 @@
@@ -13268,7 +13276,7 @@ index 2ed3c6ca6..f824aea06 100644
              while (src_pos < total) {
                  const auto & src_t = mbuf_cur.cpy[src_j];
                  const auto & dst_t = mbuf.org[dst_i];
-@@ -4980,16 +5664,14 @@ public:
+@@ -4980,16 +5664,21 @@ public:
  
                  const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
  
@@ -13277,9 +13285,7 @@ index 2ed3c6ca6..f824aea06 100644
 +                // state per row (measured 4.5 ms vs 0.15 ms for 2 MiB)
                  GGML_ASSERT(n_copy % ggml_type_size(src_t->type) == 0);
 -                const int64_t n_el = n_copy / ggml_type_size(src_t->type) * ggml_blck_size(src_t->type);
-+                ggml_tensor * dst_root     = dst_t->view_src != nullptr ? dst_t->view_src : dst_t;
-+                const size_t  dst_root_off = dst_t->view_src != nullptr ? dst_t->view_offs : 0;
- 
+-
 -                auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
 -                ggml_backend_view_init(src_v);
 -                auto * dst_v = ggml_view_1d(ctx_scratch, dst_t, n_el, dst_off);
@@ -13287,11 +13293,21 @@ index 2ed3c6ca6..f824aea06 100644
 -
 -                chunk_srcs.push_back(src_v);
 -                chunk_dsts.push_back(dst_v);
-+                jobs.push_back({ src_t, dst_root, src_off, dst_root_off + dst_off, n_copy });
++                ggml_tensor * dst_root     = dst_t->view_src != nullptr ? dst_t->view_src : dst_t;
++                const size_t  dst_root_off = dst_t->view_src != nullptr ? dst_t->view_offs : 0;
++
++                // a zero-length piece is nothing to copy: an empty cache tensor (a recurrent state with no
++                // width, say) yields src/dst pieces of 0 bytes, and `dst_root` is the tensor the read view came
++                // from -- so an empty pair can carry two different (empty) layouts and the copy's layout check
++                // fails on a copy of zero bytes (test-llama-context's cp_*_s on minimax-01-moe).  The walk still
++                // advances past it below, which is what keeps the cursor honest.
++                if (n_copy != 0) {
++                    jobs.push_back({ src_t, dst_root, src_off, dst_root_off + dst_off, n_copy });
++                }
  
                  src_pos += n_copy;
                  dst_pos += n_copy;
-@@ -5013,7 +5695,27 @@ public:
+@@ -5013,7 +5702,27 @@ public:
                  GGML_ASSERT(ggml_nbytes(mbuf.org[i]) == 0);
              }
  
@@ -13320,7 +13336,7 @@ index 2ed3c6ca6..f824aea06 100644
  
              ggml_free(ctx_scratch);
          }
-@@ -5059,8 +5761,72 @@ private:
+@@ -5059,8 +5768,72 @@ private:
      std::vector<read_info> rinfos;
  
      const llama_memory_buffers & mbufs;
@@ -13393,7 +13409,7 @@ index 2ed3c6ca6..f824aea06 100644
  size_t llama_context::state_get_size() {
      llama_io_write_dummy io(false);
      try {
-@@ -5072,7 +5838,7 @@ size_t llama_context::state_get_size() {
+@@ -5072,7 +5845,7 @@ size_t llama_context::state_get_size() {
  }
  
  size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
@@ -13402,7 +13418,7 @@ index 2ed3c6ca6..f824aea06 100644
      try {
          return state_write_data(io);
      } catch (const std::exception & err) {
-@@ -5082,7 +5848,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+@@ -5082,7 +5855,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
  }
  
  size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
@@ -13411,7 +13427,7 @@ index 2ed3c6ca6..f824aea06 100644
      try {
          return state_read_data(io);
      } catch (const std::exception & err) {
-@@ -5110,9 +5876,9 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
+@@ -5110,9 +5883,9 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
  size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
      std::unique_ptr<llama_io_write_i> io;
      if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
@@ -13423,7 +13439,7 @@ index 2ed3c6ca6..f824aea06 100644
      }
  
      try {
-@@ -5130,7 +5896,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+@@ -5130,7 +5903,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
      std::unique_ptr<llama_io_read_i> io;
      if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
          // create a temporary io to read the magic and the src seq_id
@@ -13432,7 +13448,7 @@ index 2ed3c6ca6..f824aea06 100644
  
          uint32_t magic_read;
          io->read(&magic_read, sizeof(magic_read));
-@@ -5143,9 +5909,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+@@ -5143,9 +5916,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
  
          GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
  
@@ -13444,7 +13460,7 @@ index 2ed3c6ca6..f824aea06 100644
      }
  
      try {
-@@ -5428,7 +6194,7 @@ static size_t llama_fattn_stage_accounting(ggml_backend_t backend, bool reserve,
+@@ -5428,7 +6201,7 @@ static size_t llama_fattn_stage_accounting(ggml_backend_t backend, bool reserve,
      return std::min(bound, f16_kv_bytes);
  }
  
@@ -13453,7 +13469,7 @@ index 2ed3c6ca6..f824aea06 100644
  // reserve.  `reserve` (the --fit / no_alloc path) uses the worst-case bound for a model whose largest
  // host-resident weight tensor is `max_table` bytes (the ring holds one table per slot); the live path
  // reports what the ring has actually grown to.  Every non-CUDA backend returns 0.
-@@ -5984,7 +6750,16 @@ llama_context * llama_init_from_model(
+@@ -5984,7 +6757,16 @@ llama_context * llama_init_from_model(
  
          return ctx;
      } catch (const std::exception & err) {
@@ -13471,7 +13487,7 @@ index 2ed3c6ca6..f824aea06 100644
      }
  
      return nullptr;
-@@ -6167,26 +6942,6 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+@@ -6167,26 +6949,6 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
      return ctx->get_embeddings_nextn_ith(i);
  }
  

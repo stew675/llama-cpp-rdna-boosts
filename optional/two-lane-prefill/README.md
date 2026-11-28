@@ -1,6 +1,14 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
 **Optional artifact, not part of the delivery.  Optional block `0100`; PORTED onto `r369` (2026-11-27), verified on `r353`.**
+r374 (18 official blocks `0000`-`0017` + temporary `0300`, default tree
+`760fa359026d1ce33cf22be3377311b95877bfa8`, default tip `f5f7a8e25`): RE-CUT, and **mechanical** -- r374 amends block 12
+(`src/llama-context.cpp`, the zero-length device-state piece) and block 14 (`src/llama-kv-cache.cpp`, the device lookup,
+and `common/arg.cpp`), and this artifact owns `src/llama-context.cpp` among its eight files, but it applies **strictly**
+(`git am`, no `-3`): the diff body is untouched, only the `From` id, the blob index and three hunk line numbers moved.
+sha256 `dbfd8cacae400f45a4a62af75159e879bbdd1c77f7e94f282254b059949c2bdc`; producing tree
+`9022b74d86520e3eb335e293d99646192bd288f8` alone and `b9bda9362228602aa4d14e702387c1e46d46de12` cumulative (both
+re-verified by `scripts/validate-set.sh` check 8); the cumulative tree's `all`-target build is the r374 gate-47 run below.
 r373 (18 official blocks `0000`-`0017` + temporary `0300`, default tree `95dbb18aa1e104547226407f6b29028e848366e3`, default tip `20ed444e9`):
 RE-CUT, because r373 amends block 16 (`tools/server/server-context.cpp`) and a re-cut re-exports the artifact against the new default tree.  The artifact does not touch that file, so nothing was reconciled -- the diff body is the r372 one and only the
 `From` id moved, and the sha256 is `f70aae35ee86457254a16ec17cc4216cbc96809c42b40f3d384a6f73f20923cf`; producing tree

@@ -10,7 +10,17 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 * `0101-mixed-kv.patch` — the artifact.  sha256
   `ba75c00cdd3c0e0e2efd49c52c3e384f2783686f797f4eddce6aa72544eccf4c` (the current cut; every earlier cut is
   recorded below)
-* **r372 re-cut verification (current)**: applies strictly at the r372 default tree
+* **r374 re-cut verification (current)**: applies strictly at the r374 default tree
+  `760fa359026d1ce33cf22be3377311b95877bfa8` (18 official blocks `0000`-`0017` + temporary `0300`, default tip
+  `f5f7a8e25`), sha256 `4f9a7609962aede998f238a65179dbef3c71c0768f22c62445207e1c3fb46ed4` -- **mechanical**, though
+  r374 amends two of this artifact's ten files (`src/llama-context.cpp`, the same-type K/V gate and the
+  zero-length state piece; `common/arg.cpp` is not one of them): it applies **strictly** (`git am`, no `-3`), so
+  the diff body is untouched and only the `From` id, the blob index and two hunk line numbers moved; producing tree
+  `449dc292d3523723bcec6dd5c087ce227f2eca0c` alone and `b9bda9362228602aa4d14e702387c1e46d46de12` cumulative, and
+  `scripts/gate-optional-build.sh` (gate 47) **PASS** on the cumulative tree.  `validate-set.sh` check 8 re-verifies
+  all three trees on every run; the r353 port verification below is still the numbers of record (the artifact's own
+  code did not change).
+* **r372 re-cut verification (superseded by r374)**: applies strictly at the r372 default tree
   `7c1728b37d8b914724e62156559eddf0301c062c` (18 official blocks `0000`-`0017` + temporary `0300`, default tip
   `5e844cbc6`), sha256
   `ba75c00cdd3c0e0e2efd49c52c3e384f2783686f797f4eddce6aa72544eccf4c` -- **unchanged**, unlike a re-cut: r372

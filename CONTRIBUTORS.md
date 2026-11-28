@@ -75,6 +75,7 @@ diagnosis, and often the patch was written against it.
 | [@tazmaniax](https://github.com/tazmaniax) | the gfx1100 `-lme`/GTT report behind `TODO` #347 | block `0015` (diagnosis) | issue #347 | reported |
 | [@xxyygt](https://github.com/xxyygt) | the MoE device-remap findings folded into the cache's decode path | block `0009` | issue #219 | reported |
 | [@a-n-t-0](https://github.com/a-n-t-0) | the original issue-#30 prefill reproduction | block `0005` | issue #30 | reported |
+| [@autopeasant](https://github.com/autopeasant) | two offline ctests still encoded upstream's mixed-K/V rule while the delivery refuses a mixed pair on every model (`test-kv-cache`'s diagnostic, `test-fp8-kv`'s `K=f8_e4m3`/`V=f16` arm) -- reported with the exact command and the upstream control, and made the same reporter's tree green.  The sweep over the rest of the suite then found block 14's windowless device lookup and block 12's zero-length state copy, and block 14's long-first abbreviation pair | block `0010` (r374 amendment) | issue #382 | reported |
 
 ## Debt, and how it is paid
 

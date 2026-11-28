@@ -1,4 +1,4 @@
-From ac16e1f77c98937b6bfc7ece9ccbff2337a11f71 Mon Sep 17 00:00:00 2001
+From 24aac70275cc3611a64592b4278a6424fdfc99f9 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Mon, 16 Nov 2026 23:43:27 -0600
 Subject: [PATCH 16/18] rdna-boosts: block 16: the server's prompt admission
@@ -103,6 +103,12 @@ census on its own fresh server and requires >= 80 % of >= 4 co-batched steps to 
 evenly AND place tokens in both slots (15/15 on this build; the pre-fix build reads 3/15 with a median
 ratio of 2.00, and the FAIR=0 slot-order fill reads 0 %).  Reported by @briansp2020, who supplied the
 patch, the analysis and the repro.
+- r374 (GitHub issue #382's offline-test sweep): the generated docs are REGENERATED.  Block 14's
+  `--kv-attendance-pool` argument list had to be reordered (the shorter legacy spelling first, which is the
+  order `test-arg-parser` requires of an abbreviation pair), and the three generated files print that list, so
+  `tools/{cli,completion,server}/README.md` now read `--kv-region-pool, --kv-attendance-pool`.  Folding a
+  regeneration here follows the rule (the last OFFICIAL block that touches `common/arg.cpp`, never the
+  temporary 0300); no other line of the three files moves, and `scripts/check-gen-docs.sh` is green at the tip.
 Co-authored-by: briansp2020 <bsp2020@gmail.com>
 ---
  common/arg.cpp                     |  17 ++
@@ -118,7 +124,7 @@ Co-authored-by: briansp2020 <bsp2020@gmail.com>
  10 files changed, 583 insertions(+), 20 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index f7cd72d85..ee0bbac3e 100644
+index d2b704095..65be52fa2 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2661,6 +2661,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -167,7 +173,7 @@ index db6133522..727840f63 100644
      bool        server_connect      = false;
      std::string server_connect_code = "";
 diff --git a/tools/cli/README.md b/tools/cli/README.md
-index 785ebeaab..237b00861 100644
+index 785ebeaab..97e505f97 100644
 --- a/tools/cli/README.md
 +++ b/tools/cli/README.md
 @@ -13,6 +13,7 @@
@@ -183,7 +189,7 @@ index 785ebeaab..237b00861 100644
  | `--keep N` | number of tokens to keep from the initial prompt (default: 0, -1 = all) |
  | `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
 +| `--kv-window [auto\|N]` | the RESIDENT WINDOW of the attention KV, in cells: 'auto', '0' (off: fully resident), or N cells (default: 0).  The newest N cells stay in VRAM and everything older moves to pinned system RAM inside the SAME reservation -- one copy, no page table, no kernel change.  LOSSLESS and model-agnostic: nothing is dropped, a spilled cell is just read over the PCIe link, and that read costs decode in proportion to the depth past the window -- a window at or above the run depth costs nothing.  'auto' is sized by --fit; without --fit the cache declines it and says so.  OFF by default: a placement this consequential is an opt-in.  NOT the attendance pool (which keeps a device CACHE of a host-authoritative copy) and NOT the draft window (which TRUNCATES the drafter's cache).  LLAMA_KV_RESIDENT_CELLS is this option's deprecated alias<br/>(env: LLAMA_ARG_KV_WINDOW) |
-+| `--kv-attendance-pool, --kv-region-pool [on\|off]` | take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: off).  The KV's AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated GPU, and while the resident window is active -- the two are ALTERNATIVES for the same bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 % of pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is accepted for compatibility and IGNORED<br/>(env: LLAMA_ARG_KV_REGION_POOL) |
++| `--kv-region-pool, --kv-attendance-pool [on\|off]` | take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: off).  The KV's AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated GPU, and while the resident window is active -- the two are ALTERNATIVES for the same bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 % of pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is accepted for compatibility and IGNORED<br/>(env: LLAMA_ARG_KV_REGION_POOL) |
  | `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
  | `-p, --prompt PROMPT` | prompt to start generation with; for system message, use -sys |
  | `--perf, --no-perf` | whether to enable internal libllama performance timings (default: false)<br/>(env: LLAMA_ARG_PERF) |
@@ -233,7 +239,7 @@ index 785ebeaab..237b00861 100644
  | `--spec-draft-n-start N` | initial adaptive MTP draft depth: the first verify round of each generation starts here instead of the default cold start.  Clamped to [--spec-draft-n-min-adaptive, --spec-draft-n-max].  Use it to start deeper when the workload settles high (e.g. verbatim recall) or shallower for a short generation at a deep context, where a wide verify batch costs more.  Unset: three steps below the ceiling, bounded by the floor.<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_START) |
  | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
 diff --git a/tools/completion/README.md b/tools/completion/README.md
-index 8c87eeea8..5c141a81c 100644
+index 8c87eeea8..317f9ea49 100644
 --- a/tools/completion/README.md
 +++ b/tools/completion/README.md
 @@ -96,6 +96,7 @@ llama-completion.exe -m models\gemma-1.1-7b-it.Q4_K_M.gguf --ignore-eos -n -1
@@ -249,7 +255,7 @@ index 8c87eeea8..5c141a81c 100644
  | `--keep N` | number of tokens to keep from the initial prompt (default: 0, -1 = all) |
  | `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
 +| `--kv-window [auto\|N]` | the RESIDENT WINDOW of the attention KV, in cells: 'auto', '0' (off: fully resident), or N cells (default: 0).  The newest N cells stay in VRAM and everything older moves to pinned system RAM inside the SAME reservation -- one copy, no page table, no kernel change.  LOSSLESS and model-agnostic: nothing is dropped, a spilled cell is just read over the PCIe link, and that read costs decode in proportion to the depth past the window -- a window at or above the run depth costs nothing.  'auto' is sized by --fit; without --fit the cache declines it and says so.  OFF by default: a placement this consequential is an opt-in.  NOT the attendance pool (which keeps a device CACHE of a host-authoritative copy) and NOT the draft window (which TRUNCATES the drafter's cache).  LLAMA_KV_RESIDENT_CELLS is this option's deprecated alias<br/>(env: LLAMA_ARG_KV_WINDOW) |
-+| `--kv-attendance-pool, --kv-region-pool [on\|off]` | take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: off).  The KV's AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated GPU, and while the resident window is active -- the two are ALTERNATIVES for the same bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 % of pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is accepted for compatibility and IGNORED<br/>(env: LLAMA_ARG_KV_REGION_POOL) |
++| `--kv-region-pool, --kv-attendance-pool [on\|off]` | take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: off).  The KV's AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated GPU, and while the resident window is active -- the two are ALTERNATIVES for the same bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 % of pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is accepted for compatibility and IGNORED<br/>(env: LLAMA_ARG_KV_REGION_POOL) |
  | `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
  | `-p, --prompt PROMPT` | prompt to start generation with; for system message, use -sys |
  | `--perf, --no-perf` | whether to enable internal libllama performance timings (default: false)<br/>(env: LLAMA_ARG_PERF) |
@@ -285,7 +291,7 @@ index 8c87eeea8..5c141a81c 100644
  | `-mg, --main-gpu INDEX` | the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: 0)<br/>(env: LLAMA_ARG_MAIN_GPU) |
  | `-fit, --fit [on\|off]` | whether to adjust unset arguments to fit in device memory ('on' or 'off', default: 'on')<br/>(env: LLAMA_ARG_FIT) |
 diff --git a/tools/server/README.md b/tools/server/README.md
-index 3c89ff19d..f5b262254 100644
+index 3c89ff19d..f341443fa 100644
 --- a/tools/server/README.md
 +++ b/tools/server/README.md
 @@ -34,6 +34,7 @@ For the full list of features, please refer to [server's changelog](https://gith
@@ -301,7 +307,7 @@ index 3c89ff19d..f5b262254 100644
  | `--keep N` | number of tokens to keep from the initial prompt (default: 0, -1 = all) |
  | `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
 +| `--kv-window [auto\|N]` | the RESIDENT WINDOW of the attention KV, in cells: 'auto', '0' (off: fully resident), or N cells (default: 0).  The newest N cells stay in VRAM and everything older moves to pinned system RAM inside the SAME reservation -- one copy, no page table, no kernel change.  LOSSLESS and model-agnostic: nothing is dropped, a spilled cell is just read over the PCIe link, and that read costs decode in proportion to the depth past the window -- a window at or above the run depth costs nothing.  'auto' is sized by --fit; without --fit the cache declines it and says so.  OFF by default: a placement this consequential is an opt-in.  NOT the attendance pool (which keeps a device CACHE of a host-authoritative copy) and NOT the draft window (which TRUNCATES the drafter's cache).  LLAMA_KV_RESIDENT_CELLS is this option's deprecated alias<br/>(env: LLAMA_ARG_KV_WINDOW) |
-+| `--kv-attendance-pool, --kv-region-pool [on\|off]` | take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: off).  The KV's AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated GPU, and while the resident window is active -- the two are ALTERNATIVES for the same bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 % of pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is accepted for compatibility and IGNORED<br/>(env: LLAMA_ARG_KV_REGION_POOL) |
++| `--kv-region-pool, --kv-attendance-pool [on\|off]` | take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: off).  The KV's AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated GPU, and while the resident window is active -- the two are ALTERNATIVES for the same bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 % of pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is accepted for compatibility and IGNORED<br/>(env: LLAMA_ARG_KV_REGION_POOL) |
  | `-fa, --flash-attn [on\|off\|auto]` | set Flash Attention use ('on', 'off', or 'auto', default: 'auto')<br/>(env: LLAMA_ARG_FLASH_ATTN) |
  | `--perf, --no-perf` | whether to enable internal libllama performance timings (default: false)<br/>(env: LLAMA_ARG_PERF) |
  | `-e, --escape, --no-escape` | whether to process escapes sequences (\n, \r, \t, \', \", \\) (default: true) |

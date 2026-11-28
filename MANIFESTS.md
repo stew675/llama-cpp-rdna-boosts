@@ -1256,6 +1256,25 @@ prefill-logit point reads `0.000000 / 100.000 %`, and a `--chunks 2` log-prob fi
 same pair reads 0.001354 KLD / 98.431 %, which is the rounding-level magnitude of the change and its non-vacuity
 proof.  Record: `benchmarks/2026-11-27-shexp-down-epilogue-rounding.md`.
 
+49. **The delivery must not break upstream's OFFLINE ctests** (r374, GitHub issue #382, blocks 10/12/14/16) --
+    `scripts/check-offline-tests.sh`.  The delivery replaces runtime policy in places (block 10 refuses a mixed K/V
+    pair for EVERY model, with its own diagnostic, before the per-architecture FP8 check), adds options to
+    `common/arg.cpp`, and changes internal contracts; upstream's offline ctests encode the rules that were replaced,
+    and **nothing in the release flow ran `ctest`**: r368 shipped with `test-kv-cache` and `test-fp8-kv` failing on
+    every CPU-only tree while upstream `b12597` was green, and the sweep that fixed them found two more
+    (`test-arg-parser`: an abbreviation pair ordered longest-first; `test-llama-context`: a device-state restore
+    copying a zero-length piece).  The check applies the default set at `release.json.base` in a throwaway clone
+    (strict `git am`), configures `-DLLAMA_BUILD_TESTS=ON -DGGML_HIP=OFF -DGGML_CUDA=OFF`, builds once, and runs
+    `ctest --output-on-failure`; it prints `OFFLINE_TESTS=PASS`.  **The delivery's own four tests are never exempt**
+    (`test-kv-cache`, `test-fp8-kv`, `test-arg-parser`, `test-llama-context`), and the only exemptions are the
+    box's missing packages/git-lfs (`test-tokenizers-ggml-vocabs`, `test-jinja-py`, `test-conversion-fp8`,
+    `test-kv-cache-scales`), which are REPORTED per run and required under `--strict`.  Non-vacuity: on the r373
+    set the same binary+suite reports those four delivery tests as failures (measured: 4 blocking, 4 exempt), and
+    on upstream `b12597` it reports the 4 exempt ones only.  `--build-dir DIR` reuses an existing CPU-only build
+    (~1 min once built; the full path is one ~6-10 min CPU build).  Required for every release and for any change
+    that adds an option, changes an option's argument list, alters a diagnostic upstream's tests assert on, or
+    changes a runtime policy upstream enforces differently.
+
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 
 ## Verification per block
