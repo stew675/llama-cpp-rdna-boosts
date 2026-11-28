@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 26 Nov 2026 17:54:02 +0000
+Subject: [PATCH 1/2] cuda: queued row-block reads without one copy per row --
+ the destination's owner copies 2-D, any other device gathers on the device
+ and scatters from a stream callback (GGML_CUDA_ROWS_ASYNC_GATHER=0: off)
+
+Since r364 the ASYNC device->host row-block read (ggml_cuda_rows_to_host,
+sync == false) issues one 1-D copy per row.  Under -sm tensor a KV cache is
+split by columns, so the batched state save (llama_io_write_host::flush_async,
+used for states up to LLAMA_STATE_ASYNC_MAX_MIB) reads every cell of every
+K/V tensor as its own copy on each device: a 4.4K-token prompt-cache save
+(174 MiB) takes 317-361 ms.
+
+For blocks of 64 rows or more, still queued and never synchronizing:
+- the device that allocated the pinned destination (hipPointerGetAttributes)
+  issues one 2-D D2H, the r362 copy; no peer grant is involved.  A refused
+  call queues nothing: the arm is turned off for that device (one warning)
+  and the gather below runs (GGML_CUDA_ROWS_OWNER_2D=0: off);
+- any other device gathers the rows into its own 16 MiB device staging
+  (ggml_cuda_cpy_2d_rows), copies each chunk 1-D into its own pinned bounce
+  and scatters it into the destination from cudaLaunchHostFunc.  One staging
+  pair per (device, stream); stream order makes each chunk's gather/D2H wait
+  for the previous scatter, and a later event / synchronize for the last.
+Without the staging pair the per-row copies stay.  No 2-D D2H into pinned
+memory another device owns is issued (the r364 rule).
+
+Stock r366, -sm tensor -c 65536, Flash-Next IQ3_XXS: 4.4K-token saves
+317-361 -> 13-52 ms, same restored replies.  A HIP probe on both gfx1201
+devices: work queued after a host callback, hipEventSynchronize and
+hipStreamSynchronize all wait for the callback to return.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 116 ++++++++++++++++++++++++++++++++
+ 1 file changed, 116 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 72fadf2250..5eea8600b6 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3771,6 +3771,94 @@ static char * ggml_cuda_kv_region_dev_stage(int device, size_t need, std::unique
+ //   * one 1-D copy per row otherwise: the ASYNC form, which must not synchronize (the caller batches many reads
+ //     behind one backend synchronize), and the small block the staging pair would only slow down.
+ // `GGML_CUDA_BOUNCE_MIN=0` keeps the per-row arm selectable, as it does for the pageable bounce.
++// GGML_CUDA_ROWS_ASYNC_GATHER (on unless 0; FINDINGS 1160-1161): the ASYNC row-block read below issues one 1-D copy
++// per row, which for a -sm tensor prompt-cache save of a column-split KV cache is one copy per cell per tensor per
++// device (~820K copies, 1.3 s, for 17K tokens; 17-20 s for a 2 GB agent save).  Two queued forms that keep the
++// r364 rule (no 2-D D2H into pinned memory another device owns) and never synchronize:
++//  * the destination's OWNER issues the block as one 2-D D2H (the r362 copy; no peer grant is involved -- the
++//    owner's twin copy is the one that succeeded in the r364 measurement).  GGML_CUDA_ROWS_OWNER_2D=0: off.
++//  * any other device gathers the rows on the device into its own staging buffer, copies each chunk 1-D into its
++//    own pinned bounce, and scatters the chunk on the host from a stream callback.  Everything is queued on the
++//    caller's stream, so the next chunk's gather/D2H waits for the previous scatter and one staging pair per
++//    (device, stream) is enough; a later event or synchronize on the stream covers the scatter.
++static bool ggml_cuda_rows_async_gather() {
++    static const bool v = [] { const char * e = getenv("GGML_CUDA_ROWS_ASYNC_GATHER"); return e == nullptr || atoi(e) != 0; }();
++    return v;
++}
++static bool ggml_cuda_rows_owner_2d() {
++    static const bool v = [] { const char * e = getenv("GGML_CUDA_ROWS_OWNER_2D"); return e == nullptr || atoi(e) != 0; }();
++    return v;
++}
++
++// the device that allocated a pinned host pointer, -1 when unknown (pageable, or no pointer attributes)
++static int ggml_cuda_host_ptr_owner(const void * ptr) {
++#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
++    cudaPointerAttributes attr;
++    if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return -1;
++    }
++    return attr.type == cudaMemoryTypeHost ? attr.device : -1;
++#else
++    GGML_UNUSED(ptr);
++    return -1;
++#endif
++}
++
++static constexpr size_t ggml_cuda_rows_async_chunk = 16ull << 20;
++
++struct ggml_cuda_rows_async_pair {
++    char * dev = nullptr;   // device staging (the gathered chunk)
++    char * pin = nullptr;   // pinned bounce allocated by this device
++    bool   failed = false;
++};
++
++// one staging pair per (device, stream), allocated on first use and kept for the process lifetime; nullptr if it
++// cannot be allocated (the caller keeps the per-row copies)
++static ggml_cuda_rows_async_pair * ggml_cuda_rows_async_pair_get(int device, cudaStream_t stream) {
++    static std::mutex mutex;
++    static std::map<std::pair<int, cudaStream_t>, ggml_cuda_rows_async_pair> pairs;
++    std::lock_guard<std::mutex> lock(mutex);
++    ggml_cuda_rows_async_pair & p = pairs[{device, stream}];
++    if (p.failed) {
++        return nullptr;
++    }
++    if (p.dev == nullptr) {
++        if (cudaMalloc(&p.dev, ggml_cuda_rows_async_chunk) != cudaSuccess) {
++            (void) cudaGetLastError();
++            p.dev = nullptr; p.failed = true;
++            GGML_LOG_WARN("%s: device %d: no %zu MiB staging for async row-block reads; they stay one copy per row\n",
++                          __func__, device, ggml_cuda_rows_async_chunk >> 20);
++            return nullptr;
++        }
++        if (cudaMallocHost(&p.pin, ggml_cuda_rows_async_chunk) != cudaSuccess) {
++            (void) cudaGetLastError();
++            (void) cudaFree(p.dev);
++            p.dev = nullptr; p.pin = nullptr; p.failed = true;
++            GGML_LOG_WARN("%s: device %d: no %zu MiB pinned bounce for async row-block reads; they stay one copy per row\n",
++                          __func__, device, ggml_cuda_rows_async_chunk >> 20);
++            return nullptr;
++        }
++    }
++    return &p;
++}
++
++struct ggml_cuda_rows_scatter {
++    char *       dst;
++    const char * pin;
++    size_t       size;
++    size_t       n;
++    size_t       stride_data;
++};
++
++static void ggml_cuda_rows_scatter_fn(void * user_data) {
++    ggml_cuda_rows_scatter * sc = (ggml_cuda_rows_scatter *) user_data;
++    for (size_t e = 0; e < sc->n; ++e) {
++        memcpy(sc->dst + e * sc->stride_data, sc->pin + e * sc->size, sc->size);
++    }
++    delete sc;
++}
++
+ static void ggml_cuda_rows_to_host(int device, const char * src, void * data, size_t size, size_t n_copies,
+         size_t stride_tensor, size_t stride_data, cudaStream_t stream, bool sync) {
+     if (n_copies == 0 || size == 0) {
+@@ -3818,6 +3906,34 @@ static void ggml_cuda_rows_to_host(int device, const char * src, void * data, si
+             return;
+         }
+     }
++    if (!sync && n_copies >= 64 && ggml_cuda_rows_async_gather()) {
++        // a refused 2-D copy (owner mis-reported, or a source VA one 2-D copy cannot cover) queues nothing: turn the
++        // arm off for this device and take the gather below
++        static std::atomic<bool> owner_2d_off[GGML_CUDA_MAX_DEVICES] = {};
++        if (ggml_cuda_rows_owner_2d() && !owner_2d_off[device].load(std::memory_order_relaxed) &&
++                ggml_cuda_host_ptr_owner(data) == device) {
++            const cudaError_t err = cudaMemcpy2DAsync(data, stride_data, src, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, stream);
++            if (err == cudaSuccess) {
++                return;
++            }
++            (void) cudaGetLastError();
++            owner_2d_off[device].store(true, std::memory_order_relaxed);
++            GGML_LOG_WARN("%s: device %d: owner 2-D row-block read refused (%s); gathering on the device from now on\n",
++                          __func__, device, cudaGetErrorString(err));
++        }
++        ggml_cuda_rows_async_pair * p = size <= ggml_cuda_rows_async_chunk ? ggml_cuda_rows_async_pair_get(device, stream) : nullptr;
++        if (p != nullptr) {
++            const size_t rows = ggml_cuda_rows_async_chunk / size;
++            for (size_t e0 = 0; e0 < n_copies; e0 += rows) {
++                const size_t n = std::min(rows, n_copies - e0);
++                ggml_cuda_cpy_2d_rows(p->dev, src + e0 * stride_tensor, size, n, stride_tensor, size, stream);
++                check(cudaMemcpyAsync(p->pin, p->dev, n * size, cudaMemcpyDeviceToHost, stream));
++                ggml_cuda_rows_scatter * sc = new ggml_cuda_rows_scatter{ (char *) data + e0 * stride_data, p->pin, size, n, stride_data };
++                check(cudaLaunchHostFunc(stream, ggml_cuda_rows_scatter_fn, sc));
++            }
++            return;
++        }
++    }
+     for (size_t e = 0; e < n_copies; ++e) {
+         check(cudaMemcpyAsync((char *) data + e * stride_data, src + e * stride_tensor, size, cudaMemcpyDeviceToHost, stream));
+     }
+-- 
+2.53.0
+

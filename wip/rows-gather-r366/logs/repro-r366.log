@@ -1,0 +1,72 @@
+# row-block gather + state-copy rounds, repro on stock r366 (prg.sh / rndrep2.py), 2026-11-26
+# stock = stew-r366 e10879b0b3 (v18-919794500-r366); G = stock + 0001 (43f071f9bf); GR = + 0002 (23a1219a44; the posted 0002 is 939a0817eb, one code comment reworded)
+
+### build prg366 rc=0 10:20 AM fb9b26893f
+### build prgr366 rc=0 10:26 AM 3cf713e1e9
+=== S short 10:26 AM r366 
+   A        wall  2273.3 ms | prompt  4439 tok  1876.5 ms | sha 39a0c988dad9
+   B        wall  1983.9 ms | prompt  4355 tok  1227.7 ms | sha 4291ad4ba0a2
+   A again  wall   752.9 ms | prompt     4 tok    32.9 ms | sha 39a0c988dad9
+   B again  wall   744.9 ms | prompt     4 tok    31.3 ms | sha 4291ad4ba0a2
+   state sizes: 174.210 175.390 MiB
+   saves (ms): 361.21 317.44 316.98 
+   restores (ms): 19.50 15.13 
+   faults 0
+=== G short 10:27 AM prg366 
+   A        wall  2279.4 ms | prompt  4439 tok  1880.8 ms | sha 39a0c988dad9
+   B        wall  1674.7 ms | prompt  4355 tok  1227.9 ms | sha 4291ad4ba0a2
+   A again  wall   451.9 ms | prompt     4 tok    32.1 ms | sha 39a0c988dad9
+   B again  wall   440.2 ms | prompt     4 tok    30.1 ms | sha 4291ad4ba0a2
+   state sizes: 174.210 175.390 MiB
+   saves (ms): 51.64 17.58 12.56 
+   restores (ms): 18.76 14.94 
+   faults 0
+=== GR short 10:27 AM prgr366 
+   A        wall  2272.7 ms | prompt  4439 tok  1874.9 ms | sha 39a0c988dad9
+   B        wall  1678.4 ms | prompt  4355 tok  1230.5 ms | sha 4291ad4ba0a2
+   A again  wall   452.6 ms | prompt     4 tok    31.7 ms | sha 39a0c988dad9
+   B again  wall   439.9 ms | prompt     4 tok    30.1 ms | sha 4291ad4ba0a2
+   state sizes: 174.210 175.390 MiB
+   saves (ms): 53.10 17.37 13.11 
+   restores (ms): 20.87 14.65 
+   faults 0
+=== S long 10:28 AM r366 
+   A        wall  5552.1 ms | prompt 17100 tok  5129.3 ms | sha fde687728085
+   B        wall  4696.1 ms | prompt 16104 tok  4177.7 ms | sha 0d305f598f4e
+   A again  wall   557.9 ms | prompt     4 tok    34.4 ms | sha fde687728085
+   B again  wall   563.1 ms | prompt     4 tok    34.5 ms | sha 0d305f598f4e
+   state sizes: 339.322 353.319 MiB
+   saves (ms): 57.07 55.02 51.24 
+   restores (ms): 48.71 47.06 
+   faults 0
+=== G long 10:29 AM prg366 
+   A        wall  5580.2 ms | prompt 17100 tok  5156.5 ms | sha fde687728085
+   B        wall  4714.4 ms | prompt 16104 tok  4193.6 ms | sha 0d305f598f4e
+   A again  wall   559.7 ms | prompt     4 tok    34.8 ms | sha fde687728085
+   B again  wall   566.3 ms | prompt     4 tok    35.0 ms | sha 0d305f598f4e
+   state sizes: 339.322 353.319 MiB
+   saves (ms): 57.35 55.23 50.82 
+   restores (ms): 49.47 47.55 
+   faults 0
+=== GR long 10:29 AM prgr366 
+   A        wall  5590.3 ms | prompt 17100 tok  5167.7 ms | sha fde687728085
+   B        wall  4743.7 ms | prompt 16104 tok  4203.3 ms | sha 0d305f598f4e
+   A again  wall   546.9 ms | prompt     4 tok    34.2 ms | sha fde687728085
+   B again  wall   536.9 ms | prompt     4 tok    34.2 ms | sha 0d305f598f4e
+   state sizes: 339.322 353.319 MiB
+   saves (ms): 80.77 34.33 28.43 
+   restores (ms): 56.42 40.45 
+   faults 0
+=== GRV long 10:30 AM prgr366 -e LLAMA_STATE_ROUNDS_VERIFY=1
+   A        wall  5583.9 ms | prompt 17100 tok  5161.4 ms | sha fde687728085
+   B        wall  4874.1 ms | prompt 16104 tok  4205.2 ms | sha 0d305f598f4e
+   A again  wall   659.5 ms | prompt     4 tok    34.6 ms | sha fde687728085
+   B again  wall   657.2 ms | prompt     4 tok    35.3 ms | sha 0d305f598f4e
+   state sizes: 339.322 353.319 MiB
+   saves (ms): 205.05 150.24 148.48 
+   restores (ms): 53.59 41.35 
+   log: state rounds verify: 109 windows in 2 rounds, 0 differ
+   log: state rounds verify: 109 windows in 2 rounds, 0 differ
+   log: state rounds verify: 109 windows in 2 rounds, 0 differ
+   faults 0
+### prg DONE 10:31 AM
