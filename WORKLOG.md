@@ -16,6 +16,61 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261128.011 -- PR #383 (the fair-share rotation restart) is REJECTED as superseded by r373, and issue #384's verify-band report is assessed: its 9-row boundary is confirmed, its per-type claim is not
+
+**Why.**  Two contributor reports on the same question (may the same tokens produce the same values in one server) were
+assessed together on `v18-919794500-r378`, gfx1201 / ROCm 10.2 / Linux.  **PR #383** (`wip/prefill-fair-restart` by
+@overdoingism): `share_prompt_budget()` advances `slot_next` on every step and never resets it, so "the same two-prompt
+request gives different greedy replies from one request to the next in one server".  **Issue #384** (same author): with
+`--parallel 2 --kv-unified` and speculation, 9..16-row verify ubatches give every token other numbers than the slot alone.
+
+**PR #383 — rejected, and the patch is inert on the current tree.**  The diagnosis is correct for the tree it was
+measured on (**r368**) and that tree is ten revisions stale: **r373 (PR #376) removed the mechanism**.  The share's pass
+divided the RUNNING `budget` instead of `budget_before`, so with two prompting slots and a 2048 window the one-token floor
+left 2046, the rotated-order leader took 1023 and the trailer 511, and the pass closed at **1365 / 682**, alternating with
+`slot_next`.  That alternation IS the PR's period-2 table (`4224` `d988` `4224`): a request starting at the other parity
+gets a different per-step chunk WIDTH for both prompts and MMVQ/MMQ tile boundaries land on a near-tie.  Since r373 a pass
+gives every remaining slot `budget_before / n_active`, so the split is **1024 / 1024 on every step wherever the rotation
+is** (measured: a `-lv 5` census added to `share_prompt_budget()` reads `1024 1024` on every prefill step of three
+requests, `slot_next` = 0, 1, 0 at their starts), and with `LLAMA_SERVER_PREFILL_SKEW = 1` the walk is order-invariant by
+construction (equal shares per pass; the leaving set is decided by `remaining`, not by position; so the residual budget is
+order-independent too).  End to end on 27B UD-Q4_K_XL, `-np 2 --kv-unified -c 65536 -ub 2048 -ctk/-ctv q8_0 -fa on`,
+`DUTY=1`, `ROCBLAS_USE_HIPBLASLT=0`, one `/completion` carrying two prompts (10879 + 5246 tokens), greedy,
+`cache_prompt: false`, 640 tokens each, three times to ONE server: r378 reads `41a0c021` / `7d1428e1` three times, and
+**r378 + the PR's patch reads the same two hashes bit for bit** — the change moves nothing (it applies cleanly, offset 26
+lines, so applicability is not the issue).  Its one remaining input was forced: `SKEW=4`, two IDENTICAL prompts,
+`n_predict 65` so the parity flips — splits 1637/410, then 410/1637, then 1637/410, and **identical text**, because the
+two splits are mirror images of the same per-step amounts (a token's value follows the width it computes in, not the rows
+that precede it).  Reply posted on the PR with what a revived submission needs (re-cut on the current `release.json` tree,
+the `share split` census as evidence, an end-to-end effect; `scripts/gate-prefill-fairness.sh` owns this class).  Credit
+register: nothing ships, so nothing is owed.
+
+**Issue #384 — the boundary is documented doctrine, and two of its claims are corrected by measurement.**  `GREEDY-PURITY.md`
+§11 already records `W = 1..8` as one logits class and `W = 9..16` as another (27B UD-Q4_K_XL, 2026-09-13, FA off too),
+names Cause B (the FA tile->WMMA switch at `Q->ne[1] > 8`, the `mmvq`->`MMQ` switch at `ncols == 8`), and §63 already says a
+two-slot co-batched pair is not a determinism statement; `LLAMA_SPEC_ALIGN_WIDTH_BAND` (16) aligns two sequences' verify
+batches BY DESIGN, and `INVARIANTS.md` r377 records the arrival-timing dependence of a two-request pair.  The kernel switch
+is upstream's, so it is not a regression this delivery introduced.  Two claims were measured on r378 with a new op-level
+per-column probe (12 quantized types, N = 1..16, each column compared bitwise against the same column computed alone):
+
+* **"every type differs at 9..16, and q4_1 / q5_1 already differ at <= 8" — NOT reproduced.**  At `M x K` = 512x4096,
+  512x2560, 5120x2560 and 13824x5120, `N = 1..8` is **bit-identical to N = 1 for every one of q4_0/q4_1/q5_0/q5_1/q8_0/
+  q2_K/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs**, and the first difference is **N = 9** — so q4_1/q5_1 are IN-BAND PURE here.
+* **"9..16 always differs" — the boundary is per layer and shape.**  The default-on dense MMVQ band keeps a quantized
+  weight whose output-row count is not a multiple of 128 on MMVQ up to `ne11 = 16` (`MMVQ_MOE_MAX_BATCH_SIZE`), so
+  `N = 1..16` is ONE class at `M x K` = 100x4096 and 32x4096, and `GGML_CUDA_DISABLE_MMVQ_DENSE_BAND=1` restores the N = 9
+  boundary on the same shape.  A whole-model 9..16 step is still impure as soon as ONE layer has a 128-multiple row count,
+  which is what the issue's layer-1 observation is.  `GREEDY-PURITY.md` §11's caveat list now carries this.
+
+The issue's proposed "fix by halves" (+10.6 % on the two-prompt request, +0.5 % single-slot) is the right shape of number
+for what an extension to 16 would cost, and the wide band exists because it is MMQ/WMMA: a single-pass 9..16-column kernel
+that keeps each column's summation order is the interesting form, and the property it would buy is two-slot determinism —
+which §63 explicitly does not sell.  Investigation results posted on the issue.
+
+**Record.**  `wip/batch-composition-determinism/` (README, `fair-share-repeat.py`, `mulmat-width-probe.cpp`) + its row in
+`wip/CAMPAIGNS.md`; `GREEDY-PURITY.md` §11 (the dense-band caveat); no `patches/` change, no block, no knob, no gate change,
+no release.  `release.json` and the tag set are untouched.
+
 ## 261128.010 (r378 follow-up) -- the Q5_K VDR-4 flag's RDNA4 half is measured (it stays off), and one shape is recorded as a measurement trap
 
 **Why.**  `ENVIRONMENT.md` §14's `-DGGML_HIP_RDNA4_Q5K_DENSE_VDR4` row still said "Unmeasured on RDNA4 (this repo has

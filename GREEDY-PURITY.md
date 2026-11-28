@@ -249,7 +249,13 @@ keeping: the FA chooser divides by `ncols2` (`Q->ne[1] <= 16/ncols2` and friends
 per-type MMVQ caps differ (NVIDIA's Ada/Blackwell tables return less than `MMVQ_MAX_BATCH_SIZE`), so "8 rows"
 is a measurement on the validated head shapes, not a shape-independent theorem; and do not reason "the next
 token is re-sampled at W=1 so depth+1 is safe", because the mismatch row's token is emitted before any
-re-sample happens.
+re-sample happens.  **The delivery's own dense MMVQ band moves the boundary out to 16 columns for a weight
+whose output-row count is not a multiple of 128** (RDNA4/RDNA3_5, `ggml_cuda_should_use_mmvq()` declines the
+shape and the band takes it, `ne11 <= MMVQ_MOE_MAX_BATCH_SIZE = 16`): measured 2026-11-28 with an op-level
+per-column probe (`wip/batch-composition-determinism/`), `N = 1..16` is ONE numerics class at `M x K` =
+100x4096 and 32x4096, and `GGML_CUDA_DISABLE_MMVQ_DENSE_BAND=1` restores the `N = 9` boundary on the same shape
+(`WORKLOG.md` 261128.011).  The boundary is therefore **per layer, not per model**: one layer drawn from the
+band is enough to make a whole-model W=9..16 step impure, which is what the 27B measurement above reads.
 
 **Rules.**  Establish a boundary with the **raw-logit probe, not the text gate** -- text equality is
 evidence *for* purity, never *against* divergence, because near-ties are rare.  Above the range, gate on
