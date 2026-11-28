@@ -729,14 +729,23 @@ available" deferral uses — one deferral path, one counter), and the startup li
 | variable | default | class | what it does |
 |---|---|---|---|
 | `LLAMA_SERVER_KV_ADMIT` | unset (**on**) | **kill switch** | `0` restores the pre-r365 server exactly: every request that finds a free slot is launched, whether or not its prompt fits beside the slots that are running, and two prompts whose sum exceeds the context answer HTTP 500 once the cache is full (the retry loop can only clear **idle** slots, so it halves `n_batch` to 1 and fails a running slot mid-generation).  Set it to bisect this class, or to run a server whose clients are expected to fit their own prompts.  Without a unified KV cache the whole path is inert (`--no-kv-unified`, or `-np N` with `N > 1`, which does not unify unless asked), because a per-slot cache cannot have slots take each other's cells. |
-| `LLAMA_SERVER_KV_ADMIT_RESERVE` | see [`ENVIRONMENT.md`](ENVIRONMENT.md) §29 | tuning | `0` makes admission depend on the prompts alone (the documented limit: two admitted replies can then grow into each other and fail as before); a small value admits more concurrency at the same risk. |
+| `LLAMA_SERVER_KV_ADMIT_RESERVE` | see [`ENVIRONMENT.md`](ENVIRONMENT.md) §29 | tuning | `0` makes admission depend on the prompts alone (a small value admits more concurrency and protects less). |
+| `LLAMA_SERVER_KV_FULL_STOP` | unset (**on**) | **kill switch** | The last resort *after* admission (r377, contributor PR #372): before each step the generating slots' next tokens (1, plus the draft for a speculating slot) must fit the free cells — idle slots are saved and cleared first, and if that is not enough the generating slot that has generated the most ends with `truncated: true` and `stop_type: "limit"` (`finish_reason: "length"`; in a stream, every delta has already been sent), and the step's prompt tokens are capped to the cells left, so the batch fits and is never split.  `0` restores the r376 behaviour exactly: the cache fills, the decode retry can only clear **idle** slots, and it halves `n_batch` until a running request answers HTTP 500 "Context size has been exceeded." — or, with a speculator, "speculative batch index N is not inside the current sub-batch".  Inert without a unified KV cache, and also inert while the cache has room.  **It is not gated by `LLAMA_SERVER_KV_ADMIT`**: it is useful precisely with admission off, and then (two prompts whose sum exceeds the context) the reply that loses is the one that started last. |
+
+The startup line `KV full stop: on, a reply that no longer fits the cache ends with a length stop` states the arm
+(absent with the kill switch or without a unified cache); each cut is one WARN with the numbers (`KV cache full
+(16384 of 16384 cells held, 2 needed this step): ending the reply with a length stop after 2962 generated tokens`).
 
 Accepted limitations (recorded, not bugs): a request with `n > 1` completions (a parent task) and a request whose
-prompt alone exceeds the context are **not** checked; the reserve does not bound a reply that outgrows it; and at a
-small context the reserve makes concurrent prompts take turns rather than overfill the cache.
+prompt alone exceeds the context are **not** checked by admission — and the full stop is skipped while an `n > 1`
+parent or child is processing (they share prefix cells through `seq_cp`), so such a request still falls back to the
+HTTP 500; at a small context the reserve makes concurrent prompts take turns rather than overfill the cache; and,
+with `LLAMA_SERVER_KV_ADMIT=0`, a pair of prompts that together exceed the context now answers one truncated reply
+plus one complete reply instead of two 500s — the truncated one can be very short (measured: 17 tokens) because the
+prompt that keeps prefilling holds the cells.
 
 Gate: `scripts/gate-kv-admit.sh` (`MANIFESTS.md` gate 46) — its `--self-test` runs every arm with
-`LLAMA_SERVER_KV_ADMIT=0` and requires the gate to fail.
+`LLAMA_SERVER_KV_ADMIT=0` **and** `LLAMA_SERVER_KV_FULL_STOP=0` and requires the gate to fail.
 
 ---
 

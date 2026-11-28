@@ -78,7 +78,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh --include-beta .   # 19 default bl
 ### Releases
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
-(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v18-919794500-r376`**; the block
+(the tag is the release identity: `v<blocks>-<fork-point>-r<N>`, e.g. **`v18-919794500-r377`**; the block
 count in the tag is the **official** `00xx` count, so `v15-*` tags are the 15-block releases up to r177,
 `v16-*` the 16-official-block releases from r178 on, and `v18-*` the current 18.  The temporary `0300` and
 the optional `01xx` blocks are never counted (`AGENTS.md`).  `r1` is the
@@ -216,7 +216,7 @@ HIP_VISIBLE_DEVICES=0,1,2 ./build/bin/llama-cli -m <model> -ngl 99 -sm tensor -m
 
 > **Or skip steps 1-3.**  The release's prebuilt ROCm **7.14.1** and **10.2** images already carry the applied
 > tree (`ghcr.io/stew675/llama-cpp-rdna-boosts`: `server-rocm-<ver>`, plus the immutable
-> `-<fork-point>` and `-<release>` tags, e.g. `server-rocm-10.2-v18-919794500-r376`).  Tags, provenance labels,
+> `-<fork-point>` and `-<release>` tags, e.g. `server-rocm-10.2-v18-919794500-r377`).  Tags, provenance labels,
 > the RDNA2/`gfx1150` caveats and the off-host build: [`CONTAINERS.md`](CONTAINERS.md).
 >
 > **Put `ccache` on PATH and pass the launchers** (`-DCMAKE_HIP_COMPILER_LAUNCHER=ccache`, the `C` and

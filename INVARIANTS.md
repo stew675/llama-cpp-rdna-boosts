@@ -4172,3 +4172,26 @@ fallback's new meaning) and `DIAGNOSTIC.md` §28 (`MOE_EXPERT_CACHE_TABLES` is r
   whose only change here is this row CAN be attributed exactly.  Decode never reaches MMB (`mmb_min_t`).
   `GGML_CUDA_MMB_CFG=1`'s dump prints the arch TABLE and not the env overrides, so the proof the routed path ran
   is `GGML_CUDA_MMB_LOG=1`'s `MMB_GLU fused` line (2 lines with the routed arm, 0 without).
+
+* **r377 -- a unified KV cache's occupied cells are the SUM of the slots' `prompt.n_tokens()`, and the free cells are
+  `llama_n_ctx() - that sum`; two CO-BATCHED requests are not a reproducible TEXT oracle.**  (block 16, contributor
+  PR #372.)  The server's own accounting is exact enough to decide "will this step fit" before the batch is built, and
+  that is what the KV full stop uses: `-c 16384` with two 5246-token prompts leaves 5892 cells, and the cache really
+  fills at 16384 held cells (`full` arm: the cut fires at 2963 + 2929 generated, and the stock build answers 500).
+  Two facts to reuse, neither documented elsewhere:
+  1. **A two-request pair's text depends on ARRIVAL TIMING, not on the server's configuration.**  Measured over a
+     stagger sweep (0.05 / 0.2 / 0.6 / 1.5 s) on Qwen3.5-4B-Q8_0 at `-c 16384 -np 4 -kvu` with `id_slot` pinned: each
+     FIXED timing reproduces its pair of hashes exactly across fresh servers, and the pair MOVES when the timing moves
+     (0.05 s and 0.2 s agree; 0.6 s and 1.5 s each give a different pair).  A first-token barrier (start request 1
+     only after request 0's first delta) does not fix it either.  So `GREEDY-PURITY.md` §38/§63's ban on a
+     concurrent-server text oracle extends to the gate: `gate-kv-admit.sh`'s full-stop arms assert the behaviour, the
+     census and the cut's token count IN RUN, and its byte-exact-prefix evidence is a hand measurement at one `-c`
+     (the truncated reply was a 9395/9395-char prefix of the same pair decoded 64 tokens short, and the reply that
+     survived was byte-identical to it).
+  2. **The cells fought over at the boundary are within ~64 tokens of the cut**, so a reference arm meant to reproduce
+     a truncated reply's prefix must stop at least that far below the cut: at `cut - 8` the reference arm itself takes
+     the stock decode retry and its text moves.
+  Limits of the full stop itself (recorded, not bugs): it is skipped while an `n_cmpl` parent/child processes (shared
+  prefix cells would be double-counted), it cannot help a request whose PROMPT alone exceeds the context, and with
+  `LLAMA_SERVER_KV_ADMIT=0` the reply that loses is the one that started last (17 tokens in one measured arm) because a
+  still-prefilling prompt keeps its cells.

@@ -789,14 +789,21 @@ in turn, and it produces the same tokens as when it runs alone.
 
 | variable | default | class | what it does |
 |---|---|---|---|
-| `LLAMA_SERVER_KV_ADMIT_RESERVE` | `min(n_ctx / n_parallel, n_ctx_slot())` cells | tuning | The reply space the admission charges for **each** admitted request: a request is admitted when every running slot's held cells plus this prompt, plus a reserve for every one of them, still fit the context.  The default is the per-sequence share a non-unified cache would have given each slot — so a unified cache admits as many concurrent requests as its slots were promised room for, and the one that could not finish its reply beside the others is the one that waits.  A request's own `n_predict` caps its reserve (`n_predict: 32` reserves 32 cells), and `-1` reserves the whole share.  It is an **admission heuristic, not a bound**: replies that grow past their reserves can still fill the cache and fail as before.  Smaller values admit more concurrent work and protect less; `0` admits on the prompts alone. |
+| `LLAMA_SERVER_KV_ADMIT_RESERVE` | `min(n_ctx / n_parallel, n_ctx_slot())` cells | tuning | The reply space the admission charges for **each** admitted request: a request is admitted when every running slot's held cells plus this prompt, plus a reserve for every one of them, still fit the context.  The default is the per-sequence share a non-unified cache would have given each slot — so a unified cache admits as many concurrent requests as its slots were promised room for, and the one that could not finish its reply beside the others is the one that waits.  A request's own `n_predict` caps its reserve (`n_predict: 32` reserves 32 cells), and `-1` reserves the whole share.  It is an **admission heuristic, not a bound**: replies that grow past their reserves are ended by the full stop below instead of failing.  Smaller values admit more concurrent work and protect less; `0` admits on the prompts alone. |
 
 The startup line `KV admission: on, reserve = N cells/request, unified = true` states the configuration each run
 used, and every refusal is one INFO line with the numbers (`KV admission: task 2 needs 4884 cells, 1 running
 slot(s) hold 4887 of 8192; deferred until a slot is released`) — the non-vacuity reading for any A/B on this path.
+
+**A reply that outgrows its reserve does not fail (r377).**  Admission is a pre-launch veto, so the reserve cannot
+bound a reply; the KV full stop ends the reply that has generated the most with a length stop (`truncated: true`,
+`finish_reason: "length"`) once the cache is full, and the others finish.  The startup line
+`KV full stop: on, a reply that no longer fits the cache ends with a length stop` states the arm.
+
 Gate: `scripts/gate-kv-admit.sh` (`MANIFESTS.md` gate 46).
 
-*The kill switch (and why turning it off is the pre-r365 behaviour) is in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §29.*
+*The kill switches (and why turning one off is the pre-r365 / pre-r377 behaviour) are in
+[`DIAGNOSTIC.md`](DIAGNOSTIC.md) §29.*
 
 ---
 

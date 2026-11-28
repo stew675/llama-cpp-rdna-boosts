@@ -125678,7 +125678,7 @@ index 911bb31d7..ce6c588c6 100644
  json oaicompat_completion_params_parse(const json & body);
  
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index bfade25d7..236b6b42a 100644
+index bfade25d7..0fa463667 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -307,6 +307,14 @@ struct server_slot {
@@ -125743,7 +125743,7 @@ index bfade25d7..236b6b42a 100644
      }
  
      json to_json(bool only_metrics = false) const {
-@@ -1131,8 +1165,276 @@ private:
+@@ -1131,8 +1165,296 @@ private:
  
      int n_empty_consecutive = 0;
  
@@ -125847,11 +125847,31 @@ index bfade25d7..236b6b42a 100644
 +    // finish its reply beside the others is the one that waits.  A request's own n_predict caps its reserve further
 +    // (`n_predict: 32` reserves 32 cells, not a whole share); -1 ("as many as the context allows") reserves in full.
 +    // The reserve is an ADMISSION heuristic, not a bound: a reply that grows past it can still fill the cache and
-+    // fail the way it did before (the accepted limitation in MANIFESTS.md's block-16 row).
++    // fail the way it did before -- unless the reply is ended first, below.
 +    int32_t kv_admit_reserve = [] {
 +        const char * e = getenv("LLAMA_SERVER_KV_ADMIT_RESERVE");
 +        return e == nullptr ? -1 : std::max(0, atoi(e));
 +    }();
++
++    // LLAMA_SERVER_KV_FULL_STOP (on unless 0): with a unified KV cache, a reply that outgrows its admission reserve
++    // no longer fails the decode.  Before a step, the generating slots' next tokens (1 + the draft) must fit in the
++    // free cells: idle slots are cleared first, and if that is not enough the generating slot that has generated the
++    // most ends with a length stop (finish_reason "length"; every token it produced was already sent).  The step's
++    // prompt tokens are capped to the cells left after that (idle slots' cells count as room: the decode retry clears
++    // them), so the batch fits and is not split below the MTP verify width -- the split is what raised the exceptions.
++    // Without it a reply that outgrew its reserve answered HTTP 500 "Context size has been exceeded." when the cache
++    // filled, and with a speculator "speculative batch index N is not inside the current sub-batch" (the limit the
++    // KV admission above leaves: it is a PRE-LAUNCH veto and a reply can grow past its reserve; contributor PR #372).
++    // A prompt still prefilling keeps the cells it holds: when its next chunk leaves no room for the decode tokens,
++    // the next step ends a reply (so with LLAMA_SERVER_KV_ADMIT=0 the reply that loses is the one that started last).
++    // Off while an n_cmpl parent or child is processing (they share their prefix cells through seq_cp, which the
++    // per-slot count would double), so such a request falls back to the retry path above.
++    const bool kv_full_stop = [] {
++        const char * e = getenv("LLAMA_SERVER_KV_FULL_STOP");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    // cells left for this step's prompt tokens after the generating slots (-1: no cap)
++    int64_t kv_free_step = -1;
 +
 +    // LLAMA_SERVER_LAZY_IDLE_SLOTS (on unless 0): with a unified KV cache, an idle slot keeps its context when a new task
 +    // starts and is saved to the prompt cache and cleared only once the KV cache runs out of room, so conversations that
@@ -126020,7 +126040,7 @@ index bfade25d7..236b6b42a 100644
      server_metrics metrics;
  
      // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
-@@ -1221,6 +1523,32 @@ private:
+@@ -1221,6 +1543,32 @@ private:
  
      // load the model and initialize llama_context
      // this may also be called to resume from sleeping state
@@ -126053,7 +126073,7 @@ index bfade25d7..236b6b42a 100644
      bool load_model(common_params & params) {
          load_progress_data load_progress_text  (this, "text_model");
          load_progress_data load_progress_mmproj(this, "mmproj_model");
-@@ -1233,11 +1561,11 @@ private:
+@@ -1233,11 +1581,11 @@ private:
          params_base.n_outputs_max = output_limits.total;
          params_base.n_outputs_max_per_seq = output_limits.per_seq;
  
@@ -126069,7 +126089,7 @@ index bfade25d7..236b6b42a 100644
          const bool has_spec = has_draft || spec_mtp;
  
          if (callback_state) {
-@@ -1323,7 +1651,7 @@ private:
+@@ -1323,7 +1671,7 @@ private:
              params_base.load_progress_callback_user_data = &load_progress_text;
          }
  
@@ -126078,7 +126098,7 @@ index bfade25d7..236b6b42a 100644
  
          model_tgt = llama_init->model();
          ctx_tgt   = llama_init->context();
-@@ -1363,7 +1691,7 @@ private:
+@@ -1363,7 +1711,7 @@ private:
                  params_dft.load_progress_callback           = load_progress_callback;
                  params_dft.load_progress_callback_user_data = &load_progress_spec;
  
@@ -126087,7 +126107,7 @@ index bfade25d7..236b6b42a 100644
                  model_dft = spec_init->model();
                  ctx_dft   = spec_init->context();
  
-@@ -1508,6 +1836,28 @@ private:
+@@ -1508,6 +1856,34 @@ private:
          SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                  params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
  
@@ -126104,6 +126124,12 @@ index bfade25d7..236b6b42a 100644
 +        SRV_INF("KV admission: %s, reserve = %d cells/request, unified = %s\n",
 +                kv_admit ? "on" : "off", kv_admit_reserve, params_base.kv_unified ? "true" : "false");
 +
++        // LLAMA_SERVER_KV_FULL_STOP: the last resort when a reply outgrows its reserve anyway.  Printed because the
++        // behaviour it replaces is an HTTP 500, so a log has to say which arm ran; inert without a unified cache.
++        if (kv_full_stop && params_base.kv_unified) {
++            SRV_INF("%s", "KV full stop: on, a reply that no longer fits the cache ends with a length stop\n");
++        }
++
 +        // the prompt admission policy, so a log always says which one ran (wip/session-scheduling)
 +        // `chunk` is the cap on a step that carries decode work; a step with no decoder waiting takes the
 +        // whole window (`no-decode = n_batch`), which is why the chunk is not a throughput setting.
@@ -126116,7 +126142,7 @@ index bfade25d7..236b6b42a 100644
          // initialize slots
          for (int i = 0; i < params_base.n_parallel; i++) {
              slots.emplace_back();
-@@ -1767,9 +2117,22 @@ private:
+@@ -1767,9 +2143,22 @@ private:
                  /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                  /* media_path            */ params_base.media_path,
                  /* media_allow_private   */ params_base.media_allow_private_urls,
@@ -126140,7 +126166,7 @@ index bfade25d7..236b6b42a 100644
              {
                  auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
                  auto it = params_base.default_template_kwargs.find("preserve_reasoning");
-@@ -1833,21 +2196,265 @@ private:
+@@ -1833,21 +2222,265 @@ private:
          return res;
      }
  
@@ -126407,7 +126433,7 @@ index bfade25d7..236b6b42a 100644
      }
  
      // return true if at least one slot has been cleared
-@@ -1855,13 +2462,33 @@ private:
+@@ -1855,13 +2488,33 @@ private:
      //       - smarter decision which slot to clear (LRU or longest prompt?)
      //       - move slot to level 2 cache instead of removing?
      //       - instead of purging, try to store and resume later?
@@ -126442,7 +126468,7 @@ index bfade25d7..236b6b42a 100644
          for (auto & slot : slots) {
              if (slot.is_processing()) {
                  continue;
-@@ -2668,6 +3295,28 @@ private:
+@@ -2668,6 +3321,28 @@ private:
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
@@ -126471,7 +126497,7 @@ index bfade25d7..236b6b42a 100644
          // evict checkpoints within min-step of a previous checkpoint, unless they were
          // created by the current task
          // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-@@ -2680,6 +3329,7 @@ private:
+@@ -2680,6 +3355,7 @@ private:
                  SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                          cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
  
@@ -126479,7 +126505,7 @@ index bfade25d7..236b6b42a 100644
                  it = slot.prompt.checkpoints.erase(it);
                  continue;
              }
-@@ -2690,7 +3340,8 @@ private:
+@@ -2690,7 +3366,8 @@ private:
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
              // make room for the new checkpoint, if needed
@@ -126489,7 +126515,7 @@ index bfade25d7..236b6b42a 100644
  
              SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                      cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
-@@ -2704,6 +3355,7 @@ private:
+@@ -2704,6 +3381,7 @@ private:
              for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                  if ((*it)->n_tokens == n_tokens_new) {
                      SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", (*it)->n_tokens);
@@ -126497,7 +126523,7 @@ index bfade25d7..236b6b42a 100644
                      it = slot.prompt.checkpoints.erase(it);
                  } else {
                      ++it;
-@@ -2721,6 +3373,12 @@ private:
+@@ -2721,6 +3399,12 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -126510,7 +126536,7 @@ index bfade25d7..236b6b42a 100644
          cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
          cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
          // stash the draft's speculative state with the checkpoint
-@@ -2992,7 +3650,11 @@ private:
+@@ -2992,7 +3676,11 @@ private:
  
                      if (slot == nullptr) {
                          // if no slot is available, we defer this task for processing later
@@ -126523,7 +126549,7 @@ index bfade25d7..236b6b42a 100644
                          queue_tasks.defer(std::move(task));
                          break;
                      }
-@@ -3031,7 +3693,11 @@ private:
+@@ -3031,7 +3719,11 @@ private:
                          break; // drop the task
                      }
  
@@ -126536,7 +126562,7 @@ index bfade25d7..236b6b42a 100644
                          for (auto & slot : slots) {
                              if (!slot.is_processing()) {
                                  SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-@@ -3537,6 +4203,26 @@ private:
+@@ -3537,6 +4229,26 @@ private:
  
                  metrics_flush_idle();
  
@@ -126563,7 +126589,88 @@ index bfade25d7..236b6b42a 100644
                  return; // skip further processing
  
              } else {
-@@ -3855,7 +4541,14 @@ private:
+@@ -3727,6 +4439,71 @@ private:
+         });
+     }
+ 
++    // LLAMA_SERVER_KV_FULL_STOP: make room in the unified KV cache for this step's decode tokens; sets kv_free_step.
++    // Cells held = every slot's prompt tokens.  An n_cmpl parent and its children share their prefix cells
++    // (seq_cp), which this sum would count once per slot, so the check stays off while one is processing.
++    void kv_full_check() {
++        kv_free_step = -1;
++        if (!kv_full_stop || !params_base.kv_unified) {
++            return;
++        }
++        for (const auto & slot : slots) {
++            if (slot.is_processing() && slot.task != nullptr && (slot.task->is_parent() || slot.task->is_child())) {
++                return;
++            }
++        }
++        const int64_t n_ctx_total = llama_n_ctx(ctx_tgt);
++        const int64_t n_spec      = spec ? common_speculative_n_max(spec.get()) : 0;
++        auto is_gen = [](const server_slot & slot) {
++            return slot.state == SLOT_STATE_GENERATING && slot.task != nullptr &&
++                   slot.task->type != SERVER_TASK_TYPE_TTS && slot.task->type != SERVER_TASK_TYPE_REALTIME;
++        };
++        for (;;) {
++            int64_t n_held = 0;
++            int64_t n_idle = 0; // held by idle slots: the decode retry clears them on demand, as before
++            int64_t n_need = 0;
++            for (const auto & slot : slots) {
++                n_held += slot.prompt.n_tokens();
++                if (!slot.is_processing()) {
++                    n_idle += slot.prompt.n_tokens();
++                }
++                if (is_gen(slot)) {
++                    n_need += 1 + (slot.can_speculate() ? n_spec : 0);
++                }
++            }
++            const int64_t n_free = n_ctx_total - n_held;
++            if (n_need == 0) {
++                return; // nothing decoding: the prompt-only path is unchanged
++            }
++            if (n_need <= n_free) {
++                // the step's prompt tokens may also use what idle slots hold (a full batch makes the decode retry
++                // clear them), so the cap only binds when the room is not there at all
++                kv_free_step = n_free + n_idle - n_need;
++                return;
++            }
++            if (try_clear_idle_slots()) {
++                continue;
++            }
++            server_slot * victim = nullptr;
++            for (auto & slot : slots) {
++                if (is_gen(slot) && (victim == nullptr || slot.stats.n_gen > victim->stats.n_gen)) {
++                    victim = &slot;
++                }
++            }
++            if (victim == nullptr) {
++                return;
++            }
++            SLT_WRN(*victim, "KV cache full (%" PRId64 " of %" PRId64 " cells held, %" PRId64 " needed this step): ending the reply with a length stop after %d generated tokens\n",
++                    n_held, n_ctx_total, n_need, (int) victim->stats.n_gen);
++            victim->truncated      = true;
++            victim->stop           = STOP_TYPE_LIMIT;
++            victim->has_next_token = false;
++            victim->print_timings();
++            send_final_response(*victim);
++            victim->release();
++        }
++    }
++
+     void pre_decode() {
+         // apply context-shift if needed
+         // TODO: simplify and improve
+@@ -3796,6 +4573,8 @@ private:
+             }
+         });
+ 
++        kv_full_check();
++
+         // start populating the batch for this iteration
+         batch.clear();
+ 
+@@ -3855,7 +4634,14 @@ private:
                              slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                          }
  
@@ -126579,7 +126686,7 @@ index bfade25d7..236b6b42a 100644
  
                          const bool spec_reject = slot.use_spec_rejection();
  
-@@ -3864,7 +4557,7 @@ private:
+@@ -3864,7 +4650,7 @@ private:
                              /* .n_max    = */ n_draft_max,
                              /* .pos0     = */ slot.prompt.tokens.pos_next(),
                              /* .id_last  = */ slot.sampled,
@@ -126588,7 +126695,7 @@ index bfade25d7..236b6b42a 100644
                              /* .result   = */ &slot.spec_draft,
                              /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                              /* .temp     = */ slot.task->params.sampling.temp,
-@@ -3915,7 +4608,7 @@ private:
+@@ -3915,7 +4701,7 @@ private:
                  if (use_ckpt_tgt) {
                      //const int64_t t_start = ggml_time_us();
  
@@ -126597,7 +126704,7 @@ index bfade25d7..236b6b42a 100644
  
                      //const int64_t t_total = ggml_time_us() - t_start;
                      //printf("checkpoint total: %f ms\n", t_total / 1000.0);
-@@ -3944,6 +4637,101 @@ private:
+@@ -3944,12 +4730,115 @@ private:
          auto & alora_scale       = batch.alora_scale;
          auto & alora_disabled_id = batch.alora_disabled_id;
  
@@ -126618,6 +126725,14 @@ index bfade25d7..236b6b42a 100644
 +        // after four in a row.  So an idle server (or a prompt arriving with nothing decoding) is prefilled
 +        // immediately and neither counter advances -- which is also what calibrates `prefill_step_us`.
 +        const size_t n_batch_decode = batch.size(); // the decode tokens are already in; prompt tokens are not
++
++        // LLAMA_SERVER_KV_FULL_STOP: this step's prompt tokens only take the cells left after the decode tokens.  A
++        // separate fill limit, so it bounds the step's total whatever the per-slot shares are (the fair share floors
++        // each prompt at one token), and n_batch keeps its meaning for the size checks that reject a request.
++        int32_t n_batch_fill = n_batch;
++        if (kv_free_step >= 0 && batch.size() > 0) {
++            n_batch_fill = (int32_t) std::min<int64_t>(n_batch, (int64_t) batch.size() + kv_free_step);
++        }
 +        const int64_t t_step_now = ggml_time_us();
 +        const int64_t step_us    = prefill_step_start > 0 ? t_step_now - prefill_step_start : 0;
 +        if (prefill_step_prev) {
@@ -126699,7 +126814,14 @@ index bfade25d7..236b6b42a 100644
          // next, batch any pending prompts without exceeding n_batch
          if (params_base.cont_batching || batch.size() == 0) {
              bool add_ok = true; // false means the batch is full, skip remaining slots
-@@ -3957,6 +4745,13 @@ private:
+ 
+             iterate(slots, [&](server_slot & slot) {
+-                if (!add_ok || batch.size() >= n_batch) {
++                if (!add_ok || batch.size() >= n_batch_fill) {
+                     return; // batch is full, skip remaining slots
+                 }
+ 
+@@ -3957,6 +4846,13 @@ private:
                      return;
                  }
  
@@ -126713,7 +126835,7 @@ index bfade25d7..236b6b42a 100644
                  // check if we can batch this slot with the previous one
                  if (slot_batched && !slot_batched->can_batch_with(slot)) {
                      return;
-@@ -3987,6 +4782,12 @@ private:
+@@ -3987,6 +4883,12 @@ private:
  
                          slot.state = SLOT_STATE_PROCESSING_PROMPT;
  
@@ -126726,7 +126848,7 @@ index bfade25d7..236b6b42a 100644
                          SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                  slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
  
-@@ -4230,6 +5031,10 @@ private:
+@@ -4230,6 +5132,10 @@ private:
                                          // restore the draft's speculative state
                                          common_speculative_set_state(spec.get(), slot.id, cur.data_spec);
  
@@ -126737,7 +126859,7 @@ index bfade25d7..236b6b42a 100644
                                          SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, reuse.n_past, (float) cur.size() / 1024 / 1024);
                                      }
                                  }
-@@ -4249,6 +5054,7 @@ private:
+@@ -4249,6 +5155,7 @@ private:
                                      const auto & cur = **it;
                                      if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                          SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
@@ -126745,7 +126867,16 @@ index bfade25d7..236b6b42a 100644
                                          it = slot.prompt.checkpoints.erase(it);
                                      } else {
                                          ++it;
-@@ -4405,8 +5211,12 @@ private:
+@@ -4285,7 +5192,7 @@ private:
+ 
+                     if (!slot.can_split()) {
+                         // cannot fit the prompt in the current batch - will try next iter
+-                        if (batch.size() + slot.task->n_tokens() > n_batch) {
++                        if (batch.size() + slot.task->n_tokens() > n_batch_fill) {
+                             return;
+                         }
+                     }
+@@ -4405,8 +5312,12 @@ private:
  
                      const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
  
@@ -126755,12 +126886,21 @@ index bfade25d7..236b6b42a 100644
 +                    const int32_t n_prompt_start  = (int32_t) slot.prompt.n_tokens();
 +                    const int32_t n_prompt_budget = prompt_budget[slot.id];
 +
-+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch &&
++                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_fill &&
 +                           (int32_t) slot.prompt.n_tokens() - n_prompt_start < n_prompt_budget) {
                          // get next token to process
                          llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                          if (cur_tok == LLAMA_TOKEN_NULL) {
-@@ -4482,6 +5292,9 @@ private:
+@@ -4419,7 +5330,7 @@ private:
+                         }
+ 
+                         // the outputs of a decision are read from one batch, do not split them
+-                        if (slot.prompt.n_tokens() == n_decision_first && batch.size() + slot.task->n_tokens() - n_decision_first > n_batch) {
++                        if (slot.prompt.n_tokens() == n_decision_first && batch.size() + slot.task->n_tokens() - n_decision_first > n_batch_fill) {
+                             break;
+                         }
+ 
+@@ -4482,6 +5393,9 @@ private:
                      // the number of tokens added to the batch for the current slot
                      const auto n_tokens_cur = batch.size() - n_tokens_prev;
  
@@ -126770,7 +126910,7 @@ index bfade25d7..236b6b42a 100644
                      const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
  
                      const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
-@@ -4546,6 +5359,10 @@ private:
+@@ -4546,6 +5460,10 @@ private:
                  }
              });
          }
@@ -126781,7 +126921,7 @@ index bfade25d7..236b6b42a 100644
      }
  
      // see https://github.com/ggml-org/llama.cpp/pull/29969
-@@ -4926,7 +5743,12 @@ private:
+@@ -4926,7 +5844,12 @@ private:
                              SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                          }
  
@@ -126795,7 +126935,7 @@ index bfade25d7..236b6b42a 100644
                          slot.spec_is_replay = true;
                          slot.spec_draft = std::move(accepted);
  
-@@ -4934,7 +5756,7 @@ private:
+@@ -4934,7 +5857,7 @@ private:
  
                          SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
  
@@ -126804,7 +126944,7 @@ index bfade25d7..236b6b42a 100644
  
                          if (slot.ctx_dft) {
                              GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
-@@ -5163,6 +5985,23 @@ void server_context::start_loop() {
+@@ -5163,6 +6086,23 @@ void server_context::start_loop() {
  
  void server_context::terminate() {
      impl->queue_tasks.terminate();
@@ -126828,7 +126968,7 @@ index bfade25d7..236b6b42a 100644
  }
  
  llama_context * server_context::get_llama_context() const {
-@@ -5315,8 +6154,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+@@ -5315,8 +6255,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
          // process prompt
          std::vector<server_tokens> inputs;
  
@@ -126840,7 +126980,7 @@ index bfade25d7..236b6b42a 100644
              inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
          } else {
              // Everything else, including multimodal completions.
-@@ -6385,7 +7226,20 @@ void server_routes::init_routes() {
+@@ -6385,7 +7327,20 @@ void server_routes::init_routes() {
              meta->chat_params,
              files,
              session);
@@ -126862,7 +127002,7 @@ index bfade25d7..236b6b42a 100644
          return res;
      };
  
-@@ -7244,7 +8098,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const s
+@@ -7244,7 +8199,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const s
  
      // TODO @ngxson : refactor this code block, move this to server-common and reuse it in other places
      size_t n_tokens;

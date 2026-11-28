@@ -16,6 +16,76 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261128.006 (r377) -- contributor PR #372 promoted into block 16: the KV full stop (a reply that outgrows its reserve ends with a length stop, DEFAULT ON)
+
+**Contribution.**  `@briansp2020`'s **PR #372** closes the limitation r365 wrote down for the KV admission: the
+reserve is an admission heuristic, not a bound, so a reply that grew past it still filled the unified cache, the
+decode retry could only clear *idle* slots, it halved `n_batch`, the batch split below the MTP verify width, and the
+running requests answered HTTP 500 "Context size has been exceeded." (with a speculator, "speculative batch index N
+is not inside the current sub-batch").  Their submission was a `wip/` campaign with a one-commit patch; the
+maintainer's decisions this session: **keep their victim rule** (the generating slot that has generated the most),
+**no `upstream/` candidate**, **fold into block 16 as a default-ON amendment**.
+
+**Every claim checked out**, at 1/4 scale on the r376 tree + their patch (`-c 8192 -np 4 -kvu`, one R9700,
+Qwen3.5-4B-Q8_0, `LLAMA_SERVER_KV_ADMIT_RESERVE=512`, two ~3.4 k-token prompts with 3000-token replies): stock
+**500 / 500** in 9.8 s (n_batch halved 1024->16) -> one `200 truncated=true` after 708 tokens and one `200` with all
+3000; `LLAMA_SERVER_KV_FULL_STOP=0` reads the two 500s again; `--spec-type draft-mtp --spec-draft-n-max 3` reads
+`speculative batch index 4 is not inside the current sub-batch [0, 4)` on stock and the same two 200s with the
+amendment; a pair whose replies fit is **byte-identical to stock**; the truncated reply is a **byte-exact prefix**
+(9395/9395 chars) of the same pair decoded at the same `-c` with room, and the reply that survived is
+byte-identical to that run (9047/9047); streaming ends cleanly (`stop_type=limit`, every delta delivered before the
+terminal chunk) and `/v1/completions` reports `finish_reason: "length"`; `n=2` is unchanged.  The patch applied
+**strictly** to r376.
+
+**What changed in the integration (no code redesign, four additions).**  (a) a **startup census line**
+(`KV full stop: on, a reply that no longer fits the cache ends with a length stop`), which every switch in this block
+prints and which the gate's non-vacuity reads; (b) their comments cited an external `FINDINGS 1135` and omitted the
+`LLAMA_SERVER_KV_ADMIT=0` behaviour, both rewritten for this repo's records; (c) **the gate**: four arms in
+`scripts/gate-kv-admit.sh` (`full`: one reply ends truncated while the other completes all 5000 tokens, the cut logs
+once with the count the client received, the decode retry never runs; `full0`: the kill switch answers 500 twice;
+`fullfit`: the same pair whose replies fit is untouched; `fullstream`: the SSE path ends cleanly) and `--self-test`
+now stands **both** kill switches down (`KV_ADMIT=0` alone leaves `full` passing on the pre-r377 build -- measured:
+23 failing checks, so the gate can reject it); (d) the docs (`DIAGNOSTIC.md` §29, `ENVIRONMENT.md` §29,
+`MANIFESTS.md` gate 46 + the block-16 row, the block-16 note in `patches/README.md`, `CONTRIBUTORS.md`,
+`INVARIANTS.md` r377) and the campaign record in `archive/work/kv-full-stop-r366/` (their README, patch and repro kept;
+no `wip/` stub).
+
+**The gate deliberately has no text oracle for these arms, and that is a measured finding.**  Two co-batched requests
+on this model are not reproducible across server runs: over a 0.05/0.2/0.6/1.5 s stagger sweep with `id_slot` pinned,
+each FIXED timing repeats its hashes exactly while the pair moves when the timing moves, and a first-token barrier does
+not help.  So a cross-run comparison would be flaky and a lone-run one is forbidden (`GREEDY-PURITY.md` §38/§63); the
+arms assert the behaviour, the census and the cut's token count **in run**, and the prefix evidence above is a hand
+measurement at one `-c` (`INVARIANTS.md` r377).
+
+**Release ladder (r377, the amended set at the canonical tip `6651cef37`, tree `3706b801e`; scratch path, gfx1201 box).**
+
+| gate | result |
+|---|---|
+| `validate-set.sh` | **GREEN** -- strict apply from the base tarball, both optional artifacts alone and cumulative (trees `7c27bcf25` / `a7a56868c` / `45128b1b1`), Windows lints, credit (43 handles / 39 rows / 0 debt), file-set reconciliation (582 files, 0 loss, 1 new env), system headers |
+| whole-set `all` build at the tip | OK (ccache-warm, `all` target) |
+| `check-shlib-symbols.sh` | 16/16 libraries resolve every symbol |
+| `check-gen-docs.sh` | in sync (no `common/arg.cpp` change) |
+| coherence vs the **r376** build | 4B Q8_0 1 GPU `1c5d32ac537d` and 27B UD-IQ3_S 3-GPU `-sm tensor` `fe3a5ad0f3ef` -- **identical** on both builds |
+| `gate-kv-admit.sh` (gate 46) | **PASS** -- all arms, including the four new ones (cut at 2962 tokens, equal to the client's `predicted_n`; the 5000-token reply completes; no decode retry; `fullstream` 2963 == 2963) and `--self-test` PASS (23 failing checks on the two kill switches) |
+| `gate-prefill-fairness.sh --quick` | **PASS** 2 of 3 runs; the third failed ONE check, `share split` (10/13 co-batched steps, worst 129.00), and the **r376 control build fails it with the same numbers**, so it is a pre-existing flake in that check, not this change -- the arm runs `kv_unified=false`, where the full stop cannot engage (0 census lines) |
+| `gate-prefill-duty.sh --quick` | **PASS** (burst 16 -> 137 tokens, prefill stretch 2.12x, single-request text identical) |
+| `gate-park-idle-slots.sh` | **PASS** (park == lazy-off on all four arms, the indexer cache moves with attention) |
+| `gate-optional-build.sh` (gate 47) | `OPTIONAL_BUILD=PASS` in 248 s, cumulative tree `45128b1b1` (both artifacts re-cut on the new default tree; their patch BODIES are unchanged from r376 -- only the `From` line and the parent moved, so `gate-mixed-kv.sh` was not re-run) |
+| `check-offline-tests.sh` (gate 49) | not owed: no `common/arg.cpp` change and no upstream runtime policy replaced |
+| `gate-prefill-logits.sh` | not owed: `tools/server` only, no prefill kernel or approximate path |
+| GPU faults | clean in every gate (`check-gpu-faults.sh` in each) |
+
+**Fixed during the session, not deferred:** the gate's first `fullfit`/`fullpure` designs compared text across server
+runs and flaked (measured, above) -- replaced by in-run checks; the reference arm for the prefix measurement had to
+stop 64 tokens (not 8) below the cut, because within 8 the reference itself takes the stock retry and its text moves;
+`check-credit.sh` gained a register row for the new contribution, and the release tag example in `README.md` moved to
+r377.
+
+**Open finding for the maintainer (not fixed here, not filed as a TODO):** `gate-prefill-fairness.sh`'s `share split`
+check is intermittent at the same rate on r376 and r377 (10/13 steps, `worst 129.00`, identical on both).  It is a
+release gate, so its threshold/semantics are the maintainer's call, and changing it in a release that is not about it
+would be the wrong place; the numbers above are the record.
+
 ## 261128.005 (r376, release cut) -- tagged, main and the fork pushed, the assets published, the images queued on the worker
 
 **The cut.**  `v18-919794500-r376` (annotated tag, pushed) = fork re-cut tip

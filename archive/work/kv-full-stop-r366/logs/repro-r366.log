@@ -1,0 +1,63 @@
+# KV full stop repro on stock r366 (kfsrep.sh / kfsrep.py), 2026-11-26
+# stock = stew-r366 e10879b0b3 (v18-919794500-r366); patch = stock + 0001 (daf871b4c9)
+
+### kfsrep 8:19 AM kfs366 daf871b4c9 stock e10879b0b3
+build rc=0 8:25 AM
+=== S 8:25 AM r366  -e LLAMA_SERVER_KV_ADMIT_RESERVE=512
+   srv    load_model: initializing, n_slots = 4, n_ctx_slot = 65536, kv_unified = 'true'
+   srv    load_model: KV admission: on, reserve = 512 cells/request, unified = true
+   == two ~12K at once (fit) (wall 13.5 s)
+      M1  done   13.0 s | prompt  11625 tok | gen   128 @  38.6 t/s | stop_type limit, truncated False | sha f7a7555f
+      M2  done   13.5 s | prompt  11616 tok | gen   128 @  53.0 t/s | stop_type limit, truncated False | sha 7faff34a
+   == two ~28K at once, long replies overflow 64K (wall 139.3 s)
+      L1  HTTP 500 after 139.3 s: b'{"error":{"code":500,"message":"Context size has been exceeded.","type":"server_error"}}'
+      L2  HTTP 500 after 139.3 s: b'{"error":{"code":500,"message":"Context size has been exceeded.","type":"server_error"}}'
+         log: decode: failed to find a memory slot for batch of size 2
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 0, n_batch = 1024, ret = 1
+         log: decode: failed to find a memory slot for batch of size 2
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 0, n_batch = 512, ret = 1
+         log: decode: failed to find a memory slot for batch of size 2
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 0, n_batch = 256, ret = 1
+   == one short after (wall 1.4 s)
+      S1  done    1.4 s | prompt    921 tok | gen    64 @  68.7 t/s | stop_type limit, truncated False | sha 63ec171a
+         log: srv  update_slots: decode() failed: Context size has been exceeded.
+   health after: {"status":"ok"}
+   faults 0
+=== F 8:27 AM kfs366  -e LLAMA_SERVER_KV_ADMIT_RESERVE=512
+   srv    load_model: initializing, n_slots = 4, n_ctx_slot = 65536, kv_unified = 'true'
+   srv    load_model: KV admission: on, reserve = 512 cells/request, unified = true
+   == two ~12K at once (fit) (wall 13.7 s)
+      M1  done   13.2 s | prompt  11625 tok | gen   128 @  38.6 t/s | stop_type limit, truncated False | sha f7a7555f
+      M2  done   13.7 s | prompt  11616 tok | gen   128 @  53.3 t/s | stop_type limit, truncated False | sha 7faff34a
+   == two ~28K at once, long replies overflow 64K (wall 189.3 s)
+      L1  done  139.8 s | prompt  27474 tok | gen  5328 @  45.9 t/s | stop_type limit, truncated True | sha 9c7b973f
+      L2  done  189.3 s | prompt  27488 tok | gen  8000 @  49.6 t/s | stop_type limit, truncated False | sha 0188bbc3
+         log: slot kv_full_chec: id  2 | task 172 | KV cache full (65536 of 65536 cells held, 2 needed this step): ending the reply with a length stop after 5328 generated tokens
+         log: srv  try_clear_id: making room in the KV cache: saving and clearing idle slot 2 with 32801 tokens
+   == one short after (wall 4.6 s)
+      S1  done    4.6 s | prompt    921 tok | gen    64 @  68.7 t/s | stop_type limit, truncated False | sha 63ec171a
+         log: srv         alloc:  - making room for prompt cache entry, removing oldest entry (size = 615.440 MiB)
+         log: srv         alloc:  - making room for prompt cache entry, removing oldest entry (size = 502.742 MiB)
+   health after: {"status":"ok"}
+   faults 0
+=== F0 8:31 AM kfs366 -e LLAMA_SERVER_KV_FULL_STOP=0 -e LLAMA_SERVER_KV_ADMIT_RESERVE=512
+   srv    load_model: initializing, n_slots = 4, n_ctx_slot = 65536, kv_unified = 'true'
+   srv    load_model: KV admission: on, reserve = 512 cells/request, unified = true
+   == two ~12K at once (fit) (wall 13.8 s)
+      M1  done   13.3 s | prompt  11625 tok | gen   128 @  38.5 t/s | stop_type limit, truncated False | sha f7a7555f
+      M2  done   13.8 s | prompt  11616 tok | gen   128 @  53.3 t/s | stop_type limit, truncated False | sha 7faff34a
+   == two ~28K at once, long replies overflow 64K (wall 140.0 s)
+      L1  HTTP 500 after 139.9 s: b'{"error":{"code":500,"message":"Context size has been exceeded.","type":"server_error"}}'
+      L2  HTTP 500 after 140.0 s: b'{"error":{"code":500,"message":"Context size has been exceeded.","type":"server_error"}}'
+         log: decode: failed to find a memory slot for batch of size 2
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 0, n_batch = 1024, ret = 1
+         log: decode: failed to find a memory slot for batch of size 2
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 0, n_batch = 512, ret = 1
+         log: decode: failed to find a memory slot for batch of size 2
+         log: srv        decode: failed to find free space in the KV cache, retrying with smaller batch size, off = 0, n_batch = 256, ret = 1
+   == one short after (wall 1.4 s)
+      S1  done    1.4 s | prompt    921 tok | gen    64 @  68.7 t/s | stop_type limit, truncated False | sha 63ec171a
+         log: srv  update_slots: decode() failed: Context size has been exceeded.
+   health after: {"status":"ok"}
+   faults 0
+### kfsrep DONE 8:34 AM
