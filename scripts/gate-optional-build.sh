@@ -49,6 +49,7 @@ TIP=""
 EXPECT_TREE=""
 SCRATCH="${SCRATCH_PATH:-$HOME/llama-scratch}"
 BUILD_DIR="${BUILD_DIR:-build-rocm-optional}"
+GPU_TARGETS="${GPU_TARGETS:-gfx1201}"   # scratch-tree.sh's default; the WARN below compares it to this box
 PASSTHRU=()
 
 while [ $# -gt 0 ]; do
@@ -58,7 +59,7 @@ while [ $# -gt 0 ]; do
         --path)         SCRATCH="$2"; shift 2 ;;
         --build-dir)    BUILD_DIR="$2"; shift 2 ;;
         --jobs)         PASSTHRU+=(--jobs "$2"); shift 2 ;;
-        --gpu-target)   PASSTHRU+=(--gpu-target "$2"); shift 2 ;;
+        --gpu-target)   PASSTHRU+=(--gpu-target "$2"); GPU_TARGETS="$2"; shift 2 ;;
         --rocm)         PASSTHRU+=(--rocm "$2"); shift 2 ;;
         -h|--help)      sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
         *) echo "ERROR: unknown option: $1 (try --help)" >&2; exit 2 ;;
@@ -110,5 +111,14 @@ if [ "$GOT_TREE" != "$EXPECT_TREE" ]; then
 fi
 echo "    applied tree OK ($GOT_TREE)"
 [ -x "$SCRATCH/$BUILD_DIR/bin/llama-cli" ] || { echo "FAIL: no llama-cli after the build" >&2; exit 1; }
+# A build for a target this box does not have BUILDS fine and cannot RUN, so an artifact gate run against
+# it dies with "device kernel image is invalid" and looks like a code defect.  Say so here.
+LOCAL_GFX="$(rocminfo 2>/dev/null | sed -n 's/^ *Name: *\(gfx[0-9a-f]*\).*/\1/p' | sort -u | tr '\n' ' ')"
+case " $LOCAL_GFX " in
+    *" ${GPU_TARGETS[0]:-} "*) ;;
+    *) echo "    WARN: this box has [$LOCAL_GFX] and the build targeted [$GPU_TARGETS]; the build is valid, but"
+       echo "          an artifact gate run against it will abort with \"device kernel image is invalid\"."
+       echo "          Pass --gpu-target <this box's gfx> before running one." ;;
+esac
 echo "    artifacts' own gates may now run against BUILD=$SCRATCH/$BUILD_DIR"
 echo "OPTIONAL_BUILD=PASS ($N_OPT artifacts, tree $GOT_TREE, all target)"

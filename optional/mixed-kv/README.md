@@ -8,9 +8,23 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `fecd7c50d1c973107ccd5ac9f1e7db362738d0f3e6ae06897b78a91857b2b840` (the current cut; every earlier cut is
+  `01eeeb6dffb768beb5dcdb81ffa3dfbae1e20af8ed1a9834d2d335429486e70e` (the current cut; every earlier cut is
   recorded below)
-* **r375 re-cut verification (current)**: applies strictly at the r375 default tree
+* **r376 re-cut verification (current)**: applies strictly at the r376 default tree
+  `223fbb80b1f2340b9bac698f5da8820d29d8f8f8` (18 official blocks `0000`-`0017` + temporary `0300`, default tip `01eb98010`), sha256
+  `01eeeb6dffb768beb5dcdb81ffa3dfbae1e20af8ed1a9834d2d335429486e70e` -- the sha moved because the exported commit id did, and the cut was REBASED rather than
+  re-applied: r376 amends block 05, which owns `ggml/src/ggml-cuda/fattn-tile.cuh`, the file this
+  artifact adds `type_V` to.  The only textual conflicts were the two seams where the new padded
+  GQA-6 fold lands beside it (the `launch_fattn_tile_switch_ncols1` template line, and the
+  `generate_cu_files.py` instance emitters), both resolved by keeping both sides; the fold's
+  dispatch tests the OPERANDS (`K->type == V->type == Q8_0`), so a mixed pair can never take a
+  kernel that has one K/V type.  **One line of this artifact is a fold consequence, not a mixed-K/V one**:
+  with `type_V` in the tile kernel the fold's unfolded-REFERENCE kernel pointer must name it
+  (`flash_attn_tile<..., type_KV, type_KV>`), and without that hunk the cumulative tree does not compile --
+  the class gate 47 (issue #371) exists for.  Producing tree `f7af34607a981fe40a9f66f3d6358bab460e9ffc` alone
+  and `9ee987063680ec8c8c15f806d6519e64e6f26725` with the other optional artifact on top; `scripts/validate-set.sh` check 8 re-verifies
+  all three trees on every run.
+* **r375 re-cut verification (superseded by r376)**: applies strictly at the r375 default tree
   `5fccfbcdc6c5dba3db5972362656b952d7a033ad` (18 official blocks `0000`-`0017` + temporary `0300`, default tip
   `5c35fca85`), sha256 `fecd7c50d1c973107ccd5ac9f1e7db362738d0f3e6ae06897b78a91857b2b840` -- **mechanical**, though
   r375 amends one of this artifact's ten files (`src/llama-context.cpp`, the transport sizing's constructor skip

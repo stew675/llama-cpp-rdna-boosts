@@ -59,9 +59,18 @@ reviewed and amended (see *What changed in the rebase* below).  The submitter's 
 are in the PRs; this file records what *this repo* verified, what it measures here, and what it cannot reach.
 
 * `0100-two-lane-prefill.patch` — the artifact.  sha256
-  `4c318b23a1406f340b0eba49d88388ed4247f3358947d8293309582f1cc7a86d` (the r369 PORT; every earlier cut is
+  `420c9fd1d0e0524ac5647e70138e59b5e4bf285c501457fcd8afc7900b4eeeb9` (the r369 PORT; every earlier cut is
   recorded below)
-* **r369 PORT (current)** — the artifact vs r369's staging pipeline.  r369 rewrote the very function this
+* **r376 re-cut verification (current)**: applies strictly at the r376 default tree `223fbb80b1f2340b9bac698f5da8820d29d8f8f8` (18 official
+  blocks `0000`-`0017` + temporary `0300`, default tip `01eb98010`), sha256
+  `420c9fd1d0e0524ac5647e70138e59b5e4bf285c501457fcd8afc7900b4eeeb9` -- the sha moved because the exported commit id did, not the diff: r376 amends blocks 05 and 06,
+  neither of which touches this artifact's files (`ggml/include/ggml-backend.h`,
+  `ggml/src/ggml-backend{,-impl}.{h,cpp}`, `ggml/src/ggml-cuda/ggml-cuda.cu`, `include/llama.h`,
+  `src/llama-context.{h,cpp}`, `src/llama-cparams.h`), so the cut was re-exported against the new
+  tree and applied with nothing to reconcile; producing tree `38b374973751c3bf7dc0e794ddf21ad56612fec4` alone and `032c158ea92f74efc9579d004ab69bfed774aa69` with the other
+  optional artifact on top.  `scripts/validate-set.sh` check 8 re-verifies all three trees on every
+  run.
+* **r369 PORT (superseded by r376)** — the artifact vs r369's staging pipeline.  r369 rewrote the very function this
   artifact refactors (`ggml_backend_sched_compute_splits`: a per-split `compute_split(sched, split_id, st)` + a
   driver, against r369's per-graph pipeline prologue / per-split consume / epilogue), so the re-cut was a **port**,
   not a re-export: the pipeline's prologue and epilogue are now `pipe_begin()`/`pipe_end()`, the per-split pipeline

@@ -1283,6 +1283,27 @@ almost all of them `template-instances/*.cu`.
 
 **Contents.**
 
+* **The padded GQA-6 tile fold, DEFAULT ON (r376, contributor PR #362, `@kapojko`; kill switch
+  `GGML_HIP_FA_TILE_GQA6_FOLD=0`, gate 50 `scripts/gate-gqa6-fold.sh`).**  For head 256/256, a GQA ratio of 6, a
+  symmetric NATIVE q8_0 K/V pair and a query width of 1..8 on `RDNA3_0`, the launcher's `ncols2 = 2` needs three
+  logical K/V traversals per query row; the fold pins **`ncols1 1, ncols2 8`** and places all six real query heads
+  in ONE padded eight-column block — one traversal.  Columns 6/7 get zero Q and are never stored, and a
+  padding-only warp still joins the cooperative K/V loads and barriers (it only skips KQ/softmax/VKQ).  It is a
+  **self-contained kernel copy** (`fattn-tile-gqa6-fold.cuh` + one generated TU in `template-instances/`, driven by
+  `generate_cu_files.py`) rather than a template parameter on `flash_attn_tile`: the runtime-branch form compiled
+  the fold into every instantiation and moved their register allocation, which on gfx1201 moved the occupancy the
+  decode/verify KV split is derived from (VGPR 140 -> 94, mean KLD 0.000391 / same-top-p 98.97 %, tile 1.4-5.7 %
+  slower with the fold **unreachable**).  The only shared change is `launch_fattn`'s `force_split` template
+  parameter, compiled out unless the fold's launcher sets it (it pins P to what the UNFOLDED `ncols2 = 2` kernel
+  reaches for the shape).  The dispatch tests the **operands** (`K->type == V->type == Q8_0`), so the optional
+  `0101` mixed pair can never take a kernel that has one K/V type.  Value (gfx1100, 27B IQ3_S, q8_0 K/V, tg64):
+  **+0.5 / +0.9 / +2.6 / +4.3 / +5.7 % at d2048/8192/32768/65536/98304**, and the kill-switch arm is inert against
+  the previous release (decode-width `--kv q8_0 --ub 1` mean KLD 0.000000 / 100.000 %, raw log-prob files
+  byte-identical).  NOT bit-identical by construction (the reduction grouping differs from the unfolded kernel, so
+  a near-tie can move) — measured identical at that u16 resolution and in every text cell on gfx1100 and gfx1201.
+  **It is a copy: re-sync it whenever `flash_attn_tile`/`flash_attn_tile_iter` change** (`INVARIANTS.md` r376).
+  On RDNA4 the arch gate refuses it (no census even with the env set, text and `tg64` unmoved).
+
 * **Prefill attention under a tensor split pads no GQA lane, and RDNA3_0's head-256 prefill streams Q from LDS
   (r372, GitHub issue #381; the RDNA3 half is upstream PR ggml-org/llama.cpp#31746 by `@ravel7524`).**  Two
   independent fixes to head-256 prefill attention, each useless alone on the reporter's mixed
@@ -1743,6 +1764,30 @@ a `k_idxs`/`s_copy`/`k_rot` tensor is always consumed by the node that needed it
 ---
 
 ## Block 06 — MMB and mmf32: the quantized and the F32 prefill GEMM
+
+> **r376 amendment (GitHub issue #385, `@noctrex`): the RDNA3_0 row stands the routed MoE (`MUL_MAT_ID`) prefill
+> down** — `c.routed = 0` in `mmb_arch_defaults`' RDNA3_0 branch, the same decision and the same reason the RDNA4
+> row already carried: the delivery's block-13 `mul_mat_q_routed_compact` is already a good fused expert kernel
+> there, so the routed path only adds an `mm_ids_helper` launch and costs prefill.  Dense MMB is untouched (the
+> reporter's Q4_K_XL +17-20 % and Q8_0 parity are the dense tile's).  `GGML_CUDA_MMB_ROUTED=1` restores the routed
+> arm (`DIAGNOSTIC.md` 8), so the A/B needs no rebuild.
+>
+> **Reproduced on the reporter's own model** (gfx1100, 7900 XTX, Ornith-1.5-35B-A3B **IQ4_XS**, pp2048 r3): routed
+> ON -> OFF **4854/4070/3553 -> 5060/4256/3671 t/s at d0/d8192/d16384 (+4.2 / +4.6 / +3.3 %)**, matching his
+> +3.2/+3.9/+3.3 % (Windows, first-party).  **The same A/B on IQ4_NL is neutral** (5117/4267/3692 ->
+> 5104/4246/3683): a routed row names the weight class it was measured on.  The arm is not vacuous --
+> `GGML_CUDA_MMB_LOG=1` prints `MMB_GLU fused` twice with the routed path and never without it (the `MMB_CFG`
+> dump prints the arch table, not the env override).
+>
+> **Purity: it is a kernel-FAMILY switch and it moves the prefill logits.**  On the IQ4_XS MoE the canonical
+> point reads mean KLD **0.007396 / same-top-p 96.667 %** (0.000001 / 100.000 % with `MMB_ROUTED=1`, so the
+> rest of r376 is inert), i.e. over the absolute 0.005 / 98 % limits but **no worse than the same-kernel
+> `-ub 256` control measured on the spot (0.010867 / 93.333 %)** -- the `GREEDY-PURITY.md` 46 calibration that
+> r372's RDNA3_0 head-256 prefill row was also taken on (`gate-prefill-logits.sh --family-switch ...
+> --allow-control-pass`).  The same-seed greedy text on that model moves at the near-tie (**443 chars sha
+> `7a5911eefc77` -> 428 chars sha `8d25aa669cfd`**), and the 9B/27B dense arms are unchanged.  On the IQ4_NL arm
+> the point is 0.001836 / 99.216 % (inside the limits) with the text unchanged.  Decode never reaches MMB
+> (`mmb_min_t`), so this is prefill-only.
 
 > **r217 amendment (issue #273 item 4, `getenv` audit):** `mmf32.cu`'s `GGML_CUDA_MMF32_LOG` latch read its
 > variable twice (`getenv("X") ? atoi(getenv("X")) : 0`); it now reads it once into the stored pointer.  No

@@ -1,4 +1,4 @@
-From 40f5b9257efd3c38db0d4504115f106cfd9ff105 Mon Sep 17 00:00:00 2001
+From f21201d01a85476d1cbfecdea8d436f09629570c Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Tue, 10 Nov 2026 06:52:07 -0600
 Subject: [PATCH 14/18] rdna-boosts: block 14: the streamed KV -- a fixed-VRAM
@@ -6273,10 +6273,10 @@ index 000000000..448399a58
 +// See kv-pool.cu for the writer rule this stands on.
 +void ggml_cuda_kv_pool(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
-index 2e607c5dd..62f6c3a19 100644
+index a8b366a90..1aedd876d 100644
 --- a/ggml/src/ggml-cuda/mmb.cu
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -2720,6 +2720,15 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
+@@ -2738,6 +2738,15 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
      const int n_rows_x = ne11 * T, n_rows = n_used * T;
      constexpr int BN = 128;
      const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
@@ -6292,7 +6292,7 @@ index 2e607c5dd..62f6c3a19 100644
      ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_rows);
      ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), n_rows);
      ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), E + 1);
-@@ -2736,8 +2745,6 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
+@@ -2754,8 +2763,6 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
      ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
      ggml_cuda_pool_alloc<uint32_t> desc_small(ctx.pool(), nsmall_max);
      mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN, BN_SMALL, THRESH);

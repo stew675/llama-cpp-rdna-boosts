@@ -16,6 +16,72 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261128.004 (r376) -- PR #362 promoted: the padded GQA-6 tile fold is block 05, default ON; issue #385's MMB routed row is block 06; release v18-919794500-r376
+
+**Contribution.**  `@kapojko`'s **PR #362** (padded GQA-6 tile flash-attention fold) was rejected as submitted on
+2026-11-25 (`archive/work/pr362/`, rework R1-R6) and resubmitted on 2026-11-27 as a fully isolated kernel TU.  This session
+assessed the resubmission, found R1-R6 met, and promoted it: it is now **part of block 05, DEFAULT ON**, with
+`GGML_HIP_FA_TILE_GQA6_FOLD=0` as the kill switch (`DIAGNOSTIC.md` 8), the census proving the arm, and a new
+`scripts/gate-gqa6-fold.sh` (gate 50) as its oracle.  `@noctrex`'s **issue #385** (the RDNA3_0 MMB routed prefill
+row) is folded into block 06 as a 1-line `c.routed = 0` with the reporter's numbers reproduced here.
+
+**What the fold does.**  Head 256/256, GQA ratio 6, a symmetric NATIVE q8_0 K/V pair, `n_q <= 8`, `RDNA3_0`: the
+tile launcher's `ncols2 = 2` makes three logical K/V traversals per query row; the fold pins `ncols1 1, ncols2 8`,
+placing all six real query heads in one padded eight-column block (columns 6/7 get zero Q, are never stored, and a
+padding-only warp still joins the cooperative loads and barriers).  It is a **kernel copy** in its own TU, not a
+template parameter on the shared kernel -- the runtime-branch form moved the ordinary kernels' register allocation,
+and on gfx1201 that moved the decode/verify split the launcher derives from occupancy (VGPR 140 -> 94, mean KLD
+0.000391 / same-top-p 98.97 %, tile 1.4-5.7 % slower with the fold UNREACHABLE).  The only shared change is
+`launch_fattn`'s `force_split` template parameter, compiled out unless the fold's launcher sets it.
+
+**Why `optional/` was not the answer.**  The PR shipped it as an unnumbered proposed artifact.  Three reasons it
+could not stay there: (a) `optional/` is for a finished feature with **no** validated win on the delivery's own
+configurations and this one has one on gfx1100; (b) `optional/0102` after `0100`+`0101` fails the strict cumulative
+apply `validate-set.sh` requires (optional 0101 adds `type_V` to the very lines the fold hook anchors on); (c) the
+default-on policy.  Integration needed no surgery on 0101 because the fold's dispatch tests the OPERANDS
+(`K->type == V->type == Q8_0`), so a mixed pair can never take a kernel that has one K/V type -- 0101 was re-cut
+mechanically against the new default tree instead.
+
+**Verified here (r375 tree + the two amendments, 27B IQ3_S, `-ctk q8_0 -ctv q8_0`, `ROCBLAS_USE_HIPBLASLT=0`).**
+gfx1100 (7900 XTX): the kill-switch arm is **inert against the unpatched release build** -- decode-width `--kv q8_0
+--ub 1` mean KLD **0.000000 / same-top-p 100.000 %** with the raw u16 log-prob files **byte-identical**, the same
+482-char greedy text, and tg within +-0.2 % -- and the **fold arm reads the same numbers** (identical file again),
+so the fold is a rounding-level re-grouping at the only point that can see it.  Decode tg64 on/off: **52.71 ->
+53.00 d2048 (+0.5 %), 51.58 -> 52.05 d8192 (+0.9 %), 47.11 -> 48.33 d32768 (+2.6 %), 42.29 -> 44.11 d65536
+(+4.3 %), 38.40 -> 40.59 d98304 (+5.7 %)**.  `test-backend-ops -o FLASH_ATTN_EXT` **7581/7581** with the fold on
+(the added coverage reaches it: 513 cases at `hsk=256.*nr23=[6,1]`).  gfx1201 (1x R9700, `soar`): both arms
+`-0.000000 / 100.000 %` against the unpatched build, identical text single-device (`2245b10c2cde`) and 3-GPU
+`-sm tensor` (`0f612e3cad2e`), `tg64` 27.95/26.24 unmoved, `FLASH_ATTN_EXT` 7581/7581 with the fold ON, and **no
+census even with the env set** -- the arch gate holds, so RDNA4's obligation is non-regression only.
+
+**#385, reproduced with the reporter's own model.**  Ornith-1.5-35B-A3B **IQ4_XS**, gfx1100, pp2048 r3: routed ON
+-> OFF **4854/4070/3553 -> 5060/4256/3671 t/s at d0/d8192/d16384 (+4.2 / +4.6 / +3.3 %)**, matching his
++3.2/+3.9/+3.3 %.  The same A/B on **IQ4_NL is neutral** (5117/4267/3692 -> 5104/4246/3683), so the loss is the
+IQ4_XS routed shape's, and the arm is not vacuous (`MMB_GLU fused` 2 lines with routed on, 0 off).
+
+**Purity -- the routed stand-down is a kernel-family switch and the text DOES move on the IQ4_XS MoE.**  The
+canonical point on that model reads mean KLD **0.007396 / same-top-p 96.667 %** against the routed-on arm
+(`GGML_CUDA_MMB_ROUTED=1` reads **0.000001 / 100.000 %** against the r375 base, so the rest of r376 is inert --
+the whole delta is this row), i.e. over the absolute 0.005 / 98 % limits but **no worse than the same-kernel
+`-ub 256` control measured on the spot, 0.010867 / 93.333 %**: `GREEDY-PURITY.md` 46's calibration, the same
+criterion r372's RDNA3_0 head-256 prefill row was taken on.  Same-seed greedy text moves at that near-tie
+(**443 chars `7a5911eefc77` -> 428 chars `8d25aa669cfd`**); the 9B and 27B dense arms are unchanged
+(`37b826ac5e2a`, `ddd04dc91b87`), and so is the 27B q8_0-KV arm with the fold ON (`ca199dcf8218`).  On the
+IQ4_NL arm the point is 0.001836 / 99.216 % (inside the limits) with the text unchanged.  Decode never reaches
+MMB (`mmb_min_t`), so this is prefill-only.
+
+**Release.**  r376 (block 05 + block 06 amended, blocks 07-0300 replayed; 0100/0101 re-cut against the new default
+tree), `release.json` regenerated, `validate-set.sh` green, `gate-gqa6-fold.sh` PASS, both Windows lints clean, the
+credit register gains `@kapojko` (co-author) and `@noctrex` (reported) with the trailers in the patches.  The
+`wip/pr362/` campaign is closed (moved to `archive/work/pr362/`, with its RESOLUTION.md).
+
+**Findings reported, not fixed (all recorded in the records above):** (1) the fold's kernel copy is a maintenance
+obligation, not a one-off -- a future change to `flash_attn_tile` must be mirrored (`INVARIANTS.md` r376); (2) two
+coverage gaps remain unmeasurable on this fleet: multi-RDNA3 splits (no such box) and a speculator verify batch on
+a q8_0/GQA-6 target (our 27B carries no MTP head, so the submitter's unchanged-acceptance result stands unverified
+here); (3) `GGML_CUDA_MMB_CFG=1`'s dump prints the arch table and not the env overrides while claiming both, which
+is why #385's arm was proved with `MMB_GLU` instead -- worth a fix at the next block-06 touch.
+
 ## 261128.003 (r375, release cut) -- tagged, main and the fork pushed, the assets published, the images verified 23/23, and the prefill-logit point reads 0.000000
 
 **The cut.**  `v18-919794500-r375` (annotated tag, pushed) = fork re-cut tip
@@ -57,6 +123,7 @@ tag's published body was corrected to `0000-0017`.
 
 **Record.** `release.json`; `WORKLOG.md` 261128.002 (the change and its measurements); `INVARIANTS.md` r375;
 `patches/README.md` blocks 12/15; `utilities/h2d-latency/`.
+
 
 ## 261128.002 (r375) -- issue #368: the stage-vs-gather transport is decided from a MEASURED gather read, three switches that lied are fixed, and the reporter's prefill regression has a mechanism (blocks 12/15)
 

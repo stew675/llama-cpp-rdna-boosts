@@ -1,4 +1,4 @@
-From 3bdc562574751f16f223dbc8922e2aa8af67406a Mon Sep 17 00:00:00 2001
+From 74d8b505a9fe5c9d064492f20df3ec0431b5953f Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Sat, 21 Nov 2026 18:16:14 -0600
 Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types (optional: NOT
@@ -7,17 +7,18 @@ Subject: [PATCH] rdna-boosts: block 0101: mixed K/V cache types (optional: NOT
 Co-authored-by: mjohanning99 <3389797+mjohanning99@users.noreply.github.com>
 ---
  ggml/src/ggml-cuda/fattn-rdna.cuh             | 34 +++++++-
+ ggml/src/ggml-cuda/fattn-tile-gqa6-fold.cuh   |  5 +-
  ggml/src/ggml-cuda/fattn-tile.cu              | 24 ++++++
  ggml/src/ggml-cuda/fattn-tile.cuh             | 83 +++++++++++--------
  ggml/src/ggml-cuda/fattn.cu                   |  2 +-
  ...tn-tile-instance-dkq256-dv256-q8_0-q4_0.cu |  5 ++
  ...tn-tile-instance-dkq256-dv256-q8_0-q5_0.cu |  5 ++
  ...tn-tile-instance-dkq256-dv256-q8_0-q5_1.cu |  5 ++
- .../template-instances/generate_cu_files.py   | 12 +++
+ .../template-instances/generate_cu_files.py   | 11 +++
  src/llama-context.cpp                         | 23 ++++-
  tests/test-backend-ops.cpp                    |  9 ++
  tests/test-logits-width-probe.cpp             | 11 +--
- 11 files changed, 171 insertions(+), 42 deletions(-)
+ 12 files changed, 174 insertions(+), 43 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q4_0.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_0.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0-q5_1.cu
@@ -88,6 +89,22 @@ index 831a964fa..e78f1ccb5 100644
      const bool kv_f16    = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
      const bool kv_ok     = kv_quant || kv_f16;
  
+diff --git a/ggml/src/ggml-cuda/fattn-tile-gqa6-fold.cuh b/ggml/src/ggml-cuda/fattn-tile-gqa6-fold.cuh
+index fc6060881..efc253662 100644
+--- a/ggml/src/ggml-cuda/fattn-tile-gqa6-fold.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile-gqa6-fold.cuh
+@@ -1187,7 +1187,10 @@ static void launch_fattn_tile_gqa6_fold(ggml_backend_cuda_context & ctx, ggml_te
+ 
+     constexpr int unfolded_ncols2 = 2;
+     fattn_kernel_t unfolded_kernel =
+-        flash_attn_tile<DKQ, DV, 1, unfolded_ncols2, use_logit_softcap, type_KV>;
++        // The unfolded REFERENCE is the symmetric q8_0 pair -- block 0101's mixed K/V gives the tile kernel a
++        // second V type parameter, so the reference names it explicitly (and only this line, because the fold's
++        // own kernel copy has one type by construction).
++        flash_attn_tile<DKQ, DV, 1, unfolded_ncols2, use_logit_softcap, type_KV, type_KV>;
+     const int unfolded_nwarps =
+         ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, unfolded_ncols2, cc) / warp_size;
+     const int unfolded_nbatch_fa =
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cu b/ggml/src/ggml-cuda/fattn-tile.cu
 index 54a08ded6..b04f8f7b3 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cu
@@ -124,7 +141,7 @@ index 54a08ded6..b04f8f7b3 100644
          case GGML_TYPE_BF16:
              // BF16 K/V is read natively and accumulated in FP32 (native-BF16 hardware only).
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
-index e0778c76b..fbc9277da 100644
+index 1cd8b77de..4f915366c 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cuh
 +++ b/ggml/src/ggml-cuda/fattn-tile.cuh
 @@ -927,7 +927,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
@@ -207,16 +224,16 @@ index e0778c76b..fbc9277da 100644
                  (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
                  stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
          }
-@@ -1775,7 +1778,7 @@ static __global__ void flash_attn_tile(
- #pragma clang diagnostic pop
- #endif // __clang__
+@@ -1803,7 +1806,7 @@ static inline void ggml_cuda_fattn_tile_gqa6_fold_census(const int cc, const int
+     (void) logged;
+ }
  
 -template <int DKQ, int DV, int ncols2, bool use_logit_softcap, ggml_type type_KV>
 +template <int DKQ, int DV, int ncols2, bool use_logit_softcap, ggml_type type_KV, ggml_type type_V>
  static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * Q = dst->src[0];
      const ggml_tensor * K = dst->src[1];
-@@ -1783,9 +1786,10 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1811,9 +1814,10 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
  
      // K/V types other than the kernel KV type are converted to it by the launcher.
      const bool need_f16_K = K->type != type_KV;
@@ -229,7 +246,7 @@ index e0778c76b..fbc9277da 100644
      // to both operands (FATTN_KV_NATIVE_NONE = the launcher stages).  Passing it to launch_fattn is
      // what keeps the launcher from skipping the staging of a q8_0/q4_0 operand this F16 instantiation
      // would then read as F16 (mixed K/V pairs, test-backend-ops FLASH_ATTN_EXT).
-@@ -1809,7 +1813,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1837,7 +1841,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
          constexpr int cols_per_block = ncols2 > 2 ? ncols2 : 2;
          const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
          const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -238,7 +255,7 @@ index e0778c76b..fbc9277da 100644
          // The q_h2 argument must mirror the kernel-side q_global condition
          // (GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 64): the wide RDNA2 kernels
          // read Q from the Q_h2 global half2 buffer, and omitting the argument here (default
-@@ -1836,7 +1840,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1864,7 +1868,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              constexpr int cols_per_block = 64;
              const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
              const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -247,7 +264,7 @@ index e0778c76b..fbc9277da 100644
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
                  need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
-@@ -1854,7 +1858,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1882,7 +1886,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              constexpr int cols_per_block = 32;
              const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
              const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -256,7 +273,7 @@ index e0778c76b..fbc9277da 100644
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
                  need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
-@@ -1868,7 +1872,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1896,7 +1900,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              constexpr int cols_per_block = 16;
              const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
              const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -265,7 +282,7 @@ index e0778c76b..fbc9277da 100644
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
                  need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
-@@ -1882,7 +1886,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1910,7 +1914,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              constexpr int cols_per_block = 8;
              const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
              const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -274,7 +291,7 @@ index e0778c76b..fbc9277da 100644
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
                  need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
-@@ -1896,7 +1900,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1924,7 +1928,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              constexpr int cols_per_block = 4;
              const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
              const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -283,7 +300,7 @@ index e0778c76b..fbc9277da 100644
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
                  need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
-@@ -1909,7 +1913,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1937,7 +1941,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
          constexpr int cols_per_block = 2;
          const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
          const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
@@ -292,7 +309,7 @@ index e0778c76b..fbc9277da 100644
          launch_fattn<DV, cols_per_block/ncols2, ncols2>
              (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
                  need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
-@@ -1920,7 +1924,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1948,7 +1952,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
      GGML_ABORT("fatal error");
  }
  
@@ -301,7 +318,7 @@ index e0778c76b..fbc9277da 100644
  static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * KQV  = dst;
      const ggml_tensor * Q    = dst->src[0];
-@@ -1958,12 +1962,12 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -2001,12 +2005,12 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
          // Therefore, use a GQA ratio of 16 with 16 columns / block to stay below 48 kiB of SRAM / block.
  #ifdef GGML_USE_HIP
          if (use_gqa_opt && gqa_ratio % 32 == 0) {
@@ -316,7 +333,7 @@ index e0778c76b..fbc9277da 100644
              return;
          }
  #endif // GGML_USE_HIP
-@@ -1972,11 +1976,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -2015,11 +2019,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
  
      if constexpr (DKQ == 576) {
          if (use_gqa_opt && gqa_ratio % 16 == 0) {
@@ -330,7 +347,7 @@ index e0778c76b..fbc9277da 100644
              return;
          }
      }
-@@ -1984,11 +1988,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -2027,11 +2031,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
      if constexpr (DKQ == 192) {
          // MiMo-V2.5 / V2.5-Pro / V2-Flash: gqa_ratio is 8 (SWA) or 16 (full attn)
          if (use_gqa_opt && gqa_ratio % 16 == 0) {
@@ -344,7 +361,7 @@ index e0778c76b..fbc9277da 100644
              return;
          }
          GGML_ABORT("flash-attn tile (192/128): expected GQA ratio multiple of 8");
-@@ -1996,39 +2000,39 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+@@ -2039,39 +2043,39 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
  
      if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
          if (use_gqa_opt && gqa_ratio % 8 == 0) {
@@ -391,7 +408,7 @@ index e0778c76b..fbc9277da 100644
      }
  }
  
-@@ -2071,6 +2075,19 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor
+@@ -2114,6 +2118,19 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor
      EXTERN_DECL_FATTN_TILE_CASE_TYPE(DKQ, DV, GGML_TYPE_Q5_1);            \
      EXTERN_DECL_FATTN_TILE_CASE_TYPE(DKQ, DV, GGML_TYPE_IQ4_NL)
  
@@ -458,11 +475,11 @@ index 000000000..56f32e18b
 +
 +DECL_FATTN_TILE_CASE_MIXED(256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1);
 diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
-index 64dcacf05..7b4bf9077 100755
+index b36a8cc54..74512d0e3 100755
 --- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
 +++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
-@@ -17,6 +17,13 @@ SOURCE_FATTN_TILE = """// This file has been autogenerated by generate_cu_files.
- DECL_FATTN_TILE_CASE_TYPE({head_size_kq}, {head_size_v}, {type_kv});
+@@ -26,6 +26,13 @@ DECL_FATTN_TILE_GQA6_FOLD_CASE();
+ #endif // defined(GGML_USE_HIP)
  """
  
 +SOURCE_FATTN_TILE_MIXED = """// This file has been autogenerated by generate_cu_files.py, do not edit manually.
@@ -475,18 +492,17 @@ index 64dcacf05..7b4bf9077 100755
  SOURCE_FATTN_VEC = """// This file has been autogenerated by generate_cu_files.py, do not edit manually.
  
  #include "../fattn-vec.cuh"
-@@ -104,6 +111,11 @@ for head_size_kq in HEAD_SIZES_KQ:
-         with open(f"fattn-tile-instance-dkq{head_size_kq}-dv{head_size_v}-{get_short_name(type_kv)}.cu", "w") as f:
-             f.write(SOURCE_FATTN_TILE.format(head_size_kq=head_size_kq, head_size_v=head_size_v, type_kv=type_kv))
- 
+@@ -116,6 +123,10 @@ for head_size_kq in HEAD_SIZES_KQ:
+ # The padded GQA-6 kernel has a dedicated translation unit so no existing tile instantiation contains its code.
+ with open("fattn-tile-gqa6-fold-dkq256-dv256-q8_0.cu", "w") as f:
+     f.write(SOURCE_FATTN_TILE_GQA6_FOLD)
 +# mixed K/V pairs of the tile kernel (q8_0 K, smaller V), head 256 only
 +for type_v in ["GGML_TYPE_Q4_0", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1"]:
 +    with open(f"fattn-tile-instance-dkq256-dv256-q8_0-{get_short_name(type_v)}.cu", "w") as f:
 +        f.write(SOURCE_FATTN_TILE_MIXED.format(type_v=type_v))
-+
+ 
  for type_k in TYPES_KV:
      for type_v in TYPES_KV:
-         with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index b34f383b7..cf048cb9a 100644
 --- a/src/llama-context.cpp
@@ -523,10 +539,10 @@ index b34f383b7..cf048cb9a 100644
          return nullptr;
      }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 8bab1a9d7..71ba937db 100644
+index 93e5ce901..e1db41444 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -13836,6 +13836,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13858,6 +13858,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  

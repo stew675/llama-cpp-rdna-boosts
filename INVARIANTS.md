@@ -4127,3 +4127,48 @@ apart.
 **Record.** `ENVIRONMENT.md` §31 / `DIAGNOSTIC.md` §31 (the measured rule, `GGML_SCHED_STAGE_FILL_RATIO`, the
 fallback's new meaning) and `DIAGNOSTIC.md` §28 (`MOE_EXPERT_CACHE_TABLES` is report-only);
 `utilities/h2d-latency/`; `patches/README.md` blocks 09/10/12/15; `WORKLOG.md` 261128.002.
+
+* **r376 -- the padded GQA-6 tile fold is a KERNEL COPY, and that is what makes it safe and what makes it a
+  maintenance obligation.**  (block 05, contributor PR #362, `@kapojko`; default ON, `GGML_HIP_FA_TILE_GQA6_FOLD=0`
+  the kill switch; gate 50.)  For head 256/256, GQA ratio 6, a symmetric native q8_0 K/V pair and `n_q <= 8` on
+  `RDNA3_0`, the fold pins `ncols1 1, ncols2 8` so a query row makes ONE K/V traversal instead of the three
+  `ncols2 = 2` needs, and it wins on that geometry: tg64 on gfx1100 (27B IQ3_S, q8_0 K/V) **+0.5 / +0.9 / +2.6 /
+  +4.3 / +5.7 % at d2048/8192/32768/65536/98304**, i.e. it grows with depth.  Three facts to keep:
+  1. **The isolation is a copy, not a template parameter, for a measured reason.**  The first form of this patch
+     compiled the fold into every `flash_attn_tile` instantiation as a runtime branch; that moved the ordinary
+     kernels' register allocation, which moved the occupancy the launcher derives the decode/verify KV split
+     (`parallel_blocks`, the summation order) from -- on gfx1201 VGPR 140 -> 94 on `<256,256,8,2,...>`, mean KLD
+     0.000391 / same-top-p 98.97 % and the tile path 1.4-5.7 % slower **with the fold unreachable**.  So a fold
+     added to the shared kernel is a numerics+throughput change for consumers who cannot even engage it.  As a
+     copy, `grep -c` on the new TU is the whole story: no pre-existing instantiation changes (verified: the
+     kill-switch arm's decode-width log-prob file is byte-identical to the previous release's, gfx1100 AND
+     gfx1201).
+  2. **It is NOT bit-identical by construction** -- the reduction grouping differs from the unfolded kernel
+     (unfolded `np = 4` over `nbatch_fa = 128`, fold `np = 1` over 64), so a near-tie CAN move.  What was measured:
+     identical at the u16 log-prob resolution of `--kv q8_0 --ub 1` on both arches and in every text cell
+     (gfx1100 482 chars, gfx1201 472/528 chars single-device and 3-GPU tensor).  Do not quote it as bit-identical;
+     quote the point.
+  3. **The copy must be re-synced whenever `flash_attn_tile`/`flash_attn_tile_iter` change.**  It is a copy of the
+     delivery's own kernel (kv_rows, the derived mask, the mask-skip bitmap, the native loaders, Q-from-global), so
+     a fix that lands only in `fattn-tile.cuh` is a fix this kernel does not get.  The header says so; a re-base
+     must diff the two bodies (they were identical at r376 apart from the fold bits).
+  Also **RDNA4 must refuse it**: the band owns the decode depths there (from ~10k cells) and the tile window below
+  is not attention-bound, so the arch gate is `RDNA3_0` only and gfx1201's obligation is non-regression -- verified
+  inert (census 0 with the env set, identical text and `tg64`, identical decode-width log-probs).
+
+* **r376 -- the RDNA3_0 MMB routed (MUL_MAT_ID) prefill row is a LOSS on IQ4_XS, and a routed-vs-MMQ decision is
+  weight-class specific.**  (block 06, GitHub issue #385, `@noctrex`; `c.routed = 0` on `RDNA3_0`, the same call
+  RDNA4 already carried; `GGML_CUDA_MMB_ROUTED=1` restores it.)  Measured here (gfx1100, 7900 XTX, Ornith-1.5-35B-A3B
+  **IQ4_XS**, pp2048 r3): routed ON -> OFF **4854/4070/3553 -> 5060/4256/3671 t/s at d0/d8192/d16384 (+4.2 / +4.6 /
+  +3.3 %)**, which is the reporter's +3.2/+3.9/+3.3 % reproduced.  **The same A/B on IQ4_NL is NEUTRAL**
+  (5117/4267/3692 -> 5104/4246/3683), so the loss belongs to the IQ4_XS routed shape, not to "MoE on RDNA3_0" --
+  a routed row must name the weight class it was measured on, and do not re-derive the IQ4_NL arm expecting a win.
+  **It is a kernel-FAMILY switch and the text moves on the class it wins on**: the IQ4_XS MoE point reads mean
+  KLD 0.007396 / same-top-p 96.667 % (over the absolute 0.005 / 98 %) against a same-kernel `-ub 256` control of
+  0.010867 / 93.333 %, i.e. no worse than a plain reordering (`GREEDY-PURITY.md` 46; the `--family-switch
+  --allow-control-pass` verdict), and the greedy text moves at the near-tie (443 chars `7a5911eefc77` -> 428
+  `8d25aa669cfd`).  On the IQ4_NL arm it is 0.001836 / 99.216 % (inside the limits) and the text is unchanged.
+  `GGML_CUDA_MMB_ROUTED=1` is the A/B arm and reads 0.000001 / 100.000 % against the r375 base, so a release
+  whose only change here is this row CAN be attributed exactly.  Decode never reaches MMB (`mmb_min_t`).
+  `GGML_CUDA_MMB_CFG=1`'s dump prints the arch TABLE and not the env overrides, so the proof the routed path ran
+  is `GGML_CUDA_MMB_LOG=1`'s `MMB_GLU fused` line (2 lines with the routed arm, 0 without).

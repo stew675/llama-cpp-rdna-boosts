@@ -1,52 +1,37 @@
-From 965d10fb712ef6eb85f4c58b569ac158b8f9b051 Mon Sep 17 00:00:00 2001
+From 5e3e8b867b745668e5f4e82e0d5958033dc0b3b4 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:31 -0500
 Subject: [PATCH 06/18] rdna-boosts: block 06: MMB quantized prefill GEMM
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
 
-Re-based onto a691b2345.  Applied clean, but its routed path called the pre-re-base
-`ggml_cuda_launch_mm_ids_helper` (which produced `expert_bounds` only).
+[r385] The RDNA3_0 row stands the routed MoE (MUL_MAT_ID) prefill down (GitHub issue #385, @noctrex):
+`c.routed = 0` in mmb_arch_defaults' RDNA3_0 branch, the same decision and the same reason the RDNA4
+row already carries -- the delivery's block-13 `mul_mat_q_routed_compact` is already a good fused
+expert kernel here, so the routed path only adds an `mm_ids_helper` launch and costs prefill.  Dense
+MMB is untouched (the Q4_K_XL and Q8_0 rows in the reporter's own A/B are the dense tile's).
+`GGML_CUDA_MMB_ROUTED=1` restores the routed arm (DIAGNOSTIC.md 8), so the A/B needs no rebuild.
 
-The helper now emits upstream #31047's `tile_spec` (block 00's re-implementation), so it
-gained an optional `expert_bounds` output that MMB keeps using: one compaction serves
-MMQ/MMF (tile_spec) and MMB (per-expert bounds), and both MMB call sites (routed and
-routed-GLU) allocate the tile_spec buffer they do not read.  No MMB kernel logic changed.
+Evidence, reproduced here on the reporter's own model (gfx1100 7900 XTX, Linux, Ornith-1.5-35B-A3B
+IQ4_XS, pp2048 r3): routed ON -> OFF is 4854/4070/3553 -> 5060/4256/3671 t/s at d0/d8192/d16384,
++4.2/+4.6/+3.3 %, against his +3.2/+3.9/+3.3 % (Windows).  The same A/B on IQ4_NL is neutral
+(5117/4267/3692 -> 5104/4246/3683), so the loss is the IQ4_XS routed shape's, not a general RDNA3_0
+one, and the arm is not vacuous: `GGML_CUDA_MMB_LOG=1` prints `MMB_GLU fused` twice with the routed
+path and never without it (the `MMB_CFG` dump prints the arch table, not the env override).
 
-Validated: build green; MMB_DENSE fires (GGML_CUDA_MMB_LOG=1: `MMB_CFG ... dense_geom=1
-routed=0 ...`, `MMB_DENSE blk.0.ffn_gate_inp.weight type=f32 M=128 K=2048 T=512`);
-`GGML_CUDA_MMB=0` byte-identical (108 chars, sha d94aef3f5033) on Qwen3-Coder-30B-A3B.
-
-BF16 dense weights, r336 (contributor PR #340, @briansp2020).  While rocBLAS is told to keep
-GEMMs off hipBLASLt (ROCBLAS_USE_HIPBLASLT=0, the §44 determinism control), a qwen4exp model's
-BF16 dense GEMMs -- the hc mixer, the BF16 router and the shared-expert gate, 484 tensors on a
-GSQ Flash-Next IQ3_S -- fall back to rocBLAS's own Tensile kernels, which cost that model a
-third of its prefill.  They now take the MMB bf16-WMMA tile from 33 tokens (above the MMVF
-band, `mmb_bf16_dense`, `GGML_CUDA_MMB_BF16_DENSE` / `_BF16_MIN_T`), with the warp-per-token
-tiny-M kernel for M <= 8 (`mmb_tiny_m_bf16`), which reads the activation's bf16 copy (the
-producer's RNE copy in bf16_src1_cache when it is there, `GGML_CUDA_MMB_TINY_BF16_XH` /
-`_PRODUCER_BF16`), and a 128x64 / 64x32 tile when the 256x128 grid is thin
-(`mmb_small_tile_grid`, `GGML_CUDA_MMB_SMALL_TILE` / `_SMALL_GRID`).
-
-None of it is reachable with hipBLASLt on: the arch default is gated on `mmb_hipblaslt_off()`,
-so the default path is unchanged (prefill-logit -0.000000 / 100.000 %, same greedy text).  RDNA4
-also turns `hc16` off: the hc gate's BF16 side copy (2*T*10240 bytes per call, ~84 MB at T 4096)
-is only read by the marking passes, and those are RDNA3_5-gated, so on RDNA4 it was written and
-never read; `GGML_CUDA_MMB_HC16=1` restores it.
-
-Measured (gfx1201, ROCm 10.1, 2-GPU `-sm tensor`, Flash-Next GSQ IQ3_S, host experts
-`-ncmoe 47 -lme 47`): pinned prefill 1691 -> 2196 t/s (+29.9 %) on a 5.2k-token prompt, i.e.
-above the default (hipBLASLt on) 2027 t/s; `GGML_CUDA_MMB_SMALL_TILE=0`, `_PRODUCER_BF16=0` and
-`_HC16=1` are each 0.000000 / 100.000 % against the default; test-backend-ops `-o MUL_MAT` pinned
-2691/2692 (the f16 n=2105344 case, which fails identically without this).  The pinned mode is a
-kernel-family switch by design (mean KLD 0.013781 / 96.427 % against the r334 pinned base,
-inside the 0.015033 that r334's own default-vs-pinned gap already is) -- `GREEDY-PURITY.md` §44.
+Purity.  Standing the routed GEMM down is a KERNEL-FAMILY switch, so it moves the prefill logits and
+that is recorded, not argued away.  On the IQ4_XS MoE the canonical point reads mean KLD 0.007396 /
+same-top-p 96.667 % (unit 0.000001 / 100.000 % with `MMB_ROUTED=1`, so the rest of r376 is inert),
+i.e. OVER the absolute 0.005 / 98 % limits but NO WORSE than the same-kernel `-ub 256` control
+measured on the spot (0.010867 / 93.333 %) -- the GREEDY-PURITY 46 calibration, the same criterion
+r372's RDNA3_0 head-256 prefill row was taken on.  Same-seed greedy text on that model moves at the
+near-tie (443 chars sha 7a5911eefc77 -> 428 chars sha 8d25aa669cfd); on the IQ4_NL arm the point is
+0.001836 / 99.216 % (inside the limits) and the text is unchanged.  Decode does not reach MMB
+(`mmb_min_t`), so this is prefill-only.
 
 Co-authored-by: brian <bsp2020@gmail.com>
+Reported-by: George <noctrex@users.noreply.github.com>
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu   |   60 +-
- ggml/src/ggml-cuda/mmb.cu         | 2570 +++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmb.cu         | 2588 +++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/mmb.cuh        |   32 +
  ggml/src/ggml-cuda/mmf.cu         |    2 +-
  ggml/src/ggml-cuda/mmf32.cu       |  201 +++
@@ -56,7 +41,7 @@ Co-authored-by: brian <bsp2020@gmail.com>
  ggml/src/ggml-cuda/mmq.cu         |    2 +-
  tests/CMakeLists.txt              |    1 +
  tests/test-logits-width-probe.cpp |  196 +++
- 11 files changed, 3138 insertions(+), 17 deletions(-)
+ 11 files changed, 3156 insertions(+), 17 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/mmb.cu
  create mode 100644 ggml/src/ggml-cuda/mmb.cuh
  create mode 100644 ggml/src/ggml-cuda/mmf32.cu
@@ -195,10 +180,10 @@ index 7c1ed1032..ba046221e 100644
      auto add_alloc_deps = [&](size_t start, size_t last_node) {
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
 new file mode 100644
-index 000000000..47eae70e3
+index 000000000..213a4ec4b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -0,0 +1,2570 @@
+@@ -0,0 +1,2588 @@
 +#include "common.cuh"
 +#include "mmb.cuh"
 +#include "unary.cuh"
@@ -1760,6 +1745,24 @@ index 000000000..47eae70e3
 +        // does not spill; keeping Q4_K on 128x256 is +4.5 % / +3.8 % pp2048 at d0 / d16384 over
 +        // 128x128 for every type (Qwen3.8-27B Q4_K_M).
 +        c.big_q4k_only  = 1;
++        // The routed MoE (MUL_MAT_ID) prefill loses to the block-13 MMQ ids path on gfx1100: the same
++        // "the routed path masks what the delivery's fused expert kernel already does better" pattern the
++        // RDNA4 row above records, on the reporter's first-party gfx1100 sweep (GitHub issue #385,
++        // @noctrex: pp2048 at d0/d8192/d16384 on an IQ4_XS MoE, routed arm -3.7/-6.9/-8.4 % against
++        // upstream and +3.2/+3.9/+3.3 % with it off; the MMB-on run also trailed its own off-run at every
++        // depth).  Dense MMB is untouched -- the Q4_K_XL +17-20 % and Q8_0 parity in the same A/B are the
++        // dense tile's, not this field.  REPRODUCED on this project's own gfx1100 (7900 XTX, Linux,
++        // Ornith-1.5-35B-A3B IQ4_XS, pp2048 r3): routed ON -> OFF reads 4854/4070/3553 ->
++        // 5060/4256/3671 t/s at d0/d8192/d16384, +4.2/+4.6/+3.3 %, matching the report.  The same A/B on
++        // IQ4_NL is neutral (5117/4267/3692 -> 5104/4246/3683), so the loss is the IQ4_XS routed shape's,
++        // not a general RDNA3_0 one.  It is a KERNEL-FAMILY switch, so it moves the prefill logits: on that
++        // IQ4_XS model the point reads mean KLD 0.007396 / same-top-p 96.667 % against the routed-on arm,
++        // which is OVER the absolute limits but NO WORSE than the same-kernel -ub 256 control measured on
++        // the spot (0.010867 / 93.333 %) -- the GREEDY-PURITY 46 calibration, and the same-seed greedy text
++        // moves at that near-tie (443 chars -> 428).  On the IQ4_NL arm it is 0.001836 / 99.216 % with the
++        // text unchanged.  `GGML_CUDA_MMB_ROUTED=1` restores the routed arm on any build (and reads
++        // 0.000001 / 100.000 % against the r375 base, i.e. the rest of r376 is inert).
++        c.routed        = 0;
 +    }
 +    // TODO(S12): the routed/GLU thresholds, `tall_mode`, `tiny_m*`, `f32split_*` and `cache_max` are
 +    // still the gfx1151 values on every arch.  Give RDNA4 its own once they are measured per arch.
