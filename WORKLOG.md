@@ -16,6 +16,32 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261128.010 (r378 follow-up) -- the Q5_K VDR-4 flag's RDNA4 half is measured (it stays off), and one shape is recorded as a measurement trap
+
+**Why.**  `ENVIRONMENT.md` §14's `-DGGML_HIP_RDNA4_Q5K_DENSE_VDR4` row still said "Unmeasured on RDNA4 (this repo has
+no gfx12 on the box that cut it)", which stopped being true when this box gained three R9700s.  Measured on gfx1201 /
+Linux / ROCm 10.2 against the same tree's flag-off build (`~/llama-scratch`, `test-backend-ops perf -o MUL_MAT -p
+type_a=q5_K`, A/B/A/B): `m 4096 k 14336` µs/call **41.7 -> 27.9 at n=1 (-33.2 %), 48.6 -> 32.9 at n=2 (-32.4 %),
+57.9 -> 36.9 at n=3 (-36.3 %), 76.4 -> 48.5 at n=5 (-36.6 %), 94.9 -> 66.1 at n=8 (-30.5 %)**, the k=5120 decode
+shapes -24..-29 %, k=2560 -19..-23 %, every n >= 128 inert.  End to end on 27B UD-Q5_K_XL: `tg128` **+0.6 %**
+(27.66 -> 27.83 t/s), `llama-batched-bench -npp 512 -ntg 128` **+0.7 / +2.5 / +6.4 %** at B = 1/4/8.  Op oracle
+**92/92 in both arms with the same max error** (0.0005) and the greedy text identical on the prompt probed, so the
+"moves on some prompts" wording is corrected to the RDNA3_0 observation with a per-prompt A/B owed.  **It stays
+off** -- a 0-1 % single-stream win does not justify moving a default's text (the same reasoning as r378's Q6_K
+flag).
+
+**The trap, recorded because it nearly shipped a false finding.**  `m 640 n 512 k 2560` read **+24.5 % / +26.2 %** for
+VDR 4 in the first interleaved pair and was nearly published as a regression.  Eight samples per arm show **both arms
+bimodal at ~45 µs and ~56 µs** (VDR 2: 55.95/45.07/54.78/44.82/44.81/44.85/54.56/54.40; VDR 4:
+58.10/45.20/44.91/57.23/55.80/56.61/54.16/57.20) -- the two arms had simply landed in different basins, and A F F A
+does not protect a pair from that.  The same class explains the Q6_K table's single-sample `n=512` rows (+3.4 % on
+`2560x512x6144`), so those deltas are retracted too while the "n >= 128 inert" conclusion stands.
+
+**Record and follow-up.**  `ENVIRONMENT.md` §14 (the full measurement, the end-to-end honesty, the trap) and the
+block-07 note carry it; `INVARIANTS.md` r378 (follow-up) states the rule; **PR #386 got a follow-up comment**
+documenting the retraction, the basin data and the sampling rule, for the submitter and anyone quoting either
+kernel's table.  Docs-only: `release.json`, `patches/` and the tag are untouched, so there is no new release.
+
 ## 261128.009 (r378, release cut) -- tagged, main and the fork pushed, the assets published, the images queued on the worker
 
 **The cut.**  `v18-919794500-r378` (annotated tag, pushed) = fork re-cut tip

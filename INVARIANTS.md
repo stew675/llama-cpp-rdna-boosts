@@ -4221,3 +4221,20 @@ fallback's new meaning) and `DIAGNOSTIC.md` §28 (`MOE_EXPERT_CACHE_TABLES` is r
   Correctness of the arm, for the next reader: `test-backend-ops -o MUL_MAT -p type_a=q6_K` 71/71 with the SAME max
   error as the VDR-2 arm (0.0005), and wikitext PPL identical to 4 dp chunk for chunk (6.9346).  Record:
   `archive/work/rdna4-q6k-dense-vdr4/`.
+
+* **r378 (follow-up) -- the RDNA4 half of the dense Q5_K VDR-4 flag, and the shape that invents a 25 % "regression"
+  if you sample it once.**  (r368's flag, measured because `ENVIRONMENT.md` §14 still claimed the box had no gfx12.)
+  1. **The flag wins on RDNA4 too**, `m 4096 k 14336` µs/call: **41.7 -> 27.9 at n=1 (-33.2 %), 48.6 -> 32.9 at
+     n=2 (-32.4 %), 57.9 -> 36.9 at n=3 (-36.3 %), 76.4 -> 48.5 at n=5 (-36.6 %), 94.9 -> 66.1 at n=8 (-30.5 %)**,
+     k=5120 decode shapes -24..-29 %, k=2560 -19..-23 %, every n >= 128 inert (+-0.3 %); `tg128` +0.6 % and
+     `llama-batched-bench` +0.7 / +2.5 / **+6.4 %** at B = 1/4/8 on 27B UD-Q5_K_XL (19.43 GiB, also at the DRAM
+     roof).  Op oracle 92/92 in both arms with the SAME max error (0.0005), and the greedy text of the prompt probed
+     was identical -- the "greedy text moves on some prompts" claim is the RDNA3_0 measurement and must be A/B'd
+     per prompt, not assumed from the flag.
+  2. **`m 640 n 512 k 2560` is BIMODAL IN BOTH ARMS: ~45 µs and ~56 µs, 8 samples each (VDR 2: 55.95/45.07/54.78/
+     44.82/44.81/44.85/54.56/54.40; VDR 4: 58.10/45.20/44.91/57.23/55.80/56.61/54.16/57.20).**  A single interleaved
+     A/F/F/A pair there read +24.5 % / +26.2 % and was nearly reported as a regression; the basin can hold for a
+     whole pair, so A F F A does not protect it.  **The rule: a shape whose per-process spread exceeds the effect
+     cannot be judged from one pair -- repeat the pair and take the per-arm minimum (or report the spread).**  The
+     same class explains the Q6_K table's single-sample `n=512` rows (`2560x512x6144` +3.4 %, `5120x512x17408`
+     +0.3 %): the conclusion ("n >= 128 inert") holds, those deltas do not.
