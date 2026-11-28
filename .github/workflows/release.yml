@@ -92,7 +92,10 @@ jobs:
           owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
           repo="${GITHUB_REPOSITORY#*/}"
           image="${REGISTRY}/${owner_lc}/${repo}"
-          notes="llama.cpp fork point \`${BASE}\`, canonical tree \`${TREE}\`, ${N_DEFAULT} default patches: ${N_BLOCKS} official blocks \`0000-0015\` (a \`v${N_BLOCKS}\` release) plus the temporary block \`0300\`.
+          # The official range is DERIVED from the count, never written by hand: it was hardcoded `0000-0015`
+          # and stayed that way through r356-r374 (blocks 0016/0017 shipped while the release note said otherwise).
+          last_block=$(printf '%04d' "$((N_BLOCKS - 1))")
+          notes="llama.cpp fork point \`${BASE}\`, canonical tree \`${TREE}\`, ${N_DEFAULT} default patches: ${N_BLOCKS} official blocks \`0000-${last_block}\` (a \`v${N_BLOCKS}\` release) plus the temporary block \`0300\`.
 
           Apply with \`scripts/apply-all.sh\` on a fresh llama.cpp checkout at \`${BASE}\`; verify the artifacts against \`SHA256SUMS\`.  ${N_OPTIONAL} optional artifacts (\`optional/*/01xx-*.patch\`) are NOT in the default tree -- \`--include-optional\` applies them; they are not covered by the release gates.
 

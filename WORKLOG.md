@@ -200,3 +200,8 @@ No image build ran on the primary box.
 | 2026-09-13 | 7 | `260913.001-260913.007` | [`WORKLOG-20260913.md`](archive/worklog/WORKLOG-20260913.md) |
 | 2026-09-12 | 17 | `260912.001-260912.017` | [`WORKLOG-20260912.md`](archive/worklog/WORKLOG-20260912.md) |
 | 2026-09-11 | 11 | `260911.001-260911.011` | [`WORKLOG-20260911.md`](archive/worklog/WORKLOG-20260911.md) |
+
+**Follow-up the same day (261128.002, docs/CI).**  The release note's block range was hardcoded `0000-0015` in
+`.github/workflows/release.yml` and had been wrong since r356 (blocks `0016`/`0017` shipped while every release note
+said otherwise); it is DERIVED from `n_blocks` now, and this tag's published body was corrected by hand to
+`0000-0017`.  Found while reading the r375 release page.
