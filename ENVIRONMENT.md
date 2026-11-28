@@ -845,6 +845,21 @@ Three consequences a consumer can see:
   device's slot is filled on that device's copy stream and *copied* into the split input (the in-place redirect is
   not correct for an offloaded expert table).  Both are eligible transports; which one serves a given ubatch is
   the exposure test (`GGML_SCHED_STAGE_EXPOSE_US`), so no policy may hard-code "the gather owns that tier".
+* **The stage-vs-gather choice is MEASURED, not modelled (r375, issue #368).**  The exposure test above is a model:
+  it reads COVERAGE (`host - covered`, the capacity the arena keeps) as if it were the read the device gather would
+  do.  It is not: on a shape whose routing concentrates, the gather touches a small part of the non-resident set
+  and the model over-states it, while a slower link makes the model *more* eager to stage (the same bytes divided
+  by a smaller bandwidth), which is backwards.  So once any wide graph has let the gather take an offloaded table,
+  the selector compares the fill's volume against the gather's **counted** read: the CUDA backend counts one
+  `expert_bytes` per expert a gather takes from host memory (the gather kernel knows, per expert, whether its source
+  is the arena, the pool or the master), mirrors it into pinned memory behind an event and reads it back a graph
+  later, so there is no synchronize and no warm-up bias.  Staging's only advantage is the copy engine's overlap and
+  the overlap can save at most the read the gather would have done, so the rule is "stage only if the fill moves no
+  more than `GGML_SCHED_STAGE_FILL_RATIO` times what the gather reads" (default **2.0** = a 50 % overlap
+  efficiency, the delivery's own measured value).  The exposure test stays as the answer for the graphs before the
+  first measurement.  Measured ratios on the 89k Flash-Next shape at `-ub 8192`: **0.80x** on a PCIe5 x8 card
+  (28.7 GB/s), **1.13x** on PCIe5 x16 (55 GB/s) and **1.14x** on our slowest card (14.5 GB/s), all of which stage,
+  against the reporter's box where the gather wins by 38 % and the ratio is far above 2.
 
 The measured shape of it (2 cards `-sm tensor`, GSQ-IQ3_XXS 89k, `-ub 8192`, reproducible flags
 `-lme mirror --lazy-mode off`): staged beats gather by **+8.1 % at 40 % coverage** and +3.4 % at 60 %, loses 2.1 %
@@ -853,9 +868,10 @@ at 80 % and ties at ~100 % — a crossover ~70 %, which is what the 38 µs rule 
 | variable | default | class | what it does |
 |---|---|---|---|
 | `GGML_SCHED_PIPELINE` | unset = **on** | tuning | The pipeline.  `0` leaves every host weight to the serial whole-table upload (§31 of `DIAGNOSTIC.md`). |
-| `GGML_SCHED_PIPELINE_BUFS` | unset = the residency rule | tuning | The buffer count, 0–3 (0 = GATHER); `GGML_SCHED_STAGE_SLOTS` is the alias the released block documents.  A user value is clamped to 1–3 and wins over the rule. |
-| `GGML_SCHED_STAGE_SELECT` | unset = **on** | tuning | The stage-vs-gather selector at prefill width.  `0` restores the gather for every pool-backed table (`DIAGNOSTIC.md` §31). |
-| `GGML_SCHED_STAGE_EXPOSE_US` | `38` | tuning | The crossover in µs/token (host bytes the staged ubatch would pull ÷ the device's calibrated H2D bandwidth). |
+| `GGML_SCHED_PIPELINE_BUFS` | unset = the residency rule | tuning | The buffer count, 0–3 (0 = GATHER, a real answer: no region carved, the selector keeps the gather); `GGML_SCHED_STAGE_SLOTS` is the alias the released block documents.  A user value wins over the rule. |
+| `GGML_SCHED_STAGE_SELECT` | unset = **on** | tuning | The stage-vs-gather selector at prefill width.  `0` restores the gather for every pool-backed table, and also stops the transport region being carved at all (`DIAGNOSTIC.md` §31). |
+| `GGML_SCHED_STAGE_FILL_RATIO` | `2.0` | tuning | The measured selector's threshold: stage only if the whole-table fill moves no more than this multiple of the host bytes the device gather **measured** it would read.  The physical bound is 2.0 (staging's overlap can save at most the gather's own read, and the delivery's measured overlap efficiency is 50 %); lower is more gather-favouring, higher more stage-favouring. |
+| `GGML_SCHED_STAGE_EXPOSE_US` | `38` | tuning | The **fallback** crossover in µs/token, used only for graphs before the first gather measurement (host bytes the staged ubatch would pull ÷ the device's calibrated H2D bandwidth). |
 | `GGML_CUDA_SLAB_TRANSPORT_HEADROOM_CHUNKS` | `2` | tuning | The cushion above the decode/verify band, in compute chunks; `0` = no cushion. |
 | `MOE_HOST_POOL_STAGE_BULK` | unset = **derived** per device (bulk ≥ ~50 GB/s, else the hybrid) | tuning | The prefill fill's engine: `0` = the pre-patch paths (two-tier kernel, then the per-expert bounce), `1` = one copy-engine DMA of the whole table, `2` = the HYBRID (merged host runs by DMA + one kernel launch for the arena-resident experts). |
 | `MOE_HOST_POOL_STAGE_BULK_GBPS` | `50` | tuning | The link threshold the `auto` fill form uses (a copy engine above it, the hybrid below). |

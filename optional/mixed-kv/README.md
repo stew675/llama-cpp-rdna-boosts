@@ -8,9 +8,18 @@ never contains it.  Only `scripts/apply-all.sh --include-optional` (asks `[y/N]`
 `--include-optional-all` applies it, on top of the verified default tree.
 
 * `0101-mixed-kv.patch` — the artifact.  sha256
-  `ba75c00cdd3c0e0e2efd49c52c3e384f2783686f797f4eddce6aa72544eccf4c` (the current cut; every earlier cut is
+  `fecd7c50d1c973107ccd5ac9f1e7db362738d0f3e6ae06897b78a91857b2b840` (the current cut; every earlier cut is
   recorded below)
-* **r374 re-cut verification (current)**: applies strictly at the r374 default tree
+* **r375 re-cut verification (current)**: applies strictly at the r375 default tree
+  `5fccfbcdc6c5dba3db5972362656b952d7a033ad` (18 official blocks `0000`-`0017` + temporary `0300`, default tip
+  `5c35fca85`), sha256 `fecd7c50d1c973107ccd5ac9f1e7db362738d0f3e6ae06897b78a91857b2b840` -- **mechanical**, though
+  r375 amends one of this artifact's ten files (`src/llama-context.cpp`, the transport sizing's constructor skip
+  is untouched by it; the artifact's own hunk is elsewhere in the file): the diff body is untouched and only the
+  `From` id, the blob index and the hunk line numbers moved, and it applies **strictly** (`git am`, no `-3`);
+  producing tree `c830fd2e045366b6c94fb93d5751d5f1834a2475` alone and
+  `3a30b43776a224423d1912d9cffbf686c62a6464` cumulative (both re-verified by `scripts/validate-set.sh` check 8).
+  `scripts/gate-optional-build.sh` (gate 47) is owed on this tree and is run in the r375 release ladder.
+* **r374 re-cut verification (superseded by r375)**: applies strictly at the r374 default tree
   `760fa359026d1ce33cf22be3377311b95877bfa8` (18 official blocks `0000`-`0017` + temporary `0300`, default tip
   `f5f7a8e25`), sha256 `4f9a7609962aede998f238a65179dbef3c71c0768f22c62445207e1c3fb46ed4` -- **mechanical**, though
   r374 amends two of this artifact's ten files (`src/llama-context.cpp`, the same-type K/V gate and the

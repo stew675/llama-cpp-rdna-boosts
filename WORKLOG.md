@@ -16,6 +16,80 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261128.002 (r375) -- issue #368: the stage-vs-gather transport is decided from a MEASURED gather read, three switches that lied are fixed, and the reporter's prefill regression has a mechanism (blocks 12/15)
+
+**Reported** (`@DanoPTT`, issue #368, r373 on a single R9700 at PCIe 3.0 x16, Windows): r373 prefill **1818 t/s**
+against r368's 2944 (-38%), S2 decode **50.5** against 65.8 after a long prefill "even with staging off", the
+bimodal per-start state unchanged, `GGML_SCHED_PIPELINE_BUFS=0` ignored, and `GGML_SCHED_STAGE=0` thrashing a 64 GB
+box.  `GGML_SCHED_STAGE_SELECT=0` restored his 2952 exactly, so the transport selector was the prefill cause.
+
+**Reproduced, in part, on our own links.**  The r374 default could not be made to lose on any of our three: GPU0
+(PCIe5 x8, 28.7 GB/s) staged **2423.5** against the gather's 1876.4; GPU1 (the M.2 riser, 14.4 GB/s) staged
+**1977-2119** against 1579-1651; `radix` (PCIe5 x16, 55.1 GB/s) staged **2575.1** (r374) / **2590.0** (r375).  So the
+default was not changed blind, and the fast-link arm is measurably untouched.
+
+**What was wrong with the selector.**  It compared `(host - covered)` per token over the calibrated link against a
+fixed **38 µs**.  Three findings:
+
+1. `covered` is CAPACITY, not the hit rate of the routed working set.  Same model, flags and `-ub 8192`, and the
+   field shape reads an arena hit rate of **0.95-0.97 at 51 % coverage** on his box against **0.59-0.66 at 51 %** on
+   ours, so the gather reads an order of magnitude less there and the model over-stated the transport it was
+   trading against.  His own census showed it: the slow state and the good state have the same stand-down set and
+   the same residency map, and only the gather count moves (2070 against 2208 calls).
+2. Dividing by the link made a SLOWER link more eager to stage: the same bytes over less bandwidth cross the same
+   fixed µs threshold sooner, while the staged fill's own cost is those same bytes over that same link.  The
+   trade had not improved; only the model's units had changed.
+3. The physical break-even is a RATIO of volumes.  Staging's only advantage is the copy engine's overlap, and the
+   overlap can save at most the read the gather would have done, so the fill may move at most `1/(1-alpha)` times
+   it (alpha = the overlap efficiency, measured 50 % here).
+
+**The fix.**  The gather kernel already chooses per expert between the arena (D2D), the pinned pool and the master,
+so it now adds one `expert_bytes` per host-sourced expert into a device counter; the host mirrors it into pinned
+memory behind an event and reads it **a graph later**, so there is no synchronize and, being a byte count, no
+warm-up bias (a wall-clock sample of a cold first ubatch is 2x off and would have picked the wrong transport).
+The selector stages only if the fill moves at most `GGML_SCHED_STAGE_FILL_RATIO` (default **2.0**) times the
+measured read.  Measured ratios: **0.80x / 1.13x / 1.14x** on the three links above, all STAGE, so every delivery
+decision is unchanged; his box is far above 2, which is why its gather wins.
+
+**Three switches that lied, found while chasing it.**
+
+* `GGML_SCHED_PIPELINE_BUFS=0` (documented GATHER) was parsed `if (v < 1) v = -1;` and silently became the
+  residency rule's 3.  Now `0` is a real answer: `SLAB_INIT ... transport_req=0.00 GiB`, "transport region off".
+* r362's zero-carve rule was asked ONCE at the model-load preflight; `slab_set_stage_cap`, `slab_set_stage_unit`
+  and the residency decision (which runs under the cache mutex) each re-derived `unit x depth` and re-carved.  A
+  gather arm therefore carried r374's **1408 MiB** carve, the same three evictions (116 + 158 + 3368 MiB) and the
+  same 20-table stand-down.  The answer is latched where it can be asked and every late request reads the latch.
+  At a generation length worth quoting (300 tokens on L1/L2, the natural 62-token stop on S2, one fresh server per
+  arm) the fixed grabber reads L1 **1907.6 -> 1950.8 t/s (+2.3 %)** and L2 **36.69 -> 38.14 t/s (+4 %)**, S2
+  **48.16 against 48.18**.  An earlier 30-token arm read an 8 % S2 gap between the same two arms: that was
+  short-decode noise, it is recorded here as refuted, and it is why no decode claim in this entry is made from
+  fewer than 300 generated tokens.
+* `GGML_SCHED_STAGE=0` then took the scheduler's SERIAL whole-table upload instead of the gather (region carved,
+  selector chose staging, pipeline off) -- the shape of his 64 GB thrash.  It now gathers: **1899.1 t/s**, no
+  page-cache growth.
+
+**And a per-copy cost, measured** (`utilities/h2d-latency/`, new): below ~1 MiB the link is latency-bound, not
+bandwidth-bound.  On GPU1 a 64 KiB copy achieves **5.6 GB/s** and 1 MiB **10.0 GB/s** against a calibrated 14.5,
+and the round-trip floor is **20-35 µs**.  The staged fill issues one DMA per host run (~1.9 MB on this shape:
+`123258 host DMAs` for `235687 MiB` over an 11-ubatch prefill, i.e. ~11 200 per 8192-token ubatch), so its cost is
+`DMA count x per-copy cost`, not `bytes / bandwidth`.  That is the quantity his box can be compared on, and it is
+what the tool exists to report.
+
+**Not fixed, and named for the follow-up issues**: the bimodal per-start state (un-reproduced on Linux; sub-issue),
+the 23 % S2 loss *with staging off* (we see the eviction, 3642 MiB, but not that magnitude), and his H2D
+calibration reading 9.0-9.2 GB/s where r368 read 11.7-12.6 (a per-start probe difference, `TODO` for the tool).
+
+**Verified.**  Same-seed greedy text **byte-identical** on all four field requests (r374 vs r375, sha256 of every
+response body); `gate-host-pool.sh` **59/59** (tsplit arms and the GPU fault scan included); `gate-prefill-logits.sh`
+**mean KLD 0.000000**, top-p 100.000 %; `validate-set.sh` green (checksums, fresh-tarball strict apply, optional
+0100/0101 re-cut onto the new default tree, Windows portability, credit register, and the rung file-set
+reconciliation reading `0 unexplained`, 3 new env vars); the four-block re-cut (12 and 15 amended, 09/10 untouched)
+reproduces the tree that was measured, byte for byte.
+
+**Record.** `INVARIANTS.md` r375; `ENVIRONMENT.md` §31 (`GGML_SCHED_STAGE_FILL_RATIO`, the rule, the fallback) and
+`DIAGNOSTIC.md` §31 (the three fixed switches) and §28 (`MOE_EXPERT_CACHE_TABLES` is report-only);
+`patches/README.md` blocks 12/15; `utilities/h2d-latency/`.
+
 ## 261128.001 (r374, release cut) -- tagged, main and the fork pushed, the release assets published, the images verified 23/23, and the prefill-logit point reads 0.000000
 
 **The cut.**  `v18-919794500-r374` (annotated tag, pushed) = fork re-cut tip

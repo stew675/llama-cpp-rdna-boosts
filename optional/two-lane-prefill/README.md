@@ -1,8 +1,18 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
 **Optional artifact, not part of the delivery.  Optional block `0100`; PORTED onto `r369` (2026-11-27), verified on `r353`.**
+r375 (18 official blocks `0000`-`0017` + temporary `0300`, default tree
+`5fccfbcdc6c5dba3db5972362656b952d7a033ad`, default tip `5c35fca85`): RE-CUT, and this one needed a **reconcile** --
+r375 amends block 12's scheduler (`ggml/src/ggml-backend.cpp`, the transport selector and the pipeline), which is
+where this artifact's own interleaved submission lives: the block now splits `compute_splits` into
+`pipe_begin`/`compute_split`/`pipe_end` in the same area, so the r375 gather-read sample was re-seated inside
+`pipe_end` (it must run once per graph, after the last split).  sha256
+`654d4b4cd19d8a0d2e88dff11783aac87f1256d3a463008f6cc3cf9673f96bc5`; producing tree
+`aa2b996b6907ba88e2f4d2dc48a2077da5cb1473` alone and `3a30b43776a224423d1912d9cffbf686c62a6464` cumulative (both
+re-verified by `scripts/validate-set.sh` check 8); `scripts/gate-optional-build.sh` (gate 47) is owed on this
+cumulative tree and is run in the r375 release ladder.
 r374 (18 official blocks `0000`-`0017` + temporary `0300`, default tree
-`760fa359026d1ce33cf22be3377311b95877bfa8`, default tip `f5f7a8e25`): RE-CUT, and **mechanical** -- r374 amends block 12
+`760fa359026d1ce33cf22be3377311b95877bfa8`, default tip `f5f7a8e25`, superseded): RE-CUT, and **mechanical** -- r374 amends block 12
 (`src/llama-context.cpp`, the zero-length device-state piece) and block 14 (`src/llama-kv-cache.cpp`, the device lookup,
 and `common/arg.cpp`), and this artifact owns `src/llama-context.cpp` among its eight files, but it applies **strictly**
 (`git am`, no `-3`): the diff body is untouched, only the `From` id, the blob index and three hunk line numbers moved.
