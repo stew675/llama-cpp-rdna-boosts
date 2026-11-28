@@ -93,7 +93,11 @@ done
 [ -f "$PROMPT" ]    || { echo "ERROR: no prompt at $PROMPT" >&2; exit 2; }
 
 if [ -z "$MODEL" ]; then
-    MODEL="$(ls -1 /llm/models/Qwen3.8/27B/*/*.gguf 2>/dev/null | head -1)"
+    # Prefer the delivery's own 27B test quant (a head-256/GQA-6 pair, and small enough to fit one card),
+    # then the smallest other GGUF in that directory: "the first file" can be a Q8_0 that no single device
+    # holds, which dies at load and reads as a gate failure rather than a missing model.
+    MODEL="$(ls -1 /llm/models/Qwen3.8/27B/IQ3_S/*.gguf 2>/dev/null | head -1)"
+    [ -n "$MODEL" ] || MODEL="$(ls -S -r /llm/models/Qwen3.8/27B/*/*.gguf 2>/dev/null | head -1)"
 fi
 [ -n "$MODEL" ] && [ -f "$MODEL" ] || {
     echo "ERROR: no model.  The fold only engages on head-256/256 with a GQA ratio of 6 (qwen35 27B," >&2
@@ -151,7 +155,11 @@ if [ "$A_ARM" = 1 ]; then
     off_sha="$(run_text off "$KILL=0")"
     note "text default:     $on_sha"
     note "text kill-switch: $off_sha"
-    [ -n "$on_sha" ] && [ -n "$off_sha" ] || bad "a text arm produced no extractable output (see $KEEPOUT)"
+    if [ -z "$on_sha" ] || [ -z "$off_sha" ]; then
+        bad "a text arm produced no extractable output -- see $KEEPOUT/text-*.log (usually the model does not"
+        bad "    fit one card, or the prompt/geometry is wrong)"
+        tail -3 "$KEEPOUT"/text-*.log 2>/dev/null | sed 's/^/    /'
+    fi
     if [ "$on_sha" = "$off_sha" ]; then
         note "OK: same-seed greedy text identical in both arms"
     else
