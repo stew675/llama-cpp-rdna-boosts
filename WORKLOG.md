@@ -16,6 +16,41 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261128.009 (r378, release cut) -- tagged, main and the fork pushed, the assets published, the images queued on the worker
+
+**The cut.**  `v18-919794500-r378` (annotated tag, pushed) = fork re-cut tip
+`d4dd34a93ba61748e642a3d76ddaf6c62e4f0482`, tree `976fd14dcd43b6fc8d90176cfb1c419ec72968fc`, 19 default patches
+(18 official + temporary `0300`), 2 optional artifacts re-cut against the new tree (bodies unchanged),
+optional tree `b23dc540337f3f8539c45140aefdeefaf3bd0b03` -- all recorded in `release.json`.  The taxonomy is
+one message-only re-cut into the release: the first export dropped the `Co-authored-by: DanoPTT` trailer
+(the assembler split the inserted paragraph at its own trailer line), which `check-credit.sh` caught
+immediately -- so the block 07 and 10 commits were amended again, the whole set re-exported and re-applied,
+the tree **unchanged** (`976fd14dcd`, which is why no rebuild was owed) and only the patch sha256s and `.tip`
+moved.  Determinism holds: two independent `apply-all.sh` runs from the shipped patches produce tip
+`d4dd34a93` and tree `976fd14dcd`.
+
+**The ladder** (in `WORKLOG.md` 261128.008): `validate-set.sh` green (strict 19/19 on a fresh tarball, both
+optional artifacts alone and cumulative, credit 45 handles / 40 rows / 0 debt, file-set reconciliation 582
+files 582 / 0 loss / 0 gone / 0 shrunk / **+2 defines** -- exactly `VDR_Q6_K_Q8_1_MMVQ_DENSE4` and
+`GGML_CUDA_Q6K_DENSE_VDR4`); `fork-refresh.sh --build --gates` PASS (re-cut asserted tree **and** tip, `all`
+build, `check-shlib-symbols.sh` 16/16, coherence, `gate-prefill-logits.sh` **0.000000 / 100.000 %**);
+`test-backend-ops test -o MUL_MAT` **2753/2753** on the default build; `check-gen-docs.sh` ok;
+`gate-optional-build.sh` (gate 47) PASS in 248 s on tree `b23dc5403`; coherence vs the r377 build identical on
+four arms (4B Q8_0 1 GPU and 3-GPU tensor `7e6229b260f6`, 27B UD-Q6_K_XL `da2e2d192e21`, 35B-A3B Q4_K_M
+`461ca8cd0e88`, 27B `draft-mtp` `f2f9f9a596b7`).  The flag-on arm was measured in the scratch tree, whose tree
+is **the same `976fd14dcd`**: `test-backend-ops -o MUL_MAT -p type_a=q6_K` 71/71 with the same max error as
+VDR 2, wikitext PPL 6.9346 both arms chunk for chunk, MTP acceptance 0.49755 -> 0.50825, and the kernel /
+batched tables in 261128.008.
+
+**CI and assets.**  Tier-1 `Validate delivery set` green on `main` and on the tag, `Release patch set` green;
+the GitHub Release carries its four assets (`SHA256SUMS`, `patches.tar.gz`, `rdna-boosts-all.patch`,
+`release.json`).  The personal fork's `rdna-boosts` branch carries `d4dd34a93`:
+`gh api repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` reads it.
+
+**The images.**  OWED: the `radiance` cron watcher picks the new tag up on its next poll and runs that tag's own
+`scripts/build-containers.sh --push --prune` for both ROCm lines.  A push is not proof (issue #364), so this
+entry is closed by `scripts/build-containers.sh --verify-only` reading every tag resolving to this release.
+
 ## 261128.008 (r378) -- contributor PR #386 promoted into blocks 07 + 10: the dense Q6_K VDR-4 dot product, the third RDNA4 build-time opt-in
 
 **Contribution.**  `@DanoPTT`'s **PR #386** is the Q6_K counterpart of r368's dense Q5_K VDR-4 kernel (issue #374):
