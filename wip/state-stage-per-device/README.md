@@ -130,6 +130,21 @@ pageable caller (`ggml_backend_tensor_get_2d` into a pageable buffer), so it is 
 fallback for a non-tight destination.  **Do not delete a form until the census says nothing reaches it** (a
 `state stage: pieces=<n> tight=<n>` line, §6).
 
+**3.7 The same shape has two more consumers, and they are in scope.**  `state_stage()` is not the only buffer
+allocated from simple device 0's pinned type: `output_host_buft()` is, and so is `buf_layer_inp` — which is why the
+split `result_output` read is the copy that actually aborted in r364 (`2-D read of 'result_output' failed (invalid
+argument)`, 5 rows, device 1, issue #124/#313).  Both get the same treatment from the same plan query, and each is
+the *same* change with a different consumer:
+
+* the **output** read ends in llama.cpp's contiguous logits/embeddings array, so its splice is per (row, device) —
+  tiny pieces, but it is the arm that aborts today, and it must not be left as the only 2-D D2H in the tree;
+* `buf_layer_inp` (the layer-input buffer, `llama-context.cpp:4258`) is one allocation per context and is read the
+  same way.
+
+So "the `result_output` abort goes away for free" means *free in design* — the guarantee is the same and the plan is
+already computed — but it is a **named step in section 5**, not a side effect: a per-device destination for the
+output buffer is owed its own arm (`-sm tensor`, several rows, `LLAMA_OUTPUT_PINNED` as the A/B) before it is claimed.
+
 ## 4. What must not break (the invariants this campaign is judged against)
 
 | fact | why it binds here |
@@ -158,7 +173,10 @@ fallback for a non-tight destination.  **Do not delete a form until the census s
 4. **The restore mirror** (§3.5), same arm structure.
 5. **The census must prove the reach**: on the two-device shape the `tight=` count must be > 0 and the async
    per-row loop must read 0 for these destinations.  A step whose census reads 0 is vacuous — the r221 rule.
-6. **Flip the default, delete the switch**, and only then decide whether `ggml_cuda_rows_to_host`'s staged/gather
+6. **The output and layer-input buffers** (§3.7) on the same plan: the split `result_output` read (the r364 abort)
+   and `buf_layer_inp` become per-device tight reads, with `LLAMA_OUTPUT_PINNED=0` as the A/B and a multi-row
+   `-sm tensor` arm.  This is the step that makes the tree's *only* remaining 2-D D2H a pageable-caller fallback.
+7. **Flip the default, delete the switch**, and only then decide whether `ggml_cuda_rows_to_host`'s staged/gather
    arms still have a caller.
 
 ## 6. The gate ladder (what promotion owes)
