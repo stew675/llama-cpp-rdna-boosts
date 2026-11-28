@@ -196,6 +196,10 @@ if [ "$C_ARM" = 1 ]; then
     GL=( --base-dir "$BASE_DIR" --model "$MODEL" --kv "$KV" --ub 1 --ctx "$CTX" --chunks "$CHUNKS"
          --device "$DEVICE" )
     [ "$FAULTS" = 0 ] && GL+=( --no-faults )
+    # The build UNDER TEST runs the point -- never the caller's ~/llama.cpp default (which on a box where
+    # that is a different release turns arm C into a comparison of the reference build with itself).
+    export LLAMA_PPL="${LLAMA_PPL_OVERRIDE:-$BUILD_DIR/bin/llama-perplexity}"
+    echo "    ppl under test: $LLAMA_PPL"
     if [ "$RECORD_BASE" = 1 ]; then
         echo "    recording the base from the KILL-SWITCH arm (the ordinary kernel) -- pass a base from the"
         echo "    PREVIOUS release instead when one exists: this records the build under test as its own base"
