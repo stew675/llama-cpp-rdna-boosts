@@ -1987,6 +1987,15 @@ decode path), `mmvq.cu` (the VDR-aware K-split loop and the RDNA3_5 table), `mmq
 > 1,4,8` **+0.9 / +3.4 / +14.7 %** at B = 1 / 4 / 8, MTP decode neutral — a batched/verify win, because at one
 > column a 27B model is DRAM bound while the µs/call figure is measured cache-resident.
 >
+> **r378 follow-up: the RDNA4 half of that flag is measured now** (this repo's box is gfx1201; the entry above used
+> to read "unmeasured on RDNA4"). `m 4096 k 14336` µs/call, VDR 2 -> VDR 4: **41.7 -> 27.9 at n=1 (-33.2 %),
+> 48.6 -> 32.9 at n=2 (-32.4 %), 57.9 -> 36.9 at n=3 (-36.3 %), 76.4 -> 48.5 at n=5 (-36.6 %), 94.9 -> 66.1 at
+> n=8 (-30.5 %)**, the k=5120 decode shapes -24..-29 %, k=2560 -19..-23 %, every n >= 128 inert; `tg128` **+0.6 %**
+> and `llama-batched-bench -npp 512 -ntg 128` **+0.7 / +2.5 / +6.4 %** at B = 1/4/8 on 27B UD-Q5_K_XL; op oracle
+> 92/92 in both arms with the same max error and the greedy text identical on the prompt probed.  It stays opt-in.
+> The shape `m 640 n 512 k 2560` is **bimodal in both arms** (~45/~56 µs), so a single A/B there reads a false
+> +-25 % — `ENVIRONMENT.md` §14 carries the warning.
+>
 > **`GGML_CUDA_Q6K_MMQ=1` (opt-in)** extends RDNA3_0's MMQ ceiling for Q6_K from upstream's 128 to block 06's MMB
 > floor (512), where upstream dequantises and calls rocBLAS.  Not the default: on this box the swap is a wash
 > (+-0.2 % pp4096 at `-ub 256/384`) and its prefill KLD against the rocBLAS arm is 0.005112 / 96.01 % — outside the
