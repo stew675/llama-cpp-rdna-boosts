@@ -16,6 +16,58 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261128.008 (r378) -- contributor PR #386 promoted into blocks 07 + 10: the dense Q6_K VDR-4 dot product, the third RDNA4 build-time opt-in
+
+**Contribution.**  `@DanoPTT`'s **PR #386** is the Q6_K counterpart of r368's dense Q5_K VDR-4 kernel (issue #374):
+one 32-element call, each 16-value sub-block summed in ONE integer dp4a chain before its single scale multiply, the
+-32 offset folded in through `vec_dot_q6_K_q8_1_impl_mmvq_vdr2`'s one-byte `__builtin_amdgcn_perm` table.  It was
+submitted as a `wip/` campaign with its own README and one `git am` file cut on r368; the patch applied **strictly
+(`git am -3`) to the r377 tree**, so no rebase was owed.  The maintainer's decision this session: **promote it as an
+opt-in** (the third member of the family next to `-DGGML_HIP_RDNA4_Q4K_DENSE_VDR4` / `-DGGML_HIP_RDNA4_Q5K_DENSE_VDR4`),
+**not** default-on -- the kernel win is large but the end-to-end win is 1-2 %, and a default-on switch would move
+every Q6_K consumer's greedy text for that.  Promoted in the same session, so it never had a `wip/` row and leaves no
+stub: the record is `archive/work/rdna4-q6k-dense-vdr4/` with the submitted patch and README kept verbatim.
+
+**Every claim checked, on this box (gfx1201, Linux, ROCm 10.2), not the reporter's Windows one.**  The independent
+kernel rerun reproduces their table and is better at the wide end -- `m 4096 k 14336` µs/call, A/B/A/B, VDR 2 vs
+VDR 4: **41.99 -> 33.86 at n=1 (-19.4 %, they said -20), 38.9 -> 33.9 at n=2 (-13.1 %, -13), 47.0 -> 33.8 at n=3
+(-28.0 %), 54.9 -> 39.7 at n=4 (-27.7 %), 61.4 -> 42.2 at n=5 (-31.3 %, -24), 84.4 -> 53.9 at n=8 (-36.2 %, -32)**;
+the k=5120 decode shapes -10.8..-15.2 %; the lm_head shape and every n >= 512 inert.  Controls match too: the 27B's
+`tg128` is **flat** (23.10/23.15 -> 23.09/23.14 t/s) because this model decodes at ~584 GB/s, i.e. at the card's
+DRAM roof, which is exactly what their "<= 1.1 % end to end" says.  What the reply did not measure and this session
+did: **`llama-batched-bench -npp 512 -ntg 128` reads +0.2 / +0.3 / +6.9 % at B = 1/4/8** (S_TG 23.01/80.89/126.39 ->
+23.06/81.13/135.08), and the MTP `draft-mtp` arm **+1.6 %** (43.0/43.0 -> 43.7/43.7 t/s, A B B A).  Correctness:
+`test-backend-ops -o MUL_MAT -p type_a=q6_K` **71/71 with the same max error as the VDR-2 arm** (0.0005), wikitext
+PPL **6.9346 in both arms, chunk for chunk identical**, MTP draft acceptance **0.49755 -> 0.50825**.
+
+**The 2026-09-12 revert does not apply to this kernel.**  The dense VDR=4 set was reverted in September because the
+32-element variants lost on the MTP verify widths (issue #30, `WORKLOG-20260912.md`).  That is why the band was the
+question here, and this kernel wins it outright (-13..-36 % at widths 2..8) -- it is a different formulation, and the
+merged integer chain is exact by construction (`|dot| <= 16*32*127` times `|scale| <= 128 < 2^24`).
+
+**The promotion split is r368's own**: block **07** owns the kernel, `VDR_Q6_K_Q8_1_MMVQ_DENSE4` and the
+`GGML_CUDA_Q6K_DENSE_VDR4` guard (`vecdotq.cuh`, +58); block **10** owns the host VDR (`get_vdr_mmvq_dense`, keyed on
+the runtime `table_id` -- the host side must not read a device arch macro) and the dispatch case (`mmvq.cu` +6,
+`mmvq-vecdot.cuh` +4/-1).  `GGML_HIP_Q6K_DENSE_VDR1` still wins over the new flag and the MoE path keeps
+`vec_dot_q6_K_q8_1_vdr2` / `VDR_Q6_K_Q8_1_MMVQ_MOE` 2, so **the default path is byte-inert** -- verified rather than
+assumed: the same generated text as the r377 build on 4B Q8_0 (1 GPU and 3-GPU `-sm tensor`, `7e6229b260f6`), 27B
+UD-Q6_K_XL (`da2e2d192e21`), 35B-A3B Q4_K_M (`461ca8cd0e88`) and the 27B `draft-mtp` arm (`f2f9f9a596b7`), plus
+`gate-prefill-logits.sh` **0.000000 / 100.000 %** and `llama-batched-bench` at parity on 4B.
+
+**Gates.**  `validate-set.sh` green (strict 19/19 apply on a fresh tarball, tree `976fd14dcd`, both optional artifacts
+and the cumulative tree re-cut and re-recorded, Windows path/portability lints, the system-header check, and
+`check-rung-file-sets.py` **0 loss / 0 gone / 0 shrunk, +2 defines** -- exactly
+`VDR_Q6_K_Q8_1_MMVQ_DENSE4` and `GGML_CUDA_Q6K_DENSE_VDR4`); `check-credit.sh` green with the new row (45 handles,
+40 rows, 0 debt); `test-backend-ops test -o MUL_MAT` **2753/2753** on the default build; `check-shlib-symbols.sh`
+**16/16**; `check-gen-docs.sh` ok; `gate-optional-build.sh` (gate 47) PASS on the re-cut optional tree;
+`check-rung-file-sets.py`'s per-rung pass and `validate-set.sh` both run on the final export.  The determinism contract
+holds: two independent `apply-all.sh` runs from the shipped patches produce tip `d4dd34a93` and tree `976fd14dcd`.
+
+**Record.**  `archive/work/rdna4-q6k-dense-vdr4/` (the submitted patch and README verbatim, the maintainer's
+kernel/PPL/MTP/batched tables, the reproduction command, and what is left open); `patches/README.md` blocks 07 and 10;
+`ENVIRONMENT.md` §14 (the flag, its default and its measurements); `CONTRIBUTORS.md` (one code row, `co-author`);
+`INVARIANTS.md` r378 (the verify-band fact, the DRAM-roof caveat, the inertness check).
+
 ## 261128.007 (r377, release cut) -- tagged, main and the fork pushed, PR #372 merged, the images queued on the worker
 
 **The cut.**  `v18-919794500-r377` (annotated tag, pushed) = fork re-cut tip

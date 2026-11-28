@@ -4195,3 +4195,29 @@ fallback's new meaning) and `DIAGNOSTIC.md` §28 (`MOE_EXPERT_CACHE_TABLES` is r
   prefix cells would be double-counted), it cannot help a request whose PROMPT alone exceeds the context, and with
   `LLAMA_SERVER_KV_ADMIT=0` the reply that loses is the one that started last (17 tokens in one measured arm) because a
   still-prefilling prompt keeps its cells.
+
+* **r378 -- the dense Q6_K VDR-4 kernel DOES win the verify band, so the 2026-09-12 "the 32-element variants lose on
+  the spec verify widths" verdict is about THAT kernel set and not about VDR=4 for Q6_K.**  (blocks 07 + 10,
+  contributor PR #386, `@DanoPTT`; the Q6_K counterpart of r368's dense Q5_K.)  Three facts to reuse:
+  1. **The band measurement, not the width-1 one, decides a VDR arm.**  gfx1201/Linux/ROCm 10.2 at the 27B shape
+     `m 4096 k 14336`, µs/call, A/B/A/B: VDR 2 vs VDR 4 reads 41.99/33.86 at n=1 (-19.4 %), 38.9/33.9 at n=2
+     (-13.1 %), 47.0/33.8 at n=3 (-28.0 %), 61.4/42.2 at n=5 (-31.3 %), 84.4/53.9 at n=8 (-36.2 %).  The `ql` layout
+     is what makes the 32-element call legal — four `ql` ints are 16 consecutive bytes, so low nibbles are one
+     16-value sub-block and high nibbles the next, sharing `bq8_offset`/`scale_offset`/`vh_shift`/the q8_1 int group
+     — and the `-32` offset reuses the VDR-2 kernel's one-byte `__builtin_amdgcn_perm` table.  `|dot| <= 16*32*127
+     = 65024` times `|scale| <= 128 < 2^24` keeps the merged integer chain EXACT, so the only numeric change is the
+     association order.
+  2. **A kernel win that saves time at one column is invisible when the model is at the DRAM roof, and a VDR arm
+     must be judged on the batched/verify column.**  A 23.55 GiB Q6_K 27B decodes at 23.1 t/s = ~584 GB/s, i.e. at
+     the card's bandwidth, so `tg128` is FLAT (23.10 -> 23.09) no matter what the dot product costs; MTP `draft-mtp`
+     reads +1.6 %, and `llama-batched-bench -npp 512 -ntg 128` reads +0.2 / +0.3 / **+6.9 %** at B = 1/4/8, where
+     eight columns share one weight read.  State the column with any VDR number.
+  3. **The opt-in's default path is provably inert, and that is checkable cheaply**: `#if`-guarded out, the same
+     generated text on 4B Q8_0 (1 GPU and 3-GPU `-sm tensor`, `7e6229b260f6`), 27B UD-Q6_K_XL (`da2e2d192e21`),
+     35B-A3B Q4_K_M (`461ca8cd0e88`) and the 27B `draft-mtp` arm (`f2f9f9a596b7`), `gate-prefill-logits.sh`
+     0.000000 / 100.000 %, and `llama-batched-bench` at parity.  The flag ships OFF (a Q6_K consumer's greedy text
+     would otherwise move for a 1-2 % end-to-end gain), and the escape `GGML_HIP_Q6K_DENSE_VDR1` reverts to VDR 1
+     rather than to r377's 2 — a default-on re-ask would need a `VDR2` escape of its own.
+  Correctness of the arm, for the next reader: `test-backend-ops -o MUL_MAT -p type_a=q6_K` 71/71 with the SAME max
+  error as the VDR-2 arm (0.0005), and wikitext PPL identical to 4 dp chunk for chunk (6.9346).  Record:
+  `archive/work/rdna4-q6k-dense-vdr4/`.

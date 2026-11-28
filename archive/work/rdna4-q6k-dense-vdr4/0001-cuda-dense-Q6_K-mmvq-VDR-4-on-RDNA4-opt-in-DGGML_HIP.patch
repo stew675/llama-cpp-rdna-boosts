@@ -1,0 +1,132 @@
+From 14fa33eaba6871ab1ae298e6599a86b5c0fb55e3 Mon Sep 17 00:00:00 2001
+From: DanoPTT <petrik@mms-softec.sk>
+Date: Fri, 27 Nov 2026 20:31:26 +0100
+Subject: [PATCH] cuda: dense Q6_K mmvq VDR-4 on RDNA4 (opt-in
+ -DGGML_HIP_RDNA4_Q6K_DENSE_VDR4)
+
+The Q6_K counterpart of #374's dense Q5_K form: 32 elements per call, each
+16-value sub-block summed in one integer dp4a chain before its single scale
+multiply, -32 folded in through one __builtin_amdgcn_perm byte lookup (the
+same trick as vec_dot_q6_K_q8_1_impl_mmvq_vdr2). Dense MUL_MAT only; the
+MoE path keeps the 16-element chunk. Off unless the flag is given;
+GGML_HIP_Q6K_DENSE_VDR1 still wins over it.
+
+Changes the K partition vs VDR 2, so greedy text moves once; widths 1..8
+share the kernel, so the verify band stays pure.
+
+R9700 (gfx1201), MUL_MAT perf on Qwen3.8-27B shapes vs the Q5K-flag build:
+n=1 -20 %, n=2 -13 %, n=3..8 -22 to -32 %. test-backend-ops -o MUL_MAT
+163/163 OK (q5_K + q6_K).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmvq-vecdot.cuh |  5 ++-
+ ggml/src/ggml-cuda/mmvq.cu         |  6 ++++
+ ggml/src/ggml-cuda/vecdotq.cuh     | 58 ++++++++++++++++++++++++++++++
+ 3 files changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq-vecdot.cuh b/ggml/src/ggml-cuda/mmvq-vecdot.cuh
+index 4f55a2854..8cb0dc201 100644
+--- a/ggml/src/ggml-cuda/mmvq-vecdot.cuh
++++ b/ggml/src/ggml-cuda/mmvq-vecdot.cuh
+@@ -50,7 +50,10 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type,
+ #else
+         case GGML_TYPE_Q5_K:    return moe ? vec_dot_q5_K_q8_1_vdr4 : vec_dot_q5_K_q8_1;
+ #endif
+-#if !defined(GGML_HIP_Q6K_DENSE_VDR1) && (defined(RDNA4) || defined(RDNA3_0))
++#if defined(GGML_CUDA_Q6K_DENSE_VDR4)
++        // dense Q6_K, 32-element form (RDNA4 opt-in -DGGML_HIP_RDNA4_Q6K_DENSE_VDR4); MoE keeps the 16-element chunk
++        case GGML_TYPE_Q6_K:    return moe ? vec_dot_q6_K_q8_1_vdr2 : vec_dot_q6_K_q8_1_vdr4_dense;
++#elif !defined(GGML_HIP_Q6K_DENSE_VDR1) && (defined(RDNA4) || defined(RDNA3_0))
+         // the 16-element chunk with its HIP-optimised unpack; with the VDR=1 escape every arch
+         // takes the generic kernel (whose VDR comes from the same macro)
+         case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1_vdr2;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 6e608c628..77491facb 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -103,6 +103,12 @@ static constexpr __host__ __device__ int get_vdr_mmvq_dense(ggml_type type, mmvq
+     if (q5k_dense_vdr4 && type == GGML_TYPE_Q5_K) {
+         return VDR_Q5_K_Q8_1_MMVQ_RDNA3_0;
+     }
++#if defined(GGML_HIP_RDNA4_Q6K_DENSE_VDR4) && !defined(GGML_HIP_Q6K_DENSE_VDR1)
++    // must match GGML_CUDA_Q6K_DENSE_VDR4 / vec_dot_q6_K_q8_1_vdr4_dense in vecdotq.cuh (RDNA4 only)
++    if (table_id == MMVQ_PARAMETERS_RDNA4 && type == GGML_TYPE_Q6_K) {
++        return VDR_Q6_K_Q8_1_MMVQ_DENSE4;
++    }
++#endif
+     return get_vdr_mmvq(type);
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 36ca665b9..662505619 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -1622,6 +1622,64 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_vdr2(
+     return vec_dot_q6_K_q8_1_impl_mmvq_vdr2(vl0, vl1, vh0, vh1, u, scales, bq6_K->d, d8);
+ }
+ 
++// Dense Q6_K mmvq, 32 elements per call (VDR 4), RDNA4 opt-in
++// -DGGML_HIP_RDNA4_Q6K_DENSE_VDR4; host side is get_vdr_mmvq_dense() in mmvq.cu (same macro).
++// iqs is in 0,4..28: the 4 ql ints iqs..iqs+3 are 16 consecutive ql bytes, so the low nibbles are one 16-value
++// sub-block (one int8 scale) and the high nibbles another; they share bq8_offset, scale_offset, vh_shift and
++// the q8_1 int group i8..i8+3.  Each sub-block's 16 products are summed in ONE integer dp4a chain before its
++// single scale multiply and float fma (|dot| <= 16*32*127 = 65024, times |scale| <= 128 < 2^24, exact).
++// It changes the K partition vs VDR 2, so greedy text changes once; W = 1..8 use the same kernel.
++#define VDR_Q6_K_Q8_1_MMVQ_DENSE4 4
++
++#if defined(RDNA4) && defined(GGML_HIP_RDNA4_Q6K_DENSE_VDR4) && !defined(GGML_HIP_Q6K_DENSE_VDR1)
++#define GGML_CUDA_Q6K_DENSE_VDR4
++#endif
++
++#if defined(GGML_CUDA_Q6K_DENSE_VDR4)
++static __device__ __forceinline__ float vec_dot_q6_K_q8_1_vdr4_dense(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
++
++    const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
++    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
++    const int vh_shift     = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
++    const int vh_idx       = (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4);
++    const int i8           = iqs % QI8_1;
++
++    int vl[4];
++    int vh[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        vl[j] = get_int_b4(bq6_K->ql, iqs + j);
++        vh[j] = get_int_b2(bq6_K->qh, vh_idx + j) >> vh_shift;
++    }
++
++    const int8_t * scales = bq6_K->scales + scale_offset;
++
++    float sumf = 0.0f;
++
++#pragma unroll
++    for (int i = 0; i < QR6_K; ++i) {
++        const block_q8_1 * bq8i = bq8_1 + bq8_offset + 2*i;
++        const int * q8 = (const int *) bq8i->qs + i8;
++
++        int dot = 0;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const int vil = (vl[j] >> (4*i)) & 0x0F0F0F0F;
++            // vi = (vil | 16*h) - 32 per byte via one byte-table lookup (see vec_dot_q6_K_q8_1_impl_mmvq_vdr2)
++            const int vi  = vil | __builtin_amdgcn_perm(0, 0x1000F0E0, (vh[j] >> (4*i)) & 0x03030303);
++            dot = ggml_cuda_dp4a(vi, q8[j], dot);
++        }
++
++        sumf += __low2float(bq8i->ds) * ggml_cuda_mul_small(dot, scales[4*i]);
++    }
++
++    return __half2float(bq6_K->d) * sumf;
++}
++#endif // defined(GGML_CUDA_Q6K_DENSE_VDR4)
++
+ #define VDR_IQ2_XXS_Q8_1_MMVQ 2
+ #define VDR_IQ2_XXS_Q8_1_MMQ  2
+ 
+-- 
+2.53.0.windows.2
+
