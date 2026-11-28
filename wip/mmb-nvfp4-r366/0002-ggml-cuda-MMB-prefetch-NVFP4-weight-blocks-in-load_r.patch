@@ -1,0 +1,71 @@
+From ba76635cbbda1909e6b1ef4617d7be88f41415ed Mon Sep 17 00:00:00 2001
+From: bsp2020 <bsp2020@gmail.com>
+Date: Thu, 26 Nov 2026 19:57:23 -0800
+Subject: [PATCH 2/2] ggml-cuda MMB: prefetch NVFP4 weight blocks in load_regs
+
+ggml-cuda MMB: NVFP4 (WTYPE 15) weight blocks prefetched into registers in load_regs like WTYPE 0 (3 loads overlapped with the previous K-step's WMMA instead of 8 serialized byte/dword loads between the barriers) and the UE4M3 scales converted without branches; bit-identical; Inkling pp4096 2018 -> 2219 t/s (+10 %), 28K prompt 1581 -> 1760 (GGML_CUDA_MMB_FP4_PERM=0: the old path, WTYPE 19)
+---
+ ggml/src/ggml-cuda/mmb.cu | 33 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index de9160fb64..8ff0c34249 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -434,6 +434,34 @@ __device__ __forceinline__ uint32_t mmb_pack2_exact(float a, float b) {
+     return __builtin_amdgcn_perm(__float_as_uint(a), __float_as_uint(b), 0x03020706u);  // as mmb_pack2: a low, b high
+ }
+ 
++// ggml_cuda_ue4m3_to_fp32 without branches (the same values for all 256 codes): exponent field e, mantissa m;
++// e > 0: (1 + m/8) * 2^(e-7) / 2 built as fp32 bits, e == 0: m * 2^-10 (exact), 0x7F (NaN) -> 0.
++__device__ __forceinline__ float mmb_ue4m3_f32(const uint32_t x) {
++    const uint32_t e = (x >> 3) & 0xFu, m = x & 0x7u;
++    const float r = e != 0 ? __uint_as_float(((e + 119u) << 23) | (m << 20)) : (float) m * 0x1p-10f;
++    return x == 0x7Fu ? 0.0f : r;
++}
++
++// mmb_dq_row_nvfp4 from the block already in registers (load_regs prefetch, the WTYPE 0 layout: w0 = bytes 0-15,
++// w1 = 16-31, w2 = 32-35): d[4] is w0.x, the 8 qs words follow.  Same values and bf16 bits as the pointer form.
++__device__ __forceinline__ void mmb_dq_regs_nvfp4(const uint4 w0, const uint4 w1, const uint32_t w2, uint32_t * arow) {
++    const uint32_t q[8] = { w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w, w2 };
++#pragma unroll
++    for (int s = 0; s < 4; ++s) {
++        const float d = mmb_ue4m3_f32((w0.x >> (8*s)) & 0xFFu);
++        uint32_t * out = arow + s * 8;
++#pragma unroll
++        for (int w = 0; w < 2; ++w) {
++            const uint32_t v = q[s * 2 + w];
++            const uint32_t vl = mmb_fp4_lut4(v & 0x0F0F0F0Fu), vh = mmb_fp4_lut4((v >> 4) & 0x0F0F0F0Fu);
++            out[2*w]         = mmb_pack2_exact(d * mmb_s8(vl, 0), d * mmb_s8(vl, 1));
++            out[2*w + 1]     = mmb_pack2_exact(d * mmb_s8(vl, 2), d * mmb_s8(vl, 3));
++            out[4 + 2*w]     = mmb_pack2_exact(d * mmb_s8(vh, 0), d * mmb_s8(vh, 1));
++            out[4 + 2*w + 1] = mmb_pack2_exact(d * mmb_s8(vh, 2), d * mmb_s8(vh, 3));
++        }
++    }
++}
++
+ __device__ __forceinline__ void mmb_dq_row_nvfp4(const uint8_t * base, uint32_t * arow, const bool fp4_perm) {
+     const uint8_t * sc = base;
+     const uint32_t * q = (const uint32_t *)(base + 4);
+@@ -821,6 +849,8 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
+                     a0[i] = *(const uint4 *)(p); a1[i] = *(const uint4 *)(p + 16 + (size_t)(ks & 3) * 32); a3[i] = *(const uint4 *)(p + 32 + (size_t)(ks & 3) * 32); }
+                 else if constexpr (WTYPE == 4) { const uint8_t * p = Wbase + (size_t)row * wrow_bytes + (size_t)ks * 48;
+                     a0[i] = *(const uint4 *)(p); a1[i] = *(const uint4 *)(p + 16); a3[i] = *(const uint4 *)(p + 32); }
++                else if constexpr (WTYPE == 15) { const uint8_t * p = Wbase + (size_t)row * wrow_bytes + (size_t)ks * 36;   // NVFP4: prefetched like WTYPE 0
++                    a0[i] = *(const uint4 *)(p); a1[i] = *(const uint4 *)(p + 16); a2[i] = *(const uint32_t *)(p + 32); }
+                 else if constexpr (WTYPE == 5) { /* IQ3_S: fields non-contiguous, store_lds loads from Wbase */ }
+                 else if constexpr (WTYPE >= 6) { /* K-quant / i-quant: store_lds loads from Wbase */ }
+                 else { const uint4 * p = (const uint4 *)(Wbase + (size_t)row * wrow_bytes + (size_t)ks * 128);
+@@ -855,7 +885,8 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
+             else if constexpr (WTYPE == 12) mmb_dq_row_q4_1(Wbase + (size_t)row * wrow_bytes + (size_t)ksh * 40, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else if constexpr (WTYPE == 13) mmb_dq_row_q5_0(Wbase + (size_t)row * wrow_bytes + (size_t)ksh * 44, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else if constexpr (WTYPE == 14) mmb_dq_row_mxfp4(Wbase + (size_t)row * wrow_bytes + (size_t)ksh * 34, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+-            else if constexpr (WTYPE == 15 || WTYPE == 19) mmb_dq_row_nvfp4(Wbase + (size_t)row * wrow_bytes + (size_t)ksh * 36, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE), WTYPE == 15);
++            else if constexpr (WTYPE == 15) mmb_dq_regs_nvfp4(a0[i], a1[i], a2[i], (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 19) mmb_dq_row_nvfp4(Wbase + (size_t)row * wrow_bytes + (size_t)ksh * 36, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE), false);
+             else if constexpr (WTYPE == 16) mmb_dq_row_iq2s(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 82, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else if constexpr (WTYPE == 17) mmb_dq_row_iq2xs(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 74, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else if constexpr (WTYPE == 18) mmb_dq_row_iq2xxs(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 66, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+-- 
+2.53.0
+

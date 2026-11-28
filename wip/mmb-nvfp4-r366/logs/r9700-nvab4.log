@@ -1,0 +1,34 @@
+# nvab4.log: Inkling-2-Mini UD-Q8_K_XL routed NVFP4 on 1 R9700 (GPU 0), rdna3 ink-r366 1b85b4cbca (worktree ~/w1100/inkn366, build102),
+# 2026-11-26 ~5:13-5:19 PM PST.  Raw command output copied from the session (the runs printed to stdout only).
+#
+# Part 1: llama-bench -m Inkling-2-Mini-UD-Q8_K_XL.gguf -ngl 99 -fa 1 -p 512,2048,4096 -n 0 -ub 512 -r 5,
+#   env GGML_CUDA_MMB_TYPES=nvfp4 GGML_CUDA_MMB_ROUTED=1 GGML_CUDA_MMB_FP4_PERM=$a, a = 0 1 0 1 (columns: test, t/s)
+== ROUTED=1 PERM=0
+           pp512       2152.10 ± 12.42 
+          pp2048        2008.74 ± 8.40 
+          pp4096        1949.95 ± 2.49 
+== ROUTED=1 PERM=1
+           pp512       2585.70 ± 11.23 
+          pp2048        2373.02 ± 6.61 
+          pp4096        2293.38 ± 4.60 
+== ROUTED=1 PERM=0
+           pp512       2146.69 ± 19.90 
+          pp2048        2006.23 ± 3.62 
+          pp4096        1946.20 ± 4.20 
+== ROUTED=1 PERM=1
+           pp512       2588.31 ± 11.81 
+          pp2048        2374.31 ± 7.45 
+          pp4096        2291.03 ± 2.91 
+#
+# Part 2 (nvab4.sh, output filtered to sha/faults lines): llama-server -c 40960 -ngl 99 -fa on -ub 512 -np 1, depth2.py n=60 / n=650
+=== r-perm1 5:17 PM GGML_CUDA_MMB_ROUTED=1 GGML_CUDA_MMB_TYPES=nvfp4 GGML_CUDA_MMB_ROUTED=1 GGML_CUDA_MMB_FP4_PERM=1
+   nvab-r-perm1-60 n=60: prompt 2116 tok, gen 256, sha 18b09ad8ff3e
+   nvab-r-perm1-650 n=650: prompt 22746 tok, gen 256, sha 8dbee036942e
+   faults 0
+=== r-perm0 5:18 PM GGML_CUDA_MMB_ROUTED=1 GGML_CUDA_MMB_TYPES=nvfp4 GGML_CUDA_MMB_ROUTED=1 GGML_CUDA_MMB_FP4_PERM=0
+   nvab-r-perm0-60 n=60: prompt 2116 tok, gen 256, sha 18b09ad8ff3e
+   nvab-r-perm0-650 n=650: prompt 22746 tok, gen 256, sha 8dbee036942e
+   faults 0
+#
+# For reference, the MMQ path (no MMB_TYPES / MMB_ROUTED) is in nvab3.log: pp512/2048 1860/1749, sha 412128c8fed8 / e573f3b132c9;
+# MMB_TYPES=nvfp4 without MMB_ROUTED=1 ran MMQ in both PERM arms (r=5 x2: ~1868/1759/1719, no difference).
