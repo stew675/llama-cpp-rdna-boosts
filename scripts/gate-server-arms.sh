@@ -64,7 +64,7 @@ KEEPOUT="${KEEPOUT:-$(mktemp -d)}"
 DEFAULT_LD_LIBRARY_PATH="$(rocm_ld_library_path "$LLAMA_SERVER")"
 
 FN=/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
-FN_D=/llm/models/Qwen3.8/Flash-Next/GSQ-IQ3_XXS/Qwen3.8-Flash-Next-DFlash2-Q8_0.gguf
+FN_D=/llm/models/Qwen3.8/Flash-Next/Qwen3.8-Flash-Next-DFlash2-Q8_0.gguf
 A35=/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf
 A35_D=/llm/models/Qwen3.6/35B-A3B/DFlash2/Q8_0/Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf
 
@@ -146,9 +146,9 @@ mkdir -p "$KEEPOUT"
 # put `--kv-unified` back: it makes the text a per-placement coin flip (§38), which is what this gate spent three
 # revisions discovering.
 ARMS=(
-"fn24|$FN|$FN_D|24|594368935245 b337648c3ef9|0.59259 0.77193"
-"fn10|$FN|$FN_D|10|594368935245 b337648c3ef9|0.59259 0.77193"
-"35b10|$A35|$A35_D|10|50f29e574939 a56117e02dcf|0.60741 0.69106"
+"fn24|$FN|$FN_D|24|9564942b467b e29d01e5edca|0.69106 0.69672"
+"fn10|$FN|$FN_D|10|9564942b467b e29d01e5edca|0.69106 0.69672"
+"35b10|$A35|$A35_D|10|10050d7d1b2f df3deb00c56b|0.59559 0.60000"
 )
 
 GATE_SINCE_TS="$(date -d '-1 second' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"

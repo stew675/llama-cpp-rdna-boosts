@@ -775,6 +775,23 @@ set and the transport's decided depth; the slab's stats line prints `transport=`
 
 ---
 
+## 32. The shared-expert down epilogue's rounding (block 08, r371)
+
+`shexp_down_gated_q8_0` stands in for the `MUL` + two `ADD` nodes of the shared-expert output chain, so its
+epilogue owes three rounded operations.  It owed them by comment only until r371: `__fmul_rn` is not a barrier on
+HIP, so the product was contracted into an `fma` with the first add (`GREEDY-PURITY.md` §102.2, §112).  The
+arithmetic is now pinned by inline asm (`v_mul_f32_e32` / `v_add_f32_e32`), and this is the switch that says
+whether the fused kernel ran at all — the fused and the unfused arm read the **same greedy text**, and the prefill
+KLD at the delivery's own point prints `0.000000`, so a text or KLD arm cannot decide it.
+
+| variable | default | class | what it does |
+|---|---|---|---|
+| `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE` | unset = the fusion is on | **kill switch / A/B** | `1` restores the unfused chain (`MUL` → `ADD` → `ADD` launches).  This is a different **placement**, not two arithmetics of one: the fused gate reduction (`shexp_gate_sigmoid`) does not reproduce the standalone `MUL_MAT`'s order, so the two arms' text is not an oracle for the epilogue — the ISA is (`scripts/gate-shexp-down-gate.sh`). |
+| `GGML_CUDA_SHEXP_GATE_DEBUG` | off | **diagnostic (census)** | Prints one `SHEXP DOWN GATE <out> ncols=N exact=1` line per fused launch (600 on a 4-token 35B-A3B Q8_0 run, `0` with the kill switch above).  `ncols` is the token count the epilogue served, so the band arms are visible too. |
+
+*The opt-in and tuning rows for this section are in [`ENVIRONMENT.md`](ENVIRONMENT.md) §32 (there are none: this
+section is a kill switch and a census, never a supported configuration).*
+
 ## Maintaining this file
 
 The same recipe as [`ENVIRONMENT.md`](ENVIRONMENT.md) → *Maintaining this file* derives the names; this file is

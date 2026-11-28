@@ -3365,3 +3365,67 @@ KLD **0.000000 / 100.000 %**; 9B Q8_0 (no Q5_K/IQ4_XS) text byte-identical, 27B 
 
 **Record.**  This entry; `archive/work/issue-374-kquant/README.md`; `patches/README.md` blocks 07/08/10 (r368);
 `ENVIRONMENT.md` §14 + §30; `INVARIANTS.md` r368; `WORKLOG.md` 261126.008; GitHub issue #374.
+
+## 112 (r371, block 08) — a fusion's "same rounding" claim is a claim about the EMITTED ISA, and a comment is not a barrier: `__fmul_rn` is contracted too, and the instrument that sees it is the store-anchored disassembly
+
+**Claim.**  `shexp_down_gated_q8_0` replaces the shared-expert output chain's `MUL` (down·gate), `ADD` (moe_out)
+and `ADD` (ffn_residual) with one epilogue, and its comment said so explicitly — "so the multiply must NOT be
+contracted into an FMA here (an FMA would round once instead of twice and break decode == verify)" — over the code
+`dst[o] = __fmul_rn(sum_down[t], gate_sig[t]) + moe_out[o] + ffn_residual[o]`.  HIP clang contracted it anyway:
+`__fmul_rn` lowers to a plain op and is contracted like any other (§102.2).  Reported from the source plus the ISA
+of the r366 object, GitHub issue #377; reproduced here on the delivery's toolchain (ROCm 10.2, clang 24, gfx1201),
+where **144 of the 146** store-anchored epilogue chains across the kernel's 32 instantiations were contracted.
+
+**Rule.**  Four parts.
+
+1. *"The fused path rounds like the chain" is an ISA claim, and the barrier must be a real one.*  `__fmul_rn` and
+   `__fadd_rn` are not barriers on HIP (they lower to plain ops, then contract); `#pragma clang fp contract(off)`
+   is one, and so is inline `asm("v_mul_f32_e32 …")` — which is what this file's epilogue now uses
+   (`mmvq_mul_rn`/`mmvq_add_rn`).  Pick one deliberately and say which; and keep the CUDA path on
+   `__fmul_rn`/`__fadd_rn`, where nvcc never contracts and the arithmetic should not move.  A claim in a comment
+   next to a fused epilogue is worth exactly as much as the emitted instruction, no more.
+2. *Decode == verify is a separate claim from "the same arithmetic as the chain".*  Every instantiation here
+   contracted identically, so every width computed the same thing — the invariant held perfectly while the
+   arithmetic was not the one the comment named.  "Uniform across widths" answers "does W=1 match W=8", never "is
+   this the chain's rounding".
+3. *A scan of such a kernel must be anchored on the STORE.*  The natural window ("everything after the last
+   `v_add_f32_dpp`") is right for the small instantiations and wrong for `<8,8>`, where the compiler interleaves
+   the eight-token cross-warp reduction with the dot loop and software-pipelines the stores: in the FIXED object
+   that window shows one `v_mul_f32` for eight tokens, and in the BROKEN one it misses the contraction entirely.
+   Each output value is a chain that ends in a `global_store_b32`, so the rule is: look back from every store for
+   the token's separate product, and fail if a contracted form sits in between (`scripts/gate-shexp-down-gate.sh`,
+   which reports 144 findings on the pre-fix object and 0 on the fixed one).
+4. *A single-sequence greedy arm and the prefill KLD are blind here, and the reason is the fusion's arming
+   width.*  The matcher arms only at ≤ `MMVQ_MAX_BATCH_SIZE` (8) tokens, so a batched prefill runs the epilogue
+   **only on its tail ubatch**: same-seed greedy text is byte-identical between the two arithmetics (four arms),
+   the canonical prefill-logit point reads `0.000000 / 100.000 %`, and a two-chunk `--chunks 2` log-prob file is
+   byte-identical (0 of 63 322 400 finite floats differ).  Two instruments do see it: **`-ub 1`** (every token takes
+   the epilogue, and each step's hidden state feeds the next) reads **0.001354 KLD / 98.431 %** over 512 tokens, and
+   a **verify-band arm** sees it too — `gate-server-arms.sh`'s two-slot DFlash run on 35B-A3B Q8_0 reproduces its
+   recorded anchors on r370 (`50f29e574939 a56117e02dcf`, 0.60741/0.69106) and moves to `10050d7d1b2f df3deb00c56b`
+   (0.59559/0.60000) on r371, deterministically on each build: a one-time reference move of the K-partition class
+   (§111.2), so it is a re-record and not a defect, and it is why a rounding change owes a re-record as well as an
+   ISA check.  What is *not* an oracle here is the *other* selection arm — `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`,
+   the unfused chain — before or after the fix, because the fused gate reduction has its own documented order
+   difference from the standalone `MUL_MAT` (`ggml-cuda-try-fuse.cu`): both arms read the same text in every arm
+   measured.  Hence the census, which did not exist and now does (`GGML_CUDA_SHEXP_GATE_DEBUG=1`: 600 fused launches
+   on a 4-token 35B-A3B Q8_0 run, 0 under the kill switch).
+
+**Numbers** (`benchmarks/2026-11-27-shexp-down-epilogue-rounding.md`, gfx1201, the delivery's ROCm 10.2 build,
+Qwen3.6-35B-A3B Q8_0).  ISA: 144 of 146 store-anchored epilogue chains contracted before, **0 of 146** after, all
+32 instantiations; `<1,1>` `v_fma_f32 v1, v1, s4, s5` + `v_add_f32` → `v_mul_f32_e32` + `v_add_f32_e32` +
+`v_add_f32_e32`.  Text: `2f79e37ca208` (short, 518 chars) and `a2cdef23588f` (prose, 504 chars) on both builds, on
+a 3-GPU `-sm tensor` arm and a 1-GPU `-ncmoe 40 --host-experts pool` arm, and identical to both builds' chain
+arms too.  Prefill-logit KLD: `-0.000000 / 100.000 %` at the canonical point (both directions), and
+**0.001354 / 98.431 %** at `-ub 1` (PPL 4.0962 → 4.0521).  Rate: pp512 1663.7 vs 1651.2 t/s, tg128 63.2 vs 64.3
+(±2 % band, flat as expected from two scalar instructions in a one-thread tail).
+
+**Why it is worth a rule.**  This repo has many fused epilogues whose purity argument is a comment about
+rounding, and the compiler has no obligation to honour either.  The class also shows the shape of the *evidence*:
+"no gate moved" is exactly what this defect produces, so a rounding claim needs a mechanism instrument, and a
+mechanism instrument needs a window that survives scheduling (here: the store).  §102 taught the arithmetic; this
+is where the arithmetic has to be *shown*.
+
+**Record.**  This entry; `scripts/gate-shexp-down-gate.sh` (`MANIFESTS.md` gate 48); `DIAGNOSTIC.md` §32;
+`patches/README.md` block 08 (r371); `INVARIANTS.md` r371; `WORKLOG.md` 261127.022;
+`benchmarks/2026-11-27-shexp-down-epilogue-rounding.md`; GitHub issue #377.

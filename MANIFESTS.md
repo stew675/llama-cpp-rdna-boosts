@@ -1233,6 +1233,24 @@ in CI.  The model-level gates are manual:
     collision class), and every release (`WORKLOG.md` 261126.005).
 
 
+**Gate 48 (r371, GitHub issue #377) — the shared-expert down epilogue's rounding.**  `shexp_down_gated_q8_0`
+stands in for a `MUL` + two `ADD` nodes, so its epilogue owes three roundings; it had one (HIP contracted
+`__fmul_rn(...) + c` into an `fma`, `GREEDY-PURITY.md` §102.2/§112) and the comment claimed otherwise.
+`scripts/gate-shexp-down-gate.sh` reads the **emitted ISA** (the build's own `llvm-objcopy` /
+`clang-offload-bundler` / `llvm-objdump`, from `CMAKE_HIP_COMPILER`'s directory): for every one of the 32
+`shexp_down_gated_q8_0<nwarps, ncols>` instantiations, each epilogue chain that ends in a `global_store_b32` must
+have its own `v_mul_f32` and **no** `v_fma_f32`/`v_fmac_f32`/`v_fma_mix_f32` between that product and the store
+(the store anchor is the part that matters: a window anchored on the reduction is wrong for `<8,8>`, where the
+compiler interleaves the eight-token reduction with the dot loop).  Non-vacuity: 32 instantiations must be found,
+the same pattern must match elsewhere in each kernel (the dot products do use fma forms), and the run is repeated
+on the pre-fix object, where it reports **144 contracted chains**.  Plus the census leg the arm needs anyway:
+`GGML_CUDA_SHEXP_GATE_DEBUG=1` must print at least one `SHEXP DOWN GATE <out> ncols=N exact=1` and
+`GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` must print **none**.  Why nothing else can judge it: the fusion arms only at
+≤ `MMVQ_MAX_BATCH_SIZE` tokens, so greedy text is byte-identical (`2f79e37ca208`, `a2cdef23588f`), the canonical
+prefill-logit point reads `0.000000 / 100.000 %`, and a `--chunks 2` log-prob file is byte-identical; at `-ub 1` the
+same pair reads 0.001354 KLD / 98.431 %, which is the rounding-level magnitude of the change and its non-vacuity
+proof.  Record: `benchmarks/2026-11-27-shexp-down-epilogue-rounding.md`.
+
 Run the GPU gates **alone**: two concurrent GPU jobs change the arena/band layout and invent failures.
 
 ## Verification per block

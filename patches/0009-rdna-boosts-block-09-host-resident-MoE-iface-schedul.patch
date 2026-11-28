@@ -1,4 +1,4 @@
-From f839a9a74be895f64faba79adedf45d2f7a9887a Mon Sep 17 00:00:00 2001
+From be05ae8e100639c1631b40e97069d9b9c3260ae3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Wed, 21 Oct 2026 10:40:32 -0500
 Subject: [PATCH 09/18] rdna-boosts: block 09: host-resident MoE (iface,
@@ -11181,7 +11181,7 @@ index 7b9c27789..60d5c505c 100644
          ggml_tensor node;
          void *   node_src_data_ptrs[GGML_MAX_SRC];
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index f16952b26..4b4cc8df2 100644
+index 095342a38..519cca5c5 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,5 +1,8 @@
@@ -11193,7 +11193,7 @@ index f16952b26..4b4cc8df2 100644
  #include "quantize.cuh"
  #include "unary.cuh"
  #include "vecdotq.cuh"
-@@ -1768,8 +1771,14 @@ static void mul_mat_vec_q_moe_launch(
+@@ -1792,8 +1795,14 @@ static void mul_mat_vec_q_moe_launch(
      int64_t cold_gate_n_res    = 0;
      size_t  cold_gate_channel_bytes = 0;
      size_t  cold_gate_row_bytes     = 0;
@@ -11210,7 +11210,7 @@ index f16952b26..4b4cc8df2 100644
      // The kernel indexes in type-block units; the cold geometry is reported in bytes.
      const size_t   ts = ggml_type_size(type);
      const uint32_t cold_channel_stride      = cold_channel_bytes      > 0 ? (uint32_t) (cold_channel_bytes      / ts) : 0;
-@@ -3329,3 +3338,273 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
+@@ -3353,3 +3362,273 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
              (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
      }
  }

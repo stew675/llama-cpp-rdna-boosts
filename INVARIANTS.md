@@ -3815,3 +3815,56 @@ so the deliverable part of it is an opt-in switch for the 129..511 band.
 **Record.** `archive/work/flash-next-prefill/` (`RESULTS-session7.md` §6-§7, `REVIEW-squashed.md` §10-§12,
 `HANDOVER-session8.md`, `runs/mtp4-abba-f16/`); `patches/README.md` blocks 09/10/12/15 (r369 amendments);
 `ENVIRONMENT.md` §1.3/§2/§31; `DIAGNOSTIC.md` §2/§28/§31; `TODO.md` #385-#391.
+
+## r371 (2026-11-27, `WORKLOG.md` 261127.022) — the shared-expert down epilogue owed three roundings and HIP gave it one; the ISA is the only instrument that sees it (GitHub issue #377)
+
+`shexp_down_gated_q8_0` (block 08) replaces `MUL` (down·gate) → `ADD` (moe_out) → `ADD` (ffn_residual) with one
+epilogue, so its output owes three roundings, and it computed `__fmul_rn(sum_down, gate_sig) + moe_out +
+ffn_residual`.  HIP clang contracts that into `v_fma_f32` / `v_fmac_f32` — `__fmul_rn` is not a barrier (§102.2) —
+so the epilogue rounded once where the chain rounds three times, under a comment that claimed the opposite.  Six
+things worth keeping.
+
+1. **The mechanism, measured on the delivery's own toolchain.**  ROCm 10.2 / clang 24, gfx1201: of the epilogue
+   chains that end in a `global_store_b32`, **144 of 146 were contracted** on r370 and **0 of 146** after the fix,
+   across all **32** instantiations (4 nwarps × 8 ncols).  `<1,1>` went from `v_fma_f32 v1, v1, s4, s5` +
+   `v_add_f32` to `v_mul_f32_e32` + `v_add_f32_e32` + `v_add_f32_e32`.
+2. **A scan of this kernel must be anchored on the STORE, not on the reduction.**  The obvious window ("after the
+   last `v_add_f32_dpp`") is right for `<1,1>`..`<4,8>` and wrong for `<8,8>`, where the compiler interleaves the
+   eight-token cross-warp reduction with the dot loop and software-pipelines the stores — so the window shows 1
+   `v_mul_f32` for 8 tokens in the FIXED object and misses the contraction in the BROKEN one.  Look back from each
+   store for the token's `v_mul_f32` and require no contracted form in between (`scripts/gate-shexp-down-gate.sh`
+   leg 1, which fails on the r370 object with 144 findings).
+3. **Decode == verify was never at risk, and that is why the defect survived.**  All 32 instantiations contracted
+   the same way, so every width computed the same arithmetic; only the *claim* was false.  A "same rounding at
+   every width" property is not evidence that the rounding is the one the comment names — two independent claims.
+4. **A single-sequence greedy arm and the prefill KLD are blind to this change, and the reason is the fusion's
+   own arming condition.**  Same-seed greedy text is byte-identical (`2f79e37ca208` short, `a2cdef23588f` prose, on
+   a 3-GPU `-sm tensor` arm and a 1-GPU `-ncmoe 40 --host-experts pool` arm), the canonical prefill-logit point
+   reads `0.000000 / 100.000 %`, and a two-chunk `--chunks 2` log-prob file is byte-identical between the two
+   builds — because the fusion only arms at ≤ `MMVQ_MAX_BATCH_SIZE` (8) tokens, so a batched prefill runs the
+   epilogue only on its small tail ubatch.  At **`-ub 1`**, where every token takes it and each step's hidden state
+   feeds the next, the same pair reads mean KLD **0.001354 / 98.431 %** (PPL 4.0962 → 4.0521): the change is real,
+   rounding-level, and only visible where the epilogue actually runs at every token.  **A verify-band arm is NOT
+   blind**: `scripts/gate-server-arms.sh`'s two-slot DFlash arm on 35B-A3B Q8_0 reproduces its recorded anchors on
+   r370 (`50f29e574939 a56117e02dcf`, 0.60741/0.69106) and reads `10050d7d1b2f df3deb00c56b` (0.59559/0.60000) on
+   r371, deterministically on each build — the reference text moved once, the same class as a K-partition move
+   (§111.2), because the recorded anchors were taken on the contracted arithmetic.  That arm is the reason a
+   rounding change owes a re-record, not only an ISA check.
+5. **The unfused chain is not a text oracle for this fusion** — not before the fix and not after it.  The fused
+   gate reduction (`shexp_gate_sigmoid`) has its own order difference from the standalone `MUL_MAT` it replaces
+   (`ggml-cuda-try-fuse.cu` says so), so `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` is a different *placement*: both
+   arms read the same text in every arm measured here.  The purity claim of this kernel is the ISA (§102.5's
+   "pick the instrument that can see it").
+6. **A census was owed and did not exist.**  `GGML_CUDA_SHEXP_GATE_DEBUG=1` now prints
+   `SHEXP DOWN GATE <out> ncols=N exact=1` once per fused launch (600 on a 4-token 35B-A3B Q8_0 run) and prints
+   nothing under `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`, which is what makes the fused arm observable at all.
+
+The fix uses the file's existing exact helpers (`mmvq_mul_rn` / `mmvq_add_rn`: inline-asm `v_mul_f32_e32` /
+`v_add_f32_e32` under `__HIP_PLATFORM_AMD__`, `__fmul_rn`/`__fadd_rn` elsewhere — the terms CUDA already had),
+hoisted out of the hyper-connection kernels that carried them and renamed from `mmvq_hc_*` because they are now
+the file's general rounding helpers.  Rate is flat (pp512 1663.7 vs 1651.2 t/s, tg128 63.2 vs 64.3 — inside this
+box's ±2 % band); the change adds two scalar instructions to a `threadIdx.x == 0` tail loop.
+
+**Record.** `scripts/gate-shexp-down-gate.sh` (MANIFESTS gate 48); `benchmarks/2026-11-27-shexp-down-epilogue-rounding.md`;
+`GREEDY-PURITY.md` §112; `DIAGNOSTIC.md` §32; `patches/README.md` block 08 (r371); `WORKLOG.md` 261127.022;
+issue #377 (@overdoingism).

@@ -873,6 +873,20 @@ The numbers of record are in `benchmarks/` and the `WORKLOG.md` entries for r369
 
 ---
 
+## 32. The shared-expert down epilogue's rounding (block 08, r371)
+
+There is nothing to opt in to and nothing to tune: the epilogue now performs the three roundings the chain it
+replaces performs, by mechanism rather than by comment (`v_mul_f32_e32` / `v_add_f32_e32` instead of a contracted
+`fma`), and the delivery ships it on.  The kill switch (`GGML_CUDA_DISABLE_SHEXP_DOWN_GATE`) and the census
+(`GGML_CUDA_SHEXP_GATE_DEBUG`) are in [`DIAGNOSTIC.md`](DIAGNOSTIC.md) §32.
+
+Measured effect on the delivery's own configurations: none visible — same-seed greedy text is byte-identical and
+the canonical prefill-logit point reads `0.000000 / 100.000 %`, because the fusion arms only at
+≤ `MMVQ_MAX_BATCH_SIZE` tokens.  At `-ub 1` the same comparison reads 0.001354 KLD / 98.431 % (rounding level).
+Details: `benchmarks/2026-11-27-shexp-down-epilogue-rounding.md`; rule: `GREEDY-PURITY.md` §112.
+
+---
+
 ## Maintaining this file
 
 The tables are derived from the code, so re-derive rather than trust them after a block change:

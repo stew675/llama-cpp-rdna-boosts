@@ -2032,6 +2032,30 @@ must be **bit-identical** to what it replaces at the widths it serves.
   `scripts/gate-norm-rows-alias.sh` is its gate.
 * `norm.cu` / `quantize.cu` / `unary.cu`: `rms_norm`→Q8_1 folds, the verify-band q8_1 cache, scale-unary,
   norm-rows, the conv1d/PLE fusions and the shared-expert down gate.
+* **The shared-expert down epilogue ROUNDS on its own, and the ISA is the only instrument that sees it (r371,
+  GitHub issue #377).**  `shexp_down_gated_q8_0` replaces `MUL` (down·gate) → `ADD` (moe_out) → `ADD` (residual)
+  with one epilogue, so it owes **three** roundings.  It wrote `__fmul_rn(sum_down, gate_sig) + moe_out +
+  ffn_residual`, and HIP contracts that into `v_fma_f32` / `v_fmac_f32` — `__fmul_rn` is not a barrier
+  (`GREEDY-PURITY.md` §102.2) — i.e. one rounding where the chain has two, with a comment above it claiming
+  the opposite.  The fix uses the file's own exact helpers (`mmvq_mul_rn` / `mmvq_add_rn`, inline-asm
+  `v_mul_f32_e32` / `v_add_f32_e32` on HIP, `__fmul_rn`/`__fadd_rn` elsewhere — the terms CUDA already had),
+  hoisted out of the hyper-connection kernels that carried them, so `mul`, `add`, `add` each round.  **Every one
+  of the 32 instantiations (4 nwarps × 8 ncols) contracted the same way, so decode == verify was never at
+  risk**; the comment's claim was what did not hold.  Nothing usual can see the defect: same-seed greedy text
+  is byte-identical (`2f79e37ca208` short / `a2cdef23588f` prose, on a 3-GPU `-sm tensor` arm and a 1-GPU
+  host-expert arm) and the canonical prefill-logit point reads **0.000000 KLD / 100.000 %**, because the
+  fusion only arms at ≤ `MMVQ_MAX_BATCH_SIZE` tokens and a batched prefill therefore runs the epilogue only on
+  its small tail ubatch.  At `-ub 1`, where every token takes it and 512 sequential steps amplify a 1e-7 shift,
+  the same pair reads mean KLD **0.001354 / 98.431 %** — real, and rounding-level.  So the gate is the emitted
+  ISA (`scripts/gate-shexp-down-gate.sh`: all 32 instantiations, store-anchored), plus the census it needed
+  anyway: **`GGML_CUDA_SHEXP_GATE_DEBUG=1`** prints one `SHEXP DOWN GATE <out> ncols=N exact=1` line per fused
+  launch (600 on a 4-token 35B-A3B Q8_0 run, **0** with `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`).  Rate is flat
+  (pp512 1663.7 vs 1651.2 t/s, tg128 63.2 vs 64.3, inside this box's ±2 % band).  **A verify-band arm is not
+  blind**: `gate-server-arms.sh`'s two-slot DFlash arm on 35B-A3B Q8_0 moved once with this change (r370
+  `50f29e574939 a56117e02dcf` / 0.60741 0.69106 → r371 `10050d7d1b2f df3deb00c56b` / 0.59559 0.60000,
+  deterministic on each build), so its anchors are re-recorded — the K-partition precedent (§111.2), a reference
+  move and not a defect.  `DIAGNOSTIC.md` §32;
+  `MANIFESTS.md` gate 48; `benchmarks/2026-11-27-shexp-down-epilogue-rounding.md`.
 * **The rms_norm reduction order is a numerics selector, not a knob (r145, issue #229).**
   `ggml_cuda_rms_norm_vec()` (`common.cuh`) is the single selector; `rms_norm_f32`'s dispatch and every
   kernel documented bit-identical to it consult it (`hc_combine_norm_f32`, block 11, takes it as a launch

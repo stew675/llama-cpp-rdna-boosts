@@ -16,6 +16,74 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.022 (r371) -- issue #377: the shared-expert down epilogue contracted its product, so it rounded once where the chain rounds three; the fix is mechanism, the gate is the ISA, and the census that did not exist now does
+
+@overdoingism reported (issue #377) that `shexp_down_gated_q8_0`'s epilogue -- `__fmul_rn(sum_down, gate_sig) +
+moe_out + ffn_residual`, under a comment asserting that the multiply "must NOT be contracted into an FMA" -- was
+emitted as `v_fma_f32` / `v_fmac_f32` on every instantiation, from the source plus the r366 object's ISA.  It
+reproduces exactly on the delivery's own toolchain (ROCm 10.2, clang 24, gfx1201): **144 of the 146 epilogue
+chains that end in a store were contracted, across all 32 instantiations**.  The block replaces `MUL` (down·gate)
+-> `ADD` (moe_out) -> `ADD` (residual), so it owes three roundings; it took one.
+
+**The fix, and why it is the "make the code match the comment" arm of the two the reporter offered.**  §102.2
+already says `__fmul_rn` is not a barrier on HIP, and this delivery's own doctrine (§102, r324) is that a fold
+standing in for a chain reproduces the chain's ROUNDING, not just its expression.  The epilogue now calls
+`mmvq_mul_rn` / `mmvq_add_rn` -- the file's inline-asm `v_mul_f32_e32` / `v_add_f32_e32` pair on HIP, the
+`__fmul_rn`/`__fadd_rn` terms on any other backend (so nvcc's arithmetic does not move) -- hoisted out of the
+hyper-connection kernels that already carried them and renamed from `mmvq_hc_*`, because they are now the file's
+general rounding helpers.  After: `v_mul_f32_e32` + `v_add_f32_e32` + `v_add_f32_e32` per token, **0 of 146**
+contracted.  It is a 3-line arithmetic change in a `threadIdx.x == 0` tail loop and the rate is flat
+(pp512 1663.7 vs 1651.2 t/s, tg128 63.2 vs 64.3, inside this box's +/-2 % band).
+
+**What the usual instruments could NOT see, which is the entry's real content.**  The fusion arms only at
+<= `MMVQ_MAX_BATCH_SIZE` (8) tokens, so a batched prefill runs the epilogue only on its small tail ubatch:
+same-seed greedy text is byte-identical between the two builds (`2f79e37ca208` short / `a2cdef23588f` prose, on a
+3-GPU `-sm tensor` arm and a 1-GPU `-ncmoe 40 --host-experts pool` arm, and identical to both builds' unfused-chain
+arms too), the canonical prefill-logit point reads `-0.000000 / 100.000 %` in both directions, and a `--chunks 2`
+log-prob file is byte-identical (0 of 63 322 400 finite floats differ).  At **`-ub 1`** -- every token takes the
+epilogue and each step's hidden state feeds the next -- the same pair reads mean KLD **0.001354 / 98.431 %**
+(PPL 4.0962 -> 4.0521), which is the change's rounding-level magnitude and its non-vacuity proof.  The unfused
+chain is **not** a text oracle for this fusion either (the fused gate reduction has its own documented order
+difference), so the purity instrument is the ISA.
+
+**So the change ships its own instrument.**  `GGML_CUDA_SHEXP_GATE_DEBUG=1` prints one
+`SHEXP DOWN GATE <out> ncols=N exact=1` line per fused launch -- **600** on a 4-token 35B-A3B Q8_0 run, **0** under
+`GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`.  Before this release there was no way to tell whether the kernel ran at all,
+which is exactly §102.5's "the census is not optional" and the reason the pre-fix arms could all read "clean".
+
+**Gate 48** is new (`scripts/gate-shexp-down-gate.sh`): the emitted ISA of every instantiation, extracted from the
+build's own object with `llvm-objcopy` / `clang-offload-bundler` / `llvm-objdump`, with each output chain anchored
+on its `global_store_b32` -- the obvious "after the last `v_add_f32_dpp`" window is right for `<1,1>`..`<4,8>` and
+wrong for `<8,8>`, where the compiler interleaves the eight-token reduction with the dot loop (measured on both
+objects), so the anchor is the store.  It reports 144 findings on the r370 object and 0 on the r371 one, plus the
+census legs and a reproducibility arm for each text arm.
+
+**The one arm that does see it, and the anchors it moved (or found already stale).**  `gate-server-arms.sh`'s
+two-slot DFlash arm on 35B-A3B Q8_0 (verify batches of width > 1, plus an acceptance feedback loop) reads its
+recorded anchors on the r370 build (`50f29e574939 a56117e02dcf`, 0.60741/0.69106) and reads
+`10050d7d1b2f df3deb00c56b` (0.59559/0.60000) on r371, three runs, deterministically on each build -- a one-time
+reference move of the same class as a K-partition change (§111.2), because the reference was recorded on the
+contracted arithmetic.  Acceptance stays at the same level, so it is a re-record, not a purity loss.  The same run
+produced two findings of its own, both fixed here: **`FN_D` named a Flash-Next DFlash2 GGUF that has moved** (to
+`/llm/models/Qwen3.8/Flash-Next/`, so `fn24`/`fn10` were failing as `missing model or drafter` before reaching a
+token), and **the `fn24`/`fn10` anchors were already stale on the r370 tree** (`9564942b467b e29d01e5edca` /
+0.69106 0.69672 against the recorded `594368935245 b337648c3ef9` / 0.59259 0.77193 on BOTH builds) -- expected, as
+r369 promoted the flash-next prefill transport/pipeline over blocks 09/10/12/15 the same day
+(`archive/work/flash-next-prefill/`) and that model's `ffn_down_shexp` is IQ4_NL, so this epilogue cannot reach it.
+All three anchors are re-recorded from the r371 build (`--record`) and the gate is green 3/3.  This is the second
+time these anchors have gone stale (`TODO` #322, closed at r285), which is why the re-record is recorded here
+rather than folded into the gate silently.
+
+**The re-cut.**  Block 08's commit carries the fix and its census (`git commit --amend` + a rebase of the ten
+blocks above it, clean); the block tree diff against r370 is one file, `ggml/src/ggml-cuda/mmvq.cu`.  Credit:
+`Reported-by: overdoingism` in the patch, a `reported` row in `CONTRIBUTORS.md`, and the block note in
+`patches/README.md`.  `GREEDY-PURITY.md` §112, `INVARIANTS.md` r371, `DIAGNOSTIC.md` §32 (+ the `ENVIRONMENT.md`
+pointer), `benchmarks/2026-11-27-shexp-down-epilogue-rounding.md`.
+
+Nothing else in the delivery changes: `validate-set.sh` green, the canonical prefill-logit base is NOT
+re-recorded (the dense 27B point has no shared expert and reads 0.000000 against it), and the optional artifacts
+are untouched.
+
 ## 261127.021 (r370) -- the credit re-cut: 25 contributions that shipped without a trailer now carry theirs, all 19 block trees byte-identical, and `check-credit.sh --strict` is a release gate
 
 The policy landed at r369 (`CONTRIBUTORS.md`, the AGENTS.md section, `scripts/check-credit.sh`) and it immediately
