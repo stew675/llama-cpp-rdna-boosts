@@ -33,6 +33,11 @@ WHAT IT CHECKS  (two arms on the same binary, `-np 2`, one GPU)
           pair is NOT a text oracle -- co-batching changes the ubatch shape and hence the kernel family,
           GREEDY-PURITY.md §63 / issue #234)
   HARD  * each arm's startup census says the configuration it claims (`prefill admission: fair share = ...`)
+  HARD  * the per-pass SHARE of two co-batched prompts is max-min even: >= 80 % of the steps that carried both
+          prompts divide the pass's budget in equal shares and place tokens in both (`-lv 5` census, on its own
+          fresh server).  This is the documented split itself: the order bias it replaced alternates 2:1 / 1:2
+          across steps, so every timing number in the gate agrees between an even split and an uneven one, and
+          the slot-order fill (FAIR=0) reads 0 on this check (r373)
   HARD  * no abort / assert in either log, and `scripts/check-gpu-faults.sh` reads both clean
   SOFT  * aggregate decode at concurrency 2 within --max-decode-loss (5 %) of the baseline
 
@@ -70,14 +75,21 @@ TEXT_PROMPTS = [
 SHORT_PROMPT = "[SHORT] Name three planets."
 STREAMING_RE = re.compile(r"WINDOWED KV ENABLED|taking the ATTENDANCE POOL|is_streaming|pool .*enabled", re.I)
 SPEC_RE = re.compile(r"draft acceptance = ([0-9.]+) \(\s*(\d+) accepted /\s*(\d+) generated\)")
+# `fair share: budget = <the slot's allocation for this pass>, added = <tokens taken>, batch = n / n_batch`
+# (SLT_DBG in the fill loop, so it needs -lv 5).  The first number is prompt_budget[slot.id]: the one-token
+# floor plus every take the pass's share loop gave that slot, so it equals its SHARE of the pass unless the
+# slot's prompt ran out mid-pass (which is why the check counts a FRACTION of even steps, and why it also
+# requires the share to be a divided window -- the FAIR=0 arm prints the whole window for every slot).
+SHARE_RE = re.compile(r"id\s+(\d+) \| task \d+ \| fair share: budget = (\d+), added = (\d+), batch = (\d+) / (\d+)")
 ABORT_RE = re.compile(r"GGML_ASSERT|GGML_ABORT|terminate called|Segmentation fault|fatal error", re.I)
 
 
 class Server:
-    def __init__(self, args, env_extra, log_path):
+    def __init__(self, args, env_extra, log_path, lv=4):
         self.args = args
         self.env_extra = env_extra
         self.log_path = log_path
+        self.lv = lv
         self.proc = None
         self.base = f"http://127.0.0.1:{args.port}"
 
@@ -89,7 +101,7 @@ class Server:
             self.args.server, "-m", self.args.model, "-ngl", "99",
             "-np", "2", "-c", str(self.args.ctx), "-b", str(self.args.b),
             "-ub", str(self.args.ub), "-t", str(self.args.threads),
-            "--no-warmup", "--port", str(self.args.port), "-lv", "4",
+            "--no-warmup", "--port", str(self.args.port), "-lv", str(self.lv),
         ] + shlex.split(self.args.server_args)
         self.log = open(self.log_path, "w")
         self.proc = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT, env=env,
@@ -277,6 +289,67 @@ def spec_stats(log):
     return (acc, gen, n) if n else None
 
 
+def share_split(log):
+    """Per-step max/min ratio of the two co-batched prompts' SHARES, from the `fair share` census.
+
+    The claim this checks is the documented max-min split: "each pass gives every remaining slot
+    budget/n_active tokens".  Its failure mode is an ORDER bias -- taking each share out of the budget the
+    earlier slots of the same pass left over gives the first slot of the rotated order 2/3 of a two-slot
+    window (1365 + 682 of 2048) and the second 1/3, alternating 2:1 / 1:2 across steps thanks to the rotation,
+    so no end-to-end number (wall time, aggregate t/s, per-request t/s) can see it.  Lines of one step are
+    contiguous and the slot order rotates, so a group ends at the first REPEATED slot id or at a `batch`
+    count that goes backwards.
+
+    A step is EVEN only if the two shares are within 1.05, both slots really placed tokens, and the share is a
+    DIVIDED window (<= 0.75 x n_batch): the slot-order fill (FAIR=0) prints the whole window for both slots,
+    because there the number is the budget each slot MAY take, and its two takes are exactly the order bias
+    (1689 + 359 in the arm measured below).
+    """
+    groups, cur, seen, last_batch = [], [], set(), None
+    for m in SHARE_RE.finditer(log):
+        sid, share, added, batch, n_batch = (int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                                             int(m.group(4)), int(m.group(5)))
+        # a step's `batch` only grows (the fill loop runs once per step), and the slot order rotates, so a
+        # repeated slot id or a batch that went backwards is a step boundary -- either one alone is enough
+        if sid in seen or (last_batch is not None and batch <= last_batch):
+            if len(cur) > 1:
+                groups.append(cur)
+            cur, seen = [], set()
+        cur.append((share, added, n_batch))
+        seen.add(sid)
+        last_batch = batch
+    if len(cur) > 1:
+        groups.append(cur)
+    if not groups:
+        return None
+    ratios = sorted(max(s for s, _, _ in g) / max(min(s for s, _, _ in g), 1) for g in groups)
+    # EVEN = the pass's budget was really DIVIDED and the division was equal: with two active prompts the
+    # max-min share is half the window, so a share of the whole window means the fill loop took the slot-order
+    # policy's "budget" and the two takes are what an order bias looks like (1689 + 359 in the FAIR=0 arm).
+    even = sum(1 for g in groups
+               if all(a > 0 for _, a, _ in g)
+               and max(s for s, _, _ in g) <= 0.75 * max(w for _, _, w in g)
+               and max(s for s, _, _ in g) <= 1.05 * max(min(s for s, _, _ in g), 1))
+    return {"n": len(ratios), "even": even,
+            "median": ratios[len(ratios) // 2], "worst": ratios[-1]}
+
+
+def measure_share(srv, reps):
+    """The per-pass SHARE split, on its OWN fresh server at -lv 5.
+
+    Its own server because the census line is LOG_DBG (level 5) and the timing arms must not carry debug
+    logging: a 13k-token arm writes ~1 MB of it, and the ITL / lone-prefill numbers are what the gate is for.
+    The prompts are the arm's own long prompt, so the pair spans a dozen passes rather than two: at -ub 512 a
+    ~2.2k-token pair finishes in two steps and the check would rest on two observations (measured 2026-11-27).
+    Two DIFFERENT texts of equal length (the same text twice is served from the prompt cache) so both slots
+    have the same number of tokens left, which is what makes the shares comparable.
+    """
+    global BASE
+    BASE = srv.base
+    run_pair([(sentence(reps, "SHAREA"), 2, "sa", 0.0, 0), (sentence(reps, "SHAREB"), 2, "sb", 0.0, 1)])
+    return share_split(srv.log_text())
+
+
 def measure_text(srv):
     """The single-slot greedy text oracle, on its OWN fresh server.
 
@@ -401,12 +474,21 @@ def main():
             finally:
                 srv.stop()
 
+            # pass 1c: the per-pass share split (see measure_share)
+            srv = Server(a, env, os.path.join(logdir, f"{tag}.share.log"), lv=5)
+            try:
+                srv.start()
+                share = measure_share(srv, a.reps)
+            finally:
+                srv.stop()
+
             # pass 2: the interaction arms
             srv = Server(a, env, log_path)
             try:
                 srv.start()
                 cfg = check_arm_config(srv.log_text(), env["LLAMA_SERVER_PREFILL_FAIR"], chunk)
                 results[name] = measure(srv, a.reps, dec_n, agg_n)
+                results[name]["share"] = share
                 results[name]["text"] = text
                 results[name]["census"] = cfg
                 results[name]["lone_tps"] = lone_tps
@@ -580,6 +662,21 @@ def main():
           f"{ci.get('max', 0):.0f}ms over {ci.get('n', 0)} gaps; baseline {bi.get('median', 0):.0f}/"
           f"{bi.get('p95', 0):.0f}/{bi.get('max', 0):.0f}ms -- the cap trades a few long stalls for more "
           f"short ones, so p95 may rise while max falls")
+
+    # the max-min share ITSELF (r373): per pass, not cumulatively -- the rotation already evens the cumulative
+    # split for equal prompts, so this is the only observation that separates an even share from a 2:1 / 1:2
+    # alternation.  A step where one prompt is placing its last few tokens caps its share, so the check is the
+    # FRACTION of steps that are even (a tail step cannot move it); the defect reads 1.00 on none of them.
+    sh = c.get("share")
+    if sh and sh["n"]:
+        frac = sh["even"] / sh["n"]
+        hard(frac >= 0.8 and sh["n"] >= 4, "share split",
+             f"{sh['even']}/{sh['n']} co-batched step(s) split the pass's budget evenly (>= 80 % of >= 4 steps "
+             f"needed); median ratio {sh['median']:.2f}, worst {sh['worst']:.2f} -- 1.00 = the max-min split, 2.00 = shares "
+             f"taken from the running budget; too few observations is a failure, not a pass)")
+    else:
+        hard(False, "share split",
+             "no fair-share census with two active prompts (FAIR=0, or the pass's share is not max-min)")
 
     pf = (c["lone_tps"] / b["lone_tps"]) if b["lone_tps"] else 0.0
     hard(pf >= 1.0 - a.max_prefill_loss, "lone prefill",

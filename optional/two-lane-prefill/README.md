@@ -1,7 +1,11 @@
 # `two-lane-prefill` — `LLAMA_PREFILL_LANES`: consecutive-ubatch prefill overlap
 
 **Optional artifact, not part of the delivery.  Optional block `0100`; PORTED onto `r369` (2026-11-27), verified on `r353`.**
-r372 (18 official blocks `0000`-`0017` + temporary `0300`, default tree `7c1728b37d8b914724e62156559eddf0301c062c`, default tip `5e844cbc6`):
+r373 (18 official blocks `0000`-`0017` + temporary `0300`, default tree `95dbb18aa1e104547226407f6b29028e848366e3`, default tip `20ed444e9`):
+RE-CUT, because r373 amends block 16 (`tools/server/server-context.cpp`) and a re-cut re-exports the artifact against the new default tree.  The artifact does not touch that file, so nothing was reconciled -- the diff body is the r372 one and only the
+`From` id moved, and the sha256 is `f70aae35ee86457254a16ec17cc4216cbc96809c42b40f3d384a6f73f20923cf`; producing tree
+`3a56f076702a8b414a36d12c38e1eea92ce262d3` alone and `3fa3b2a7c535de68bcc56429e2d869d82303324b` cumulative (both re-verified by
+`scripts/validate-set.sh`; the `all`-target build of the cumulative tree is the r372 gate-47 run below -- this re-cut moves no artifact source line, so it was not re-built).  (r372, superseded: default tree `7c1728b37d8b914724e62156559eddf0301c062c`, default tip `5e844cbc6`):
 applies strictly on the r369 port, **nothing to reconcile** -- r372 amends block 05 (`ggml/src/ggml-cuda/fattn*.{cu,cuh}`), none of this artifact's eight files, so its own diff and export are untouched and the sha256 is **unchanged** at
 `ce21bccde08257b3f3e536141651ad63a8d22fd84ef52eeabb5d50f16c40e032`; producing tree
 `bcdf4dfbc57ca5d1520a6b20ceb7d2983b83b3b3` alone and `d74527df00cb751fdf695ef3d7be38346c485f87` cumulative, and

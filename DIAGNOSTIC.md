@@ -625,7 +625,7 @@ None of these change the computed result on the default path.
 
 | variable | default | class | what it does |
 |---|---|---|---|
-| `LLAMA_SERVER_PREFILL_FAIR` | **on** | **kill-switch** | The max-min fair share: water-filling over the slots that still have prompt tokens, so every active prompt is admitted to every step and a slot that needs less returns the difference to the pool.  `0` restores the slot-order fill exactly. |
+| `LLAMA_SERVER_PREFILL_FAIR` | **on** | **kill-switch** | The max-min fair share: water-filling over the slots that still have prompt tokens, where each pass divides the PASS's budget (not what its earlier slots left) across the slots still in it — r373, so two prompting slots get 1024/1024 of a 2048 window and not 1365/682 — so every active prompt is admitted to every step and a slot that needs less returns the difference to the pool.  `0` restores the slot-order fill exactly (a slot adds up to the whole window, so the lowest slot wins it). |
 
 *The opt-in and tuning rows for this section are in [`ENVIRONMENT.md`](ENVIRONMENT.md) §22.*
 

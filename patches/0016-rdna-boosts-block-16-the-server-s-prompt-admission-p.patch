@@ -1,4 +1,4 @@
-From 9de0a59b8455856555206e81057c59a9cff5ddb6 Mon Sep 17 00:00:00 2001
+From ac16e1f77c98937b6bfc7ece9ccbff2337a11f71 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Mon, 16 Nov 2026 23:43:27 -0600
 Subject: [PATCH 16/18] rdna-boosts: block 16: the server's prompt admission
@@ -80,6 +80,29 @@ the server idles at 0 ticks after the drain.  Gate: scripts/gate-kv-admit.sh (MA
 gate 46), whose --self-test runs every arm on the kill switch and rejects it on 12 checks.
 Knobs: ENVIRONMENT.md 29 / DIAGNOSTIC.md 29.  Record: WORKLOG.md 261126.001, INVARIANTS.md
 r365, patches/README.md block 16.
+
+The max-min share divides the PASS's budget (r373, contributor PR #376).  Each pass of the share loop
+took a slot's share out of `budget` -- the budget the earlier slots of the same pass had already spent
+-- instead of out of `budget_before`, the pass's own budget that the loop already keeps for its stop
+check.  With two prompts and a 2048-token window the one-token-each phase leaves 2046, so the first slot
+of the ROTATED order got 1023 and the second 511, and the pass closed at 1365 + 682 (a simulated
+4-slot window reads 748/560/421/316).  The rotation still alternates which slot leads, so the CUMULATIVE
+split and every end-to-end number -- wall time, aggregate t/s, per-request t/s -- are the same either
+way: measured 2026-11-27, 4B Qwen3.5 Q8_0, one R9700, `-np 2 -b 2048 -ub 2048`, two fresh 22797-token
+prompts, `-lv 5` census: the default build alternates `added = 1365` / `682` every step and both requests
+finish at 7.15 s (3278 / 3234 t/s), the pass's budget reads `1024` / `1024` every step and they finish at
+7.01 s (3309 / 3309 t/s).  What the fix buys is the split the block documents and the loop's comment
+promises ("each pass gives every remaining slot budget/n_active tokens"): a per-pass share that does not
+depend on the slot's position in the rotation, which is also what makes `LLAMA_SERVER_PREFILL_SKEW`
+mean what it says -- 4:1:1 on a 2048 window is 1365 / 341 / 341, where the running budget read
+1777 / 147 / 123 whenever the skewed slot came first.  The sums are unchanged (a pass's shares add up to
+budget_before exactly), one prefilling prompt is unchanged (budget_before == budget), and a slot that
+needs less than its share still returns the difference to the pool for the next pass.
+Gate: `scripts/gate-prefill-fairness.sh` -- the new HARD `share split` check reads the `-lv 5` per-step
+census on its own fresh server and requires >= 80 % of >= 4 co-batched steps to divide the pass's budget
+evenly AND place tokens in both slots (15/15 on this build; the pre-fix build reads 3/15 with a median
+ratio of 2.00, and the FAIR=0 slot-order fill reads 0 %).  Reported by @briansp2020, who supplied the
+patch, the analysis and the repro.
 Co-authored-by: briansp2020 <bsp2020@gmail.com>
 ---
  common/arg.cpp                     |  17 ++
@@ -87,12 +110,12 @@ Co-authored-by: briansp2020 <bsp2020@gmail.com>
  tools/cli/README.md                |  18 +-
  tools/completion/README.md         |  14 +-
  tools/server/README.md             |  19 +-
- tools/server/server-context.cpp    | 469 ++++++++++++++++++++++++++++-
+ tools/server/server-context.cpp    | 473 ++++++++++++++++++++++++++++-
  tools/server/server-queue.cpp      |  11 +
  tools/server/server-queue.h        |   4 +
  tools/server/server-slot-sched.cpp |  13 +-
  tools/server/server-slot-sched.h   |  24 ++
- 10 files changed, 579 insertions(+), 20 deletions(-)
+ 10 files changed, 583 insertions(+), 20 deletions(-)
 
 diff --git a/common/arg.cpp b/common/arg.cpp
 index f7cd72d85..ee0bbac3e 100644
@@ -335,7 +358,7 @@ index 3c89ff19d..f5b262254 100644
  | `--spec-draft-n-start N` | initial adaptive MTP draft depth: the first verify round of each generation starts here instead of the default cold start.  Clamped to [--spec-draft-n-min-adaptive, --spec-draft-n-max].  Use it to start deeper when the workload settles high (e.g. verbatim recall) or shallower for a short generation at a deep context, where a wide verify batch costs more.  Unset: three steps below the ceiling, bounded by the floor.<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_START) |
  | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index fde607ac3..196e0bfff 100644
+index fde607ac3..236b6b42a 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1165,8 +1165,112 @@ private:
@@ -571,7 +594,7 @@ index fde607ac3..196e0bfff 100644
      // call only when the task is sure to launch on the slot
      void update_prompt_cache(server_slot & slot, const server_task & task) {
          SRV_TRC("%s", "updating prompt cache\n");
-@@ -2144,6 +2340,119 @@ private:
+@@ -2144,6 +2340,123 @@ private:
          }
      }
  
@@ -667,7 +690,11 @@ index fde607ac3..196e0bfff 100644
 +            for (size_t i = 0; i < active.size(); ++i) {
 +                const size_t  k = active[i];
 +                const int64_t w = (i == skew_i ? prefill_skew : 1);
-+                const int64_t share_i = (int64_t) budget * w / wsum;
++                // the share is of the PASS's budget, not of what the earlier slots of this pass left: taken from
++                // the running budget, the first slot of the rotated order gets 2/3 of a two-slot window (1365 +
++                // 682 of 2048) instead of the max-min split below, and the skew's weight is double-counted the
++                // same way.  The sums are unchanged: the shares of a pass add up to budget_before exactly.
++                const int64_t share_i = (int64_t) budget_before * w / wsum;
 +                const int64_t take    = std::min<int64_t>(remaining[k], share_i);
 +
 +                prompt_budget[k] += (int32_t) take;
@@ -691,7 +718,7 @@ index fde607ac3..196e0bfff 100644
      // return true if at least one slot has been cleared
      // TODO: improve logic
      //       - smarter decision which slot to clear (LRU or longest prompt?)
-@@ -3337,7 +3646,11 @@ private:
+@@ -3337,7 +3650,11 @@ private:
  
                      if (slot == nullptr) {
                          // if no slot is available, we defer this task for processing later
@@ -704,7 +731,7 @@ index fde607ac3..196e0bfff 100644
                          queue_tasks.defer(std::move(task));
                          break;
                      }
-@@ -3886,6 +4199,26 @@ private:
+@@ -3886,6 +4203,26 @@ private:
  
                  metrics_flush_idle();
  
@@ -731,7 +758,7 @@ index fde607ac3..196e0bfff 100644
                  return; // skip further processing
  
              } else {
-@@ -4300,6 +4633,101 @@ private:
+@@ -4300,6 +4637,101 @@ private:
          auto & alora_scale       = batch.alora_scale;
          auto & alora_disabled_id = batch.alora_disabled_id;
  
@@ -833,7 +860,7 @@ index fde607ac3..196e0bfff 100644
          // next, batch any pending prompts without exceeding n_batch
          if (params_base.cont_batching || batch.size() == 0) {
              bool add_ok = true; // false means the batch is full, skip remaining slots
-@@ -4313,6 +4741,13 @@ private:
+@@ -4313,6 +4745,13 @@ private:
                      return;
                  }
  
@@ -847,7 +874,7 @@ index fde607ac3..196e0bfff 100644
                  // check if we can batch this slot with the previous one
                  if (slot_batched && !slot_batched->can_batch_with(slot)) {
                      return;
-@@ -4772,8 +5207,12 @@ private:
+@@ -4772,8 +5211,12 @@ private:
  
                      const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
  
@@ -862,7 +889,7 @@ index fde607ac3..196e0bfff 100644
                          // get next token to process
                          llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                          if (cur_tok == LLAMA_TOKEN_NULL) {
-@@ -4849,6 +5288,9 @@ private:
+@@ -4849,6 +5292,9 @@ private:
                      // the number of tokens added to the batch for the current slot
                      const auto n_tokens_cur = batch.size() - n_tokens_prev;
  
@@ -872,7 +899,7 @@ index fde607ac3..196e0bfff 100644
                      const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
  
                      const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
-@@ -4913,6 +5355,10 @@ private:
+@@ -4913,6 +5359,10 @@ private:
                  }
              });
          }
@@ -883,7 +910,7 @@ index fde607ac3..196e0bfff 100644
      }
  
      // see https://github.com/ggml-org/llama.cpp/pull/29969
-@@ -5535,6 +5981,23 @@ void server_context::start_loop() {
+@@ -5535,6 +5985,23 @@ void server_context::start_loop() {
  
  void server_context::terminate() {
      impl->queue_tasks.terminate();

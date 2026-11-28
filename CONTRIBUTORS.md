@@ -38,6 +38,7 @@ policy is to add the trailer at the next message re-cut that touches the block; 
 | [@briansp2020](https://github.com/briansp2020) | sequence parallelism — the qwen4exp hyper-connection chain, token-split | block `0012` | PR #315 | **co-author** ✅ |
 | [@briansp2020](https://github.com/briansp2020) | the server's KV admission: the max-min fair share, the reply reserve, the deferral | block `0016` | PR #370 | **co-author** ✅ |
 | [@briansp2020](https://github.com/briansp2020) | the attendance pool's stale-KV drop (`ggml_kv_pool_drop`) | block `0014` | PR #369 | **co-author** ✅ |
+| [@briansp2020](https://github.com/briansp2020) | the max-min prompt share divides the PASS's budget (`budget_before`), so two prompting slots get 1024/1024 instead of 1365/682; plus the analysis, the repro and the `-lv 5` evidence | block `0016` (r373) | PR #376 | **co-author** ✅ |
 | [@briansp2020](https://github.com/briansp2020) | Windows host memory — the WDDM free figure and the working-set release of an uploaded mapping | blocks `0009`/`0011`/`0012`/`0014` | PR #269 | **co-author** ✅ |
 | [@briansp2020](https://github.com/briansp2020) | the scheduler/slab/offload series (the async input ring, the wide-band redirect, the sizing rules, … — each landing is listed per block in `patches/README.md`) | blocks `0002`/`0005`/`0010` | PRs #169 #177 #182 #194 #253 #256 #266 #267 #335 #337, and others | **co-author** ✅ |
 | [@burnoutIA](https://github.com/burnoutIA) | the VERIFY band's WMMA `iu8` matvec family (opt-in `--wmma-verify`) | block `0007` | PR #317 | **co-author** ✅ |

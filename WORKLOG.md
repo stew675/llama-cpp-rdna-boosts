@@ -16,6 +16,74 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.026 (r373) -- the max-min prompt share divided the RUNNING budget, not the pass's: two prompting slots got 1365 + 682 of a 2048 window instead of 1024 + 1024 (block 16, contributor PR #376)
+
+`@briansp2020` submitted (`wip/share-budget-r366`) a one-line patch and a careful analysis: every pass of
+`share_prompt_budget()` takes a slot's share out of `budget` -- what that pass's earlier slots had already spent --
+instead of `budget_before`, the pass's budget the loop already keeps for its stop check.  The arithmetic in the
+submission is exact and reproduced here to the token: a 2048-token pass leaves 2046 after the one-token floor, the
+first slot of the rotated order takes 1023 and the second 511, and the pass closes at **1365 + 682**; four slots read
+748 / 560 / 421 / 316 (simulated).  Dividing `budget_before` gives 1024 / 1024 and 512 x 4, which is what the loop's
+own comment documents.
+
+**Verified before shipping, and the claim split in two.**  Observed directly with the fill loop's `-lv 5` census
+(`fair share: budget = <allocation>, added = <take>`, `SLT_DBG`): 4B Qwen3.5 Q8_0, one R9700, `-np 2 -b 2048 -ub 2048`,
+two fresh 22797-token prompts -- the delivery tree alternates `1365` / `682` on every step and the amended tree reads
+`1024` / `1024` on every one.  But the `slot_next` rotation makes the pass-1 leader the pass-2 trailer, so the
+**cumulative** split and every end-to-end number were already even: 7.15 s (3278 / 3234 t/s) before against 7.01 s
+(3309 / 3309 t/s) after, and an unequal pair (22797 + 14141) is proportional in both.  **So the submission's wall-time
+table (25.9 -> 22.1 s, 45.1 -> 36.8 s) is not this change**: every step fills the whole window in both arms, so there
+is no throughput to recover, and the two client threads' arrival alignment (or state left by whichever arm ran first)
+is the remaining explanation.  The fix is kept for what it actually is -- the split the block documents and the knob
+`LLAMA_SERVER_PREFILL_SKEW` weights -- and is recorded as a fairness/determinism fix, not a speedup
+(`archive/work/share-budget-r366/README.md` has the reproduced/not-reproduced split).
+
+**A second consequence the submission did not claim.**  `LLAMA_SERVER_PREFILL_SKEW` is documented as "weight the
+shortest-remaining slot K times against the others"; the same running-budget division inflated it, and the result
+depended on the rotation.  A `4:1:1` window of 2048 is 1365 / 341 / 341 with the pass's budget and read
+1777 / 147 / 123 whenever the skewed slot came first.  Both are now what the docs say.
+
+**So it is gated, not merely fixed.**  `scripts/gate-prefill-fairness.sh` gained a HARD **`share split`** check: a
+fourth pass per arm on its own fresh `-lv 5` server, two different texts of equal length, grouping the census lines
+into steps (a repeated slot id or a `batch` count that goes backwards is a boundary) and requiring **>= 80 % of >= 4**
+co-batched steps to divide the pass's budget evenly *and* place tokens in both slots -- with the share required to be
+a DIVIDED window (`<= 0.75 x n_batch`), because the `FAIR=0` arm prints the whole window for every slot and a
+share-only comparison would pass it vacuously.  Non-vacuity is the 4-step floor: the first cut of the check ran a
+~2.2k-token pair that finishes in two steps at `-ub 512`, and a gate resting on two observations is not a gate.
+
+* **dense 4B arm: PASS**, `15/15` steps even (median ratio 1.00); admission 0.858 s <= 1.184 x 1.25, fairness 2.3x,
+  ITL max 89 <= 148 ms, lone prefill +0.0 %, single-request text identical (`07d799debc25c15c` / `128021138e9202ff`),
+  census `fair share = on, chunk = 512, skew = 1, duty = 16`.
+* **streamed host-expert arm: PASS**, `15/15` even -- Flash-Next IQ3_XXS, `--gpu 0,2 --server-args "-sm tensor -ncmoe
+  47" --env MOE_EXPERT_CACHE_MIB=8192`, admission 16.095 s <= 19.986 x 1.25, fairness 2.1x, ITL max 1580 <= 2227 ms,
+  text identical (`e968f4d1ed133780` / `87910dc525bedce7`).  Its lone-prefill arm read 257 -> 415 t/s (+61 %): that is
+  arm-to-arm ARENA variance on that shape and cannot be the change, because one active prompt reads
+  `budget_before == budget` by construction (the same phantom the gate's own `measure_solo` note warns about).
+* **the control: the same binary with the fix reverted FAILS**, `3/15` steps even with a median ratio of **2.00** --
+  a gate that cannot reject the defect is not a gate -- and the `FAIR=0` slot-order fill reads **0 %**.
+  `--self-test` still rejects the unfixed build (admission + fairness + the share check).
+
+**Delivery mechanics.**  Block `0016` is amended (a re-cut, no new block: +5 / -1 lines in `server-context.cpp`,
+`+583 / -20` over 10 files for the block).  `@briansp2020` already carries the block's `Co-authored-by`, so the credit
+is in the patch; the commit body now names the amendment and the PR, and `CONTRIBUTORS.md` has its own row for it.
+`release.json` moves to `v18-919794500-r373`: default tree `95dbb18aa1e104547226407f6b29028e848366e3`, tip
+`20ed444e9`; the OPTIONAL artifacts are re-cut against the new default tree (`0100` `f70aae35...` alone
+`3a56f0767`, `0101` `290fecd5...` alone `3ddbec1a7`, cumulative `3fa3b2a7c`).  Gates: `validate-set.sh` GREEN (19
+default patches, 578 files / 190 defines / 604 envs / 14 options reconciled against r372 with 0 unexplained, the
+522-file Windows-portability scan, the credit register and the system-header scan); `gate-prefill-duty.sh` PASS
+(15 -> 136 decode tokens during a foreign prefill, 9.1x, stretch 2.10x, text identical); `gate-kv-admit.sh` PASS;
+`gate-optional-build.sh` (gate 47) PASS -- the cumulative optional tree builds the `all` target; `gate-mixed-kv.sh`
+on that build **14/14**; `check-gen-docs.sh` OK at the release tree; coherence 4B 3-GPU `-sm tensor` `100 chars
+sha=1c5d32ac537d` -- and the same hash on the fix-REVERTED build of the same tree, i.e. a single request is
+untouched (one active slot reads `budget_before == budget`, so the arithmetic is identical by construction).
+The dense fairness gate was re-run on the final release tree (`--tag r373-release`) after the full `all` build:
+same verdict, `15/15` even.  The PR itself is merged and its campaign moved to
+`archive/work/share-budget-r366/` -- no `wip/` stub left behind.
+
+**Record.** `INVARIANTS.md` r373; `patches/README.md` block 16 (the r373 amendment, and the block's file count
+corrected from a stale 5 to 10); `MANIFESTS.md` gate 16; `scripts/gate-prefill-fairness.py`; `ENVIRONMENT.md` §22 /
+`DIAGNOSTIC.md` §22; `optional/*/README.md` (the r373 re-cut); `archive/work/share-budget-r366/`.
+
 ## 261127.025 (r372, docs) -- block 17's owed gfx1100 arm ran on `fingon` and passes 12/12: the bit-identity to the CPU's AVX2 path holds on a second arch, and `TODO` #381 closes
 
 `TODO` #381 had been open since r356, because `fingon` (gfx1100, RX 7900 XTX) rebooted twice mid-build and then

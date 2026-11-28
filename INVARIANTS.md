@@ -3986,3 +3986,38 @@ prefill KQ/VKQ work is padding** (at `-ub 1024`, 256 blocks of 64 columns per la
 
 **Record.** `patches/README.md` block 05; `DIAGNOSTIC.md`/`ENVIRONMENT.md` §33; `CONTRIBUTORS.md` (`@mjohanning99`
 issue #381, `@ravel7524` upstream #31746, both `co-author`); `WORKLOG.md` 261127.024.
+
+## r373 (2026-11-27, `WORKLOG.md` 261127.026) — a max-min share taken out of the RUNNING budget is an order bias the step rotation hides, so only the per-pass census can see it (block 16, contributor PR #376)
+
+`share_prompt_budget()`'s pass divided `budget` -- what the pass's earlier slots had already taken -- instead of
+`budget_before`, the pass's own budget the loop keeps for its stop check.  The consequence is exact and only
+per-step:
+
+1. **The bias is `2/3 : 1/3` for two prompts, and it is not the max-min split the block documents.**  A 2048-token
+   pass leaves 2046 after the one-token floor, so the first slot of the rotated order took 1023 and the second 511,
+   and the pass closed at **1365 / 682**; four slots read 748 / 560 / 421 / 316.  Dividing `budget_before` gives
+   1024 / 1024 (and 512 x 4), which is what the loop's own comment promises: *each pass gives every remaining slot
+   `budget/n_active` tokens*.
+2. **Every end-to-end number is blind to it, because `slot_next` rotates the order every pass.**  The rotation makes
+   the pass-1 leader the pass-2 trailer, so the CUMULATIVE allocation of two equal prompts is already even and they
+   finish in the same step: measured on 4B Qwen3.5 Q8_0, one R9700, `-np 2 -b 2048 -ub 2048`, two fresh
+   22797-token prompts -- default tree 7.15 s (3278 / 3234 t/s), amended tree 7.01 s (3309 / 3309 t/s), and an
+   unequal pair (22797 + 14141) is proportional in both.  So a wall-clock or throughput A/B cannot justify this
+   fix, and a submission that reports one is measuring something else (the r366 submission reported 45.1 -> 36.8 s
+   on an equal pair; not reproduced here).  What is observable is the `-lv 5` per-step census
+   (`fair share: budget = <the slot's share>, added = ...`, `SLT_DBG` in the fill loop): `1365` / `682` alternating
+   before, `1024` / `1024` on every pass after.
+3. **The same field is what the SKEW knob weights, so the bug also inflated the skew.**  `LLAMA_SERVER_PREFILL_SKEW`
+   is documented as "weight the shortest-remaining slot K times against the others", i.e. a `4:1:1` window split is
+   1365 / 341 / 341; taken from the running budget it read 1777 / 147 / 123 whenever the skewed slot came first,
+   and a different (usually milder) ratio when it did not -- an allocation that depends on the rotation.
+4. **A share check must subtract the `FAIR=0` shape explicitly.**  With the slot-order fill the census line still
+   prints a per-slot number, but it is the budget the slot MAY take (the whole window, for every slot) and the
+   order bias lives in the takes (1689 + 359 measured).  So `gate-prefill-fairness.sh`'s `share split` check
+   requires the share to be a DIVIDED window (<= 0.75 x `n_batch`) as well as equal, and both slots to have placed
+   tokens; a share-only comparison passes `FAIR=0` vacuously.  Non-vacuity is a floor of 4 co-batched steps (a
+   ~2.2k-token pair at `-ub 512` finishes in two, which is how the first cut of the check rested on 2
+   observations).
+
+**Record.** `patches/README.md` block 16 (the r373 amendment); `MANIFESTS.md` gate 16; `scripts/gate-prefill-fairness.py`
+(`share_split()` / `measure_share()`); `archive/work/share-budget-r366/`; `CONTRIBUTORS.md` (`@briansp2020`).
