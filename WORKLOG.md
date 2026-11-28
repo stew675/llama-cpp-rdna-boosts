@@ -16,6 +16,37 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261128.007 (r377, release cut) -- tagged, main and the fork pushed, PR #372 merged, the images queued on the worker
+
+**The cut.**  `v18-919794500-r377` (annotated tag, pushed) = fork re-cut tip
+`6651cef37fe2c9470bb47ddc6a7c551c7d71667a`, tree `3706b801e235bbb371bfd0a02bb4239bb4a89778` (recorded in
+`release.json`), 19 default patches (18 official + temporary `0300`), 2 optional artifacts, optional tree
+`45128b1b1345209e8272272f36caa2ad5ac0a947`.  The tree was derived twice independently (the amended chain and
+`scripts/validate-set.sh`'s throwaway tarball) and `scripts/fork-refresh.sh --build --gates` re-cut the fork from
+`patches/` and asserted tree **and** tip; `gh api repos/stew675/llama.cpp/branches/rdna-boosts` reads `6651cef37`.
+
+**The re-cut exports from the CANONICAL chain.**  The first export came from the amended working chain, which moved
+the `From <sha>` line of every block (a rebuilt fork produces its own commit ids).  Re-exporting from a fresh
+`apply-all.sh` chain at `release.json.base` reproduced blocks `00`-`15` with the **exact ids r376 shipped**
+(`a46ca023c` ... `0198bcd15`) and moved only block 16 (`5ee370656`), block 17 and `0300` -- so the delivered diff is
+that one block plus the optional artifacts' parent lines, and the determinism contract in `AGENTS.md` still holds.
+
+**The PR.**  Merged (`--rebase`, attribution kept, `40ec4dbc`) and the merged `wip/kv-full-stop-r366/` copy removed in
+the next commit: the record is `archive/work/kv-full-stop-r366/` (their README, patch and repro kept unchanged) and a
+promoted campaign leaves no `wip/` stub.
+
+**The ladder.**  In `WORKLOG.md` 261128.006 (the promotion entry): `validate-set.sh` green, `fork-refresh.sh --build
+--gates` PASS, `gate-kv-admit.sh` PASS on every arm plus `--self-test` 23 failing checks, `gate-prefill-duty.sh` and
+`gate-park-idle-slots.sh` PASS, `gate-optional-build.sh` PASS (248 s), `check-shlib-symbols.sh` 16/16,
+`check-gen-docs.sh` ok, coherence identical to the r376 build on 4B Q8_0 (1 GPU) and 27B UD-IQ3_S (3-GPU tensor).
+`gate-prefill-fairness.sh` PASS in 2 of 3 runs, with the third failing only `share split` -- reproduced with the same
+numbers (10/13 steps, worst 129.00) on the **r376** build, and unreachable from this change (that arm runs
+`kv_unified=false`), so it is a pre-existing flake in that check and it is flagged for the maintainer in 261128.006.
+
+**Images.**  The `radiance` watcher (cron, every 10 min) picks the new tag up on its next poll and runs that tag's
+`scripts/build-containers.sh --push --prune`.  A release is only finished when `scripts/build-containers.sh
+--verify-only` says every tag RESOLVES (issue #364) -- see the entry above the index for that verdict.
+
 ## 261128.006 (r377) -- contributor PR #372 promoted into block 16: the KV full stop (a reply that outgrows its reserve ends with a length stop, DEFAULT ON)
 
 **Contribution.**  `@briansp2020`'s **PR #372** closes the limitation r365 wrote down for the KV admission: the
