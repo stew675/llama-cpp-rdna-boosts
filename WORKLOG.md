@@ -16,6 +16,48 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261128.003 (r375, release cut) -- tagged, main and the fork pushed, the assets published, the images verified 23/23, and the prefill-logit point reads 0.000000
+
+**The cut.**  `v18-919794500-r375` (annotated tag, pushed) = fork re-cut tip
+`5c35fca859bdae4fc9614bd5d48fac38248f973a`, tree `5fccfbcdc6c5dba3db5972362656b952d7a033ad` (recorded in
+`release.json`), 19 default patches (18 official + temporary `0300`) and 2 optional artifacts.  The default tree was
+re-derived twice independently (the throwaway `~/llama-scratch` apply and the fork refresh) and both produced the
+same tip.  `main` is `91b6838a`; all three CI runs read **success** (`Validate delivery set` on `main` and on the tag,
+`Release patch set` on the tag) and the Release carries its four assets.
+
+**The re-cut itself.**  Two blocks were amended: **12** takes the whole transport-selector change (its final form and
+the iface fills live there, and the gather counter is in the cache engine it owns) and **15** takes the
+`moe_cache_residency`/`gather_read` signature on the iface row it writes last.  Blocks 09/10 are untouched: their
+`From` ids move with the chain and nothing else.  The rebuild was `git am -3` per patch plus an apply-and-amend at 12
+and 15, and it reproduces `r374 tree + the measured change` byte for byte (`git diff f5f7a8e25 recut-r375` equals the
+working diff).  Both optional artifacts were re-cut against the new default tree; `0100` needed a real reconcile,
+because the block's scheduler refactor (`pipe_begin`/`compute_split`/`pipe_end`) is exactly where its own interleaved
+submission lives, so the gather-read sample was re-seated inside `pipe_end` (once per graph, after the last split).
+
+**Fork refresh (`scripts/fork-refresh.sh --build --gates --push`).**  Branch deleted and re-applied at `919794500`
+(strict `git am`), tree matched `release.json`, built the `all` target, `check-shlib-symbols.sh` **16/16**, the
+coherence gate passed, and the prefill-logit gate reads **mean KLD 0.000000** (limit 0.005), top-p 100.000 % -- the
+change is inert on the default path, as a transport decision should be.  `gh api
+repos/stew675/llama.cpp/branches/rdna-boosts --jq .commit.sha` reads `5c35fca85...`.
+
+**Also verified before the tag**: `gate-host-pool.sh` **59/59** (its `tsplit` arms cover the Meta `stage_input`
+forwarder the signature change touches), `gate-optional-build.sh` (gate 47) **PASS** on the cumulative optional tree
+(all target, 100 s, tree `3a30b4377`), `validate-set.sh` green including the rung file-set reconciliation
+(`blocks 21 -> 21, files 580 -> 580, defines 190 -> 190, envs 604 -> 607, options 14 -> 14`, 0 unexplained, 3 new),
+and same-seed greedy text byte-identical on all four field requests.
+
+**Containers, verified and not assumed.**  The worker watcher on `radiance` picked the tag up on its 05:10 poll,
+built and pushed by 05:34, and `scripts/build-containers.sh --verify-only` then reads **23/23 tags PRESENT, every
+moving tag carries this release** (`latest`, `rocm-*`, `server-rocm-*` at `sha256:7e734abe6140` on 10.2; `full` at
+`9584242d0b09`, `light` at `d60ce6429859`).  No image build ran on the primary box.
+
+**Also in this cut, and found while doing it**: `.github/workflows/release.yml` hardcoded the official block range
+as `0000-0015`, so every release note since r356 said the wrong thing; it is derived from `n_blocks` now and this
+tag's published body was corrected to `0000-0017`.
+
+**Record.** `release.json`; `WORKLOG.md` 261128.002 (the change and its measurements); `INVARIANTS.md` r375;
+`patches/README.md` blocks 12/15; `utilities/h2d-latency/`.
+
 ## 261128.002 (r375) -- issue #368: the stage-vs-gather transport is decided from a MEASURED gather read, three switches that lied are fixed, and the reporter's prefill regression has a mechanism (blocks 12/15)
 
 **Reported** (`@DanoPTT`, issue #368, r373 on a single R9700 at PCIe 3.0 x16, Windows): r373 prefill **1818 t/s**
