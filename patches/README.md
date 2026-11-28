@@ -6862,6 +6862,17 @@ in the release's gate set.
 r356 with the accumulation fix, the contiguity decline and the restated claims; its campaign record (what was
 measured and what was refused) is [`../archive/work/tq-hip/`](../archive/work/tq-hip/README.md).
 
+**The gfx1100 arm (r372, `TODO` #381 closed).**  The r356 cross-arch matrix was gfx1201 + gfx1151; `fingon`
+(gfx1100, RX 7900 XTX) went down mid-session and came back for r372, so the owed arm ran on the release tree
+(tip `5e844cbc6`) with the gate's own command: **12 passed / 0 failed**.  `MUL_MAT` **61/61** and `GET_ROWS`
+**16/16**, every one of the 305/84 reported NMSE values **exactly 0** (so the bit-identity to the CPU's AVX2 path
+holds on a second arch, not just gfx1201); one text per arm on both models at the shallow and the 200-token
+generation; the census non-vacuous (`small=2652 vec=262 vec_fused=324`, and `0/0/0/0/0` under `GGML_CUDA_TQ=0`);
+`mma=0` by design (gfx1100 has no RDNA4 int8-WMMA kernel, so the small-batch kernel takes every batch).  Rate,
+`llama-bench -fa 1 -p 512 -n 128 -r 3`: pp512 **1510.4 vs 195.6** and tg128 **230.2 vs 12.3** t/s against the
+CPU-backend arm.  The neutrality arm was skipped (`--dense-ref ''`, as the row said): gfx1100 has no recorded
+dense reference, and the gfx1201 + gfx1151 arms already cover it.
+
 **Not covered:** `MUL_MAT_ID` (a TQ MoE keeps its experts on the CPU backend, so a ternary MoE half-runs on the GPU —
 the model's own output layer may also stay on the host, as `models/bitnet.cpp`'s `tok_embd` FIXME does), draft/MTP
 decoding with a TQ model, the **CUDA (nvcc) build** of `tq.cu` (only HIP is compiled here; the `#pragma clang fp

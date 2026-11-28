@@ -16,6 +16,42 @@ index below.  That is the whole roll-over: one move, one row.
 A reference written `WORKLOG.md` 261124.012 means entry `261124.012` — it is in this file if it is today's,
 otherwise look its day up in the index.
 
+## 261127.025 (r372, docs) -- block 17's owed gfx1100 arm ran on `fingon` and passes 12/12: the bit-identity to the CPU's AVX2 path holds on a second arch, and `TODO` #381 closes
+
+`TODO` #381 had been open since r356, because `fingon` (gfx1100, RX 7900 XTX) rebooted twice mid-build and then
+dropped off port 22 for the rest of that session.  The box was up for r372, so the arm ran on the release tree
+(tip `5e844cbc6`, applied from `release.json` on the box, `all` build green) with the row's own command:
+`scripts/gate-tq.sh --build <dir> --tq2 TQ2_0.gguf --tq1 TQ1_0.gguf --dense <a non-TQ Q8_0> --dense-ref '' --device 0
+--no-split --bench`.  **12 passed, 0 failed.**
+
+* **The op oracle, with NMSE**: `MUL_MAT` **61/61**, `GET_ROWS` **16/16**, and every one of the **305 / 84** reported
+  errors **exactly 0**.  That is the block's whole claim (bit-identity to `ggml_vec_dot_tq{1,2}_0_q8_K`, the unfused
+  mul+add per block) holding on a second arch rather than only on gfx1201; gfx1151 had already read 305/305 and 84/84
+  exactly 0, and this is the second non-MMA arch.
+* **The text**: the default and `GGML_CUDA_TQ_FUSE=0` arms read one text on both models at the shallow and the
+  200-token generation.  The CPU-placement arm was reported, not gated (§38/§82: it is a different placement, not a
+  reference), and the shared prefixes were 292/292 (TQ2_0 shallow), 539/539 (TQ2_0 long, 539 of 539/621) and
+  539/539 (TQ1_0 long).
+* **The census, non-vacuous**: `mul_mat small=2652 mma=0 get_rows=0 vec=262 vec_fused=324` on the default,
+  `vec=457 vec_fused=0` under `GGML_CUDA_TQ_FUSE=0` (the fusions really are what `vec_fused` counts) and
+  `0/0/0/0/0` under `GGML_CUDA_TQ=0` (a kill switch that leaves the path live is not a switch).  `mma=0` is by
+  design here: gfx1100 has no RDNA4 int8-WMMA kernel, so the small-batch kernel takes every batch, exactly as the
+  row predicted.
+* **Rate** (`llama-bench -fa 1 -p 512 -n 128 -r 3`): pp512 **1510.4 vs 195.6**, tg128 **230.2 vs 12.3** t/s against
+  the `GGML_CUDA_TQ=0` (CPU-backend, pre-r356 behaviour) arm.
+* **Neutrality was skipped on purpose** (`--dense-ref ''`, which the row specified): gfx1100 has no recorded dense
+  reference, and the gfx1201 + gfx1151 arms already carry it.  Saying so is the point; quoting another box's hash
+  would have been the trap.
+
+Two things about the run itself: the models are not on `fingon` (the TQ pair was copied over, 4.5 GiB in ~40 s), and
+the box's canonical build script is the ROCm 10.1 one (`build-llama-rocm-101`, `build-rocm` there is configured for
+10.1 and the 10.2 script refuses a reused dir) so the arm ran on that line -- acceptable because the gate's claims
+are arch-level (NMSE exactly 0, one text per arm), and it is recorded rather than left implicit.  The four results
+are in `patches/README.md` block 17; `TODO` #381 is removed from the open row set and marked CLOSED in the handle
+history.
+
+**Record.** `patches/README.md` block 17 (*The gfx1100 arm*); `TODO.md` (`#381` closed); `scripts/gate-tq.sh`.
+
 ## 261127.024 (r372) -- issue #381: a tensor split's head-256 prefill attention padded a quarter of the GQA group. RDNA4 takes the stock divisor `ncols2`, gfx1100 takes upstream #31746's Q-from-LDS row, and the r285 measurement that chose the split-aware rule is now inverted
 
 `@mjohanning99` reported (issue #381) that a mixed RX 9070 (gfx1201) + RX 7900 GRE (gfx1100) `-sm tensor` pair
